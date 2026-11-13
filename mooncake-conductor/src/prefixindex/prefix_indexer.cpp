@@ -228,6 +228,10 @@ RegistrationResult PrefixCacheTable::ValidateRegistration(
     if (registration.dp_rank < 0) {
         return {.error = "dp_rank must be non-negative"};
     }
+    if (registration.publisher_kind != common::PublisherKind::kVllm &&
+        registration.publisher_kind != common::PublisherKind::kSglang) {
+        return {.error = "engine publisher must be vLLM or SGLang"};
+    }
     if (auto error = ValidateHashProfile(registration.profile);
         !error.empty()) {
         return {.error = std::move(error)};
@@ -246,6 +250,8 @@ RegistrationResult PrefixCacheTable::Register(
         std::make_shared<ContextState>(registration.profile, block_limit_);
     candidate->instance_ranks[registration.instance_id].insert(
         registration.dp_rank);
+    candidate->instance_publishers[registration.instance_id].emplace(
+        registration.dp_rank, registration.publisher_kind);
 
     std::shared_ptr<ContextState> state;
     {
@@ -263,9 +269,21 @@ RegistrationResult PrefixCacheTable::Register(
         return {.error =
                     "registration conflicts with the ContextKey hash profile"};
     }
+    auto publisher = state->instance_publishers.find(registration.instance_id);
+    if (publisher != state->instance_publishers.end()) {
+        auto rank = publisher->second.find(registration.dp_rank);
+        if (rank != publisher->second.end() &&
+            rank->second != registration.publisher_kind) {
+            return {
+                .error =
+                    "registration conflicts with the engine publisher kind"};
+        }
+    }
     const bool inserted = state->instance_ranks[registration.instance_id]
                               .insert(registration.dp_rank)
                               .second;
+    state->instance_publishers[registration.instance_id].emplace(
+        registration.dp_rank, registration.publisher_kind);
     return {.inserted = inserted, .error = ""};
 }
 
@@ -322,6 +340,13 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
             state->instance_ranks.erase(instance);
         }
     }
+    auto publisher = state->instance_publishers.find(instance_id);
+    if (publisher != state->instance_publishers.end()) {
+        publisher->second.erase(dp_rank);
+        if (publisher->second.empty()) {
+            state->instance_publishers.erase(publisher);
+        }
+    }
 
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
@@ -335,6 +360,10 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
         };
         std::erase_if(presence.cpu_local_owners, [&](const EngineOwner& owner) {
             return owner.instance_id == instance_id && owner.dp_rank == dp_rank;
+        });
+        std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
+            return ref.first.instance_id == instance_id &&
+                   ref.first.dp_rank == dp_rank;
         });
         std::erase_if(presence.disk_owners, matches_engine);
     }
@@ -357,12 +386,26 @@ std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
         !instance->second.contains(mutation.owner.dp_rank)) {
         return "engine owner instance/rank is not registered";
     }
+    const bool vllm_local =
+        mutation.tier == StorageTier::kCpuLocal &&
+        state->instance_publishers.at(mutation.owner.instance_id)
+                .at(mutation.owner.dp_rank) == common::PublisherKind::kVllm;
     for (ProjectedPrefix prefix : mutation.prefixes) {
+        if (vllm_local) {
+            auto existing = state->blocks.find(prefix);
+            if (existing != state->blocks.end() &&
+                !existing->second.cpu_share_owners.empty()) {
+                continue;
+            }
+        }
         auto& presence = state->blocks[prefix];
         if (mutation.tier == StorageTier::kDevice) {
             presence.device_owners.insert(mutation.owner);
         } else if (mutation.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.insert(mutation.owner);
+            if (vllm_local) {
+                ++presence.cpu_local_refs[mutation.owner];
+            }
         } else {
             presence.disk_owners.insert(mutation.owner);
         }
@@ -389,6 +432,13 @@ std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
             if (mutation.tier == StorageTier::kDevice) {
                 block->second.device_owners.erase(mutation.owner);
             } else if (mutation.tier == StorageTier::kCpuLocal) {
+                auto& refs = block->second.cpu_local_refs;
+                if (auto ref = refs.find(mutation.owner); ref != refs.end()) {
+                    if (--ref->second > 0) {
+                        continue;  // another resident chunk still holds it
+                    }
+                    refs.erase(ref);
+                }
                 block->second.cpu_local_owners.erase(mutation.owner);
             } else {
                 block->second.disk_owners.erase(mutation.owner);
@@ -419,6 +469,7 @@ std::string PrefixCacheTable::ClearEngine(const EngineClear& clear) {
         }
         if (!clear.tier || *clear.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.erase(clear.owner);
+            presence.cpu_local_refs.erase(clear.owner);
         }
         if (!clear.tier || *clear.tier == StorageTier::kDisk) {
             presence.disk_owners.erase(clear.owner);
@@ -442,6 +493,20 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
         auto& presence = state->blocks[prefix];
         if (mutation.tier == StorageTier::kCpuShare) {
             presence.cpu_share_owners.insert(mutation.owner);
+            std::erase_if(
+                presence.cpu_local_owners, [&](const EngineOwner& owner) {
+                    auto instance =
+                        state->instance_publishers.find(owner.instance_id);
+                    if (instance == state->instance_publishers.end()) {
+                        return false;
+                    }
+                    auto rank = instance->second.find(owner.dp_rank);
+                    return rank != instance->second.end() &&
+                           rank->second == common::PublisherKind::kVllm;
+                });
+            std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
+                return !presence.cpu_local_owners.contains(ref.first);
+            });
         } else {
             presence.disk_owners.insert(mutation.owner);
         }

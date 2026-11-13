@@ -46,8 +46,31 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_executable(cuda_ipc_buffer_test cuda_ipc_buffer_test.cpp)
+  target_link_libraries(cuda_ipc_buffer_test
+                        PRIVATE mooncake_store CUDA::cuda_driver CUDA::cudart)
+  add_test(NAME cuda_ipc_buffer_test COMMAND cuda_ipc_buffer_test)
+  set_tests_properties(cuda_ipc_buffer_test PROPERTIES SKIP_RETURN_CODE 77
+                                                       TIMEOUT 60)
+endif()
+if(USE_MLU)
+  foreach(mlu_test mlu_accelerator_test mlu_store_test)
+    # These tests do not use master_service_test_peer, which would pull the
+    # production mooncake_store library back into shared builds.
+    add_executable(${mlu_test} ${mlu_test}.cpp mlu_test_hooks.cpp)
+    target_link_libraries(${mlu_test} PRIVATE mooncake_store_mlu_test gtest
+                                              gtest_main pthread)
+    target_link_options(${mlu_test} PRIVATE "-Wl,--wrap=cnrtMemcpy"
+                        "-Wl,--wrap=cnrtHostMalloc" "-Wl,--wrap=cnrtFreeHost")
+    add_test(NAME ${mlu_test} COMMAND ${mlu_test})
+  endforeach()
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
+add_store_test(local_shm_conflict_test local_shm_conflict_test.cpp)
+add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -69,7 +92,8 @@ add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(session_tag_test session_tag_test.cpp)
-add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
+add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp
+               kv_event_publisher_batching_test.cpp)
 if(ENABLE_KV_EVENTS)
   target_compile_definitions(kv_event_publisher_test
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
@@ -162,6 +186,7 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(variadic_serialization_test variadic_serialization_test.cpp)
 add_test(NAME client_hca_affinity_test
          COMMAND client_integration_test
                  --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
@@ -199,8 +224,7 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
-add_store_test(nof_probe_context_pool_test
-               nof_probe_context_pool_test.cpp)
+add_store_test(nof_probe_context_pool_test nof_probe_context_pool_test.cpp)
 if(USE_TENT)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
@@ -237,16 +261,21 @@ if(USE_TENT)
       transfer_task_test
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
-  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+  # Scatter transfers require a cancellable transport; without RDMA the default
+  # TENT config only installs TCP, so swap it for HP_TCP.
+  set_tests_properties(
+    transfer_scatter_tent_test
+    PROPERTIES
+      ENVIRONMENT
+      "MC_USE_TENT=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":true}}}"
+  )
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
@@ -265,6 +294,14 @@ add_store_test(group_index_test group_index_test.cpp)
 add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
 add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
 add_store_test(eviction_index_test eviction_index_test.cpp)
+# These tests exercise metadata and the evictor without a transport runtime.
+add_executable(parallel_eviction_test parallel_eviction_test.cpp)
+target_link_libraries(
+  parallel_eviction_test
+  PRIVATE mooncake_store_master cachelib_memory_allocator glog::glog gtest_main
+          yalantinglibs::yalantinglibs)
+add_test(NAME parallel_eviction_test COMMAND parallel_eviction_test)
+set_tests_properties(parallel_eviction_test PROPERTIES TIMEOUT 90)
 add_store_test(evictor_test evictor_test.cpp)
 add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
@@ -298,9 +335,12 @@ add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
-add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test
+               real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -394,12 +434,26 @@ add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(bucket_direct_write_test bucket_direct_write_test.cpp)
+if(TARGET Mooncake::liburing)
+  target_compile_definitions(bucket_direct_write_test PRIVATE USE_URING)
+endif()
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(object_storage_backend_test object_storage_backend_test.cpp)
+add_store_test(kvcs_object_storage_adapter_test
+               kvcs_object_storage_adapter_test.cpp)
+if(NOT MOONCAKE_KVCS_SDK_FOUND)
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_NO_SDK=1)
+else()
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_SDK=1)
+endif()
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
@@ -482,10 +536,32 @@ add_ha_test(ha_backend_availability_test
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(ha_kv_backend_write_result_test
+            ha/kv/ha_kv_backend_write_result_test.cpp)
+# Exercise the actual etcd adapter with a controlled external helper. Keep this
+# target independent of the real etcd helper/client so timeouts need no server.
+add_executable(
+  etcd_ha_kv_backend_write_result_test
+  ha/kv/etcd_ha_kv_backend_write_result_test.cpp
+  ../src/ha/kv/etcd_ha_kv_backend.cpp ../src/types.cpp)
+target_include_directories(etcd_ha_kv_backend_write_result_test
+                           PRIVATE ../include)
+target_link_libraries(
+  etcd_ha_kv_backend_write_result_test
+  PRIVATE cachelib_memory_allocator
+          yalantinglibs::yalantinglibs
+          JsonCpp::JsonCpp
+          glog::glog
+          gtest
+          gtest_main
+          pthread)
+add_test(NAME etcd_ha_kv_backend_write_result_test
+         COMMAND etcd_ha_kv_backend_write_result_test)
 add_ha_test(redis_ha_kv_backend_test ha/kv/redis_ha_kv_backend_test.cpp)
 if(STORE_USE_REDIS)
-  target_sources(redis_ha_kv_backend_test
-                 PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp)
+  target_sources(
+    redis_ha_kv_backend_test PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp
+                                     ha/kv/redis_ha_kv_protocol_test.cpp)
   target_link_libraries(redis_ha_kv_backend_test PRIVATE Mooncake::hiredis)
   # gtest_main never calls gflags::ParseCommandLineFlags, so --redis_endpoint
   # would stay empty. This target provides main() instead.
@@ -561,3 +637,14 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+# Compile the production resource manager against a USRBIO test double, even
+# when USE_3FS is disabled. Keep it separate from mooncake_store's real client.
+add_executable(
+  hf3fs_resource_manager_test hf3fs_resource_manager_test.cpp
+                              ../src/hf3fs/hf3fs_resource_manager.cpp)
+target_include_directories(hf3fs_resource_manager_test BEFORE
+                           PRIVATE hf3fs_stub ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
+                                                          pthread)
+add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)

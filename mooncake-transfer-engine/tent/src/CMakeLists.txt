@@ -7,6 +7,15 @@ target_include_directories(
             $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
+# ascend_affinity.h lives next to the shared allocator implementation, but TENT
+# headers (tent/transport/ascend/ascend_direct_transport.h) include it, so the
+# header directory must be on every TENT consumer's include path.
+if(USE_ASCEND OR USE_ASCEND_DIRECT)
+  target_include_directories(
+    tent_interface
+    INTERFACE ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator)
+endif()
+
 if(TARGET asio_shared)
   target_link_libraries(tent_interface INTERFACE asio_shared)
 endif()

@@ -794,8 +794,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Keep the handoff until serving is established so restore failure
         // or a later lease loss can still resume from the applied cursor.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
+        // This review unit can replay and snapshot obligations but cannot yet
+        // resume their Master lifecycle. Never serve after dropping that state.
         auto restore_result =
-            promotion_ctx->metadata_store
+            promotion_ctx->HasObjectReplicaState()
+                ? tl::expected<void, ErrorCode>(
+                      tl::unexpected(ErrorCode::NOT_SUPPORTED))
+            : promotion_ctx->metadata_store
                 ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
                       *promotion_ctx->metadata_store,
                       promotion_ctx->applied_cursor, promotion_ctx->segments,

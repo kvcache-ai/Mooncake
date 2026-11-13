@@ -143,6 +143,8 @@ Status MemoryProber::alloc(void** pptr, size_t size, const std::string& loc) {
             !p.iface.alloc)
             continue;
         int rc = p.iface.alloc(p.ctx, pptr, size, loc.c_str());
+        if (rc == TENT_DEVICE_PLUGIN_ERROR)
+            return Status::InternalError("Device plugin allocation failed");
         if (rc == 0) {
             std::lock_guard<std::mutex> lock(mu_);
             memory_type_map_[*pptr] = type;
@@ -170,6 +172,8 @@ Status MemoryProber::free(void* ptr, size_t size) {
             !p.iface.free)
             continue;
         int rc = p.iface.free(p.ctx, ptr, size);
+        if (rc == TENT_DEVICE_PLUGIN_ERROR)
+            return Status::InternalError("Device plugin free failed");
         if (rc == 0) {
             memory_type_map_.erase(ptr);
             return Status::OK();
@@ -256,6 +260,7 @@ const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size,
     for (auto& p : plugins_) {
         if (!p.iface.query_location) continue;
         int rc = p.iface.query_location(p.ctx, addr, size, list_buf, 64);
+        if (rc == TENT_DEVICE_PLUGIN_ERROR) return {};
         if (rc > 0) {
             std::vector<RangeLocation> out;
             for (int i = 0; i < rc; ++i) {
@@ -274,6 +279,7 @@ std::string MemoryProber::type(void* addr) {
         location_t list_buf;
         if (!p.iface.query_location) continue;
         int rc = p.iface.query_location(p.ctx, addr, 1, &list_buf, 1);
+        if (rc == TENT_DEVICE_PLUGIN_ERROR) return "";
         if (rc > 0) return LocationParser(list_buf.location).type();
     }
     return "cpu";

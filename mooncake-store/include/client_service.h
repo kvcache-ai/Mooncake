@@ -28,6 +28,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "gather_read.h"
 
 namespace mooncake {
 
@@ -277,6 +278,15 @@ class Client {
     std::optional<StoreScatterTransferOperation> SubmitScatterNative(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
+
+    bool SupportsGatherRead() const {
+        return !transfer_engine_->isUsingTent() && protocol_ == "rdma" &&
+               transfer_engine_->getTransport("rdma");
+    }
+    std::optional<store::GatherReadOperation> SubmitGatherRead(
+        const std::string& endpoint,
+        const std::vector<store::GatherReadRange>& ranges, void* destination,
+        size_t capacity);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -870,6 +880,14 @@ class Client {
     }
 
     /**
+     * @brief Whether a DFS replica is served by an fs adapter that accepts
+     * arbitrary host read buffers, so a host destination can be read into
+     * directly without a staging buffer.
+     */
+    bool CanReadDfsReplicaIntoHostMemory(
+        const Replica::Descriptor& replica) const;
+
+    /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
      */
@@ -964,6 +982,14 @@ class Client {
     // SSD read (#3884).
     DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
 
+    // Reads one byte window of each DISK or DFS replica. `windows[i]` receives
+    // `windows[i].size` bytes starting at `value_offsets[i]` in the value.
+    std::vector<tl::expected<void, ErrorCode>> BatchReadFileReplicaRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<Slice>& windows,
+        const std::vector<uint64_t>& value_offsets);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -1008,6 +1034,12 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    // Submits one transfer without waiting for it. The caller must get() the
+    // returned future before it releases the slices or the replica.
+    tl::expected<TransferFuture, ErrorCode> SubmitSingleTransfer(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
@@ -1028,6 +1060,12 @@ class Client {
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
         TransferIntent intent = TransferIntent::kUnspecified);
+    // Writes the slices to every memory and NoF replica in the list. All
+    // transfers are submitted before any is waited on. Returns the type and
+    // result of each such replica, in order.
+    std::vector<std::pair<ReplicaType, ErrorCode>> WriteMemoryAndNofReplicas(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<Slice>& slices);
     ErrorCode TransferRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
@@ -1038,6 +1076,9 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
+    void ReconcileMissingKvcsReplica(
+        const std::string& key, const QueryResult& query_result,
+        const Replica::Descriptor& replica_descriptor);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -1131,6 +1172,17 @@ class Client {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
+    std::unique_ptr<store::GatherReadService> gather_service_;
+    std::string gather_endpoint_;
+    std::mutex gather_clients_mutex_;
+    struct GatherPeer {
+        std::mutex mutex;
+        std::string endpoint;
+        std::chrono::steady_clock::time_point refresh_at{};
+        std::vector<std::unique_ptr<store::GatherReadClient>> clients;
+    };
+    std::unordered_map<std::string, std::shared_ptr<GatherPeer>>
+        gather_clients_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
     // NoF initiator injected by RealClient; nullptr when NoF is unavailable.

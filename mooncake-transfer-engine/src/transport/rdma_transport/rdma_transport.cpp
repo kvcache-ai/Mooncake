@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <set>
 #include <thread>
@@ -45,7 +46,27 @@
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
+
 namespace mooncake {
+
+namespace {
+
+// Mirrors the ownership test the submit path already uses (see the
+// buffer.protocol checks below): descs published by this transport, plus
+// legacy descs with no protocol field. Without this, RDMA's removal can
+// erase a same-address desc belonging to HIP/nvlink, which now filter.
+bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol.empty() || desc.protocol == "rdma";
+#else
+    return desc.shm_name.empty();
+#endif
+}
+
+}  // namespace
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
@@ -274,6 +295,24 @@ RdmaTransport::RdmaTransport() {
     }
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void RdmaTransport::recordClassicCongestionControlMode(
+    adaptive_congestion_control::Mode mode) {
+    const auto next_mode = static_cast<ClassicCongestionControlMode>(mode);
+    auto current =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    while (current == ClassicCongestionControlMode::kUninitialized) {
+        if (classic_congestion_control_mode_.compare_exchange_weak(
+                current, next_mode, std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            return;
+    }
+    if (current != next_mode)
+        classic_congestion_control_mode_.store(
+            ClassicCongestionControlMode::kConflict, std::memory_order_release);
+}
+#endif
+
 RdmaTransport::~RdmaTransport() {
     notify_running_.store(false, std::memory_order_release);
     if (notify_worker_.joinable()) notify_worker_.join();
@@ -429,6 +468,22 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool remote_accessible,
                                                bool update_metadata,
                                                bool force_sequential) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // When HyLink is installed, device memory registration is delegated
+    // to HyLink, which rejects allocations it cannot export.
+    if (localSegmentHasHylink(metadata_) && isDtkDeviceMemory(addr)) {
+        {
+            std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+            skipped_hylink_fabric_addrs_.insert(
+                reinterpret_cast<uint64_t>(addr));
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "RdmaTransport: skipping device memory " << addr
+                      << " (owned by HyLink)";
+        }
+        return 0;
+    }
+#endif
     int access_rights = IBV_ACCESS_LOCAL_WRITE;
     if (remote_accessible)
         access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -583,7 +638,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                chunks[ri].first, isOwnRdmaDesc, /*update_metadata=*/false);
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
@@ -761,6 +816,13 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     return 0;
 }
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+void RdmaTransport::clearSkipRegistration(void *addr) {
+    std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+    skipped_hylink_fabric_addrs_.erase(reinterpret_cast<uint64_t>(addr));
+}
+#endif
+
 int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return unregisterLocalMemoryInternal(addr, update_metadata, false);
 }
@@ -768,6 +830,18 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
                                                  bool force_sequential) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    {
+        std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+        auto it =
+            skipped_hylink_fabric_addrs_.find(reinterpret_cast<uint64_t>(addr));
+        if (it != skipped_hylink_fabric_addrs_.end()) {
+            // Other transports may still fail. Keep the delegation mark so
+            // retrying the engine-level unregister remains a no-op for RDMA.
+            return 0;
+        }
+    }
+#endif
     // Mooncake#2017: if this base buffer was split into chunks at registration,
     // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
     // receives the base addr).
@@ -792,7 +866,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // chunk); publish once after all removals, below.
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), isOwnRdmaDesc,
+                /*update_metadata=*/false);
             // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
             // removed this chunk's metadata and then failed partway through
             // deregistration: tolerate it so the retry reaches the MR cleanup.
@@ -854,7 +929,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, isOwnRdmaDesc,
+                                                update_metadata);
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
     // But a missing entry also occurs for an address that was never a
@@ -1118,6 +1194,18 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     std::mutex cleaned_mutex;
     std::vector<void *> cleaned_addrs;
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        {
+            std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+            if (skipped_hylink_fabric_addrs_.count(
+                    reinterpret_cast<uint64_t>(addr_list[i]))) {
+                // No RDMA cleanup: exclude this address from cleaned_addrs so
+                // a publish failure cannot seed pending_dereg_ for HyLink.
+                any_cleaned.store(true, std::memory_order_relaxed);
+                return 0;
+            }
+        }
+#endif
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         // NOT_REGISTERED means nothing remains for this member: its metadata
         // entry is gone and no pending MR cleanup is recorded. A batch retry
@@ -1193,11 +1281,43 @@ Status RdmaTransport::submitTransfer(
 #endif
         task_list.push_back(&task);
     }
-    return submitTransferTask(task_list);
+    return submitTransferTaskWithSeal(task_list);
+}
+
+Status RdmaTransport::submitTransferTaskWithSeal(
+    const std::vector<TransferTask *> &task_list) {
+    for (auto *task : task_list) Slice::unsealTaskSubmission(task);
+    auto status = submitTransferTask(task_list);
+    for (auto *task : task_list) Slice::sealTaskSubmission(task);
+    return status;
 }
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto congestion_control_mode =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    std::optional<TaskCongestionControllerMode> task_mode;
+    switch (congestion_control_mode) {
+        case ClassicCongestionControlMode::kOff:
+            task_mode = TaskCongestionControllerMode::kOff;
+            break;
+        case ClassicCongestionControlMode::kObserve:
+            task_mode = TaskCongestionControllerMode::kObserve;
+            break;
+        case ClassicCongestionControlMode::kEnforce:
+            task_mode = TaskCongestionControllerMode::kEnforce;
+            break;
+        case ClassicCongestionControlMode::kUninitialized:
+        case ClassicCongestionControlMode::kConflict:
+            break;
+    }
+    if (task_mode) {
+        for (auto *task : task_list) {
+            task->rdma_congestion_control_mode = {true, *task_mode};
+        }
+    }
+#endif
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
@@ -1217,6 +1337,15 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    size_t pending_slice_count = 0;
+    auto flush_pending_slices = [&]() {
+        for (auto &entry : slices_to_post) {
+            if (entry.second.empty()) continue;
+            entry.first->submitPostSend(entry.second);
+            entry.second.clear();
+        }
+        pending_slice_count = 0;
+    };
     auto fail_unposted_slices = [&]() {
         for (auto &entry : slices_to_post)
             for (auto *slice : entry.second) slice->markFailed();
@@ -1236,6 +1365,10 @@ Status RdmaTransport::submitTransferTask(
             slice->length = 0;
             slice->task = &task;
             slice->status = Slice::PENDING;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
             __sync_fetch_and_add(&task.slice_count, 1);
             slice->markFailed();
@@ -1249,7 +1382,6 @@ Status RdmaTransport::submitTransferTask(
         fail_unposted_slices();
         fail_unstarted_tasks(task_index + 1);
     };
-    uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
@@ -1261,7 +1393,6 @@ Status RdmaTransport::submitTransferTask(
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
-        nr_slices = 0;
         assert(task.request);
         auto &request = task.request[request_index++];
         if (request_index == task.request_count) {
@@ -1323,10 +1454,6 @@ Status RdmaTransport::submitTransferTask(
 
             Slice *slice = getSliceCache().allocate();
             assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
-
             slice->source_addr = (char *)request.source + offset;
             slice->length = slice_length;
             slice->source_location.clear();
@@ -1338,17 +1465,25 @@ Status RdmaTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
             slice->ts = 0;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
+            // Selected but inactive RNICs, named in the error below.
+            std::set<int> inactive_device_ids;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
                 if (request_context && request_context->active()) {
                     found_device = true;
                     buffer_id = request_buffer_id;
                     device_id = request_device_id;
+                } else if (request_context) {
+                    inactive_device_ids.insert(request_device_id);
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
@@ -1373,7 +1508,10 @@ Status RdmaTransport::submitTransferTask(
                        static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
-                if (!context->active()) continue;
+                if (!context->active()) {
+                    inactive_device_ids.insert(device_id);
+                    continue;
+                }
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
@@ -1387,13 +1525,29 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
+                std::string reason;
+                if (inactive_device_ids.empty()) {
+                    reason = "no selectable registered buffer covers " +
+                             std::to_string(slice->length) +
+                             " bytes at this address; registered buffers: " +
+                             std::to_string(local_segment_desc->buffers.size());
+                } else {
+                    reason = "selected RNIC(s) inactive:";
+                    const char *separator = " ";
+                    for (const int device_id : inactive_device_ids) {
+                        reason += separator;
+                        reason += context_list_[device_id]->deviceName();
+                        separator = ", ";
+                    }
+                }
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
-                    << source_addr;
+                    << source_addr << " (" << reason << ")";
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)) +
+                    " (" + reason + ")");
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
@@ -1415,19 +1569,16 @@ Status RdmaTransport::submitTransferTask(
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
+            // Flush prepared slices so TE worker post can overlap with slice
+            // preparation
+            if (++pending_slice_count >= kSubmitWatermark)
+                flush_pending_slices();
 
             offset += slice->length;
         }
     }
 
-    for (auto &entry : slices_to_post)
-        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    flush_pending_slices();
     return Status::OK();
 }
 
@@ -1661,13 +1812,20 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
                        uint64_t offset, std::string_view hint,
                        std::string_view local_hca, int retry_count,
                        bool by_local_hca) {
+    // Drop topology candidates without valid keys for this buffer before the
+    // selection rule applies. An entry that exists but has no such candidate
+    // fails rather than falling back to the wildcard entry, which would leave
+    // the buffer's location or the peer-affinity mapping.
+    const std::function<bool(int)> device_filter = [desc, &buffer](int id) {
+        return RdmaTransport::hasValidKeys(desc, buffer, id);
+    };
     if (by_local_hca) {
         const auto location = resolveBufferLocation(buffer, offset);
         int device_id = desc->topology.selectDeviceByLocalHca(
-            location, local_hca, retry_count);
-        if (device_id >= 0) return device_id;
-        return desc->topology.selectDeviceByLocalHca(kWildcardLocation,
-                                                     local_hca, retry_count);
+            location, local_hca, retry_count, device_filter);
+        if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
+        return desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count, device_filter);
     }
 
     std::string location = buffer.name;
@@ -1679,17 +1837,22 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     // A named hint is an explicit override: try the buffer location first,
     // then the global HCA set. Do not call the hint-taking selectDevice()
     // overload here because it applies normal selection immediately on a
-    // location miss, making the wildcard attempt unreachable.
+    // location miss, making the wildcard attempt unreachable. A hinted HCA
+    // without valid keys for the buffer is treated like an unknown hint name.
     if (!hint.empty()) {
         int device_id = desc->topology.getDeviceIndex(location, hint);
-        if (device_id >= 0) return device_id;
+        if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
+            return device_id;
         device_id = desc->topology.getDeviceIndex(kWildcardLocation, hint);
-        if (device_id >= 0) return device_id;
+        if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
+            return device_id;
     }
 
-    int device_id = desc->topology.selectDevice(location, retry_count);
-    if (device_id >= 0) return device_id;
-    return desc->topology.selectDevice(kWildcardLocation, retry_count);
+    int device_id =
+        desc->topology.selectDevice(location, retry_count, device_filter);
+    if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
+    return desc->topology.selectDevice(kWildcardLocation, retry_count,
+                                       device_filter);
 }
 
 int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
@@ -1717,8 +1880,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
             if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                RdmaTransport::hasValidKeys(desc, buffer, hint_device_id)) {
                 selected = hint_device_id;
             }
         }
@@ -1746,7 +1908,35 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
+// The device is within the segment and `keys` holds a nonzero key for it.
+bool isKeyedDevice(
+    const RdmaTransport::SegmentDesc *desc,
+    const std::vector<TransferMetadata::BufferDesc::mr_key_t> &keys,
+    int device_id) {
+    if (device_id < 0) return false;
+    const size_t id = static_cast<size_t>(device_id);
+    if (!desc->devices.empty() && id >= desc->devices.size()) return false;
+    return id < keys.size() && keys[id] != 0;
+}
+
 }  // namespace
+
+bool RdmaTransport::hasValidLkey(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    return isKeyedDevice(desc, buffer.lkey, device_id);
+}
+
+bool RdmaTransport::hasValidRkey(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    return isKeyedDevice(desc, buffer.rkey, device_id);
+}
+
+bool RdmaTransport::hasValidKeys(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    if (buffer.lkey.empty() && buffer.rkey.empty()) return false;
+    return (buffer.lkey.empty() || hasValidLkey(desc, buffer, device_id)) &&
+           (buffer.rkey.empty() || hasValidRkey(desc, buffer, device_id));
+}
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, std::string_view hint,

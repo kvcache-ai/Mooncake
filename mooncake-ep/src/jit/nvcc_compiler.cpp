@@ -14,11 +14,14 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <spawn.h>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+
+extern char** environ;
 
 namespace mooncake {
 namespace jit {
@@ -116,25 +119,44 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
         raw_argv.push_back(const_cast<char*>(arg.c_str()));
     raw_argv.push_back(nullptr);
 
-    const pid_t pid = fork();
-    if (pid < 0) {
-        const int saved_errno = errno;
+    const auto close_pipe_and_report_error = [&](const char* operation,
+                                                 int error) {
         close(pipe_fd[0]);
         close(pipe_fd[1]);
-        result->output =
-            std::string("fork failed: ") + std::strerror(saved_errno);
+        result->output = std::string(operation) +
+                         " failed: " + std::strerror(error) +
+                         " (errno=" + std::to_string(error) + ")";
         return false;
+    };
+
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawn_file_actions_init(&actions);
+    if (error != 0)
+        return close_pipe_and_report_error("posix_spawn_file_actions_init",
+                                           error);
+
+    // The child only writes to this pipe, so close its read end.
+    // Do this before dup2: pipe_fd[0] could be fd 1 or 2.
+    error = posix_spawn_file_actions_addclose(&actions, pipe_fd[0]);
+    if (error == 0)
+        error = posix_spawn_file_actions_adddup2(&actions, pipe_fd[1],
+                                                 STDOUT_FILENO);
+    if (error == 0)
+        error = posix_spawn_file_actions_adddup2(&actions, pipe_fd[1],
+                                                 STDERR_FILENO);
+    if (error == 0 && pipe_fd[1] != STDOUT_FILENO &&
+        pipe_fd[1] != STDERR_FILENO)
+        error = posix_spawn_file_actions_addclose(&actions, pipe_fd[1]);
+    if (error != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return close_pipe_and_report_error("posix_spawn_file_actions", error);
     }
 
-    if (pid == 0) {
-        close(pipe_fd[0]);
-        dup2(pipe_fd[1], STDOUT_FILENO);
-        dup2(pipe_fd[1], STDERR_FILENO);
-        close(pipe_fd[1]);
-
-        execvp(raw_argv[0], raw_argv.data());
-        _exit(127);
-    }
+    pid_t pid = -1;
+    error = posix_spawnp(&pid, raw_argv[0], &actions, nullptr, raw_argv.data(),
+                         environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error != 0) return close_pipe_and_report_error("posix_spawnp", error);
 
     close(pipe_fd[1]);
     char buffer[4096];

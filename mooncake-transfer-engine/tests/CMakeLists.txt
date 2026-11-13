@@ -1,6 +1,19 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_executable(task_congestion_observation_test
+                 ${WORKSPACE}/task_congestion_observation_test.cpp)
+  target_include_directories(
+    task_congestion_observation_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control
+      ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(
+    task_congestion_observation_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME task_congestion_observation_test
+           COMMAND task_congestion_observation_test)
+
   add_executable(adaptive_congestion_control_test
                  ${WORKSPACE}/adaptive_congestion_control_test.cpp)
   target_link_libraries(
@@ -28,7 +41,23 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
                  ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
   target_link_libraries(adaptive_congestion_control_benchmark
                         PRIVATE adaptive_congestion_control_core)
+
+  add_executable(classic_rdma_congestion_control_test
+                 ${WORKSPACE}/classic_rdma_congestion_control_test.cpp)
+  target_link_libraries(classic_rdma_congestion_control_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  add_test(NAME classic_rdma_congestion_control_test
+           COMMAND classic_rdma_congestion_control_test)
 endif()
+
+configure_file(installed_congestion_control_header_test.cmake.in
+               installed_congestion_control_header_test.cmake @ONLY)
+add_test(
+  NAME installed_congestion_control_header_test
+  COMMAND
+    ${CMAKE_COMMAND} -DTRANSFER_ENGINE_LIBRARY=$<TARGET_FILE:transfer_engine>
+    -P
+    ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake)
 
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
@@ -60,12 +89,31 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# The timeout decision is stateful but independent of RDMA hardware; keep its
+# timing behavior covered by a deterministic unit test.
+add_executable(cq_timeout_diagnostic_test
+               ${WORKSPACE}/cq_timeout_diagnostic_test.cpp)
+target_include_directories(cq_timeout_diagnostic_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(cq_timeout_diagnostic_test PRIVATE gtest gtest_main)
+add_test(NAME cq_timeout_diagnostic_test COMMAND cq_timeout_diagnostic_test)
+
 # Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
 # the device's advertised limits; no RDMA device required.
 add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
 target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
                                                   gtest_main)
 add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
+
+add_executable(task_congestion_c_abi_test
+               ${CMAKE_CURRENT_SOURCE_DIR}/task_congestion_c_abi_test.c)
+target_include_directories(
+  task_congestion_c_abi_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+          ${CMAKE_BINARY_DIR}/mooncake-transfer-engine/include)
+target_link_libraries(task_congestion_c_abi_test PRIVATE transfer_engine)
+set_target_properties(task_congestion_c_abi_test PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME task_congestion_c_abi_test COMMAND task_congestion_c_abi_test)
 
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
@@ -76,6 +124,20 @@ target_include_directories(
 target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
 add_test(NAME flagcx_transport_internal_test
          COMMAND flagcx_transport_internal_test)
+
+if(WITH_METRICS)
+  add_executable(transfer_engine_metrics_test
+                 ${WORKSPACE}/transfer_engine_metrics_test.cpp)
+  target_link_libraries(transfer_engine_metrics_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+  add_test(NAME transfer_engine_metrics_test
+           COMMAND transfer_engine_metrics_test)
+
+  add_executable(metrics_exporter_test ${WORKSPACE}/metrics_exporter_test.cpp)
+  target_link_libraries(metrics_exporter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME metrics_exporter_test COMMAND metrics_exporter_test)
+endif()
 
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
@@ -114,6 +176,11 @@ target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Control GID I/O and port-state queries so event recovery can be exercised
   # without an RDMA device.
+  if(BUILD_SHARED_LIBS)
+    # --wrap only rewrites calls in objects linked into this executable.
+    target_sources(worker_pool_rail_state_test
+                   PRIVATE $<TARGET_OBJECTS:rdma_transport>)
+  endif()
   target_link_options(
     worker_pool_rail_state_test
     PRIVATE
@@ -233,6 +300,12 @@ if(USE_TCP)
 endif()
 
 if(USE_NVMEOF)
+  # cuFile entry points are faked by the executable; no GPU or SSD is needed.
+  add_executable(nvmeof_request_test ${WORKSPACE}/nvmeof_request_test.cpp)
+  target_link_libraries(nvmeof_request_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+  add_test(NAME nvmeof_request_test COMMAND nvmeof_request_test)
+
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
                                                   gtest_main)
@@ -267,6 +340,17 @@ if(USE_TCP)
     target_link_libraries(tcp_cuda_staging_test PUBLIC transfer_engine gtest
                                                        gtest_main CUDA::cudart)
     add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
+  endif()
+
+  if(USE_ASCEND
+     OR USE_ASCEND_DIRECT
+     OR USE_ASCEND_HETEROGENEOUS
+     OR USE_UBSHMEM)
+    add_executable(tcp_ascend_staging_test
+                   ${WORKSPACE}/tcp_ascend_staging_test.cpp)
+    target_link_libraries(tcp_ascend_staging_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+    add_test(NAME tcp_ascend_staging_test COMMAND tcp_ascend_staging_test)
   endif()
 endif()
 
@@ -366,6 +450,18 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
+
+  add_executable(hip_stream_pool_test ${WORKSPACE}/hip_stream_pool_test.cpp)
+  target_link_libraries(hip_stream_pool_test PUBLIC transfer_engine gtest
+                                                    gtest_main)
+  foreach(priority default high invalid)
+    add_test(NAME hip_stream_pool_${priority}_test
+             COMMAND ${CMAKE_COMMAND} -E env MC_HIP_STREAM_PRIORITY=${priority}
+                     $<TARGET_FILE:hip_stream_pool_test>)
+  endforeach()
+  add_test(NAME hip_stream_pool_unset_test
+           COMMAND ${CMAKE_COMMAND} -E env --unset=MC_HIP_STREAM_PRIORITY
+                   $<TARGET_FILE:hip_stream_pool_test>)
 endif()
 
 if(USE_UBSHMEM)
@@ -393,10 +489,9 @@ if(USE_EFA)
 
   add_executable(efa_stale_segment_desc_test
                  ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
-  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine gtest
-                                                           gtest_main)
-  add_test(NAME efa_stale_segment_desc_test
-           COMMAND efa_stale_segment_desc_test)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  add_test(NAME efa_stale_segment_desc_test COMMAND efa_stale_segment_desc_test)
 
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
@@ -411,6 +506,12 @@ if(USE_EFA)
   target_compile_options(
     efa_endpoint_handshake_test
     PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  # The test builds efa_endpoint.cpp against fake EFA headers and does not link
+  # transfer_engine, so it does not inherit the include path of the generated
+  # mooncake_te_build_config.h, which transport.h includes.
+  target_include_directories(
+    efa_endpoint_handshake_test
+    PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(
     efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
                                        gtest_main pthread)
@@ -556,6 +657,17 @@ target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 
+# Connection-lifecycle tests for the redis metadata storage plugin. Uses an
+# in-process RESP fake, so no redis server is required.
+if(USE_REDIS)
+  add_executable(transfer_metadata_redis_plugin_test
+                 ${WORKSPACE}/transfer_metadata_redis_plugin_test.cpp)
+  target_link_libraries(transfer_metadata_redis_plugin_test
+                        PUBLIC transfer_engine gtest glog::glog)
+  add_test(NAME transfer_metadata_redis_plugin_test
+           COMMAND transfer_metadata_redis_plugin_test)
+endif()
+
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
@@ -634,6 +746,16 @@ target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
 if(USE_ASCEND_DIRECT)
+  # ascend_allocator.so API: config provider precedence, runtime flags, host
+  # allocation/free, ASCEND_USE_SHMEM handle publication. ACL calls are mocked
+  # in the test file.
+  add_executable(ascend_allocator_test ${WORKSPACE}/ascend_allocator_test.cpp)
+  target_link_libraries(ascend_allocator_test PUBLIC ascend_allocator gtest
+                                                     gtest_main)
+  add_test(NAME ascend_allocator_test COMMAND ascend_allocator_test)
+endif()
+
+if(USE_ASCEND_DIRECT)
   # AscendDirectTransport unit test with mock implementations Mock
   # implementations are included in the test file via anonymous namespace
   add_executable(ascend_direct_transport_test
@@ -648,8 +770,8 @@ if(USE_ASCEND_DIRECT)
            COMMAND ascend_direct_transport_test)
 endif()
 
-# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
-if(ENABLE_MULTI_PROTOCOL)
+# This multi-protocol test directly uses CxlTransport and requires its backend.
+if(ENABLE_MULTI_PROTOCOL AND USE_CXL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main)

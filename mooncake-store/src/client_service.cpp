@@ -501,6 +501,9 @@ Client::~Client() {
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
     }
+    if (!gather_endpoint_.empty())
+        (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
+                                                   gather_endpoint_, true);
 
     leader_monitor_running_ = false;
     if (leader_monitor_thread_.joinable()) {
@@ -516,6 +519,10 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
+
+    // Unmount callbacks must finish before the service and sources are drained.
+    gather_service_.reset();
+    gather_clients_.clear();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -581,6 +588,13 @@ Client::~Client() {
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
+        // KVCS is represented by one Mooncake DFS descriptor. The adapter
+        // independently handles target placement and provider replicas, so a
+        // Mooncake replica count greater than one must not create a policy the
+        // single target descriptor cannot satisfy.
+        client_cfg.dfs_replica_num = 1;
+    }
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
@@ -1102,11 +1116,30 @@ ErrorCode Client::InitTransferEngine(
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxi") {
+            // Auto-discovery is RDMA-only, so populate the topology with the
+            // CXI NICs before installing the transport (an empty device list
+            // means "all NICs"); otherwise CxiTransport finds no devices.
+            std::vector<std::string> devices;
+            if (device_names.has_value() && !device_names->empty()) {
+                devices = ParseDeviceNames(device_names.value());
+            }
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete for CXI. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "cxi_transport_install_failed error_message=\""
                            << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXI transport";
+                return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
@@ -1615,6 +1648,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     if (err != ErrorCode::OK) {
+        if (err == ErrorCode::OBJECT_NOT_FOUND) {
+            ReconcileMissingKvcsReplica(object_key, query_result, replica);
+        }
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
     }
@@ -1757,6 +1793,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::unordered_map<std::string, TargetReadGroup> target_groups;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
+    std::vector<Replica::Descriptor> dfs_read_replicas;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1813,6 +1850,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             dfs_read_requests.push_back(
                 DfsReadRequest{key, desc, slices_it->second});
             dfs_read_indices.push_back(i);
+            dfs_read_replicas.push_back(replica);
             continue;
         } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
@@ -1920,6 +1958,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                             toString(dfs_results[i].error()));
                     }
                     results[index] = tl::unexpected(dfs_results[i].error());
+                    if (dfs_results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                        ReconcileMissingKvcsReplica(request.key,
+                                                    query_results[index],
+                                                    dfs_read_replicas[i]);
+                    }
                     continue;
                 }
                 // The I/O itself delivered these bytes, so they count even if
@@ -2125,19 +2168,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // Transfer data using allocated handles from all replicas
-            const auto replica_type = replica.is_memory_replica()
-                                          ? ReplicaType::MEMORY
-                                          : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err = TransferWrite(replica, slices);
-            if (transfer_err != ErrorCode::OK) {
-                transfer_summary.RecordFailure(replica_type, transfer_err);
-                continue;
-            }
-            transfer_summary.RecordSuccess(replica_type);
+    for (const auto& [replica_type, transfer_err] :
+         WriteMemoryAndNofReplicas(start_result.value(), slices)) {
+        if (transfer_err != ErrorCode::OK) {
+            transfer_summary.RecordFailure(replica_type, transfer_err);
+            continue;
         }
+        transfer_summary.RecordSuccess(replica_type);
     }
 
     if (transfer_summary.allocated_dfs_replicas > 0 &&
@@ -2181,7 +2218,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
@@ -2334,18 +2371,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Transfer to memory and NoF replicas first.
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            const auto replica_type = replica.is_memory_replica()
-                                          ? ReplicaType::MEMORY
-                                          : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err = TransferWrite(replica, slices);
-            if (transfer_err != ErrorCode::OK) {
-                transfer_summary.RecordFailure(replica_type, transfer_err);
-                continue;
-            }
-            transfer_summary.RecordSuccess(replica_type);
+    for (const auto& [replica_type, transfer_err] :
+         WriteMemoryAndNofReplicas(start_result.value(), slices)) {
+        if (transfer_err != ErrorCode::OK) {
+            transfer_summary.RecordFailure(replica_type, transfer_err);
+            continue;
         }
+        transfer_summary.RecordSuccess(replica_type);
     }
 
     if (transfer_summary.allocated_dfs_replicas > 0 &&
@@ -2388,7 +2420,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
@@ -2653,6 +2685,7 @@ void Client::healDanglingLocalDiskBatchStarts(
     }
     const auto retry_config =
         config.group_ids || config.session_ids ||
+                config.residency_affinity_ids ||
                 config.per_key_preferred_hca_names
             ? std::make_optional(config.ForKeySubset(retry_config_indices))
             : std::nullopt;
@@ -2728,6 +2761,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             AttachBatchHcaAffinity(base_config, ops, active_indices);
     } else if (active_indices.size() != ops.size() &&
                (base_config.group_ids || base_config.session_ids ||
+                base_config.residency_affinity_ids ||
                 base_config.per_key_preferred_hca_names)) {
         active_config = base_config.ForKeySubset(active_indices);
     }
@@ -2837,6 +2871,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
             AttachBatchHcaAffinity(base_config, ops, active_indices);
     } else if (active_indices.size() != ops.size() &&
                (base_config.group_ids || base_config.session_ids ||
+                base_config.residency_affinity_ids ||
                 base_config.per_key_preferred_hca_names)) {
         active_config = base_config.ForKeySubset(active_indices);
     }
@@ -3793,10 +3828,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
+        auto results = BatchRemove({key}, force);
+        if (results.size() != 1)
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return std::move(results.front());
+    }
+
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
-
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -3807,12 +3848,15 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
-
     return {};
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    // KVCS has no provider-side key listing or conditional bulk delete yet.
+    // Removing only Master metadata would skip provider cleanup.
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3832,6 +3876,8 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3853,18 +3899,35 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
 
     auto results = master_client_.BatchRemove(keys, force);
 
-    if (hot_cache_) {
-        std::vector<std::string> removed_keys;
-        removed_keys.reserve(std::min(keys.size(), results.size()));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (i < results.size() && results[i].has_value()) {
-                removed_keys.emplace_back(keys[i]);
-            }
-        }
-        if (!removed_keys.empty()) {
-            hot_cache_->RemoveHotKeys(removed_keys);
+    const size_t result_count = std::min(keys.size(), results.size());
+    std::vector<std::string> removed_keys;
+    std::vector<size_t> removed_indices;
+    removed_keys.reserve(result_count);
+    removed_indices.reserve(result_count);
+    for (size_t i = 0; i < result_count; ++i) {
+        if (results[i]) {
+            removed_keys.emplace_back(keys[i]);
+            removed_indices.push_back(i);
         }
     }
+
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
+        !removed_keys.empty()) {
+        const auto deleted =
+            dfs_storage_backend_->BatchDeleteObjects(removed_keys);
+        if (deleted.size() != removed_keys.size()) {
+            for (size_t index : removed_indices) {
+                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } else {
+            for (size_t i = 0; i < deleted.size(); ++i) {
+                if (!deleted[i]) results[removed_indices[i]] = deleted[i];
+            }
+        }
+    }
+
+    if (hot_cache_ && !removed_keys.empty())
+        hot_cache_->RemoveHotKeys(removed_keys);
 
     return results;
 }
@@ -3931,6 +3994,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
+    if (gather_service_)
+        gather_service_->removeSource(reinterpret_cast<void*>(it->second.base));
     int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(it->second.base));
     if (rc != 0) {
@@ -4022,9 +4087,36 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
+        // Only CPU memory on classic RDMA owners enables gather.
+        // Service setup failure leaves the existing direct path available.
+        if (SupportsGatherRead() && protocol == "rdma" &&
+            !device::GetAcceleratorRegistry()
+                 .RuntimeAccelerators()
+                 .FindDeviceForPointer(buffer)) {
+            try {
+                if (!gather_service_) {
+                    auto service = std::make_unique<store::GatherReadService>(
+                        transfer_engine_, store::GatherReadOptions{},
+                        GetSegmentEndpoint());
+                    service->start("0.0.0.0");
+                    gather_endpoint_ = buildHostNameWithPort(
+                        getHostNameWithoutPort(
+                            transfer_engine_->getLocalIpAndPort()),
+                        service->port());
+                    gather_service_ = std::move(service);
+                    (void)master_client_.PublishGatherEndpoint(
+                        GetSegmentEndpoint(), gather_endpoint_);
+                }
+                gather_service_->addSource(const_cast<void*>(buffer), size);
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Store gather unavailable: " << e.what();
+            }
+        }
         auto mount_result = master_client_.MountSegment(segment);
         if (!mount_result) {
             ErrorCode err = mount_result.error();
+            if (gather_service_)
+                gather_service_->removeSource(const_cast<void*>(buffer));
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
             return tl::unexpected(err);
@@ -4119,6 +4211,9 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
             std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
             auto it = gracefully_unmounting_segments_.find(segment_id);
             if (it != gracefully_unmounting_segments_.end()) {
+                if (gather_service_)
+                    gather_service_->removeSource(
+                        reinterpret_cast<void*>(it->second.base));
                 int rc = transfer_engine_->unregisterLocalMemory(
                     reinterpret_cast<void*>(it->second.base));
                 if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
@@ -4400,6 +4495,12 @@ void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
+}
+
+bool Client::CanReadDfsReplicaIntoHostMemory(
+    const Replica::Descriptor& replica) const {
+    return replica.is_dfs_replica() && dfs_storage_backend_ &&
+           dfs_storage_backend_->SupportsArbitraryHostReadBuffers();
 }
 
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
@@ -4828,13 +4929,12 @@ void Client::PutToLocalFile(const std::string& key,
     });
 }
 
-ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code,
-                               TransferIntent intent) {
+tl::expected<TransferFuture, ErrorCode> Client::SubmitSingleTransfer(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    TransferRequest::OpCode op_code, TransferIntent intent) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::optional<TransferFuture> future;
@@ -4842,7 +4942,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
-            return ErrorCode::INVALID_PARAMS;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         future = transfer_submitter_->submit(replica_descriptor, slices,
                                              op_code, contiguous_range->ptr,
@@ -4853,11 +4953,23 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
-        return ErrorCode::TRANSFER_FAIL;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
+    return std::move(*future);
+}
+
+ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
+                               std::vector<Slice>& slices,
+                               TransferRequest::OpCode op_code,
+                               TransferIntent intent) {
+    auto future =
+        SubmitSingleTransfer(replica_descriptor, slices, op_code, intent);
+    if (!future) {
+        return future.error();
+    }
     return future->get();
 }
 
@@ -5137,6 +5249,31 @@ ErrorCode Client::TransferReadInternal(
     return future->get();
 }
 
+std::vector<std::pair<ReplicaType, ErrorCode>>
+Client::WriteMemoryAndNofReplicas(
+    const std::vector<Replica::Descriptor>& replicas,
+    std::vector<Slice>& slices) {
+    // Submit all before waiting, as BatchPut does, so the writes overlap.
+    std::vector<std::pair<ReplicaType, tl::expected<TransferFuture, ErrorCode>>>
+        pending;
+    pending.reserve(replicas.size());
+    std::vector<std::pair<ReplicaType, ErrorCode>> results;
+    results.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            pending.emplace_back(
+                replica.is_memory_replica() ? ReplicaType::MEMORY
+                                            : ReplicaType::NOF_SSD,
+                SubmitSingleTransfer(replica, slices, TransferRequest::WRITE));
+        }
+    }
+    for (auto& [replica_type, future] : pending) {
+        results.emplace_back(replica_type,
+                             future ? future->get() : future.error());
+    }
+    return results;
+}
+
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 TransferIntent intent) {
@@ -5240,6 +5377,139 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
             << ", offset=" << desc.offset << ", size=" << desc.object_size
             << ", latency_us=" << read_latency_us;
     return ErrorCode::OK;
+}
+
+void Client::ReconcileMissingKvcsReplica(
+    const std::string& key, const QueryResult& query_result,
+    const Replica::Descriptor& replica_descriptor) {
+    if (!dfs_storage_backend_ || !dfs_storage_backend_->UsesKvcs() ||
+        !replica_descriptor.is_dfs_replica()) {
+        return;
+    }
+    if (!query_result.resolved_tenant_id.has_value()) {
+        LOG(WARNING) << "Cannot reconcile missing KVCS replica without "
+                        "resolved tenant, key="
+                     << key;
+        return;
+    }
+
+    auto evicted = master_client_.EvictDiskReplicaIfCurrent(
+        key, *query_result.resolved_tenant_id, ReplicaType::DFS,
+        replica_descriptor.id);
+    if (!evicted) {
+        LOG(WARNING) << "Failed to reconcile missing KVCS replica, key=" << key
+                     << ", replica_id=" << replica_descriptor.id
+                     << ", error=" << toString(evicted.error());
+    } else if (!*evicted) {
+        VLOG(1) << "KVCS replica was replaced before miss reconciliation, key="
+                << key << ", replica_id=" << replica_descriptor.id;
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchReadFileReplicaRanges(
+    const std::vector<std::string>& keys,
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<Slice>& windows,
+    const std::vector<uint64_t>& value_offsets) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != replicas.size() || keys.size() != windows.size() ||
+        keys.size() != value_offsets.size()) {
+        LOG(ERROR) << "BatchReadFileReplicaRanges size mismatch";
+        return results;
+    }
+
+    std::vector<DfsReadRequest> dfs_requests;
+    std::vector<size_t> dfs_indexes;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (windows[i].size >
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            continue;
+        }
+        if (replicas[i].is_disk_replica()) {
+            if (!storage_backend_) {
+                LOG(ERROR) << "Storage backend is not initialized";
+                results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                continue;
+            }
+            if (value_offsets[i] >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                continue;
+            }
+            std::vector<Slice> slices{windows[i]};
+            auto loaded = storage_backend_->LoadObject(
+                replicas[i].get_disk_descriptor().file_path, slices,
+                static_cast<int64_t>(windows[i].size),
+                static_cast<int64_t>(value_offsets[i]));
+            results[i] = loaded ? tl::expected<void, ErrorCode>{}
+                                : tl::unexpected(loaded.error());
+            continue;
+        }
+        if (!replicas[i].is_dfs_replica()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        if (!dfs_storage_backend_) {
+            LOG(ERROR) << "DFS backend is not initialized";
+            results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            if (auto* dfs_metric = GetDfsMetricPtr()) {
+                dfs_metric->RecordReadErrors(
+                    toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+            }
+            continue;
+        }
+        dfs_requests.push_back(DfsReadRequest{keys[i],
+                                              replicas[i].get_dfs_descriptor(),
+                                              {windows[i]},
+                                              value_offsets[i],
+                                              true});
+        dfs_indexes.push_back(i);
+        results[i] = {};
+    }
+
+    if (dfs_requests.empty()) return results;
+
+    // Same counters as Get/BatchGet. Bytes are the window that was read,
+    // not the full object: a layer transfers only that window.
+    auto* dfs_metric = GetDfsMetricPtr();
+    const auto dfs_read_start = std::chrono::steady_clock::now();
+    auto dfs_results = dfs_storage_backend_->BatchRead(dfs_requests);
+    const auto dfs_read_latency_us = elapsed_us_since(dfs_read_start);
+    if (dfs_results.size() != dfs_requests.size()) {
+        LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
+                   << dfs_requests.size() << ", got " << dfs_results.size();
+        for (size_t index : dfs_indexes) {
+            results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (dfs_metric) {
+            dfs_metric->RecordReadErrors(
+                toString(ErrorCode::INTERNAL_ERROR),
+                static_cast<int64_t>(dfs_indexes.size()));
+        }
+        return results;
+    }
+
+    int64_t dfs_success_keys = 0;
+    int64_t dfs_success_bytes = 0;
+    for (size_t j = 0; j < dfs_results.size(); ++j) {
+        const size_t index = dfs_indexes[j];
+        if (!dfs_results[j]) {
+            LOG(ERROR) << "DFS range read failed, action=range_read, key="
+                       << keys[index] << ", error=" << dfs_results[j].error();
+            results[index] = tl::unexpected(dfs_results[j].error());
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(toString(dfs_results[j].error()));
+            }
+            continue;
+        }
+        ++dfs_success_keys;
+        dfs_success_bytes += static_cast<int64_t>(windows[index].size);
+    }
+    if (dfs_metric && dfs_success_keys > 0) {
+        dfs_metric->ObserveRead(dfs_success_keys, dfs_success_bytes,
+                                dfs_read_latency_us);
+    }
+    return results;
 }
 
 ErrorCode Client::TransferReadRange(
@@ -5490,6 +5760,16 @@ void Client::StorageHeartbeatThreadMain() {
                                      [this] { return master_client_.Ping(); })
                                : master_client_.Ping();
         if (ping_result) {
+            // Ephemeral gather discovery survives Master restart/failover
+            // through the existing owner heartbeat, not snapshot metadata.
+            std::string gather_endpoint;
+            {
+                std::lock_guard lock(mounted_segments_mutex_);
+                gather_endpoint = gather_endpoint_;
+            }
+            if (!gather_endpoint.empty())
+                (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
+                                                           gather_endpoint);
             // Reset ping failure count
             ping_fail_count = 0;
             last_ping_success_.store(true);
@@ -5825,6 +6105,56 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
         }
     }
     return false;
+}
+
+std::optional<store::GatherReadOperation> Client::SubmitGatherRead(
+    const std::string& endpoint,
+    const std::vector<store::GatherReadRange>& ranges, void* destination,
+    size_t capacity) {
+    if (!SupportsGatherRead() || endpoint.empty()) return std::nullopt;
+    std::shared_ptr<GatherPeer> peer_ptr;
+    {
+        std::lock_guard lock(gather_clients_mutex_);
+        auto& slot = gather_clients_[endpoint];
+        if (!slot) slot = std::make_shared<GatherPeer>();
+        peer_ptr = slot;
+    }
+    auto& peer = *peer_ptr;
+    std::lock_guard lock(peer.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= peer.refresh_at) {
+        auto discovered = master_client_.ResolveGatherEndpoint(endpoint);
+        const std::string resolved = discovered ? *discovered : "";
+        if (resolved != peer.endpoint) peer.clients.clear();
+        peer.endpoint = resolved;
+        peer.refresh_at = now + std::chrono::seconds(resolved.empty() ? 5 : 30);
+    }
+    if (peer.endpoint.empty()) return std::nullopt;
+    auto& clients = peer.clients;
+    std::erase_if(clients,
+                  [](const auto& client) { return client->retired(); });
+    auto it =
+        std::find_if(clients.begin(), clients.end(),
+                     [](const auto& client) { return client->available(); });
+    if (it == clients.end()) {
+        if (clients.size() >= 64) return std::nullopt;
+        try {
+            clients.push_back(std::make_unique<store::GatherReadClient>(
+                transfer_engine_, peer.endpoint, std::chrono::seconds(60),
+                endpoint));
+        } catch (const std::exception& e) {
+            peer.refresh_at = now + std::chrono::seconds(5);
+            peer.endpoint.clear();
+            clients.clear();
+            LOG(WARNING) << "Store gather connection unavailable: " << e.what();
+            return std::nullopt;
+        }
+        it = std::prev(clients.end());
+    }
+    // The synchronous get_into_ranges caller owns the destination and its
+    // registration until all operations (including recovery fences) finish.
+    return (*it)->submitGatherRead(ranges, destination, capacity,
+                                   transfer_engine_);
 }
 
 }  // namespace mooncake

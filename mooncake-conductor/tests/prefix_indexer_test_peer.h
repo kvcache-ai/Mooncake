@@ -26,6 +26,8 @@ struct BlockPresenceSnapshot {
 struct ContextStateSnapshot {
     HashProfile profile;
     std::map<std::string, std::set<int64_t>> instance_ranks;
+    std::map<std::string, std::map<int64_t, common::PublisherKind>>
+        instance_publishers;
     std::unordered_map<ProjectedPrefix, BlockPresenceSnapshot> blocks;
 
     bool operator==(const ContextStateSnapshot&) const = default;
@@ -115,6 +117,7 @@ class PrefixCacheTableTestPeer {
             ContextStateSnapshot state_snapshot;
             state_snapshot.profile = state->profile;
             state_snapshot.instance_ranks = state->instance_ranks;
+            state_snapshot.instance_publishers = state->instance_publishers;
             for (const auto& [prefix, presence] : state->blocks) {
                 state_snapshot.blocks.emplace(
                     prefix, BlockPresenceSnapshot{presence.device_owners,

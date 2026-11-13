@@ -13,6 +13,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <optional>
 #include <string>
@@ -938,6 +939,90 @@ class RouterEventPublisher {
     uint64_t sequence_ = 0;
 };
 
+void PublishVllmCpu(RouterEventPublisher& publisher, uint64_t hash,
+                    bool removed = false) {
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_array(3);
+    packer.pack(1.25);
+    packer.pack_array(1);
+    packer.pack_map(removed ? 3 : 8);
+    packer.pack("type");
+    packer.pack(removed ? "BlockRemoved" : "BlockStored");
+    packer.pack("block_hashes");
+    packer.pack(std::vector<uint64_t>{hash});
+    packer.pack("medium");
+    packer.pack("CPU");
+    if (!removed) {
+        packer.pack("parent_block_hash");
+        packer.pack_nil();
+        packer.pack("token_ids");
+        packer.pack_nil();
+        packer.pack("block_size");
+        packer.pack(16);
+        packer.pack("lora_id");
+        packer.pack_nil();
+        packer.pack("lora_name");
+        packer.pack_nil();
+    }
+    packer.pack(0);
+    publisher.Publish(std::string(buffer.data(), buffer.size()));
+}
+
+void PublishMooncakeCpu(RouterEventPublisher& publisher, uint64_t hash,
+                        bool removed = false) {
+    constexpr int64_t timestamp = 1700000000123;
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_array(3);
+    packer.pack(timestamp);
+    packer.pack_array(1);
+    packer.pack_map(removed ? 16 : 18);
+    packer.pack("event_type");
+    packer.pack(removed ? "removed" : "stored");
+    packer.pack("event_id");
+    packer.pack(1);
+    packer.pack("timestamp");
+    packer.pack(timestamp);
+    packer.pack("model_name");
+    packer.pack(E2EContext().model_name);
+    packer.pack("block_size");
+    packer.pack(E2EContext().block_size);
+    packer.pack("additional_salt");
+    packer.pack_nil();
+    packer.pack("lora_name");
+    packer.pack_nil();
+    packer.pack("tenant_id");
+    packer.pack(E2EContext().tenant_id);
+    packer.pack("backend_id");
+    packer.pack("e2e-backend");
+    packer.pack("medium");
+    packer.pack("CPU");
+    packer.pack("dp_rank");
+    packer.pack(0);
+    packer.pack("group_id");
+    packer.pack_nil();
+    packer.pack("seq_hashes");
+    packer.pack(std::vector<uint64_t>{hash});
+    packer.pack("base_block_idx");
+    packer.pack_nil();
+    packer.pack("object_key");
+    packer.pack("e2e-object");
+    char low64[17];
+    std::snprintf(low64, sizeof(low64), "%016llx",
+                  static_cast<unsigned long long>(hash));
+    packer.pack("connector_block_hash");
+    packer.pack(std::string(48, '0') + low64);
+    if (!removed) {
+        packer.pack("parent_hash");
+        packer.pack_nil();
+        packer.pack("token_ids");
+        packer.pack_nil();
+    }
+    packer.pack(0);
+    publisher.Publish(std::string(buffer.data(), buffer.size()));
+}
+
 enum class QueryProtocol { kHttp, kRpc };
 
 class RouterQueryTest : public ::testing::TestWithParam<QueryProtocol> {
@@ -1178,6 +1263,87 @@ TEST_P(RouterQueryTest, FallsBackOnMissAndQueryFailure) {
     manager_.Stop();
     EXPECT_FALSE(Query(request_).has_value());
     ASSERT_NO_FATAL_FAILURE(ExpectRoute(0, RouteReason::kQueryFailed));
+}
+
+TEST(ClientServerE2ETest, VllmCpuLocalYieldsToMooncakeAcrossPublicQueries) {
+    RouterEventPublisher a;
+    RouterEventPublisher b;
+    RouterEventPublisher pool;
+    EventManager manager({}, 0, kRpcPort);
+    ASSERT_TRUE(manager.StartHTTPServer());
+    ASSERT_TRUE(manager.StartRPCServer());
+    manager.Start();
+    const uint16_t http_port = EventManagerTestPeer::HttpPort(manager);
+    ConductorClient client;
+    ASSERT_NO_FATAL_FAILURE(
+        SetupWithRetry(client, "127.0.0.1:" + std::to_string(kRpcPort)));
+    auto engine_a = E2EService("engine-a", a.Endpoint());
+    auto engine_b = E2EService("engine-b", b.Endpoint());
+    auto shared_pool = E2EService("shared-pool", pool.Endpoint());
+    shared_pool.publisher_kind = common::PublisherKind::kMooncake;
+    ASSERT_TRUE(client.Register(engine_a).has_value());
+    ASSERT_TRUE(a.WaitForSubscriber());
+    ASSERT_TRUE(client.Register(engine_b).has_value());
+    ASSERT_TRUE(b.WaitForSubscriber());
+    ASSERT_TRUE(client.Register(shared_pool).has_value());
+    ASSERT_TRUE(pool.WaitForSubscriber());
+
+    QueryRequest request{.context = E2EContext(), .token_ids = Sequence(1, 16)};
+    const auto hashes =
+        ProjectedFor(request.context, E2EProfile(), request.token_ids);
+    ASSERT_EQ(hashes.size(), 1u);
+    coro_http::coro_http_client http;
+    auto query =
+        [&](const QueryRequest& requested) -> std::optional<Json::Value> {
+        const auto rpc = client.Query(requested);
+        if (!rpc) return std::nullopt;
+        return QueryResultToJson(*rpc)["instances"];
+    };
+    auto wait_for = [&](int64_t local_b, int64_t shared_a,
+                        int64_t shared_b) -> ::testing::AssertionResult {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        Json::Value last_rpc;
+        Json::Value last_http;
+        do {
+            const auto result = query(request);
+            if (result) last_rpc = *result;
+            const auto response =
+                HttpPost(http, http_port, "/query", QueryMsgpackBody(request));
+            if (response.status == 200) {
+                last_http = DecodeMsgpackBody(response.body)["instances"];
+            }
+            if (result && last_rpc == last_http &&
+                last_rpc["engine-b"]["cpu_local"].asInt64() == local_b &&
+                last_rpc["engine-a"]["cpu_share"].asInt64() == shared_a &&
+                last_rpc["engine-b"]["cpu_share"].asInt64() == shared_b) {
+                return ::testing::AssertionSuccess();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return ::testing::AssertionFailure()
+               << "query state did not converge: rpc=" << last_rpc
+               << " http=" << last_http;
+    };
+    std::array<MockBackend, 2> backends{
+        {{"engine-a", 0, {}}, {"engine-b", 0, {}}}};
+    MockRouter router(query, backends);
+
+    PublishVllmCpu(b, hashes[0].value);
+    ASSERT_TRUE(wait_for(16, 0, 16));
+    EXPECT_EQ(router.Route(request).backend, 1u);
+    PublishMooncakeCpu(pool, hashes[0].value);
+    ASSERT_TRUE(wait_for(0, 16, 16));
+    EXPECT_EQ(router.Route(request).backend, 0u);
+    PublishMooncakeCpu(pool, hashes[0].value, true);
+    ASSERT_TRUE(wait_for(0, 0, 0));
+    EXPECT_EQ(router.Route(request).reason, RouteReason::kMiss);
+    PublishVllmCpu(b, hashes[0].value);
+    ASSERT_TRUE(wait_for(16, 0, 16));
+    EXPECT_EQ(router.Route(request).backend, 1u);
+
+    client.Close();
+    manager.Stop();
 }
 
 INSTANTIATE_TEST_SUITE_P(

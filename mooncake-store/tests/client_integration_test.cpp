@@ -2,7 +2,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstdint>
@@ -107,14 +109,17 @@ TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
     auto decoded = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(legacy));
     ASSERT_TRUE(decoded);
+    EXPECT_FALSE(decoded->residency_affinity_ids);
     EXPECT_FALSE(decoded->preferred_hca_names);
     EXPECT_EQ(decoded->preferred_segments, legacy.preferred_segments);
     decoded->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
     decoded->group_ids = std::vector<std::string>{"a", "b"};
+    decoded->residency_affinity_ids = std::vector<std::string>{"u0", "u1"};
     auto current = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(*decoded));
     ASSERT_TRUE(current);
     EXPECT_EQ(current->preferred_hca_names, decoded->preferred_hca_names);
+    EXPECT_EQ(current->residency_affinity_ids, decoded->residency_affinity_ids);
     EXPECT_EQ(current->ForSingleKey(1).preferred_hca_names,
               decoded->preferred_hca_names);
     auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(
@@ -133,12 +138,14 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
         struct_pack::serialize(session_config));
     ASSERT_TRUE(current);
     EXPECT_EQ(current->session_ids, session_config.session_ids);
+    EXPECT_FALSE(current->residency_affinity_ids);
     EXPECT_FALSE(current->preferred_hca_names);
     EXPECT_FALSE(current->per_key_preferred_hca_names);
 
     current->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
     current->per_key_preferred_hca_names =
         std::vector<std::vector<std::string>>{{}, {"mlx5_1"}};
+    current->residency_affinity_ids = std::vector<std::string>{"u0", "u1"};
     auto session_reader = struct_pack::deserialize<SessionReplicateConfig>(
         struct_pack::serialize(*current));
     ASSERT_TRUE(session_reader);
@@ -148,6 +155,8 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
         struct_pack::serialize(*current));
     ASSERT_TRUE(affinity_reader);
     EXPECT_EQ(affinity_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(affinity_reader->residency_affinity_ids,
+              current->residency_affinity_ids);
     EXPECT_EQ(affinity_reader->preferred_hca_names,
               current->preferred_hca_names);
     EXPECT_EQ(affinity_reader->per_key_preferred_hca_names,
@@ -290,6 +299,7 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     ReplicateConfig config;
     config.group_ids = std::vector<std::string>{"g0", "g1", "g2"};
     config.session_ids = std::vector<std::string>{"s0", "s1", "s2"};
+    config.residency_affinity_ids = std::vector<std::string>{"u0", "u1", "u2"};
     config.per_key_preferred_hca_names =
         std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}, {}};
     EXPECT_TRUE(config.HasValidKeyHints(3));
@@ -299,6 +309,10 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     EXPECT_EQ(*subset.group_ids, (std::vector<std::string>{"g2", "g0"}));
     ASSERT_TRUE(subset.ValidSessionIds(2));
     EXPECT_EQ(*subset.session_ids, (std::vector<std::string>{"s2", "s0"}));
+    EXPECT_EQ(*subset.residency_affinity_ids,
+              (std::vector<std::string>{"u2", "u0"}));
+    EXPECT_EQ(*subset.ForSingleKey(0).residency_affinity_ids,
+              (std::vector<std::string>{"u2"}));
     EXPECT_EQ(subset.ForSingleKey(0).SessionId(), "s2");
     EXPECT_TRUE(subset.ForSingleKey(0).preferred_hca_names->empty());
     EXPECT_EQ(*subset.ForSingleKey(1).preferred_hca_names,
@@ -309,6 +323,9 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     for (size_t index : {1, 0, 1}) {
         key_config.SetKeyIds(subset, index);
         EXPECT_EQ(key_config.SessionId(), subset.session_ids->at(index));
+        EXPECT_EQ(*key_config.residency_affinity_ids,
+                  (std::vector<std::string>{
+                      subset.residency_affinity_ids->at(index)}));
         EXPECT_EQ(*key_config.group_ids,
                   (std::vector<std::string>{subset.group_ids->at(index)}));
         EXPECT_EQ(*key_config.preferred_hca_names,
@@ -322,10 +339,32 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     ASSERT_TRUE(restored);
     EXPECT_EQ(restored->per_key_preferred_hca_names,
               config.per_key_preferred_hca_names);
+    EXPECT_EQ(restored->residency_affinity_ids, config.residency_affinity_ids);
     auto legacy = struct_pack::deserialize<LegacyReplicateConfig>(
         struct_pack::serialize(config));
     ASSERT_TRUE(legacy);
     EXPECT_EQ(legacy->group_ids, config.group_ids);
+}
+
+TEST(HcaAffinityTest, ResidencyAffinityPreservesEmptyAndAbsentValues) {
+    ReplicateConfig config;
+    EXPECT_FALSE(config.residency_affinity_ids);
+    EXPECT_TRUE(config.HasValidKeyHints(1));
+    EXPECT_FALSE(config.ForSingleKey(0).residency_affinity_ids);
+    config.residency_affinity_ids = std::vector<std::string>{};
+    EXPECT_TRUE(config.HasValidKeyHints(0));
+    EXPECT_FALSE(config.HasValidKeyHints(1));
+    auto empty = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(empty);
+    ASSERT_TRUE(empty->residency_affinity_ids);
+    EXPECT_TRUE(empty->residency_affinity_ids->empty());
+    EXPECT_TRUE(empty->ForKeySubset({}).residency_affinity_ids.has_value());
+    config.residency_affinity_ids.reset();
+    auto absent = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(absent);
+    EXPECT_FALSE(absent->residency_affinity_ids);
 }
 
 TEST(ReadAffinityTest,
@@ -747,6 +786,91 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
 
+constexpr size_t kReplicaCheckSize = 256 * 1024;
+
+void FillReplicaCheckPattern(void* buffer, char seed) {
+    for (size_t i = 0; i < kReplicaCheckSize; ++i) {
+        static_cast<char*>(buffer)[i] = static_cast<char>(i * 31 + seed);
+    }
+}
+
+// Reads each replica of the key on its own and compares it with expected.
+void ExpectEveryReplicaHolds(Client& client, SimpleAllocator& allocator,
+                             const std::string& key, const void* expected,
+                             size_t expected_replicas) {
+    auto query_result = client.Query(key);
+    ASSERT_TRUE(query_result.has_value());
+    ASSERT_EQ(query_result->replicas.size(), expected_replicas);
+    void* buffer = allocator.allocate(kReplicaCheckSize);
+    ASSERT_NE(buffer, nullptr);
+    for (const auto& replica : query_result->replicas) {
+        ASSERT_TRUE(replica.is_memory_replica());
+        memset(buffer, 0, kReplicaCheckSize);
+        QueryResult one_replica({replica}, query_result->lease_timeout,
+                                query_result->object_checksum);
+        std::vector<Slice> slices{Slice{buffer, kReplicaCheckSize}};
+        auto get_result = client.Get(key, one_replica, slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get failed: " << toString(get_result.error());
+        const char* got = static_cast<const char*>(buffer);
+        const char* want = static_cast<const char*>(expected);
+        auto [got_end, want_end] =
+            std::mismatch(got, got + kReplicaCheckSize, want);
+        EXPECT_EQ(got_end, got + kReplicaCheckSize)
+            << "replica " << replica.id << " differs at offset "
+            << (got_end - got);
+    }
+    allocator.deallocate(buffer, kReplicaCheckSize);
+}
+
+// Keys stay unique when the suite is repeated in one process.
+std::string UniqueReplicaCheckKey(const std::string& prefix) {
+    static std::atomic<int> counter{0};
+    return prefix + "_" + std::to_string(counter++);
+}
+
+TEST_F(ClientIntegrationTest, PutWritesEveryMemoryReplica) {
+    // The allocator places the two replicas on the two mounted segments.
+    const std::string key = UniqueReplicaCheckKey("put_every_replica");
+    void* buffer = client_buffer_allocator_->allocate(kReplicaCheckSize);
+    ASSERT_NE(buffer, nullptr);
+    FillReplicaCheckPattern(buffer, 7);
+    std::vector<Slice> slices{Slice{buffer, kReplicaCheckSize}};
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << toString(put_result.error());
+    ExpectEveryReplicaHolds(*test_client_, *client_buffer_allocator_, key,
+                            buffer, 2);
+    client_buffer_allocator_->deallocate(buffer, kReplicaCheckSize);
+}
+
+TEST_F(ClientIntegrationTest, UpsertSameSizeWritesEveryMemoryReplica) {
+    const std::string key = UniqueReplicaCheckKey("upsert_every_replica");
+    void* buffer = client_buffer_allocator_->allocate(kReplicaCheckSize);
+    ASSERT_NE(buffer, nullptr);
+    FillReplicaCheckPattern(buffer, 7);
+    std::vector<Slice> slices{Slice{buffer, kReplicaCheckSize}};
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << toString(put_result.error());
+
+    // Wait for the lease so the same-size Upsert rewrites both replicas in
+    // place.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    FillReplicaCheckPattern(buffer, 91);
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert failed: " << toString(upsert_result.error());
+    ExpectEveryReplicaHolds(*test_client_, *client_buffer_allocator_, key,
+                            buffer, 2);
+    client_buffer_allocator_->deallocate(buffer, kReplicaCheckSize);
+}
+
 TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
     if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
@@ -879,6 +1003,64 @@ TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
         }
     }
     client_buffer_allocator_->deallocate(buffer, 4);
+}
+
+TEST_F(ClientIntegrationTest, AffinityOnlyBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "affinity-invalid-slice",
+            upsert ? "affinity-filtered-upsert" : "affinity-filtered-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.residency_affinity_ids =
+            std::vector<std::string>{"invalid-affinity", "valid-affinity"};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(results[1]) << (upsert ? "BatchUpsert" : "BatchPut");
+        if (!results[1]) continue;
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
+}
+
+TEST_F(ClientIntegrationTest, ResidencyAffinityRejectsMutationAndEmptyValue) {
+    constexpr size_t value_size = 4;
+    void* buffer = client_buffer_allocator_->allocate(value_size);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", value_size);
+    std::vector<Slice> slices{{buffer, value_size}};
+
+    ReplicateConfig initial;
+    initial.residency_affinity_ids = std::vector<std::string>{"affinity-a"};
+    ASSERT_TRUE(test_client_->Put("residency-affinity-wire", slices, initial));
+
+    ReplicateConfig changed = initial;
+    changed.residency_affinity_ids = std::vector<std::string>{"affinity-b"};
+    auto upsert =
+        test_client_->Upsert("residency-affinity-wire", slices, changed);
+    ASSERT_FALSE(upsert);
+    EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicateConfig empty;
+    empty.residency_affinity_ids = std::vector<std::string>{};
+    auto empty_put =
+        test_client_->Put("residency-affinity-empty", slices, empty);
+    ASSERT_FALSE(empty_put);
+    EXPECT_EQ(empty_put.error(), ErrorCode::INVALID_PARAMS);
+
+    client_buffer_allocator_->deallocate(buffer, value_size);
 }
 
 // Test Remove operation

@@ -2,11 +2,11 @@
 
 The source code path for Ascend Transport is `Mooncake/mooncake-transfer-engine/src/transport/ascend_transport`, which also includes automated build scripts and the README file.
 
-**ASCEND TRANSPORT is scheduled for deprecation, please use [ASCEND DIRECT TRANSPORT](./ascend_direct_transport.md) on ASCEND platform. **
+**ASCEND TRANSPORT (HCCL) is deprecated and is no longer built: the `hccl_transport` sources remain in the tree as dead code. `USE_ASCEND` now selects the [ASCEND DIRECT TRANSPORT](./ascend_direct_transport.md) on the Ascend platform. **
 
 ## Overview
 
-Ascend Transport is a high-performance zero-copy NPU data transfer library with one-sided semantics, directly compatible with Mooncake Transfer Engine. To compile and use the Ascend Transport library, please set the `USE_ASCEND` flag to `"ON"` in the `mooncake-common/common.cmake` file.
+Ascend Transport is a high-performance zero-copy NPU data transfer library with one-sided semantics, directly compatible with Mooncake Transfer Engine. The HCCL library described by this page is no longer compiled; building with the `USE_ASCEND` flag in `mooncake-common/common.cmake` produces the Ascend Direct Transport instead.
 
 Ascend Transport supports inter-NPU data transfer using one-sided semantics (currently supports Device to Device; other modes are under development). Users only need to specify the node and memory information at both ends through the Mooncake Transfer Engine interface to achieve high-performance point-to-point data transfer. Ascend Transport abstracts away internal complexities and automatically handles operations such as establishing connections, registering and exchanging memory, and checking transfer status.
 

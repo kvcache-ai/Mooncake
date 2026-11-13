@@ -5,7 +5,18 @@ stale line from a previous round fails the exact comparison below.
 
     python python/tests/ep/test_mooncake_ep_xpu.py --num-ranks 4
 
-MOONCAKE_EP_TEST_DEVICES (e.g. "0,1,2,3") picks the XPU of each rank.
+Across nodes, launch it with torchrun on every node; --num-ranks is then
+ignored and the ranks come from the environment:
+
+    torchrun --nnodes 2 --nproc-per-node 4 --node-rank <0|1> \
+        --master-addr <node 0> --master-port 29500 \
+        python/tests/ep/test_mooncake_ep_xpu.py
+
+Ranks on the same node are reached over Level Zero IPC, ranks on other nodes
+over RDMA. MC_EP_RANKS_PER_NODE=n splits one host into nodes of n ranks, so
+the RDMA path can be tested without a second host.
+
+MOONCAKE_EP_TEST_DEVICES (e.g. "0,1,2,3") picks the XPU of each local rank.
 """
 
 import argparse
@@ -487,9 +498,9 @@ def check_dead_rank(buffer, group, rank, world, args):
     torch.testing.assert_close(combined.float(), ref, rtol=2e-2, atol=2e-2)
 
 
-def worker(local_rank, world, args, port):
+def worker(local_rank, world, args, port, rank=None):
     try:
-        _worker(local_rank, world, args, port)
+        _worker(local_rank if rank is None else rank, local_rank, world, args, port)
     except BaseException:
         # A peer still inside a receive kernel would block mp.spawn's join, so
         # report the failure here rather than after it.
@@ -500,16 +511,17 @@ def worker(local_rank, world, args, port):
         os._exit(1)
 
 
-def _worker(local_rank, world, args, port):
+def _worker(rank, local_rank, world, args, port):
     torch.xpu.set_device(_device_for(local_rank))
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("xccl", rank=local_rank, world_size=world)
+    if port is not None:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("xccl", rank=rank, world_size=world)
     group = dist.new_group(list(range(world)))
     global _CPU_GROUP
     _CPU_GROUP = dist.new_group(list(range(world)), backend="gloo")
-    random.seed(1234 + local_rank)
-    torch.manual_seed(1234 + local_rank)
+    random.seed(1234 + rank)
+    torch.manual_seed(1234 + rank)
 
     from mooncake.mooncake_ep_buffer import Buffer
 
@@ -528,9 +540,9 @@ def _worker(local_rank, world, args, port):
         hook_mode = bool((i // 2) % 2)
         with_weights = bool((i // 4) % 2)
         check_round(
-            buffer, group, local_rank, world, args, n, use_fp8, hook_mode, with_weights
+            buffer, group, rank, world, args, n, use_fp8, hook_mode, with_weights
         )
-        if local_rank == 0:
+        if rank == 0:
             print(
                 f"round {i}: tokens={n} fp8={use_fp8} hook={hook_mode} "
                 f"weights_at_dispatch={with_weights} ok",
@@ -540,28 +552,26 @@ def _worker(local_rank, world, args, port):
     # part in the pre-reduced combine like its peers. A few tokens elsewhere
     # suffice and keep the CPU reference check fast at 8 ranks.
     for empty_rank, use_fp8, hook_mode in ((0, False, False), (world - 1, True, True)):
-        n = 0 if local_rank == empty_rank else max(1, args.max_tokens // 8)
-        check_round(buffer, group, local_rank, world, args, n, use_fp8, hook_mode, True)
+        n = 0 if rank == empty_rank else max(1, args.max_tokens // 8)
+        check_round(buffer, group, rank, world, args, n, use_fp8, hook_mode, True)
     for _ in range(4):
-        check_two_batch_overlap(buffer, group, local_rank, world, args)
-    check_duplicate_experts(buffer, group, local_rank, world, args, False)
-    check_duplicate_experts(buffer, group, local_rank, world, args, True)
-    check_reused_src_info(buffer, group, local_rank, world, args)
-    check_unknown_handle(buffer, group, local_rank, world, args)
-    check_cross_stream(buffer, group, local_rank, world, args)
-    check_fast_path_agreement(buffer, group, local_rank, world, args)
-    check_round(
-        buffer, group, local_rank, world, args, args.max_tokens, False, False, True
-    )
+        check_two_batch_overlap(buffer, group, rank, world, args)
+    check_duplicate_experts(buffer, group, rank, world, args, False)
+    check_duplicate_experts(buffer, group, rank, world, args, True)
+    check_reused_src_info(buffer, group, rank, world, args)
+    check_unknown_handle(buffer, group, rank, world, args)
+    check_cross_stream(buffer, group, rank, world, args)
+    check_fast_path_agreement(buffer, group, rank, world, args)
+    check_round(buffer, group, rank, world, args, args.max_tokens, False, False, True)
     if world > 2:
-        check_dead_rank(buffer, group, local_rank, world, args)
+        check_dead_rank(buffer, group, rank, world, args)
     # Free the buffer only once no peer can still be reading from it.
     torch.xpu.synchronize()
     dist.barrier(_CPU_GROUP)
     del buffer
     torch.xpu.synchronize()
     dist.barrier(_CPU_GROUP)
-    if local_rank == 0:
+    if rank == 0:
         print(
             f"PASSED: {len(token_counts)} rounds + 2 empty-rank rounds"
             " + 4 two-batch rounds + duplicate experts"
@@ -589,6 +599,17 @@ def main():
         help="give the dead-rank check's dispatch its top-k weights",
     )
     args = p.parse_args()
+    if "RANK" in os.environ and "LOCAL_RANK" in os.environ:
+        # Launched by torchrun: one process per rank, possibly across nodes;
+        # MASTER_ADDR and MASTER_PORT come from the environment.
+        worker(
+            int(os.environ["LOCAL_RANK"]),
+            int(os.environ["WORLD_SIZE"]),
+            args,
+            None,
+            rank=int(os.environ["RANK"]),
+        )
+        return
     port = 29500 + random.randint(0, 1000)
     mp.spawn(worker, args=(args.num_ranks, args, port), nprocs=args.num_ranks)
 

@@ -18,6 +18,9 @@ namespace mooncake {
  */
 class EtcdHelper {
    public:
+    // Configure before the first store connection; resets reuse this limit.
+    static ErrorCode SetMaxSendMessageBytes(int32_t max_bytes);
+
     /*
      * @brief Connect to the etcd store client. There is a global etcd client in
      * libetcd. It is used for all the etcd operations for mooncake-store. This

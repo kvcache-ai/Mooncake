@@ -110,9 +110,18 @@ XpuIpcBuffer::XpuIpcBuffer(sycl::queue& queue, size_t bytes, int rank,
     // block at an offset the importer cannot recover. Peers write into this
     // memory over PCIe, which must not land on a compressed surface, so ask
     // for it uncompressed rather than relying on the driver-wide
-    // RenderCompressedBuffersEnabled=0.
+    // RenderCompressedBuffersEnabled=0. With the verbs path built, a NIC
+    // also reads and writes it, through a dma-buf export.
+#if MOONCAKE_EP_XPU_RDMA
+    ze_external_memory_export_desc_t dmabuf{
+        ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC, nullptr,
+        ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF};
+    void* const export_next = &dmabuf;
+#else
+    void* const export_next = nullptr;
+#endif
     ze_memory_compression_hints_ext_desc_t uncompressed{
-        ZE_STRUCTURE_TYPE_MEMORY_COMPRESSION_HINTS_EXT_DESC, nullptr,
+        ZE_STRUCTURE_TYPE_MEMORY_COMPRESSION_HINTS_EXT_DESC, export_next,
         ZE_MEMORY_COMPRESSION_HINTS_EXT_FLAG_UNCOMPRESSED};
     ze_device_mem_alloc_desc_t desc{ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC,
                                     &uncompressed, 0, 0};

@@ -28,6 +28,13 @@
 #include "xpu_ep_common.h"
 #include "xpu_ep_kernels.h"
 #include "xpu_ipc.h"
+// Set by the build when rdma-core has ibv_reg_dmabuf_mr.
+#ifndef MOONCAKE_EP_XPU_RDMA
+#define MOONCAKE_EP_XPU_RDMA 0
+#endif
+#if MOONCAKE_EP_XPU_RDMA
+#include "xpu_ep_proxy.h"
+#endif
 
 namespace mooncake {
 namespace xpu_ep {
@@ -45,10 +52,12 @@ class XpuEventHandle {
     sycl::event event_;
 };
 
-// Intel XPU implementation of the native Mooncake EP Buffer for ranks on one
-// node. It exposes the same methods as the CUDA MooncakeEpBuffer so that
-// mooncake_ep_buffer.Buffer drives both; there is no RDMA path, so
-// ibgda_disabled() is always true and peers are reached over Level Zero IPC.
+// Intel XPU implementation of the native Mooncake EP Buffer. It exposes the
+// same methods as the CUDA MooncakeEpBuffer so that mooncake_ep_buffer.Buffer
+// drives both. Peers on the node are reached over Level Zero IPC; ranks on
+// other nodes, when built with the verbs path, through a host proxy's RDMA
+// writes (the hybrid path). There is no IBGDA, so ibgda_disabled() is always
+// true.
 class MooncakeEpXpuBuffer {
    public:
     using Hook = std::optional<std::function<void()>>;
@@ -62,6 +71,17 @@ class MooncakeEpXpuBuffer {
     bool p2p_enabled() const { return p2p_enabled_; }
     bool is_roce() const { return false; }
     bool use_fast_path() const;
+
+    // The hybrid path. init_rdma registers the buffer with the nearest NIC
+    // and creates a queue pair for each rank r with remote[r] set (ranks on
+    // other nodes), returning what peers need to connect to it; connect_rdma
+    // connects to the active ones from every rank's init_rdma result. Both
+    // come before sync_nvlink_ipc_handles, which then leaves remote ranks
+    // unmapped. Every rank must end up with the same ranks connected or none.
+    static bool rdma_available();
+    std::vector<int32_t> init_rdma(const std::vector<int>& remote);
+    void connect_rdma(const std::vector<std::vector<int32_t>>& infos,
+                      const std::vector<int>& active_ranks_mask);
 
     std::vector<int32_t> get_ipc_handle();
     void sync_nvlink_ipc_handles(
@@ -100,6 +120,9 @@ class MooncakeEpXpuBuffer {
     void checkShape(int hidden, int num_topk,
                     int num_max_dispatch_tokens_per_rank,
                     int num_experts) const;
+    PeerView peerView() const;
+    // Waits for the proxy's writes (with mu_ not held).
+    void drainProxy();
 
     int rank_, num_ranks_;
     int64_t num_ep_buffer_bytes_;
@@ -124,6 +147,17 @@ class MooncakeEpXpuBuffer {
     // recv_table_ints(num_ranks) per slot, allocated by the first dispatch
     // given top-k weights.
     int32_t* recv_tables_ = nullptr;
+
+    // The hybrid path: ranks on other nodes, and whether any is connected.
+    std::vector<int> remote_;
+    std::vector<int> rdma_ranks_;  // connected, in rank order
+    bool rdma_ok_ = false;         // connect_rdma succeeded
+    bool hybrid_ = false;          // some rank is connected
+    int* d_remote_ = nullptr;      // device copy of the connected ranks
+    int* host_counts_ = nullptr;   // two halves of kHostCountInts
+#if MOONCAKE_EP_XPU_RDMA
+    std::unique_ptr<XpuEpProxy> proxy_;
+#endif
 };
 
 }  // namespace xpu_ep

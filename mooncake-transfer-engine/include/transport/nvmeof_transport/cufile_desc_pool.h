@@ -47,6 +47,8 @@ struct CUFileBatchDesc {
     // so its output cannot be treated as a positional status snapshot.
     std::vector<CUfileIOEvents_t> io_events;
     std::vector<CUfileIOEvents_t> polled_events;
+    // Prefix already accepted by cuFile; cookies retain their global index.
+    size_t submitted_params = 0;
     bool reusable = true;
 };
 
@@ -85,6 +87,8 @@ class CUFileDescPool {
 
     // Prevent an unsafe batch handle from being returned to the reusable pool.
     void markUnreusable(int idx);
+
+    size_t getSliceCapacity() const { return max_batch_size_; }
 
     // Get current number of slices in the descriptor
     int getSliceNum(int idx);

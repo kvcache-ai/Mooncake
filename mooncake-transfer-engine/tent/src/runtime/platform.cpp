@@ -17,7 +17,9 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_set>
+#include <utility>
 #include <vector>
+#include <unistd.h>
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -41,27 +43,36 @@
 namespace mooncake {
 namespace tent {
 
+void DmabufExport::close() {
+    if (!close_fd || fd < 0) return;
+    const int owned_fd = fd;
+    fd = -1;
+    close_fd = false;
+    if (::close(owned_fd) != 0) PLOG(WARNING) << "Failed to close dma-buf fd";
+}
+
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     static std::shared_ptr<Platform> g_instance;
     static std::once_flag flag;
-    std::call_once(flag, [&]() {
+    std::call_once(flag, [conf = std::move(conf)]() {
+        const auto init_conf = conf ? conf : std::make_shared<Config>();
 #ifdef USE_CUDA
-        g_instance = std::make_shared<CudaPlatform>(conf);
+        g_instance = std::make_shared<CudaPlatform>(init_conf);
 #elif defined(USE_HIP)
-        g_instance = std::make_shared<RocmPlatform>(conf);
+        g_instance = std::make_shared<RocmPlatform>(init_conf);
 #elif defined(USE_SUNRISE)
-        g_instance = std::make_shared<SunrisePlatform>(conf);
+        g_instance = std::make_shared<SunrisePlatform>(init_conf);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
     defined(USE_MEMFABRIC)
-        g_instance = std::make_shared<AscendPlatform>(conf);
+        g_instance = std::make_shared<AscendPlatform>(init_conf);
 #elif defined(USE_TPU)
-        g_instance = std::make_shared<TpuPlatform>(conf);
+        g_instance = std::make_shared<TpuPlatform>(init_conf);
 #elif defined(USE_MLU)
-            g_instance = std::make_shared<MluPlatform>(conf);
+            g_instance = std::make_shared<MluPlatform>(init_conf);
 #elif defined(USE_XPU)
-            g_instance = std::make_shared<XpuPlatform>(conf);
+            g_instance = std::make_shared<XpuPlatform>(init_conf);
 #else
-        g_instance = std::make_shared<CpuPlatform>(conf);
+        g_instance = std::make_shared<CpuPlatform>(init_conf);
 #endif
     });
     return *g_instance;

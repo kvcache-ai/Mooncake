@@ -584,6 +584,10 @@ void setWhitelistFilters(std::vector<std::string>&& filters);
 Sets the device whitelist used during topology discovery.
 - Typical use: restrict transfers to a subset of NICs or GPUs for performance isolation or testing.
 
+In classic Transfer Engine, a non-empty whitelist also filters the topology
+loaded from `MC_CUSTOM_TOPO_JSON`, and `init()` fails if none of its HCAs is
+listed.
+
 #### TransferEngine::numContexts
 
 ```cpp

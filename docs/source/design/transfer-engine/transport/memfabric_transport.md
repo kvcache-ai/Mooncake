@@ -95,7 +95,8 @@ By default, enable either Ascend / Ascend Direct (HIXL) or MemFabric.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `LD_LIBRARY_PATH` | Yes | — | Directory containing `libmf_smem.so` |
-| `MF_PROTOCOL` | Yes | — | Transport protocol: `device_sdma` / `device_rdma` / `host_rdma` / `device_urma` / `device_uboe` |
+| `MF_PROTOCOL` | Yes for standalone TE / PD | — | Default transport protocol: `device_sdma` / `device_rdma` / `host_rdma` / `device_urma` / `device_uboe` |
+| `MF_STORE_PROTOCOL` | No | `MF_PROTOCOL` | Store transport protocol; also controls Store Host memory allocation. Unset or empty values use `MF_PROTOCOL`. |
 | `MF_TRANSFER_TIMEOUT` | No | `10000` | Quiesce polling timeout in milliseconds |
 | `MC_USE_TENT` | Yes | — | Set to `1` to enable TENT mode |
 | `MC_TENT_CONF` | Yes | — | Path to TENT config JSON file; must include `transports/memfabric/enable: true` |
@@ -173,7 +174,8 @@ timeout is not proof that buffers and batches are safe to reclaim.
 
 1. **`libmf_smem.so` must be in `LD_LIBRARY_PATH`**: MemFabric Transport loads it via dlopen at runtime. If the library cannot be found, `install()` returns `DeviceNotFound`.
 
-2. **`MF_PROTOCOL` must be set**: If unset, `install()` returns `InvalidArgument`.
+2. **A protocol must be set**: Standalone TE / PD requires `MF_PROTOCOL`; Store
+   accepts `MF_STORE_PROTOCOL` or falls back to `MF_PROTOCOL`.
 
 3. **Hugepage configuration**: When using Store pooling (`protocol=ascend`), hugepages must be reserved.
    The page size depends on the system configuration; check with `cat /proc/meminfo | grep Hugepagesize`:

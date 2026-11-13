@@ -538,8 +538,8 @@ std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
     py::object torch_tensor = py::reinterpret_borrow<py::object>(tensor);
     const auto [start, size] =
         calculate_shard_range(shape[split_dim], rank, shard_count);
-    return torch_tensor.attr("narrow")(split_dim, start, size)
-        .attr("contiguous")();
+    return materialize_contiguous_tensor(
+        torch_tensor.attr("narrow")(split_dim, start, size));
 }
 
 [[maybe_unused]] std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
@@ -868,7 +868,8 @@ bool is_default_replicate_config(const ReplicateConfig &config) {
            config.preferred_segments.empty() &&
            config.preferred_segment.empty() &&
            !config.prefer_alloc_in_same_node && !config.group_ids.has_value() &&
-           !config.session_ids.has_value();
+           !config.session_ids.has_value() &&
+           !config.residency_affinity_ids.has_value();
 }
 
 std::optional<ParallelAxisSpec> parse_parallel_axis_spec(

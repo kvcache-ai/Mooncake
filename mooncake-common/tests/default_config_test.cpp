@@ -30,7 +30,7 @@ class DefaultConfigTest : public ::testing::Test {
 
 TEST_F(DefaultConfigTest, LoadJsonSuccess) {
     DefaultConfig config;
-    config.SetPath(path_ + "/../../mooncake-common/tests/test.json");
+    config.SetPath(std::string(MOONCAKE_COMMON_TESTS_DIR) + "/test.json");
     config.Load();
 
     // Validate some default values
@@ -55,7 +55,7 @@ TEST_F(DefaultConfigTest, LoadJsonSuccess) {
 
 TEST_F(DefaultConfigTest, LoadYamlSuccess) {
     DefaultConfig config;
-    config.SetPath(path_ + "/../../mooncake-common/tests/test.yaml");
+    config.SetPath(std::string(MOONCAKE_COMMON_TESTS_DIR) + "/test.yaml");
     config.Load();
 
     // Validate some default values
@@ -113,7 +113,7 @@ TEST(DurationUtilsTest, ParseDurationMsRejectsInvalidInput) {
 
 TEST_F(DefaultConfigTest, GetDurationMsFromJsonSupportsNumbersAndStrings) {
     DefaultConfig config;
-    config.SetPath(path_ + "/../../mooncake-common/tests/test.json");
+    config.SetPath(std::string(MOONCAKE_COMMON_TESTS_DIR) + "/test.json");
     config.Load();
 
     uint64_t legacy_ms = 0;
@@ -140,7 +140,7 @@ TEST_F(DefaultConfigTest, GetDurationMsFromJsonSupportsNumbersAndStrings) {
 
 TEST_F(DefaultConfigTest, GetDurationMsFromYamlSupportsNumbersAndStrings) {
     DefaultConfig config;
-    config.SetPath(path_ + "/../../mooncake-common/tests/test.yaml");
+    config.SetPath(std::string(MOONCAKE_COMMON_TESTS_DIR) + "/test.yaml");
     config.Load();
 
     uint64_t legacy_ms = 0;

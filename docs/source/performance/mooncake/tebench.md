@@ -428,6 +428,35 @@ buffer.
 ./tebench --target_seg_name=<SEG> --target_offset=536870912 --target_range_size=536870912
 ```
 
+By default every operation of a thread uses the same target offset. That
+suits memory targets and isolating transport overhead, but on file targets
+the results depend heavily on the storage device: repeated writes to the
+same blocks can hit a device rewrite penalty, and repeated reads can be
+served from the device's cache. Use `--target_access=random` for results
+comparable with storage benchmarks that use random offsets. It cannot be
+combined with `write_seed` / `read_verify`.
+
+Each thread owns its own region of the target, its window. Thread `i`'s
+window starts at `i x window size`, so threads never touch each other's
+blocks. With `random`, each operation (block size x batch size bytes) goes
+to a random operation-aligned offset in the window, never the same one twice
+in a row. Set the window with `--target_window_size`, normally the file size
+divided by the thread count; it must be a multiple of 4096 (file targets
+use `O_DIRECT`), at least `max_block_size x max_batch_size`, and is accepted
+only with `random`.
+Without it, the window is `max_block_size x max_batch_size` bytes, which at
+the largest block and batch size holds a single operation, so the offset
+stays fixed. `fixed` mode is unchanged: one offset per thread, spaced
+`max_block_size x max_batch_size` apart.
+
+```bash
+# 8 threads, random 4 KiB writes across a 1 GiB file:
+# window = 1 GiB / 8 = 128 MiB = 134217728 bytes, 32768 slots of 4 KiB
+./tebench --target_seg_name=file:///path/to/file --op_type=write \
+  --start_num_threads=8 --max_num_threads=8 --start_block_size=4096 \
+  --max_block_size=4096 --target_access=random --target_window_size=134217728
+```
+
 For read-only verification with multiple readers, first write deterministic data
 using `--op_type=write_seed`, then run readers with `--op_type=read_verify`
 against the same target range. `read_verify` performs pure READs and validates

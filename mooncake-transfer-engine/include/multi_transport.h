@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "transport/transport.h"
+#include "task_congestion_status.h"
 
 namespace mooncake {
 class TransferEngineImpl;
@@ -74,11 +75,19 @@ class MultiTransport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
 
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState &state) const;
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail &detail) const;
+
     Status getScatterRequestStatuses(
         BatchID batch_id, size_t task_id,
         std::vector<TransferStatusEnum> &request_statuses);
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+    // walk_tasks skips the finished-task counter shortcut and asks every task.
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status,
+                                  bool walk_tasks = false);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
@@ -108,6 +117,23 @@ class MultiTransport {
 
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);
+
+    // Stamp a task's submission time and direction for the metrics, before it
+    // is posted to its transport.
+    static void recordTaskStart(Transport::TransferTask &task,
+                                const TransferRequest &request);
+
+    // Record `task` in the metrics once, on the first poll or batch free that
+    // observes a terminal `status` (COMPLETED, FAILED, CANCELED or TIMEOUT).
+    static void recordTaskEnd(Transport::TransferTask &task,
+                              const TransferStatus &status);
+
+    // Record a finished `task` from the outcome the event-driven completion
+    // callback saved, or else from its slice counters.
+    static void recordFinishedTask(Transport::TransferTask &task);
+
+    // True while the metrics record tasks.
+    static bool metricsEnabled();
 
     // If `allows_reuse` is non-null it is written on every return. True means
     // this segment's transport is a function of `target_id` only, so the

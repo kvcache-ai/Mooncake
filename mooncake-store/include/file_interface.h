@@ -137,6 +137,9 @@ class StorageFile {
         return tl::make_unexpected(code);
     }
 
+    // errno of the first failed syscall; 0 for logical failures (e.g. EOF).
+    int sys_errno() const { return sys_errno_; }
+
     /**
      * @brief file locking mechanism
      */
@@ -155,10 +158,15 @@ class StorageFile {
     ErrorCode get_error_code() { return error_code_; }
 
    protected:
+    void record_sys_errno(int err) {
+        if (sys_errno_ == 0) sys_errno_ = err;
+    }
+
     bool delete_on_write_fail_ = true;
     std::string filename_;
     int fd_;
     ErrorCode error_code_{ErrorCode::OK};
+    int sys_errno_ = 0;
     std::atomic<bool> is_locked_{false};
 };
 
@@ -236,6 +244,9 @@ class UringFile : public StorageFile {
     // single thread before I/O threads begin. Other threads lazily pick up
     // the registration on their first I/O call via ensure_buf_registered().
     static bool register_global_buffer(void *buffer, size_t length);
+    // Unpins the buffer: releases the shared registration and every I/O
+    // thread's clone of it. Call after all I/O on the buffer has stopped and
+    // before the buffer is freed.
     static void unregister_global_buffer();
 
     bool register_buffer(void *buffer, size_t length);
@@ -245,6 +256,9 @@ class UringFile : public StorageFile {
    private:
     bool use_direct_io_;
     static constexpr size_t ALIGNMENT_ = 4096;
+
+    /// After a failed ring call: keep the errno of its first failed CQE.
+    void record_ring_errno();
 
     /// Allocate / free an O_DIRECT aligned bounce buffer.
     void *alloc_aligned_buffer(size_t size) const;

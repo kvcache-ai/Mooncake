@@ -57,6 +57,7 @@
 
 ## Checklist
 
+- [ ] Every commit I contribute includes my `Signed-off-by` trailer certifying the [DCO](https://github.com/kvcache-ai/Mooncake/blob/main/DCO)
 - [ ] I have performed a self-review of my own code
 - [ ] I have formatted my code using `./scripts/code_format.sh`
 - [ ] I have run pre-commit on the files changed in this PR and all hooks pass

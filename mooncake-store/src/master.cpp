@@ -19,6 +19,7 @@
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
+#include "etcd_helper.h"
 #include "ha/ha_types.h"
 #include "ha/leadership/master_service_supervisor.h"
 #include "ha/snapshot/batch_oplog/config.h"
@@ -142,6 +143,9 @@ DEFINE_string(metrics_host,
               std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
+DEFINE_string(metrics_key_groups, "",
+              "Break key count and value bytes down by key, e.g. "
+              "\"kv:suffix:_k,state:prefix:state_\"; empty disables it");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -347,6 +351,9 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_int32(etcd_max_send_message_bytes, 2 * 1024 * 1024,
+             "Maximum outgoing gRPC message size in bytes for the HA store "
+             "etcd client; must be positive. Does not change server limits.");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "Deprecated alias for --client_active_ttl_sec");
 DEFINE_int64(client_active_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
@@ -682,6 +689,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                             FLAGS_ha_leader_lease_ttl_sec);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
+    default_config.GetInt32("etcd_max_send_message_bytes",
+                            &master_config.etcd_max_send_message_bytes,
+                            FLAGS_etcd_max_send_message_bytes);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
@@ -804,10 +814,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                          << ". Please migrate to use rpc_thread_num only.";
         }
         master_config.rpc_thread_num = rpc_thread_num;
-    } else {
-        if (!conf_set) {
-            master_config.rpc_thread_num = server_thread_num;
-        }
+    } else if (!conf_set || master_config.rpc_thread_num == 0) {
+        // A config file without rpc_thread_num leaves it at the flag's 0,
+        // which must fall back like the command line does: the RPC handler
+        // worker pool below is sized from it.
+        master_config.rpc_thread_num = server_thread_num;
     }
 
     // Determine RPC server port with compatibility warnings
@@ -1128,6 +1139,15 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
+    }
+    if ((google::GetCommandLineFlagInfo("etcd_max_send_message_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.etcd_max_send_message_bytes =
+            FLAGS_etcd_max_send_message_bytes;
+    }
+    if (master_config.etcd_max_send_message_bytes <= 0) {
+        LOG(FATAL) << "etcd_max_send_message_bytes must be positive";
     }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
@@ -1469,6 +1489,8 @@ int main(int argc, char* argv[]) {
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
+        mooncake::MasterMetricManager::instance().configure_key_groups(
+            FLAGS_metrics_key_groups);
     } catch (const std::exception& error) {
         LOG(ERROR) << "Invalid metrics bootstrap configuration: "
                    << error.what();
@@ -1534,6 +1556,14 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "Invalid memory allocator: "
                    << master_config.memory_allocator
                    << ", must be 'cachelib' or 'offset'";
+        return 1;
+    }
+
+    if (master_config.enable_ha && master_config.ha_backend_type == "etcd" &&
+        mooncake::EtcdHelper::SetMaxSendMessageBytes(
+            master_config.etcd_max_send_message_bytes) !=
+            mooncake::ErrorCode::OK) {
+        LOG(ERROR) << "Failed to configure etcd_max_send_message_bytes";
         return 1;
     }
 
@@ -1617,6 +1647,8 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
+        << ", etcd_max_send_message_bytes="
+        << master_config.etcd_max_send_message_bytes
         << ", client_active_ttl_sec=" << master_config.client_active_ttl_sec
         << ", client_suspicion_ttl_sec="
         << master_config.client_suspicion_ttl_sec

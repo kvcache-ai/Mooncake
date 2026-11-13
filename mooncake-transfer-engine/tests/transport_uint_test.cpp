@@ -42,6 +42,7 @@
 #include "transfer_engine.h"
 #include "transfer_engine_c.h"
 #include "transfer_engine_impl.h"
+#include "task_congestion_status.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
 #include "tent/common/config.h"
@@ -53,7 +54,6 @@ using namespace mooncake;
 
 namespace mooncake {
 
-#ifdef USE_TENT
 class ScopedEnvVar {
    public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
@@ -76,7 +76,6 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> old_value_;
 };
-#endif
 
 class TransferEngineImplTestPeer {
    public:
@@ -289,6 +288,42 @@ TEST(TransferEngineTentCompatibilityTest,
     EXPECT_EQ(topology->getHcaList(), (std::vector<std::string>{selected}));
 }
 
+TEST(TransferEngineTentCompatibilityTest,
+     CongestionQueryPreservesInvalidArgumentForInvalidBatch) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-invalid-congestion"), 0);
+    TaskCongestionState state = TaskCongestionState::kUnknown;
+    TaskCongestionDetail detail;
+    for (BatchID batch_id : {BatchID{0}, INVALID_BATCH_ID}) {
+        auto simple = engine.getTaskCongestionState(batch_id, 0, state);
+        EXPECT_TRUE(simple.IsInvalidArgument()) << simple.ToString();
+        auto detailed = engine.getTaskCongestionDetail(batch_id, 0, detail);
+        EXPECT_TRUE(detailed.IsInvalidArgument()) << detailed.ToString();
+    }
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     CongestionQueryReportsUnsupportedWithoutProgressingTask) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-unsupported-congestion"), 0);
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_NE(batch_id, INVALID_BATCH_ID);
+    TaskCongestionState state = TaskCongestionState::kNormal;
+    auto simple = engine.getTaskCongestionState(batch_id, 0, state);
+    EXPECT_TRUE(simple.IsNotImplemented()) << simple.ToString();
+    EXPECT_EQ(state, TaskCongestionState::kUnknown);
+    TaskCongestionDetail detail;
+    detail.state = TaskCongestionState::kCongested;
+    detail.reason = {true, TaskCongestionReason::kByteWindow};
+    auto detailed = engine.getTaskCongestionDetail(batch_id, 0, detail);
+    EXPECT_TRUE(detailed.IsNotImplemented()) << detailed.ToString();
+    EXPECT_EQ(detail.state, TaskCongestionState::kUnknown);
+    EXPECT_FALSE(detail.reason.observed);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
 #endif
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
@@ -346,6 +381,31 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
               "rdma");
 }
 
+#if !defined(USE_UBSHMEM) && !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+TEST(TransferEngineDeviceFilterTest,
+     CustomTopoJsonRejectsEmptyDeviceFilterIntersection) {
+    char path[] = "/tmp/mc_custom_topo_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NE(fd, -1);
+    const std::string json = R"({"cpu:0": [["mc_fake_0"], ["mc_fake_1"]]})";
+    const ssize_t written = write(fd, json.data(), json.size());
+    close(fd);
+    ASSERT_EQ(written, static_cast<ssize_t>(json.size()));
+
+    {
+        ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path);
+        ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+        ScopedEnvVar force_shm("MC_FORCE_SHM", nullptr);
+        ScopedEnvVar force_hca("MC_FORCE_HCA", nullptr);
+        TransferEngineImpl engine(true, {"mlx5_absent"});
+        EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"),
+                  ERR_DEVICE_NOT_FOUND);
+        EXPECT_TRUE(engine.getLocalTopology()->getHcaList().empty());
+    }
+    unlink(path);
+}
+#endif
+
 TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     EXPECT_TRUE(shouldInstallAscendTransport(""));
@@ -358,14 +418,10 @@ TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
 }
 
 TEST(TransferEngineAscendTransportTest, HostHintsKeepHostTransportPath) {
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-    // HCCL builds always install Ascend, whatever the hint names.
-    EXPECT_TRUE(shouldInstallAscendTransport("rdma"));
-    EXPECT_TRUE(shouldInstallAscendTransport("tcp"));
-#else
+    // Ascend builds (USE_ASCEND or USE_ASCEND_DIRECT) install the Ascend Direct
+    // transport only when the hint names it; host hints keep the host path.
     EXPECT_FALSE(shouldInstallAscendTransport("rdma"));
     EXPECT_FALSE(shouldInstallAscendTransport("tcp"));
-#endif
 }
 
 TEST(TransferEngineAscendTransportTest, ProtocolHintMergeKeepsStoredProtocol) {
@@ -594,6 +650,7 @@ class BatchResultTransport : public Transport {
         : unregister_result_(unregister_result) {}
 
     int unregisterBatchCalls() const { return unregister_batch_calls_; }
+    int statusCalls() const { return status_calls_; }
     size_t registeredBufferCount() const { return registered_buffers_.size(); }
     void setRegisterResult(int result) { register_result_ = result; }
 
@@ -603,6 +660,7 @@ class BatchResultTransport : public Transport {
     }
 
     Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        ++status_calls_;
         return Status::OK();
     }
 
@@ -645,8 +703,41 @@ class BatchResultTransport : public Transport {
     int register_result_ = 0;
     int unregister_result_;
     int unregister_batch_calls_ = 0;
+    int status_calls_ = 0;
     std::vector<void*> registered_buffers_;
 };
+
+TEST(TaskCongestionQueryTest, UnknownAndInvalidTaskDoNotPollTransport) {
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    BatchResultTransport transport;
+    const auto batch_id = transports.allocateBatchID(1);
+    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.transport_ = &transport;
+
+    TaskCongestionState state = TaskCongestionState::kNormal;
+    ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kUnknown);
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.state, TaskCongestionState::kUnknown);
+    EXPECT_EQ(detail.attempt_kind, TaskCongestionAttemptKind::kOther);
+    EXPECT_EQ(transport.statusCalls(), 0);
+    EXPECT_FALSE(transports.getTaskCongestionState(batch_id, 1, state).ok());
+    EXPECT_FALSE(transports.getTaskCongestionDetail(batch_id, 1, detail).ok());
+    EXPECT_FALSE(transports.getTaskCongestionState(0, 0, state).ok());
+    EXPECT_FALSE(transports.getTaskCongestionDetail(0, 0, detail).ok());
+    EXPECT_FALSE(
+        transports.getTaskCongestionState(static_cast<BatchID>(-1), 0, state)
+            .ok());
+    EXPECT_FALSE(
+        transports.getTaskCongestionDetail(static_cast<BatchID>(-1), 0, detail)
+            .ok());
+
+    task.is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
 
 class BlockingRegistrationTransport : public Transport {
    public:
@@ -790,6 +881,25 @@ class TerminalFailureTransport : public BatchResultTransport {
    private:
     bool initially_finished_;
     std::vector<TransferTask*> tasks_;
+};
+
+// Models RDMA's completion order: a task's status query already reports
+// COMPLETED while the worker has not yet bumped the batch's finished-task
+// counter.
+class CounterLaggingTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) task->slice_count = 1;
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+
+    bool supportsBatchCompletionCounter() const override { return true; }
 };
 
 enum class ScatterPollFailure { kStatusError, kTimeout };
@@ -1553,6 +1663,73 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
     EXPECT_EQ(
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
+}
+
+// Callers that ignore the return value otherwise only see per-region warnings
+// for the regions that failed, not that the rest were rolled back as well.
+TEST_F(TransportTest, RegisterLocalMemoryBatchLogsRollback) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto failing = std::make_shared<BatchResultTransport>();
+    failing->setRegisterResult(ERR_MEMORY);
+    TransferEngineImplTestPeer::replaceTransports(engine,
+                                                  {{"failing", failing}});
+
+    std::array<char, 2> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data(), 1},
+        {buffer.data() + 1, 1},
+    };
+    const bool saved_logtostderr = FLAGS_logtostderr;
+    FLAGS_logtostderr = true;
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), ERR_MEMORY);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    FLAGS_logtostderr = saved_logtostderr;
+
+    EXPECT_NE(log.find("Failed to register a batch of 2 memory region(s) with "
+                       "transport batch-result (ret=" +
+                       std::to_string(ERR_MEMORY) + ")"),
+              std::string::npos)
+        << log;
+    EXPECT_NE(log.find("unregistering the whole batch"), std::string::npos)
+        << log;
+}
+
+TEST_F(TransportTest, TaskCompletedSendsNotifyBeforeBatchCounterCatchesUp) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<CounterLaggingTransport>();
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"counter-lagging", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "127.0.0.1:1";
+    descriptor->protocol = "counter-lagging";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "127.0.0.1:1",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+    ASSERT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(Transport::toBatchDesc(batch_id).finished_task_count.load(), 0u);
+    // A caller that frees the batch now must not lose the notification.
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
 }
 
 TEST_F(TransportTest, FreeBatchClearsPendingNotify) {

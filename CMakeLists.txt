@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake CXX C)
 
+# EP and PG are separate components. Declare these before the scikit-build
+# subdirectory reads them so WITH_PG has its final default on first configure.
+option(WITH_EP "build mooncake with expert parallelism support" OFF)
+if(USE_XPU)
+  set(_WITH_PG_DEFAULT OFF)
+else()
+  set(_WITH_PG_DEFAULT "${WITH_EP}")
+endif()
+option(WITH_PG "build the Mooncake ProcessGroup backend" ${_WITH_PG_DEFAULT})
+
 # indicates cmake is invoked from top-level dir
 set(GLOBAL_CONFIG "true")
 
@@ -17,6 +27,12 @@ if(BUILD_UNIT_TESTS)
 endif()
 
 option(WITH_TE "build mooncake transfer engine and sample code" ON)
+if(WITH_PG AND NOT WITH_TE)
+  message(
+    FATAL_ERROR
+      "WITH_PG=ON requires WITH_TE=ON because Mooncake PG links transfer_engine"
+  )
+endif()
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
 option(WITH_CONDUCTOR "build mooncake conductor service" OFF)
@@ -26,15 +42,13 @@ option(WITH_RUST_EXAMPLE
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_CONDUCTOR_RUST
        "build the Rust bindings for the Mooncake Conductor client" OFF)
-option(
-  WITH_STORE_RS
-  "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
-  OFF)
+option(WITH_STORE_RS
+       "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
+       OFF)
 option(
   WITH_STORE_C_SHARED
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
   OFF)
-option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)
@@ -44,6 +58,14 @@ endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
 
+# Clear the shared wheel staging directory on every configure so disabled
+# components cannot leak stale artifacts into a later build.
+set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
+file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}")
+
+if(USE_XPU AND WITH_PG)
+  message(FATAL_ERROR "WITH_PG=ON is not supported on Intel XPU")
+endif()
 # Without TENT only Mooncake EP builds for XPU: the Store's XPU device gets its
 # SYCL flags from TENT's platform library. Checked before the Store's
 # dependencies are looked up, which would fail first and less clearly.
@@ -188,8 +210,9 @@ if(WITH_CONDUCTOR_RUST)
   add_subdirectory(mooncake-conductor/rust)
 endif()
 
-if (WITH_STORE_RS)
-  message(STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
+if(WITH_STORE_RS)
+  message(
+    STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
   add_subdirectory(mooncake-store-rs)
 endif()
 
@@ -200,86 +223,77 @@ if(WITH_EP AND USE_XPU)
   message(
     STATUS "WITH_EP enabled on Intel XPU: building the SYCL Mooncake EP module")
   add_subdirectory(mooncake-ep)
-elseif(WITH_EP)
-  add_subdirectory(mooncake-pg)
-  include_directories(mooncake-pg/include)
+elseif(WITH_EP OR WITH_PG)
+  if(WITH_PG)
+    add_subdirectory(mooncake-pg)
+    include_directories(mooncake-pg/include)
+  endif()
 
-  if(EP_USE_IDE)
+  if(EP_USE_IDE AND WITH_EP)
     message(WARNING "EP_USE_IDE enabled. DO NOT USE IN PRODUCTION!")
     add_subdirectory(mooncake-ep)
     include_directories(mooncake-ep/include)
-    add_library(
-      mooncake_pg_torch_ide OBJECT
-      mooncake-pg/torch/src/mooncake_backend.cpp
-      mooncake-pg/torch/src/pg_py.cpp mooncake-pg/torch/src/work_handles.cpp)
-    # Reuse Mooncake EP's dependency include paths for clangd indexing.
-    target_include_directories(
-      mooncake_pg_torch_ide
-      PRIVATE mooncake-pg/torch/include mooncake-pg/include
-              $<TARGET_PROPERTY:_ep,INCLUDE_DIRECTORIES>)
+    if(WITH_PG)
+      add_library(
+        mooncake_pg_torch_ide OBJECT
+        mooncake-pg/torch/src/mooncake_backend.cpp
+        mooncake-pg/torch/src/pg_py.cpp mooncake-pg/torch/src/work_handles.cpp)
+      # Reuse Mooncake EP's dependency include paths for clangd indexing.
+      target_include_directories(
+        mooncake_pg_torch_ide
+        PRIVATE mooncake-pg/torch/include mooncake-pg/include
+                $<TARGET_PROPERTY:_ep,INCLUDE_DIRECTORIES>)
+    endif()
   else()
-    message(
-      STATUS
-        "WITH_EP enabled: building Mooncake EP natively and staging PG native libraries; Torch adapter is JIT-built at runtime")
     if(USE_CUDA)
       find_package(CUDAToolkit REQUIRED)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
     endif()
+    if(WITH_EP)
+      message(STATUS "Building Mooncake EP")
+      add_subdirectory(mooncake-ep)
+      include_directories(mooncake-ep/include)
+    endif()
+  endif()
 
-    add_subdirectory(mooncake-ep)
-    include_directories(mooncake-ep/include)
-
-    # Keep generated Torch extensions and device libraries in backend-owned
-    # build directories. The legacy release path injects the staged device
-    # artifacts after auditwheel; scikit-build-core installs them directly into
-    # its private wheel tree.
-    set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
-    file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}")
-    file(MAKE_DIRECTORY "${EP_PG_STAGING_DIR}")
-
-    # Stage the runtime JIT source bundle for the legacy wheel script. The
-    # scikit-build install path consumes the authoritative files directly via
-    # python/CMakeLists.txt; no package-tree mirror is maintained.
+  file(MAKE_DIRECTORY "${EP_PG_STAGING_DIR}")
+  if(WITH_PG)
     add_custom_target(
       mooncake_pg_jit_sources_stage ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory
-              "${EP_PG_STAGING_DIR}/_pg_jit"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/pg_py.cpp"
-              "${EP_PG_STAGING_DIR}/_pg_jit/pg_py.cpp"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/mooncake_backend.cpp"
-              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.cpp"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/work_handles.cpp"
-              "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.cpp"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/mooncake_backend.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/work_handles.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/torch_utils.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/torch_utils.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/pg_utils.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/pg_utils.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/mooncake_pg.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}/_pg_jit"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/pg_py.cpp"
+        "${EP_PG_STAGING_DIR}/_pg_jit/pg_py.cpp"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/mooncake_backend.cpp"
+        "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.cpp"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/work_handles.cpp"
+        "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.cpp"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/mooncake_backend.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/work_handles.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/torch_utils.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/torch_utils.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/pg_utils.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/pg_utils.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/mooncake_pg.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
       COMMENT "Staging Mooncake PG Torch JIT sources")
-
-    if(USE_CUDA)
-      add_custom_target(
-        mooncake_ep_device_stage ALL
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
-        COMMENT "Staging Mooncake EP CUDA device library"
-        DEPENDS mooncake_ep_device
-        VERBATIM)
-    endif()
 
     add_custom_target(
       mooncake_pg_device_stage ALL
@@ -288,6 +302,17 @@ elseif(WITH_EP)
               "$<TARGET_FILE:mooncake_pg_device>" "${EP_PG_STAGING_DIR}/"
       COMMENT "Staging Mooncake PG device library"
       DEPENDS mooncake_pg_device
+      VERBATIM)
+  endif()
+
+  if(WITH_EP AND USE_CUDA)
+    add_custom_target(
+      mooncake_ep_device_stage ALL
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
+      COMMENT "Staging Mooncake EP CUDA device library"
+      DEPENDS mooncake_ep_device
       VERBATIM)
   endif()
 endif()

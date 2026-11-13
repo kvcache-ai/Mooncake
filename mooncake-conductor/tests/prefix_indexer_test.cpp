@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <barrier>
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,6 +17,7 @@
 
 namespace {
 
+using mooncake::conductor::common::PublisherKind;
 using mooncake::conductor::prefixindex::BlockPresenceSnapshot;
 using mooncake::conductor::prefixindex::CacheHitResult;
 using mooncake::conductor::prefixindex::ContextKey;
@@ -93,14 +96,16 @@ HashProfile SglangBigramProfile() {
 }
 
 EngineRegistration Registration(const std::string& instance_id = "instance-a",
-                                int64_t dp_rank = 0) {
+                                int64_t dp_rank = 0,
+                                PublisherKind kind = PublisherKind::kVllm) {
     const ContextKey context = TestContext();
     return {.context = context,
             .profile = TestProfile(),
             .instance_id = instance_id,
             .dp_rank = dp_rank,
             .effective_block_size = context.block_size,
-            .cache_group = 0};
+            .cache_group = 0,
+            .publisher_kind = kind};
 }
 
 EngineOwner DeviceOwner(const std::string& instance_id = "instance-a",
@@ -281,6 +286,10 @@ TEST(Registration, InvalidInputsDoNotCreateContextState) {
     negative_rank.dp_rank = -1;
     invalid.push_back(negative_rank);
 
+    auto pool_publisher = Registration();
+    pool_publisher.publisher_kind = PublisherKind::kMooncake;
+    invalid.push_back(pool_publisher);
+
     auto malformed_profile = Registration();
     malformed_profile.profile.root_digest = "not-a-digest";
     invalid.push_back(malformed_profile);
@@ -330,9 +339,11 @@ TEST(Registration, SglangSeedVariantsShareContextAndBinding) {
         PrefixCacheTable table;
         auto first = Registration();
         first.profile = profile;
+        first.publisher_kind = PublisherKind::kSglang;
         ASSERT_TRUE(table.Register(first).error.empty());
         auto second = Registration("instance-b", 1);
         second.profile = profile;
+        second.publisher_kind = PublisherKind::kSglang;
         second.profile.python_hash_seed = "different-unused-seed";
         ASSERT_TRUE(table.Register(second).error.empty());
         EXPECT_TRUE(table.ValidateProfileBinding(TestContext(), second.profile)
@@ -382,7 +393,33 @@ TEST(Registration, TracksEveryInstanceAndRankIdempotently) {
     EXPECT_EQ(state.profile, TestProfile());
     EXPECT_EQ(state.instance_ranks.at("instance-a"), (std::set<int64_t>{0, 2}));
     EXPECT_EQ(state.instance_ranks.at("instance-b"), (std::set<int64_t>{1}));
+    EXPECT_EQ(state.instance_publishers.at("instance-a").at(0),
+              PublisherKind::kVllm);
+    EXPECT_EQ(state.instance_publishers.at("instance-a").at(2),
+              PublisherKind::kVllm);
+    EXPECT_EQ(state.instance_publishers.at("instance-b").at(1),
+              PublisherKind::kVllm);
     EXPECT_TRUE(state.blocks.empty());
+}
+
+TEST(Registration, PublisherKindConflictPreservesStateAndUnregisterRemovesIt) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto conflict =
+        table.Register(Registration("instance-a", 0, PublisherKind::kSglang));
+    EXPECT_FALSE(conflict.inserted);
+    EXPECT_NE(conflict.error.find("publisher kind"), std::string::npos);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+
+    ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
+                    .contexts.at(TestContext())
+                    .instance_publishers.empty());
+    auto replacement =
+        table.Register(Registration("instance-a", 0, PublisherKind::kSglang));
+    EXPECT_TRUE(replacement.error.empty());
+    EXPECT_TRUE(replacement.inserted);
 }
 
 TEST(Registration, ConflictingProfilePreservesCompleteState) {
@@ -724,6 +761,7 @@ TEST(Query, TrailingPartialBlockNeverReportsMoreThanPromptTokens) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     // 40 tokens over a 16-token block size: two whole blocks plus a trailing
@@ -750,6 +788,7 @@ TEST(Query, WholeBlockRunIsUnaffectedByThePromptLengthClamp) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     const auto tokens = Tokens(40);
@@ -772,6 +811,7 @@ TEST(Query, BigramFullMatchReportsOneFewerPositionThanPromptTokens) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangBigramProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     // 40 raw tokens over a 16-token block size. The bigram chain covers 39
@@ -799,6 +839,7 @@ TEST(Query, BigramWholeBlockRunIsUnaffectedByTheLogicalLengthClamp) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangBigramProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     const auto tokens = Tokens(40);
@@ -928,7 +969,7 @@ TEST(Query, CumulativeTierIncludesHigherTierAfterLowerTierBlocks) {
     EXPECT_EQ(result.disk, 64);
 }
 
-TEST(Query, LocalAndSharedTiersRespectRankAndContinuousPrefix) {
+TEST(Query, VllmSharedCpuSupersedesLocalAcrossRanksAndPrefix) {
     PrefixCacheTable table;
     for (const auto& registration :
          {Registration(), Registration("instance-a", 1),
@@ -954,9 +995,12 @@ TEST(Query, LocalAndSharedTiersRespectRankAndContinuousPrefix) {
     ASSERT_EQ(table.StoreShared(shared), "");
     EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-b").cpu_share,
               80);
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    EXPECT_EQ(
+        table.Query(TestContext(), tokens).at("instance-a").rank_matches.at(0),
+        RankMatch(0, 0, 80, 80));
     ASSERT_EQ(table.RemoveShared(shared), "");
-    EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-a").cpu_share,
-              48);
+    EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-a").cpu_share, 0);
     EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-b").cpu_share, 0);
     ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
     RegisterOrFail(table, Registration());
@@ -1013,11 +1057,16 @@ TEST(Query, FourTierInterleavedPrefixesAndGaps) {
 
 TEST(Query, FourTierOwnersRemainIndependentAcrossRanksAndLifecycle) {
     PrefixCacheTable table;
-    RegisterOrFail(table, Registration());
-    RegisterOrFail(table, Registration("instance-a", 1));
-    RegisterOrFail(table, Registration("instance-b"));
+    for (const auto& [instance, rank] :
+         std::vector<std::pair<std::string, int64_t>>{
+             {"instance-a", 0}, {"instance-a", 1}, {"instance-b", 0}}) {
+        auto registration =
+            Registration(instance, rank, PublisherKind::kSglang);
+        registration.profile = SglangProfile();
+        RegisterOrFail(table, registration);
+    }
     const auto tokens = Tokens(48);
-    const auto hashes = Hashes(tokens);
+    const auto hashes = SglangHashes(tokens);
     auto local = Device(hashes);
     local.tier = StorageTier::kCpuLocal;
     const auto shared = Shared(hashes, StorageTier::kCpuShare);
@@ -1048,10 +1097,222 @@ TEST(Query, FourTierOwnersRemainIndependentAcrossRanksAndLifecycle) {
               RankMatch(0, 0, 48, 48));
     ASSERT_EQ(table.StoreEngine(local), "");
     ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
-    RegisterOrFail(table, Registration());
+    auto replacement = Registration("instance-a", 0, PublisherKind::kSglang);
+    replacement.profile = SglangProfile();
+    RegisterOrFail(table, replacement);
     EXPECT_EQ(
         table.Query(TestContext(), tokens).at("instance-a").rank_matches.at(0),
         RankMatch(0, 0, 48, 48));
+}
+
+TEST(Mutations, VllmCpuLocalYieldsToSharedAcrossInstancesAndRanks) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-a", 1));
+    RegisterOrFail(table, Registration("instance-b", 0));
+    const auto tokens = Tokens(32);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 2u);
+    const auto a0 = DeviceOwner("instance-a", 0, "stream-a0");
+    const auto a1 = DeviceOwner("instance-a", 1, "stream-a1");
+    const auto b0 = DeviceOwner("instance-b", 0, "stream-b0");
+    auto local_a0 = Device({hashes[0]}, a0);
+    local_a0.tier = StorageTier::kCpuLocal;
+    auto local_a1 = Device({hashes[0]}, a1);
+    local_a1.tier = StorageTier::kCpuLocal;
+    auto local_b0 = Device({hashes[0]}, b0);
+    local_b0.tier = StorageTier::kCpuLocal;
+    ASSERT_EQ(table.StoreEngine(local_a0), "");
+    ASSERT_EQ(table.StoreEngine(local_a1), "");
+    ASSERT_EQ(table.StoreEngine(local_b0), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0]}, a0)), "");
+    ASSERT_EQ(table.StoreShared(Shared({hashes[0]}, StorageTier::kDisk)), "");
+    EXPECT_EQ(Presence(table, hashes[0]).cpu_local_owners.size(), 3u);
+
+    const auto shared_a = Shared({hashes[0]}, StorageTier::kCpuShare);
+    const auto shared_b =
+        Shared({hashes[0]}, StorageTier::kCpuShare, SharedOwner("object-b"));
+    ASSERT_EQ(table.StoreShared(shared_a), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    EXPECT_EQ(Presence(table, hashes[0]).device_owners,
+              (std::set<EngineOwner>{a0}));
+    EXPECT_EQ(Presence(table, hashes[0]).disk_owners.size(), 1u);
+
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto order = PrefixCacheTableTestPeer::Order(table, TestContext());
+    ASSERT_EQ(table.StoreEngine(local_a0), "");
+    ASSERT_EQ(table.StoreEngine(local_b0), "");
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Order(table, TestContext()).write_order,
+              order.write_order);
+    ASSERT_EQ(table.StoreShared(shared_b), "");
+    ASSERT_EQ(table.RemoveShared(shared_a), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    ASSERT_EQ(table.RemoveShared(shared_b), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    ASSERT_EQ(table.StoreEngine(local_b0), "");
+    EXPECT_EQ(Presence(table, hashes[0]).cpu_local_owners,
+              (std::set<EngineOwner>{b0}));
+    ASSERT_EQ(table.RemoveEngine(local_b0), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+
+    const auto shared_first = Shared({hashes[1]}, StorageTier::kCpuShare);
+    auto later_local = Device({hashes[1]}, a0);
+    later_local.tier = StorageTier::kCpuLocal;
+    ASSERT_EQ(table.StoreShared(shared_first), "");
+    ASSERT_EQ(table.StoreEngine(later_local), "");
+    EXPECT_TRUE(Presence(table, hashes[1]).cpu_local_owners.empty());
+    ASSERT_EQ(table.RemoveShared(shared_first), "");
+    EXPECT_FALSE(
+        PrefixCacheTableTestPeer::Presence(table, TestContext(), hashes[1])
+            .has_value());
+    ASSERT_EQ(table.StoreEngine(later_local), "");
+    EXPECT_EQ(Presence(table, hashes[1]).cpu_local_owners,
+              (std::set<EngineOwner>{a0}));
+}
+
+TEST(Mutations, ConcurrentVllmLocalAndSharedStoresKeepSharedOnly) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    for (uint64_t value = 100; value < 132; ++value) {
+        const auto prefix = Prefix(value);
+        auto local = Device({prefix});
+        local.tier = StorageTier::kCpuLocal;
+        const auto shared = Shared({prefix}, StorageTier::kCpuShare);
+        std::barrier start(3);
+        std::string local_error;
+        std::string shared_error;
+        std::thread local_writer([&] {
+            start.arrive_and_wait();
+            local_error = table.StoreEngine(local);
+        });
+        std::thread shared_writer([&] {
+            start.arrive_and_wait();
+            shared_error = table.StoreShared(shared);
+        });
+        start.arrive_and_wait();
+        local_writer.join();
+        shared_writer.join();
+        ASSERT_TRUE(local_error.empty()) << local_error;
+        ASSERT_TRUE(shared_error.empty()) << shared_error;
+        const auto presence = Presence(table, prefix);
+        EXPECT_TRUE(presence.cpu_local_owners.empty());
+        EXPECT_EQ(presence.cpu_share_owners,
+                  (std::set<SharedObjectOwner>{shared.owner}));
+    }
+}
+
+// In chunk mode, vLLM's OffloadingConnector announces an offloaded chunk with
+// all of its block hashes. Chunks that overlap a shared prefix which is not
+// chunk-aligned re-announce the shared hashes, and evicting a chunk removes
+// all of its hashes, so consumers must reference-count the announcements
+// (vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py).
+// One chunk is 4 blocks of 16 tokens here.
+TEST(Mutations, VllmCpuLocalOverlappingChunksSurviveOneChunkEviction) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+
+    // Request A has 8 blocks. Request B shares A's first 6 blocks and then
+    // diverges, so B's second chunk is a different chunk that re-announces
+    // A's blocks 4 and 5.
+    const std::vector<int32_t> tokens_a = Tokens(128);
+    std::vector<int32_t> tokens_b = tokens_a;
+    for (size_t i = 96; i < tokens_b.size(); ++i) {
+        tokens_b[i] = 100000 + static_cast<int32_t>(i);
+    }
+    const auto ha = Hashes(tokens_a);
+    const auto hb = Hashes(tokens_b);
+    ASSERT_EQ(ha.size(), 8u);
+    ASSERT_EQ(hb.size(), 8u);
+    ASSERT_EQ(ha[5], hb[5]);
+    ASSERT_NE(ha[6], hb[6]);
+
+    auto chunk = [](const std::vector<ProjectedPrefix>& hashes, size_t first) {
+        auto mutation = Device(std::vector<ProjectedPrefix>(
+            hashes.begin() + first, hashes.begin() + first + 4));
+        mutation.tier = StorageTier::kCpuLocal;
+        return mutation;
+    };
+    const auto a_chunk0 = chunk(ha, 0);
+    const auto a_chunk1 = chunk(ha, 4);
+    const auto b_chunk1 = chunk(hb, 4);  // re-announces ha[4] and ha[5]
+    auto b_hit = [&] {
+        return table.Query(TestContext(), tokens_b)
+            .at("instance-a")
+            .rank_matches.at(0);
+    };
+    auto local_owners = [&](ProjectedPrefix prefix) {
+        const auto presence =
+            PrefixCacheTableTestPeer::Presence(table, TestContext(), prefix);
+        return presence ? presence->cpu_local_owners : std::set<EngineOwner>{};
+    };
+    ASSERT_EQ(table.StoreEngine(a_chunk0), "");
+    ASSERT_EQ(table.StoreEngine(a_chunk1), "");
+    ASSERT_EQ(table.StoreEngine(b_chunk1), "");
+    EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
+
+    // vLLM evicts A's second chunk: BlockRemoved for ha[4..7]. Both of B's
+    // chunks are still in vLLM's CPU tier, so all of B's prompt can still be
+    // loaded from it.
+    ASSERT_EQ(table.RemoveEngine(a_chunk1), "");
+    EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
+    EXPECT_EQ(local_owners(ha[4]), (std::set<EngineOwner>{a_chunk1.owner}));
+    EXPECT_EQ(local_owners(ha[5]), (std::set<EngineOwner>{a_chunk1.owner}));
+    EXPECT_TRUE(local_owners(ha[6]).empty());
+    EXPECT_TRUE(local_owners(ha[7]).empty());
+    // A's prompt is not checked here: vLLM looks up one key per chunk (the
+    // chunk's last block hash), so it can load only A's first chunk (64
+    // tokens), while this block-level index also sees ha[4] and ha[5]
+    // through B's chunk.
+
+    // Evicting B's second chunk removes the last announcement of ha[4] and
+    // ha[5]; only A's first chunk is left.
+    ASSERT_EQ(table.RemoveEngine(b_chunk1), "");
+    EXPECT_TRUE(local_owners(ha[4]).empty());
+    EXPECT_TRUE(local_owners(ha[5]).empty());
+    EXPECT_EQ(b_hit(), RankMatch(0, 64, 64, 64));
+}
+
+// A vLLM owner's announcement count must not outlive its ownership: after a
+// clear, an unregister, or a Mooncake shared CPU store drops the owner, one
+// new store and one removal leave no local owner.
+TEST(Mutations, VllmCpuLocalCountsResetWhenOwnershipIsDropped) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    const auto hashes = Hashes(Tokens(16));
+    ASSERT_EQ(hashes.size(), 1u);
+    auto local = Device(hashes);
+    local.tier = StorageTier::kCpuLocal;
+    // A disk copy keeps the block in the index through every step below.
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
+    auto announce_twice = [&] {
+        ASSERT_EQ(table.StoreEngine(local), "");
+        ASSERT_EQ(table.StoreEngine(local), "");
+    };
+    auto store_and_remove_leave_no_owner = [&](const char* after) {
+        SCOPED_TRACE(after);
+        ASSERT_EQ(table.StoreEngine(local), "");
+        ASSERT_EQ(table.RemoveEngine(local), "");
+        EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    };
+
+    // A clear of every local tier, as vLLM's AllBlocksCleared is applied.
+    auto clear = ClearFor(local.owner);
+    clear.tier = std::nullopt;
+    announce_twice();
+    ASSERT_EQ(table.ClearEngine(clear), "");
+    store_and_remove_leave_no_owner("ClearEngine");
+
+    announce_twice();
+    ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
+    RegisterOrFail(table, Registration());
+    store_and_remove_leave_no_owner("Unregister");
+
+    const auto shared = Shared(hashes, StorageTier::kCpuShare);
+    announce_twice();
+    ASSERT_EQ(table.StoreShared(shared), "");
+    ASSERT_EQ(table.RemoveShared(shared), "");
+    store_and_remove_leave_no_owner("StoreShared");
 }
 
 TEST(Mutations, FourTierMutationsRejectWrongOwnerFamily) {
@@ -1080,6 +1341,7 @@ TEST(Query, FourTierLocalPartialTailUsesProfileLogicalPositions) {
         PrefixCacheTable table;
         auto registration = Registration();
         registration.profile = bigram ? SglangBigramProfile() : SglangProfile();
+        registration.publisher_kind = PublisherKind::kSglang;
         RegisterOrFail(table, registration);
         const auto hashes =
             bigram ? SglangBigramHashes(tokens) : SglangHashes(tokens);

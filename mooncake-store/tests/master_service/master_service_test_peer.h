@@ -53,8 +53,6 @@ class MasterServiceTestPeer {
     // the fields that payload carries.
     static std::string SerializeMetadataForOpLogForTesting(
         MasterService& service, const ObjectMetadata& metadata);
-    static std::string SerializeMetadataForOpLogWithoutMemReplicasForTesting(
-        MasterService& service, const ObjectMetadata& metadata);
     static std::string
     SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
         MasterService& service, const ObjectMetadata& metadata,
@@ -68,6 +66,12 @@ class MasterServiceTestPeer {
                                     double evict_ratio_lowerbound);
 
     void RunDfsEvictionForTesting();
+
+    void ConfigureKvcsCapacityForTesting(
+        std::unique_ptr<KvcsCapacityProvider> provider, bool eviction_enabled,
+        double high_watermark, double low_watermark);
+
+    void RefreshKvcsDfsUsageForTesting();
 
     // Queue one segment through the private HTTP metadata cleanup path, as the
     // client monitor does when a client times out.
@@ -174,6 +178,17 @@ class MasterServiceTestPeer {
     }
     static const auto& EnableDfs(const MasterService& service) {
         return service.enable_dfs_;
+    }
+
+    static auto& DfsAllocator(MasterService& service) {
+        return service.dfs_allocator_;
+    }
+    static const auto& DfsAllocator(const MasterService& service) {
+        return service.dfs_allocator_;
+    }
+
+    static bool UsesKvcs(const MasterService& service) {
+        return service.use_kvcs_;
     }
 
     static auto& EnableOplog(MasterService& service) {
@@ -418,11 +433,6 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
-    }
-
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
@@ -443,6 +453,14 @@ class MasterServiceTestPeer {
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const {
         return DynamicReplicationController::VersionEpoch(metadata);
+    }
+
+    // Submits a dynamic replica proposal under the shared state lock that
+    // SubmitReplicaActionProposalLocked expects.
+    tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
+        const ReplicaActionProposal& proposal) {
+        std::shared_lock<std::shared_mutex> lock(service_.master_state_mutex_);
+        return service_.SubmitReplicaActionProposalLocked(proposal);
     }
 
     size_t EraseReplicasWithCacheTotalAccounting(

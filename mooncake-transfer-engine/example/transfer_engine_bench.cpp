@@ -843,7 +843,9 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
         }
 
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        // An OK or BatchCleanupDeferred return invalidates batch_id; the
+        // latter only means completion callbacks are still unwinding.
+        LOG_ASSERT(s.ok() || s.IsBatchCleanupDeferred());
         batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
@@ -920,7 +922,17 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
     } else if (FLAGS_protocol == "ub") {
-        engine->getLocalTopology()->discover({FLAGS_device_name});
+        // --device_name is a comma-separated list, as documented for the UB
+        // transport. Passing it as one string matches no URMA device, and
+        // discovery then falls back to mock_urma_device, which fails to open.
+        std::vector<std::string> ub_filter;
+        {
+            std::stringstream ss(FLAGS_device_name);
+            std::string item;
+            while (std::getline(ss, item, ','))
+                if (!item.empty()) ub_filter.push_back(item);
+        }
+        engine->getLocalTopology()->discover(ub_filter);
         xport = engine->installTransport(FLAGS_protocol, nullptr);
     } else if (FLAGS_protocol == "efa") {
         // EFA needs topology discovery to find devices, but auto_discovery

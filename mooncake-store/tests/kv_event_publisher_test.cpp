@@ -2,12 +2,15 @@
 
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 #include "kv_event/kv_event_publisher.h"
+#include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
 #include <msgpack.hpp>
@@ -483,6 +486,211 @@ TEST(KvEventPublisherTest, RemovalEmitsEveryMediumFromCaller) {
               "cpu");
     EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 1), "medium")),
               "disk");
+}
+
+TEST(KvEventPublisherTest, MemoryEvictionRetractsLastReplica) {
+    for (bool grouped : {false, true}) {
+        SCOPED_TRACE(grouped);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "eviction-test";
+        config.default_kv_lease_ttl = 0;
+        MasterService service(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "kv_event_eviction_segment";
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client = generate_uuid();
+        ASSERT_TRUE(service.MountSegment(segment, client));
+
+        const std::string key = "kv_event_eviction_key";
+        ReplicateConfig replication;
+        if (grouped) {
+            replication.group_ids = std::vector<std::string>{"event-group"};
+        }
+        ASSERT_TRUE(service.PutStart(client, key, TenantId::Default(), 1024,
+                                     replication));
+        ASSERT_TRUE(service.PutEnd(client, key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "stored", key);
+
+        test::MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+        const auto replicas =
+            service.GetReplicaListForAdmin(key, TenantId::Default());
+        ASSERT_FALSE(replicas.has_value());
+        ASSERT_EQ(replicas.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "removed", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                  "cpu");
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    }
+}
+
+TEST(KvEventPublisherTest, SegmentUnmountRetractsOnlyLastCpuReplica) {
+    for (int replica_count : {1, 2}) {
+        SCOPED_TRACE(replica_count);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "unmount-test";
+        MasterService service(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        std::vector<Segment> segments;
+        std::vector<UUID> clients;
+        for (int i = 0; i < replica_count; ++i) {
+            Segment segment;
+            segment.id = generate_uuid();
+            segment.name = "kv_event_unmount_segment_" + std::to_string(i);
+            segment.te_endpoint = segment.name;
+            segment.base = 0x300000000 + i * 0x10000000;
+            segment.size = 16 * 1024 * 1024;
+            clients.push_back(generate_uuid());
+            ASSERT_TRUE(service.MountSegment(segment, clients.back()));
+            segments.push_back(segment);
+        }
+        const std::string key = "kv_event_unmount_key";
+        ReplicateConfig replication;
+        replication.replica_num = replica_count;
+        ASSERT_TRUE(service.PutStart(clients[0], key, TenantId::Default(), 1024,
+                                     replication));
+        ASSERT_TRUE(service.PutEnd(clients[0], key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "stored", key);
+
+        for (int i = 0; i < replica_count; ++i) {
+            ASSERT_TRUE(service.UnmountSegment(segments[i].id, clients[i]));
+            const auto exists = service.ExistKey(key, TenantId::Default());
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_EQ(*exists, i + 1 < replica_count);
+            if (i + 1 < replica_count) {
+                EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+            }
+        }
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "removed", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                  "cpu");
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        // Repeated unmount is idempotent, including its event side effects.
+        ASSERT_TRUE(service.UnmountSegment(segments.back().id, clients.back()));
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    }
+}
+
+TEST(KvEventPublisherTest, MemoryCleanupDefersInvalidNoFRemoval) {
+    for (bool surviving_nof : {false, true}) {
+        SCOPED_TRACE(surviving_nof);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "mixed-cleanup-test";
+        MasterService service(config);
+        test::MasterServiceTestPeer peer(service);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "kv_event_mixed_segment";
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client = generate_uuid();
+        ASSERT_TRUE(service.MountSegment(segment, client));
+        const std::string key = "kv_event_mixed_key";
+        const auto tenant = TenantId::Default();
+        ASSERT_TRUE(
+            service.PutStart(client, key, tenant, 1024, ReplicateConfig{}));
+
+        // Inject NoF buffers without a physical device. Releasing one allocator
+        // below models segment teardown while its COMPLETE record remains.
+        auto expired_allocator = std::make_shared<DummyBufferAllocator>(
+            "expired-nof", "expired-nof");
+        auto live_allocator =
+            std::make_shared<DummyBufferAllocator>("live-nof", "live-nof");
+        using Accessor = test::MasterServiceTestPeer::MetadataAccessorRW;
+        const test::MasterServiceTestPeer::ObjectIdentity object_id{tenant,
+                                                                    key};
+        {
+            Accessor accessor(&service, object_id, Accessor::AsIs{});
+            ASSERT_TRUE(accessor.IsPublished());
+            std::vector<Replica> replicas;
+            replicas.emplace_back(std::make_unique<AllocatedBuffer>(
+                                      expired_allocator, nullptr, 1024),
+                                  ReplicaStatus::COMPLETE,
+                                  ReplicaType::NOF_SSD);
+            if (surviving_nof) {
+                replicas.emplace_back(std::make_unique<AllocatedBuffer>(
+                                          live_allocator, nullptr, 1024),
+                                      ReplicaStatus::COMPLETE,
+                                      ReplicaType::NOF_SSD);
+            }
+            accessor.Get().AddReplicas(std::move(replicas));
+        }
+        ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::MEMORY));
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 2u);
+        ExpectObjectEvent(EventAt(payload, 0), "stored", key);
+        ExpectObjectEvent(EventAt(payload, 1), "stored", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 0), "medium")),
+                  "cpu");
+        EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 1), "medium")),
+                  "disk");
+        expired_allocator.reset();
+
+        // Each ordinary write accessor runs memory-only cleanup. Neither may
+        // retract the invalid NoF replica that it leaves in metadata.
+        for (int i = 0; i < 2; ++i) {
+            {
+                Accessor accessor(&service, object_id);
+                ASSERT_TRUE(accessor.IsPublished());
+                EXPECT_EQ(accessor.Get().GetAllReplicas().size(),
+                          surviving_nof ? 3u : 2u);
+            }
+            EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        }
+
+        peer.ClearInvalidHandles();
+        if (!surviving_nof) {
+            ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+            ASSERT_EQ(EventCount(payload), 1u);
+            ExpectObjectEvent(FirstEvent(payload), "removed", key);
+            EXPECT_EQ(
+                MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                "disk");
+        }
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        {
+            Accessor accessor(&service, object_id);
+            ASSERT_TRUE(accessor.IsPublished());
+            EXPECT_EQ(accessor.Get().GetAllReplicas().size(),
+                      surviving_nof ? 2u : 1u);
+        }
+        peer.ClearInvalidHandles();
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    }
 }
 
 // A medium that survives the mutation must not be announced as removed, even

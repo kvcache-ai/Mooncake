@@ -1,12 +1,31 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "acl/acl_rt.h"
 #endif
 
 namespace mooncake {
+// Config provider for the two process switches the allocator reads. The
+// transfer engine registers callbacks at load time that read globalConfig()
+// live, so a store that flips the switches after init is picked up
+// immediately. A consumer that does not link the transfer engine (for example
+// a TENT-only Python module) leaves the provider unset and either calls
+// ascend_allocator_set_runtime_flags() or relies on the environment defaults.
+// Priority: provider > runtime flags > environment default.
+using AscendConfigBoolFn = bool (*)();
+
+void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
+                                          AscendConfigBoolFn use_fabric_mem);
+
+// Set the fallback switches used when no config provider is registered.
+// Calling this again replaces both values.
+void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem);
+
 void* ascend_allocate_memory(size_t total_size, const std::string& protocol);
 
 // Matches store allocate_buffer_mmap_memory(size, alignment, defer_populate).
@@ -49,4 +68,5 @@ void* ascend_allocate_vmm_memory_direct(size_t size);
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 aclrtDrvMemHandle ascend_get_physical_handle_from_va(void* va);
 #endif
+
 }  // namespace mooncake

@@ -363,8 +363,10 @@ class HighPerformanceTcpClient::Lane
 
     void cancelTimer() {
         ++timer_generation_;
-        std::error_code ignored;
-        timer_.cancel(ignored);
+        try {
+            timer_.cancel();
+        } catch (const std::exception&) {
+        }
     }
 
     void armIdleTimer() {

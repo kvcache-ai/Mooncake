@@ -2,6 +2,11 @@
 
 #include <cstdint>
 #include <ostream>
+#include <vector>
+
+#include <ylt/util/tl/expected.hpp>
+
+#include "types.h"
 
 namespace mooncake {
 
@@ -66,9 +71,34 @@ struct BucketBackendConfig {
     // carrying keys into a later cycle without their current offload tasks.
     bool flush_partial_buckets = false;
 
+    // Per-disk quotas, positionally aligned with the disks parsed out of
+    // FileStorageConfig::storage_filepath. Empty => broadcast the scalar
+    // max_total_size to every disk. Otherwise it must have exactly one entry
+    // per disk; BucketStorageBackend::Init() rejects any other length.
+    std::vector<int64_t> max_total_size_per_disk;
+
+    // Write bucket data files with O_DIRECT instead of through the page
+    // cache. Every value starts on a 4 KiB boundary of the file (zeros, then
+    // the key, in front of it), so the 4 KiB blocks of a value in 4 KiB
+    // aligned buffers go to the device from those buffers; only key blocks,
+    // each value's last partial block and unaligned values are copied.
+    // Files written this way stay readable when the option is off.
+    // Set by MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned.
+    bool aligned_direct_write = false;
+
     bool Validate() const;
 
-    static BucketBackendConfig FromEnvironment();
+    /**
+     * @brief Build the configuration from MOONCAKE_OFFLOAD_BUCKET_* variables.
+     *
+     * Scalar variables that fail to parse fall back to their defaults with a
+     * warning. The per-disk quota list is stricter because it is positionally
+     * aligned with the disks: an empty or unparsable entry is an error.
+     *
+     * @return The configuration; INVALID_PARAMS if the per-disk quota list
+     *         has an empty or unparsable entry.
+     */
+    static tl::expected<BucketBackendConfig, ErrorCode> FromEnvironment();
 };
 
 }  // namespace mooncake

@@ -49,6 +49,7 @@ struct FabricProfile {
     // Request FI_DELIVERY_COMPLETE so a WRITE completion means the data is
     // visible at the target, for providers that complete on transmit.
     bool delivery_complete;
+    bool hmem;  // request FI_HMEM in GPU builds
 };
 
 // Returns nullptr for an unknown name. "auto" is resolved by the caller.
@@ -163,14 +164,16 @@ class FabricContext {
     const std::string& address() const { return address_; }
     int numaNode() const { return numa_node_; }
     bool virtAddr() const { return virt_addr_; }
+    bool hmem() const { return hmem_; }
     uint64_t maxMrSize() const { return max_mr_size_; }
     size_t maxMsgSize() const { return max_msg_size_; }
     uint64_t inflight() const {
         return inflight_.load(std::memory_order_acquire);
     }
 
-    Status registerMemory(void* addr, size_t length, struct fid_mr*& mr,
-                          void*& desc, uint64_t& key);
+    // cuda_device is the CUDA ordinal owning addr, or -1 for host memory.
+    Status registerMemory(void* addr, size_t length, int cuda_device,
+                          struct fid_mr*& mr, void*& desc, uint64_t& key);
     void deregisterMemory(struct fid_mr* mr);
 
     // Inserts a peer's fi_getname() blob into the AV once and caches it.
@@ -196,6 +199,7 @@ class FabricContext {
     bool virt_addr_ = true;
     bool mr_bind_ep_ = false;
     bool prov_key_ = true;
+    bool hmem_ = false;
     uint64_t max_mr_size_ = 0;
     size_t max_msg_size_ = 0;
     size_t credits_ = 0;

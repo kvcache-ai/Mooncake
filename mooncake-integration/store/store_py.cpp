@@ -25,15 +25,6 @@
 #include "integration_utils.h"
 #include "buffer_pool.h"
 
-// Forward declaration for EngramStore bindings
-namespace mooncake {
-namespace engram {
-void bind_engram_store(py::module &m);
-}
-}  // namespace mooncake
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
-
 namespace py = pybind11;
 
 namespace mooncake {
@@ -157,6 +148,23 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
+py::object materialize_contiguous_tensor(const py::handle &tensor) {
+    py::object contiguous = tensor.attr("contiguous")();
+#ifdef USE_MLU
+    if (!contiguous.is(tensor) &&
+        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        // CNRT copies do not wait for work on PyTorch's current MLU stream.
+        // The caller can synchronize its input, but this new copy is ours.
+        // Wait before exposing its pointer to Store, including for TP shards.
+        py::module_::import("torch")
+            .attr("mlu")
+            .attr("current_stream")(contiguous.attr("device"))
+            .attr("synchronize")();
+    }
+#endif
+    return contiguous;
+}
+
 PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                       const std::string &key_name,
                                       bool require_contiguous,
@@ -181,7 +189,7 @@ PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         }
 
         py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
+            require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
         info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = inspected.attr("numel")().cast<size_t>();
@@ -489,6 +497,27 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
 // ErrorCode values are already negative, so just cast to int
 inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
+}
+
+// View a Python buffer as the bytes it covers. `buffer_info::size` counts
+// elements, not bytes, so the byte length is size * itemsize; a span cannot
+// describe a non-contiguous buffer, so those are rejected. Call this before
+// releasing the GIL: it may raise.
+inline std::span<const char> contiguous_buffer_span(
+    const py::buffer_info &info) {
+    if (info.size > 0) {
+        py::ssize_t expected_stride = info.itemsize;
+        for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+            if (info.shape[dim] > 1 && info.strides[dim] != expected_stride) {
+                throw py::value_error(
+                    "value must be a C-contiguous buffer (bytes, bytearray, "
+                    "or a contiguous array); got a strided view");
+            }
+            expected_stride *= info.shape[dim];
+        }
+    }
+    return {static_cast<const char *>(info.ptr),
+            static_cast<size_t>(info.size * info.itemsize)};
 }
 
 #include "store_py_internal.h"
@@ -1178,6 +1207,7 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
         if (!config.group_ids && !config.session_ids &&
+            !config.residency_affinity_ids &&
             !config.per_key_preferred_hca_names) {
             return config;
         }
@@ -1201,9 +1231,10 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (!config.HasValidKeyHints(key_count)) {
-            LOG(ERROR) << operation_name
-                       << ": group_ids and per-key HCA hint counts must match "
-                          "keys size";
+            LOG(ERROR)
+                << operation_name
+                << ": group, affinity and per-key HCA hint counts must match "
+                   "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1214,11 +1245,20 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        // Single-tensor TP keeps per-shard group/HCA hints and one source
-        // session ID, which is expanded to all shards below.
-        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
+        // Single-tensor TP keeps per-shard group/HCA hints. Session and
+        // residency affinity IDs describe the source tensor, not each shard.
+        if (!config.ValidSessionIds(1) ||
+            (config.residency_affinity_ids &&
+             config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
+            ReplicateConfig tp_config = config;
+            if (config.residency_affinity_ids) {
+                tp_config.residency_affinity_ids = std::vector<std::string>(
+                    tp_size, config.residency_affinity_ids->front());
+            }
+            if (!tp_config.HasValidKeyHints(tp_size))
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
@@ -1230,7 +1270,6 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            ReplicateConfig tp_config = config;
             if (config.session_ids) {
                 tp_config.session_ids =
                     std::vector<std::string>(tp_size, config.SessionId());
@@ -2175,6 +2214,18 @@ PYBIND11_MODULE(_store, m) {
                 if (ids) config.session_ids = std::move(*ids);
             })
         .def_property(
+            "residency_affinity_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.residency_affinity_ids) return std::nullopt;
+                return *config.residency_affinity_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.residency_affinity_ids.reset();
+                if (ids) config.residency_affinity_ids = std::move(*ids);
+            })
+        .def_property(
             "preferred_hca_names",
             [](const ReplicateConfig &config)
                 -> std::optional<std::vector<std::string>> {
@@ -2394,33 +2445,6 @@ PYBIND11_MODULE(_store, m) {
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
-    // Helper function to extract PyClient shared_ptr from
-    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
-    // PyClient We return it as a Python capsule to avoid type registration
-    // issues
-    m.def(
-        "_get_pyclient_from_wrapper",
-        [](MooncakeStorePyWrapper &wrapper) -> py::object {
-            if (!wrapper.store_) {
-                return py::none();
-            }
-            // Return as a capsule containing the shared_ptr
-            // The caller (engram_store_py.cpp) will extract it
-            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
-            // freed; otherwise release() transfers ownership to the capsule.
-            auto ptr =
-                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
-            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
-            py::object cap = py::capsule(raw_ptr, [](void *p) {
-                delete static_cast<std::shared_ptr<PyClient> *>(p);
-            });
-            (void)ptr.release();  // Transfer ownership to capsule
-            return cap;
-        },
-        py::arg("wrapper"),
-        "Get PyClient from MooncakeDistributedStore (internal use, returns "
-        "capsule)");
-
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
@@ -2958,12 +2982,9 @@ PYBIND11_MODULE(_store, m) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->upsert(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->upsert(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{},
@@ -3016,9 +3037,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3225,12 +3244,9 @@ PYBIND11_MODULE(_store, m) {
                py::buffer buf,
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->put(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->put(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{})
@@ -3276,9 +3292,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3562,9 +3576,6 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
-
-    // Add EngramStore bindings
-    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake

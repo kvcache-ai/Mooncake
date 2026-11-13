@@ -153,6 +153,61 @@ Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints`
 
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
+**etcd TLS and mutual TLS:** the Go etcd wrapper accepts the following environment
+variables. They apply to the Store HA, snapshot, and dedicated lease keepalive
+clients, as well as Transfer Engine metadata clients built with `USE_ETCD=ON`
+and `USE_ETCD_LEGACY=OFF`.
+
+| Variable | Meaning |
+|---|---|
+| `MOONCAKE_ETCD_CA_CERT` | PEM CA bundle used to verify the etcd server. If omitted, TLS uses the system trust store. |
+| `MOONCAKE_ETCD_CLIENT_CERT` | PEM client certificate chain for mutual TLS. Requires `MOONCAKE_ETCD_CLIENT_KEY`. |
+| `MOONCAKE_ETCD_CLIENT_KEY` | Client private key. Requires `MOONCAKE_ETCD_CLIENT_CERT`. |
+| `MOONCAKE_ETCD_SERVER_NAME` | Optional server name for SNI and certificate hostname verification, for example when connecting by IP. Requires a CA bundle or client certificate configuration. |
+
+Set only the CA bundle for server-authenticated TLS, or also set the client
+certificate and key for mutual TLS. Server certificate verification remains
+enabled, and configured TLS requires TLS 1.2 or newer. Use `https://` or bare
+`host:port` endpoints with these variables. An `http://` endpoint is rejected
+when TLS is configured because the etcd Go client would otherwise discard the
+TLS credentials for that endpoint.
+
+For Transfer Engine `metadata_server`, use bare `host:port` endpoints or the
+`etcd://host:port` backend selector with these variables. A top-level `https://`
+metadata URL selects Mooncake's HTTP metadata service instead of etcd. Store
+leader discovery also keeps its `etcd://` backend selector, for example
+`etcd://10.0.0.1:2379;10.0.0.2:2379` for `master_server_addr`.
+
+For example, start an HA master against an etcd cluster requiring mutual TLS:
+
+```bash
+export MOONCAKE_ETCD_CA_CERT=/etc/etcd/ca.pem
+export MOONCAKE_ETCD_CLIENT_CERT=/etc/etcd/client.pem
+export MOONCAKE_ETCD_CLIENT_KEY=/etc/etcd/client-key.pem
+# Optional: use the DNS name on the server certificate when connecting by IP.
+export MOONCAKE_ETCD_SERVER_NAME=etcd.example.com
+
+mooncake_master \
+  --enable_ha=true \
+  --ha_backend_type=etcd \
+  --ha_backend_connstring="https://10.0.0.1:2379;https://10.0.0.2:2379" \
+  --rpc_address=10.0.0.10
+```
+
+Set the same variables in client processes that connect to these etcd endpoints.
+Python applications can set them using `os.environ` after importing Mooncake,
+before calling `setup()`. No additional Python or C API calls are required.
+The variables configure all Go etcd clients in the process; configure them before
+initializing clients and keep them stable during use. Existing connections do
+not reload certificates automatically.
+
+If all four variables are unset, existing endpoint behavior is preserved.
+Incomplete certificate/key pairs, unreadable or invalid certificate files,
+and a server-name override without TLS configuration return client initialization
+errors. Server trust, hostname, and client-authentication checks occur when the
+connection is established; the first etcd operation reports a handshake failure
+if those checks fail.
+
 ---
 
 ### High-Availability (Redis) — Experimental Alternative HA Backend
@@ -161,7 +216,7 @@ Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints`
 Redis-backed HA is experimental. It still needs further verification and hardening. It is not a Primary-Standby deployment and it is not a strict-durability failover path.
 ```
 
-Redis is an ephemeral coordination store. A successful Redis write means Redis accepted the record. It does not mean the record is durably committed, and failover does not recover cluster metadata from Redis. `appendfsync everysec` can remain the default operational setting because correctness does not depend on replaying acknowledged Redis records after a restart. If the Redis namespace is missing, empty, or fails validation, treat that state as lost and rebuild by starting a new empty cluster so applications can repopulate metadata from the authoritative source. See **Recovery from Unusable HA State**. Primary-Standby OpLog replication, promotion, and batch OpLog snapshots require `ha_backend_type=etcd`.
+Redis is an ephemeral coordination store. A successful Redis write means Redis accepted the record. It does not mean the record is durably committed, and failover does not recover cluster metadata from Redis. `appendfsync everysec` can remain the default operational setting because correctness does not depend on replaying acknowledged Redis records after a restart. If the Redis namespace is missing, empty, or fails validation, treat that state as lost and rebuild by starting a new empty cluster so applications can repopulate metadata from the authoritative source. See **Recovery from Unusable HA State**. Batch OpLog snapshots require `ha_backend_type=etcd`. Redis OpLog remains experimental and uses the replica acknowledgment policy below.
 
 ```bash
 mooncake_master \
@@ -172,6 +227,32 @@ mooncake_master \
 ```
 
 **Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. The build must include `STORE_USE_REDIS`.
+
+**Redis OpLog replica acknowledgments:** with `--enable_oplog=true`, the HA KV
+backend factory uses a fixed policy requiring exactly one replica acknowledgment.
+This changes the earlier behavior that accepted a successful Lua reply without
+waiting for replicas. It applies to `Put`, `Txn`, and `DeleteRange`, including
+their legacy `ErrorCode` interfaces. The supported deployment for this factory
+path is one primary with exactly one replica; Redis leadership without OpLog is
+unaffected by this KV policy.
+
+The count is neither discovered automatically nor interpreted as a minimum.
+With no replica, a write can execute but remains unknown after the confirmation
+timeout. With two or more replicas, `WAIT 1` can return `2` or more, which is a
+valid Redis response but does not match the fixed policy. Such a write returns
+unknown (`ETCD_OPERATION_ERROR` through the legacy interface), even if every
+replica received it. It can instead succeed when only one ACK has arrived, so
+multi-replica deployments through this factory are unsupported and their results
+can depend on ACK timing. An unknown result does not prove that no write occurred;
+the backend does not automatically replay it.
+
+Master configuration cannot yet change this count, and the factory does not
+validate replica membership. Component callers can construct `RedisHaKvBackend`
+with an explicit policy matching their deployment, but this does not configure
+the Master factory path. Explicit replica-count configuration and topology
+validation remain follow-up work. These backend acknowledgments also do not
+establish end-to-end OpLog durability: existing readback reconciliation can still
+report success for a visible batch without proving the replica policy was met.
 
 
 ---
@@ -368,6 +449,7 @@ HA leadership and metadata replication are configured separately:
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--etcd_max_send_message_bytes`: Outgoing gRPC message limit for the HA store etcd client, in bytes. Defaults to `2097152` (2 MiB) and must be positive. For a server configured with `--max-request-bytes=16777216`, use `--etcd_max_send_message_bytes=16777216` and keep serialized batches below that request budget. The setting is applied before the first connection and reused by reset and keepalive clients; it does not change the server limit, receive limit, Transfer Engine client, or snapshot client. The YAML/JSON configuration key is also `etcd_max_send_message_bytes`; an explicitly supplied CLI flag overrides it.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
 - With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
 - Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
@@ -580,6 +662,11 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_requested_bytes_sum`
 - `mooncake_tenant_quota_effective_bytes_sum`
 
+With `--metrics_key_groups="kv:suffix:_k,state:prefix:state_"`, `/metrics` also
+reports `master_key_count_by_group{group}` and `master_value_bytes_by_group{group}`.
+Rules are `group:prefix|suffix|contains:pattern`; the first match wins and other
+keys count as `other`. Value bytes are logical, once per key.
+
 ---
 
 ## Tenant Quota Management
@@ -642,6 +729,7 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 |------|---------|-------------|
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
+| `--metrics_key_groups` | `""` | Break key count and value bytes down by key; see [Metrics Endpoints](#metrics-endpoints) |
 
 ### KV Cache Event Publisher
 
@@ -795,6 +883,7 @@ mooncake_master \
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
+| `--etcd_max_send_message_bytes` | `2097152` | Positive outgoing gRPC message limit in bytes for the HA store etcd client; configure before connection and keep requests within the etcd server byte limit |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
@@ -1093,6 +1182,8 @@ reads for that descriptor.
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
+- Put sessions (`batch_put_session_start` and the ranged put APIs) write MEMORY
+  replicas only and reject `dfs_replica_num > 0` with `INVALID_PARAMS`.
 - A DFS object must fit in a single shard after alignment and allocator
   size-class rounding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
@@ -1229,7 +1320,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
-| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; with `bucket_storage_backend` it may be a comma-separated list of paths to spread offload across several disks. DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |

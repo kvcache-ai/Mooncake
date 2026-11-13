@@ -153,11 +153,14 @@ struct RdmaSlice {
     std::string target_machine_id;
 
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
+    // Whether this slice's posted WR generates a CQE during normal operation.
+    // An unsignaled WR can still generate a CQE when its QP is flushed.
+    bool completion_signaled = false;
     // Posted work requests whose completion has not been polled and fully
-    // handled yet; every work request is signalled, so each accepted post
-    // owes one. The status cannot stand in for this -- a timeout or a
-    // teardown resolves a slice while its work request is live. Above zero,
-    // the completion queue can still hand this address back, or a handler
+    // handled yet; every WR owes one because a QP error can produce a flush
+    // CQE for an unsignaled WR too. The status cannot stand in for this: a
+    // timeout or teardown can resolve a slice while its WR is still live.
+    // While nonzero, the CQ can still hand this address back, or a handler
     // can still be reading the slice, so the storage must outlive the
     // batch: see RdmaTransport::freeSubBatch() and Workers::handleCompletion().
     std::atomic<int> completions_owed{0};
@@ -203,10 +206,13 @@ struct RdmaSlice {
     // Non-owning pointer to the per-worker RailMonitor for this slice's
     // target machine, resolved once in generatePostPath. Lets asyncPollCq
     // and disableEndpoint call markRecovered / markFailed without a
-    // string-keyed map lookup on the RDMA hot path. Stable because
-    // WorkerContext::rails stores values via unique_ptr, so rehashes do
-    // not invalidate the pointee.
-    RailMonitor* rail_monitor = nullptr;
+    // string-keyed map lookup on the RDMA hot path. Shared ownership keeps it
+    // alive through endpoint teardown and stable across map rehashes.
+    std::shared_ptr<RailMonitor> rail_monitor;
+    // Nonzero only when this slice owns an admitted probe/trial on
+    // rail_monitor. A stale completion/flush must not cancel another slice's
+    // in-flight probe on the same per-worker RailMonitor.
+    std::atomic<uint64_t> rail_probe_token{0};
     int priority = PRIO_HIGH;
 };
 

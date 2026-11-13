@@ -18,6 +18,8 @@ HPE = "HPE"
 [default.extend-identifiers]
 # CPython buffer protocol flag from the Python C API.
 PyBUF_ND = "PyBUF_ND"
+# PyTorch tensor creation API used in documentation examples.
+arange = "arange"
 
 [files]
 extend-exclude = [

@@ -325,6 +325,42 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
 
+    def test_put_typed_buffer_stores_all_bytes(self):
+        """put/upsert/put_batch must use the byte length, not the element count."""
+        import array
+
+        key = "test_put_typed_buffer"
+        batch_keys = [f"{key}_batch_{i}" for i in range(2)]
+        value = array.array("f", [1.5] * 1024)  # 1024 elements, 4096 bytes
+        expected = value.tobytes()
+        self.assertEqual(len(expected), 4 * len(value))
+
+        self.assertEqual(self.store.put(key, value), 0)
+        self.assertEqual(self.store.get_size(key), len(expected))
+        self.assertEqual(self.store.get(key), expected)
+
+        self.assertEqual(self.store.upsert(key, value), 0)
+        self.assertEqual(self.store.get_size(key), len(expected))
+        self.assertEqual(self.store.get(key), expected)
+
+        batch_values = [value, bytearray(expected)]
+        self.assertEqual(self.store.put_batch(batch_keys, batch_values), 0)
+        for batch_key in batch_keys:
+            self.assertEqual(self.store.get_size(batch_key), len(expected))
+            self.assertEqual(self.store.get(batch_key), expected)
+
+        # A strided view has no single contiguous byte range and must be rejected
+        # instead of being stored with the wrong bytes.
+        strided_key = key + "_strided"
+        with self.assertRaises(ValueError):
+            self.store.put(strided_key, memoryview(expected)[::2])
+        self.assertEqual(self.store.is_exist(strided_key), 0)
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.remove(key), 0)
+        for batch_key in batch_keys:
+            self.assertEqual(self.store.remove(batch_key), 0)
+
     def test_batch_is_exist_operations(self):
         """Test batch is_exist operations through the Python interface."""
         batch_size = 20

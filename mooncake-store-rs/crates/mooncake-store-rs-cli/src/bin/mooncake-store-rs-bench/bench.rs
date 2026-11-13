@@ -10,6 +10,7 @@ use mooncake_store_client::{
 use mooncake_store_core::{Result as StoreResult, StoreError};
 use tracing::{debug, info, warn};
 
+use crate::aligned_buffer::AlignedBuffer;
 use crate::cli::{BenchArgs, BenchMode, GlobalArgs, ReadInterface, WriteInterface};
 use crate::datagen::{make_key, make_seed, payload};
 use crate::latency::LatencyRecorder;
@@ -139,7 +140,7 @@ fn read_operation_width(interface: ReadInterface, batch_size: usize) -> usize {
 
 struct RegisteredWriteBuffers<'a> {
     client: &'a StoreClient,
-    storage: Vec<u8>,
+    storage: AlignedBuffer,
     slot_size: usize,
 }
 
@@ -150,7 +151,7 @@ impl<'a> RegisteredWriteBuffers<'a> {
         slot_size: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let total_bytes = slots.saturating_mul(slot_size);
-        let mut storage = vec![0u8; total_bytes];
+        let mut storage = AlignedBuffer::zeroed(total_bytes);
         client.register_buffer(storage.as_mut_ptr().cast(), storage.len())?;
         Ok(Self {
             client,
@@ -162,7 +163,7 @@ impl<'a> RegisteredWriteBuffers<'a> {
     fn fill_slot(&mut self, slot: usize, value: &[u8]) {
         let start = slot * self.slot_size;
         let end = start + self.slot_size;
-        self.storage[start..end].copy_from_slice(value);
+        self.storage.as_mut_slice()[start..end].copy_from_slice(value);
     }
 
     fn request<'b>(
@@ -202,13 +203,15 @@ impl Drop for RegisteredWriteBuffers<'_> {
 }
 
 struct ReadBuffers {
-    slots: Vec<Vec<u8>>,
+    slots: Vec<AlignedBuffer>,
 }
 
 impl ReadBuffers {
     fn new(slots: usize, slot_size: usize) -> Self {
         Self {
-            slots: (0..slots).map(|_| vec![0u8; slot_size]).collect(),
+            slots: (0..slots)
+                .map(|_| AlignedBuffer::zeroed(slot_size))
+                .collect(),
         }
     }
 

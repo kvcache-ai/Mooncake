@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +33,10 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // When range_read is set, slices are a window of the value starting at
+    // value_offset. Otherwise slices must cover the whole object.
+    uint64_t value_offset = 0;
+    bool range_read = false;
 };
 
 /**
@@ -62,6 +67,14 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
 
+    bool UsesKvcs() const {
+        return UsesObjectStorage() && distributed_config_.UsesKvcs();
+    }
+
+    // True when reads go through a filesystem adapter that can read straight
+    // into arbitrary host memory without an intermediate buffer.
+    bool SupportsArbitraryHostReadBuffers() const;
+
     tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -76,6 +89,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
+
+    ObjectStorageIoResults BatchDeleteObjects(
+        std::span<const std::string> logical_keys);
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.

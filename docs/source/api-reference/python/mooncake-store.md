@@ -620,6 +620,44 @@ In the example above:
 - Source overflow is checked against the source object's size.
 - Full-object `get_into()` and ranged `get_into_ranges()` are different APIs; use `get_into()` when you want the whole object into one buffer.
 
+Gather endpoints are discovered through a separate, expiring Store RPC directory.
+Owners refresh their entries on existing heartbeats; readers cache discoveries.
+This does not change segment/object descriptors, allocator metadata, or snapshots.
+Missing entries or unsupported directory RPCs fall back to scatter.
+
+**Automatic gather/scatter selection:** for remote CPU memory replicas on
+classic RDMA Store owners, the Store can pack many small source fragments
+into registered chunks and pipeline ordinary Transfer Engine WRITEs into a
+contiguous destination. The API and per-fragment results remain unchanged.
+
+Selection is per owner and destination buffer, including ranges from multiple
+keys ordered by destination offset. The initial policy requires at least 256
+source runs, fragments of at most 1 KiB, at least 64 KiB total payload, and a
+contiguous, non-overlapping destination. Requests are bounded to 131,072 ranges
+and 512 MiB per gather operation. Small requests, large fragments, destination
+gaps, local-copy/shared-memory proxy paths, TCP, TENT, mixed-protocol destinations,
+and owners without the capability use existing paths. TCP gathering is disabled
+because a failed sender cannot fence writes still pending at the receiver. Set `MC_STORE_GATHER_READ=0` on the reader to disable gather selection.
+This switch does not change buffer registration, allowing direct comparisons.
+
+Store output buffers registered on supported classic RDMA transports are published
+for remote access because gather uses owner-initiated WRITEs. Callers must keep
+buffers and registrations alive until the synchronous read returns, and must
+establish GPU visibility before consuming RDMA-written GPU data. Ordinary reads
+retain lease renewal during discovery, connection/session setup, and transfer
+completion across all owners; snapshot reads do not renew or change the selected
+snapshot. An owner rejection before any write can fall back to scatter. If a
+later chunk fails, fully completed fragments retain their successful results;
+fragments overlapping failed or unproven chunks return errors after all writes
+drain. Submitted data failures do not fall back or replay writes.
+Idle sessions may be retired when the owner's session table is full; retired
+sessions fall back safely, and readers replace retired connections. Fencing
+identifies the service instance so session retirement cannot hide an owner restart.
+After a control-connection failure, the reader fences the original operation
+before returning; it does not replay writes. If the original owner/session
+cannot be reached, the read remains pending rather than allowing unsafe buffer
+reuse. Automatic recovery from a lost owner process is not provided.
+
 **Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
 
 ---
@@ -778,6 +816,35 @@ Old RPC readers can ignore the compatible extension, but do not persist or
 publish session tags. Upgrade the Store client and Master to enable attribution.
 A storage node's disk scan alone cannot reconstruct metadata tags after all
 Master metadata is lost; preserve the metadata recovery artifacts as well.
+
+#### residency_affinity_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional opaque per-key residency affinity metadata. Supply one entry per input
+key, including one entry for a single-key write. An empty string records no
+affinity; an empty list is invalid for a nonempty write. Batch splitting and
+retry subsets preserve the IDs in key order.
+
+```python
+config = ReplicateConfig()
+config.residency_affinity_ids = ["tensor-a", "tensor-a", ""]
+store.put_batch(["key-a", "key-b", "key-c"], [b"a", b"b", b"c"], config)
+config.residency_affinity_ids = None
+```
+
+Upsert preserves an existing object's affinity when the field is omitted,
+including when storage is reallocated. An explicitly different ID is rejected;
+remove and recreate the object to change its affinity. Duplicate Put leaves
+the existing metadata unchanged.
+
+Affinity survives metadata OpLog replay, snapshots, and standby promotion.
+Persisted object metadata appends affinity after the existing session and
+checksum extensions. Old records default to empty affinity, and old readers
+can ignore the new field.
+Upgrade clients and Masters together to retain affinity throughout recovery.
+This field only records metadata: it does not enable migration, change placement
+or eviction policy, or alter the weight metadata snapshot schema.
 
 #### group_ids
 **Type:** `List[str] | None`
@@ -3152,10 +3219,11 @@ are read into request-scoped host staging and then scattered to host or device
 destinations; for device destinations, staging first uses the fixed-capacity
 pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
 and falls back to the regular client buffer allocator if it is unavailable or
-exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
-and then scatter object-byte ranges into already `register_buffer`'d
-destinations (the reader does not need a setup local buffer). DISK replicas
-`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+exhausted. LOCAL_DISK replicas restore only the requested byte window on the
+owner via the offload RPC and then scatter that window into already
+`register_buffer`'d destinations (the reader does not need a setup local
+buffer). DISK and DFS replicas read that same window into a temporary host
+buffer and scatter it. If a key
 has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
 it has only NOF replicas — `batch_get_session_start` returns
 `INVALID_REPLICA` for that key and does not open a session. Put sessions
@@ -3165,7 +3233,9 @@ reserve object space via Master `BatchPutStart` and finalize with
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
 `batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
-Reliable multi-replica NoF configs are rejected at session start. `end` / `revoke`
+Reliable multi-replica NoF configs are rejected at session start. DFS configs
+(`dfs_replica_num > 0`, including DFS-only) are also rejected at session start with
+`INVALID_PARAMS`; use `put` / `batch_put_from` for DFS placement. `end` / `revoke`
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 

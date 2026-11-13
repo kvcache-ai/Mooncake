@@ -49,14 +49,38 @@ impl StoreClient {
         )
     }
 
-    fn mark_local_pending_reservation(
+    fn reserve_local_pending(
         &self,
-        reservation: &mooncake_store_core::SegmentReservation,
-    ) {
-        let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
-        self.allocator
-            .lock()
-            .mark_pending_reservation(reservation, deadline_ms);
+        owner: &ClientRuntimeId,
+        segment_name: Option<&SegmentName>,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let deadline_ms = self.pending_publish_deadline_ms(length_bytes);
+        let mut allocator = self.allocator.lock();
+        let lifecycle_enabled = self.allocation_lifecycle_enabled;
+        match (segment_name, lifecycle_enabled) {
+            (Some(segment_name), true) => allocator
+                .reserve_specific_with_pending_publication_limited(
+                    owner,
+                    segment_name,
+                    length_bytes,
+                    deadline_ms,
+                    self.allocation_lifecycle,
+                ),
+            (None, true) => allocator.reserve_any_with_pending_publication_limited(
+                owner,
+                length_bytes,
+                deadline_ms,
+                self.allocation_lifecycle,
+            ),
+            (Some(segment_name), false) => allocator.reserve_specific_with_pending(
+                owner,
+                segment_name,
+                length_bytes,
+                deadline_ms,
+            ),
+            (None, false) => allocator.reserve_any_with_pending(owner, length_bytes, deadline_ms),
+        }
     }
 
     fn set_lifecycle_state(&self, next_state: ClientLifecycleState) {
@@ -206,11 +230,9 @@ impl StoreClient {
         let result = self.evacuate_draining_routes_until_stable(
             "hot-upgrade evacuation still has live bytes on local segments",
             |route| match helper_writer.as_ref() {
-                Some(writer) => self.migrate_owned_route_to_runtime_via_writer(
-                    writer,
-                    successor,
-                    route,
-                ),
+                Some(writer) => {
+                    self.migrate_owned_route_to_runtime_via_writer(writer, successor, route)
+                }
                 None => self.migrate_owned_route_to_runtime(successor, route),
             },
         );
@@ -578,6 +600,27 @@ impl StoreClient {
         }
     }
 
+    fn lookup_runtime_lease_for_release_once(
+        &self,
+        runtime: &ClientRuntimeId,
+        force_refresh: bool,
+    ) -> Result<ClientLease> {
+        self.compatible_live_clients(force_refresh)?
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime)
+            .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", runtime)))
+    }
+
+    fn lookup_runtime_lease_for_release(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
+        match self.lookup_runtime_lease_for_release_once(runtime, false) {
+            Ok(lease) => Ok(lease),
+            Err(StoreError::NotFound(_)) => {
+                self.lookup_runtime_lease_for_release_once(runtime, true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn transport_open_segment_name<'a>(
         segment_name: &'a SegmentName,
         transport_endpoint: Option<&'a str>,
@@ -654,7 +697,7 @@ impl StoreClient {
         force_refresh: bool,
     ) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
         let mut leases = BTreeMap::new();
-        for lease in self.available_compatible_live_clients(force_refresh)? {
+        for lease in self.compatible_live_clients(force_refresh)? {
             if !wanted.contains(&lease.runtime) {
                 continue;
             }
@@ -747,6 +790,9 @@ impl StoreClient {
     ) -> Result<mooncake_store_core::SegmentReservation> {
         if *owner == self.lease.runtime {
             lifecycle_accepts_writes(&self.lifecycle_state, "local storage allocator")?;
+            let _ = self
+                .storage_owner
+                .process_due_delete_pending_for_reserve()?;
             if require_local_memory {
                 let state = self.state.lock();
                 if let Some(segment_name) = segment_name {
@@ -765,30 +811,14 @@ impl StoreClient {
                 .get("storage")
                 .is_some_and(|value| value == "true");
             if !allow_local_eviction {
-                let reservation = match segment_name {
-                    Some(segment_name) => self
-                        .allocator
-                        .lock()
-                        .reserve_specific(owner, segment_name, length_bytes),
-                    None => self.allocator.lock().reserve_any(owner, length_bytes),
-                }?;
-                self.mark_local_pending_reservation(&reservation);
+                let reservation = self.reserve_local_pending(owner, segment_name, length_bytes)?;
                 return Ok(reservation);
             }
             let mut last_error = None;
             for _ in 0..=32usize {
-                let reservation = match segment_name {
-                    Some(segment_name) => self
-                        .allocator
-                        .lock()
-                        .reserve_specific(owner, segment_name, length_bytes),
-                    None => self.allocator.lock().reserve_any(owner, length_bytes),
-                };
+                let reservation = self.reserve_local_pending(owner, segment_name, length_bytes);
                 match reservation {
-                    Ok(reservation) => {
-                        self.mark_local_pending_reservation(&reservation);
-                        return Ok(reservation);
-                    }
+                    Ok(reservation) => return Ok(reservation),
                     Err(StoreError::Allocator(message)) => {
                         last_error = Some(message);
                     }
@@ -799,7 +829,7 @@ impl StoreClient {
                         self.storage_owner.as_ref(),
                     );
                 }
-                if !self.storage_owner.evict_one(segment_name)? {
+                if !self.storage_owner.evict_one_for_reservation(segment_name)? {
                     break;
                 }
             }
@@ -809,14 +839,30 @@ impl StoreClient {
         }
 
         let owner_lease = self.lookup_runtime_lease(owner)?;
-        let rpc_result = match segment_name {
-            Some(segment_name) => self.control_client.reserve_specific(
+        let lifecycle_enabled = owner_lease
+            .compatibility
+            .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+        let rpc_result = match (segment_name, lifecycle_enabled) {
+            (Some(segment_name), true) => self
+                .control_client
+                .reserve_specific_with_pending_publication(
+                    &owner_lease,
+                    owner,
+                    segment_name,
+                    length_bytes,
+                ),
+            (None, true) => self.control_client.reserve_any_with_pending_publication(
+                &owner_lease,
+                owner,
+                length_bytes,
+            ),
+            (Some(segment_name), false) => self.control_client.reserve_specific(
                 &owner_lease,
                 owner,
                 segment_name,
                 length_bytes,
             ),
-            None => self
+            (None, false) => self
                 .control_client
                 .reserve_any(&owner_lease, owner, length_bytes),
         };
@@ -846,11 +892,8 @@ impl StoreClient {
             }
             if request_preferred_segments.is_empty() {
                 if let Some(segments) = placement.preferred_segments.as_ref() {
-                    hint_preferred_segments = segments
-                        .iter()
-                        .cloned()
-                        .map(SegmentName::new)
-                        .collect();
+                    hint_preferred_segments =
+                        segments.iter().cloned().map(SegmentName::new).collect();
                 }
             }
             if let Some(prefer_local) = placement.prefer_local {
@@ -871,7 +914,8 @@ impl StoreClient {
 
         let required_preferred_segments =
             Self::resolve_preferred_segments(&request_preferred_segments, true)?;
-        let hint_preferred_segments = Self::resolve_preferred_segments(&hint_preferred_segments, false)?;
+        let hint_preferred_segments =
+            Self::resolve_preferred_segments(&hint_preferred_segments, false)?;
 
         Ok(ResolvedReplicationPolicy {
             replica_count,
@@ -957,6 +1001,7 @@ impl StoreClient {
         soft && matches!(
             error,
             StoreError::Allocator(_)
+                | StoreError::Backpressure(_)
                 | StoreError::NotFound(_)
                 | StoreError::InvalidState(_)
                 | StoreError::Transport(_)
@@ -997,12 +1042,12 @@ impl StoreClient {
         let mut targets = Vec::with_capacity(policy.replica_count);
         let mut reservations = Vec::with_capacity(policy.replica_count);
         let mut excluded = BTreeSet::new();
-        let rollback =
-            |this: &Self,
-             targets: &[ReplicaWriteTarget],
-             reservations: &[mooncake_store_core::SegmentReservation]| {
-                let _ = this.release_reserved_allocations(targets, reservations);
-            };
+        let mut last_backpressure;
+        let rollback = |this: &Self,
+                        reservations: &[mooncake_store_core::SegmentReservation],
+                        reason: &str| {
+            this.release_reservations_or_enqueue(reservations, reason);
+        };
 
         {
             let mut preferred = PreferredSegmentReservationContext {
@@ -1015,19 +1060,36 @@ impl StoreClient {
                 reservations: &mut reservations,
             };
 
-            self.reserve_preferred_segments(
+            last_backpressure = match self.reserve_preferred_segments(
                 &mut preferred,
                 &policy.required_preferred_segments,
                 PreferredSegmentSource::Request,
                 false,
-            )?;
+            ) {
+                Ok(error) => error,
+                Err(error) => {
+                    rollback(
+                        self,
+                        preferred.reservations,
+                        "reserve_required_segments_failed",
+                    );
+                    return Err(error);
+                }
+            };
             if preferred.targets.len() != policy.replica_count {
-                self.reserve_preferred_segments(
+                match self.reserve_preferred_segments(
                     &mut preferred,
                     &policy.hint_preferred_segments,
                     PreferredSegmentSource::TenantPolicy,
                     true,
-                )?;
+                ) {
+                    Ok(Some(error)) => last_backpressure = Some(error),
+                    Ok(None) => {}
+                    Err(error) => {
+                        rollback(self, preferred.reservations, "reserve_hint_segments_failed");
+                        return Err(error);
+                    }
+                }
             }
         }
         if targets.len() == policy.replica_count {
@@ -1061,6 +1123,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
@@ -1069,7 +1134,10 @@ impl StoreClient {
                         "skipping preferred storage owner after reservation failure"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rollback(self, &reservations, "reserve_preferred_owner_failed");
+                    return Err(error);
+                }
             }
         }
 
@@ -1091,6 +1159,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
@@ -1099,13 +1170,23 @@ impl StoreClient {
                         "skipping local preferred owner after reservation failure"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rollback(self, &reservations, "reserve_local_owner_failed");
+                    return Err(error);
+                }
             }
         }
 
-        let ranked = self
+        let ranked = match self
             .request_placement_planner()
-            .ranked_candidates(self, object)?;
+            .ranked_candidates(self, object)
+        {
+            Ok(ranked) => ranked,
+            Err(error) => {
+                rollback(self, &reservations, "rank_placement_candidates_failed");
+                return Err(error);
+            }
+        };
         for owner in ranked {
             if excluded.contains(&owner) {
                 continue;
@@ -1125,6 +1206,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
@@ -1133,11 +1217,54 @@ impl StoreClient {
                         "skipping fallback storage owner after reservation failure"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rollback(self, &reservations, "reserve_fallback_owner_failed");
+                    return Err(error);
+                }
             }
         }
 
-        rollback(self, &targets, &reservations);
+        // C++ Store always has a master-chosen segment; a masterless client
+        // can race peer announcements, so keep the local segment as a last
+        // resort regardless of the prefer-local policy.
+        if !excluded.contains(&self.lease.runtime)
+            && self.can_prefer_local_storage_for_write_mode()
+        {
+            let candidate = ReplicaPlacementCandidate {
+                target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
+                soft: true,
+            };
+            match self.reserve_candidate(&candidate.target, length_bytes) {
+                Ok((target, reservation)) => {
+                    excluded.insert(self.lease.runtime.clone());
+                    targets.push(target);
+                    reservations.push(reservation);
+                    if targets.len() == policy.replica_count {
+                        return Ok((targets, reservations));
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
+                    debug!(
+                        tenant,
+                        key,
+                        error = %error,
+                        "skipping local last-resort owner after reservation failure"
+                    );
+                }
+                Err(error) => {
+                    rollback(self, &reservations, "reserve_local_last_resort_failed");
+                    return Err(error);
+                }
+            }
+        }
+
+        rollback(self, &reservations, "reserve_replica_targets_incomplete");
+        if let Some(error) = last_backpressure {
+            return Err(error);
+        }
         Err(StoreError::InvalidState(format!(
             "not enough writable placement targets: reserved={} need={}",
             targets.len(),
@@ -1151,7 +1278,8 @@ impl StoreClient {
         segments: &[SegmentName],
         source: PreferredSegmentSource,
         soft: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<StoreError>> {
+        let mut last_backpressure = None;
         for segment in segments {
             match self.lookup_preferred_segment(segment) {
                 Ok(segment_owner) => {
@@ -1183,10 +1311,13 @@ impl StoreClient {
                             preferred.targets.push(target);
                             preferred.reservations.push(reservation);
                             if preferred.targets.len() == preferred.replica_count {
-                                return Ok(());
+                                return Ok(last_backpressure);
                             }
                         }
                         Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            if matches!(error, StoreError::Backpressure(_)) {
+                                last_backpressure = Some(error.clone());
+                            }
                             self.log_skipped_preferred_segment(
                                 preferred.tenant,
                                 preferred.key,
@@ -1200,6 +1331,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     self.log_skipped_preferred_segment(
                         preferred.tenant,
                         preferred.key,
@@ -1212,7 +1346,7 @@ impl StoreClient {
                 Err(error) => return Err(error),
             }
         }
-        Ok(())
+        Ok(last_backpressure)
     }
 
     fn log_skipped_preferred_segment(

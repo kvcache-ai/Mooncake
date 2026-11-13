@@ -5,7 +5,7 @@ This document describes how to build and use Mooncake with AWS Elastic Fabric Ad
 (efa-prerequisites-driver)=
 ## Prerequisite: AWS EFA Driver and libfabric
 
-This is the one requirement that applies in *every* case, including a `pip install` of a published wheel — those deliberately do not bundle libfabric (see [Building a Distributable Wheel](#efa-distributable-wheel)). It is normally already satisfied: EFA-enabled instances (e.g., p6-b300.48xlarge, p6-b200.48xlarge, p5en.48xlarge, p5e.48xlarge, p5.48xlarge, trn2.48xlarge, trn1.32xlarge) ship with the driver and libfabric pre-installed.
+This is the one requirement that applies in *every* case, including a `pip install` of a published wheel: the wheels do not bundle libfabric (see [Installing from PyPI](#efa-install-pypi)). It is normally already satisfied: EFA-enabled instances (e.g., p6-b300.48xlarge, p6-b200.48xlarge, p5en.48xlarge, p5e.48xlarge, p5.48xlarge, trn2.48xlarge, trn1.32xlarge) ship with the driver and libfabric pre-installed.
 
 Verify installation:
 ```bash
@@ -19,28 +19,24 @@ ls /opt/amazon/efa/include/rdma/fabric.h
 
 If not installed, follow [AWS EFA documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html).
 
+(efa-install-pypi)=
 ## Installing from PyPI (recommended)
 
-The default wheels (`mooncake-transfer-engine`, `-cuda13`, `-non-cuda`) are built with the EFA transport, so the same package works on AWS EFA and on IB/RoCE. Use `protocol=efa` (e.g. `MOONCAKE_PROTOCOL=efa` in SGLang) on EFA. With `rdma`, EFA NICs are skipped and IB/RoCE NICs are used when present. Unlike the dedicated EFA wheels below, the default wheels also include Mooncake EP/PG.
-
-Pre-built EFA wheels are also published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
+Starting with 0.3.14, the default wheels are built with the EFA transport, so the same package works on AWS EFA and on IB/RoCE. Install the one that matches your CUDA version:
 
 ```bash
-# GPU memory transfers with CUDA 12 — built with USE_CUDA=ON
-pip install mooncake-transfer-engine-efa
-
-# GPU memory transfers with CUDA 13 — built with USE_CUDA=ON
-pip install mooncake-transfer-engine-efa-cuda13
-
-# CPU/DRAM-only transfers — built with USE_CUDA=OFF
-pip install mooncake-transfer-engine-efa-non-cuda
+pip install mooncake-transfer-engine            # CUDA 12
+pip install mooncake-transfer-engine-cuda13     # CUDA 13
+pip install mooncake-transfer-engine-non-cuda   # no CUDA: host memory, or Neuron HBM
 ```
 
-The CUDA 13 wheel requires an NVIDIA 580-series or newer driver, following the [CUDA compatibility requirements](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
+The CUDA 13 wheel requires an NVIDIA 580-series or newer driver, following the [CUDA compatibility requirements](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html). `python -c "from mooncake import engine; print(engine.SUPPORT_EFA)"` prints `True` for a wheel with the EFA transport.
 
-> **Note:** These wheels deliberately do **not** bundle `libfabric`/`libefa` (see the runtime note in [Building a Distributable Wheel](#efa-distributable-wheel)). They resolve to the system AWS EFA installation at runtime, so the EFA driver and libfabric from the [Prerequisites](#efa-prerequisites-driver) must still be present on the instance. Make sure `/opt/amazon/efa/lib` is on `LD_LIBRARY_PATH`.
->
-> libfabric is loaded with `dlopen` when the EFA transport is installed (`protocol=efa`), not at import time, so the wheel imports and serves other protocols on hosts without libfabric. Mooncake loads `libfabric.so.1` through the normal library search path and falls back to `/opt/amazon/efa/lib/libfabric.so.1`. Set `MC_LIBFABRIC_PATH` to use a specific file. libfabric 1.18 or newer is required, and the distro package (e.g. 1.17 on Ubuntu 24.04) is rejected with an explicit error. The AWS libfabric must be used together with the AWS `libefa`/`libibverbs`, which is why its lib directory belongs on `LD_LIBRARY_PATH`.
+Select the transport with `protocol=efa`: in SGLang, set `MOONCAKE_PROTOCOL=efa`; in vLLM, set `"mooncake_protocol":"efa"` in `kv_connector_extra_config` of `--kv-transfer-config` (see [Usage with vLLM](#efa-vllm)). With `rdma`, EFA NICs are skipped and IB/RoCE NICs are used when present.
+
+> **Note:** The separate EFA packages (`mooncake-transfer-engine-efa`, `-efa-cuda13`, `-efa-non-cuda`) are no longer needed and stop at 0.3.13.post1. Install the default package instead.
+
+> **Note:** The wheels neither link nor bundle `libfabric`. It is loaded with `dlopen` when the EFA transport is installed (`protocol=efa`), not at import time, so the wheel imports and serves other protocols on hosts without libfabric. Mooncake loads `libfabric.so.1` through the normal library search path and falls back to `/opt/amazon/efa/lib/libfabric.so.1`; set `MC_LIBFABRIC_PATH` to use a specific file. libfabric 1.18 or newer is required, and the distro package (e.g. 1.17 on Ubuntu 24.04) is rejected with an explicit error. The AWS libfabric must be used together with the AWS `libefa`/`libibverbs`, so put `/opt/amazon/efa/lib` on `LD_LIBRARY_PATH`.
 
 To build from source instead (for development, an unreleased revision, or a custom configuration), follow the sections below.
 
@@ -75,7 +71,7 @@ cmake .. \
 make -j$(nproc)
 ```
 
-> **Note:** `-DUSE_CUDA=ON` is required when transferring GPU memory (e.g., KV cache in vLLM). Without it, the TCP transport (used as fallback when `mooncake_protocol` is set to `"tcp"`) cannot detect GPU memory and will fail with "Bad address" (EFAULT) errors.
+> **Note:** `-DUSE_CUDA=ON` is required to transfer GPU memory (e.g., KV cache in vLLM). Without it, GPU buffers are treated as host memory, and transfers on them fail (for example with "Bad address" (EFAULT) on the TCP fallback).
 
 **No NVIDIA GPU (CPU memory, or Neuron devices):**
 
@@ -119,24 +115,11 @@ pip install mooncake-wheel/dist/*.whl
 
 > **Note:** the script must be run from the repository root (it resolves `mooncake-wheel/` and `${BUILD_DIR}` relatively), and the output directory is relative to `mooncake-wheel/` — so the wheel lands in **`mooncake-wheel/dist/`**, not `./dist/`. The `set -x` trace prints `mv repaired_wheels_3.13/... dist/` because that step runs with `mooncake-wheel/` as the working directory.
 
-To produce a wheel whose package name matches one of the published variants, set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
+The wheel is named `mooncake_transfer_engine-*.whl`, like the default CUDA 12 package. To name it like the CUDA 13 or non-CUDA package, set `CU13_BUILD=1` or `NON_CUDA_BUILD=1`, as the release pipeline does. The name only changes what pip records: EFA and Neuron support are decided by the `cmake` flags.
 
-```bash
-# GPU build (cmake was configured with USE_CUDA=ON):
-EFA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+> **CI/CD:** The release pipeline builds every default wheel with `-DUSE_EFA=ON` (`.github/workflows/_build-wheel.yaml`), and PR CI builds the EFA unit tests and runs the ones that need no EFA hardware (`efa-unit-tests` in `.github/workflows/ci.yml`), so EFA-only test code is compiled before a release. No EFA hardware and no libfabric library are needed to build, only the headers: the pipeline fetches libfabric 1.18.3 headers, the oldest API the transport accepts. The distro `libfabric-dev` is not used, because Ubuntu 22.04, which sets the wheel's glibc floor, ships libfabric 1.11. That predates both the `FI_VERSION(1, 18)` the transport asks `fi_getinfo()` for and the `FI_HMEM_NEURON` interface needed for [Neuron device memory](#efa-neuron).
 
-# CUDA 13 GPU build (cmake was configured with CUDA 13 and USE_CUDA=ON):
-EFA_CU13_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
-
-# CPU build (cmake was configured with USE_CUDA=OFF):
-EFA_NON_CUDA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
-```
-
-With no variant variable set the wheel is named `mooncake_transfer_engine-*.whl`, i.e. the same distribution name as the upstream non-EFA package — a useful way to tell from the filename alone whether the flag took effect. It only changes the name pip records; the importable module is `mooncake` either way, so which variant name you build has no bearing on whether EFA or Neuron support is compiled in (that is decided by the `cmake` flags).
-
-> **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation), `.github/workflows/release-efa.yaml` (CUDA 12 release), `.github/workflows/release-efa-cuda13.yaml` (CUDA 13 release), and `.github/workflows/release-efa-non-cuda.yaml` (non-CUDA release). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner gets by building libfabric from source with every provider disabled. The distro `libfabric-dev` package is deliberately not used — Ubuntu 22.04, the runner that fixes this wheel's glibc floor, packages libfabric 1.11, which predates both the `FI_VERSION(1, 18)` the transport asks `fi_getinfo()` for and the `FI_HMEM_NEURON` interface needed for [Neuron device memory](#efa-neuron). The pin is the oldest libfabric the transport claims to support, so the headers cannot describe structures that a supported runtime is too old to provide.
-
-> **Important (EFA builds):** `auditwheel repair` excludes `libfabric` and `libefa` from the wheel so they resolve to the system EFA installation (`/opt/amazon/efa/lib`) at runtime. This is required because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the **same** system `libfabric`. If the wheel bundled its own copy, the process would load two independent libfabric instances — Mooncake's bundled one and NCCL's system one — and whichever initializes first claims the EFA device, leaving the other with an empty provider list (`fi_getinfo: provider efa output empty list`). NCCL then silently falls back to the TCP provider and cross-node collectives such as `all_gather_object` hang. Excluding libfabric/libefa (see `scripts/build_wheel.sh`) keeps a single shared libfabric in the process. If you are on an older Mooncake build whose wheel still bundles libfabric, force the system copy with `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
+> **Why libfabric is never bundled:** the in-process `aws-ofi-nccl` plugin (loaded by NCCL) uses the system `libfabric`. A second, bundled copy would mean two independent libfabric instances in one process. Whichever initializes first claims the EFA device and leaves the other with an empty provider list (`fi_getinfo: provider efa output empty list`); NCCL then silently falls back to TCP and cross-node collectives such as `all_gather_object` hang. Old wheels that still bundled libfabric need `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
 
 ## Verification
 
@@ -198,7 +181,7 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
 
 The following commands are the GPU-to-GPU shape used for the [Benchmark Results](#benchmark-results) tables below, which top out at 780 GB/s write on a p6-b300.48xlarge pair and 365 GB/s on p5en.48xlarge — see each table for the `threads`/`batch_size` that peaked on that host. Two things matter the most:
 
-- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU, which in turn lets both NUMA nodes' NICs saturate. Pinning a single GPU (the default `--gpu_id=0`) halves throughput because half the NICs end up cross-NUMA.
+- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU, which in turn lets both NUMA nodes' NICs saturate. Pinning a single GPU (the default `--gpu_id=0`) caps throughput at that GPU's topology-local NICs — about 95 GB/s on p6-b300.48xlarge, which has two per GPU — because a device buffer is always served by its preferred NICs.
 - `--block_size=1048576` (1MB, not the 64 KB default) — each block becomes one `fi_write` / `fi_read`, so larger blocks amortize per-op overhead and are the main knob for hitting line rate.
 
 ### 1. Target Node (receiver)
@@ -236,7 +219,7 @@ Replace `<target_hostname>:<target_port>` with the target node's address shown i
 
 > **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in that case — the bench will spread buffers across NUMA nodes instead.
 
-> **Why `threads=16` and not 32:** measured, on 16-NIC hosts. It used to also be forced by the WR cap — when that cap was a fixed 256, 32 threads × 128 batch = 4096 slices chased 16 × 256 = 4096 WRs with no headroom and runs timed out. The cap is now the provider's real transmit depth (see the WR-cap tip under **Tuning Tips** below), which is far higher, so `threads=16` stands on the measurement alone.
+> **Why `threads=16`:** it is what peaked on the 16-NIC hosts measured below.
 
 ### Key Parameters
 
@@ -290,26 +273,26 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 | block=1MB, threads=16, batch=128 | 282.04 GB/s | 249.67 GB/s |
 | block=1MB, threads=32, batch=64 | 282.84 GB/s | 256.26 GB/s |
 
-> CPU-to-CPU is bounded by DRAM bandwidth on the Xeon 8559C — write throughput is essentially flat across thread/batch combinations (~282 GB/s), confirming DRAM controller saturation rather than a NIC or in-flight-WR limit.
+> CPU-to-CPU is bounded by how fast the host accepts PCIe writes into its memory, about 143 GB/s per socket, not by the NICs or Mooncake. Write throughput is flat across thread/batch combinations (~282 GB/s), and GPU-to-host copies (`cudaMemcpy` D2H on all 8 GPUs) hit the same ~287 GB/s, while host-to-GPU copies reach ~441 GB/s. Writing in both directions at once reaches ~393 GB/s in total (~196 GB/s each way).
 
 #### 2. p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
-Tested on two p6-b200.48xlarge instances in the same AWS placement group.
+Tested on two p6-b200.48xlarge instances on `main` (ad103713, 2026-10-28); numbers are the mean of 3 interleaved runs unless marked.
 
-> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and current EFA tuning work. They are a lower bound for the current code; we will re-sweep and update when a B200 pair is available again.
-
-**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, threads=16, batch=128):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| block=1MB, threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
-| **block=1MB, threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
+| block=8MB, buf=16GB/GPU | **337.0 GB/s** | - |
+| block=1MB, buf=4GB/GPU | 322 GB/s (1 run) | **335.7 GB/s** |
 
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+**CPU-to-CPU** (`--use_vram=false`, block=1MB, threads=16, batch=128, buf=16GB):
 
-| Configuration | Write | Read |
-|---------------|-------|------|
-| block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
+| Write | Read |
+|-------|------|
+| **224.6 GB/s** | **224.1 GB/s** |
+
+> CPU-to-CPU is bounded by the PCIe topology, not by the NICs or Mooncake. Each of the four PCIe switches carries 2 EFA NICs and 2 GPUs behind one Gen5 x16 uplink (~56 GB/s), and host memory traffic has to cross it: 2 NICs on one switch reach 56.9 GB/s, 2 NICs on different switches 94.7 GB/s, and all 8 NICs 4 × ~56 ≈ 224 GB/s. GPU-to-GPU traffic stays inside the switch, which is why it is faster.
 
 #### 3. p5en.48xlarge (H200, 16 EFA × 200 Gbps)
 
@@ -326,7 +309,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | block=1MB, threads=32, batch=128 | 364.21 GB/s | 250.90 GB/s |
 | block=1MB, threads=48, batch=64 | 363.47 GB/s | 268.43 GB/s |
 
-> **Peak write: 365 GB/s** at `threads=16, batch=128` — ~91% of the 400 GB/s theoretical line rate (16×200 Gbps). Write saturates on batch size, so `batch=128` outperforms smaller batches as long as `threads × batch` stays under the shared-endpoint WR cap — `16 × 256 = 4096` when this sweep was taken, since the per-endpoint cap was still a fixed 256; it is now the provider's transmit depth, see the WR-cap tip under **Tuning Tips**. **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate smaller in-flight queues, and throughput drops as batch grows.
+> **Peak write: 365 GB/s** at `threads=16, batch=128` — ~91% of the 400 GB/s theoretical line rate (16×200 Gbps). Write saturates on batch size, so `batch=128` outperforms smaller batches. **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate smaller in-flight queues, and throughput drops as batch grows.
 
 **CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
 
@@ -338,7 +321,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | block=1MB, threads=32, batch=128 | 212.99 GB/s | 210.33 GB/s |
 | **block=1MB, threads=48, batch=32** | **213.57 GB/s** | 206.92 GB/s |
 
-> CPU-to-CPU is DRAM-bound — throughput is essentially flat (~205–214 GB/s) across every thread / batch combination that doesn't hit the WR cap. Peak write 213.57 GB/s, peak read 212.18 GB/s.
+> CPU-to-CPU is flat (~205–214 GB/s) across every thread / batch combination, so the limit is on the host side rather than in Mooncake. It is consistent with the PCIe uplink limit measured on p6-b200: p5en also puts its NICs behind shared switches, with 4 NICs per switch.
 
 **block_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 buf=4GB --gpu_id=-1`):
 
@@ -364,7 +347,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 #### 4. p5.48xlarge (H100, 32 EFA × 100 Gbps)
 
-Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA devices) in the same AWS placement group. Per-NIC line rate is half of p5en's, but with twice the NIC count the aggregate ceiling is the same 400 GB/s. The WR cap scales with NIC count, so this host tolerated twice the in-flight slices p5en did: `32 NICs × 256 = 8192` versus 4096, with the fixed per-endpoint 256 in force when this sweep was taken.
+Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA devices) in the same AWS placement group. Per-NIC line rate is half of p5en's, but with twice the NIC count the aggregate ceiling is the same 400 GB/s.
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=4294967296`):
 
@@ -377,7 +360,7 @@ Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA device
 | block=1MB, threads=16, batch=32 | - | 356.94 GB/s |
 | block=1MB, threads=32, batch=32 | - | 380.66 GB/s |
 
-> **Peak write: 389 GB/s** at `threads=32, batch=128` — ~97% of the 400 GB/s theoretical line rate (32×100 Gbps). The plateau is wide: any `(threads, batch)` between `(16, 128)` and `(32, 128)` lands within 0.1% of peak. **Peak read: 382 GB/s** at `threads=32, batch=128` — unlike p5en, reads on this host scale with batch size up to 128 because the wider 32-NIC fabric absorbs larger in-flight queues without backoff. `(32, 256)` and `(64, 128)` — both exactly at that run's 8192 WR cap, with no headroom for retries — failed.
+> **Peak write: 389 GB/s** at `threads=32, batch=128` — ~97% of the 400 GB/s theoretical line rate (32×100 Gbps). The plateau is wide: any `(threads, batch)` between `(16, 128)` and `(32, 128)` lands within 0.1% of peak. **Peak read: 382 GB/s** at `threads=32, batch=128` — unlike p5en, reads on this host scale with batch size up to 128 because the wider 32-NIC fabric absorbs larger in-flight queues without backoff.
 
 **CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
 
@@ -451,8 +434,8 @@ For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC) 
 - **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
 - **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` whose WR cap is the provider's transmit queue depth (`fi_tx_attr: size`: 4096 on p5, 2048 on p6-b300). Exceeding it trips "timed out waiting for CQ drain". In practice this is no longer the binding constraint — a 16-NIC b300 allows `16 × 2048 = 32768` in-flight slices, far more than any sane `threads × batch` — so pick `threads` and `batch_size` from the measurements above (`threads=16, batch=128` on 16-NIC hosts; `threads=32, batch=128` on 32-NIC p5) and treat this as a sanity check. Read your host's depth from the `provider tx queue=` field in Mooncake's per-device startup log, or with `fi_info -p efa -t FI_EP_RDM -v | grep -A9 fi_tx_attr`.
 - **Write vs read:** write benefits from larger batches (peak at `batch=128`); on 16-NIC p5en read prefers smaller queues (peak at `batch=32`), but on 32-NIC p5 reads scale up to `batch=128` because the wider fabric absorbs larger in-flight queues.
-- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
-- For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
+- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU caps throughput at that GPU's topology-local NICs.
+- For **CPU-to-CPU**: the host side is the ceiling (the PCIe uplinks on p6-b200, the host's PCIe-write bandwidth on p6-b300), so more threads or NICs do not help once the numbers above are reached. Writing in both directions at once uses capacity a single direction cannot.
 - `--buffer_size` only needs `≥ block × batch × threads`; larger values do not improve throughput. The example commands use 4 GB because that is safe for any reasonable config.
 - **Leave the `MC_EFA_*` environment variables alone** — the defaults are what every number above was measured with. [Environment Variables](#efa-env-vars) explains what each one does and why overriding `MC_MAX_WR` in particular causes transfer *failures*, not slowdowns.
 
@@ -547,7 +530,7 @@ Measured end to end on **`trn2.48xlarge`** (Trainium2) and **`trn1.32xlarge`** (
 
 Two runtime conditions have to hold. Both are already met on a stock Neuron instance, and each has a log line that names it when it is not:
 
-1. **libfabric 1.15 or newer**, for `FI_HMEM_NEURON`. The published EFA wheels satisfy this, as does any libfabric from the AWS EFA installer. A build against an older libfabric logs a warning on Neuron hosts and falls back to treating the device as unsupported rather than silently registering HBM as host memory.
+1. **libfabric 1.15 or newer**, for `FI_HMEM_NEURON`. The published wheels satisfy this, as does any libfabric from the AWS EFA installer. A build against an older libfabric logs a warning on Neuron hosts and falls back to treating the device as unsupported rather than silently registering HBM as host memory.
 2. **`libnrt.so.1` must be findable.** libfabric reaches the Neuron runtime through `dlopen("libnrt.so.1")` while initialising its HMEM interfaces, and the Neuron SDK installs it under `/opt/aws/neuron/lib` without putting that directory on the loader path — so libfabric's own `dlopen` would fail and leave `fi_mr_regattr` returning `-FI_ENOSYS` with nothing pointing at the cause. Mooncake loads the library itself (`RTLD_GLOBAL`) before the first `fi_getinfo`, adopting the framework's already-mapped copy if there is one and otherwise trying the soname and then the SDK's default path, so a stock install needs no configuration. Only a runtime installed elsewhere needs help, and it has to be given before the process starts — glibc reads `LD_LIBRARY_PATH` once, at startup:
 
    ```bash
@@ -577,7 +560,7 @@ make -j$(nproc)
 --   Neuron (FI_HMEM_NEURON): 1
 ```
 
-A `0` there means the headers predate libfabric 1.15 and the build will refuse to register Neuron HBM at runtime; point `-DLIBFABRIC_INCLUDE_DIR` at newer libfabric headers. To install rather than build, take the **non-CUDA** wheel (`pip install mooncake-transfer-engine-efa-non-cuda`) — the published wheels are built against a libfabric that has `FI_HMEM_NEURON`.
+A `0` there means the headers predate libfabric 1.15 and the build will refuse to register Neuron HBM at runtime; point `-DLIBFABRIC_INCLUDE_DIR` at newer libfabric headers. To install rather than build, take the **non-CUDA** wheel (`pip install mooncake-transfer-engine-non-cuda`); the published wheels are built against libfabric headers that have `FI_HMEM_NEURON`.
 
 (pcie-switch-nic-affinity)=
 ### PCIe NIC affinity
@@ -734,11 +717,11 @@ These apply to any Mooncake caller — the framework sections below only add the
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOONCAKE_PROTOCOL` | `rdma` | Set to `efa` to select this transport. Read by the vLLM / SGLang connectors |
+| `MOONCAKE_PROTOCOL` | `rdma` | Set to `efa` to select this transport. Read by SGLang; vLLM's `MooncakeConnector` takes `mooncake_protocol` from `kv_connector_extra_config` instead (see [Usage with vLLM](#efa-vllm)) |
 | `MC_MAX_WR` | provider's transmit depth | Per-NIC in-flight WR cap. **Do not set** — see below |
 | `MC_EFA_STALL_MIN_MS` | `1000` | How long a peer must refuse every post (unbroken `FI_EAGAIN`, at least 1024 waves) before its slices fail. A new connection's first completions take 50–100 ms, so much lower values fail healthy peers. `<= 0` restores the count-only check |
 | `MC_EFA_CQ_THREADS` | `1` | CQ polling threads. **Leave alone** — see below |
-| `MC_EFA_NIC_SELECTION` | `all` | `local` registers each device buffer only on its topology-local NICs — see below |
+| `MC_EFA_NIC_SELECTION` | `local` | `local` registers each device buffer only on its topology-local NICs; `all` registers it on every NIC — see below |
 | `MC_EFA_DISABLE_NEURON` | unset | `1` skips Neuron HBM registration and stages through host memory — see [AWS Neuron](#efa-neuron) |
 | `MC_MS_AUTO_DISC`, `MC_MS_FILTERS` | on / unset | Mooncake Store device auto-discovery — see [Verification](#verification) |
 | `FI_PROVIDER`, `FI_EFA_USE_DEVICE_RDMA`, `LD_LIBRARY_PATH` | set by the EFA installer | libfabric-side, not Mooncake's. Only needed if a container image drops them |
@@ -765,7 +748,18 @@ These apply to any Mooncake caller — the framework sections below only add the
 > export MC_EFA_CQ_THREADS=0   # lift cap: one poller per EFA device (legacy)
 > ```
 
-> **`MC_EFA_NIC_SELECTION`** — `all` (default) registers every buffer on every NIC, so any NIC can serve any transfer. `local` narrows a device buffer to the NICs the topology reports as closest to its GPU, which trades bandwidth for registration time: fewer NICs can serve a transfer touching that buffer, but registering one buffer on N NICs costs roughly N registrations, and for device memory a per-domain cost is paid on top. Measured on p5.48xlarge with 48 × 391 MB GPU buffers registered serially: **123.7 s across 32 NICs, 17.6 s across 4, 4.4 s on 1.** Use it when startup registration time dominates, not to chase throughput. Host (`cpu:N`) buffers are deliberately never narrowed — a NUMA node's NIC set is half the machine, not a rail group. This knob is unrelated to the Neuron switch-locality win, which comes from the topology's transfer-time NIC preference and needs no configuration.
+> **`MC_EFA_NIC_SELECTION`** — `local` (default) registers each device buffer only on the NICs the topology reports as closest to its GPU; `all` registers every buffer on every NIC. Registering one device buffer on N NICs costs roughly N registrations, plus a per-domain cost on top, while it buys no steady-state bandwidth: `Topology::selectDevice()` picks a device buffer's NIC from `preferred_hca` — the same topology-local set — on every first attempt, so keys on the other NICs are only used by retries. What `local` gives up is retrying a device buffer over a non-local NIC after its local NICs fail; set `all` if you need that. Host (`cpu:N`) buffers are never narrowed — a NUMA node's NIC set is half the machine, not a rail group.
+>
+> | Measured | `all` | `local` |
+> |---|---|---|
+> | p5.48xlarge, 48 × 391 MB GPU buffers registered serially | 123.7 s (32 NICs) | 17.6 s (4 NICs) |
+> | p6-b300.48xlarge, vLLM TP8 KV cache, slowest rank | 274 s (16 NICs) | 9 s (2 NICs) |
+> | p6-b300.48xlarge, vLLM engine start to all KV caches registered | 546 s | 283 s |
+> | p6-b300.48xlarge, vLLM 1P1D PD, both sides ready | 822 s | 308 s |
+> | p6-b300.48xlarge GPU-to-GPU write / read, `--gpu_id=-1` (8 GPUs) | 761.8 / 763.4 GB/s | 762.3 / 757.6 GB/s |
+> | p6-b300.48xlarge GPU-to-GPU write / read, `--gpu_id=0` (1 GPU) | 95.7 / 94.6 GB/s | 95.2 / 94.1 GB/s |
+>
+> This knob is unrelated to the Neuron switch-locality win, which comes from the topology's transfer-time NIC preference and needs no configuration.
 
 (efa-large-memory)=
 ## Registering Large Memory: Use Huge Pages
@@ -786,6 +780,7 @@ The `Auto-split params: page_size=...` log line shows which budget a registratio
 
 **Shared-memory buffers.** These buffers come from `memfd`, for example the HiCache host pool that SGLang allocates for its `mooncake` storage backend. `MADV_HUGEPAGE` THP does not apply to `memfd`. Such buffers use 2 MB pages only with `MC_STORE_USE_HUGEPAGE` set and enough hugetlb pages reserved (`vm.nr_hugepages`). Otherwise they are 4 KB-backed, and the limits above apply to each of them.
 
+(efa-vllm)=
 ## Usage with vLLM
 
 ### 1. Prefill Instance
@@ -826,17 +821,9 @@ vllm-router --policy round_robin \
 
 SGLang's PD-disaggregation Mooncake integration reads the transport from `MOONCAKE_PROTOCOL`. Set it to `efa` and select the Mooncake backend with `--disaggregation-transfer-backend mooncake`.
 
-### 1. Apply EFA Patch (only if SGLang version predates PR #25083)
+### 1. SGLang version
 
-Older SGLang releases hardcode `"rdma"` in the transfer engine init. [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) has been **merged into SGLang `main`**, so the protocol is now read from `MOONCAKE_PROTOCOL`. If your SGLang build includes that PR (any recent `main` or release built after it), **this step is unnecessary** — skip to step 2.
-
-Only if you are pinned to an older release that predates PR #25083, apply the [patch script](https://github.com/whn09/kimi-k2-sglang/blob/main/patch_sglang_efa.sh):
-
-```bash
-bash patch_sglang_efa.sh
-```
-
-The script is idempotent and safe to rerun.
+SGLang reads the protocol from `MOONCAKE_PROTOCOL` since [PR #25083](https://github.com/sgl-project/sglang/pull/25083). Releases older than that hardcode `"rdma"`; for those, apply the [patch script](https://github.com/whn09/kimi-k2-sglang/blob/main/patch_sglang_efa.sh) (`bash patch_sglang_efa.sh`, safe to rerun).
 
 ### 2. Environment Variables
 
@@ -992,13 +979,15 @@ Solution: Ensure proper permissions or run with sudo for testing
 ### libfabric not found
 
 ```
-cannot find -lfabric
+EfaTransport: cannot load libfabric. Install the AWS EFA userspace and put its lib directory (e.g. /opt/amazon/efa/lib) on LD_LIBRARY_PATH, or set MC_LIBFABRIC_PATH.
 ```
 
-Solution: Verify `/opt/amazon/efa/lib` is in the library path:
+Mooncake loads libfabric at runtime, not at link time. Install the AWS EFA software if `/opt/amazon/efa/lib/libfabric.so.1` is missing, then:
 ```bash
 export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
+
+The same fix applies to `... is libfabric 1.17, but the EFA transport needs 1.18 or newer`, which means an older distro libfabric was found first.
 
 ### Large buffer registration fails or is split across NICs
 

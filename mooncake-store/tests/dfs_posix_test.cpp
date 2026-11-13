@@ -708,6 +708,49 @@ TEST(ShardAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EXPECT_EQ(evicted.front().key, "B");
 }
 
+TEST(ShardAllocatorTest, LruIndexOutlivesCallerKeys) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    TempDir tmp("dfs_lru_long_keys");
+
+    ShardAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+
+    // Keys longer than the small-string buffer live on the heap, so a view
+    // into a destroyed caller string would be caught by ASan.
+    auto long_key = [](int i) {
+        return std::string(64, 'k') + std::to_string(i);
+    };
+    std::vector<DistributedFSDescriptor> descs;
+    for (int i = 0; i < 4; ++i) {
+        auto desc = alloc.Allocate(long_key(i), 8192);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(long_key(i), desc->shard_idx, desc->offset);
+        descs.push_back(*desc);
+    }
+
+    // Restore explicitly, by PendingEviction destruction, and by rejecting
+    // every candidate; each path re-inserts the keys into the index.
+    auto initial = alloc.PrepareEviction();
+    ASSERT_EQ(initial.Candidates().size(), 2u);
+    alloc.RestorePreparedEviction(std::move(initial));
+    {
+        auto dropped = alloc.PrepareEviction();
+    }
+    alloc.ResolvePreparedEviction(alloc.PrepareEviction(), {false, false});
+
+    alloc.Free(descs[0].offset, descs[0].aligned_size, descs[0].shard_idx,
+               long_key(0));
+
+    auto pending = alloc.PrepareEviction();
+    ASSERT_FALSE(pending.Empty());
+    EXPECT_EQ(pending.Candidates().front().key, long_key(1));
+    alloc.CommitPreparedEviction(std::move(pending));
+}
+
 TEST(ShardAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     EnvGuard env;
     ConfigurePosixDfs(env);
@@ -1173,6 +1216,15 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void SetSupportsFdReopen(bool v) { supports_reopen_ = v; }
     bool SupportsFdReopen() const override { return supports_reopen_; }
 
+    // Models an adapter that keeps the "posix" name but constrains read
+    // buffers (e.g. an O_DIRECT mode).
+    void SetSupportsArbitraryHostReadBuffers(bool v) {
+        arbitrary_host_read_buffers_ = v;
+    }
+    bool SupportsArbitraryHostReadBuffers() const override {
+        return arbitrary_host_read_buffers_;
+    }
+
     std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
         std::span<const FdIoRequest> requests) override {
         ADD_FAILURE() << "POSIX shard writes must retain per-request I/O";
@@ -1238,6 +1290,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int64_t short_read_offset_ = -1;
     std::atomic<int64_t> fail_write_offset_once_{-1};
     bool supports_reopen_ = true;
+    bool arbitrary_host_read_buffers_ = true;
 };
 
 // Builds a backend backed by a ControlledPosixFsAdapter pointed at an existing
@@ -1310,6 +1363,22 @@ class BlockingShardFsAdapter : public PosixFsAdapter {
     std::promise<void> release_signal_;
     std::shared_future<void> released_{release_signal_.get_future().share()};
 };
+
+TEST_F(DfsBackendTest, PosixAdapterAcceptsArbitraryHostReadBuffers) {
+    EXPECT_TRUE(PosixFsAdapter().SupportsArbitraryHostReadBuffers());
+    EXPECT_TRUE(backend_->SupportsArbitraryHostReadBuffers());
+}
+
+TEST_F(DfsBackendTest, HostReadBufferCapabilityIgnoresAdapterName) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+    ASSERT_STREQ(controlled->GetName(), "posix");
+    EXPECT_TRUE(backend->SupportsArbitraryHostReadBuffers());
+
+    controlled->SetSupportsArbitraryHostReadBuffers(false);
+    EXPECT_FALSE(backend->SupportsArbitraryHostReadBuffers());
+}
 
 TEST_F(DfsBackendTest, SlowShardInitializationDoesNotBlockOtherShards) {
     for (bool block_file_size : {false, true}) {
@@ -1851,6 +1920,38 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     EXPECT_EQ(controlled_adapter->OpenCallCount(), 2);
 }
 
+TEST_F(DfsBackendTest, RangeReadRejectsTruncatedObjectWithoutReadingTail) {
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('T');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend_->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+
+    AlignedBuffer window(512);
+    ASSERT_NE(window.data(), nullptr);
+    const DfsReadRequest request{
+        "key", desc, {{window.data(), window.size()}}, 0, true};
+    auto intact = backend_->BatchRead({request});
+    ASSERT_EQ(intact.size(), 1);
+    ASSERT_TRUE(intact[0].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), window.data(), window.size()), 0);
+
+    // The requested 512 bytes are still present. The object is not.
+    std::error_code ec;
+    std::filesystem::resize_file(desc.file_path,
+                                 desc.offset + desc.object_size / 2, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    window.Fill('Z');
+    auto truncated = backend_->BatchRead({request});
+    ASSERT_EQ(truncated.size(), 1);
+    ASSERT_FALSE(truncated[0].has_value());
+    EXPECT_EQ(truncated[0].error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(window.data()[0], 'Z');
+}
+
 TEST_F(DfsBackendTest, WriteReopensStaleDescriptorAndSucceeds) {
     ControlledPosixFsAdapter* controlled = nullptr;
     auto backend = MakeControlledBackend(tmp_->path(), &controlled);
@@ -2083,8 +2184,9 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     std::atomic<int> failures{0};
     for (int i = 0; i < kThreads; ++i) {
         threads.emplace_back([&, i]() {
-            const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
-                                               kBlock, 0};
+            const DistributedFSDescriptor desc{
+                ShardPath(0), static_cast<uint64_t>(i * kBlock), kBlock, kBlock,
+                0};
             auto results = backend->BatchWrite(
                 {{"key_" + std::to_string(i),
                   desc,
@@ -2102,8 +2204,8 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     for (int i = 0; i < kThreads; ++i) {
         AlignedBuffer read_buf(kBlock);
         ASSERT_NE(read_buf.data(), nullptr);
-        const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
-                                           kBlock, 0};
+        const DistributedFSDescriptor desc{
+            ShardPath(0), static_cast<uint64_t>(i * kBlock), kBlock, kBlock, 0};
         auto read_results =
             backend->BatchRead({{"key_" + std::to_string(i),
                                  desc,

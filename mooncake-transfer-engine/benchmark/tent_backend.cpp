@@ -34,20 +34,6 @@
 namespace mooncake {
 namespace tent {
 
-std::atomic<bool> g_tent_running{true};
-std::atomic<bool> g_tent_triggered_sig{false};
-
-void signalHandlerV1(int signum) {
-    if (g_tent_triggered_sig.load()) {
-        LOG(ERROR) << "Received signal " << signum
-                   << " again, forcefully terminating...";
-        std::exit(EXIT_FAILURE);
-    }
-    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_tent_running.store(false);
-    g_tent_triggered_sig.store(true);
-}
-
 // Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
 // seg_type names. Empty input returns an empty vector.
 static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
@@ -338,6 +324,18 @@ int TENTBenchRunner::allocateBuffers() {
 }
 
 int TENTBenchRunner::freeBuffers() {
+    const uint64_t abandoned = abandoned_batches_.load();
+    if (abandoned != 0) {
+        // A transport may still copy into these buffers; releasing them
+        // would turn a stopped run into a use-after-free. The process is
+        // exiting, so leaving them allocated costs nothing.
+        LOG(WARNING) << abandoned
+                     << " transfer batch(es) were still in flight when the "
+                        "run stopped; leaving the engine and local buffers "
+                        "allocated";
+        pinned_buffer_list_.clear();
+        return 0;
+    }
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         CHECK_FAIL(engine_->unregisterLocalMemory(pinned_buffer_list_[i],
@@ -349,8 +347,6 @@ int TENTBenchRunner::freeBuffers() {
 }
 
 TENTBenchRunner::TENTBenchRunner() {
-    signal(SIGINT, signalHandlerV1);
-    signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
     intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
@@ -358,29 +354,19 @@ TENTBenchRunner::TENTBenchRunner() {
         << "Failed to allocate benchmark buffers";
 }
 
-TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
+TENTBenchRunner::~TENTBenchRunner() {
+    freeBuffers();
+    if (abandoned_batches_.load() != 0) {
+        // The default Transport::quiesce() does not drain outstanding work.
+        // Keep the engine's registrations, batches and transport state alive
+        // alongside the buffers until process exit.
+        (void)engine_.release();
+    }
+}
 
 int TENTBenchRunner::runTarget() {
-    while (g_tent_running.load()) sleep(1);
+    while (!stopRequested()) sleep(1);
     return 0;
-}
-
-size_t TENTBenchRunner::targetIndex(int thread_id) const {
-    LOG_ASSERT(!target_handles_.empty());
-    return static_cast<size_t>(thread_id) % target_handles_.size();
-}
-
-int TENTBenchRunner::localTargetThreadId(int thread_id) const {
-    LOG_ASSERT(!target_handles_.empty());
-    return thread_id / static_cast<int>(target_handles_.size());
-}
-
-uint64_t TENTBenchRunner::getTargetSegmentId(int thread_id) const {
-    return target_handles_[targetIndex(thread_id)];
-}
-
-size_t TENTBenchRunner::getTargetCount() const {
-    return std::max<size_t>(target_handles_.size(), 1);
 }
 
 int TENTBenchRunner::startInitiator(int num_threads) {
@@ -407,24 +393,7 @@ int TENTBenchRunner::startInitiator(int num_threads) {
         target_infos_.push_back(std::move(info));
     }
     LOG(INFO) << "Opened " << target_handles_.size() << " target segments";
-    threads_.resize(num_threads);
-    current_task_.resize(threads_.size());
-    g_tent_running.store(true);
-    for (size_t i = 0; i < threads_.size(); ++i)
-        threads_[i] = std::thread(&TENTBenchRunner::runner, this, i);
-    return 0;
-}
-
-int TENTBenchRunner::stopInitiator() {
-    {
-        std::unique_lock<std::mutex> lk(mtx_);
-        g_tent_running.store(false);
-        cv_task_.notify_all();
-        cv_done_.notify_all();
-    }
-    for (auto& thread : threads_) {
-        thread.join();
-    }
+    startWorkers(num_threads);
     return 0;
 }
 
@@ -503,49 +472,42 @@ void TENTBenchRunner::pinThread(int thread_id) {
     }
 }
 
-int TENTBenchRunner::runner(int thread_id) {
-    while (g_tent_running.load()) {
-        std::function<int(int)> task;
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            cv_task_.wait(lk, [&] {
-                return !g_tent_running.load() || current_task_[thread_id];
-            });
-            if (!g_tent_running.load()) break;
-            std::swap(task, current_task_[thread_id]);
+// How long a stopped run keeps waiting for a batch already handed to the
+// transports before abandoning it. A second SIGINT still exits immediately.
+static constexpr uint64_t kStopDrainTimeoutNs = 5ull * 1000 * 1000 * 1000;
+
+Status TENTBenchRunner::waitForBatch(BatchID batch_id, TransferStatus& status,
+                                     uint64_t& polls) {
+    uint64_t stop_seen_ns = 0;
+    while (true) {
+        auto polled = engine_->getTransferStatus(batch_id, status);
+        ++polls;
+        if (!polled.ok()) {
+            // The batch state is unknown, so treat it as still in flight.
+            abandoned_batches_.fetch_add(1);
+            return polled;
         }
-        if (task) task(thread_id);
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            if (--pending_ == 0) cv_done_.notify_all();
+        if (status.s != TransferStatusEnum::PENDING &&
+            status.s != TransferStatusEnum::INITIAL) {
+            return Status::OK();
+        }
+        if (running()) continue;
+        const uint64_t now_ns = getCurrentTimeInNano();
+        if (stop_seen_ns == 0) {
+            stop_seen_ns = now_ns;
+        } else if (now_ns - stop_seen_ns > kStopDrainTimeoutNs) {
+            abandoned_batches_.fetch_add(1);
+            status.s = TransferStatusEnum::PENDING;
+            return Status::OK();
         }
     }
-    return 0;
-}
-
-int TENTBenchRunner::runInitiatorTasks(
-    const std::function<int(int /* thread_id */)>& func) {
-    std::unique_lock<std::mutex> lk(mtx_);
-    for (size_t id = 0; id < current_task_.size(); ++id)
-        current_task_[id] = func;
-    pending_ = (int)threads_.size();
-    cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return !g_tent_running.load() || pending_ == 0; });
-    return g_tent_running.load() ? 0 : -1;
-}
-
-void TENTBenchRunner::noteTransferFailed() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    g_tent_running.store(false);
-    cv_task_.notify_all();
-    cv_done_.notify_all();
 }
 
 double TENTBenchRunner::runSingleTransfer(
     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
     uint64_t block_size, uint64_t batch_size, OpCode opcode,
     uint64_t deadline_ns, IntentType intent_type) {
-    if (!g_tent_running.load()) return -1.0;
+    if (!running()) return -1.0;
 
     auto abortTransfer = [&](const char* why) {
         LOG(ERROR) << why;
@@ -590,26 +552,22 @@ double TENTBenchRunner::runSingleTransfer(
             noteTransferFailed();
             return finish(-1.0);
         }
-        while (g_tent_running.load()) {
-            TransferStatus overall_status;
-            auto polled = engine_->getTransferStatus(batch_id, overall_status);
-            if (!polled.ok()) {
-                LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
-                noteTransferFailed();
-                return finish(-1.0);
-            }
-            if (overall_status.s == TransferStatusEnum::COMPLETED) {
-                return finish(timer.lap_us());
-            }
-            if (overall_status.s == TransferStatusEnum::FAILED ||
-                overall_status.s == TransferStatusEnum::TIMEOUT ||
-                overall_status.s == TransferStatusEnum::CANCELED ||
-                overall_status.s == TransferStatusEnum::INVALID) {
-                LOG(ERROR) << "Failed transfer detected";
-                noteTransferFailed();
-                return finish(-1.0);
-            }
+        TransferStatus overall_status;
+        uint64_t polls = 0;
+        auto polled = waitForBatch(batch_id, overall_status, polls);
+        if (!polled.ok()) {
+            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+            noteTransferFailed();
+            return finish(-1.0);
         }
+        if (overall_status.s == TransferStatusEnum::COMPLETED) {
+            return finish(timer.lap_us());
+        }
+        if (overall_status.s == TransferStatusEnum::PENDING) {
+            return finish(-1.0);  // stopped and abandoned
+        }
+        LOG(ERROR) << "Failed transfer detected";
+        noteTransferFailed();
         return finish(-1.0);
     }
 
@@ -629,29 +587,23 @@ double TENTBenchRunner::runSingleTransfer(
     const uint64_t submit_us = submit_timer.lap_us();
     XferBenchTimer wait_timer;
     uint64_t polls = 0;
-    while (g_tent_running.load()) {
-        TransferStatus overall_status;
-        auto polled = engine_->getTransferStatus(batch_id, overall_status);
-        polls++;
-        if (!polled.ok()) {
-            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
-            noteTransferFailed();
-            return finish(-1.0);
-        }
-        if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            const uint64_t wait_us = wait_timer.lap_us();
-            logSplitXfer({batch_size, submit_us, wait_us, polls});
-            return finish(static_cast<double>(submit_us + wait_us));
-        }
-        if (overall_status.s == TransferStatusEnum::FAILED ||
-            overall_status.s == TransferStatusEnum::TIMEOUT ||
-            overall_status.s == TransferStatusEnum::CANCELED ||
-            overall_status.s == TransferStatusEnum::INVALID) {
-            LOG(ERROR) << "Failed transfer detected";
-            noteTransferFailed();
-            return finish(-1.0);
-        }
+    TransferStatus overall_status;
+    auto polled = waitForBatch(batch_id, overall_status, polls);
+    if (!polled.ok()) {
+        LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+        noteTransferFailed();
+        return finish(-1.0);
     }
+    if (overall_status.s == TransferStatusEnum::COMPLETED) {
+        const uint64_t wait_us = wait_timer.lap_us();
+        logSplitXfer({batch_size, submit_us, wait_us, polls});
+        return finish(static_cast<double>(submit_us + wait_us));
+    }
+    if (overall_status.s == TransferStatusEnum::PENDING) {
+        return finish(-1.0);  // stopped and abandoned
+    }
+    LOG(ERROR) << "Failed transfer detected";
+    noteTransferFailed();
     return finish(-1.0);
 }
 

@@ -1,0 +1,61 @@
+cmake_minimum_required(VERSION 3.16)
+
+set(prefix
+    "@CMAKE_CURRENT_BINARY_DIR@/installed_congestion_control_header_prefix")
+file(REMOVE_RECURSE "${prefix}")
+
+get_filename_component(library_dir "${TRANSFER_ENGINE_LIBRARY}" DIRECTORY)
+if("@BUILD_SHARED_LIBS@")
+  set(consumer_flags "${TRANSFER_ENGINE_LIBRARY}" "-Wl,-rpath,${library_dir}"
+                     -o "${prefix}/consumer")
+else()
+  set(consumer_flags -fsyntax-only)
+endif()
+
+set(expected_adaptive_control 0)
+if("@MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL@")
+  set(expected_adaptive_control 1)
+endif()
+
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" "-DCMAKE_INSTALL_PREFIX=${prefix}"
+          -P "@CMAKE_CURRENT_BINARY_DIR@/../include/cmake_install.cmake"
+  RESULT_VARIABLE install_result
+  OUTPUT_VARIABLE install_output
+  ERROR_VARIABLE install_error)
+if(NOT install_result EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Installing the congestion-control build failed:\n${install_output}${install_error}"
+  )
+endif()
+
+execute_process(
+  COMMAND
+    "@CMAKE_CXX_COMPILER@" -std=c++20
+    -DMC_EXPECT_ADAPTIVE_CONTROL=${expected_adaptive_control} -I${prefix}/include
+    "@CMAKE_CURRENT_SOURCE_DIR@/installed_congestion_control_header_test.cpp"
+    ${consumer_flags}
+  RESULT_VARIABLE compile_result
+  OUTPUT_VARIABLE compile_output
+  ERROR_VARIABLE compile_error)
+if(NOT compile_result EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Installed congestion-control consumer failed to compile or link:\n${compile_output}${compile_error}"
+  )
+endif()
+
+if(NOT "@BUILD_SHARED_LIBS@")
+  return()
+endif()
+
+execute_process(
+  COMMAND "${prefix}/consumer"
+  RESULT_VARIABLE run_result
+  OUTPUT_VARIABLE run_output
+  ERROR_VARIABLE run_error)
+if(NOT run_result EQUAL 0)
+  message(FATAL_ERROR
+    "Installed congestion-control consumer failed to run:\n${run_output}${run_error}")
+endif()

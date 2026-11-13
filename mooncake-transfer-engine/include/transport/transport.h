@@ -31,8 +31,13 @@
 #include <mutex>
 #include <condition_variable>
 
+#include "mooncake_te_build_config.h"
 #include "common/base/status.h"
 #include "transfer_metadata.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#include "task_congestion_observation.h"
+#endif
 
 namespace mooncake {
 
@@ -206,6 +211,16 @@ class Transport {
         // delete the slice.
         using CleanupCallback = void (*)(Slice *);
         CleanupCallback cleanup_callback = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        adaptive_congestion_control::Permit rdma_congestion_control_permit;
+        size_t rdma_congestion_control_slice_ordinal = 0;
+        std::atomic<bool> rdma_congestion_control_observed_blocked{false};
+        // Accessed only by the slice's current worker owner.
+        uint64_t rdma_congestion_control_window_episode = 0;
+        void *rdma_congestion_control_route = nullptr;
+        RdmaEndPoint *rdma_congestion_control_endpoint = nullptr;
+        uint64_t rdma_congestion_control_endpoint_generation = 0;
+#endif
 
         union {
             struct {
@@ -235,6 +250,8 @@ class Transport {
                 void *cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
                 int cuda_device;    // device that owns cuda_stream
+                void *hip_event;    // completion event of the async HIP
+                                    // transport (see hip_transport.cpp)
             } local;
             struct {
                 void *event;  // cudaEvent_t
@@ -350,7 +367,22 @@ class Transport {
                                                      std::memory_order_acq_rel);
 #else
             // EDC waiters can freeBatchID after the CV without a walk.
-            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+#ifdef WITH_METRICS
+            // Save the outcome only for tasks the metrics record.
+            if (task->start_time.time_since_epoch().count() != 0) {
+                __atomic_store_n(
+                    &task->end_ticks,
+                    std::chrono::steady_clock::now().time_since_epoch().count(),
+                    __ATOMIC_RELAXED);
+                const bool failed = __atomic_load_n(&task->failed_slice_count,
+                                                    __ATOMIC_ACQUIRE) != 0;
+                __atomic_store_n(&task->end_status,
+                                 failed ? TransferStatusEnum::FAILED
+                                        : TransferStatusEnum::COMPLETED,
+                                 __ATOMIC_RELAXED);
+            }
+#endif
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
 
             auto prev = batch_desc.finished_task_count.fetch_add(
                 1, std::memory_order_acq_rel);
@@ -444,6 +476,17 @@ class Transport {
             slice->cleanup_callback = nullptr;
             if (cleanup) cleanup(slice);
             slice->interned_peer_nic_path = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            Transport::releaseCongestionPermit(slice);
+            slice->rdma_congestion_control_route = nullptr;
+            slice->rdma_congestion_control_endpoint = nullptr;
+            slice->rdma_congestion_control_endpoint_generation = 0;
+            slice->rdma_congestion_control_window_episode = 0;
+            if (slice->rdma_congestion_control_observed_blocked.load(
+                    std::memory_order_relaxed))
+                slice->rdma_congestion_control_observed_blocked.store(
+                    false, std::memory_order_relaxed);
+#endif
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
@@ -482,8 +525,29 @@ class Transport {
         // query for NVLink async transfers) in getTransferStatus().
         Transport *transport_ = nullptr;
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        // Allocated only when RDMA admission or feedback reports an anomaly.
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+            congestion_observation;
+        // Captured once per logical task from its actual Classic RDMA workers.
+        TaskCongestionObserved<TaskCongestionControllerMode>
+            rdma_congestion_control_mode;
+#endif
+
 #ifdef WITH_METRICS
+        // Stamped once at submit and never cleared; zero means not stamped.
         std::chrono::steady_clock::time_point start_time;
+        TransferRequest::OpCode metrics_opcode = TransferRequest::READ;
+        // Separate flags until export and log collection are unified.
+        // Accessed with __atomic builtins like is_finished (std::atomic would
+        // make the task non-movable).
+        volatile bool export_metrics_recorded = false;
+        volatile bool log_metrics_recorded = false;
+        // Set by the event-driven completion callback when it finishes the
+        // task: steady_clock ticks (else 0) and COMPLETED or FAILED (else
+        // WAITING). Atomic: a poll may read them while the callback writes.
+        volatile int64_t end_ticks = 0;
+        volatile int end_status = WAITING;
 #endif
 
         // record the origin request
@@ -612,6 +676,10 @@ class Transport {
     static ThreadLocalSliceCache &getSliceCache();
 
    private:
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    static void releaseCongestionPermit(Slice *slice);
+#endif
+
     virtual int registerLocalMemory(void *addr, size_t length,
                                     const std::string &location,
                                     bool remote_accessible,

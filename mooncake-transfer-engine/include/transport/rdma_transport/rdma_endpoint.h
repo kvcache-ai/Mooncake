@@ -187,6 +187,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Failed tasks (which must be submitted) are inserted in failed_slice_list
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    int submitPostSendLimited(
+        std::vector<Transport::Slice *> &slice_list,
+        std::vector<Transport::Slice *> &failed_slice_list, size_t max_count);
+#endif
 
     // Map a CQE onto the posting-order FIFO for that QP. Retires every WR
     // up to `completed` inclusive (RC order). The tail stays queued because
