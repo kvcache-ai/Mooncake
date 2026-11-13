@@ -1647,23 +1647,45 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 
         updateGlobalConfig(device_attr);
         supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
-        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
-        max_qp_init_rd_atom_ =
-            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        {
+            // Scoped so the gotos to cleanup_context_and_devices below do not
+            // jump past this initialization.
+            const auto &config = globalConfig();
+            max_qp_rd_atom_ = resolveRdAtomicDepth(config.max_dest_rd_atomic,
+                                                   device_attr.max_qp_rd_atom);
+            max_qp_init_rd_atom_ = resolveRdAtomicDepth(
+                config.max_rd_atomic, device_attr.max_qp_init_rd_atom);
+            if (config.max_rd_atomic > 0 || config.max_dest_rd_atomic > 0) {
+                LOG(INFO) << "Device " << device_name
+                          << " RD-atomic depth: max_rd_atomic="
+                          << max_qp_init_rd_atom_
+                          << " (MC_MAX_RD_ATOMIC=" << config.max_rd_atomic
+                          << ", device max_qp_init_rd_atom="
+                          << device_attr.max_qp_init_rd_atom
+                          << "), max_dest_rd_atomic=" << max_qp_rd_atom_
+                          << " (MC_MAX_DEST_RD_ATOMIC="
+                          << config.max_dest_rd_atomic
+                          << ", device max_qp_rd_atom="
+                          << device_attr.max_qp_rd_atom << ")";
+            }
+        }
         if (!supports_rdma_atomic_) {
             LOG(INFO) << "RNIC " << device_name
                       << " reports no RDMA atomic; data QPs will not request "
                          "IBV_ACCESS_REMOTE_ATOMIC";
         }
-        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
-            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+        if (clampRdAtomicDepth(device_attr.max_qp_rd_atom) <
+                kIdealRdAtomicDepth ||
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom) <
+                kIdealRdAtomicDepth) {
             LOG(WARNING)
                 << "Device " << device_name
                 << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
-                << max_qp_rd_atom_
-                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
-                << "; QPs on this NIC will use those "
-                << "values instead of the default " << kIdealRdAtomicDepth;
+                << device_attr.max_qp_rd_atom
+                << ", max_qp_init_rd_atom=" << device_attr.max_qp_init_rd_atom
+                << "; QPs on this NIC will use max_dest_rd_atomic="
+                << max_qp_rd_atom_ << ", max_rd_atomic=" << max_qp_init_rd_atom_
+                << " instead of the default " << kIdealRdAtomicDepth;
         }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;

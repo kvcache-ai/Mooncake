@@ -22,6 +22,7 @@
 
 #include "config.h"
 #include "transport/batch_registration.h"
+#include "transport/rdma_transport/rdma_context.h"
 
 namespace mooncake {
 namespace {
@@ -1095,6 +1096,70 @@ TEST_F(RdmaWorkerIdleSpinEnvTest, EmptyStringKeepsDefault) {
     config.rdma_worker_idle_spin_us = 19;
     loadGlobalConfig(config);
     EXPECT_EQ(config.rdma_worker_idle_spin_us, 19u);
+}
+
+// --- MC_MAX_RD_ATOMIC / MC_MAX_DEST_RD_ATOMIC (1-255, clamped to device) ---
+
+class RdAtomicEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override {
+        ::unsetenv("MC_MAX_RD_ATOMIC");
+        ::unsetenv("MC_MAX_DEST_RD_ATOMIC");
+    }
+};
+
+TEST_F(RdAtomicEnvTest, UnsetMeansDeviceDefault) {
+    ::unsetenv("MC_MAX_RD_ATOMIC");
+    ::unsetenv("MC_MAX_DEST_RD_ATOMIC");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_rd_atomic, 0);
+    EXPECT_EQ(config.max_dest_rd_atomic, 0);
+}
+
+TEST_F(RdAtomicEnvTest, ValidOverrides) {
+    ASSERT_EQ(::setenv("MC_MAX_RD_ATOMIC", "2", 1), 0);
+    ASSERT_EQ(::setenv("MC_MAX_DEST_RD_ATOMIC", "255", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_rd_atomic, 2);
+    EXPECT_EQ(config.max_dest_rd_atomic, 255);
+}
+
+TEST_F(RdAtomicEnvTest, OutOfRangeIsIgnored) {
+    for (const char* bad : {"0", "-2", "256", "abc"}) {
+        ASSERT_EQ(::setenv("MC_MAX_RD_ATOMIC", bad, 1), 0);
+        ASSERT_EQ(::setenv("MC_MAX_DEST_RD_ATOMIC", bad, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.max_rd_atomic, 0) << "value=" << bad;
+        EXPECT_EQ(config.max_dest_rd_atomic, 0) << "value=" << bad;
+    }
+}
+
+TEST(RdAtomicResolveTest, UnsetKeepsUpstreamDeviceDerivedDepth) {
+    // requested == 0 must match clampRdAtomicDepth() exactly (#4312 behavior).
+    for (int dev : {-1, 0, 1, 2, 8, 16, 32, 255}) {
+        EXPECT_EQ(resolveRdAtomicDepth(0, dev), clampRdAtomicDepth(dev))
+            << "device_max=" << dev;
+    }
+}
+
+TEST(RdAtomicResolveTest, RequestBelowDeviceLimitIsHonored) {
+    EXPECT_EQ(resolveRdAtomicDepth(2, 16), 2);
+    EXPECT_EQ(resolveRdAtomicDepth(1, 8), 1);
+}
+
+TEST(RdAtomicResolveTest, RequestIsClampedToDeviceLimit) {
+    EXPECT_EQ(resolveRdAtomicDepth(32, 16), 16);
+    EXPECT_EQ(resolveRdAtomicDepth(255, 8), 8);
+    // A device that advertises 0 still floors at 1.
+    EXPECT_EQ(resolveRdAtomicDepth(4, 0), 1);
+}
+
+TEST(RdAtomicResolveTest, RequestMayExceedHistoricalCapUpToDeviceLimit) {
+    EXPECT_EQ(resolveRdAtomicDepth(64, 128), 64);
+    EXPECT_EQ(resolveRdAtomicDepth(255, 255), 255);
 }
 
 }  // namespace
