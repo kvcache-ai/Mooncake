@@ -10804,6 +10804,38 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
     return QueryTaskResponse(task_option.value());
 }
 
+tl::expected<ListTasksResponse, ErrorCode> MasterService::ListTasks(
+    const TaskListRequest& request) {
+    auto page = task_manager_.get_read_access().list_tasks(request);
+    if (!page) {
+        return tl::make_unexpected(page.error());
+    }
+    ListTasksResponse response;
+    response.tasks.reserve(page->tasks.size());
+    for (const auto& task : page->tasks) {
+        response.tasks.emplace_back(task);
+    }
+    response.next_page_token = std::move(page->next_page_token);
+    return response;
+}
+
+tl::expected<void, ErrorCode> MasterService::CancelTask(
+    const UUID& task_id, const TenantId& tenant_id) {
+    std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+    auto result =
+        task_manager_.get_write_access().cancel_task(task_id, tenant_id);
+    if (result != ErrorCode::OK) {
+        return tl::make_unexpected(result);
+    }
+    return {};
+}
+
+tl::expected<bool, ErrorCode> MasterService::IsTaskCancellationRequested(
+    const UUID& client_id, const UUID& task_id) {
+    return task_manager_.get_read_access().is_cancellation_requested(client_id,
+                                                                     task_id);
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
     const auto liveness = FindClientRecord(client_id);
@@ -10859,6 +10891,9 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
     }
 
     for (const auto& segment_name : request.segments) {
+        if (segment_name.empty()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (!segment_access.ExistsSegmentName(segment_name)) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
@@ -10874,7 +10909,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
     }
 
     for (const auto& target_segment : request.target_segments) {
-        if (unique_segments.contains(target_segment)) {
+        if (target_segment.empty() ||
+            unique_segments.contains(target_segment)) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (!segment_access.ExistsSegmentName(target_segment)) {
@@ -10918,7 +10954,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     }
 
     auto job = std::make_shared<DrainJob>();
-    job->id = generate_uuid();
+    do {
+        job->id = generate_uuid();
+    } while (drain_jobs_.contains(job->id));
     job->request = request;
     job->created_at = std::chrono::system_clock::now();
     job->last_updated_at = job->created_at;
@@ -10941,25 +10979,72 @@ tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
     }
 
     std::lock_guard<std::mutex> job_lock(job->mutex);
+    return job->ToResponse();
+}
+
+QueryJobResponse MasterService::DrainJob::ToResponse() const {
     QueryJobResponse response;
-    response.id = job->id;
-    response.type = job->type;
-    response.status = job->status;
+    response.id = id;
+    response.type = type;
+    response.status = status;
     response.created_at_ms_epoch = static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->created_at.time_since_epoch())
+            created_at.time_since_epoch())
             .count());
     response.last_updated_at_ms_epoch = static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->last_updated_at.time_since_epoch())
+            last_updated_at.time_since_epoch())
             .count());
-    response.segments = job->request.segments;
-    response.succeeded_units = job->succeeded_units;
-    response.failed_units = job->failed_units;
-    response.blocked_units = job->blocked_units;
-    response.active_units = static_cast<uint64_t>(job->active_tasks.size());
-    response.migrated_bytes = job->migrated_bytes;
-    response.message = job->message;
+    response.segments = request.segments;
+    response.succeeded_units = succeeded_units;
+    response.failed_units = failed_units;
+    response.blocked_units = blocked_units;
+    response.active_units = static_cast<uint64_t>(active_tasks.size());
+    response.migrated_bytes = migrated_bytes;
+    response.message = message;
+    return response;
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> MasterService::ListDrainJobs(
+    const DrainJobListRequest& request) {
+    constexpr std::string_view prefix = "drain-v1:";
+    UUID after{};
+    if (request.limit == 0 || request.limit > 1000 ||
+        (request.status && (*request.status < JobStatus::CREATED ||
+                            *request.status > JobStatus::CANCELED)) ||
+        (request.segment && request.segment->empty())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!request.page_token.empty()) {
+        const auto token = std::string_view(request.page_token);
+        if (!token.starts_with(prefix) ||
+            !StringToUuid(std::string(token.substr(prefix.size())), after) ||
+            token.substr(prefix.size()) != UuidToString(after)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    ListDrainJobsResponse response;
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    auto it = request.page_token.empty() ? drain_jobs_.begin()
+                                         : drain_jobs_.upper_bound(after);
+    for (; it != drain_jobs_.end(); ++it) {
+        const auto& job = *it->second;
+        std::lock_guard<std::mutex> job_lock(job.mutex);
+        const auto& segments = job.request.segments;
+        if ((request.status && job.status != *request.status) ||
+            (request.segment &&
+             std::find(segments.begin(), segments.end(), *request.segment) ==
+                 segments.end())) {
+            continue;
+        }
+        if (response.jobs.size() == request.limit) {
+            response.next_page_token =
+                std::string(prefix) + UuidToString(response.jobs.back().id);
+            break;
+        }
+        response.jobs.push_back(job.ToResponse());
+    }
     return response;
 }
 
@@ -10975,24 +11060,17 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
         job = it->second;
     }
 
-    std::vector<std::string> segments_to_restore;
-    {
-        std::lock_guard<std::mutex> job_lock(job->mutex);
-        if (job->status == JobStatus::SUCCEEDED ||
-            job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-
-        job->status = JobStatus::CANCELED;
-        job->last_updated_at = std::chrono::system_clock::now();
-        job->message = "Drain job canceled";
-        segments_to_restore = job->request.segments;
+    std::lock_guard<std::mutex> job_lock(job->mutex);
+    if (job->status == JobStatus::SUCCEEDED ||
+        job->status == JobStatus::FAILED ||
+        job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
+    // Keep the job locked while restoring segments, so queries and the
+    // scheduler observe the terminal state only after restoration.
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    for (const auto& segment_name : segments_to_restore) {
+    for (const auto& segment_name : job->request.segments) {
         SegmentStatus status = SegmentStatus::UNDEFINED;
         if (segment_access.GetSegmentStatusByName(segment_name, status) ==
                 ErrorCode::OK &&
@@ -11001,6 +11079,9 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
                                                         SegmentStatus::OK);
         }
     }
+    job->status = JobStatus::CANCELED;
+    job->last_updated_at = std::chrono::system_clock::now();
+    job->message = "Drain job canceled";
     return {};
 }
 

@@ -74,6 +74,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
         {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
         {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
+        {ErrorCode::TASK_CANCELED, "TASK_CANCELED"},
         {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"},
         {ErrorCode::DFS_NETWORK_TIMEOUT, "DFS_NETWORK_TIMEOUT"},
         {ErrorCode::DFS_SERVICE_UNAVAILABLE, "DFS_SERVICE_UNAVAILABLE"},

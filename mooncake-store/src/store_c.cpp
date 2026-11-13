@@ -14,12 +14,14 @@
 
 #include "store_c.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "real_client.h"
@@ -83,6 +85,127 @@ mooncake::ExistOptions to_exist_options(
     if (!c_options) return options;
     options.prefetch_to_memory = c_options->prefetch_to_memory != 0;
     return options;
+}
+
+using mooncake::ErrorCode;
+
+template <typename Fn>
+int with_migration_store(mooncake_store_t store, Fn &&fn) {
+    if (!store) {
+        return toInt(ErrorCode::INVALID_PARAMS);
+    }
+    try {
+        return toInt(fn(*as_client(store)));
+    } catch (...) {
+        return toInt(ErrorCode::INTERNAL_ERROR);
+    }
+}
+
+template <typename Output, typename Fn>
+int with_migration_output(mooncake_store_t store, Output *out, Fn &&fn) {
+    if (!out) {
+        return toInt(ErrorCode::INVALID_PARAMS);
+    }
+    *out = {};
+    return with_migration_store(store, std::forward<Fn>(fn));
+}
+
+bool read_segments(const char *const *names, size_t count,
+                   std::vector<std::string> &out) {
+    if (count && !names) {
+        return false;
+    }
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (!names[i] || !*names[i]) {
+            return false;
+        }
+        out.emplace_back(names[i]);
+    }
+    return true;
+}
+
+mooncake_store_uuid_t c_uuid(const mooncake::UUID &id) {
+    return {id.first, id.second};
+}
+
+ErrorCode write_id(const tl::expected<mooncake::UUID, ErrorCode> &result,
+                   mooncake_store_uuid_t *out) {
+    if (!result) {
+        return result.error();
+    }
+    *out = c_uuid(*result);
+    return ErrorCode::OK;
+}
+
+const char *copy_c_string(char *&cursor, const std::string &value) {
+    auto *start = cursor;
+    const auto size = value.size() + 1;
+    std::memcpy(start, value.c_str(), size);
+    cursor += size;
+    return start;
+}
+
+// Single malloc block: optional page header, job array, segment pointers,
+// then NUL-terminated strings. Only the leading object is freed by the caller.
+ErrorCode allocate_drain_results(
+    std::span<const mooncake::QueryJobResponse> jobs, const std::string &token,
+    mooncake_store_drain_job_info_t **job_out,
+    mooncake_store_drain_job_page_t **page_out) {
+    constexpr size_t job_alignment = alignof(mooncake_store_drain_job_info_t);
+    constexpr size_t page_size = sizeof(mooncake_store_drain_job_page_t);
+    constexpr size_t aligned_page_size =
+        (page_size + job_alignment - 1) / job_alignment * job_alignment;
+    static_assert(alignof(mooncake_store_drain_job_info_t) >=
+                  alignof(const char *));
+    size_t pointer_count = 0;
+    size_t string_bytes = token.size() + 1;
+    for (const auto &job : jobs) {
+        pointer_count += job.segments.size();
+        string_bytes += job.message.size() + 1;
+        for (const auto &segment : job.segments) {
+            string_bytes += segment.size() + 1;
+        }
+    }
+    const size_t header_size = page_out ? aligned_page_size : 0;
+    auto *block = static_cast<char *>(std::malloc(
+        header_size + jobs.size() * sizeof(mooncake_store_drain_job_info_t) +
+        pointer_count * sizeof(const char *) + string_bytes));
+    if (!block) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    auto *infos = reinterpret_cast<mooncake_store_drain_job_info_t *>(
+        block + header_size);
+    auto *segments = reinterpret_cast<const char **>(infos + jobs.size());
+    auto *strings = reinterpret_cast<char *>(segments + pointer_count);
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto &job = jobs[i];
+        infos[i] = {.id = c_uuid(job.id),
+                    .status = static_cast<int32_t>(job.status),
+                    .created_at_ms_epoch = job.created_at_ms_epoch,
+                    .last_updated_at_ms_epoch = job.last_updated_at_ms_epoch,
+                    .segments = job.segments.empty() ? nullptr : segments,
+                    .segment_count = job.segments.size(),
+                    .succeeded_units = job.succeeded_units,
+                    .failed_units = job.failed_units,
+                    .blocked_units = job.blocked_units,
+                    .active_units = job.active_units,
+                    .migrated_bytes = job.migrated_bytes,
+                    .message = copy_c_string(strings, job.message)};
+        for (const auto &segment : job.segments) {
+            *segments++ = copy_c_string(strings, segment);
+        }
+    }
+    if (page_out) {
+        auto *page = reinterpret_cast<mooncake_store_drain_job_page_t *>(block);
+        *page = {.jobs = jobs.empty() ? nullptr : infos,
+                 .count = jobs.size(),
+                 .next_page_token = copy_c_string(strings, token)};
+        *page_out = page;
+    } else {
+        *job_out = infos;
+    }
+    return ErrorCode::OK;
 }
 
 }  // namespace
@@ -498,6 +621,128 @@ int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer) {
     } catch (...) {
         return -1;
     }
+}
+
+int mooncake_store_create_copy_task(mooncake_store_t store, const char *key,
+                                    const char *const *targets,
+                                    size_t target_count,
+                                    mooncake_store_uuid_t *task_id_out) {
+    return with_migration_output(store, task_id_out, [&](auto &client) {
+        std::vector<std::string> target_segments;
+        if (!key || target_count == 0 ||
+            !read_segments(targets, target_count, target_segments)) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        return write_id(client.create_copy_task(key, target_segments),
+                        task_id_out);
+    });
+}
+
+int mooncake_store_create_move_task(mooncake_store_t store, const char *key,
+                                    const char *source, const char *target,
+                                    mooncake_store_uuid_t *task_id_out) {
+    return with_migration_output(store, task_id_out, [&](auto &client) {
+        if (!key || !source || !*source || !target || !*target) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        return write_id(client.create_move_task(key, source, target),
+                        task_id_out);
+    });
+}
+
+int mooncake_store_query_task(mooncake_store_t store,
+                              mooncake_store_uuid_t task_id,
+                              mooncake_store_task_info_t **result_out) {
+    return with_migration_output(store, result_out, [&](auto &client) {
+        auto result = client.query_task({task_id.high, task_id.low});
+        if (!result) {
+            return result.error();
+        }
+        auto *info = static_cast<mooncake_store_task_info_t *>(std::malloc(
+            sizeof(mooncake_store_task_info_t) + result->message.size() + 1));
+        if (!info) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        auto *message = reinterpret_cast<char *>(info + 1);
+        *info = {.id = c_uuid(result->id),
+                 .type = static_cast<int32_t>(result->type),
+                 .status = static_cast<int32_t>(result->status),
+                 .created_at_ms_epoch = result->created_at_ms_epoch,
+                 .last_updated_at_ms_epoch = result->last_updated_at_ms_epoch,
+                 .assigned_client = c_uuid(result->assigned_client),
+                 .message = copy_c_string(message, result->message)};
+        *result_out = info;
+        return ErrorCode::OK;
+    });
+}
+
+int mooncake_store_create_drain_job(
+    mooncake_store_t store, const mooncake_store_drain_job_request_t *request,
+    mooncake_store_uuid_t *job_id_out) {
+    return with_migration_output(store, job_id_out, [&](auto &client) {
+        mooncake::CreateDrainJobRequest native;
+        if (!request || request->segment_count == 0 ||
+            request->max_concurrency == 0 ||
+            !read_segments(request->segments, request->segment_count,
+                           native.segments) ||
+            !read_segments(request->target_segments, request->target_count,
+                           native.target_segments)) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        native.max_concurrency = request->max_concurrency;
+        return write_id(client.create_drain_job(native), job_id_out);
+    });
+}
+
+int mooncake_store_query_drain_job(
+    mooncake_store_t store, mooncake_store_uuid_t job_id,
+    mooncake_store_drain_job_info_t **result_out) {
+    return with_migration_output(store, result_out, [&](auto &client) {
+        auto result = client.query_drain_job({job_id.high, job_id.low});
+        if (!result) {
+            return result.error();
+        }
+        return allocate_drain_results({&*result, 1}, "", result_out, nullptr);
+    });
+}
+
+int mooncake_store_cancel_drain_job(mooncake_store_t store,
+                                    mooncake_store_uuid_t job_id) {
+    return with_migration_store(store, [&](auto &client) {
+        auto result = client.cancel_drain_job({job_id.high, job_id.low});
+        return result ? ErrorCode::OK : result.error();
+    });
+}
+
+int mooncake_store_list_drain_jobs(
+    mooncake_store_t store, const mooncake_store_drain_job_filter_t *filter,
+    mooncake_store_drain_job_page_t **result_out) {
+    return with_migration_output(store, result_out, [&](auto &client) {
+        mooncake::DrainJobListRequest request;
+        if (filter) {
+            if (filter->has_status) {
+                if (filter->status < MOONCAKE_STORE_DRAIN_CREATED ||
+                    filter->status > MOONCAKE_STORE_DRAIN_CANCELED) {
+                    return ErrorCode::INVALID_PARAMS;
+                }
+                request.status =
+                    static_cast<mooncake::JobStatus>(filter->status);
+            }
+            if (filter->segment) {
+                request.segment = filter->segment;
+            }
+            request.page_token = c_str_or(filter->page_token, "");
+            if (filter->limit != 0) {
+                request.limit = filter->limit;
+            }
+        }
+        auto result = client.list_drain_jobs(request);
+        if (!result) {
+            return result.error();
+        }
+        return allocate_drain_results(result->jobs, result->next_page_token,
+                                      nullptr, result_out);
+    });
 }
 
 }  // extern "C"

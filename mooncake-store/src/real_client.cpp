@@ -9403,17 +9403,72 @@ std::vector<std::string> RealClient::batch_replica_clear(
 
 tl::expected<UUID, ErrorCode> RealClient::create_copy_task(
     const std::string &key, const std::vector<std::string> &targets) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return client_->CreateCopyTask(key, targets);
 }
 
 tl::expected<UUID, ErrorCode> RealClient::create_move_task(
     const std::string &key, const std::string &source,
     const std::string &target) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return client_->CreateMoveTask(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> RealClient::create_drain_job(
+    const CreateDrainJobRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CreateDrainJob(request);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> RealClient::query_drain_job(
+    const UUID &job_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->QueryDrainJob(job_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::cancel_drain_job(const UUID &job_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CancelDrainJob(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> RealClient::list_drain_jobs(
+    const DrainJobListRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->ListDrainJobs(request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> RealClient::list_tasks(
+    const TaskListRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->ListTasks(request);
+}
+
+tl::expected<void, ErrorCode> RealClient::cancel_task(const UUID &task_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CancelTask(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return client_->QueryTask(task_id);
 }
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>

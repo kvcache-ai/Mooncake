@@ -2325,6 +2325,7 @@ PYBIND11_MODULE(_store, m) {
         .value("PROCESSING", TaskStatus::PROCESSING)
         .value("SUCCESS", TaskStatus::SUCCESS)
         .value("FAILED", TaskStatus::FAILED)
+        .value("CANCELED", TaskStatus::CANCELED)
         .export_values();
 
     py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
@@ -2350,6 +2351,40 @@ PYBIND11_MODULE(_store, m) {
                 << ", message=\"" << self.message << "\")";
             return oss.str();
         });
+
+    py::enum_<JobType>(m, "JobType").value("DRAIN", JobType::DRAIN);
+    py::enum_<JobStatus>(m, "JobStatus")
+        .value("CREATED", JobStatus::CREATED)
+        .value("PLANNING", JobStatus::PLANNING)
+        .value("RUNNING", JobStatus::RUNNING)
+        .value("SUCCEEDED", JobStatus::SUCCEEDED)
+        .value("FAILED", JobStatus::FAILED)
+        .value("CANCELED", JobStatus::CANCELED);
+
+    py::class_<QueryJobResponse>(m, "QueryJobResponse")
+        .def_readonly("id", &QueryJobResponse::id)
+        .def_readonly("type", &QueryJobResponse::type)
+        .def_readonly("status", &QueryJobResponse::status)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryJobResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryJobResponse::last_updated_at_ms_epoch)
+        .def_readonly("segments", &QueryJobResponse::segments)
+        .def_readonly("succeeded_units", &QueryJobResponse::succeeded_units)
+        .def_readonly("failed_units", &QueryJobResponse::failed_units)
+        .def_readonly("blocked_units", &QueryJobResponse::blocked_units)
+        .def_readonly("active_units", &QueryJobResponse::active_units)
+        .def_readonly("migrated_bytes", &QueryJobResponse::migrated_bytes)
+        .def_readonly("message", &QueryJobResponse::message);
+
+    py::class_<ListDrainJobsResponse>(m, "ListDrainJobsResponse")
+        .def_readonly("jobs", &ListDrainJobsResponse::jobs)
+        .def_readonly("next_page_token",
+                      &ListDrainJobsResponse::next_page_token);
+
+    py::class_<ListTasksResponse>(m, "ListTasksResponse")
+        .def_readonly("tasks", &ListTasksResponse::tasks)
+        .def_readonly("next_page_token", &ListTasksResponse::next_page_token);
 
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
@@ -3544,7 +3579,131 @@ PYBIND11_MODULE(_store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        .def(
+            "create_drain_job",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &segments,
+               const std::vector<std::string> &target_segments,
+               int64_t max_concurrency) -> py::tuple {
+                if (!self.is_client_initialized() || max_concurrency <= 0 ||
+                    max_concurrency > std::numeric_limits<uint32_t>::max()) {
+                    return py::make_tuple(UUID{},
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->create_drain_job(
+                    {segments, target_segments,
+                     static_cast<uint32_t>(max_concurrency)});
+                py::gil_scoped_acquire acquire;
+                return py::make_tuple(result.value_or(UUID{}),
+                                      result ? 0 : toInt(result.error()));
+            },
+            py::arg("segments"),
+            py::arg("target_segments") = std::vector<std::string>{},
+            py::arg("max_concurrency") = 4,
+            "Start draining mounted memory segments. Returns (job_id, "
+            "error_code).")
+        .def(
+            "query_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) -> py::tuple {
+                if (!self.is_client_initialized()) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->query_drain_job(job_id);
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("job_id"),
+            "Return (job, error_code). The job is None on error.")
+        .def(
+            "cancel_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_drain_job(job_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("job_id"),
+            "Cancel a nonterminal job with no active moves. Returns an error "
+            "code.")
+        .def(
+            "list_drain_jobs",
+            [](MooncakeStorePyWrapper &self, std::optional<JobStatus> status,
+               const std::optional<std::string> &segment, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_drain_jobs(
+                    {status, segment, page_token,
+                     static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("segment") = py::none(),
+            py::arg("limit") = 100, py::arg("page_token") = "",
+            "Return (page, error_code) for cluster-wide drain jobs. Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "list_tasks",
+            [](MooncakeStorePyWrapper &self, std::optional<TaskStatus> status,
+               std::optional<TaskType> type,
+               std::optional<UUID> assigned_client,
+               const std::optional<std::string> &key, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_tasks(
+                    {.status = status,
+                     .type = type,
+                     .assigned_client = assigned_client,
+                     .key = key,
+                     .page_token = page_token,
+                     .limit = static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("type") = py::none(),
+            py::arg("assigned_client") = py::none(),
+            py::arg("key") = py::none(), py::arg("limit") = 100,
+            py::arg("page_token") = "",
+            "Return (page, error_code) for tasks in this client's tenant. "
+            "Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "cancel_task",
+            [](MooncakeStorePyWrapper &self, const UUID &task_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_task(task_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("task_id"),
+            "Cancel a pending task immediately or request cancellation of a "
+            "processing task. Returns an error code. Query the final status.");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

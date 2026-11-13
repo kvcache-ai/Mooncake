@@ -904,6 +904,9 @@ class MasterService {
      */
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
 
+    tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
+
     /**
      * @brief Query current segment lifecycle state by segment name.
      */
@@ -1020,6 +1023,14 @@ class MasterService {
      * @return Task basic info
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<void, ErrorCode> CancelTask(const UUID& task_id,
+                                             const TenantId& tenant_id);
+    tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& client_id, const UUID& task_id);
+
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
 
     /**
      * @brief fetch tasks assigned to a client
@@ -2152,6 +2163,9 @@ class MasterService {
     };
 
     struct DrainJob {
+        // Caller holds mutex.
+        QueryJobResponse ToResponse() const;
+
         mutable std::mutex mutex;
         UUID id;
         JobType type{JobType::DRAIN};
@@ -2191,8 +2205,8 @@ class MasterService {
     std::atomic<bool> job_dispatch_running_{false};
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
     std::mutex job_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
-        drain_jobs_ GUARDED_BY(job_mutex_);
+    std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_
+        GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 

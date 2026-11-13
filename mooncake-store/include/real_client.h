@@ -493,6 +493,22 @@ class RealClient : public PyClient {
      */
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
+    tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) override;
+
+    tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) override;
+
+    tl::expected<void, ErrorCode> cancel_drain_job(const UUID &job_id) override;
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) override;
+
+    tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) override;
+
+    tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
+
     // Hot cache acquire: returns (offset, size) within the shm region.
     // Increments ref_count to prevent eviction.
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(

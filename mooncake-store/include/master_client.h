@@ -735,6 +735,28 @@ class MasterClient {
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelTask(const UUID& task_id);
+    [[nodiscard]] tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& task_id);
+
+    /**
+     * List task summaries in this client's tenant (request.tenant_id is
+     * replaced). Keep filters fixed while following next_page_token.
+     * Pages reflect current state, not a snapshot across calls; completed
+     * tasks may disappear when task-history retention prunes them.
+     */
+    [[nodiscard]] tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        TaskListRequest request = {});
+
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+    [[nodiscard]] tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
+        const UUID& job_id);
+    [[nodiscard]] tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelDrainJob(
+        const UUID& job_id);
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch

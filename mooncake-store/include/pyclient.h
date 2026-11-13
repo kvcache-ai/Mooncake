@@ -650,6 +650,23 @@ class PyClient {
         const std::string &key, const std::string &source,
         const std::string &target) = 0;
 
+    virtual tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) = 0;
+
+    virtual tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) = 0;
+
+    virtual tl::expected<void, ErrorCode> cancel_drain_job(
+        const UUID &job_id) = 0;
+
+    virtual tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) = 0;
+
+    virtual tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) = 0;
+
+    virtual tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) = 0;
+
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 

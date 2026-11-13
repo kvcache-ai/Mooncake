@@ -434,6 +434,7 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+    TASK_CANCELED = -1403,  ///< Task canceled before committing.
 
     // DFS errors (Range: -1600 to -1699)
     DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
