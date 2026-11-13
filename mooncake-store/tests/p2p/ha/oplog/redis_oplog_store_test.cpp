@@ -827,6 +827,67 @@ TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
     }
 }
 
+TEST_F(RedisOpLogStoreTest, StopWritingWhileEntriesAreBeingPersisted) {
+    auto writer = CreateWriter();
+    const auto first = MakeEntry(1);
+    ASSERT_EQ(writer->WriteOpLog(first, true), ErrorCode::OK);
+    std::promise<void> producer_ready;
+    auto ready = producer_ready.get_future();
+    std::future<ErrorCode> producer;
+    {
+        // Stop on every exit before the producer future is joined/destroyed.
+        struct StopWriter {
+            RedisOpLogStore& writer;
+            ~StopWriter() { writer.StopWriting(); }
+        } cleanup{*writer};
+        producer = std::async(std::launch::async, [&] {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            // Missing seq=2 keeps the committed prefix at 1 while writes run.
+            for (uint64_t seq = 3; std::chrono::steady_clock::now() < deadline;
+                 ++seq) {
+                const auto result = writer->WriteOpLog(MakeEntry(seq), false);
+                if (result != ErrorCode::OK) return result;
+                if (seq == 102) producer_ready.set_value();
+                // Stay below queue capacity until stop rejects a write.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // Reaching the safety deadline must fail the rejection assertion.
+            return ErrorCode::OK;
+        });
+        ASSERT_EQ(ready.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        OpLogEntry persisted;
+        for (int i = 0; i < 200; ++i) {
+            if (writer->ReadOpLog(3, persisted) == ErrorCode::OK) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_EQ(persisted.sequence_id, 3u);
+        EXPECT_EQ(producer.wait_for(std::chrono::milliseconds(0)),
+                  std::future_status::timeout);
+        writer->RequestStopWriting();
+        ASSERT_EQ(producer.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        EXPECT_EQ(producer.get(), ErrorCode::INTERNAL_ERROR);
+    }
+    const auto pattern = "mooncake:" + cluster_id_ + ":oplog:entry:*";
+    const auto count = ScanKeys(pattern).size();
+    EXPECT_GT(count, 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(ScanKeys(pattern).size(), count);
+    uint64_t latest = 0;
+    ASSERT_EQ(writer->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 1u);
+    OpLogEntry stored;
+    ASSERT_EQ(writer->ReadOpLog(1, stored), ErrorCode::OK);
+    EXPECT_EQ(stored.payload, first.payload);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), true),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), false),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(HAMetricManager::instance().get_oplog_async_queue_size(), 0);
+}
+
 TEST_F(RedisOpLogStoreTest, PipelineReplyReadFailureRetriesWholeBatch) {
     CheckPipelineFaultRecovery(/*reply_read_failure=*/true);
 }
