@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <thread>
@@ -57,6 +58,21 @@ CxiContext::~CxiContext() {
 
 int CxiContext::construct(size_t num_cq_list, size_t max_cqe,
                           int max_endpoints) {
+    // Configure the monitor before the first libfabric call. The memhooks
+    // monitor patches libc mmap/munmap at runtime, which can race with
+    // application threads already executing those functions. Initialize once
+    // across contexts and preserve an explicitly configured monitor.
+    static const bool monitor_configured = [] {
+        if (std::getenv("FI_MR_CACHE_MONITOR")) return true;
+        if (setenv("FI_MR_CACHE_MONITOR", "userfaultfd", 0) != 0) {
+            PLOG(ERROR) << "CXI: failed to configure FI_MR_CACHE_MONITOR";
+            return false;
+        }
+        LOG(INFO) << "CXI: defaulting FI_MR_CACHE_MONITOR to userfaultfd";
+        return true;
+    }();
+    if (!monitor_configured) return ERR_CONTEXT;
+
     // Setup hints for CXI provider
     hints_ = fi_allocinfo();
     if (!hints_) {
@@ -240,15 +256,25 @@ int CxiContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
     return 0;
 }
 
-int CxiContext::deconstruct() {
-    // Destroy all endpoints before closing domain/fabric/AV.
-    // Endpoints hold fi_ep handles that reference the domain, so they must
-    // be closed first.
-    if (shared_ep_) {
-        fi_close(&shared_ep_->fid);
-        shared_ep_ = nullptr;
+namespace {
+// fi_close() fails (e.g. -FI_EBUSY) when the object still has dependents and
+// leaves it open; report that instead of silently leaking it.
+bool closeFid(struct fid* fid, const char* what) {
+    int ret = fi_close(fid);
+    if (ret) {
+        LOG(ERROR) << "CxiContext: fi_close(" << what
+                   << ") failed: " << fi_strerror(-ret);
+        return false;
     }
+    return true;
+}
+}  // namespace
 
+int CxiContext::deconstruct() {
+    // Close libfabric objects in dependency order: MRs (bound to the
+    // endpoint under FI_MR_ENDPOINT), endpoint, CQs/AV, domain, fabric.
+    // Closing the endpoint while MRs are still bound fails with -FI_EBUSY,
+    // which cascades to the CQ/AV/domain.
     {
         RWSpinlock::WriteGuard guard(peer_map_lock_);
         for (auto& entry : peer_map_) {
@@ -261,15 +287,20 @@ int CxiContext::deconstruct() {
         RWSpinlock::WriteGuard guard(mr_lock_);
         for (auto& entry : mr_map_) {
             if (entry.second.mr) {
-                fi_close(&entry.second.mr->fid);
+                closeFid(&entry.second.mr->fid, "mr");
             }
         }
         mr_map_.clear();
     }
 
+    if (shared_ep_) {
+        closeFid(&shared_ep_->fid, "endpoint");
+        shared_ep_ = nullptr;
+    }
+
     for (auto& cq : cq_list_) {
         if (cq && cq->cq) {
-            fi_close(&cq->cq->fid);
+            closeFid(&cq->cq->fid, "cq");
             cq->cq = nullptr;
         }
     }
@@ -277,17 +308,26 @@ int CxiContext::deconstruct() {
     shared_cq_.reset();
 
     if (av_) {
-        fi_close(&av_->fid);
+        closeFid(&av_->fid, "av");
         av_ = nullptr;
     }
 
+    bool domain_closed = true;
     if (domain_) {
-        fi_close(&domain_->fid);
+        domain_closed = closeFid(&domain_->fid, "domain");
         domain_ = nullptr;
     }
 
     if (fabric_) {
-        fi_close(&fabric_->fid);
+        // A fabric closed under a still-open domain leaves a dangling entry
+        // in libfabric's global fabric/domain list, and the next
+        // fi_getinfo() crashes walking it. Leak the fabric instead.
+        if (domain_closed) {
+            closeFid(&fabric_->fid, "fabric");
+        } else {
+            LOG(ERROR) << "CxiContext: leaking fabric because its domain "
+                          "could not be closed";
+        }
         fabric_ = nullptr;
     }
 

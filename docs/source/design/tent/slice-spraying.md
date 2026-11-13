@@ -231,11 +231,15 @@ All slice spraying parameters are configurable via the configuration file:
 
 ### Core Scheduling
 
+Smart scheduling is temporarily disabled by default because of scheduling
+issues on some platforms. The default uses round-robin selection; set
+`transports/rdma/enable_smart_scheduling` to `true` to opt in.
+
 ```json
 {
   "transports": {
     "rdma": {
-      "enable_smart_scheduling": true
+      "enable_smart_scheduling": false
     }
   }
 }
@@ -243,7 +247,7 @@ All slice spraying parameters are configurable via the configuration file:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `enable_smart_scheduling` | bool | `true` | Enable EWMA-based selection (false = round-robin) |
+| `enable_smart_scheduling` | bool | `false` | Enable EWMA-based selection (false = round-robin) |
 
 ### NUMA Penalties
 

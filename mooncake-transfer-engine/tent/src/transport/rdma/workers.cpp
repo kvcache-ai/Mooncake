@@ -109,9 +109,10 @@ Workers::Workers(RdmaTransport* transport)
     // Core Scheduling Configuration
     // ============================================================
 
-    // Enable/disable smart scheduling (false = simple round-robin)
+    // Keep smart scheduling opt-in while platform-specific scheduling issues
+    // are investigated (false = simple round-robin).
     bool enable_smart_scheduling =
-        conf->get("transports/rdma/enable_smart_scheduling", true);
+        conf->get("transports/rdma/enable_smart_scheduling", false);
     device_selector_->setSmartSelection(enable_smart_scheduling);
 
     // ============================================================

@@ -9,7 +9,7 @@ use crate::identity::{
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::nof::NofBackingRouteFilter;
 use crate::route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
+    CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
     SegmentReservation, TenantObjectAccounting, TenantPolicy, TenantPolicyScope,
     TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
@@ -17,6 +17,17 @@ use crate::route::{
     TenantQuotaState,
 };
 use std::sync::Arc;
+
+/// Result of an exact replica-reference confirmation for one object key.
+///
+/// `Absent` is only valid when the directory has checked every authority that
+/// can currently serve the key. Callers must treat a directory error as an
+/// indeterminate result and retain the local allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteReplicaReference {
+    Referenced(Box<ObjectRoute>),
+    Absent,
+}
 
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
@@ -469,6 +480,45 @@ pub trait RouteDirectory: Send + Sync {
             .collect())
     }
 
+    /// Proves whether any currently serving authority still references the
+    /// exact replica. The default is deliberately unsupported: a canonical
+    /// route read cannot prove absence when authorities may diverge.
+    fn confirm_replica_reference(
+        &self,
+        _observer: &ClientLease,
+        _key: &ObjectKey,
+        _replica: &ReplicaRoute,
+    ) -> Result<RouteReplicaReference> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not support exact replica confirmation".to_string(),
+        ))
+    }
+
+    /// Classifies allocator candidates across all currently serving route
+    /// authorities. `Absent` is returned only when every authority agrees;
+    /// transport errors, membership changes, and divergent answers fail closed.
+    fn get_allocation_route_references_consistent(
+        &self,
+        _observer: &ClientLease,
+        _identities: &[crate::route::AllocationRouteIdentity],
+    ) -> Result<Vec<crate::route::AllocationRouteReferenceState>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not provide allocation reference queries".to_string(),
+        ))
+    }
+
+    /// Returns exact route keys for lifecycle recovery. This is intentionally a
+    /// separate background-only query so normal allocator reserve stays key-free.
+    fn get_allocation_route_reference_keys_consistent(
+        &self,
+        _observer: &ClientLease,
+        _identities: &[crate::route::AllocationRouteIdentity],
+    ) -> Result<Vec<crate::route::AllocationRouteReference>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not provide allocation reference key queries".to_string(),
+        ))
+    }
+
     fn compare_and_swap_object_route(
         &self,
         observer: &ClientLease,
@@ -544,6 +594,27 @@ pub trait RouteDirectory: Send + Sync {
         Ok(())
     }
 
+    /// Visits an owner route set only when the directory's ownership listing is
+    /// complete. Callers that release storage or replace derived state must use
+    /// this variant instead of the best-effort streaming visitor above.
+    ///
+    /// Direct metadata directories expose an all-or-error owner listing and
+    /// inherit this implementation. Paged remote directories must override it
+    /// to validate their continuation snapshot before callers commit
+    /// irreversible reclamation. The visitor may accumulate provisional state,
+    /// but must defer side effects until this method returns `Ok(())`.
+    fn visit_routes_by_replica_owner_consistent(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        for route in self.list_routes_by_replica_owner(observer, owner)? {
+            visitor(route)?;
+        }
+        Ok(())
+    }
+
     fn list_routes_by_cold_backing(
         &self,
         _observer: &ClientLease,
@@ -583,6 +654,20 @@ pub trait RouteDirectory: Send + Sync {
     ) -> Vec<Option<RouteVersion>> {
         keys.iter()
             .map(|key| self.get_version_floor(observer, key))
+            .collect()
+    }
+
+    fn get_delete_marker(&self, _observer: &ClientLease, _key: &ObjectKey) -> Option<RouteVersion> {
+        None
+    }
+
+    fn get_delete_markers(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        keys.iter()
+            .map(|key| self.get_delete_marker(observer, key))
             .collect()
     }
 
@@ -841,6 +926,7 @@ mod tests {
             Ok(CasResult {
                 applied: expected == Some(RouteVersion(7)),
                 current: next.cloned().or_else(|| Some(sample_route(key.0.as_str()))),
+                delete_version: None,
                 version_floor: None,
             })
         }
@@ -870,6 +956,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg-a"),
+                allocation_id: None,
                 offset: Some(64),
                 segment_offset: 64,
                 length: 8,

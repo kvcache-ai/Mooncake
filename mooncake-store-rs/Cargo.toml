@@ -29,6 +29,7 @@ warnings = "deny"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
 dashmap = "6"
+hashlink = "0.12"
 parking_lot = "0.12"
 pyo3 = { version = "0.24", features = ["multiple-pymethods"] }
 serde = { version = "1", features = ["derive"] }

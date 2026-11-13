@@ -85,6 +85,7 @@ impl StoredSegmentState {
                 segment_name: segment.clone(),
                 offset_bytes: span.offset_bytes,
                 length_bytes,
+                allocation_id: 0,
             });
         }
 
@@ -112,6 +113,7 @@ impl StoredSegmentState {
             segment_name: segment.clone(),
             offset_bytes: offset,
             length_bytes,
+            allocation_id: 0,
         })
     }
 

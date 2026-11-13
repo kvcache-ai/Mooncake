@@ -1,6 +1,9 @@
 use super::codec::*;
 use super::*;
-use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+use mooncake_store_route::{
+    RouteAuthorityRecord, RouteControlRequest, RouteControlResponse, RouteControlTransport,
+    RouteOwnerPageQuery,
+};
 
 impl RouteControlTransport for ControlPlaneClient {
     fn send_route_control(
@@ -26,7 +29,10 @@ fn decode_route_batch_get_reply(reply: pb::BatchGetRoutesReply) -> Result<RouteC
             .into_iter()
             .map(|entry| {
                 decode_error(entry.error)?;
-                entry.route.map(try_object_route).transpose()
+                Ok(RouteAuthorityRecord {
+                    route: entry.route.map(try_object_route).transpose()?,
+                    delete_version: entry.delete_version.map(RouteVersion),
+                })
             })
             .collect(),
     ))
@@ -97,27 +103,32 @@ fn decode_route_list_by_replica_owner_reply(
         mooncake_store_route::RouteOwnerPage {
             routes,
             next_cursor: reply.next_cursor,
+            snapshot_epoch: reply.snapshot_epoch,
         },
     ))
 }
 
-#[cfg(test)]
-mod owner_page_decode_tests {
-    use super::*;
-
-    #[test]
-    fn owner_route_reply_rejects_oversized_pages_before_decoding() {
-        let routes = (0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE)
-            .map(|_| pb::ObjectRoute::default())
-            .collect();
-        let error = decode_route_list_by_replica_owner_reply(pb::ListRoutesByReplicaOwnerReply {
-            routes,
-            error: None,
-            next_cursor: None,
-        })
-        .expect_err("an oversized transport page must fail closed");
-        assert!(matches!(error, StoreError::Transport(_)));
+fn decode_allocation_route_references_reply(
+    reply: pb::GetAllocationRouteReferencesReply,
+    include_route_key: bool,
+) -> Result<RouteControlResponse> {
+    decode_error(reply.error)?;
+    if include_route_key {
+        return Ok(RouteControlResponse::AllocationReferenceKeys(
+            reply
+                .references
+                .into_iter()
+                .map(try_allocation_reference)
+                .collect::<Result<Vec<_>>>()?,
+        ));
     }
+    Ok(RouteControlResponse::AllocationReferences(
+        reply
+            .references
+            .into_iter()
+            .map(try_allocation_reference_state)
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
 impl ControlPlaneClient {
@@ -209,9 +220,30 @@ impl ControlPlaneClient {
                 authority,
                 owner,
                 cursor,
+                snapshot_epoch,
                 limit,
             } => self.send_route_list_by_replica_owner(
-                lease, namespace, authority, owner, cursor, limit,
+                lease,
+                namespace,
+                authority,
+                RouteOwnerPageQuery {
+                    owner,
+                    cursor,
+                    snapshot_epoch,
+                    limit,
+                },
+            ),
+            RouteControlRequest::GetAllocationReferences {
+                namespace,
+                authority,
+                identities,
+                include_route_key,
+            } => self.send_route_allocation_references(
+                lease,
+                namespace,
+                authority,
+                identities,
+                include_route_key,
             ),
         }
     }
@@ -373,16 +405,15 @@ impl ControlPlaneClient {
         lease: &ClientLease,
         namespace: String,
         authority: ClientStableId,
-        owner: ClientRuntimeId,
-        cursor: Option<String>,
-        limit: usize,
+        query: RouteOwnerPageQuery,
     ) -> Result<RouteControlResponse> {
         let request = pb::ListRoutesByReplicaOwnerRequest {
             namespace,
             authority: authority.0.clone(),
-            owner: Some(pb_runtime_id(&owner)),
-            cursor,
-            limit: limit.try_into().unwrap_or(u32::MAX),
+            owner: Some(pb_runtime_id(&query.owner)),
+            cursor: query.cursor,
+            snapshot_epoch: query.snapshot_epoch,
+            limit: query.limit.try_into().unwrap_or(u32::MAX),
         };
         match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
             request_id,
@@ -410,7 +441,7 @@ impl ControlPlaneClient {
             Err(error) => {
                 warn!(
                     authority = %authority,
-                    owner = %owner,
+                    owner = %query.owner,
                     error = %error,
                     "control stream list_routes_by_replica_owner failed; falling back to unary rpc"
                 );
@@ -422,6 +453,31 @@ impl ControlPlaneClient {
                 .await
         })?;
         decode_route_list_by_replica_owner_reply(reply)
+    }
+
+    fn send_route_allocation_references(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        identities: Vec<AllocationRouteIdentity>,
+        include_route_key: bool,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::GetAllocationRouteReferencesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            identities: identities
+                .iter()
+                .map(pb_allocation_route_identity)
+                .collect(),
+            include_route_key,
+        };
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client
+                .get_allocation_route_references(Request::new(request))
+                .await
+        })?;
+        decode_allocation_route_references_reply(reply, include_route_key)
     }
 
     fn send_route_batch_replace(
@@ -439,6 +495,12 @@ impl ControlPlaneClient {
                 .map(|request| pb::RouteReplaceEntry {
                     key: request.key.0.clone(),
                     next: request.next.as_ref().map(pb_object_route),
+                    delete_version: request
+                        .next
+                        .is_none()
+                        .then_some(request.expected)
+                        .flatten()
+                        .map(|version| version.0),
                 })
                 .collect(),
         };
@@ -495,7 +557,10 @@ impl ControlPlaneClient {
             },
         )?;
         match response {
-            RouteControlResponse::BatchGet(replies) => Ok(replies),
+            RouteControlResponse::BatchGet(replies) => Ok(replies
+                .into_iter()
+                .map(|reply| reply.map(|record| record.route))
+                .collect()),
             _ => Err(StoreError::Transport(
                 "test batch_get_routes returned non-get route response".to_string(),
             )),
@@ -565,6 +630,7 @@ impl ControlPlaneClient {
                 authority: authority.clone(),
                 owner: owner.clone(),
                 cursor: None,
+                snapshot_epoch: None,
                 limit: mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE,
             },
         )?;
@@ -694,6 +760,63 @@ impl ControlPlaneClient {
         result
     }
 
+    pub(crate) fn batch_notify_delete_pending(
+        &self,
+        lease: &ClientLease,
+        entries: &[DeletePendingEntry],
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_eviction_batch_notify_delete_pending");
+        let result = (|| {
+            if entries.is_empty() {
+                return Ok(0);
+            }
+            let request = pb::BatchNotifyDeletePendingRequest {
+                entries: entries.iter().map(pb_delete_pending_entry).collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(
+                    pb::control_stream_request::Body::EvictionNotifyDeletePending(request.clone()),
+                ),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::EvictionNotifyDeletePending(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_notify_delete_pending reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_notify_delete_pending reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return Ok(reply.accepted as usize);
+                }
+                Err(error) => {
+                    warn!(
+                        items = entries.len(),
+                        error = %error,
+                        "control stream batch_notify_delete_pending failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client
+                    .batch_notify_delete_pending(Request::new(request))
+                    .await
+            })?;
+            decode_error(reply.error)?;
+            Ok(reply.accepted as usize)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
     pub(crate) fn submit_migration_task(
         &self,
         lease: &ClientLease,
@@ -775,9 +898,10 @@ impl ControlPlaneClient {
                 "control plane get_route transport returned non-route reply".to_string(),
             ));
         };
-        replies.pop().ok_or_else(|| {
+        let record = replies.pop().ok_or_else(|| {
             StoreError::Transport("control plane get_route reply is missing batch item".to_string())
-        })?
+        })??;
+        Ok(record.route)
     }
 
     #[allow(dead_code)]
@@ -802,11 +926,45 @@ impl ControlPlaneClient {
         })?
     }
 
+    pub(crate) fn reserve_any_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> Result<SegmentReservation> {
+        let mut replies =
+            self.batch_reserve_any_with_pending_publication(lease, owner, &[length_bytes])?;
+        replies.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane reserve_any publication reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
     pub(crate) fn batch_reserve_any(
         &self,
         lease: &ClientLease,
         owner: &ClientRuntimeId,
         length_bytes: &[u64],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_any_inner(lease, owner, length_bytes, false)
+    }
+
+    pub(crate) fn batch_reserve_any_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_any_inner(lease, owner, length_bytes, true)
+    }
+
+    fn batch_reserve_any_inner(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+        pending_publication: bool,
     ) -> Result<Vec<Result<SegmentReservation>>> {
         let tracker = OperationTracker::new("control_allocator_batch_reserve_any");
         let result = (|| {
@@ -816,6 +974,7 @@ impl ControlPlaneClient {
             let request = pb::BatchReserveAnyRequest {
                 owner: Some(pb_runtime_id(owner)),
                 length_bytes: length_bytes.to_vec(),
+                pending_publication,
             };
             match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
                 request_id,
@@ -907,11 +1066,53 @@ impl ControlPlaneClient {
         })?
     }
 
+    pub(crate) fn reserve_specific_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> Result<SegmentReservation> {
+        let mut results = self.batch_reserve_specific_with_pending_publication(
+            lease,
+            owner,
+            &[ReserveSpecificOp {
+                segment_name: segment_name.clone(),
+                length_bytes,
+            }],
+        )?;
+        results.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane reserve_specific publication reply is missing batch item"
+                    .to_string(),
+            )
+        })?
+    }
+
     pub(crate) fn batch_reserve_specific(
         &self,
         lease: &ClientLease,
         owner: &ClientRuntimeId,
         requests: &[ReserveSpecificOp],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_specific_inner(lease, owner, requests, false)
+    }
+
+    pub(crate) fn batch_reserve_specific_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_specific_inner(lease, owner, requests, true)
+    }
+
+    fn batch_reserve_specific_inner(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+        pending_publication: bool,
     ) -> Result<Vec<Result<SegmentReservation>>> {
         let tracker = OperationTracker::new("control_allocator_batch_reserve_specific");
         let result = (|| {
@@ -927,6 +1128,7 @@ impl ControlPlaneClient {
                         length_bytes: request.length_bytes,
                     })
                     .collect(),
+                pending_publication,
             };
             match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
                 request_id,
@@ -1023,6 +1225,7 @@ impl ControlPlaneClient {
                         segment_name: request.segment_name.0.clone(),
                         offset_bytes: request.offset_bytes,
                         length_bytes: request.length_bytes,
+                        allocation_id: request.allocation_id,
                     })
                     .collect(),
             };
@@ -1409,5 +1612,55 @@ pub(super) fn fail_stream_session(session: &ControlStreamSession, message: Strin
     let pending = std::mem::take(&mut *session.pending.lock());
     for (_, tx) in pending {
         let _ = tx.send(Err(StoreError::Transport(message.clone())));
+    }
+}
+
+impl ControlPlaneClient {
+    #[cfg(test)]
+    pub(crate) fn list_routes_by_replica_owner_page(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        query: RouteOwnerPageQuery,
+    ) -> Result<mooncake_store_route::RouteOwnerPage> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::ListByReplicaOwner {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                owner: query.owner,
+                cursor: query.cursor,
+                snapshot_epoch: query.snapshot_epoch,
+                limit: query.limit,
+            },
+        )?;
+        match response {
+            RouteControlResponse::ListByReplicaOwner(page) => Ok(page),
+            _ => Err(StoreError::Transport(
+                "test list_routes_by_replica_owner_page returned non-page route response"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_page_decode_tests {
+    use super::*;
+
+    #[test]
+    fn owner_route_reply_rejects_oversized_pages_before_decoding() {
+        let routes = (0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|_| pb::ObjectRoute::default())
+            .collect();
+        let error = decode_route_list_by_replica_owner_reply(pb::ListRoutesByReplicaOwnerReply {
+            routes,
+            error: None,
+            next_cursor: None,
+            snapshot_epoch: None,
+        })
+        .expect_err("an oversized transport page must fail closed");
+        assert!(matches!(error, StoreError::Transport(_)));
     }
 }
