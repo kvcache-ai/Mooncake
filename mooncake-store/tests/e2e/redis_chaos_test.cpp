@@ -1122,6 +1122,38 @@ class RedisOpLogStopTest : public RedisGracefulShutdownTest {
         }
         return {};
     }
+
+    bool WaitForStoppedWriter(int index) {
+        const auto url =
+            "http://127.0.0.1:" + std::to_string(54051 + index) + "/metrics";
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            coro_http::coro_http_client client;
+            auto response = client.get(url);
+            if (response.status == 200) {
+                std::istringstream lines(std::string(response.resp_body));
+                std::string line;
+                bool workers_stopped = false;
+                bool queue_empty = false;
+                while (std::getline(lines, line)) {
+                    std::istringstream metric(line);
+                    std::string name;
+                    double value = -1;
+                    if (metric >> name >> value) {
+                        if (name == "ha_oplog_async_workers_running") {
+                            workers_stopped = value == 0;
+                        } else if (name == "ha_oplog_async_queue_size") {
+                            queue_empty = value == 0;
+                        }
+                    }
+                }
+                if (workers_stopped && queue_empty) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
 };
 
 TEST_F(RedisOpLogStopTest, SigtermDuringContinuousWrites) {
@@ -1160,6 +1192,43 @@ TEST_F(RedisOpLogStopTest, SigtermDuringContinuousWrites) {
     ASSERT_FALSE(
         WaitForCommittedWrite(prefix, last_written, last_written.load())
             .empty());
+}
+
+TEST_F(RedisOpLogStopTest, LeadershipLossDuringContinuousWrites) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    ClientCtlProcess client(/*index=*/30, FLAGS_out_dir);
+    ASSERT_TRUE(StartWriterClient(client));
+    std::atomic<size_t> last_written{0};
+    const std::string prefix = "demotion_writes_";
+    auto writes = StartWrites(client, prefix, last_written);
+    ASSERT_FALSE(WaitForCommittedWrite(prefix, last_written, 2).empty());
+
+    const auto log_offset = MasterLogEndOffset(leader);
+    ASSERT_TRUE(masters_[leader]->suspend());
+    int successor = -1;
+    ViewVersionId successor_version = 0;
+    ASSERT_TRUE(
+        WaitForNewLeader(leader, version, successor, successor_version));
+    ASSERT_TRUE(masters_[leader]->resume());
+    ASSERT_TRUE(WaitForMasterLogSince(
+        leader, "Starting P2P standby from demoted primary handoff", log_offset,
+        std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForStoppedWriter(leader));
+    ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", true,
+                                         std::chrono::seconds(15)));
+
+    WaitForLeaderServiceReady();
+    const auto key =
+        WaitForCommittedWrite(prefix, last_written, last_written.load());
+    ASSERT_FALSE(key.empty());
+    // The old primary is still serving as a standby and consumes new commits
+    // after its own writer has stopped.
+    ASSERT_TRUE(WaitForSnapshotObject(leader, key, std::chrono::seconds(30)));
+    EXPECT_TRUE(WaitForStoppedWriter(leader));
 }
 
 TEST_F(RedisChaosTest, LeaderKilledFailover) {
