@@ -530,9 +530,12 @@ def run(bundle: Path, source: Path, output: Path) -> None:
     verify_hashes(bundle, {"provenance.txt"})
     native = extract_native(bundle, output)
     # Intel PyTorch ships SYCL/UR in its interpreter prefix, not ldconfig.
-    os.environ["LD_LIBRARY_PATH"] = (
-        f"{native / 'lib'}:{Path(sys.prefix) / 'lib'}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-    )
+    library_paths = [
+        str(native / "lib"),
+        str(Path(sys.prefix) / "lib"),
+        *os.environ.get("LD_LIBRARY_PATH", "").split(":"),
+    ]
+    os.environ["LD_LIBRARY_PATH"] = ":".join(path for path in library_paths if path)
     python = sys.executable
     wheel = next(bundle.glob("*.whl"))
     command(

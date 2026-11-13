@@ -469,6 +469,28 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
 
 
 class CommandLineTest(unittest.TestCase):
+    def test_run_library_path_excludes_empty_components(self):
+        for previous in (None, "", "/existing/lib", "/first::/second:"):
+            with (
+                self.subTest(previous=previous),
+                tempfile.TemporaryDirectory() as directory,
+                patch.dict(os.environ),
+                patch.object(VERIFY, "verify_hashes"),
+                patch.object(VERIFY, "extract_native") as extract,
+                patch.object(VERIFY, "command"),
+            ):
+                root = Path(directory)
+                (root / "test.whl").touch()
+                extract.return_value = root / "native"
+                if previous is None:
+                    os.environ.pop("LD_LIBRARY_PATH", None)
+                else:
+                    os.environ["LD_LIBRARY_PATH"] = previous
+                VERIFY.run(root, root / "source", root / "output")
+                expected = [str(root / "native/lib"), str(Path(sys.prefix) / "lib")]
+                expected.extend(path for path in (previous or "").split(":") if path)
+                self.assertEqual(os.environ["LD_LIBRARY_PATH"].split(":"), expected)
+
     def test_no_arguments_preserve_host_only_wheel_checks(self):
         with (
             patch.object(sys, "argv", ["verify_xpu_ci.py"]),

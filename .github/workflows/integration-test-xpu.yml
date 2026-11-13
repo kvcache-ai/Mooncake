@@ -78,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid artifact ID"; exit 1; }
-          [[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid source SHA"; exit 1; }
+          [[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid checkout SHA"; exit 1; }
           [ "$SOURCE_SHA" = "$CHECKOUT_SHA" ] || { echo "::error::Build SHA differs from requested SHA"; exit 1; }
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$RUN_DIRECTORY/artifact.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUN_DIRECTORY/artifact.zip"
