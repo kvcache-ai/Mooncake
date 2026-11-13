@@ -46,6 +46,7 @@
 #include "test_p2p_server_helpers.h"
 #include "types.h"
 #include "utils.h"
+#include "version.h"
 
 namespace mooncake {
 namespace testing {
@@ -127,7 +128,85 @@ std::unique_ptr<HeartbeatTestClient> MakeClient(const UUID& client_id) {
 
 constexpr uint16_t PortOf(int port) { return static_cast<uint16_t>(port); }
 
+class SlowHeartbeatMaster {
+   public:
+    uint16_t heartbeat_port = 0;
+
+    tl::expected<std::string, ErrorCode> ServiceReady() {
+        return GetMooncakeStoreVersion();
+    }
+    tl::expected<uint32_t, ErrorCode> HeartbeatServiceReady() {
+        return heartbeat_port;
+    }
+    tl::expected<P2PHeartbeatResponse, ErrorCode> Heartbeat(
+        const P2PHeartbeatRequest&) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return P2PHeartbeatResponse{};
+    }
+    tl::expected<bool, ErrorCode> ExistKey(std::string_view) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return false;
+    }
+};
+
 }  // namespace
+
+class HeartbeatTimeoutTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(HeartbeatTimeoutTest, TimeoutIsPerClientAndDoesNotAffectBusinessRpc) {
+    SlowHeartbeatMaster handler;
+    coro_rpc::coro_rpc_server main_server(2, 0, "127.0.0.1");
+    coro_rpc::coro_rpc_server heartbeat_server(2, 0, "127.0.0.1");
+    main_server.register_handler<&SlowHeartbeatMaster::ServiceReady>(
+        &handler, coro_rpc::func_id<&P2PMasterRpcService::ServiceReady>());
+    main_server.register_handler<&SlowHeartbeatMaster::HeartbeatServiceReady>(
+        &handler,
+        coro_rpc::func_id<&P2PMasterRpcService::HeartbeatServiceReady>());
+    main_server.register_handler<&SlowHeartbeatMaster::ExistKey>(
+        &handler, coro_rpc::func_id<&P2PMasterRpcService::ExistKey>());
+    auto& heartbeat_endpoint = GetParam() ? heartbeat_server : main_server;
+    heartbeat_endpoint.register_handler<&SlowHeartbeatMaster::Heartbeat>(
+        &handler, coro_rpc::func_id<&P2PMasterRpcService::Heartbeat>());
+    if (GetParam()) {
+        heartbeat_server.register_handler<&SlowHeartbeatMaster::ServiceReady>(
+            &handler, coro_rpc::func_id<&P2PMasterRpcService::ServiceReady>());
+        ASSERT_FALSE(heartbeat_server.async_start().hasResult());
+        handler.heartbeat_port = heartbeat_server.port();
+    }
+    ASSERT_FALSE(main_server.async_start().hasResult());
+
+    P2PMasterClient short_timeout(generate_uuid());
+    P2PMasterClient long_timeout(generate_uuid());
+    ASSERT_EQ(short_timeout.SetHeartbeatRpcTimeoutMs(0),
+              ErrorCode::INVALID_PARAMS);
+    ASSERT_EQ(short_timeout.SetHeartbeatRpcTimeoutMs(-1),
+              ErrorCode::INVALID_PARAMS);
+    ASSERT_EQ(short_timeout.SetHeartbeatRpcTimeoutMs(100), ErrorCode::OK);
+    ASSERT_EQ(long_timeout.SetHeartbeatRpcTimeoutMs(5000), ErrorCode::OK);
+    for (auto* client : {&short_timeout, &long_timeout}) {
+        client->SetHeartbeatRpcPort(handler.heartbeat_port);
+        ASSERT_EQ(
+            client->Connect("127.0.0.1:" + std::to_string(main_server.port())),
+            ErrorCode::OK);
+    }
+    EXPECT_EQ(short_timeout.SetHeartbeatRpcTimeoutMs(200),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(short_timeout.SetHeartbeatRpcTimeoutMs(100), ErrorCode::OK);
+    auto short_result =
+        short_timeout.Heartbeat(MakeHeartbeatRequest(generate_uuid()));
+    ASSERT_FALSE(short_result.has_value());
+    EXPECT_EQ(short_result.error(), ErrorCode::RPC_FAIL);
+    EXPECT_TRUE(long_timeout.Heartbeat(MakeHeartbeatRequest(generate_uuid()))
+                    .has_value());
+    // The 500ms business RPC must not inherit this client's 100ms heartbeat
+    // timeout.
+    auto business_result = short_timeout.ExistKey("missing");
+    ASSERT_TRUE(business_result.has_value());
+    EXPECT_FALSE(*business_result);
+}
+
+INSTANTIATE_TEST_SUITE_P(HeartbeatPorts, HeartbeatTimeoutTest,
+                         ::testing::Bool());
 
 // ---------------------------------------------------------------------------
 // Dedicated heartbeat server enabled.

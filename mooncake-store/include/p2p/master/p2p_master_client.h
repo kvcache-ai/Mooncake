@@ -51,6 +51,10 @@ class P2PMasterClient final {
 
     void SetHeartbeatRpcPort(uint16_t port) { heartbeat_rpc_port_ = port; }
 
+    // Configure before the first Connect; also applies when using the main
+    // port.
+    [[nodiscard]] ErrorCode SetHeartbeatRpcTimeoutMs(int32_t timeout_ms);
+
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
         std::string_view object_key);
 
@@ -310,6 +314,7 @@ class P2PMasterClient final {
     RpcClientAccessor client_accessor_;
     RpcClientAccessor heartbeat_accessor_;
     uint16_t heartbeat_rpc_port_ = 0;
+    std::chrono::milliseconds heartbeat_rpc_timeout_{1000};
 
     const UUID client_id_;
     P2PMasterClientMetric* metrics_;
