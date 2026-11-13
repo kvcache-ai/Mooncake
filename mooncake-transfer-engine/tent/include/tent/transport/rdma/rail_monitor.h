@@ -24,6 +24,8 @@
 
 namespace mooncake {
 namespace tent {
+struct DeviceDesc;
+
 // Each RDMA worker owns its own RailMonitor via WorkerContext::rails. Endpoint
 // teardown may cancel probes from the monitor thread, so rail state is guarded
 // for that lifecycle path.
@@ -45,6 +47,8 @@ class RailMonitor {
         "transports/rdma/rail_cooldown_secs";
     static constexpr const char *kCfgProbeIntervalSecs =
         "transports/rdma/rail_probe_interval_secs";
+    static constexpr const char *kCfgSubnetPrefixLen =
+        "transports/rdma/rail_subnet_prefix_len";
 
    public:
     RailMonitor() = default;
@@ -61,13 +65,18 @@ class RailMonitor {
     // conf: optional Config pointer; when non-null, overrides the default
     //   error_threshold / error_window_secs / cooldown_secs values via
     //   kCfgErrorThreshold / kCfgErrorWindowSecs / kCfgCooldownSecs.
+    // local_devices / remote_devices: optional published device descriptors
+    //   of the two segments. Their GIDs tell the default rail map which peer
+    //   NICs a local NIC can actually reach; see kCfgSubnetPrefixLen.
     // A later call with the same NIC/memory layout only refreshes the pins
     // (segment COW snapshots); it does not rebuild rail_states_ or reprint
     // the config banner.
     Status load(std::shared_ptr<const Topology> local,
                 std::shared_ptr<const Topology> remote,
                 const std::string &rail_topo_json = "",
-                const Config *conf = nullptr);
+                const Config *conf = nullptr,
+                const std::vector<DeviceDesc> *local_devices = nullptr,
+                const std::vector<DeviceDesc> *remote_devices = nullptr);
 
     bool ready() const {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -117,6 +126,20 @@ class RailMonitor {
     }
 
    private:
+    // NIC id -> IPv4 address carried by that NIC's published IPv4-mapped
+    // RoCE v2 GID. NICs on IB or native IPv6 GIDs expose no IPv4 subnet and
+    // are simply absent.
+    using GidIpv4Map = std::unordered_map<int, uint32_t>;
+
+    static GidIpv4Map collectGidIpv4(const Topology &topo,
+                                     const std::vector<DeviceDesc> *devices);
+
+    // Peer NICs that share a local NIC's IPv4 subnet, keyed by local NIC id.
+    // A local NIC is listed only when at least one peer NIC matches; the
+    // others are absent and keep the full peer list, so the filter can never
+    // strand a NIC with no rail at all.
+    std::unordered_map<int, std::unordered_set<int>> subnetPeers() const;
+
     Status loadFromJson(const std::string &rail_topo_json);
 
     Status loadDefault();
@@ -132,6 +155,8 @@ class RailMonitor {
     bool ready_{false};
     std::shared_ptr<const Topology> local_;
     std::shared_ptr<const Topology> remote_;
+    GidIpv4Map local_gid_ipv4_;
+    GidIpv4Map remote_gid_ipv4_;
 
     struct PairHash {
         std::size_t operator()(const std::pair<int, int> &p) const noexcept {
@@ -166,6 +191,10 @@ class RailMonitor {
     std::chrono::seconds error_window_{10};
     std::chrono::seconds cooldown_{30};
     std::chrono::seconds probe_interval_{1};
+    // IPv4 prefix length used to group RoCE v2 NICs into subnets when the
+    // default rail map is built. 0 disables the grouping and restores the
+    // plain all-pairs map.
+    int subnet_prefix_len_ = 24;
 };
 
 }  // namespace tent

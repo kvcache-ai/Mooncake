@@ -93,6 +93,16 @@ The admission gate is split into a pure predicate and a mutating admit:
 
 This produces two recovery signals — a probe/trial result, and a live success on a posted transfer — so a flaky rail returns to service at the first good completion instead of waiting for the full cooldown, and a still-dead peer is probed at one trial per `probe_interval_` rather than slammed every cycle.
 
+### Which pairs become rails
+
+Rail health can only react *after* a pair has failed, and on an RC queue pair that costs a full retry timeout (seconds) per pair, per worker. A host with a front-end NIC on the management network plus rail NICs on their own subnets has a whole class of pairs — rail NIC to peer front-end NIC — with no path at all, so paying that timeout to discover each one is wasted budget.
+
+`loadDefault` therefore prunes those pairs before any of them can be selected. Each NIC publishes its GID in `DeviceDesc`; for an IPv4-mapped RoCE v2 GID that address is grouped into a subnet by `rail_subnet_prefix_len`. A local NIC that has at least one peer NIC in its own subnet keeps *only* those pairs; everything else is left out of `rail_states_`, which removes it from `localDeviceMask`, from `updateBestMapping`, and from `admit` — the three places a pair can be chosen.
+
+The filter is deliberately one-sided. When a local NIC has no peer NIC in its subnet, the prefix does not describe that fabric (a routed rail network, an IB fabric with no IPv4 GID, a prefix length that does not match the deployment), so every pair for that NIC is kept and rail health decides as before. A wrong prefix in either direction degrades to the old all-pairs map; it can never leave a NIC with no rail. An explicit rail topology file is authoritative and is never filtered.
+
+
+
 ### UB rail recovery
 
 UB rails have their own monitor, `RailMonitor`, keyed by the physical rail
@@ -141,6 +151,7 @@ All knobs live in the top-level `transfer-engine.json`. Defaults are safe for pr
 | `transports/rdma/rail_error_window_secs` | `10` | Sliding window for counting rail errors. A failure older than the window resets `error_count` to 1. |
 | `transports/rdma/rail_cooldown_secs` | `30` | Initial cooldown after tripping. Escalates on a fresh pause across recovery cycles, capped at 300 s. |
 | `transports/rdma/rail_probe_interval_secs` | `1` | While a rail is paused, `admit` arms one exploratory probe / Half-Open trial every this many seconds; `0` disables probing. |
+| `transports/rdma/rail_subnet_prefix_len` | `24` | IPv4 prefix length used to group RoCE v2 NICs into subnets when the automatic rail map is built. `0` disables the grouping. |
 
 The RDMA keys are read by `RailMonitor::load`. Example:
 
@@ -173,6 +184,8 @@ The counter is only built when TENT is compiled with `-DTENT_METRICS_ENABLED=ON`
 | `Transport failover: X -> Y (attempt N/M)` | A task has successfully switched transports. |
 | `Task failover limit reached (M), last transport=X` | Task exhausted its budget and will surface `FAILED`. |
 | `No more transports available after X failed` | `resolveTransport` returned `UNSPEC`; no further fallback exists for this request. |
+| `Rail paused: local_nic=N (name) remote_nic=M (name)` | A rail tripped the error threshold and is in cooldown. Both NIC names are printed so the link is identifiable. |
+| `RailMonitor: dropped N NIC pairs whose RoCE v2 GIDs sit on different /P subnets` | The automatic rail map left out pairs with no path; see "Which pairs become rails" above. |
 | `Rail recovered: local_nic=... remote_nic=... (cooldown expired)` | Cooldown elapsed; the next `admit` transitions the rail to Half-Open and arms one trial. |
 | `Rail recovered: ... (un-paused by successful transfer)` | Live success (or a successful probe/trial) brought a previously paused rail back early. |
 | `Rail half-open: local_nic=... remote_nic=... (cooldown=Ns retained, trial admitted)` | Cooldown expired and `admit` armed a single Half-Open trial; escalation occurs only if the trial fails. |
