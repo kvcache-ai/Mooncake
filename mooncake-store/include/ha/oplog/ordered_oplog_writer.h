@@ -85,6 +85,11 @@ class OrderedOpLogWriter {
     // larger than max_entries_per_batch is rejected up front instead of
     // producing an oversized record the backend might refuse.
     tl::expected<Reservation, ErrorCode> ReserveBatch(size_t entry_count);
+    // Validates `entry` the way Commit does, then reserves its slot. A caller
+    // that knows the entry before it changes anything has the entry's shape
+    // and size refused here, so committing that same entry afterwards can only
+    // fail because the writer stopped accepting or became terminal.
+    tl::expected<Reservation, ErrorCode> ReserveFor(const OpLogEntry& entry);
     virtual tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     // Commit all entries as one indivisible group: they are sealed into a
