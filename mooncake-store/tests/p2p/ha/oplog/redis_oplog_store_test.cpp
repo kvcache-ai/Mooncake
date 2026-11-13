@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <string_view>
 #include <vector>
 #include <string>
@@ -37,9 +41,46 @@ std::atomic<bool> fail_one_latest_write{false};
 std::atomic<size_t> max_pipelined_sets{0};
 std::atomic<bool> fail_one_pipelined_reply{false};
 std::atomic<bool> fail_one_pipelined_status{false};
+std::atomic<bool> trace_pipeline_sets{false};
+std::atomic<bool> hold_initial_pipeline{false};
+std::atomic<bool> hold_failed_retry{false};
+std::atomic<bool> failed_retry_blocked{false};
+std::mutex pipeline_trace_mutex;
+std::map<std::string, size_t> pipeline_set_attempts;
+std::vector<std::string> failed_pipeline_keys;
+std::string failed_retry_key;
 thread_local size_t appended_sets = 0;
+thread_local std::vector<std::string> appended_set_keys;
+thread_local std::vector<std::string> pipeline_set_keys;
 thread_local size_t pipeline_replies_total = 0;
 thread_local size_t pipeline_replies_remaining = 0;
+
+void ResetPipelineTrace() {
+    std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+    pipeline_set_attempts.clear();
+    failed_pipeline_keys.clear();
+    failed_retry_key.clear();
+    failed_retry_blocked.store(false);
+    hold_initial_pipeline.store(true);
+    hold_failed_retry.store(true);
+    trace_pipeline_sets.store(true);
+}
+
+void StopPipelineTrace() {
+    hold_initial_pipeline.store(false);
+    hold_failed_retry.store(false);
+    trace_pipeline_sets.store(false);
+    fail_one_pipelined_reply.store(false);
+    fail_one_pipelined_status.store(false);
+}
+
+void WaitForPipelineRelease(const std::atomic<bool>& hold) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (hold.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 
 extern "C" void* __wrap_redisCommand(redisContext* ctx, const char* format,
                                      ...) {
@@ -67,6 +108,28 @@ extern "C" int __wrap_redisAppendCommand(redisContext* ctx, const char* format,
                                          ...) {
     va_list args;
     va_start(args, format);
+    std::string key;
+    const bool tracing = trace_pipeline_sets.load();
+    if (tracing && std::strcmp(format, "SET %b %b") == 0) {
+        va_list copy;
+        va_copy(copy, args);
+        const auto* data = va_arg(copy, const char*);
+        const auto length = va_arg(copy, size_t);
+        key.assign(data, length);
+        va_end(copy);
+        // Queue the full workload before allowing workers to finish batches.
+        WaitForPipelineRelease(hold_initial_pipeline);
+        bool block_retry = false;
+        {
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            block_retry = key == failed_retry_key &&
+                          pipeline_set_attempts.count(key) != 0;
+        }
+        if (block_retry && hold_failed_retry.load()) {
+            failed_retry_blocked.store(true);
+            WaitForPipelineRelease(hold_failed_retry);
+        }
+    }
     const int result = redisvAppendCommand(ctx, format, args);
     va_end(args);
     if (result == REDIS_OK && std::strcmp(format, "SET %b %b") == 0) {
@@ -74,6 +137,11 @@ extern "C" int __wrap_redisAppendCommand(redisContext* ctx, const char* format,
         size_t previous = max_pipelined_sets.load();
         while (count > previous &&
                !max_pipelined_sets.compare_exchange_weak(previous, count)) {
+        }
+        if (tracing) {
+            appended_set_keys.push_back(key);
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            ++pipeline_set_attempts[key];
         }
     }
     return result;
@@ -85,6 +153,10 @@ extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
         pipeline_replies_total = appended_sets;
         pipeline_replies_remaining = appended_sets;
         appended_sets = 0;
+        if (trace_pipeline_sets.load()) {
+            pipeline_set_keys = std::move(appended_set_keys);
+            appended_set_keys.clear();
+        }
     }
     const int result = __real_redisGetReply(ctx, reply);
     if (result == REDIS_OK && pipeline_replies_remaining > 0) {
@@ -93,6 +165,11 @@ extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
         --pipeline_replies_remaining;
         if (pipeline_replies_total > 1 && reply_number == 2 &&
             fail_one_pipelined_reply.exchange(false)) {
+            if (trace_pipeline_sets.load()) {
+                std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+                failed_pipeline_keys = pipeline_set_keys;
+                failed_retry_key = pipeline_set_keys.front();
+            }
             freeReplyObject(*reply);
             *reply = nullptr;
             ctx->err = REDIS_ERR_IO;
@@ -100,6 +177,12 @@ extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
         }
         if (pipeline_replies_total > 1 && reply_number == 2 &&
             fail_one_pipelined_status.exchange(false)) {
+            if (trace_pipeline_sets.load()) {
+                std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+                failed_pipeline_keys = pipeline_set_keys;
+                failed_retry_key = pipeline_set_keys[1];
+            }
+            // The SET reached Redis, but the worker cannot accept this reply.
             auto* status = static_cast<redisReply*>(*reply);
             if (status->type == REDIS_REPLY_STATUS && status->len >= 2) {
                 std::memcpy(status->str, "NO", 2);
@@ -280,6 +363,85 @@ class RedisOpLogStoreTest : public ::testing::Test {
                 ? 0
                 : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
         return entry;
+    }
+
+    void CheckPipelineFaultRecovery(bool reply_read_failure) {
+        auto writer = CreateWriter();
+        ResetPipelineTrace();
+        // Declared after writer: release hooks before its destructor joins.
+        struct TraceCleanup {
+            ~TraceCleanup() { StopPipelineTrace(); }
+        } cleanup;
+        max_pipelined_sets.store(0);
+        fail_one_pipelined_reply.store(reply_read_failure);
+        fail_one_pipelined_status.store(!reply_read_failure);
+        auto& metrics = HAMetricManager::instance();
+        const auto failures_before =
+            metrics.get_oplog_redis_pipeline_batch_failures_total();
+        const auto retries_before =
+            metrics.get_oplog_redis_pipeline_batch_retries_total();
+
+        // With the initial appends held, four workers cannot drain these
+        // entries one at a time; at least one batch must contain multiple SETs.
+        for (uint64_t seq = 1; seq <= 40; ++seq) {
+            ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
+        }
+        hold_initial_pipeline.store(false);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!failed_retry_blocked.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(failed_retry_blocked.load());
+        std::string retry_key;
+        {
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            retry_key = failed_retry_key;
+        }
+        ASSERT_FALSE(retry_key.empty());
+        const auto failed_sequence =
+            std::stoull(retry_key.substr(retry_key.rfind(':') + 1));
+        uint64_t latest = 0;
+        ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+        EXPECT_LT(latest, failed_sequence);
+        ASSERT_EQ(ErrorCode::OK, writer->GetLocalCommittedSequenceId(latest));
+        EXPECT_LT(latest, failed_sequence);
+
+        hold_failed_retry.store(false);
+        ASSERT_TRUE(writer->DrainWriting(5000).drained);
+        // Join before inspecting attempts or disabling tracing.
+        writer->StopWriting();
+        EXPECT_GT(max_pipelined_sets.load(), 1u);
+        EXPECT_FALSE(fail_one_pipelined_reply.load());
+        EXPECT_FALSE(fail_one_pipelined_status.load());
+        EXPECT_GT(metrics.get_oplog_redis_pipeline_batch_failures_total(),
+                  failures_before);
+        EXPECT_GT(metrics.get_oplog_redis_pipeline_batch_retries_total(),
+                  retries_before);
+
+        std::vector<std::string> failed_keys;
+        std::map<std::string, size_t> attempts;
+        {
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            failed_keys = failed_pipeline_keys;
+            attempts = pipeline_set_attempts;
+        }
+        ASSERT_GT(failed_keys.size(), 1u);
+        for (const auto& key : failed_keys) {
+            EXPECT_EQ(reply_read_failure || key == retry_key ? 2u : 1u,
+                      attempts[key])
+                << key;
+        }
+
+        auto reader = CreateReader();
+        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
+        EXPECT_EQ(40u, latest);
+        for (uint64_t seq = 1; seq <= 40; ++seq) {
+            OpLogEntry entry;
+            ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(seq, entry)) << seq;
+            EXPECT_EQ("payload_" + std::to_string(seq), entry.payload);
+        }
     }
 
     std::string redis_endpoint_;
@@ -597,37 +759,12 @@ TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
     }
 }
 
-TEST_F(RedisOpLogStoreTest, PipelineRetriesAndCommitsEveryEntry) {
-    max_pipelined_sets.store(0);
-    fail_one_pipelined_reply.store(true);
-    fail_one_pipelined_status.store(true);
-    auto writer = CreateWriter();
+TEST_F(RedisOpLogStoreTest, PipelineReplyReadFailureRetriesWholeBatch) {
+    CheckPipelineFaultRecovery(/*reply_read_failure=*/true);
+}
 
-    // Queue entries beyond the gap so workers can pipeline batches before
-    // seq=1 allows latest to advance.
-    for (uint64_t seq = 2; seq <= 40; ++seq) {
-        ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
-    }
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
-    EXPECT_GT(max_pipelined_sets.load(), 1u);
-    EXPECT_FALSE(fail_one_pipelined_reply.load());
-    EXPECT_FALSE(fail_one_pipelined_status.load());
-
-    auto reader = CreateReader();
-    uint64_t latest = 0;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    do {
-        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
-        if (latest == 40u) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    } while (std::chrono::steady_clock::now() < deadline);
-    EXPECT_EQ(40u, latest);
-    for (uint64_t seq = 1; seq <= 40; ++seq) {
-        OpLogEntry entry;
-        ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(seq, entry)) << seq;
-        EXPECT_EQ("payload_" + std::to_string(seq), entry.payload);
-    }
+TEST_F(RedisOpLogStoreTest, PipelineNonOkReplyRetriesOnlyFailedEntry) {
+    CheckPipelineFaultRecovery(/*reply_read_failure=*/false);
 }
 
 TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
