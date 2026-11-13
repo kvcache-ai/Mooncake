@@ -34,6 +34,7 @@ endif()
 set(MOONCAKE_DISPLAY_VERSION "${MOONCAKE_DISPLAY_VERSION_BASE} (git: ${GIT_SHORT_HASH})")
 
 configure_file(include/version.h.in include/version.h @ONLY)
+configure_file(src/version.cpp.in src/version.cpp @ONLY)
 
 if (STORE_USE_ETCD)
     set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/)

@@ -1,0 +1,7 @@
+#include "version.h"
+
+namespace mooncake {
+
+extern const char* const MOONCAKE_DISPLAY_VERSION = "@MOONCAKE_DISPLAY_VERSION@";
+
+}  // namespace mooncake

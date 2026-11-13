@@ -4,6 +4,7 @@ add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
+    ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
     allocator_metric.cpp
     types.cpp
     common/network.cpp

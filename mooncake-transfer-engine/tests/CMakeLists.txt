@@ -447,6 +447,7 @@ if(USE_EFA)
   target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
+  set_tests_properties(efa_transport_test PROPERTIES LABELS "efa_hw")
 
   add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
   target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
@@ -492,6 +493,7 @@ if(USE_EFA)
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+  set_tests_properties(efa_c_api_test PROPERTIES LABELS "efa_hw")
 
   add_executable(efa_remote_accessible_test
                  ${WORKSPACE}/efa_remote_accessible_test.cpp)
@@ -538,6 +540,7 @@ if(USE_EFA)
                                                          gtest_main cudart)
     endif()
     add_test(NAME efa_gpu_loopback_test COMMAND efa_gpu_loopback_test)
+    set_tests_properties(efa_gpu_loopback_test PROPERTIES LABELS "efa_hw")
   endif()
 endif()
 
