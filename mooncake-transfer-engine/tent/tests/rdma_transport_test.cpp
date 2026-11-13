@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include <cerrno>
 #include <dlfcn.h>
 #include <gtest/gtest.h>
@@ -1133,6 +1134,46 @@ bool waitBatchDone(TransferEngine& engine, BatchID batch) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return false;
+}
+
+TEST(RdmaWorkersNumaTest, OnlySuccessfullyBoundLocalWorkersAreEligible) {
+    unsigned int cpu, node;
+    ASSERT_EQ(syscall(SYS_getcpu, &cpu, &node, nullptr), 0);
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topologyWithRdmaNics(1));
+    auto& params = RdmaTransportTestPeer::params(transport)->workers;
+    params.num_workers = 3;
+    Workers workers(&transport);
+    RdmaTransportTestPeer::makeWorkerContexts(workers, 3);
+    auto& w0 = RdmaTransportTestPeer::workerContext(workers, 0);
+    auto& w1 = RdmaTransportTestPeer::workerContext(workers, 1);
+    auto& w2 = RdmaTransportTestPeer::workerContext(workers, 2);
+    w0.numa_node = node;
+    w1.numa_node = node + 1;
+    w2.numa_node = -1;  // Failed or not-yet-published binding.
+    EXPECT_TRUE(workers.localSubmissionWorkers().empty());
+    params.prefer_local = true;
+    EXPECT_EQ(workers.localSubmissionWorkers(), (std::vector<int>{0}));
+    w2.numa_node = node;
+    EXPECT_EQ(workers.localSubmissionWorkers(), (std::vector<int>{0, 2}));
+    w0.numa_node = -1;
+    w2.numa_node = -1;
+    EXPECT_TRUE(workers.localSubmissionWorkers().empty());
+    RdmaTransportTestPeer::destroyWorkerContexts(workers);
+}
+
+TEST(RdmaWorkersNumaTest, UnavailableNodeFailsBeforeAllocatingContexts) {
+    RdmaTransport transport;
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/rdma/workers/numa_nodes",
+              std::vector<int>{std::numeric_limits<int>::max()});
+    std::string name = "127.0.0.1:0";
+    auto status =
+        transport.install(name, nullptr, topologyWithRdmaNics(1), conf);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("Unavailable RDMA worker NUMA node"),
+              std::string::npos);
+    EXPECT_TRUE(RdmaTransportTestPeer::contextSet(transport).empty());
 }
 
 TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {

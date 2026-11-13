@@ -79,6 +79,10 @@ class Workers {
 
     Status cancel(RdmaTask* task);
 
+    // Snapshot once per API submission, not per slice. Unknown/failed bindings
+    // are excluded, and an empty result retains the existing round-robin route.
+    std::vector<int> localSubmissionWorkers() const;
+
     DeviceSelector* getDeviceSelector() const { return device_selector_.get(); }
 
     // Submit-side allocation with pinned peer metadata. An empty result leaves
@@ -368,6 +372,7 @@ class Workers {
 
     struct WorkerContext {
         std::thread thread;
+        std::atomic<int> numa_node{-1};
         BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
         // Only this lane may touch its own set, so slices swept by another

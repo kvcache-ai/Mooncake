@@ -37,6 +37,7 @@
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
+#include "tent/transport/rdma/worker_numa.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -255,6 +256,17 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
                   << " QP pool(s) for per-class link-layer isolation";
     }
 
+    status = parseWorkerNumaConfig(*conf, params->workers.num_workers,
+                                   params->workers.numa_nodes,
+                                   params->workers.prefer_local);
+    if (!status.ok()) return status;
+    // Reject unavailable placement before allocating contexts or starting any
+    // threads. Workers::start historically has no failure path at install().
+    for (int node : params->workers.numa_nodes) {
+        if (numa_available() < 0 || node > numa_max_node() ||
+            !numa_bitmask_isbitset(numa_all_nodes_ptr, node))
+            return Status::InvalidArgument("Unavailable RDMA worker NUMA node");
+    }
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
@@ -574,7 +586,8 @@ Status RdmaTransport::submitTransferTasks(
     // Distribute starting worker across threads to avoid contention
     static std::atomic<int> g_caller_threads(0);
     thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
-    int next_worker_idx = tl_caller_id;
+    size_t next_worker_idx = static_cast<unsigned int>(tl_caller_id);
+    const auto local_workers = workers_->localSubmissionWorkers();
     for (auto& request : request_list) {
         bool flush_ready = false;
         auto opcode = request.opcode;
@@ -643,7 +656,8 @@ Status RdmaTransport::submitTransferTasks(
                 slice->charged_dev = slice->source_dev_id;
             }
             offset += length;
-            int part_id = next_worker_idx % num_workers;
+            int part_id = selectSubmissionWorker(next_worker_idx, num_workers,
+                                                 local_workers);
             auto& list = slice_lists[part_id];
             auto& tail = slice_tails[part_id];
             list.num_slices++;

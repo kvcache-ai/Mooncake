@@ -191,6 +191,11 @@ inline NotifyQpRtsAttrs buildNotifyQpRtsAttrs(const EndPointParams& params) {
 
 struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
+    // Empty keeps legacy placement; one node applies to all workers, otherwise
+    // supply exactly one node per worker. Local dispatch is independently
+    // opt-in.
+    std::vector<int> numa_nodes;
+    bool prefer_local = false;
     int max_retry_count = 8;
     int block_size = 65536;
     uint64_t grace_period_ns = 5000000;  // 5ms

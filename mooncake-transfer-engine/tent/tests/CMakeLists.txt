@@ -969,3 +969,12 @@ if(USE_MLU)
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+# Hardware-independent routing/configuration tests; affinity checks use the host
+# CPU topology and do not require an RDMA device.
+add_executable(worker_numa_test worker_numa_test.cpp)
+target_link_libraries(worker_numa_test PRIVATE tent_common gtest gtest_main
+                                               glog::glog numa)
+target_include_directories(worker_numa_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME worker_numa_test COMMAND worker_numa_test)

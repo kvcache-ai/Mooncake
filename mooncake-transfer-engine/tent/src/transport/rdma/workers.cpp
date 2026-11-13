@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sys/syscall.h>
+#include "tent/transport/rdma/worker_numa.h"
 #include "tent/transport/rdma/workers.h"
 
 #include "tent/transport/rdma/gdr_reachability.h"
@@ -1351,8 +1353,44 @@ void Workers::showLatencyInfo() {
     worker.perf.inflight_lat.clear();
 }
 
+std::vector<int> Workers::localSubmissionWorkers() const {
+    if (!transport_->params_->workers.prefer_local || !worker_context_)
+        return {};
+    // Read the current node for each batch so migrating submitters and multiple
+    // engines do not inherit a stale thread-local routing cache.
+    unsigned int cpu, node;
+    if (syscall(SYS_getcpu, &cpu, &node, nullptr) != 0) return {};
+    std::vector<int> local;
+    for (size_t id = 0; id < num_workers_; ++id) {
+        if (worker_context_[id].numa_node.load(std::memory_order_acquire) ==
+            static_cast<int>(node))
+            local.push_back(id);
+    }
+    return local;
+}
+
 void Workers::workerThread(int thread_id) {
-    bindToSocket(thread_id % numa_num_configured_nodes());
+    const auto& params = transport_->params_->workers;
+    const int default_node =
+        thread_id % std::max(1, numa_num_configured_nodes());
+    if (params.numa_nodes.empty() && !params.prefer_local) {
+        bindToSocket(default_node);
+    } else {
+        const int node =
+            params.numa_nodes.empty()
+                ? default_node
+                : params.numa_nodes[params.numa_nodes.size() == 1 ? 0
+                                                                  : thread_id];
+        if (bindRdmaWorkerToNode(node) == 0) {
+            worker_context_[thread_id].numa_node.store(
+                node, std::memory_order_release);
+        } else {
+            LOG(WARNING) << "Unable to bind RDMA worker " << thread_id
+                         << " to NUMA node " << node
+                         << "; keeping inherited affinity and excluding it "
+                            "from local dispatch";
+        }
+    }
     tl_wid = thread_id;
     auto& worker = worker_context_[thread_id];
 
