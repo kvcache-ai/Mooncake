@@ -1,3 +1,9 @@
+mod full_lifecycle_cold_probe;
+mod full_lifecycle_delete_probe;
+mod full_lifecycle_offload_nof_boundary;
+mod full_lifecycle_publication_probe;
+mod full_lifecycle_restart_probe;
+mod full_restore_retry_tests;
 mod route_cas_boundary_tests;
 mod route_clock_cold_read_tests;
 mod route_clock_offload_tests;
@@ -163,6 +169,7 @@ struct CountingRouteDirectory {
     miss_bounded_reads: AtomicBool,
     miss_full_reads: AtomicBool,
     bounded_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    owner_visit_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     before_single_cas_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     after_single_cas_hook: Mutex<Option<Box<dyn FnOnce(&mooncake_store_core::CasResult) + Send>>>,
     injected_routes: Mutex<BTreeMap<String, ObjectRoute>>,
@@ -559,6 +566,7 @@ impl CountingRouteDirectory {
             miss_bounded_reads: AtomicBool::new(false),
             miss_full_reads: AtomicBool::new(false),
             bounded_read_hook: Mutex::new(None),
+            owner_visit_hook: Mutex::new(None),
             before_single_cas_hook: Mutex::new(None),
             after_single_cas_hook: Mutex::new(None),
             injected_routes: Mutex::new(BTreeMap::new()),
@@ -2172,6 +2180,10 @@ impl RouteDirectory for CountingRouteDirectory {
             .visit_routes_by_replica_owner_consistent(observer, owner, visitor)?;
         if let Some(injected) = self.injected_route_for_owner(owner) {
             visitor(injected)?;
+        }
+        let hook = self.owner_visit_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
         Ok(())
     }

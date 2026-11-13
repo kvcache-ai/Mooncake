@@ -15,9 +15,9 @@ const PENDING_DELETE_RECLAIM_PREPARE_TTL_MS: u64 = 60_000;
 const STALE_CANDIDATE_RECONCILE_MIN_INTERVAL_MS: u64 = 100;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(in super) struct EvictionAttempt {
-    pub(in super) made_progress: bool,
-    pub(in super) dropped_without_cold: bool,
+pub(super) struct EvictionAttempt {
+    pub(super) made_progress: bool,
+    pub(super) dropped_without_cold: bool,
 }
 
 struct StaleCandidateReconcileGuard<'a> {
@@ -735,7 +735,10 @@ mod state_store_tests {
         assert!(!cold_entry.hot && !cold_entry.fresh_write);
         assert_eq!(cold_entry.hot_credit, 0);
         let hot_entry = clock.entries[clock.by_key[&hot.key][0]].as_ref().unwrap();
-        assert_eq!(hot_entry.hot_credit, StorageClockState::READ_HOT_CLOCK_CREDIT);
+        assert_eq!(
+            hot_entry.hot_credit,
+            StorageClockState::READ_HOT_CLOCK_CREDIT
+        );
 
         // Reuse may change the order of equally cold entries, but must not
         // transfer a removed entry's heat or bypass the fresh-write grace.
@@ -1356,8 +1359,8 @@ impl StorageOwnerState {
         let mut accepted = 0usize;
         for entry in entries {
             if let Some(cold) = entry.cold_backing.as_ref() {
-                accepted = accepted
-                    .saturating_add(self.enqueue_cold_delete_pending(entry, cold, now_ms)?);
+                accepted =
+                    accepted.saturating_add(self.enqueue_cold_delete_pending(entry, cold, now_ms)?);
                 continue;
             }
             let Some(route_identity) = entry.identity.as_ref() else {
@@ -1562,11 +1565,7 @@ impl StorageOwnerState {
         self.pending_cold_deletes.lock().complete(identity);
     }
 
-    fn defer_cold_delete(
-        &self,
-        identity: &crate::control_plane::ColdDeleteTarget,
-        reason: &str,
-    ) {
+    fn defer_cold_delete(&self, identity: &crate::control_plane::ColdDeleteTarget, reason: &str) {
         let now_ms = now_ms();
         let (attempts, became_deferred) = {
             let mut pending = self.pending_cold_deletes.lock();
@@ -1749,9 +1748,7 @@ impl StorageOwnerState {
                     }
                 }
                 mooncake_store_core::AllocationRouteReferenceState::Exact => {
-                    self.pending_deletes
-                        .lock()
-                        .clear_absent(&entry.identity);
+                    self.pending_deletes.lock().clear_absent(&entry.identity);
                     let Some(route_key) = reference.route_key else {
                         self.defer_pending_delete(
                             &entry.identity,
@@ -1810,9 +1807,7 @@ impl StorageOwnerState {
                     }
                 }
                 mooncake_store_core::AllocationRouteReferenceState::Conflict => {
-                    self.pending_deletes
-                        .lock()
-                        .clear_absent(&entry.identity);
+                    self.pending_deletes.lock().clear_absent(&entry.identity);
                     self.defer_pending_delete(
                         &entry.identity,
                         "delete reference authorities disagree",
@@ -1828,6 +1823,7 @@ impl StorageOwnerState {
         let started = Instant::now();
         let used_before = self.allocator.lock().usage_bytes().0;
         let result = (|| {
+            self.recover_owner_restore_publications();
             let mut evicted = self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)?;
             let _ = self.recover_due_pending_publications()?;
             evicted = evicted.saturating_add(
@@ -2218,6 +2214,9 @@ impl StorageOwnerState {
         &self,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<bool> {
+        if self.recover_owner_restore_publications() > 0 {
+            return Ok(true);
+        }
         if self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)? > 0 {
             return Ok(true);
         }
@@ -2353,9 +2352,9 @@ impl StorageOwnerState {
                         .confirm_replica_reference(&route_key, &replica)
                     {
                         Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
-                            match self.track_routes_with_initial_cold_backing(
-                                std::slice::from_ref(&route),
-                            ) {
+                            match self.track_routes_with_initial_cold_backing(std::slice::from_ref(
+                                &route,
+                            )) {
                                 Ok(_) => registry::record_eviction_guard_event(
                                     "pending_publication",
                                     "finalized",
@@ -2451,7 +2450,7 @@ impl StorageOwnerState {
             .made_progress)
     }
 
-    pub(in super) fn evict_one_blocking_with_outcome(
+    pub(super) fn evict_one_blocking_with_outcome(
         &self,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<EvictionAttempt> {
@@ -2663,10 +2662,7 @@ impl StorageOwnerState {
         Ok(self.evict_candidate_with_outcome(victim)?.made_progress)
     }
 
-    fn evict_candidate_with_outcome(
-        &self,
-        victim: &ClockEntryId,
-    ) -> Result<EvictionAttempt> {
+    fn evict_candidate_with_outcome(&self, victim: &ClockEntryId) -> Result<EvictionAttempt> {
         let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
             if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
                 return Ok(EvictionAttempt {
@@ -3493,15 +3489,20 @@ impl StorageOwnerState {
     fn rebuild_clock(&self) -> Result<()> {
         let tracker = OperationTracker::new("storage_owner_rebuild_clock");
         let result = (|| {
-            let mut clock = StorageClockState::for_runtime(&self.runtime);
             let mut route_count = 0usize;
-            self.route_ops
-                .visit_routes_by_replica_owner_consistent(&self.runtime, &mut |route| {
-                    clock.track_route(&route, &self.runtime);
+            self.route_ops.visit_routes_by_replica_owner_consistent(
+                &self.runtime,
+                &mut |route| {
+                    // Merge without replacing concurrent publications or access credits.
+                    // Stale identities still require exact reclaim.
+                    self.hot_replicas
+                        .clock
+                        .lock()
+                        .track_route(&route, &self.runtime);
                     route_count = route_count.saturating_add(1);
                     Ok(())
-                })?;
-            *self.hot_replicas.clock.lock() = clock;
+                },
+            )?;
             debug!(
                 runtime = %self.runtime,
                 routes = route_count,
@@ -3685,9 +3686,7 @@ impl StorageClockState {
         let Some(backing) = route
             .nof_backing
             .as_ref()
-            .filter(|backing| {
-                backing.state == mooncake_store_core::ColdBackingState::Materialized
-            })
+            .filter(|backing| backing.state == mooncake_store_core::ColdBackingState::Materialized)
         else {
             return;
         };
@@ -3704,7 +3703,7 @@ impl StorageClockState {
             self.upsert_replica(
                 route,
                 &ReplicaRoute {
-            allocation_id: None,
+                    allocation_id: None,
                     owner: owner.clone(),
                     segment_name: nof_backing_clock_segment(target_id),
                     offset: None,
