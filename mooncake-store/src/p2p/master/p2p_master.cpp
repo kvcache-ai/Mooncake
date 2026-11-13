@@ -51,6 +51,20 @@ namespace {
 
 constexpr uint32_t kShutdownDrainTimeoutMs = 3000;
 
+// Callers retain their contextual startup log; lower layers log the detailed
+// failure. Updating the diagnostic cache must not emit another error log.
+void RecordHAStartupFailure(const std::string& role, std::string error) {
+    auto& status = HAStatusManager::instance();
+    status.SetSnapshotReady(false);
+    status.SetRoleState(role, "FAILED");
+    status.SetLastError(std::move(error));
+}
+
+void RecordHAStartupFailure(const std::string& role, const std::string& message,
+                            ErrorCode error) {
+    RecordHAStartupFailure(role, message + ": " + toString(error));
+}
+
 std::unique_ptr<coro_rpc::coro_rpc_server> CreateRpcServer(
     const P2PMasterConfig& config) {
     auto server = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -233,10 +247,34 @@ bool WaitForElectionPause(std::chrono::steady_clock::time_point deadline,
 
 int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                                    P2PMasterRpcService& p2p_service,
-                                   std::function<void()> before_start,
+                                   std::function<void()> after_start,
                                    std::function<void()> after_stop,
                                    std::function<bool()> stopping,
-                                   std::function<bool()> stepping_down) {
+                                   std::function<bool()> stepping_down,
+                                   std::string* startup_error) {
+    if (startup_error) {
+        startup_error->clear();
+    }
+    auto startup_result = [startup_error](const std::string& service,
+                                          uint32_t port,
+                                          coro_rpc::err_code error) {
+        // Each runner owns fresh servers. stop() may win before async_start()
+        // (server_has_ran), or cancel its accept loop during startup. These
+        // shutdown/demotion races are not bind/listen failures.
+        if (error == coro_rpc::errc::operation_canceled ||
+            error == coro_rpc::errc::server_has_ran) {
+            LOG(INFO) << service << " startup cancelled: " << error.message();
+            return 0;
+        }
+        const std::string message = "Failed to start " + service +
+                                    ", port=" + std::to_string(port) + ": " +
+                                    std::string(error.message());
+        LOG(ERROR) << message;
+        if (startup_error) {
+            *startup_error = message;
+        }
+        return -1;
+    };
     auto is_stopping = [&stopping] { return stopping && stopping(); };
     std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
     auto finish = [&] {
@@ -262,9 +300,6 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
     const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
     RegisterP2PRpcService(server, p2p_service,
                           /*include_heartbeat=*/!dedicated_heartbeat);
-    if (before_start) {
-        before_start();
-    }
 
     if (dedicated_heartbeat) {
         heartbeat_server.emplace(
@@ -275,20 +310,26 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
         RegisterP2PHeartbeatRpcService(*heartbeat_server, p2p_service);
         auto heartbeat_result = heartbeat_server->async_start();
         if (heartbeat_result.hasResult()) {
-            LOG(ERROR) << "Failed to start heartbeat RPC server: "
-                       << heartbeat_result.result().value();
+            const int result = startup_result(
+                "heartbeat RPC server", config_.rpc.heartbeat_port,
+                heartbeat_result.result().value());
             finish();
-            return -1;
+            return result;
         }
     }
 
     auto server_result = server.async_start();
     if (server_result.hasResult()) {
-        LOG(ERROR) << "Failed to start P2P master RPC server: "
-                   << server_result.result().value();
+        const int result =
+            startup_result("P2P master RPC server", config_.rpc.port,
+                           server_result.result().value());
         // A concurrent stop can also complete the future during startup.
         finish();
-        return -1;
+        return result;
+    }
+    // Publish RUNNING only after both listeners have started successfully.
+    if (after_start && !is_stopping()) {
+        after_start();
     }
     while (!is_stopping() && !server_result.hasResult()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -355,7 +396,7 @@ int P2PMaster::RunStandalone() {
     auto server = CreateRpcServer(config_);
     auto active_service = CreateActiveService(config_, /*view_version=*/0);
     return RunActiveRpcServers(
-        *server, *active_service, /*before_start=*/{}, /*after_stop=*/{},
+        *server, *active_service, /*after_start=*/{}, /*after_stop=*/{},
         [this] { return P2PMaster::IsShutdownRequested(); });
 }
 
@@ -408,6 +449,8 @@ int P2PMaster::RunWithHA() {
             master_view = std::move(redis_view);
 #else
             LOG(ERROR) << "Redis election requires STORE_USE_REDIS";
+            RecordHAStartupFailure("starting",
+                                   "Redis election requires STORE_USE_REDIS");
             return -1;
 #endif
         } else {
@@ -426,8 +469,7 @@ int P2PMaster::RunWithHA() {
             const std::string error =
                 std::string("Failed to initialize P2P master view: ") +
                 toString(connect_result);
-            HAStatusManager::instance().SetRoleState("starting", "FAILED");
-            HAStatusManager::instance().SetLastError(error);
+            RecordHAStartupFailure("starting", error);
             LOG(ERROR) << error;
             return -1;
         }
@@ -514,6 +556,8 @@ int P2PMaster::RunWithHA() {
             if (start_result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to start P2P standby: "
                            << toString(start_result);
+                RecordHAStartupFailure("standby", "Failed to start P2P standby",
+                                       start_result);
                 return -1;
             }
 #ifdef STORE_USE_REDIS
@@ -695,6 +739,9 @@ int P2PMaster::RunWithHA() {
             if (promote_result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to promote P2P standby: "
                            << toString(promote_result);
+                RecordHAStartupFailure("promoting",
+                                       "Failed to promote P2P standby",
+                                       promote_result);
                 master_view->CancelKeepAlive(lease_id);
                 keep_leader_thread.join();
                 return -1;
@@ -771,6 +818,9 @@ int P2PMaster::RunWithHA() {
             if (restore_result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to restore promoted metadata: "
                            << toString(restore_result);
+                RecordHAStartupFailure("primary",
+                                       "Failed to restore promoted metadata",
+                                       restore_result);
                 master_view->CancelKeepAlive(lease_id);
                 keep_leader_thread.join();
                 return -1;
@@ -791,6 +841,9 @@ int P2PMaster::RunWithHA() {
             config_.ha.snapshot_service_port > 0 && invalid_snapshot_port) {
             LOG(ERROR) << "P2P primary snapshot fallback port conflicts with "
                           "active RPC port";
+            RecordHAStartupFailure("primary",
+                                   "P2P primary snapshot fallback port "
+                                   "conflicts with active RPC port");
             master_view->CancelKeepAlive(lease_id);
             keep_leader_thread.join();
             return -1;
@@ -809,8 +862,12 @@ int P2PMaster::RunWithHA() {
                 *primary_snapshot_server, primary_snapshot_service.get());
             auto snapshot_result = primary_snapshot_server->async_start();
             if (snapshot_result.hasResult()) {
-                LOG(ERROR) << "P2P primary snapshot fallback server failed"
-                           << ", port=" << config_.ha.snapshot_service_port;
+                const std::string error =
+                    "P2P primary snapshot fallback server failed, port=" +
+                    std::to_string(config_.ha.snapshot_service_port) + ": " +
+                    std::string(snapshot_result.result().value().message());
+                LOG(ERROR) << error;
+                RecordHAStartupFailure("primary", error);
                 primary_snapshot_server->stop();
                 primary_snapshot_server.reset();
                 primary_snapshot_service.reset();
@@ -848,6 +905,9 @@ int P2PMaster::RunWithHA() {
             if (trim_start != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to start Redis OpLog auto trim worker: "
                            << toString(trim_start);
+                RecordHAStartupFailure(
+                    "primary", "Failed to start Redis OpLog auto trim worker",
+                    trim_start);
                 redis_oplog_trim_worker.reset();
                 master_view->CancelKeepAlive(lease_id);
                 keep_leader_thread.join();
@@ -886,6 +946,7 @@ int P2PMaster::RunWithHA() {
 #else
         auto mark_primary = std::move(mark_primary_running);
 #endif
+        std::string rpc_startup_error;
         const int run_result = RunActiveRpcServers(
             *server, *active_service, std::move(mark_primary),
             std::move(drain_before_stop), stopping,
@@ -893,7 +954,11 @@ int P2PMaster::RunWithHA() {
                 return active_stepdown_requested.load(
                            std::memory_order_acquire) &&
                        !leadership_lost.load(std::memory_order_acquire);
-            });
+            },
+            &rpc_startup_error);
+        if (run_result != 0) {
+            RecordHAStartupFailure("primary", rpc_startup_error);
+        }
         HAStatusManager::instance().SetSnapshotReady(false);
 #ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
@@ -901,13 +966,16 @@ int P2PMaster::RunWithHA() {
         const bool demoted_primary =
             active_stepdown_requested.load(std::memory_order_acquire) ||
             leadership_lost.load(std::memory_order_acquire);
-        HAStatusManager::instance().SetRoleState(
-            demoted_primary ? "standby" : "primary",
-            leadership_lost.load(std::memory_order_acquire)
-                ? "LEADERSHIP_LOST"
-                : (active_stepdown_requested.load(std::memory_order_acquire)
-                       ? "STEPPED_DOWN"
-                       : "STOPPED"));
+        // Preserve startup failure diagnostics through the common cleanup.
+        if (run_result == 0) {
+            HAStatusManager::instance().SetRoleState(
+                demoted_primary ? "standby" : "primary",
+                leadership_lost.load(std::memory_order_acquire)
+                    ? "LEADERSHIP_LOST"
+                    : (active_stepdown_requested.load(std::memory_order_acquire)
+                           ? "STEPPED_DOWN"
+                           : "STOPPED"));
+        }
         if (auto* manager =
                 primary_oplog_manager.load(std::memory_order_acquire)) {
             manager->StopWriting();
@@ -984,7 +1052,9 @@ int P2PMaster::RunWithHA() {
         keep_leader_thread.join();
         if (stopping()) {
             const auto release_result = master_view->ReleaseLeader();
-            HAStatusManager::instance().SetRoleState("primary", "STOPPED");
+            if (run_result == 0) {
+                HAStatusManager::instance().SetRoleState("primary", "STOPPED");
+            }
             if (!graceful_drain_complete) {
                 // The drain path already reports queue/sequence details. This
                 // aggregate log and exit status distinguish incomplete
@@ -996,7 +1066,7 @@ int P2PMaster::RunWithHA() {
             }
             LOG(INFO) << "HA shutdown completed"
                       << ", release_result=" << toString(release_result);
-            return 0;
+            return run_result;
         }
         if (active_stepdown_requested.load(std::memory_order_acquire)) {
             // Release only after RPC handlers, OpLog writes, and keepalive have

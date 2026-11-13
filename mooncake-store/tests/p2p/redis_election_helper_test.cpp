@@ -100,6 +100,40 @@ class RedisElectionHelperTest : public ::testing::Test {
 
     void SetUp() override { CleanupRedisKeys(); }
     void TearDown() override { CleanupRedisKeys(); }
+
+    void ExpectMasterStartupFailure(const P2PMasterConfig& config,
+                                    const std::string& role,
+                                    const std::string& error) {
+        struct ResetDiagnostics {
+            ~ResetDiagnostics() {
+                HAStatusManager::instance().Reset();
+                P2PMaster::shutdown_requested_.store(false);
+            }
+        } reset;
+        HAStatusManager::instance().Reset();
+        P2PMaster master(config);
+        auto result = std::async(std::launch::async,
+                                 [&master] { return master.RunWithHA(); });
+        const auto completed = result.wait_for(std::chrono::seconds(10));
+        if (completed != std::future_status::ready) {
+            // Bound a regression that accidentally reaches the serving loop.
+            P2PMaster::RequestShutdown();
+        }
+        EXPECT_EQ(completed, std::future_status::ready);
+        EXPECT_EQ(result.get(), -1);
+        const auto status = HAStatusManager::instance().Snapshot();
+        EXPECT_EQ(status.role, role);
+        EXPECT_EQ(status.state, "FAILED");
+        EXPECT_FALSE(status.snapshot_ready);
+        EXPECT_NE(status.last_error.find(error), std::string::npos)
+            << status.last_error;
+        const auto doctor = HAStatusManager::instance().GetDoctorReport();
+        const auto failed = std::find_if(
+            doctor.issues.begin(), doctor.issues.end(),
+            [](const auto& issue) { return issue.code == "HA_FAILED"; });
+        ASSERT_NE(failed, doctor.issues.end());
+        EXPECT_EQ(failed->message, status.last_error);
+    }
 };
 
 struct ScopedElectionDiagnostics {
@@ -139,13 +173,14 @@ static P2PMasterConfig MakeRedisMasterConfig(
     config.rpc.address = "127.0.0.1";
     config.metrics.enable_reporting = false;
     config.metrics.http_port = 0;
+    config.ha.enabled = true;
     config.ha.election_backend = ElectionBackend::REDIS;
     config.redis.endpoint = FLAGS_redis_endpoint;
     config.redis.username = FLAGS_redis_username;
     config.redis.password = redis_password;
     config.redis.master_view_ttl_seconds = FLAGS_redis_ttl_sec;
     config.redis.heartbeat_interval_seconds = 1;
-    config.cluster_id = FLAGS_cluster_id + "_wrong_password_startup";
+    config.cluster_id = FLAGS_cluster_id;
     return config;
 }
 
@@ -191,6 +226,65 @@ TEST_F(RedisElectionHelperTest, MasterRunWithHAFailsWithWrongRedisPassword) {
                   "Failed to initialize P2P master view"),
               std::string::npos);
     HAStatusManager::instance().Reset();
+}
+
+TEST_F(RedisElectionHelperTest, MasterRpcStartupFailureSurvivesCleanup) {
+    asio::io_context io;
+    asio::ip::tcp::acceptor occupied(io,
+                                     {asio::ip::make_address("127.0.0.1"), 0});
+    auto config = MakeRedisMasterConfig(FLAGS_redis_password);
+    config.rpc.port = occupied.local_endpoint().port();
+    ExpectMasterStartupFailure(config, "primary",
+                               "Failed to start P2P master RPC server, port=" +
+                                   std::to_string(config.rpc.port));
+}
+
+TEST_F(RedisElectionHelperTest, HeartbeatRpcStartupFailureSurvivesCleanup) {
+    asio::io_context io;
+    asio::ip::tcp::acceptor occupied(io,
+                                     {asio::ip::make_address("127.0.0.1"), 0});
+    auto config = MakeRedisMasterConfig(FLAGS_redis_password);
+    config.rpc.heartbeat_port = occupied.local_endpoint().port();
+    ExpectMasterStartupFailure(config, "primary",
+                               "Failed to start heartbeat RPC server, port=" +
+                                   std::to_string(config.rpc.heartbeat_port));
+}
+
+TEST_F(RedisElectionHelperTest, StandbyStartupFailureRecordsReason) {
+    asio::io_context io;
+    asio::ip::tcp::acceptor occupied(io,
+                                     {asio::ip::make_address("127.0.0.1"), 0});
+    auto config = MakeRedisMasterConfig(FLAGS_redis_password);
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.ha.snapshot_service_port = occupied.local_endpoint().port();
+    ExpectMasterStartupFailure(config, "standby",
+                               "Failed to start P2P standby");
+}
+
+TEST_F(RedisElectionHelperTest, PrimarySnapshotPortConflictRecordsReason) {
+    asio::io_context io;
+    asio::ip::tcp::acceptor reserved(io,
+                                     {asio::ip::make_address("127.0.0.1"), 0});
+    auto config = MakeRedisMasterConfig(FLAGS_redis_password);
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.ha.snapshot_service_port = reserved.local_endpoint().port();
+    config.rpc.port = config.ha.snapshot_service_port;
+    reserved.close();
+    ExpectMasterStartupFailure(
+        config, "primary",
+        "P2P primary snapshot fallback port conflicts with active RPC port");
+}
+
+TEST_F(RedisElectionHelperTest, AutoTrimStartupFailureRecordsReason) {
+    auto config = MakeRedisMasterConfig(FLAGS_redis_password);
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.oplog.enable_auto_trim = true;
+    config.oplog.auto_trim_interval_sec = 0;
+    ExpectMasterStartupFailure(config, "primary",
+                               "Failed to start Redis OpLog auto trim worker");
 }
 
 // === Test 2: ElectLeader + GetMasterView ===
