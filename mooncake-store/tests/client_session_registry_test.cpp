@@ -280,6 +280,46 @@ TEST_F(ClientSessionRegistryTest, ExceptionsDiscardOnlyUncommittedNewRecords) {
 }
 
 TEST_F(ClientSessionRegistryTest,
+       RemountInitializesNewSessionAfterRegistryLockWait) {
+    ClientSessionRegistry registry;
+    constexpr auto active_ttl = 10ms;
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    std::future<bool> remounted;
+    Clock::time_point before_unlock;
+    {
+        // Block BeginRemount() before it can create the missing session.
+        // Keep the future outside this scope so the lock is released before
+        // joining the worker, including if an assertion fails.
+        auto blocker = registry.BeginRestore();
+        remounted = std::async(std::launch::async, [&] {
+            started.set_value();
+            auto remount = registry.BeginRemount(kClient);
+            if (!remount) return false;
+            remount->Commit();
+            return true;
+        });
+        started_future.wait();
+        EXPECT_EQ(remounted.wait_for(2 * active_ttl),
+                  std::future_status::timeout);
+        before_unlock = Clock::now();
+    }
+    ASSERT_TRUE(remounted.get());
+    const auto after_remount = Clock::now();
+
+    const auto record = Find(registry, kClient);
+    ASSERT_TRUE(record);
+    // Use sampled bounds, not wall time after joining, so scheduling delays
+    // cannot make the freshly initialized session expire during the check.
+    EXPECT_EQ(record->Evaluate(before_unlock + active_ttl - Clock::duration{1},
+                               active_ttl, 20s),
+              Transition::NONE);
+    EXPECT_TRUE(registry.TryAcquireServingSession(kClient));
+    EXPECT_EQ(record->Evaluate(after_remount + active_ttl, active_ttl, 20s),
+              Transition::BECAME_SUSPECTED);
+}
+
+TEST_F(ClientSessionRegistryTest,
        RemountCommitsReadinessWithoutRenewingLiveness) {
     ClientSessionRegistry registry;
     auto record = Register(registry);

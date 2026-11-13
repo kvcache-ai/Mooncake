@@ -54,7 +54,9 @@ ClientSessionRegistry::BeginRegistration(
 
 std::optional<ClientSessionRegistry::Registration>
 ClientSessionRegistry::BeginRemount(const UUID& id) {
-    return Begin(id, RegistrationKind::Remount, Clock::now());
+    // Initialize new sessions after acquiring the registry lock; existing
+    // sessions keep their liveness timestamp.
+    return Begin(id, RegistrationKind::Remount, std::nullopt);
 }
 
 std::optional<ClientSessionRegistry::Registration> ClientSessionRegistry::Begin(
