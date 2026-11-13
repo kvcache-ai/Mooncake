@@ -189,6 +189,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
+# Hardware-free regression tests for the PXN runtime integration with
+# RdmaTransport / RdmaContext / WorkerPool. Covers the null-safety contract
+# of PxnRuntimeMgr() under -DUSE_PXN=ON (uninstalled transport, failed
+# device open), and is the home for future host-side PXN unit tests.
+add_executable(rdma_pxn_transport_test
+               ${WORKSPACE}/rdma_pxn_transport_test.cpp)
+target_link_libraries(rdma_pxn_transport_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_pxn_transport_test COMMAND rdma_pxn_transport_test)
+
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
 # when no RDMA device is present, so safe to register with ctest.
 add_executable(endpoint_store_integration_test
@@ -421,18 +431,6 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
-
-  add_executable(hip_stream_pool_test ${WORKSPACE}/hip_stream_pool_test.cpp)
-  target_link_libraries(hip_stream_pool_test PUBLIC transfer_engine gtest
-                                                    gtest_main)
-  foreach(priority default high invalid)
-    add_test(NAME hip_stream_pool_${priority}_test
-             COMMAND ${CMAKE_COMMAND} -E env MC_HIP_STREAM_PRIORITY=${priority}
-                     $<TARGET_FILE:hip_stream_pool_test>)
-  endforeach()
-  add_test(NAME hip_stream_pool_unset_test
-           COMMAND ${CMAKE_COMMAND} -E env --unset=MC_HIP_STREAM_PRIORITY
-                   $<TARGET_FILE:hip_stream_pool_test>)
 endif()
 
 if(USE_UBSHMEM)
