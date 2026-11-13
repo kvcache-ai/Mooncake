@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -100,6 +101,31 @@ class RedisElectionHelperTest : public ::testing::Test {
     void SetUp() override { CleanupRedisKeys(); }
     void TearDown() override { CleanupRedisKeys(); }
 };
+
+struct ScopedElectionDiagnostics {
+    ScopedElectionDiagnostics() {
+        auto& status = HAStatusManager::instance();
+        status.Reset();
+        status.Configure(true, FLAGS_cluster_id, "10.0.0.2:50051");
+        status.SetRoleState("standby", "WATCHING");
+    }
+    ~ScopedElectionDiagnostics() { HAStatusManager::instance().Reset(); }
+};
+
+static bool WaitForDoctorIssue(const std::string& code) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        const auto report = HAStatusManager::instance().GetDoctorReport();
+        if (std::any_of(
+                report.issues.begin(), report.issues.end(),
+                [&code](const auto& issue) { return issue.code == code; })) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
 
 static std::string WrongRedisPassword() {
     return FLAGS_redis_password + "-wrong-for-auth-failure-test";
@@ -237,11 +263,17 @@ TEST_F(RedisElectionHelperTest, ElectLeaderUsesConfiguredInstanceId) {
 }
 
 TEST_F(RedisElectionHelperTest, ShouldElectBlocksUntilReady) {
+    ScopedElectionDiagnostics diagnostics;
     std::atomic<bool> ready{false};
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
                                FLAGS_redis_username);
-    helper.SetShouldElect([&ready] { return ready.load(); });
+    helper.SetShouldElect([&ready] {
+        const bool can_elect = ready.load();
+        HAStatusManager::instance().SetElectionReadinessBlocked(
+            !can_elect, 100, std::nullopt, 10);
+        return can_elect;
+    });
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     ViewVersionId version = 0;
@@ -255,6 +287,15 @@ TEST_F(RedisElectionHelperTest, ShouldElectBlocksUntilReady) {
 
     EXPECT_EQ(elected_future.wait_for(std::chrono::milliseconds(300)),
               std::future_status::timeout);
+    EXPECT_TRUE(WaitForDoctorIssue("ELECTION_READINESS_BLOCKED"));
+    const auto waiting_report = HAStatusManager::instance().GetDoctorReport();
+    EXPECT_EQ(waiting_report.issues.size(), 1u);
+    for (const auto& issue : waiting_report.issues) {
+        EXPECT_EQ(issue.code, "ELECTION_READINESS_BLOCKED");
+        EXPECT_EQ(issue.severity, "warning");
+        EXPECT_NE(issue.message.find("latest_sequence_id=unknown"),
+                  std::string::npos);
+    }
 
     std::string current_leader;
     ViewVersionId current_version = 0;
@@ -271,6 +312,38 @@ TEST_F(RedisElectionHelperTest, ShouldElectBlocksUntilReady) {
     elect_thread.join();
     EXPECT_GT(version, 0u);
     EXPECT_GT(lease_id, 0);
+    EXPECT_TRUE(HAStatusManager::instance().GetDoctorReport().issues.empty());
+}
+
+TEST_F(RedisElectionHelperTest, CancellationClearsOnlyReadinessDiagnostics) {
+    ScopedElectionDiagnostics diagnostics;
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
+    helper.SetShouldElect([] {
+        HAStatusManager::instance().SetElectionReadinessBlocked(
+            true, 100, std::nullopt, 10);
+        return false;
+    });
+    ASSERT_EQ(ErrorCode::OK, helper.Connect());
+    ViewVersionId version = 0;
+    int lease_id = 0;
+    std::thread elect_thread(
+        [&] { helper.ElectLeader("10.0.0.2:50051", version, lease_id); });
+    // Use nonfatal assertions until the worker is cancelled and joined.
+    EXPECT_TRUE(WaitForDoctorIssue("ELECTION_READINESS_BLOCKED"));
+    HAStatusManager::instance().SetDoctorIssue("ELECTION_FAILED",
+                                               "Previous Redis failure");
+    helper.CancelElection();
+    elect_thread.join();
+
+    EXPECT_EQ(version, 0u);
+    EXPECT_EQ(lease_id, 0);
+    const auto report = HAStatusManager::instance().GetDoctorReport();
+    ASSERT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.issues[0].code, "ELECTION_FAILED");
+    EXPECT_EQ(report.issues[0].severity, "error");
+    EXPECT_EQ(report.issues[0].message, "Previous Redis failure");
 }
 
 TEST_F(RedisElectionHelperTest, ContentionDoesNotAdvanceEpoch) {

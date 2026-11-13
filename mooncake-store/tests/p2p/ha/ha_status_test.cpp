@@ -379,7 +379,10 @@ TEST_F(HAStatusTest, DoctorReportsElectionReadinessBlocked) {
 
     // The readiness gate is event-driven: only set while the standby is
     // actually blocked inside the readiness wait loop or election callback.
-    status.SetElectionReadinessBlocked(true, 100, 50);
+    status.SetElectionReadinessBlocked(true, 40, 140, 50);
+    // Background status progress must not rewrite the sample that caused
+    // this decision before the election callback evaluates it again.
+    status.SetOpLogProgress(140, 140);
     auto report = doctor();
     EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "ELECTION_READINESS_BLOCKED");
@@ -394,6 +397,77 @@ TEST_F(HAStatusTest, DoctorReportsElectionReadinessBlocked) {
     // gone, so normal lag/catch-up never produces a false positive.
     status.SetElectionReadinessBlocked(false);
     EXPECT_EQ(FindIssue(doctor(), "ELECTION_READINESS_BLOCKED"), nullptr);
+}
+
+TEST_F(HAStatusTest, DoctorDistinguishesUnknownLatestFromExcessiveLag) {
+    // The status cache may still contain an older known latest value.
+    status.SetOpLogProgress(40, 140);
+    status.SetElectionReadinessBlocked(true, 40, std::nullopt, 50);
+    auto report = doctor();
+    ASSERT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.issues[0].code, "ELECTION_READINESS_BLOCKED");
+    EXPECT_EQ(report.issues[0].severity, "warning");
+    EXPECT_NE(report.issues[0].message.find("latest oplog sequence is unknown"),
+              std::string::npos);
+    EXPECT_NE(report.issues[0].message.find("applied_sequence_id=40"),
+              std::string::npos);
+    EXPECT_NE(report.issues[0].message.find("latest_sequence_id=unknown"),
+              std::string::npos);
+    EXPECT_EQ(report.issues[0].message.find("lag="), std::string::npos);
+    EXPECT_EQ(report.issues[0].message.find("exceeds"), std::string::npos);
+
+    status.SetElectionReadinessBlocked(true, 40, 140, 50);
+    status.SetOpLogProgress(40, std::nullopt);
+    report = doctor();
+    ASSERT_EQ(report.issues.size(), 1u);
+    EXPECT_NE(report.issues[0].message.find("lag=100"), std::string::npos);
+    EXPECT_NE(report.issues[0].message.find("latest_sequence_id=140"),
+              std::string::npos);
+    EXPECT_EQ(report.issues[0].message.find("unknown"), std::string::npos);
+
+    status.ClearDoctorIssues();
+    EXPECT_EQ(FindIssue(doctor(), "ELECTION_READINESS_BLOCKED"), nullptr);
+    status.SetElectionReadinessBlocked(true, 40, std::nullopt, 50);
+    status.Reset();
+    status.Configure(true, "test_cluster", "local");
+    status.SetRoleState("standby", "WATCHING");
+    EXPECT_EQ(doctor().health, "ok");
+    EXPECT_TRUE(doctor().issues.empty());
+}
+
+TEST_F(HAStatusTest, DoctorDeduplicatesReadinessWithoutHidingElectionErrors) {
+    status.SetDoctorIssue("ELECTION_NOT_READY", "ShouldElect rejected attempt");
+    auto report = doctor();
+    ASSERT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.issues[0].code, "ELECTION_NOT_READY");
+    EXPECT_EQ(report.issues[0].severity, "warning");
+
+    status.SetElectionReadinessBlocked(true, 40, std::nullopt, 50);
+    report = doctor();
+    ASSERT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.issues[0].code, "ELECTION_READINESS_BLOCKED");
+    EXPECT_EQ(report.issues[0].severity, "warning");
+
+    status.SetDoctorIssue("ELECTION_FAILED", "Redis election failed");
+    report = doctor();
+    ASSERT_EQ(report.issues.size(), 2u);
+    const auto* failure = FindIssue(report, "ELECTION_FAILED");
+    ASSERT_NE(failure, nullptr);
+    EXPECT_EQ(failure->severity, "error");
+
+    // A generic gate still has a warning when no specific P2P reason exists.
+    status.SetElectionReadinessBlocked(false);
+    report = doctor();
+    ASSERT_EQ(report.issues.size(), 2u);
+    EXPECT_EQ(FindIssue(report, "ELECTION_READINESS_BLOCKED"), nullptr);
+    ASSERT_NE(FindIssue(report, "ELECTION_NOT_READY"), nullptr);
+    EXPECT_EQ(FindIssue(report, "ELECTION_NOT_READY")->severity, "warning");
+
+    status.SetDoctorIssue("ELECTION_NOT_READY");
+    report = doctor();
+    ASSERT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.issues[0].code, "ELECTION_FAILED");
+    EXPECT_EQ(report.issues[0].severity, "error");
 }
 
 TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {

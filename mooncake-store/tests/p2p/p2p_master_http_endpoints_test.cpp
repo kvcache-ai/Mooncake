@@ -837,6 +837,45 @@ TEST_F(P2PMasterHttpEndpointsTest,
     EXPECT_TRUE(report["issues"].empty());
 }
 
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorExplainsElectionReadinessOnce) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetRoleState("standby", "WATCHING");
+    status.SetOpLogProgress(100, 120);
+    status.SetDoctorIssue("ELECTION_NOT_READY", "ShouldElect rejected attempt");
+    status.SetElectionReadinessBlocked(true, 100, std::nullopt, 10);
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+    auto report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(),
+              "ELECTION_READINESS_BLOCKED");
+    EXPECT_EQ(report["issues"][0]["severity"].asString(), "warning");
+    EXPECT_NE(report["issues"][0]["message"].asString().find(
+                  "latest_sequence_id=unknown"),
+              std::string::npos);
+    EXPECT_EQ(report["issues"][0]["message"].asString().find("exceeds"),
+              std::string::npos);
+
+    status.SetElectionReadinessBlocked(true, 100, 120, 10);
+    report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["severity"].asString(), "warning");
+    EXPECT_NE(report["issues"][0]["message"].asString().find("lag=20, max=10"),
+              std::string::npos);
+
+    status.SetElectionReadinessBlocked(false);
+    status.SetDoctorIssue("ELECTION_NOT_READY");
+    report = doctor();
+    EXPECT_TRUE(report["issues"].empty());
+    EXPECT_EQ(report["health"].asString(), "ok");
+}
+
 TEST_F(P2PMasterHttpEndpointsTest,
        HADoctorDoesNotTreatGapsOrHistoryAsFailures) {
     HAStatusResetGuard reset_guard;
