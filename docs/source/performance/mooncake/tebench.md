@@ -80,6 +80,12 @@ On the initiator machine:
 Use `--request_interval_us=<N>` to add a per-thread delay before each
 transfer batch. The value is in microseconds; `0` disables pacing.
 
+Pacing is closed loop: each thread waits the interval after its previous
+transfer completes, then issues the next one. The per-thread request rate is
+therefore at most `1 / (interval + transfer latency)`, not `1 / interval`, and
+it drops as latency grows. The wait spins with `yield`, so each paced thread
+keeps a CPU core busy, which can compete with transport polling threads.
+
 When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
@@ -160,6 +166,13 @@ Each output row corresponds to one benchmark configuration.
 | `Avg Tx (us)`  | Average per-transfer execution time, excluding gaps |
 | `P99 Tx (us)`  | P99 transfer latency                                |
 | `P999 Tx (us)` | P999 transfer latency                               |
+
+`BW` is the throughput of the requested workload: total bytes divided by the
+pooled average worker duration of the measurement phase. It therefore includes
+work done inside the loop on request, such as `--request_interval_us` pacing
+and the data fill and verify of `--check_consistency`. `Avg Tx`, `P99 Tx`,
+`P999 Tx`, and `Avg Inst GB/s` time only the transfer itself, from submit to
+completion.
 
 A short (~1 second) warmup phase is executed before measurements begin.
 

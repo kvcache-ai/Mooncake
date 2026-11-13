@@ -131,6 +131,38 @@ if(BUILD_UNIT_TESTS)
     PROPERTIES PASS_REGULAR_EXPRESSION
                "Mooncake Transfer Engine Benchmarking Tool" TIMEOUT 10)
 
+  # Bad flags are rejected before anything connects. The message is only
+  # printed by the validation path, which then exits with a failure.
+  add_test(
+    NAME tebench_reject_zero_sweep_start
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --start_block_size=0)
+  set_tests_properties(
+    tebench_reject_zero_sweep_start
+    PROPERTIES PASS_REGULAR_EXPRESSION "--start_block_size must be positive"
+               TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_sweep_overflow
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --max_block_size=18446744073709551615)
+  set_tests_properties(
+    tebench_reject_sweep_overflow
+    PROPERTIES PASS_REGULAR_EXPRESSION "--max_block_size .* must be at most"
+               TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_zero_duration
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --duration=0)
+  set_tests_properties(
+    tebench_reject_zero_duration
+    PROPERTIES PASS_REGULAR_EXPRESSION "--duration must be positive" TIMEOUT 10)
+
   if(WITH_METRICS AND USE_TCP)
     add_executable(
       tebench_metrics_integration_test
