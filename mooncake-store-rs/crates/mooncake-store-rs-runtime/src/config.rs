@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mooncake_store_client::{AllocationLifecycleConfig, ColdTierTargetConfig, ColdTierTargetSpec};
 #[cfg(test)]
 use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
-use mooncake_store_client::{ColdTierTargetConfig, ColdTierTargetSpec};
 use mooncake_store_core::{MetadataBackend, Result, StoreError};
 use mooncake_store_rs_metadata::{
     build_store_metadata_backend, resolve_redis_auth, MetadataKeyspace,
@@ -30,6 +30,8 @@ const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
 const DUMMY_RPC_TIMEOUT_ENV: &str = "MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS";
 const EVICTION_HIGH_WATERMARK_ENV: &str = "MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT";
 const EVICTION_LOW_WATERMARK_ENV: &str = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT";
+const MAX_PENDING_PUBLICATIONS_ENV: &str = "MC_STORE_RS_MAX_PENDING_PUBLICATIONS";
+const MAX_PENDING_PUBLICATION_BYTES_ENV: &str = "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES";
 const CLASSIC_GID_INDEX_ENV: &str = "MC_STORE_RS_GID_INDEX";
 const COLD_TIER_TARGETS_ENV: &str = "MC_STORE_RS_COLD_TIER_TARGETS";
 
@@ -168,6 +170,7 @@ pub struct CompatBuildPlan {
     pub scratch_bytes: usize,
     pub eviction_high_watermark_percent: Option<u8>,
     pub eviction_low_watermark_percent: Option<u8>,
+    pub allocation_lifecycle: AllocationLifecycleConfig,
     pub expires_at_ms: u64,
     pub lease_ttl_ms: u64,
     pub use_hugepage: Option<bool>,
@@ -194,6 +197,8 @@ pub struct CompatSetupArgs {
     pub local_buffer_size: usize,
     pub eviction_high_watermark_percent: Option<u8>,
     pub eviction_low_watermark_percent: Option<u8>,
+    pub max_pending_publications: Option<usize>,
+    pub max_pending_publication_bytes: Option<u64>,
     pub protocol: String,
     pub _rdma_devices: String,
     pub transport_rpc_port: Option<u16>,
@@ -224,6 +229,8 @@ impl CompatSetupArgs {
             local_buffer_size,
             eviction_high_watermark_percent,
             eviction_low_watermark_percent,
+            max_pending_publications,
+            max_pending_publication_bytes,
             protocol,
             _rdma_devices: _,
             transport_rpc_port,
@@ -313,6 +320,19 @@ impl CompatSetupArgs {
             EVICTION_LOW_WATERMARK_ENV,
         )?;
 
+        let mut allocation_lifecycle = AllocationLifecycleConfig::default();
+        if let Some(value) = resolve_optional_integer_env_override(
+            max_pending_publications,
+            MAX_PENDING_PUBLICATIONS_ENV,
+        )? {
+            allocation_lifecycle = allocation_lifecycle.max_pending_publications(value);
+        }
+        if let Some(value) = resolve_optional_integer_env_override(
+            max_pending_publication_bytes,
+            MAX_PENDING_PUBLICATION_BYTES_ENV,
+        )? {
+            allocation_lifecycle = allocation_lifecycle.max_pending_publication_bytes(value);
+        }
         Ok(CompatBuildPlan {
             metadata,
             transport_backend,
@@ -330,6 +350,7 @@ impl CompatSetupArgs {
             scratch_bytes: local_buffer_size,
             eviction_high_watermark_percent,
             eviction_low_watermark_percent,
+            allocation_lifecycle,
             expires_at_ms,
             lease_ttl_ms,
             use_hugepage,
@@ -378,6 +399,37 @@ fn resolve_optional_u8_env_override(explicit: Option<u8>, env_name: &str) -> Res
     }
     trimmed.parse::<u8>().map(Some).map_err(|error| {
         StoreError::InvalidState(format!("{env_name} must be an integer in 0..=255: {error}"))
+    })
+}
+
+fn resolve_optional_integer_env_override<T>(
+    explicit: Option<T>,
+    env_name: &str,
+) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    let value = match std::env::var(env_name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => {
+            return Err(StoreError::InvalidState(format!(
+                "{env_name} is not valid UTF-8: {error}"
+            )));
+        }
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed.parse::<T>().map(Some).map_err(|error| {
+        StoreError::InvalidState(format!(
+            "{env_name} must be a non-negative integer within the supported range: {error}"
+        ))
     })
 }
 
@@ -741,6 +793,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -765,6 +819,45 @@ mod tests {
     fn build_compat_setup_args(args: CompatSetupArgs) -> Result<CompatBuildPlan> {
         let _guard = env_test_lock().lock();
         args.build()
+    }
+
+    #[test]
+    fn compat_setup_pending_publication_limits() {
+        let _guard = env_test_lock().lock();
+        std::env::remove_var(MAX_PENDING_PUBLICATIONS_ENV);
+        std::env::remove_var(MAX_PENDING_PUBLICATION_BYTES_ENV);
+        let plan = sample_compat_setup_args().build().unwrap();
+        assert_eq!(plan.allocation_lifecycle.max_pending_publications, 8192);
+        assert_eq!(
+            plan.allocation_lifecycle.max_pending_publication_bytes,
+            1024 * 1024 * 1024
+        );
+        std::env::set_var(MAX_PENDING_PUBLICATIONS_ENV, "17");
+        std::env::set_var(MAX_PENDING_PUBLICATION_BYTES_ENV, "4096");
+        let plan = sample_compat_setup_args().build().unwrap();
+        assert_eq!(plan.allocation_lifecycle.max_pending_publications, 17);
+        assert_eq!(
+            plan.allocation_lifecycle.max_pending_publication_bytes,
+            4096
+        );
+        let mut args = sample_compat_setup_args();
+        args.max_pending_publications = Some(3);
+        args.max_pending_publication_bytes = Some(512);
+        std::env::set_var(MAX_PENDING_PUBLICATIONS_ENV, "invalid");
+        std::env::set_var(MAX_PENDING_PUBLICATION_BYTES_ENV, "invalid");
+        let plan = args.build().unwrap();
+        assert_eq!(plan.allocation_lifecycle.max_pending_publications, 3);
+        assert_eq!(plan.allocation_lifecycle.max_pending_publication_bytes, 512);
+        assert!(sample_compat_setup_args().build().is_err());
+        std::env::remove_var(MAX_PENDING_PUBLICATIONS_ENV);
+        assert!(sample_compat_setup_args().build().is_err());
+        std::env::remove_var(MAX_PENDING_PUBLICATION_BYTES_ENV);
+        let mut args = sample_compat_setup_args();
+        args.max_pending_publications = Some(0);
+        args.max_pending_publication_bytes = Some(0);
+        let plan = args.build().unwrap();
+        assert_eq!(plan.allocation_lifecycle.max_pending_publications, 1);
+        assert_eq!(plan.allocation_lifecycle.max_pending_publication_bytes, 1);
     }
 
     #[test]
@@ -890,6 +983,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1026,6 +1121,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1064,6 +1161,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1100,6 +1199,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1136,6 +1237,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "rdma".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: Some(17112),
@@ -1193,6 +1296,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1238,6 +1343,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1277,6 +1384,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1344,6 +1453,8 @@ mod tests {
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,

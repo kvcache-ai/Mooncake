@@ -1168,16 +1168,12 @@ class MasterService {
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
-    // Caller must hold client_mutex_.
-    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
-        const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
+    void ClearInvalidHandlesLocked();
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // every tenant. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
@@ -1372,9 +1368,7 @@ class MasterService {
         bool would_invalidate{false};
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
-        const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
-        const;
+        const ObjectMetadata& metadata) const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -1423,10 +1417,9 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client no longer retains resources.
-    bool CleanupStaleHandles(
-        const std::string& key, const TenantId& tenant_id,
-        ObjectMetadata& metadata, route::ObjectState& state,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
+    bool CleanupStaleHandles(const std::string& key, const TenantId& tenant_id,
+                             ObjectMetadata& metadata,
+                             route::ObjectState& state);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (promotion-task cancellation) instead of
     // duplicating it.
@@ -1504,9 +1497,7 @@ class MasterService {
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
     // with OBJECT_ALREADY_EXISTS.
-    auto CleanupStaleBeforeWrite(
-        const char* why, MetadataAccessorRW& accessor,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
         -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission
@@ -2270,9 +2261,15 @@ class MasterService {
     // Gated snapshots for the call sites that capture a pre-mutation medium
     // set. They run on hot metadata paths, so skip the VisitReplicas walk
     // entirely when no publisher is listening.
-    std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
-        return KvEventsEnabled() ? KvMediaForMetadata(metadata)
-                                 : std::vector<std::string>{};
+    // Cleanup paths recover previously announced media only for invalid
+    // COMPLETE replicas selected by their own removal predicate.
+    std::vector<std::string> KvMediaSnapshot(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_include_invalid =
+            {}) {
+        return KvEventsEnabled()
+                   ? KvMediaForMetadata(metadata, should_include_invalid)
+                   : std::vector<std::string>{};
     }
     std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForRemoval(metadata)
@@ -2281,7 +2278,8 @@ class MasterService {
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata);
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_include_invalid = {});
     // Removal paths may run after replicas have transitioned to PROCESSING or
     // REMOVED. Keep their former medium visible as a conservative hint even
     // though only COMPLETE replicas count as currently available media.

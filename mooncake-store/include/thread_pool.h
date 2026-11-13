@@ -38,6 +38,9 @@ class ThreadPool {
     /// Stops the thread pool (waits for current tasks to complete)
     void stop();
 
+    /// Number of worker threads in the pool
+    size_t size() const { return workers.size(); }
+
    private:
     std::vector<std::thread> workers;         ///< Worker thread pool
     std::queue<std::function<void()>> tasks;  ///< Task queue

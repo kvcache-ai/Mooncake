@@ -236,7 +236,7 @@ TEST(LocalMemoryLifecycle, DefaultHostOptionsAllocateUsableSharedMemory) {
     request.target_id = peer;
     request.target_offset = reinterpret_cast<uint64_t>(source);
     request.length = kSize;
-    ASSERT_TRUE(initiator.transferSync({request}).ok());
+    ASSERT_TRUE(initiator.submitAndWaitTransfer({request}).ok());
     EXPECT_EQ(std::memcmp(source, destination, kSize), 0);
 
     EXPECT_TRUE(initiator.closeSegment(peer).ok());
@@ -276,7 +276,7 @@ TEST(LocalMemoryLifecycle, BasicShmAllocationsRegisterForReadAndWrite) {
         request.opcode = opcode;
         std::memset(source, 0x6b, kSize);
         std::memset(destination, 0x5a, kSize);
-        auto status = initiator.transferSync({request});
+        auto status = initiator.submitAndWaitTransfer({request});
         EXPECT_TRUE(status.ok()) << status.ToString();
         EXPECT_EQ(std::memcmp(source, destination, kSize), 0);
     }

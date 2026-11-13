@@ -906,12 +906,6 @@ class MasterServiceHATest : public ::testing::Test {
         return MasterServiceTestPeer::NeedMemEviction(service).load();
     }
 
-    static void ClearInvalidHandlesForTesting(
-        MasterService& service,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-        MasterServiceTestPeer(service).ClearInvalidHandles(alive_clients);
-    }
-
     static void ClearInvalidHandlesForTesting(MasterService& service) {
         MasterServiceTestPeer(service).ClearInvalidHandles();
     }

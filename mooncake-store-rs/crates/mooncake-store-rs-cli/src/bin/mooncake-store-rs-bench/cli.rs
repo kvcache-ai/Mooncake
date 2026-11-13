@@ -47,6 +47,10 @@ pub struct GlobalArgs {
     pub eviction_high_watermark_percent: Option<u8>,
     #[arg(long, env = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT")]
     pub eviction_low_watermark_percent: Option<u8>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATIONS")]
+    pub max_pending_publications: Option<usize>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES")]
+    pub max_pending_publication_bytes: Option<u64>,
     #[arg(long, default_value = "bench", env = "MC_STORE_RS_TENANT")]
     pub tenant: String,
     #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
@@ -458,6 +462,45 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn pending_publication_cli_env_precedence() {
+        const CHILD_ENV: &str = "MC_BENCH_TEST_PUBLICATION_LIMITS_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("cli::tests::pending_publication_cli_env_precedence")
+                .arg("--exact")
+                .env(CHILD_ENV, "1")
+                .env("MC_STORE_RS_MAX_PENDING_PUBLICATIONS", "17")
+                .env("MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES", "4096")
+                .status()
+                .expect("isolated CLI env test should start");
+            assert!(status.success());
+            return;
+        }
+        let env = Cli::try_parse_from([
+            "mooncake-store-rs-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "bench",
+        ]);
+        let explicit = Cli::try_parse_from([
+            "mooncake-store-rs-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "--max-pending-publications",
+            "3",
+            "--max-pending-publication-bytes",
+            "512",
+            "bench",
+        ]);
+        let env = env.unwrap().global;
+        assert_eq!(env.max_pending_publications, Some(17));
+        assert_eq!(env.max_pending_publication_bytes, Some(4096));
+        let explicit = explicit.unwrap().global;
+        assert_eq!(explicit.max_pending_publications, Some(3));
+        assert_eq!(explicit.max_pending_publication_bytes, Some(512));
+    }
 
     #[test]
     fn bench_cli_exposes_interface_selection_defaults() {

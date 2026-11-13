@@ -35,6 +35,15 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority_get(namespace, authority, key)
     }
 
+    fn get_route_record(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<mooncake_store_route::RouteAuthorityRecord> {
+        crate::route_directory::authority_get_record(namespace, authority, key)
+    }
+
     fn list_routes_by_replica_owner(
         &self,
         namespace: &str,
@@ -44,16 +53,48 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority_list_routes_by_replica_owner(namespace, authority, owner)
     }
 
+    fn get_allocation_route_references(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        identities: &[mooncake_store_core::AllocationRouteIdentity],
+    ) -> Result<Vec<mooncake_store_core::AllocationRouteReferenceState>> {
+        crate::route_directory::authority_get_allocation_route_references(
+            namespace,
+            authority,
+            identities,
+        )
+    }
+
+    fn get_allocation_route_reference_keys(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        identities: &[mooncake_store_core::AllocationRouteIdentity],
+    ) -> Result<Vec<mooncake_store_core::AllocationRouteReference>> {
+        crate::route_directory::authority_get_allocation_route_reference_keys(
+            namespace,
+            authority,
+            identities,
+        )
+    }
+
     fn list_routes_by_replica_owner_page(
         &self,
         namespace: &str,
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<mooncake_store_route::RouteOwnerPage> {
         crate::route_directory::authority_list_routes_by_replica_owner_page(
-            namespace, authority, owner, cursor, limit,
+            namespace,
+            authority,
+            owner,
+            cursor,
+            snapshot_epoch,
+            limit,
         )
     }
 
@@ -80,14 +121,14 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority_replace(namespace, authority, key, next)
     }
 
-    fn batch_get_routes(
+    fn batch_get_route_records(
         &self,
         namespace: &str,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Vec<Result<Option<ObjectRoute>>> {
-        match authority_get_many(namespace, authority, keys) {
-            Ok(routes) => routes.into_iter().map(Ok).collect(),
+    ) -> Vec<Result<mooncake_store_route::RouteAuthorityRecord>> {
+        match crate::route_directory::authority_get_records(namespace, authority, keys) {
+            Ok(records) => records.into_iter().map(Ok).collect(),
             Err(error) => keys
                 .iter()
                 .map(|_| Err(StoreError::NotFound(error.to_string())))
@@ -156,6 +197,7 @@ struct LocalAllocatorAdapter {
     lifecycle_state: SharedLifecycleState,
     transfer_stall_timeout: Duration,
     request_timeout_override: Option<Duration>,
+    allocation_lifecycle: AllocationLifecycleConfig,
 }
 
 impl LocalAllocatorAdapter {
@@ -175,21 +217,26 @@ impl LocalAllocatorAdapter {
         &self,
         owner: &ClientRuntimeId,
         length_bytes: u64,
+        pending_publication: bool,
     ) -> Result<mooncake_store_core::SegmentReservation> {
         let mut last_error = None;
         for _ in 0..=32usize {
+            let deadline_ms = self.pending_publish_deadline_ms(length_bytes);
             let reservation = {
                 let mut allocator = self.allocator.lock();
-                allocator.reserve_any(owner, length_bytes)
+                if pending_publication {
+                    allocator.reserve_any_with_pending_publication_limited(
+                        owner,
+                        length_bytes,
+                        deadline_ms,
+                        self.allocation_lifecycle,
+                    )
+                } else {
+                    allocator.reserve_any_with_pending(owner, length_bytes, deadline_ms)
+                }
             };
             match reservation {
-                Ok(reservation) => {
-                    let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
-                    self.allocator
-                        .lock()
-                        .mark_pending_reservation(&reservation, deadline_ms);
-                    return Ok(reservation);
-                }
+                Ok(reservation) => return Ok(reservation),
                 Err(StoreError::Allocator(message)) => {
                     last_error = Some(message);
                 }
@@ -200,7 +247,7 @@ impl LocalAllocatorAdapter {
                     self.storage_owner.as_ref(),
                 );
             }
-            if !self.storage_owner.evict_one(None)? {
+            if !self.storage_owner.evict_one_for_reservation(None)? {
                 break;
             }
         }
@@ -214,21 +261,32 @@ impl LocalAllocatorAdapter {
         owner: &ClientRuntimeId,
         segment_name: &SegmentName,
         length_bytes: u64,
+        pending_publication: bool,
     ) -> Result<mooncake_store_core::SegmentReservation> {
         let mut last_error = None;
         for _ in 0..=32usize {
+            let deadline_ms = self.pending_publish_deadline_ms(length_bytes);
             let reservation = {
                 let mut allocator = self.allocator.lock();
-                allocator.reserve_specific(owner, segment_name, length_bytes)
+                if pending_publication {
+                    allocator.reserve_specific_with_pending_publication_limited(
+                        owner,
+                        segment_name,
+                        length_bytes,
+                        deadline_ms,
+                        self.allocation_lifecycle,
+                    )
+                } else {
+                    allocator.reserve_specific_with_pending(
+                        owner,
+                        segment_name,
+                        length_bytes,
+                        deadline_ms,
+                    )
+                }
             };
             match reservation {
-                Ok(reservation) => {
-                    let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
-                    self.allocator
-                        .lock()
-                        .mark_pending_reservation(&reservation, deadline_ms);
-                    return Ok(reservation);
-                }
+                Ok(reservation) => return Ok(reservation),
                 Err(StoreError::Allocator(message)) => {
                     last_error = Some(message);
                 }
@@ -239,7 +297,10 @@ impl LocalAllocatorAdapter {
                     self.storage_owner.as_ref(),
                 );
             }
-            if !self.storage_owner.evict_one(Some(segment_name))? {
+            if !self
+                .storage_owner
+                .evict_one_for_reservation(Some(segment_name))?
+            {
                 break;
             }
         }
@@ -265,7 +326,7 @@ impl AllocatorService for LocalAllocatorAdapter {
             )));
         }
         self.ensure_accepting_writes()?;
-        self.reserve_any_with_eviction(owner, length_bytes)
+        self.reserve_any_with_eviction(owner, length_bytes, false)
     }
 
     fn reserve_specific(
@@ -281,7 +342,7 @@ impl AllocatorService for LocalAllocatorAdapter {
             )));
         }
         self.ensure_accepting_writes()?;
-        self.reserve_specific_with_eviction(owner, segment_name, length_bytes)
+        self.reserve_specific_with_eviction(owner, segment_name, length_bytes, false)
     }
 
     fn release(
@@ -290,6 +351,7 @@ impl AllocatorService for LocalAllocatorAdapter {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> Result<()> {
         if *owner != self.runtime {
             return Err(StoreError::InvalidState(format!(
@@ -299,7 +361,13 @@ impl AllocatorService for LocalAllocatorAdapter {
         }
         self.allocator
             .lock()
-            .release(owner, segment_name, offset_bytes, length_bytes)
+            .release(
+                owner,
+                segment_name,
+                offset_bytes,
+                length_bytes,
+                allocation_id,
+            )
     }
 
     fn batch_reserve_any(
@@ -323,7 +391,32 @@ impl AllocatorService for LocalAllocatorAdapter {
         }
         length_bytes
             .iter()
-            .map(|length_bytes| self.reserve_any_with_eviction(owner, *length_bytes))
+            .map(|length_bytes| self.reserve_any_with_eviction(owner, *length_bytes, false))
+            .collect()
+    }
+
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Vec<Result<mooncake_store_core::SegmentReservation>> {
+        if *owner != self.runtime {
+            return length_bytes
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "allocator rpc targeted runtime {} on {}",
+                        owner, self.runtime
+                    )))
+                })
+                .collect();
+        }
+        if let Err(error) = self.ensure_accepting_writes() {
+            return length_bytes.iter().map(|_| Err(error.clone())).collect();
+        }
+        length_bytes
+            .iter()
+            .map(|length_bytes| self.reserve_any_with_eviction(owner, *length_bytes, true))
             .collect()
     }
 
@@ -349,7 +442,44 @@ impl AllocatorService for LocalAllocatorAdapter {
         requests
             .iter()
             .map(|request| {
-                self.reserve_specific_with_eviction(owner, &request.segment_name, request.length_bytes)
+                self.reserve_specific_with_eviction(
+                    owner,
+                    &request.segment_name,
+                    request.length_bytes,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Vec<Result<mooncake_store_core::SegmentReservation>> {
+        if *owner != self.runtime {
+            return requests
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "allocator rpc targeted runtime {} on {}",
+                        owner, self.runtime
+                    )))
+                })
+                .collect();
+        }
+        if let Err(error) = self.ensure_accepting_writes() {
+            return requests.iter().map(|_| Err(error.clone())).collect();
+        }
+        requests
+            .iter()
+            .map(|request| {
+                self.reserve_specific_with_eviction(
+                    owner,
+                    &request.segment_name,
+                    request.length_bytes,
+                    true,
+                )
             })
             .collect()
     }
@@ -375,6 +505,7 @@ impl AllocatorService for LocalAllocatorAdapter {
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )
             })
             .collect()
@@ -388,6 +519,10 @@ impl EvictionService for LocalAllocatorAdapter {
 
     fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<RouteTrafficReport> {
         Ok(self.storage_owner.track_routes(routes))
+    }
+
+    fn batch_notify_delete_pending(&self, entries: &[DeletePendingEntry]) -> Result<usize> {
+        self.storage_owner.enqueue_delete_pending(entries)
     }
 }
 

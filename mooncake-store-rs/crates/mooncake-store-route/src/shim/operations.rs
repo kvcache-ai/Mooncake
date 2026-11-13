@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ColdBackingRouteFilter, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteState, RouteVersion,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ColdBackingRouteFilter, MetadataBackend, NamespaceScope,
+    ObjectKey, ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
+    RouteReplicaReference, RouteState, RouteVersion,
 };
 
 pub trait RouteHitReporter {
@@ -75,6 +76,31 @@ impl RouteOperations {
     pub fn contains_active_routes_bounded(&self, keys: &[ObjectKey]) -> Result<Vec<bool>> {
         self.directory
             .contains_object_routes_bounded(&self.observer, keys)
+    }
+
+    pub fn confirm_replica_reference(
+        &self,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> Result<RouteReplicaReference> {
+        self.directory
+            .confirm_replica_reference(&self.observer, key, replica)
+    }
+
+    pub fn get_allocation_route_references_consistent(
+        &self,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        self.directory
+            .get_allocation_route_references_consistent(&self.observer, identities)
+    }
+
+    pub fn get_allocation_route_reference_keys_consistent(
+        &self,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        self.directory
+            .get_allocation_route_reference_keys_consistent(&self.observer, identities)
     }
 
     pub fn load_active_route_and_report<R: RouteHitReporter>(
@@ -193,6 +219,15 @@ impl RouteOperations {
             .visit_routes_by_replica_owner(&self.observer, owner, visitor)
     }
 
+    pub fn visit_routes_by_replica_owner_consistent(
+        &self,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        self.directory
+            .visit_routes_by_replica_owner_consistent(&self.observer, owner, visitor)
+    }
+
     pub fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         self.directory.list_routes_in_scope(&self.observer, scope)
     }
@@ -210,7 +245,7 @@ impl RouteOperations {
             .map(|route| route.version.next())
             .unwrap_or_else(|| {
                 self.directory
-                    .get_version_floor(&self.observer, key)
+                    .get_delete_marker(&self.observer, key)
                     .map(|version| version.next())
                     .unwrap_or(RouteVersion(1))
             })
@@ -243,7 +278,7 @@ impl RouteOperations {
         }
         let floors = self
             .directory
-            .get_version_floors(&self.observer, &missing_keys);
+            .get_delete_markers(&self.observer, &missing_keys);
         for (index, floor) in missing_indices.into_iter().zip(floors) {
             versions[index] = Some(
                 floor
