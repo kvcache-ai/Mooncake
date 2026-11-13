@@ -16,6 +16,9 @@ pub enum StoreError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("publication attempt retired: {0}")]
+    PublicationRetired(String),
+
     #[error("quota exceeded ({kind:?}): {message}")]
     QuotaExceeded { kind: QuotaKind, message: String },
 

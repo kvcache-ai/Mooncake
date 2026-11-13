@@ -1,4 +1,16 @@
+static NEXT_PUBLICATION_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[allow(deprecated)]
+fn next_publication_attempt_sequence() -> Result<u64> {
+    NEXT_PUBLICATION_ATTEMPT_SEQUENCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| StoreError::InvalidState("publication attempt sequence exhausted".to_string()))
+}
+
 struct PreferredSegmentReservationContext<'a> {
+    publication: Option<&'a mooncake_store_core::PublicationAttempt>,
     tenant: &'a str,
     key: &'a str,
     length_bytes: usize,
@@ -9,6 +21,37 @@ struct PreferredSegmentReservationContext<'a> {
 }
 
 impl StoreClient {
+    fn publication_cohort(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<mooncake_store_core::PublicationAttempt>> {
+        // Preparation uses the observer's immutable identity and route scope;
+        // authority lifecycle and expiry come from the membership snapshot.
+        match self.route_directory.prepare_publication(
+            &self.lease,
+            key,
+            next_publication_attempt_sequence()?,
+        ) {
+            Ok(attempt) => Ok(Some(attempt)),
+            Err(StoreError::Unsupported(_)) if !self.route_directory.publication_fencing_enabled() => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn mint_publication(
+        &self,
+        cohort: Option<&mooncake_store_core::PublicationAttempt>,
+    ) -> Result<Option<mooncake_store_core::PublicationAttempt>> {
+        cohort
+            .map(|cohort| {
+                let mut attempt = cohort.clone();
+                attempt.sequence = next_publication_attempt_sequence()?;
+                Ok(attempt)
+            })
+            .transpose()
+    }
     fn drain_lease_guard_timeout(&self) -> Duration {
         self.request_timeout_override
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_CAP)
@@ -1012,9 +1055,20 @@ impl StoreClient {
         &self,
         candidate: &ReplicaPlacementTarget,
         length_bytes: usize,
+        publication: Option<&mooncake_store_core::PublicationAttempt>,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
         let storage_runtime = candidate.storage_runtime();
         let is_local = storage_runtime == &self.lease.runtime;
+        if publication.is_some() {
+            let request = StorageRuntimeReservationRequest {
+                storage_runtime: storage_runtime.clone(),
+                segment_name: match candidate { ReplicaPlacementTarget::Segment { segment_name, .. } => Some(segment_name.clone()), _ => None },
+                length_bytes: length_bytes as u64, require_local_memory: is_local,
+                publication: self.mint_publication(publication)?,
+            };
+            return self.reserve_storage_runtime_segments_batch(&[request])?.pop()
+                .ok_or_else(|| StoreError::Transport("publication reservation reply is missing".to_string()))?;
+        }
         match candidate {
             ReplicaPlacementTarget::StorageRuntime(storage_runtime) => {
                 self.reserve_storage_runtime_segment(storage_runtime, length_bytes, is_local)
@@ -1039,6 +1093,10 @@ impl StoreClient {
     )> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
         let key = object.key;
+        let publication_key = ObjectKey::from_logical_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set), key,
+        ));
+        let publication = self.publication_cohort(&publication_key)?;
         let mut targets = Vec::with_capacity(policy.replica_count);
         let mut reservations = Vec::with_capacity(policy.replica_count);
         let mut excluded = BTreeSet::new();
@@ -1051,6 +1109,7 @@ impl StoreClient {
 
         {
             let mut preferred = PreferredSegmentReservationContext {
+                publication: publication.as_ref(),
                 tenant,
                 key,
                 length_bytes,
@@ -1113,7 +1172,7 @@ impl StoreClient {
             if excluded.contains(storage_runtime) {
                 continue;
             }
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, publication.as_ref()) {
                 Ok((target, reservation)) => {
                     excluded.insert(storage_runtime.clone());
                     targets.push(target);
@@ -1149,7 +1208,7 @@ impl StoreClient {
                 target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
                 soft: true,
             };
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, publication.as_ref()) {
                 Ok((target, reservation)) => {
                     excluded.insert(self.lease.runtime.clone());
                     targets.push(target);
@@ -1196,7 +1255,7 @@ impl StoreClient {
                 soft: true,
             };
             let storage_runtime = candidate.target.storage_runtime().clone();
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, publication.as_ref()) {
                 Ok((target, reservation)) => {
                     excluded.insert(storage_runtime);
                     targets.push(target);
@@ -1234,7 +1293,7 @@ impl StoreClient {
                 target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
                 soft: true,
             };
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, publication.as_ref()) {
                 Ok((target, reservation)) => {
                     excluded.insert(self.lease.runtime.clone());
                     targets.push(target);
@@ -1305,7 +1364,7 @@ impl StoreClient {
                     if preferred.excluded.contains(&storage_runtime) {
                         continue;
                     }
-                    match self.reserve_candidate(&candidate.target, preferred.length_bytes) {
+                    match self.reserve_candidate(&candidate.target, preferred.length_bytes, preferred.publication) {
                         Ok((target, reservation)) => {
                             preferred.excluded.insert(storage_runtime);
                             preferred.targets.push(target);

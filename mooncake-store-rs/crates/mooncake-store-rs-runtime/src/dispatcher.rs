@@ -1690,7 +1690,9 @@ fn soft_get_status(error: &StoreError) -> i64 {
         StoreError::InvalidState(_) => -2,
         StoreError::Metadata(_) => -3,
         StoreError::Transport(_) => -4,
-        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } => -5,
+        StoreError::Conflict(_)
+        | StoreError::PublicationRetired(_)
+        | StoreError::QuotaExceeded { .. } => -5,
         StoreError::StaleEpoch(_) => -6,
         StoreError::Unsupported(_) => -7,
         StoreError::Allocator(_) => -8,

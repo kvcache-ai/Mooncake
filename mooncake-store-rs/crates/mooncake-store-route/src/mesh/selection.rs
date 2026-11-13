@@ -155,7 +155,7 @@ pub(crate) fn ranked_top_authorities(
     key: &ObjectKey,
     limit: usize,
 ) -> Vec<ClientLease> {
-    let mut top = Vec::<(RouteAuthorityLifetime, f64, ClientLease)>::with_capacity(
+    let mut top = Vec::<(RouteAuthorityLifetime, f64, &ClientLease)>::with_capacity(
         limit.min(candidates.len()),
     );
     for lease in candidates {
@@ -178,11 +178,11 @@ pub(crate) fn ranked_top_authorities(
             .is_lt()
         });
         if insert_at < limit {
-            top.insert(insert_at, (lifetime, score, lease.clone()));
+            top.insert(insert_at, (lifetime, score, lease));
             top.truncate(limit);
         }
     }
-    top.into_iter().map(|(_, _, lease)| lease).collect()
+    top.into_iter().map(|(_, _, lease)| lease.clone()).collect()
 }
 
 pub(crate) fn ranked_merged_authorities(

@@ -120,10 +120,10 @@ fn membership_equivalent(left: &[ClientLease], right: &[ClientLease]) -> bool {
     };
     left.iter().all(|(runtime, expected)| {
         right.get(runtime).is_some_and(|candidate| {
-            candidate.runtime == expected.runtime
-                && candidate.state == expected.state
-                && candidate.compatibility == expected.compatibility
-                && candidate.endpoints == expected.endpoints
+                candidate.runtime == expected.runtime
+                    && candidate.state == expected.state
+                    && candidate.compatibility == expected.compatibility
+                    && candidate.endpoints == expected.endpoints
         })
     })
 }
@@ -277,7 +277,8 @@ pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLea
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut newest_active_by_stable = BTreeMap::<String, ClientLease>::new();
+    let mut newest_active_by_stable =
+        BTreeMap::<String, (mooncake_store_core::ClientEpoch, u64)>::new();
     for lease in &live {
         if lease.state != ClientLifecycleState::Active {
             continue;
@@ -285,14 +286,14 @@ pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLea
         let stable_id = lease.runtime.stable_id.0.clone();
         let replace = newest_active_by_stable
             .get(&stable_id)
-            .map(|current| {
-                lease.runtime.epoch > current.runtime.epoch
-                    || (lease.runtime.epoch == current.runtime.epoch
-                        && lease.expires_at_ms > current.expires_at_ms)
+            .map(|(epoch, expires_at_ms)| {
+                lease.runtime.epoch > *epoch
+                    || (lease.runtime.epoch == *epoch && lease.expires_at_ms > *expires_at_ms)
             })
             .unwrap_or(true);
         if replace {
-            newest_active_by_stable.insert(stable_id, lease.clone());
+            newest_active_by_stable
+                .insert(stable_id, (lease.runtime.epoch, lease.expires_at_ms));
         }
     }
 
@@ -303,7 +304,7 @@ pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLea
             }
             newest_active_by_stable
                 .get(lease.runtime.stable_id.0.as_str())
-                .is_some_and(|current| current.runtime == lease.runtime)
+                .is_some_and(|(epoch, _)| *epoch == lease.runtime.epoch)
         })
         .collect()
 }
@@ -369,6 +370,29 @@ mod state_core_tests {
     }
 
     #[test]
+    fn filter_live_client_leases_preserves_duplicate_epochs_and_lifecycle_order() {
+        let now = current_time_ms();
+        let mut leases = vec![
+            sample_lease("node-a", 1, ClientLifecycleState::Active, now + 10_000),
+            sample_lease("node-a", 3, ClientLifecycleState::Standby, now + 40_000),
+            sample_lease("node-a", 2, ClientLifecycleState::Active, now + 30_000),
+            sample_lease("node-a", 2, ClientLifecycleState::Active, now + 20_000),
+            sample_lease("node-a", 4, ClientLifecycleState::Draining, now + 50_000),
+            sample_lease("node-a", 5, ClientLifecycleState::Active, now - 1),
+        ];
+        leases[2].endpoints.labels.insert("address".into(), "first".into());
+        leases[3].endpoints.labels.insert("address".into(), "second".into());
+        let expected = vec![
+            leases[1].clone(),
+            leases[2].clone(),
+            leases[3].clone(),
+            leases[4].clone(),
+        ];
+
+        assert_eq!(filter_live_client_leases(&leases), expected);
+    }
+
+    #[test]
     fn membership_equivalent_ignores_order_and_lease_expiry() {
         let left = vec![
             sample_lease("node-a", 1, ClientLifecycleState::Active, 100),
@@ -392,8 +416,7 @@ mod state_core_tests {
         ];
 
         assert!(!membership_equivalent(&left, &right));
-    }
-    #[test]
+    }    #[test]
     fn stale_route_track_does_not_clear_reused_generation_pending_publication() {
         let owner = ClientRuntimeId::new("pending-owner", ClientEpoch(1));
         let segment_name = SegmentName::new("pending-segment");
@@ -441,6 +464,7 @@ mod state_core_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
                 allocation_id: Some(old.allocation_id),
@@ -663,6 +687,7 @@ mod state_core_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: owner.clone(),
                 segment_name,
                 allocation_id: Some(reservation.allocation_id),
@@ -756,6 +781,7 @@ mod state_core_tests {
         assert!(retry.is_ready(0));
         assert_eq!(retry.consecutive_failures, 0);
     }
+
 }
 
 #[derive(Default)]
@@ -783,6 +809,7 @@ struct SegmentTransportMetadata {
 /// (cold_tier_devices, hot_replicas, offload_mode, offload_priority)
 /// are consumed by the offload/restore pipeline.
 struct StorageOwnerState {
+    publication_finalization_wake: Mutex<Option<std::sync::mpsc::SyncSender<AsyncEvictionMessage>>>,
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
     metadata: Arc<dyn MetadataBackend>,
@@ -873,6 +900,7 @@ struct EvictionToken {
     kind: PendingEvictionKind,
     route_key: Option<ObjectKey>,
     expected_version: RouteVersion,
+    superseded_before: Option<RouteVersion>,
     evicted_replica: Option<ReplicaRoute>,
     clock_id: Option<ClockEntryId>,
     next_route: Option<ObjectRoute>,
@@ -881,6 +909,8 @@ struct EvictionToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingEvictionKind {
     RouteCas,
+    ExistingHolderCas,
+    HistoricalClock,
     AllocationCandidate,
 }
 
@@ -923,6 +953,10 @@ struct RouteWritePermit<'a> {
 
 #[derive(Default)]
 struct LocalAllocatorState {
+    publication_provenance: HashMap<AllocationIdentity, mooncake_store_core::PublicationAttempt>,
+    publication_release_authorized: HashSet<AllocationIdentity>,
+    publication_finalizations: BTreeMap<AllocationIdentity, (mooncake_store_core::PublicationRevokeRequest, bool)>,
+    publication_finalization_cursor: Option<AllocationIdentity>,
     segments: BTreeMap<SegmentName, SegmentAllocator>,
     // Exact lookup only; the ready queues maintain retry order.
     pending_allocations: HashMap<AllocationSpan, PendingAllocation>,
@@ -960,6 +994,7 @@ enum PendingAllocation {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct PendingPublication {
     identity: AllocationIdentity,
+    attempt: Option<mooncake_store_core::PublicationAttempt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1028,6 +1063,51 @@ struct UntrackedCandidateScanProgress {
 }
 
 impl LocalAllocatorState {
+    fn bind_publication(
+        &mut self,
+        mut reservation: mooncake_store_core::SegmentReservation,
+        attempt: mooncake_store_core::PublicationAttempt,
+        lifecycle: AllocationLifecycleConfig,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let span = AllocationSpan {
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        };
+        let identity = self
+            .allocation_identity(&span)
+            .filter(|identity| identity.allocation_id == reservation.allocation_id)
+            .ok_or_else(|| {
+                StoreError::Allocator("publication reservation generation has changed".to_string())
+            })?;
+        if let Some(previous) = self.publication_provenance.get(&identity) {
+            if previous != &attempt {
+                return Err(StoreError::InvalidState(
+                    "allocation publication identity is immutable".to_string(),
+                ));
+            }
+        }
+        let deadline_ms = match self.pending_allocations.get(&span) {
+            Some(PendingAllocation::Legacy { deadline_ms })
+            | Some(PendingAllocation::Publication { deadline_ms, .. }) => *deadline_ms,
+            _ => {
+                return Err(StoreError::InvalidState(
+                    "publication reservation is no longer pending".to_string(),
+                ))
+            }
+        };
+        if !matches!(
+            self.pending_allocations.get(&span),
+            Some(PendingAllocation::Publication { .. })
+        ) {
+            self.ensure_pending_publication_capacity(reservation.length_bytes, lifecycle)?;
+        }
+        reservation.publication = Some(attempt.clone());
+        self.mark_pending_publication(&reservation, deadline_ms);
+        self.publication_provenance.insert(identity, attempt);
+        Ok(reservation)
+    }
+
     fn upsert(&mut self, announcement: &SegmentAnnouncement) {
         match self.segments.get_mut(&announcement.segment_name) {
             Some(segment) => {
@@ -1397,6 +1477,13 @@ impl LocalAllocatorState {
         };
         if let Some(identity) = self.allocation_identity(&span) {
             if (allocation_id == 0 || allocation_id == identity.allocation_id)
+                && self.publication_provenance.contains_key(&identity)
+                && !self.publication_release_authorized.contains(&identity) {
+                return Err(StoreError::Backpressure("allocation requires publication revocation before release".to_string()));
+            }
+        }
+        if let Some(identity) = self.allocation_identity(&span) {
+            if (allocation_id == 0 || allocation_id == identity.allocation_id)
                 && self.allocation_pins.contains_key(&identity)
             {
                 let pin = self
@@ -1747,6 +1834,32 @@ impl LocalAllocatorState {
                 None => false,
             };
             if should_clear {
+                if let Some(identity) = self.allocation_identity(&allocation) {
+                    if let Some(attempt) = self.publication_provenance.get(&identity).cloned() {
+                        if self.publication_finalizations.len() >= 4096
+                            && !self.publication_finalizations.contains_key(&identity) {
+                            continue;
+                        }
+                        let newly_queued = !self.publication_finalizations.contains_key(&identity);
+                        self.publication_finalizations.entry(identity.clone()).or_insert_with(|| (
+                            mooncake_store_core::PublicationRevokeRequest {
+                                attempt,
+                                closed_receivers: Vec::new(),
+                                registration_generation: 0,
+                                receiver_permits: Vec::new(),
+                                superseded_before: None,
+                                allocation: AllocationRouteIdentity {
+                                    owner: runtime.clone(), segment_name: identity.segment_name.clone(),
+                                    offset_bytes: identity.offset_bytes, length_bytes: identity.length_bytes,
+                                    allocation_id: identity.allocation_id,
+                                },
+                            }, false,
+                        ));
+                        if newly_queued {
+                            registry::record_eviction_guard_event("publication_finalize", "queued");
+                        }
+                    }
+                }
                 self.remove_pending_allocation(&allocation);
             }
         }
@@ -1917,7 +2030,10 @@ impl LocalAllocatorState {
                 },
             );
             if matches_current {
-                candidates.push(PendingPublication { identity });
+                candidates.push(PendingPublication {
+                    attempt: self.publication_provenance.get(&identity).cloned(),
+                    identity,
+                });
             }
         }
         candidates
@@ -1980,6 +2096,7 @@ impl LocalAllocatorState {
             })
             .collect()
     }
+
 }
 
 #[derive(Clone, Copy)]
@@ -2082,14 +2199,9 @@ impl SegmentAllocator {
                 .ok_or_else(|| {
                 StoreError::Allocator("segment reservation overflow".to_string())
             })?;
-            self.allocations.insert(
-                offset_bytes,
-                SegmentAllocation {
-                    length_bytes,
-                    allocation_id,
-                },
-            );
+            self.allocations.insert(offset_bytes, SegmentAllocation { length_bytes, allocation_id });
             return Ok(mooncake_store_core::SegmentReservation {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
                 offset_bytes,
@@ -2125,6 +2237,7 @@ impl SegmentAllocator {
             },
         );
         Ok(mooncake_store_core::SegmentReservation {
+            publication: None,
             owner: owner.clone(),
             segment_name: segment_name.clone(),
             offset_bytes: offset,
@@ -2330,6 +2443,7 @@ impl PreparedObjectWrite<'_> {
 
 #[derive(Clone, Debug)]
 struct StorageRuntimeReservationRequest {
+    publication: Option<mooncake_store_core::PublicationAttempt>,
     storage_runtime: ClientRuntimeId,
     segment_name: Option<SegmentName>,
     length_bytes: u64,
@@ -2432,6 +2546,7 @@ enum ReclaimMode {
     Scheduled,
     Immediate,
     Deferred,
+
 }
 
 #[cfg(test)]
@@ -2486,14 +2601,11 @@ mod offload_pin_tests {
                 reservation.allocation_id,
             )
             .expect("duplicate deferred release should be idempotent");
-        assert_eq!(
-            allocator.allocation_identity(&AllocationSpan {
-                segment_name: segment_name.clone(),
-                offset_bytes: reservation.offset_bytes,
-                length_bytes: reservation.length_bytes,
-            }),
-            Some(identity.clone())
-        );
+        assert_eq!(allocator.allocation_identity(&AllocationSpan {
+            segment_name: segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        }), Some(identity.clone()));
         assert_eq!(allocator.usage_bytes().0, 4096);
 
         allocator

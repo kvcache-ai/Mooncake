@@ -15,6 +15,7 @@ fn clock_hit_route(runtime: &ClientRuntimeId) -> ObjectRoute {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: runtime.clone(),
             segment_name: SegmentName::new("clock-hit-segment"),
             offset: Some(0),

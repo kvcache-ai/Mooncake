@@ -137,6 +137,8 @@ struct ColdOffloadReplyLossDirectory {
 }
 
 impl RouteDirectory for ColdOffloadReplyLossDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,

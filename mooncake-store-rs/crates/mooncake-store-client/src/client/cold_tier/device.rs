@@ -94,6 +94,7 @@ impl StorageOwnerState {
                 super::super::PendingColdDeleteQueue::default(),
             ),
             pending_delete_next_due_at_ms: AtomicU64::new(u64::MAX),
+            publication_finalization_wake: parking_lot::Mutex::new(None),
             pending_publication_authority_retry: parking_lot::Mutex::new(
                 super::super::PendingPublicationAuthorityRetry::default(),
             ),

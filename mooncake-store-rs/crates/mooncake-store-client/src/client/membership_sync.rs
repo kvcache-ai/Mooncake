@@ -138,8 +138,13 @@ impl Drop for MembershipSyncHandle {
     }
 }
 
+enum AsyncEvictionMessage {
+    FinalizePublications,
+    Shutdown,
+}
+
 struct AsyncEvictionHandle {
-    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    shutdown: Option<std::sync::mpsc::SyncSender<AsyncEvictionMessage>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -157,30 +162,48 @@ impl AsyncEvictionHandle {
         local_memory: &LocalMemoryConfig,
         storage_owner: Arc<StorageOwnerState>,
     ) -> Result<Self> {
-        if local_memory.eviction_poll_interval.is_zero()
+        let eviction_enabled = !(local_memory.eviction_poll_interval.is_zero()
             || !local_memory.has_storage()
             || lease
                 .endpoints
                 .labels
                 .get("storage")
                 .map(|value| value != "true")
-                .unwrap_or(true)
-        {
+                .unwrap_or(true));
+        let finalization_enabled =
+            local_memory.has_storage() && storage_owner.route_ops.publication_fencing_enabled();
+        if !eviction_enabled && !finalization_enabled {
             return Ok(Self::disabled());
         }
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
+        *storage_owner.publication_finalization_wake.lock() = Some(shutdown_tx.clone());
         let stable_id = runtime.stable_id.0.clone();
-        let interval = local_memory.eviction_poll_interval;
+        let interval = if local_memory.eviction_poll_interval.is_zero() {
+            Duration::from_millis(100)
+        } else {
+            local_memory.eviction_poll_interval
+        };
         let high_percent = local_memory.eviction_high_watermark_percent;
         let low_percent = local_memory.eviction_low_watermark_percent;
         let thread = std::thread::Builder::new()
             .name(format!("mooncake-async-evict-{stable_id}"))
             .spawn(move || {
-                while shutdown_rx.recv_timeout(interval).is_err() {
-                    if let Err(error) =
-                        storage_owner.evict_until_low_watermark(high_percent, low_percent)
-                    {
-                        tracing::warn!(error = %error, "background storage-owner eviction failed");
+                let mut next_maintenance = Instant::now() + interval;
+                loop {
+                    match shutdown_rx.recv_timeout(next_maintenance.saturating_duration_since(Instant::now())) {
+                        Ok(AsyncEvictionMessage::Shutdown) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Ok(AsyncEvictionMessage::FinalizePublications) => storage_owner.flush_publication_finalizations(),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if Instant::now() >= next_maintenance {
+                        if eviction_enabled {
+                            if let Err(error) = storage_owner.evict_until_low_watermark(high_percent, low_percent) {
+                                tracing::warn!(error = %error, "background storage-owner eviction failed");
+                            }
+                        } else {
+                            storage_owner.flush_publication_finalizations();
+                        }
+                        next_maintenance = Instant::now() + interval;
                     }
                 }
             })
@@ -195,7 +218,7 @@ impl AsyncEvictionHandle {
 
     fn shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(AsyncEvictionMessage::Shutdown);
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

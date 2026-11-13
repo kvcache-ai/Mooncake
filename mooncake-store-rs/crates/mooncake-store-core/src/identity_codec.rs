@@ -127,6 +127,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: crate::ClientRuntimeId::new("runtime-a", crate::ClientEpoch(1)),
                 segment_name: crate::SegmentName::new("segment-a"),
                 allocation_id: None,

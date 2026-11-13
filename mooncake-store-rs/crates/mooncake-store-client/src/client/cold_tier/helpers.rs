@@ -276,6 +276,7 @@ pub(in super::super) fn cold_backing_placeholder(
     cold_backing: &mooncake_store_core::ColdBackingRoute,
 ) -> ReplicaRoute {
     ReplicaRoute {
+        publication: None,
         owner: cold_backing.owner.clone(),
         segment_name: SegmentName::new("__cold_backing__"),
         allocation_id: None,

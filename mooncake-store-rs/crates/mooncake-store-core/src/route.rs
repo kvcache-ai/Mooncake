@@ -110,6 +110,8 @@ pub struct ReplicaRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<crate::PublicationAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
     #[serde(default)]
     pub segment_offset: u64,
@@ -189,6 +191,8 @@ pub struct SegmentReservation {
     pub length_bytes: u64,
     #[serde(default)]
     pub allocation_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<crate::PublicationAttempt>,
 }
 
 /// Identifies one allocator generation that may be referenced by a route.
@@ -1294,6 +1298,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("node", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg"),
                 allocation_id: Some(42),

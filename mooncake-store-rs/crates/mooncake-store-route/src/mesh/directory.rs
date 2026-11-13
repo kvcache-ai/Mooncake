@@ -126,6 +126,9 @@ struct BaselineState {
 }
 
 struct EmbeddedWrhRouteDirectory {
+    publication_permits:
+        Mutex<BTreeMap<ClientRuntimeId, mooncake_store_core::PublicationReceiverPermit>>,
+    publication_finalize_retry: Mutex<BTreeMap<ClientRuntimeId, Instant>>,
     route_topk: usize,
     namespace: String,
     local_stable_id: ClientStableId,
@@ -190,6 +193,39 @@ fn validate_owner_route_page(
 }
 
 impl EmbeddedWrhRouteDirectory {
+    fn publication_control_at(
+        &self,
+        authority: &ClientLease,
+        operations: &[mooncake_store_core::PublicationControl],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+        super::publication::control_at(
+            &self.namespace,
+            self.authority_client.as_ref(),
+            authority,
+            operations,
+        )
+    }
+
+    fn publication_authority(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
+        if let Some(lease) = self
+            .membership
+            .live_clients(false, "publication_authority_current_snapshot")?
+            .into_iter()
+            .find(|lease| &lease.runtime == runtime)
+        {
+            return Ok(lease);
+        }
+        self.membership
+            .retained_live_clients("publication_authority_snapshot")?
+            .into_iter()
+            .find(|lease| &lease.runtime == runtime)
+            .ok_or_else(|| {
+                StoreError::Transport(format!(
+                    "publication authority incarnation {runtime} is unavailable"
+                ))
+            })
+    }
+
     #[cfg(test)]
     fn new(
         route_topk: usize,
@@ -217,11 +253,7 @@ impl EmbeddedWrhRouteDirectory {
         membership: Arc<dyn RouteMembershipProvider>,
     ) -> Self {
         let namespace = metadata.route_namespace();
-        register_local_authority(
-            &namespace,
-            &lease.runtime.stable_id,
-            delete_marker_budget_bytes,
-        );
+        register_local_authority(&namespace, &lease.runtime, delete_marker_budget_bytes);
         let async_mirror = AsyncRouteMirrorWorker::spawn(
             namespace.clone(),
             lease.runtime.stable_id.clone(),
@@ -235,6 +267,8 @@ impl EmbeddedWrhRouteDirectory {
             .map(|c| c.runtime.stable_id.0.clone())
             .collect();
         Self {
+            publication_permits: Mutex::new(BTreeMap::new()),
+            publication_finalize_retry: Mutex::new(BTreeMap::new()),
             route_topk,
             namespace,
             local_stable_id: lease.runtime.stable_id.clone(),
@@ -542,7 +576,7 @@ impl EmbeddedWrhRouteDirectory {
         &self,
         authority: &ClientStableId,
         requests: &[RouteCasRequest],
-    ) -> Result<Vec<CasResult>> {
+    ) -> Result<Vec<Result<CasResult>>> {
         authority_compare_and_swap_many(&self.namespace, authority, requests)
     }
 
@@ -559,9 +593,7 @@ impl EmbeddedWrhRouteDirectory {
                     requests,
                 ));
             }
-            return self
-                .cas_local_batch(&authority.runtime.stable_id, requests)
-                .map(|results| results.into_iter().map(Ok).collect());
+            return self.cas_local_batch(&authority.runtime.stable_id, requests);
         }
         self.authority_client.batch_compare_and_swap_routes(
             authority,
@@ -1082,6 +1114,16 @@ impl EmbeddedWrhRouteDirectory {
                 Ok(results) => {
                     for (request, result) in requests.iter().zip(results) {
                         if let Err(error) = result {
+                            if matches!(error, StoreError::PublicationRetired(_)) {
+                                mirror_secondary_batch(
+                                    &self.namespace,
+                                    self.authority_client.as_ref(),
+                                    self.membership.as_ref(),
+                                    &authority,
+                                    std::slice::from_ref(request),
+                                );
+                                continue;
+                            }
                             self.maybe_mark_authority_suspect(
                                 &authority,
                                 &error,
@@ -1097,6 +1139,16 @@ impl EmbeddedWrhRouteDirectory {
                     }
                 }
                 Err(error) => {
+                    if matches!(error, StoreError::PublicationRetired(_)) {
+                        mirror_secondary_batch(
+                            &self.namespace,
+                            self.authority_client.as_ref(),
+                            self.membership.as_ref(),
+                            &authority,
+                            &requests,
+                        );
+                        continue;
+                    }
                     self.maybe_mark_authority_suspect(
                         &authority,
                         &error,
@@ -1208,8 +1260,15 @@ impl EmbeddedWrhRouteDirectory {
                         match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
                             Ok(results) => {
                                 for (index, result) in indices.into_iter().zip(results) {
-                                    resolved[index] = Some(Ok(result));
-                                    resolved_authorities[index] = Some(authority.clone());
+                                    match result {
+                                        Ok(result) => {
+                                            resolved[index] = Some(Ok(result));
+                                            resolved_authorities[index] = Some(authority.clone());
+                                        }
+                                        Err(error) => {
+                                            last_errors[index] = Some(error);
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -1301,6 +1360,426 @@ impl Drop for EmbeddedWrhRouteDirectory {
 }
 
 impl RouteDirectory for EmbeddedWrhRouteDirectory {
+    fn publication_fencing_enabled(&self) -> bool {
+        true
+    }
+
+    fn invalidate_publication(&self, attempt: &mooncake_store_core::PublicationAttempt) {
+        let mut permits = self.publication_permits.lock();
+        for permit in &attempt.permits {
+            if permits.get(&permit.receiver) == Some(permit) {
+                permits.remove(&permit.receiver);
+            }
+        }
+    }
+
+    fn publication_receivers(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> Result<Vec<ClientRuntimeId>> {
+        let candidates = self.authority_candidates(observer)?;
+        Ok(
+            ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk)
+                .into_iter()
+                .map(|lease| lease.runtime)
+                .collect(),
+        )
+    }
+
+    fn prepare_publication(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        sequence: u64,
+    ) -> Result<mooncake_store_core::PublicationAttempt> {
+        use mooncake_store_core::{
+            PublicationAttempt, PublicationControl, PublicationControlReply,
+        };
+        let mut unavailable = BTreeSet::new();
+        let mut refreshed = false;
+        let mut candidates = match self.authority_candidates(observer) {
+            Ok(candidates) => candidates,
+            Err(error) if Self::route_authority_error_should_refresh(&error) => {
+                refreshed = true;
+                self.authority_candidates_force_refresh(observer)?
+            }
+            Err(error) => return Err(error),
+        };
+        loop {
+            let unavailable_before = unavailable.len();
+            let result = (|| {
+                candidates.retain(|candidate| !unavailable.contains(&candidate.runtime));
+                let receivers =
+                    ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk);
+                let primary = receivers
+                    .first()
+                    .ok_or_else(|| {
+                        StoreError::Transport("no publication authority is available".to_string())
+                    })?
+                    .runtime
+                    .clone();
+                let mut permits = Vec::with_capacity(receivers.len());
+                for receiver in &receivers {
+                    let cached = self
+                        .publication_permits
+                        .lock()
+                        .get(&receiver.runtime)
+                        .cloned();
+                    let permit = if let Some(permit) = cached {
+                        permit
+                    } else {
+                        let enrollment = (|| {
+                            let replies = self.publication_control_at(
+                                receiver,
+                                &[PublicationControl::Enroll {
+                                    publisher: observer.runtime.clone(),
+                                }],
+                            )?;
+                            let Some(reply) = replies.into_iter().next() else {
+                                return Err(StoreError::Transport(
+                                    "publication enrollment reply is missing".to_string(),
+                                ));
+                            };
+                            let PublicationControlReply::Enrolled(permit) = reply? else {
+                                return Err(StoreError::Transport(
+                                    "publication enrollment reply type mismatch".to_string(),
+                                ));
+                            };
+                            if permit.receiver != receiver.runtime || permit.enrollment == 0 {
+                                return Err(StoreError::Transport(
+                                    "publication enrollment incarnation mismatch".to_string(),
+                                ));
+                            }
+                            Ok(permit)
+                        })();
+                        let permit = enrollment.inspect_err(|error| {
+                            unavailable.insert(receiver.runtime.clone());
+                            self.maybe_mark_authority_suspect(
+                                receiver,
+                                error,
+                                "publication_enrollment_failed",
+                            );
+                        })?;
+                        let mut cache = self.publication_permits.lock();
+                        if cache.len() >= 4096 {
+                            cache.pop_first();
+                        }
+                        cache.insert(receiver.runtime.clone(), permit.clone());
+                        permit
+                    };
+                    permits.push(permit);
+                }
+                Ok(PublicationAttempt::new(
+                    mooncake_store_core::PublicationAttemptFields {
+                        publisher: observer.runtime.clone(),
+                        sequence,
+                        key: key.clone(),
+                        primary,
+                        receivers: receivers.into_iter().map(|lease| lease.runtime).collect(),
+                        permits,
+                    },
+                ))
+            })();
+            match result {
+                Err(error) if Self::route_authority_error_should_refresh(&error) => {
+                    if !refreshed {
+                        candidates = self.authority_candidates_force_refresh(observer)?;
+                        refreshed = true;
+                    } else if unavailable.len() == unavailable_before {
+                        return Err(error);
+                    }
+                    // No allocation has been granted yet. Retry only by removing
+                    // another exact runtime from this one refreshed snapshot.
+                    candidates.retain(|candidate| !unavailable.contains(&candidate.runtime));
+                    if candidates.is_empty() {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn revoke_publications(
+        &self,
+        _observer: &ClientLease,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+    ) -> Result<Vec<mooncake_store_core::PublicationRevokeReply>> {
+        use mooncake_store_core::{
+            PublicationControl, PublicationControlReply, PublicationRevokeReply,
+        };
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let primary = self.publication_authority(&request.attempt.primary)?;
+            let mut replies = self
+                .publication_control_at(&primary, &[PublicationControl::Revoke(request.clone())])?;
+            if replies.len() != 1 {
+                return Err(StoreError::Transport(
+                    "publication revocation reply count mismatch".to_string(),
+                ));
+            }
+            let PublicationControlReply::Revoked(primary_reply) = replies.remove(0)? else {
+                return Err(StoreError::Transport(
+                    "publication revocation reply type mismatch".to_string(),
+                ));
+            };
+            if !primary_reply.registration_closed {
+                return Err(StoreError::Transport(
+                    "publication receiver registration is open".to_string(),
+                ));
+            }
+            let mut receivers: BTreeSet<_> = request.attempt.receivers.iter().cloned().collect();
+            receivers.extend(primary_reply.registered_receivers);
+            let mut merged = Some(primary_reply.reference);
+            let mut receiver_request = request.clone();
+            receiver_request.registration_generation = primary_reply.registration_generation;
+            receiver_request.receiver_permits = primary_reply.receiver_permits.clone();
+            for runtime in &receivers {
+                if runtime == &primary.runtime {
+                    continue;
+                }
+                let receiver = self.publication_authority(runtime)?;
+                let mut replies = self.publication_control_at(
+                    &receiver,
+                    &[PublicationControl::Revoke(receiver_request.clone())],
+                )?;
+                if replies.len() != 1 {
+                    return Err(StoreError::Transport(
+                        "publication revocation reply count mismatch".to_string(),
+                    ));
+                }
+                let PublicationControlReply::Revoked(reply) = replies.remove(0)? else {
+                    return Err(StoreError::Transport(
+                        "publication revocation reply type mismatch".to_string(),
+                    ));
+                };
+                if !reply.registration_closed {
+                    return Err(StoreError::Transport(
+                        "publication receiver is not closed".to_string(),
+                    ));
+                }
+                merged = Some(merge_allocation_route_reference(
+                    merged.as_ref(),
+                    reply.reference,
+                ));
+            }
+            results.push(PublicationRevokeReply {
+                reference: merged.expect("primary supplied an observation"),
+                registered_receivers: receivers.into_iter().collect(),
+                registration_closed: true,
+                registration_generation: primary_reply.registration_generation,
+                receiver_permits: primary_reply.receiver_permits,
+            });
+        }
+        Ok(results)
+    }
+
+    fn revoke_publications_batch(
+        &self,
+        _observer: &ClientLease,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationRevokeReply>>> {
+        use mooncake_store_core::{
+            PublicationControl, PublicationControlReply, PublicationRevokeReply,
+        };
+        let send = |groups: BTreeMap<ClientRuntimeId, Vec<(usize, PublicationControl)>>| {
+            let mut observations = Vec::new();
+            for (runtime, operations) in groups {
+                let receiver = self.publication_authority(&runtime);
+                let mut unavailable = receiver.as_ref().err().cloned();
+                for chunk in operations.chunks(64) {
+                    let replies = match &unavailable {
+                        Some(error) => Err(error.clone()),
+                        None => self.publication_control_at(
+                            receiver.as_ref().expect("authority resolved"),
+                            &chunk
+                                .iter()
+                                .map(|(_, operation)| operation.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                    };
+                    match replies {
+                        Ok(replies) if replies.len() == chunk.len() => {
+                            for ((index, _), reply) in chunk.iter().zip(replies) {
+                                let reply = reply.and_then(|reply| match reply {
+                                    PublicationControlReply::Revoked(reply)
+                                        if reply.registration_closed =>
+                                    {
+                                        Ok(reply)
+                                    }
+                                    _ => Err(StoreError::Transport(
+                                        "publication receiver is not closed".to_string(),
+                                    )),
+                                });
+                                observations.push((*index, reply));
+                            }
+                        }
+                        other => {
+                            let error = other.err().unwrap_or_else(|| {
+                                StoreError::Transport(
+                                    "publication revocation reply count mismatch".to_string(),
+                                )
+                            });
+                            unavailable = Some(error.clone());
+                            observations.extend(
+                                chunk.iter().map(|(index, _)| (*index, Err(error.clone()))),
+                            );
+                        }
+                    }
+                }
+            }
+            observations
+        };
+        let mut primary_groups = BTreeMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            primary_groups
+                .entry(request.attempt.primary.clone())
+                .or_insert_with(Vec::new)
+                .push((index, PublicationControl::Revoke(request.clone())));
+        }
+        let mut results: Vec<Result<PublicationRevokeReply>> = requests
+            .iter()
+            .map(|_| {
+                Err(StoreError::Transport(
+                    "publication primary supplied no observation".to_string(),
+                ))
+            })
+            .collect();
+        let mut receiver_groups = BTreeMap::new();
+        for (index, observation) in send(primary_groups) {
+            match observation {
+                Err(error) => results[index] = Err(error),
+                Ok(mut reply) => {
+                    let request = &requests[index];
+                    let mut receivers: BTreeSet<_> =
+                        request.attempt.receivers.iter().cloned().collect();
+                    receivers.extend(reply.registered_receivers.iter().cloned());
+                    let mut receiver_request = request.clone();
+                    receiver_request.registration_generation = reply.registration_generation;
+                    receiver_request.receiver_permits = reply.receiver_permits.clone();
+                    for runtime in &receivers {
+                        if *runtime != request.attempt.primary {
+                            receiver_groups
+                                .entry(runtime.clone())
+                                .or_insert_with(Vec::new)
+                                .push((
+                                    index,
+                                    PublicationControl::Revoke(receiver_request.clone()),
+                                ));
+                        }
+                    }
+                    reply.registered_receivers = receivers.into_iter().collect();
+                    results[index] = Ok(reply);
+                }
+            }
+        }
+        // Only requests whose primary closed registration enter the receiver phase.
+        for (index, observation) in send(receiver_groups) {
+            match observation {
+                Err(error) => results[index] = Err(error),
+                Ok(reply) => {
+                    if let Ok(merged) = &mut results[index] {
+                        merged.reference = merge_allocation_route_reference(
+                            Some(&merged.reference),
+                            reply.reference,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn finalize_publications(
+        &self,
+        _observer: &ClientLease,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+        released: bool,
+    ) -> Result<Vec<Result<()>>> {
+        use mooncake_store_core::PublicationControl;
+        let mut groups = BTreeMap::<ClientRuntimeId, Vec<(usize, PublicationControl)>>::new();
+        let mut results = vec![Ok(()); requests.len()];
+        for (index, request) in requests.iter().enumerate() {
+            let receivers = if released {
+                if request.closed_receivers.is_empty() {
+                    return Err(StoreError::InvalidState(
+                        "release finalization requires a closed receiver set".to_string(),
+                    ));
+                }
+                request.closed_receivers.clone()
+            } else {
+                request.attempt.receivers.clone()
+            };
+            for runtime in receivers {
+                groups.entry(runtime).or_default().push((
+                    index,
+                    PublicationControl::Finalize {
+                        request: request.clone(),
+                        released,
+                    },
+                ));
+            }
+        }
+        for (runtime, operations) in groups {
+            if self
+                .publication_finalize_retry
+                .lock()
+                .get(&runtime)
+                .is_some_and(|deadline| *deadline > Instant::now())
+            {
+                for (index, _) in &operations {
+                    results[*index] = Err(StoreError::Transport(
+                        "publication finalization receiver is backed off".to_string(),
+                    ));
+                }
+                continue;
+            }
+            let receiver = match self.publication_authority(&runtime) {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    for (index, _) in &operations {
+                        results[*index] = Err(error.clone());
+                    }
+                    continue;
+                }
+            };
+            for (chunk_index, chunk) in operations.chunks(64).enumerate() {
+                let batch = chunk
+                    .iter()
+                    .map(|(_, operation)| operation.clone())
+                    .collect::<Vec<_>>();
+                let replies = self.publication_control_at(&receiver, &batch);
+                match replies {
+                    Ok(replies) if replies.len() == chunk.len() => {
+                        for ((index, _), reply) in chunk.iter().zip(replies) {
+                            if let Err(error) = reply {
+                                results[*index] = Err(error);
+                            }
+                        }
+                    }
+                    other => {
+                        let error = other.err().unwrap_or_else(|| {
+                            StoreError::Transport(
+                                "publication finalization reply count mismatch".to_string(),
+                            )
+                        });
+                        let mut retries = self.publication_finalize_retry.lock();
+                        if retries.len() >= 4096 && !retries.contains_key(&runtime) {
+                            retries.pop_first();
+                        }
+                        retries.insert(runtime.clone(), Instant::now() + Duration::from_secs(1));
+                        for (index, _) in &operations[chunk_index * 64..] {
+                            results[*index] = Err(error.clone());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
     fn metadata(&self) -> &dyn MetadataBackend {
         self.metadata.as_ref()
     }
@@ -1767,6 +2246,171 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         results.pop().ok_or_else(|| {
             StoreError::InvalidState("missing route cas result from batch path".to_string())
         })?
+    }
+
+    fn get_existing_holder_delete_version(
+        &self,
+        _observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+        expected: RouteVersion,
+    ) -> Result<Option<RouteVersion>> {
+        let attempt = replica.publication.as_ref().ok_or_else(|| {
+            StoreError::InvalidState("delete proof requires publication provenance".to_string())
+        })?;
+        if attempt.key != *key || replica.allocation_id.is_none_or(|id| id == 0) {
+            return Err(StoreError::InvalidState(
+                "delete proof identity mismatch".to_string(),
+            ));
+        }
+        let primary = self.publication_authority(&attempt.primary)?;
+        let mut replies = self.publication_control_at(
+            &primary,
+            &[mooncake_store_core::PublicationControl::MarkerProof {
+                request: mooncake_store_core::PublicationRevokeRequest {
+                    attempt: attempt.clone(),
+                    allocation: AllocationRouteIdentity {
+                        owner: replica.owner.clone(),
+                        segment_name: replica.segment_name.clone(),
+                        offset_bytes: replica.segment_offset,
+                        length_bytes: replica.length,
+                        allocation_id: replica.allocation_id.unwrap(),
+                    },
+                    closed_receivers: Vec::new(),
+                    registration_generation: 0,
+                    receiver_permits: Vec::new(),
+                    superseded_before: None,
+                },
+                expected,
+            }],
+        )?;
+        if replies.len() != 1 {
+            return Err(StoreError::Transport(
+                "delete proof incarnation reply count mismatch".to_string(),
+            ));
+        }
+        match replies.remove(0)? {
+            mooncake_store_core::PublicationControlReply::MarkerProof(version) => {
+                Ok(version.filter(|version| *version >= expected))
+            }
+            _ => Err(StoreError::Transport(
+                "unexpected delete proof reply".to_string(),
+            )),
+        }
+    }
+
+    fn evict_existing_route_replica(
+        &self,
+        observer: &ClientLease,
+        current: &ObjectRoute,
+        replica: &ReplicaRoute,
+        next: Option<&ObjectRoute>,
+    ) -> Result<CasResult> {
+        use mooncake_store_core::{PublicationControl, PublicationControlReply};
+
+        let invalid = || StoreError::InvalidState("invalid existing-holder eviction".to_string());
+        let Some(index) = current.replicas.iter().position(|item| item == replica) else {
+            return Err(invalid());
+        };
+        if replica.allocation_id.is_none_or(|id| id == 0)
+            || current
+                .replicas
+                .iter()
+                .filter(|item| *item == replica)
+                .count()
+                != 1
+        {
+            return Err(invalid());
+        }
+        let attempt = replica.publication.as_ref().ok_or_else(invalid)?;
+        if attempt.key != current.key || attempt.receivers.len() > 64 {
+            return Err(invalid());
+        }
+        if let Some(next) = next {
+            let mut expected = current.clone();
+            expected.version = RouteVersion(current.version.0.checked_add(1).ok_or_else(invalid)?);
+            expected.replicas.remove(index);
+            expected.replicas.sort_by_key(|item| item.priority);
+            for (priority, item) in expected.replicas.iter_mut().enumerate() {
+                item.priority = priority as u16;
+            }
+            if *next != expected {
+                return Err(invalid());
+            }
+        } else if current.replicas.len() != 1
+            || current.cold_backing.as_ref().is_some_and(|backing| {
+                backing.state != mooncake_store_core::ColdBackingState::PendingOffload
+            })
+            || current.nof_backing.is_some()
+        {
+            return Err(invalid());
+        }
+
+        // The original cohort and current top-k bound this recovery-only probe.
+        let candidates = self.authority_candidates(observer)?;
+        let mut authorities =
+            ranked_top_authorities(&self.namespace, &candidates, &current.key, self.route_topk);
+        for runtime in std::iter::once(&attempt.primary).chain(attempt.receivers.iter()) {
+            if !authorities
+                .iter()
+                .any(|authority| authority.runtime == *runtime)
+            {
+                authorities.push(self.publication_authority(runtime)?);
+            }
+        }
+        let mut holder = None;
+        for authority in &authorities {
+            let mut records =
+                self.read_authority_batch(authority, std::slice::from_ref(&current.key))?;
+            if records.len() != 1 {
+                return Err(StoreError::Transport(
+                    "existing-holder read count mismatch".to_string(),
+                ));
+            }
+            let record = records.remove(0)?;
+            if record
+                .delete_version
+                .is_some_and(|version| version >= current.version)
+                || record.route.as_ref().is_some_and(|route| route != current)
+            {
+                return Ok(CasResult {
+                    applied: false,
+                    current: record.route,
+                    delete_version: record.delete_version,
+                    version_floor: None,
+                });
+            }
+            if record.route.as_ref() == Some(current) && holder.is_none() {
+                holder = Some(authority);
+            }
+        }
+        let Some(holder) = holder else {
+            return Ok(CasResult {
+                applied: false,
+                current: None,
+                delete_version: None,
+                version_floor: None,
+            });
+        };
+        let mut replies = self.publication_control_at(
+            holder,
+            &[PublicationControl::PruneExisting {
+                expected: Box::new(current.clone()),
+                next: next.cloned().map(Box::new),
+            }],
+        )?;
+        if replies.len() != 1 {
+            return Err(StoreError::Transport(
+                "existing-holder prune count mismatch".to_string(),
+            ));
+        }
+        // Do not mirror an old-holder update over an independently newer cohort.
+        match replies.remove(0)? {
+            PublicationControlReply::Pruned(result) => Ok(*result),
+            _ => Err(StoreError::Transport(
+                "existing-holder prune reply mismatch".to_string(),
+            )),
+        }
     }
 
     fn compare_and_swap_local_route(
@@ -2295,7 +2939,171 @@ mod owner_page_contract_tests {
         queried_authorities: Arc<Mutex<Vec<String>>>,
     }
 
+    #[test]
+    fn publication_import_resolves_a_current_primary_absent_from_retained_membership() {
+        use mooncake_store_core::{
+            PublicationAttempt, PublicationControl, PublicationControlReply,
+        };
+        let primary = test_lease("publication-current-primary");
+        let target = test_lease("publication-current-target");
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let client = Arc::new(RecordingConfirmationClient {
+            routes: BTreeMap::new(),
+            queried_authorities: Arc::new(Mutex::new(Vec::new())),
+        });
+        let membership = Arc::new(RetainedMembership {
+            current: vec![primary.clone(), target.clone()],
+            retained: Vec::new(),
+        });
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &primary,
+            client.clone(),
+            membership.clone(),
+        );
+        let _target_directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &target,
+            client.clone(),
+            membership.clone(),
+        );
+        let PublicationControlReply::Enrolled(permit) = directory
+            .publication_control_at(
+                &primary,
+                &[PublicationControl::Enroll {
+                    publisher: primary.runtime.clone(),
+                }],
+            )
+            .unwrap()
+            .remove(0)
+            .unwrap()
+        else {
+            panic!("enrollment required");
+        };
+        let mut route = test_route("default::publication-current-import", &primary.runtime);
+        route.replicas[0].allocation_id = Some(1);
+        route.replicas[0].publication = Some(PublicationAttempt::new(
+            mooncake_store_core::PublicationAttemptFields {
+                publisher: primary.runtime.clone(),
+                sequence: 1,
+                key: route.key.clone(),
+                primary: primary.runtime.clone(),
+                receivers: vec![primary.runtime.clone()],
+                permits: vec![permit],
+            },
+        ));
+        let source = crate::LocalRouteAuthority::new(&namespace, primary.runtime.stable_id.clone());
+        let recipient =
+            crate::LocalRouteAuthority::new(&namespace, target.runtime.stable_id.clone());
+        assert!(
+            source
+                .compare_and_swap_route(&route.key, None, Some(&route))
+                .unwrap()
+                .applied
+        );
+        assert!(matches!(
+            recipient.replace_route(&route.key, Some(&route)),
+            Err(StoreError::PublicationRetired(_))
+        ));
+        super::super::publication::register_imports(
+            &namespace,
+            client.as_ref(),
+            membership.as_ref(),
+            &target,
+            &[RouteCasRequest {
+                key: route.key.clone(),
+                expected: None,
+                next: Some(route.clone()),
+            }],
+        )
+        .unwrap();
+        recipient.replace_route(&route.key, Some(&route)).unwrap();
+        assert_eq!(recipient.get_route(&route.key).unwrap(), Some(route));
+    }
+
+    #[test]
+    fn publication_finalize_connection_failure_stops_receiver_chunks_and_preserves_other_receivers()
+    {
+        use mooncake_store_core::{PublicationAttempt, PublicationRevokeRequest};
+        let observer = test_lease("publication-observer");
+        let bad = test_lease("publication-bad");
+        let good = test_lease("publication-good");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::new(),
+                queried_authorities: calls.clone(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![bad.clone(), good.clone()],
+            }),
+        );
+        let requests = (0..130)
+            .map(|index| {
+                let receiver = if index < 129 { &bad } else { &good };
+                PublicationRevokeRequest {
+                    attempt: PublicationAttempt::new(
+                        mooncake_store_core::PublicationAttemptFields {
+                            publisher: observer.runtime.clone(),
+                            sequence: index + 1,
+                            key: ObjectKey::new(format!("default::finalize-{index}")),
+                            primary: receiver.runtime.clone(),
+                            receivers: vec![receiver.runtime.clone()],
+                            permits: Vec::new(),
+                        },
+                    ),
+                    allocation: AllocationRouteIdentity {
+                        owner: observer.runtime.clone(),
+                        segment_name: SegmentName::new("segment"),
+                        offset_bytes: index * 16,
+                        length_bytes: 16,
+                        allocation_id: index + 1,
+                    },
+                    closed_receivers: Vec::new(),
+                    registration_generation: 0,
+                    receiver_permits: Vec::new(),
+                    superseded_before: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = directory
+            .finalize_publications(&observer, &requests, false)
+            .unwrap();
+        assert!(results[..129].iter().all(Result::is_err));
+        assert!(results[129].is_ok());
+        assert_eq!(*calls.lock(), vec!["publication-bad", "publication-good"]);
+        directory
+            .finalize_publications(&observer, &requests, false)
+            .unwrap();
+        assert_eq!(*calls.lock(), vec!["publication-bad", "publication-good", "publication-good"],
+            "a backed-off receiver must not block a healthy receiver or repeat its failed connection");
+    }
+
     impl RouteAuthorityClient for RecordingConfirmationClient {
+        fn publication_control(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            authority: &ClientStableId,
+            operations: &[mooncake_store_core::PublicationControl],
+        ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+            self.queried_authorities.lock().push(authority.0.clone());
+            if authority.0 == "publication-bad" {
+                return Err(StoreError::Transport(
+                    "injected receiver connection failure".to_string(),
+                ));
+            }
+            Ok(operations
+                .iter()
+                .map(|_| Ok(mooncake_store_core::PublicationControlReply::Finalized))
+                .collect())
+        }
         fn batch_get_routes(
             &self,
             _lease: &ClientLease,
@@ -2568,6 +3376,7 @@ mod owner_page_contract_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: SegmentName::new("segment-a".to_string()),
                 allocation_id: None,
@@ -2884,6 +3693,21 @@ mod owner_page_contract_tests {
         )
     }
 
+    fn prepare_fixture_publication(
+        directory: &EmbeddedWrhRouteDirectory,
+        observer: &ClientLease,
+        route: &mut ObjectRoute,
+        sequence: u64,
+    ) {
+        let attempt = directory
+            .prepare_publication(observer, &route.key, sequence)
+            .expect("fixture publication should enroll its authority receivers");
+        for replica in &mut route.replicas {
+            replica.allocation_id.get_or_insert(sequence);
+            replica.publication = Some(attempt.clone());
+        }
+    }
+
     #[test]
     fn authority_mirror_ignores_delayed_older_live_route() {
         let observer = test_lease("observer-delayed-live-mirror");
@@ -2894,6 +3718,7 @@ mod owner_page_contract_tests {
         );
         let mut old = test_route("delayed-live-mirror", &observer.runtime);
         old.version = RouteVersion(3);
+        prepare_fixture_publication(&directory, &observer, &mut old, 1);
         let mut new = old.clone();
         new.version = RouteVersion(4);
         authority.replace_route(&old.key, Some(&old)).unwrap();
@@ -2915,6 +3740,7 @@ mod owner_page_contract_tests {
         );
         let mut route = test_route("delayed-delete-mirror", &observer.runtime);
         route.version = RouteVersion(4);
+        prepare_fixture_publication(&directory, &observer, &mut route, 1);
         authority.replace_route(&route.key, Some(&route)).unwrap();
         authority
             .replace_routes(&[RouteCasRequest {
@@ -2945,8 +3771,9 @@ mod owner_page_contract_tests {
         let keys = (0..32)
             .map(|index| ObjectKey::new(format!("budget-key-{index}")))
             .collect::<Vec<_>>();
-        for key in &keys {
-            let route = test_route(&key.0, &observer.runtime);
+        for (index, key) in keys.iter().enumerate() {
+            let mut route = test_route(&key.0, &observer.runtime);
+            prepare_fixture_publication(&directory, &observer, &mut route, index as u64 + 1);
             assert!(
                 directory
                     .compare_and_swap_object_route(&observer, key, None, Some(&route))
@@ -2964,7 +3791,8 @@ mod owner_page_contract_tests {
         assert_eq!(markers.iter().filter(|marker| marker.is_some()).count(), 1);
         assert_eq!(markers.last(), Some(&Some(RouteVersion(1))));
         let last = keys.last().unwrap();
-        let stale = test_route(&last.0, &observer.runtime);
+        let mut stale = test_route(&last.0, &observer.runtime);
+        prepare_fixture_publication(&directory, &observer, &mut stale, 33);
         let result = directory
             .compare_and_swap_object_route(&observer, last, None, Some(&stale))
             .unwrap();
@@ -2980,17 +3808,19 @@ mod owner_page_contract_tests {
         let directory = mirror_regression_directory(&observer, candidates.clone());
         register_local_authority(
             &directory.namespace,
-            &peer.runtime.stable_id,
+            &peer.runtime,
             DEFAULT_DELETE_MARKER_BUDGET_BYTES,
         );
         let key = ObjectKey::new("version-floor-merge");
         let ranked = ranked_top_authorities(&directory.namespace, &candidates, &key, 2);
+        let mut prepared = test_route(&key.0, &observer.runtime);
+        prepare_fixture_publication(&directory, &observer, &mut prepared, 1);
         for (lease, version) in ranked.iter().zip([RouteVersion(4), RouteVersion(9)]) {
             let authority = crate::mesh::local_authority::LocalRouteAuthority::new(
                 &directory.namespace,
                 lease.runtime.stable_id.clone(),
             );
-            let mut route = test_route(&key.0, &observer.runtime);
+            let mut route = prepared.clone();
             route.version = version;
             authority.replace_route(&key, Some(&route)).unwrap();
             assert!(
@@ -3029,13 +3859,14 @@ mod owner_page_contract_tests {
         );
         register_local_authority(
             &directory.namespace,
-            &peer.runtime.stable_id,
+            &peer.runtime,
             DEFAULT_DELETE_MARKER_BUDGET_BYTES,
         );
         let ranked = ranked_top_authorities(&directory.namespace, &candidates, &key, 2);
         let mut stale = test_route(&key.0, &observer.runtime);
         stale.version = RouteVersion(2);
         stale.replicas[0].allocation_id = Some(7);
+        prepare_fixture_publication(&directory, &observer, &mut stale, 1);
         crate::mesh::registry::authority_replace_many(
             &directory.namespace,
             &ranked[0].runtime.stable_id,
@@ -3071,6 +3902,7 @@ mod owner_page_contract_tests {
         assert_eq!(rejected.delete_version, Some(RouteVersion(5)));
         stale.version = RouteVersion(6);
         stale.replicas[0].allocation_id = Some(8);
+        prepare_fixture_publication(&directory, &observer, &mut stale, 2);
         assert!(
             directory
                 .compare_and_swap_object_route(&observer, &key, Some(RouteVersion(5)), Some(&stale))
@@ -3107,7 +3939,7 @@ mod owner_page_contract_tests {
         );
         register_local_authority(
             &directory.namespace,
-            &peer.runtime.stable_id,
+            &peer.runtime,
             DEFAULT_DELETE_MARKER_BUDGET_BYTES,
         );
 
@@ -3374,6 +4206,7 @@ mod owner_page_contract_tests {
         );
         let mut route = test_route("allocation-cas-generation", &observer.runtime);
         route.replicas[0].allocation_id = Some(7);
+        prepare_fixture_publication(&directory, &observer, &mut route, 1);
         let identity = AllocationRouteIdentity {
             owner: observer.runtime.clone(),
             segment_name: route.replicas[0].segment_name.clone(),
@@ -3400,6 +4233,7 @@ mod owner_page_contract_tests {
         let mut next = route.clone();
         next.version = route.version.next();
         next.replicas[0].allocation_id = Some(8);
+        prepare_fixture_publication(&directory, &observer, &mut next, 2);
         assert!(
             directory
                 .compare_and_swap_object_route(
@@ -3431,6 +4265,7 @@ mod owner_page_contract_tests {
         changed_length.version = next.version.next();
         changed_length.replicas[0].allocation_id = Some(7);
         changed_length.replicas[0].length += 1;
+        prepare_fixture_publication(&directory, &observer, &mut changed_length, 3);
         assert!(
             directory
                 .compare_and_swap_object_route(
@@ -3786,6 +4621,7 @@ mod snapshot_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: SegmentName::new("segment-a".to_string()),
                 allocation_id: None,

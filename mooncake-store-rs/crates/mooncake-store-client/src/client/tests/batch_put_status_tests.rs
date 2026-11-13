@@ -1,6 +1,6 @@
 use super::*;
 
-fn routed_status_writer(
+pub(super) fn routed_status_writer(
     metadata: Arc<dyn MetadataBackend>,
     name: &str,
 ) -> (StoreClient, StoreClient, Arc<TestTransport>) {
@@ -123,6 +123,8 @@ struct BatchReplyFaultRouteDirectory {
 }
 
 impl RouteDirectory for BatchReplyFaultRouteDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -198,6 +200,7 @@ fn assert_pending_publication_retains_allocation(storage: &StoreClient, route: &
         .expect("published route should keep its replica");
     assert_eq!(replica.owner, *storage.runtime_id());
     let pending = PendingPublication {
+        attempt: None,
         identity: AllocationIdentity {
             segment_name: replica.segment_name.clone(),
             offset_bytes: replica.segment_offset,

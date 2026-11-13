@@ -885,12 +885,27 @@ fn managed_nof_hot_replica_owner_writes_for_remote_target_owner() {
         .unwrap();
     let mut reassigned = route.clone();
     reassigned.version = route.version.next();
+    let attempt = writer.publication_cohort(&route.key).unwrap().unwrap();
+    let reservation = {
+        let mut allocator = non_writer.allocator.lock();
+        let reservation = allocator
+            .reserve_any_with_pending_publication(
+                non_writer.runtime_id(),
+                writer_replica.length,
+                test_future_expiry_ms(),
+            )
+            .unwrap();
+        allocator
+            .bind_publication(reservation, attempt, non_writer.allocation_lifecycle)
+            .unwrap()
+    };
     reassigned.replicas.push(ReplicaRoute {
-            allocation_id: None,
+        publication: reservation.publication.clone(),
         owner: non_writer.runtime_id().clone(),
-        segment_name: SegmentName::new("nof-managed-stale-writer-segment"),
-        offset: None,
-        segment_offset: 0,
+        segment_name: reservation.segment_name.clone(),
+        allocation_id: Some(reservation.allocation_id),
+        offset: Some(reservation.offset_bytes),
+        segment_offset: reservation.offset_bytes,
         length: writer_replica.length,
         checksum: writer_replica.checksum,
         tier: mooncake_store_core::ReplicaTier::Dram,

@@ -436,6 +436,103 @@ pub trait MetadataBackend: Send + Sync {
 }
 
 pub trait RouteDirectory: Send + Sync {
+    /// Reads an actual deletion marker from this allocation's pinned authority.
+    fn get_existing_holder_delete_version(
+        &self,
+        _observer: &ClientLease,
+        _key: &ObjectKey,
+        _replica: &ReplicaRoute,
+        _expected: RouteVersion,
+    ) -> Result<Option<RouteVersion>> {
+        Err(crate::StoreError::Unsupported(
+            "existing-holder delete proof is unavailable".to_string(),
+        ))
+    }
+
+    /// Removes one exact allocation from a route stranded outside the current cohort.
+    fn evict_existing_route_replica(
+        &self,
+        _observer: &ClientLease,
+        _current: &ObjectRoute,
+        _replica: &ReplicaRoute,
+        _next: Option<&ObjectRoute>,
+    ) -> Result<CasResult> {
+        Err(crate::StoreError::Unsupported(
+            "existing-holder eviction is unavailable".to_string(),
+        ))
+    }
+
+    fn publication_fencing_enabled(&self) -> bool {
+        false
+    }
+
+    fn invalidate_publication(&self, _attempt: &crate::PublicationAttempt) {}
+
+    fn prepare_publication(
+        &self,
+        _observer: &ClientLease,
+        _key: &ObjectKey,
+        _sequence: u64,
+    ) -> Result<crate::PublicationAttempt> {
+        Err(crate::StoreError::Unsupported(
+            "publication enrollment is unavailable".to_string(),
+        ))
+    }
+
+    fn finalize_publications(
+        &self,
+        _observer: &ClientLease,
+        _requests: &[crate::PublicationRevokeRequest],
+        _released: bool,
+    ) -> Result<Vec<Result<()>>> {
+        Err(crate::StoreError::Unsupported(
+            "publication finalization is unavailable".to_string(),
+        ))
+    }
+
+    /// Selects immutable receivers using the existing membership snapshot.
+    fn publication_receivers(
+        &self,
+        _observer: &ClientLease,
+        _key: &ObjectKey,
+    ) -> Result<Vec<crate::ClientRuntimeId>> {
+        Err(crate::StoreError::Unsupported(
+            "route directory does not support publication fencing".to_string(),
+        ))
+    }
+
+    /// Revokes an attempt and closes its complete receiver registration set.
+    fn revoke_publications(
+        &self,
+        _observer: &ClientLease,
+        _requests: &[crate::PublicationRevokeRequest],
+    ) -> Result<Vec<crate::PublicationRevokeReply>> {
+        Err(crate::StoreError::Unsupported(
+            "route directory does not support publication revocation".to_string(),
+        ))
+    }
+
+    /// Preserves input order and isolates failures to each revocation.
+    fn revoke_publications_batch(
+        &self,
+        observer: &ClientLease,
+        requests: &[crate::PublicationRevokeRequest],
+    ) -> Result<Vec<Result<crate::PublicationRevokeReply>>> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                let mut replies =
+                    self.revoke_publications(observer, std::slice::from_ref(request))?;
+                if replies.len() != 1 {
+                    return Err(crate::StoreError::Transport(
+                        "publication revocation reply count mismatch".to_string(),
+                    ));
+                }
+                Ok(replies.remove(0))
+            })
+            .collect())
+    }
+
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -954,6 +1051,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg-a"),
                 allocation_id: None,

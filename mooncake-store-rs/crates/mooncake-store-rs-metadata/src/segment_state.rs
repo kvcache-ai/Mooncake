@@ -81,6 +81,7 @@ impl StoredSegmentState {
                 StoreError::Allocator("segment reservation overflow".to_string())
             })?;
             return Ok(SegmentReservation {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: segment.clone(),
                 offset_bytes: span.offset_bytes,
@@ -109,6 +110,7 @@ impl StoredSegmentState {
             .checked_add(reserved_len)
             .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
         Ok(SegmentReservation {
+            publication: None,
             owner: owner.clone(),
             segment_name: segment.clone(),
             offset_bytes: offset,

@@ -552,6 +552,7 @@ impl StoreClient {
                     .zip(offsets.iter())
                     .enumerate()
                     .map(|(priority, (target, offset))| ReplicaRoute {
+                        publication: reservations[priority].publication.clone(),
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
                         allocation_id: Some(reservations[priority].allocation_id),
@@ -597,6 +598,14 @@ impl StoreClient {
             cas_tracker.finish(&cas_result, 0);
             let mut cas = match cas_result {
                 Ok(cas) => cas,
+                Err(StoreError::PublicationRetired(_)) if attempt < max_write_attempts.max(3) => {
+                    self.retire_publication_reservations(&reservations);
+                    let _ = self.abort_tenant_quota_reservation(
+                        quota_reservation.as_ref(),
+                        "put_publication_retired",
+                    );
+                    continue;
+                }
                 Err(error) => {
                     self.release_only_legacy_reservations_after_unknown_route_publish(
                         &reservations,
@@ -609,6 +618,44 @@ impl StoreClient {
                     return Err(error);
                 }
             };
+            // Migration writes fresh data before initializing an empty replacement
+            // authority. A deletion marker or version floor remains a conflict.
+            if !cas.applied
+                && matches!(reclaim_mode, ReclaimMode::Deferred)
+                && expected_version.is_some()
+                && cas.current.is_none()
+                && cas.delete_version.is_none()
+                && cas.version_floor.is_none()
+                && route
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.publication.is_some())
+            {
+                cas = match self.route_ops().publish_route(&route.key, None, &route) {
+                    Ok(cas) => cas,
+                    Err(StoreError::PublicationRetired(_))
+                        if attempt < max_write_attempts.max(3) =>
+                    {
+                        self.retire_publication_reservations(&reservations);
+                        let _ = self.abort_tenant_quota_reservation(
+                            quota_reservation.as_ref(),
+                            "migration_publication_retired",
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        self.release_only_legacy_reservations_after_unknown_route_publish(
+                            &reservations,
+                            "migration_publication_unknown",
+                        );
+                        let _ = self.abort_tenant_quota_reservation(
+                            quota_reservation.as_ref(),
+                            "migration_publication_unknown",
+                        );
+                        return Err(error);
+                    }
+                };
+            }
             if !cas.applied && expected_version.is_none() && cas.current.is_none() {
                 if cas.delete_version.is_none() && cas.version_floor.is_some() {
                     registry::record_delete_marker_event("legacy_floor_retry", 1);
@@ -635,6 +682,16 @@ impl StoreClient {
                     );
                     cas = match retry_result {
                         Ok(cas) => cas,
+                        Err(StoreError::PublicationRetired(_))
+                            if attempt < max_write_attempts.max(3) =>
+                        {
+                            self.retire_publication_reservations(&reservations);
+                            let _ = self.abort_tenant_quota_reservation(
+                                quota_reservation.as_ref(),
+                                "put_publication_retired",
+                            );
+                            continue;
+                        }
                         Err(error) => {
                             self.release_only_legacy_reservations_after_unknown_route_publish(
                                 &reservations,
@@ -659,6 +716,15 @@ impl StoreClient {
                     quota_reservation.as_ref(),
                     "route_compare_and_swap_conflict",
                 );
+                if matches!(reclaim_mode, ReclaimMode::Deferred)
+                    && expected_version.is_some()
+                    && cas.current.is_none()
+                    && (cas.delete_version.is_some() || cas.version_floor.is_some())
+                {
+                    return Err(StoreError::Conflict(
+                        "migration observed a route deletion or version floor".to_string(),
+                    ));
+                }
                 if attempt < max_write_attempts {
                     current = cas.current;
                     continue;
@@ -1166,6 +1232,7 @@ impl StoreClient {
             .zip(offsets.iter())
             .enumerate()
             .map(|(priority, (target, offset))| ReplicaRoute {
+                publication: reservations[priority].publication.clone(),
                 owner: target.storage_runtime.clone(),
                 segment_name: target.segment_name.clone(),
                 allocation_id: Some(reservations[priority].allocation_id),
@@ -1272,6 +1339,11 @@ impl StoreClient {
     )> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
         let key = object.key;
+        let publication_key = ObjectKey::from_logical_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+            key,
+        ));
+        let publication = self.publication_cohort(&publication_key)?;
         let allow_partial_copy =
             !plan.all_or_nothing && matches!(plan.mode, ExplicitMigrationMode::Copy);
         let mut targets = Vec::with_capacity(plan.target_segments.len());
@@ -1333,12 +1405,13 @@ impl StoreClient {
                 );
                 return Err(error);
             }
-            let is_local = preferred.owner == self.lease.runtime;
-            let (target, reservation) = match self.reserve_specific_segment(
-                &preferred.owner,
-                &preferred.segment_name,
+            let (target, reservation) = match self.reserve_candidate(
+                &ReplicaPlacementTarget::Segment {
+                    storage_runtime: preferred.owner.clone(),
+                    segment_name: preferred.segment_name.clone(),
+                },
                 length_bytes,
-                is_local,
+                publication.as_ref(),
             ) {
                 Ok(result) => result,
                 Err(error) if allow_partial_copy => {
@@ -1523,6 +1596,49 @@ impl StoreClient {
         }
     }
 
+    fn query_route_for_evacuation(
+        &self,
+        object_id: &LogicalObjectId,
+    ) -> Result<Option<ObjectRoute>> {
+        if let Some(route) = self.query_route_by_object_id(object_id)? {
+            return Ok(Some(route));
+        }
+        let key = mooncake_store_core::ObjectKey::from_logical_id(object_id);
+        let Some(route) = crate::route_directory::authority_get(
+            &self.metadata.route_namespace(),
+            &self.lease.runtime.stable_id,
+            &key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let operations = self.route_ops();
+        if operations
+            .directory()
+            .get_delete_marker(operations.observer(), &key)
+            .is_some_and(|version| version >= route.version)
+        {
+            return Ok(None);
+        }
+        let owned = route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == self.lease.runtime)
+            .collect::<Vec<_>>();
+        let valid = !owned.is_empty()
+            && owned.iter().all(|replica| {
+                self.allocator
+                    .lock()
+                    .allocation_identity(&AllocationSpan {
+                        segment_name: replica.segment_name.clone(),
+                        offset_bytes: replica.segment_offset,
+                        length_bytes: replica.length,
+                    })
+                    .is_some_and(|identity| replica.allocation_id == Some(identity.allocation_id))
+            });
+        Ok(valid.then_some(route))
+    }
+
     fn migrate_owned_route_via_writer(
         &self,
         writer: &StoreClient,
@@ -1530,7 +1646,7 @@ impl StoreClient {
     ) -> Result<bool> {
         let object_id = self.route_object_id(route)?;
         for _ in 0..4 {
-            let Some(observed) = self.query_route_by_object_id(&object_id)? else {
+            let Some(observed) = self.query_route_for_evacuation(&object_id)? else {
                 return Ok(false);
             };
             if observed.state != RouteState::Active {
@@ -1544,7 +1660,7 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let Some(confirmed) = self.query_route_by_object_id(&object_id)? else {
+            let Some(confirmed) = self.query_route_for_evacuation(&object_id)? else {
                 return Ok(false);
             };
             if confirmed.version != observed.version {
@@ -1945,6 +2061,41 @@ impl StoreClient {
                     }
                     Ok(())
                 })?;
+
+            // A draining authority can still hold the only healthy copy of an
+            // old route while its primary is absent from current membership.
+            let local = mooncake_store_route::LocalRouteAuthority::new(
+                self.metadata.route_namespace(),
+                owner.stable_id.clone(),
+            );
+            let mut cursor = None;
+            loop {
+                let page = match local.list_routes_by_replica_owner_page(
+                    &owner,
+                    cursor.as_deref(),
+                    None,
+                    64,
+                ) {
+                    Ok(page) => page,
+                    Err(StoreError::NotFound(_)) => break,
+                    Err(error) => return Err(error),
+                };
+                for route in &page.routes {
+                    had_routes = true;
+                    if migrate_route(route)? {
+                        migrated = migrated.saturating_add(1);
+                    }
+                }
+                let Some(next) = page.next_cursor else {
+                    break;
+                };
+                if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+                    return Err(StoreError::InvalidState(
+                        "local evacuation page cursor did not advance".to_string(),
+                    ));
+                }
+                cursor = Some(next);
+            }
 
             flush_reclaims(self)?;
             let live_allocations = self.current_owned_allocations()?;
@@ -3701,6 +3852,7 @@ impl StoreClient {
                         .or_default() += 1;
                     cold_success_count += 1;
                     resolved[index].replica = ReplicaRoute {
+                        publication: None,
                         owner: batch.owner_lease.runtime.clone(),
                         segment_name: segment_name.clone(),
                         allocation_id: None,
@@ -3989,6 +4141,7 @@ impl StoreClient {
                             None
                         };
                         resolved[index].replica = ReplicaRoute {
+                            publication: None,
                             owner: batch.owner_lease.runtime.clone(),
                             segment_name: segment_name.clone(),
                             allocation_id: None,
@@ -6398,6 +6551,7 @@ mod runtime_io_tests {
         length: u64,
     ) -> ReplicaRoute {
         ReplicaRoute {
+            publication: None,
             owner: ClientRuntimeId::new("test-runtime", ClientEpoch(0)),
             segment_name: SegmentName::new(segment_name),
             allocation_id: None,

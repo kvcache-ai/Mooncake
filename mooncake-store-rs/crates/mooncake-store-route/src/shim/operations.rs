@@ -103,6 +103,43 @@ impl RouteOperations {
             .get_allocation_route_reference_keys_consistent(&self.observer, identities)
     }
 
+    pub fn prepare_publication(
+        &self,
+        key: &ObjectKey,
+        sequence: u64,
+    ) -> Result<mooncake_store_core::PublicationAttempt> {
+        self.directory
+            .prepare_publication(&self.observer, key, sequence)
+    }
+
+    pub fn publication_fencing_enabled(&self) -> bool {
+        self.directory.publication_fencing_enabled()
+    }
+
+    pub fn revoke_publications(
+        &self,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+    ) -> Result<Vec<mooncake_store_core::PublicationRevokeReply>> {
+        self.directory.revoke_publications(&self.observer, requests)
+    }
+
+    pub fn finalize_publications(
+        &self,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+        released: bool,
+    ) -> Result<Vec<Result<()>>> {
+        self.directory
+            .finalize_publications(&self.observer, requests, released)
+    }
+
+    pub fn revoke_publications_batch(
+        &self,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationRevokeReply>>> {
+        self.directory
+            .revoke_publications_batch(&self.observer, requests)
+    }
+
     pub fn load_active_route_and_report<R: RouteHitReporter>(
         &self,
         key: &ObjectKey,
@@ -162,6 +199,26 @@ impl RouteOperations {
         expected: Option<RouteVersion>,
     ) -> Result<CasResult> {
         self.compare_and_swap_route(key, expected, None)
+    }
+
+    pub fn evict_existing_route_replica(
+        &self,
+        current: &ObjectRoute,
+        replica: &ReplicaRoute,
+        next: Option<&ObjectRoute>,
+    ) -> Result<CasResult> {
+        self.directory
+            .evict_existing_route_replica(&self.observer, current, replica, next)
+    }
+
+    pub fn get_existing_holder_delete_version(
+        &self,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+        expected: RouteVersion,
+    ) -> Result<Option<RouteVersion>> {
+        self.directory
+            .get_existing_holder_delete_version(&self.observer, key, replica, expected)
     }
 
     /// Delete an existing route after advancing its version floor.

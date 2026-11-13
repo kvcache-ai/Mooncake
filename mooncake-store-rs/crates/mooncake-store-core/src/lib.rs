@@ -6,6 +6,7 @@ pub mod identity;
 pub mod identity_codec;
 pub mod lifecycle;
 mod nof;
+pub mod publication;
 pub mod route;
 pub mod traits;
 
@@ -32,6 +33,11 @@ pub use identity_codec::{
     scoped_logical_object_id, scoped_object_key,
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
+pub use publication::{
+    PublicationAttempt, PublicationAttemptFields, PublicationControl, PublicationControlReply,
+    PublicationReceiverPermit, PublicationReceiverRegistration, PublicationRevokeReply,
+    PublicationRevokeRequest,
+};
 pub use route::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
     ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,

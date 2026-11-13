@@ -255,6 +255,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg".to_string()),
                 allocation_id: None,
@@ -282,6 +283,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("other-owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("other-seg".to_string()),
                 allocation_id: None,

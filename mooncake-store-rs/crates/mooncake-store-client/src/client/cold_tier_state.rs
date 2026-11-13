@@ -247,14 +247,10 @@ impl OffloadPressureTracker {
             last_completion_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             soft_threshold: config.pressure_soft_threshold.max(1),
-            hard_threshold: config
-                .pressure_hard_threshold
-                .max(config.pressure_soft_threshold + 1),
+            hard_threshold: config.pressure_hard_threshold.max(config.pressure_soft_threshold + 1),
             restore_floor: config.pressure_restore_floor.max(1),
             restore_ceiling: config.restore_device_max_in_flight.max(1),
-            offload_boost: config
-                .pressure_offload_boost
-                .max(config.offload_device_max_in_flight),
+            offload_boost: config.pressure_offload_boost.max(config.offload_device_max_in_flight),
             stall_timeout_ms: config.pressure_stall_timeout_ms.max(100),
         }
     }
@@ -285,11 +281,9 @@ impl OffloadPressureTracker {
         let range = self.hard_threshold - self.soft_threshold;
         let excess = depth - self.soft_threshold;
         let scale = (range - excess) as f64 / range as f64;
-        let effective =
-            self.restore_floor as f64 + (self.restore_ceiling - self.restore_floor) as f64 * scale;
-        (effective as usize)
-            .max(self.restore_floor)
-            .min(self.restore_ceiling)
+        let effective = self.restore_floor as f64
+            + (self.restore_ceiling - self.restore_floor) as f64 * scale;
+        (effective as usize).max(self.restore_floor).min(self.restore_ceiling)
     }
 
     /// Compute effective offload device concurrency limit.
@@ -578,6 +572,7 @@ impl PendingBackingRoute {
         matches!(self, Self::Nof(_))
     }
 
+
     fn backing(&self) -> &mooncake_store_core::ColdBackingRoute {
         match self {
             Self::Cold(backing) | Self::Nof(backing) => backing,
@@ -595,10 +590,7 @@ impl PendingBackingRoute {
     fn publish_local(self, route: &mut ObjectRoute) {
         match self {
             Self::Cold(backing) => route.cold_backing = Some(backing),
-            Self::Managed {
-                route: managed_route,
-                ..
-            } => *route = *managed_route,
+            Self::Managed { route: managed_route, .. } => *route = *managed_route,
             Self::Nof(_) => {}
         }
     }
@@ -878,7 +870,10 @@ impl OwnerColdRestoreFlightMap {
     /// Non-blocking check: returns the leader's published result if available,
     /// `None` if the leader is still in-flight. Used by batch coordinator to
     /// avoid blocking the coordinator thread on external singleflight leaders.
-    fn try_wait(&self, flight: &OwnerColdRestoreFlight) -> Option<Result<OwnerColdRestoreOutcome>> {
+    fn try_wait(
+        &self,
+        flight: &OwnerColdRestoreFlight,
+    ) -> Option<Result<OwnerColdRestoreOutcome>> {
         let state = flight.data_ready.lock().unwrap_or_else(|e| e.into_inner());
         state.clone()
     }
@@ -896,16 +891,9 @@ impl OwnerColdRestoreFlightLeader {
     /// Publish RDMA coordinates to waiters — called as soon as SSD read is done.
     /// Waiters are unblocked immediately. Route CAS happens after this returns.
     /// The flight is removed from the map when this leader is dropped.
-    fn publish_data_ready(
-        &mut self,
-        result: Result<OwnerColdRestoreOutcome>,
-    ) -> Result<OwnerColdRestoreOutcome> {
+    fn publish_data_ready(&mut self, result: Result<OwnerColdRestoreOutcome>) -> Result<OwnerColdRestoreOutcome> {
         {
-            let mut state = self
-                .flight
-                .data_ready
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = self.flight.data_ready.lock().unwrap_or_else(|e| e.into_inner());
             *state = Some(result.clone());
         }
         self.flight.data_ready_cv.notify_all();
@@ -918,11 +906,7 @@ impl Drop for OwnerColdRestoreFlightLeader {
     fn drop(&mut self) {
         if !self.published {
             // Leader died before publishing — notify waiters with error.
-            let mut state = self
-                .flight
-                .data_ready
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = self.flight.data_ready.lock().unwrap_or_else(|e| e.into_inner());
             *state = Some(Err(StoreError::InvalidState(
                 "owner cold restore leader dropped before publishing result".to_string(),
             )));
@@ -1121,4 +1105,5 @@ impl ReadPinRegistry {
             inner.pinned_count = inner.pinned_count.saturating_sub(1);
         }
     }
+
 }

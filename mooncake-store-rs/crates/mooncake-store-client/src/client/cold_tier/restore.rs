@@ -704,6 +704,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
     }
 
     let policy = client.resolve_replication_policy(Some(&task.policy))?;
+    let publication = client.publication_cohort(&task.current.key)?;
     let reserve_tracker =
         OperationTracker::new("restore_promote_reserve").input_bytes(task.payload.len() as u64);
     let reserve_result = if let (Some(target_runtime), Some(target_segment)) =
@@ -716,6 +717,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
                     segment_name: target_segment.clone(),
                 },
                 task.payload.len(),
+                publication.as_ref(),
             )
             .map(|(target, reservation)| (vec![target], vec![reservation]))
     } else {
@@ -746,6 +748,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
         .iter()
         .enumerate()
         .map(|(priority, target)| ReplicaRoute {
+            publication: reservations[priority].publication.clone(),
             owner: target.storage_runtime.clone(),
             segment_name: target.segment_name.clone(),
             allocation_id: Some(reservations[priority].allocation_id),
@@ -1377,7 +1380,7 @@ fn release_owner_restore_reservation(
     reservation: &mooncake_store_core::SegmentReservation,
     release_reason: &str,
 ) -> bool {
-    if let Err(error) = storage_owner.allocator.lock().release(
+    if let Err(error) = storage_owner.release_with_publication_fence(
         &storage_owner.runtime,
         &reservation.segment_name,
         reservation.offset_bytes,
@@ -1432,6 +1435,7 @@ fn build_owner_restored_route(
     let mut next = base.clone();
     next.version = base.version.next();
     next.replicas = vec![ReplicaRoute {
+        publication: reservation.publication.clone(),
         owner: storage_owner.runtime.clone(),
         segment_name: reservation.segment_name.clone(),
         allocation_id: Some(reservation.allocation_id),
@@ -1591,6 +1595,49 @@ pub(in super::super) struct PromoteTimingBreakdown {
     pub total_us: u64,
 }
 
+fn prepare_owner_restore_publication(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+) -> Result<Option<mooncake_store_core::PublicationAttempt>> {
+    match storage_owner.route_ops.prepare_publication(
+        &route.key,
+        super::super::next_publication_attempt_sequence()?,
+    ) {
+        Ok(attempt) => Ok(Some(attempt)),
+        Err(StoreError::Unsupported(_))
+            if !storage_owner.route_ops.publication_fencing_enabled() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn bind_owner_restore_publication(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+    reservation: mooncake_store_core::SegmentReservation,
+    attempt: Option<mooncake_store_core::PublicationAttempt>,
+) -> Result<mooncake_store_core::SegmentReservation> {
+    let Some(attempt) = attempt else {
+        return Ok(reservation);
+    };
+    let result = storage_owner.allocator.lock().bind_publication(
+        reservation.clone(),
+        attempt,
+        super::super::AllocationLifecycleConfig::default(),
+    );
+    if result.is_err() {
+        release_owner_restore_reservation(
+            storage_owner,
+            route,
+            &reservation,
+            "publication_bind_error",
+        );
+    }
+    result
+}
+
 fn promote_materialized_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
@@ -1606,7 +1653,9 @@ fn promote_materialized_cold_backing(
     // Reserve DRAM segment space.  Uses the same kick-offload + evict-one
     // loop as the PUT path — no separate admission gate needed.
     let t_reserve = std::time::Instant::now();
+    let attempt = prepare_owner_restore_publication(storage_owner, route)?;
     let reservation = storage_owner.reserve_owner_restore_space(cold_backing.length)?;
+    let reservation = bind_owner_restore_publication(storage_owner, route, reservation, attempt)?;
     let admission_wait_us = t_reserve.elapsed().as_micros() as u64;
     let t_ssd = std::time::Instant::now();
     let ssd_read_result = (|| -> Result<()> {
@@ -2854,6 +2903,21 @@ pub(in super::super) fn execute_owner_cold_restore_promote_phase(
         // else: reader already ACKed → drop slot → recycle buffer.
     };
 
+    // Enroll before reserving so enrollment failure cannot leak a DRAM slot.
+    let attempt = match prepare_owner_restore_publication(storage_owner, &staging_ctx.route) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            warn!(
+                runtime = %storage_owner.runtime,
+                route_key = %staging_ctx.route.key.0,
+                error = %error,
+                "cold restore publication enrollment failed"
+            );
+            release_staging(staging_slot);
+            return;
+        }
+    };
+
     // 1. Try fast-path: allocate from free pool (no eviction).
     let reservation = {
         let mut alloc = allocator.lock();
@@ -2899,6 +2963,24 @@ pub(in super::super) fn execute_owner_cold_restore_promote_phase(
         registry::record_cold_tier_operation("restore_promote", "skipped", "no_dram_slot");
         release_staging(staging_slot);
         return;
+    };
+    let reservation = match bind_owner_restore_publication(
+        storage_owner,
+        &staging_ctx.route,
+        reservation,
+        attempt,
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            warn!(
+                runtime = %storage_owner.runtime,
+                route_key = %staging_ctx.route.key.0,
+                error = %error,
+                "cold restore publication binding failed"
+            );
+            release_staging(staging_slot);
+            return;
+        }
     };
 
     // 3. memcpy staging → DRAM.

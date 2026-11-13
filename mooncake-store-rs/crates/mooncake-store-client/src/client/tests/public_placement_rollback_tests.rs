@@ -6,6 +6,32 @@ struct PublicRollbackFaultAllocator {
     release_calls: Arc<AtomicUsize>,
 }
 impl AllocatorService for PublicRollbackFaultAllocator {
+    fn bind_publication(
+        &self,
+        reservation: SegmentReservation,
+        attempt: mooncake_store_core::PublicationAttempt,
+    ) -> Result<SegmentReservation> {
+        self.inner.bind_publication(reservation, attempt)
+    }
+
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        lengths: &[u64],
+    ) -> Vec<Result<SegmentReservation>> {
+        self.inner
+            .batch_reserve_any_with_pending_publication(owner, lengths)
+    }
+
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[crate::control_plane::ReserveSpecificOp],
+    ) -> Vec<Result<SegmentReservation>> {
+        self.inner
+            .batch_reserve_specific_with_pending_publication(owner, requests)
+    }
+
     fn reserve_any(
         &self,
         owner: &ClientRuntimeId,
@@ -62,6 +88,33 @@ fn public_put_partial_reservation_release_failure_is_retryable() {
         alignment_bytes: 1,
         tags: vec!["dram".to_string()],
     });
+    let mut remote_storage_owner =
+        test_storage_owner_state(&remote_owner, remote_allocator.clone());
+    let observer = ClientLease {
+        runtime: remote_owner.clone(),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: test_future_expiry_ms(),
+    };
+    let remote_live_client_cache = Arc::new(Mutex::new(super::super::LiveClientCache::default()));
+    let route_directory = build_route_directory(
+        crate::route_directory::RouteDirectoryBuildConfig {
+            mode: RouteControlMode::EmbeddedWrh,
+            route_topk: 2,
+            delete_marker_budget_bytes: 64 * 1024 * 1024,
+        },
+        metadata.clone(),
+        &observer,
+        Arc::new(ControlPlaneClient::new().expect("allocator control client should build")),
+        remote_live_client_cache.clone(),
+        Arc::new(Mutex::new(super::super::SuspectRuntimeCache::default())),
+    );
+    let owner_state = Arc::get_mut(&mut remote_storage_owner)
+        .expect("fixture storage owner must remain uniquely owned during setup");
+    owner_state.metadata = metadata.clone();
+    owner_state.route_ops = mooncake_store_route::RouteOperations::new(route_directory, observer);
+
     let remote_control = ControlPlaneHandle::spawn(
         "127.0.0.1",
         Arc::new(LocalAuthorityAdapter {
@@ -73,18 +126,16 @@ fn public_put_partial_reservation_release_failure_is_retryable() {
             release_calls: release_calls.clone(),
             inner: StaticAllocatorAdapter {
                 runtime: remote_owner.clone(),
+                storage_owner: remote_storage_owner,
                 allocator: remote_allocator.clone(),
             },
         }),
         Arc::new(NoopEvictionService),
     )
     .expect("static storage control plane should spawn");
-    // This fixture implements only the legacy allocator protocol; advertise
-    // matching capabilities so the writer exercises the mixed-version fallback.
-    let mut remote_compatibility = CompatibilityDescriptor::default();
-    remote_compatibility
-        .capabilities
-        .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    // Admission supports pending publication; rollback still traverses the
+    // fault-injected allocator release RPC.
+    let remote_compatibility = CompatibilityDescriptor::default();
     let mut endpoints = ClientEndpointSet {
         rpc_address: "127.0.0.1:0".to_string(),
         segment_name: Some(SegmentName::new("seg-prefer")),
@@ -131,6 +182,7 @@ fn public_put_partial_reservation_release_failure_is_retryable() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .label("route", "true")
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(transport)
         .local_memory(rw_only_config())
@@ -139,6 +191,12 @@ fn public_put_partial_reservation_release_failure_is_retryable() {
     client
         .register_local_memory()
         .expect("writer buffers should register");
+    super::super::refresh_live_client_cache(
+        client.metadata.as_ref(),
+        &remote_live_client_cache,
+        "public_rollback_fixture_membership_prewarm",
+    )
+    .expect("allocator route directory must prewarm the shared live membership");
     let policy = ReplicationPolicy::new()
         .replica_count(2)
         .preferred_segments(["seg-prefer", "missing-required-public-rollback-segment"]);

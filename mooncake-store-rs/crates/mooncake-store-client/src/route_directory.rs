@@ -146,7 +146,7 @@ pub(crate) fn authority_compare_and_swap_many(
     namespace: &str,
     authority: &ClientStableId,
     requests: &[RouteCasRequest],
-) -> Result<Vec<CasResult>> {
+) -> Result<Vec<Result<CasResult>>> {
     LocalRouteAuthority::new(namespace, authority.clone()).compare_and_swap_routes(requests)
 }
 

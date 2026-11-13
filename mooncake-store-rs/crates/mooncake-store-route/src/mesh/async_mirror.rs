@@ -313,7 +313,30 @@ pub(crate) fn mirror_secondary_batch(
     };
     let base_delay = mirror_retry_base_delay();
     for attempt in 0..attempts {
-        let result = mirror_secondary_batch_once(namespace, authority_client, secondary, requests);
+        let mut result =
+            mirror_secondary_batch_once(namespace, authority_client, secondary, requests);
+        let needs_registration = match &result {
+            Ok(results) => results.iter().any(|result| {
+                matches!(
+                    result,
+                    Err(mooncake_store_core::StoreError::PublicationRetired(_))
+                )
+            }),
+            Err(mooncake_store_core::StoreError::PublicationRetired(_)) => true,
+            _ => false,
+        };
+        if needs_registration {
+            result = super::publication::register_imports(
+                namespace,
+                authority_client,
+                membership,
+                secondary,
+                requests,
+            )
+            .and_then(|()| {
+                mirror_secondary_batch_once(namespace, authority_client, secondary, requests)
+            });
+        }
         let succeeded = result
             .as_ref()
             .is_ok_and(|results| results.iter().all(|result| result.is_ok()));

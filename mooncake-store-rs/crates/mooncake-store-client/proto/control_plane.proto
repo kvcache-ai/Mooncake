@@ -48,6 +48,7 @@ enum ErrorKind {
   ERROR_KIND_METADATA = 7;
   ERROR_KIND_TRANSPORT = 8;
   ERROR_KIND_BACKPRESSURE = 9;
+  ERROR_KIND_PUBLICATION_RETIRED = 10;
 }
 
 message ErrorDetail {
@@ -58,6 +59,20 @@ message ErrorDetail {
 message ClientRuntimeId {
   string stable_id = 1;
   uint64 epoch = 2;
+}
+
+message PublicationReceiverPermitRpc {
+  ClientRuntimeId receiver = 1;
+  uint64 enrollment = 2;
+}
+
+message PublicationAttemptRpc {
+  ClientRuntimeId publisher = 1;
+  uint64 sequence = 2;
+  string key = 3;
+  ClientRuntimeId primary = 4;
+  repeated ClientRuntimeId receivers = 5;
+  repeated PublicationReceiverPermitRpc permits = 6;
 }
 
 message CompatibilityDescriptor {
@@ -122,6 +137,7 @@ message ReplicaRoute {
   ReplicaTier tier = 7;
   uint32 priority = 8;
   optional uint64 allocation_id = 9;
+  bytes publication = 10;
 }
 
 message ColdBackingRoute {
@@ -187,6 +203,7 @@ message SegmentReservation {
   uint64 offset_bytes = 3;
   uint64 length_bytes = 4;
   uint64 allocation_id = 5;
+  bytes publication = 6;
 }
 
 message GetRouteRequest {
@@ -298,6 +315,7 @@ message BatchReserveAnyRequest {
   ClientRuntimeId owner = 1;
   repeated uint64 length_bytes = 2;
   bool pending_publication = 3;
+  repeated bytes publication_attempts = 4;
 }
 
 message BatchReserveAnyReply {
@@ -319,6 +337,7 @@ message ReserveSpecificReply {
 message ReserveSpecificEntry {
   string segment_name = 1;
   uint64 length_bytes = 2;
+  bytes publication_attempt = 3;
 }
 
 message BatchReserveSpecificRequest {
@@ -401,6 +420,107 @@ message GetAllocationRouteReferencesRequest {
 
 message GetAllocationRouteReferencesReply {
   repeated AllocationRouteReferenceState references = 1;
+  ErrorDetail error = 2;
+}
+
+message PublicationControlRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated bytes operations = 3;
+}
+
+message PublicationRevokeRequestRpc {
+  PublicationAttemptRpc attempt = 1;
+  AllocationRouteIdentity allocation = 2;
+  repeated ClientRuntimeId closed_receivers = 3;
+  uint64 registration_generation = 4;
+  repeated PublicationReceiverPermitRpc receiver_permits = 5;
+  optional uint64 superseded_before = 6;
+}
+
+message PublicationRegistrationRpc {
+  PublicationAttemptRpc attempt = 1;
+  ClientRuntimeId receiver = 2;
+  PublicationReceiverPermitRpc permit = 3;
+  repeated AllocationRouteIdentity allocations = 4;
+  uint64 generation = 5;
+}
+
+message PublicationMarkerRequestRpc {
+  PublicationRevokeRequestRpc request = 1;
+  uint64 expected = 2;
+}
+
+message PublicationFinalizeRpc {
+  PublicationRevokeRequestRpc request = 1;
+  bool released = 2;
+}
+
+message PublicationPruneExistingRpc {
+  bytes expected_json = 1;
+  optional bytes next_json = 2;
+}
+
+message PublicationPrunedRpc {
+  bytes result_json = 1;
+}
+
+message PublicationOperationRpc {
+  oneof operation {
+    ClientRuntimeId enroll = 1;
+    PublicationRevokeRequestRpc revoke = 2;
+    PublicationMarkerRequestRpc marker_proof = 3;
+    PublicationRegistrationRpc register_receiver = 4;
+    PublicationRegistrationRpc admit_receiver = 5;
+    PublicationFinalizeRpc finalize = 6;
+    PublicationPruneExistingRpc prune_existing = 7;
+  }
+}
+
+message PublicationReferenceRpc {
+  enum State {
+    UNSPECIFIED = 0;
+    ABSENT = 1;
+    EXACT = 2;
+    CONFLICT = 3;
+  }
+  State state = 1;
+  optional string route_key = 2;
+}
+
+message PublicationRevokeReplyRpc {
+  PublicationReferenceRpc reference = 1;
+  repeated ClientRuntimeId registered_receivers = 2;
+  bool registration_closed = 3;
+  uint64 registration_generation = 4;
+  repeated PublicationReceiverPermitRpc receiver_permits = 5;
+}
+
+message PublicationMarkerReplyRpc {
+  optional uint64 version = 1;
+}
+
+message PublicationAckRpc {}
+
+message PublicationReplyRpc {
+  oneof reply {
+    PublicationReceiverPermitRpc enrolled = 1;
+    PublicationRevokeReplyRpc revoked = 2;
+    PublicationMarkerReplyRpc marker_proof = 3;
+    PublicationRegistrationRpc registered = 4;
+    PublicationAckRpc admitted = 5;
+    PublicationAckRpc finalized = 6;
+    PublicationPrunedRpc pruned = 7;
+  }
+}
+
+message PublicationControlResult {
+  bytes result = 1;
+  ErrorDetail error = 2;
+}
+
+message PublicationControlReply {
+  repeated PublicationControlResult results = 1;
   ErrorDetail error = 2;
 }
 
@@ -647,6 +767,7 @@ message ControlStreamRequest {
   uint64 request_id = 1;
   oneof body {
     BatchNotifyDeletePendingRequest eviction_notify_delete_pending = 14;
+    PublicationControlRequest publication = 15;
 
     BatchGetRoutesRequest route_get = 2;
     BatchCompareAndSwapRoutesRequest route_cas = 3;
@@ -665,6 +786,7 @@ message ControlStreamReply {
   uint64 request_id = 1;
   oneof body {
     BatchNotifyDeletePendingReply eviction_notify_delete_pending = 14;
+    PublicationControlReply publication = 15;
 
     BatchGetRoutesReply route_get = 2;
     BatchCompareAndSwapRoutesReply route_cas = 3;

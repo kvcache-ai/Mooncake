@@ -526,6 +526,7 @@ impl StoreClient {
             }
 
             struct PendingBatchReservation<'a> {
+                publication: Option<mooncake_store_core::PublicationAttempt>,
                 tenant: &'a str,
                 object_id: LogicalObjectId,
                 qos_tier: Option<&'a str>,
@@ -744,6 +745,7 @@ impl StoreClient {
                     request.key,
                 );
                 pending.push(PendingBatchReservation {
+                    publication: None,
                     tenant,
                     object_id,
                     qos_tier: request.qos_tier,
@@ -766,6 +768,12 @@ impl StoreClient {
                     targets: Vec::with_capacity(resolved_policy.replica_count),
                     reservations: Vec::with_capacity(resolved_policy.replica_count),
                 });
+            }
+
+            for entry in &mut pending {
+                entry.publication = self
+                    .publication_cohort(&entry.scoped_key)
+                    .map_err(BatchPutReserveStageError::terminal)?;
             }
 
             let mut last_backpressure = None;
@@ -831,6 +839,9 @@ impl StoreClient {
                     round_indices.push(index);
                     round_candidates.push(candidate);
                     round_requests.push(StorageRuntimeReservationRequest {
+                        publication: self
+                            .mint_publication(entry.publication.as_ref())
+                            .map_err(BatchPutReserveStageError::terminal)?,
                         require_local_memory: storage_runtime == self.lease.runtime,
                         storage_runtime,
                         segment_name,
@@ -1155,6 +1166,7 @@ impl StoreClient {
                                 target_offset
                             };
                             replicas.push(ReplicaRoute {
+                                publication: reservation.publication.clone(),
                                 owner: target.storage_runtime.clone(),
                                 segment_name: target.segment_name.clone(),
                                 allocation_id: Some(reservation.allocation_id),
@@ -1751,6 +1763,63 @@ impl StoreClient {
                             })));
                         }
                     }
+                }
+                Err(StoreError::PublicationRetired(_)) => {
+                    self.retire_publication_reservations(&prepared[index].reservations);
+                    let _ = self.abort_tenant_quota_reservation(
+                        prepared[index].quota_reservation.as_ref(),
+                        "batch_publication_retired",
+                    );
+                    let entry = &prepared[index];
+                    let result = (|| {
+                        let current = self.route_ops().load_route(&entry.scoped_key)?;
+                        if current.as_ref().map(|route| route.version) != pending.expected_version {
+                            if conflict_policy
+                                == BatchPutRouteConflictPolicy::AcceptExistingActiveRoute
+                            {
+                                if let Some(current) = current.filter(|route| {
+                                    route.state == RouteState::Active
+                                        && mooncake_store_route::route_has_readable_replicas(
+                                            &route_namespace,
+                                            route,
+                                        )
+                                }) {
+                                    self.storage_owner.track_route(&current);
+                                    return Ok(current);
+                                }
+                            }
+                            return Err(StoreError::Conflict(format!(
+                                "route update lost race for key {}",
+                                pending.key.0,
+                            )));
+                        }
+                        let value = match (entry.value, entry.registered_source) {
+                            (Some(value), _) => value,
+                            (None, Some(source)) => unsafe {
+                                slice::from_raw_parts(source.cast::<u8>(), entry.value_len)
+                            },
+                            (None, None) => {
+                                return Err(StoreError::InvalidState(
+                                    "retired batch publication has no source".to_string(),
+                                ))
+                            }
+                        };
+                        self.put_object_with_policy_current(
+                            &entry.object_id,
+                            entry.qos_tier,
+                            value,
+                            PutObjectCurrentOptions {
+                                registered_source: entry.registered_source,
+                                policy,
+                                current: current.as_ref(),
+                                reclaim_mode: ReclaimMode::Scheduled,
+                            },
+                        )
+                    })();
+                    if let Ok(route) = &result {
+                        published.push(route.clone());
+                    }
+                    statuses.push(result);
                 }
                 Err(error) => {
                     self.release_only_legacy_reservations_after_unknown_route_publish(

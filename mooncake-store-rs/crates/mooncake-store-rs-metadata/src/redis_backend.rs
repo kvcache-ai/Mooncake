@@ -2026,6 +2026,7 @@ impl MetadataBackend for RedisMetadataBackend {
             .map_err(|error| metadata_error("redis reserve segment", error))?;
         match result.0 {
             1 => Ok(SegmentReservation {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: segment.clone(),
                 offset_bytes: result.1 as u64,
@@ -3401,6 +3402,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: sample_runtime(),
                 segment_name: SegmentName::new("segment-a"),
                 allocation_id: None,
