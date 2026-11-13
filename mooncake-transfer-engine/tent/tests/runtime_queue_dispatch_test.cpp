@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -586,6 +587,162 @@ TEST(RuntimeQueueDispatch, CancelsQueuedOwnerWithoutDispatchingIt) {
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
     EXPECT_EQ(first.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, TimeoutDoesNotDispatchQueuedRequestsOfBatch) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // The first poll blocks past the timeout, so waitTransfer() enters its
+    // timeout path. The status poll that follows then completes the dispatched
+    // owner and frees its dispatch window slot; a refill would submit the
+    // queued owner of the same batch unless it has already been canceled.
+    std::atomic<int> polls{0};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&polls](const Request& request, int) {
+            if (++polls == 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x6b);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 1);
+    ASSERT_EQ(TransferEngineImplTestPeer::windowOwners(engine), 1U);
+    ASSERT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 2U);
+
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine.waitTransfer(batch, &statuses, 1).ok());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(TransferEngineImplTestPeer::windowOwners(engine), 0U);
+    EXPECT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 0U);
+    ASSERT_EQ(statuses.size(), 2U);
+    EXPECT_EQ(statuses[0].s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(statuses[1].s, TransferStatusEnum::CANCELED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, ReportsFailedTaskOnlyWhenStatusListIsRequested) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_auto_failover_on_poll", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::FAILED, 0};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x4d);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+
+    // A failed request is data for a caller that asked for per-request
+    // statuses; the call itself still succeeds.
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine.waitTransfer(batch, &statuses, 0).ok());
+    ASSERT_EQ(statuses.size(), 1U);
+    EXPECT_EQ(statuses[0].s, TransferStatusEnum::FAILED);
+
+    // Without status_list the same outcome is a call-level failure.
+    EXPECT_FALSE(engine.waitTransfer(batch).ok());
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, TimesOutWithoutStatusList) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // The task stays pending, so the wait hits its deadline and cancels it.
+    // Without status_list the caller has to query the batch afterwards, so the
+    // call reports the timeout itself.
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x7c);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+
+    EXPECT_TRUE(engine.waitTransfer(batch, nullptr, 1).IsTimedOut());
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, SaturatesHugeTimeoutInsteadOfOverflowing) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // A timeout near the uint64 limit must not wrap the deadline into the
+    // past; the task is left pending for the first polls and then completes.
+    std::atomic<int> polls{0};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&polls](const Request& request, int) {
+            if (++polls < 20)
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x8d);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine
+                    .waitTransfer(batch, &statuses,
+                                  std::numeric_limits<uint64_t>::max())
+                    .ok());
+    ASSERT_EQ(statuses.size(), 1U);
+    EXPECT_EQ(statuses[0].s, TransferStatusEnum::COMPLETED);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(
