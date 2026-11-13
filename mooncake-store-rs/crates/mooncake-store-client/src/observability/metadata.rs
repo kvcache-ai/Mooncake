@@ -104,6 +104,7 @@ pub(super) fn metadata_result_label<T>(result: &Result<T>) -> &'static str {
         Err(StoreError::Metadata(_)) => "metadata_error",
         Err(StoreError::Transport(_)) => "transport_error",
         Err(StoreError::Backpressure(_)) => "backpressure",
+        Err(StoreError::PublicationRetired(_)) => "publication_retired",
     }
 }
 

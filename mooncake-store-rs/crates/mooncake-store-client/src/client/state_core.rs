@@ -277,7 +277,8 @@ pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLea
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut newest_active_by_stable = BTreeMap::<String, ClientLease>::new();
+    let mut newest_active_by_stable =
+        BTreeMap::<String, (mooncake_store_core::ClientEpoch, u64)>::new();
     for lease in &live {
         if lease.state != ClientLifecycleState::Active {
             continue;
@@ -285,14 +286,14 @@ pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLea
         let stable_id = lease.runtime.stable_id.0.clone();
         let replace = newest_active_by_stable
             .get(&stable_id)
-            .map(|current| {
-                lease.runtime.epoch > current.runtime.epoch
-                    || (lease.runtime.epoch == current.runtime.epoch
-                        && lease.expires_at_ms > current.expires_at_ms)
+            .map(|(epoch, expires_at_ms)| {
+                lease.runtime.epoch > *epoch
+                    || (lease.runtime.epoch == *epoch && lease.expires_at_ms > *expires_at_ms)
             })
             .unwrap_or(true);
         if replace {
-            newest_active_by_stable.insert(stable_id, lease.clone());
+            newest_active_by_stable
+                .insert(stable_id, (lease.runtime.epoch, lease.expires_at_ms));
         }
     }
 
@@ -303,7 +304,7 @@ pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLea
             }
             newest_active_by_stable
                 .get(lease.runtime.stable_id.0.as_str())
-                .is_some_and(|current| current.runtime == lease.runtime)
+                .is_some_and(|(epoch, _)| *epoch == lease.runtime.epoch)
         })
         .collect()
 }
@@ -366,6 +367,29 @@ mod state_core_tests {
                 ("node-b".to_string(), 1, ClientLifecycleState::Active),
             ]
         );
+    }
+
+    #[test]
+    fn filter_live_client_leases_preserves_duplicate_epochs_and_lifecycle_order() {
+        let now = current_time_ms();
+        let mut leases = vec![
+            sample_lease("node-a", 1, ClientLifecycleState::Active, now + 10_000),
+            sample_lease("node-a", 3, ClientLifecycleState::Standby, now + 40_000),
+            sample_lease("node-a", 2, ClientLifecycleState::Active, now + 30_000),
+            sample_lease("node-a", 2, ClientLifecycleState::Active, now + 20_000),
+            sample_lease("node-a", 4, ClientLifecycleState::Draining, now + 50_000),
+            sample_lease("node-a", 5, ClientLifecycleState::Active, now - 1),
+        ];
+        leases[2].endpoints.labels.insert("address".into(), "first".into());
+        leases[3].endpoints.labels.insert("address".into(), "second".into());
+        let expected = vec![
+            leases[1].clone(),
+            leases[2].clone(),
+            leases[3].clone(),
+            leases[4].clone(),
+        ];
+
+        assert_eq!(filter_live_client_leases(&leases), expected);
     }
 
     #[test]
@@ -440,6 +464,7 @@ mod state_core_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
                 allocation_id: Some(old.allocation_id),
@@ -662,6 +687,7 @@ mod state_core_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: owner.clone(),
                 segment_name,
                 allocation_id: Some(reservation.allocation_id),
@@ -783,6 +809,7 @@ struct SegmentTransportMetadata {
 /// (cold_tier_devices, hot_replicas, offload_mode, offload_priority)
 /// are consumed by the offload/restore pipeline.
 struct StorageOwnerState {
+    publication_finalization_wake: Mutex<Option<std::sync::mpsc::SyncSender<AsyncEvictionMessage>>>,
     runtime: ClientRuntimeId,
     route_ops: RouteOperations,
     metadata: Arc<dyn MetadataBackend>,
@@ -808,6 +835,7 @@ struct StorageOwnerState {
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
     owner_cold_restore_flights: OwnerColdRestoreFlightMap,
+    pending_restore_publications: Mutex<VecDeque<OwnerRestorePublication>>,
     cold_restore_io_tracker: ColdRestoreIoTracker,
     /// Signaled by offload when an entry becomes Materialized (clean).
     eviction_ready_signal: EvictionReadySignal,
@@ -816,6 +844,13 @@ struct StorageOwnerState {
     pending_staging_slots: Mutex<HashMap<(SegmentName, u64), (cold_tier::StagingSlot, Instant)>>,
     staging_pool_bytes: usize,
     staging_slot_ttl: Duration,
+}
+
+struct OwnerRestorePublication {
+    expected: ObjectRoute,
+    next: ObjectRoute,
+    reservation: mooncake_store_core::SegmentReservation,
+    release_only: bool,
 }
 
 #[derive(Default)]
@@ -865,6 +900,7 @@ struct EvictionToken {
     kind: PendingEvictionKind,
     route_key: Option<ObjectKey>,
     expected_version: RouteVersion,
+    superseded_before: Option<RouteVersion>,
     evicted_replica: Option<ReplicaRoute>,
     clock_id: Option<ClockEntryId>,
     next_route: Option<ObjectRoute>,
@@ -873,6 +909,8 @@ struct EvictionToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingEvictionKind {
     RouteCas,
+    ExistingHolderCas,
+    HistoricalClock,
     AllocationCandidate,
 }
 
@@ -915,6 +953,10 @@ struct RouteWritePermit<'a> {
 
 #[derive(Default)]
 struct LocalAllocatorState {
+    publication_provenance: HashMap<AllocationIdentity, mooncake_store_core::PublicationAttempt>,
+    publication_release_authorized: HashSet<AllocationIdentity>,
+    publication_finalizations: BTreeMap<AllocationIdentity, (mooncake_store_core::PublicationRevokeRequest, bool)>,
+    publication_finalization_cursor: Option<AllocationIdentity>,
     segments: BTreeMap<SegmentName, SegmentAllocator>,
     // Exact lookup only; the ready queues maintain retry order.
     pending_allocations: HashMap<AllocationSpan, PendingAllocation>,
@@ -932,6 +974,10 @@ struct LocalAllocatorState {
 
 #[derive(Clone, Debug)]
 enum PendingAllocation {
+    // A cold restore retry context owns this allocation until CAS completion.
+    RestorePublication {
+        allocation_id: u64,
+    },
     // Local publication is synchronously tracked by the allocation owner.
     Legacy {
         deadline_ms: u64,
@@ -948,6 +994,7 @@ enum PendingAllocation {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct PendingPublication {
     identity: AllocationIdentity,
+    attempt: Option<mooncake_store_core::PublicationAttempt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1016,6 +1063,51 @@ struct UntrackedCandidateScanProgress {
 }
 
 impl LocalAllocatorState {
+    fn bind_publication(
+        &mut self,
+        mut reservation: mooncake_store_core::SegmentReservation,
+        attempt: mooncake_store_core::PublicationAttempt,
+        lifecycle: AllocationLifecycleConfig,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let span = AllocationSpan {
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        };
+        let identity = self
+            .allocation_identity(&span)
+            .filter(|identity| identity.allocation_id == reservation.allocation_id)
+            .ok_or_else(|| {
+                StoreError::Allocator("publication reservation generation has changed".to_string())
+            })?;
+        if let Some(previous) = self.publication_provenance.get(&identity) {
+            if previous != &attempt {
+                return Err(StoreError::InvalidState(
+                    "allocation publication identity is immutable".to_string(),
+                ));
+            }
+        }
+        let deadline_ms = match self.pending_allocations.get(&span) {
+            Some(PendingAllocation::Legacy { deadline_ms })
+            | Some(PendingAllocation::Publication { deadline_ms, .. }) => *deadline_ms,
+            _ => {
+                return Err(StoreError::InvalidState(
+                    "publication reservation is no longer pending".to_string(),
+                ))
+            }
+        };
+        if !matches!(
+            self.pending_allocations.get(&span),
+            Some(PendingAllocation::Publication { .. })
+        ) {
+            self.ensure_pending_publication_capacity(reservation.length_bytes, lifecycle)?;
+        }
+        reservation.publication = Some(attempt.clone());
+        self.mark_pending_publication(&reservation, deadline_ms);
+        self.publication_provenance.insert(identity, attempt);
+        Ok(reservation)
+    }
+
     fn upsert(&mut self, announcement: &SegmentAnnouncement) {
         match self.segments.get_mut(&announcement.segment_name) {
             Some(segment) => {
@@ -1385,6 +1477,13 @@ impl LocalAllocatorState {
         };
         if let Some(identity) = self.allocation_identity(&span) {
             if (allocation_id == 0 || allocation_id == identity.allocation_id)
+                && self.publication_provenance.contains_key(&identity)
+                && !self.publication_release_authorized.contains(&identity) {
+                return Err(StoreError::Backpressure("allocation requires publication revocation before release".to_string()));
+            }
+        }
+        if let Some(identity) = self.allocation_identity(&span) {
+            if (allocation_id == 0 || allocation_id == identity.allocation_id)
                 && self.allocation_pins.contains_key(&identity)
             {
                 let pin = self
@@ -1606,6 +1705,30 @@ impl LocalAllocatorState {
             .saturating_add(reservation.length_bytes);
     }
 
+    fn mark_pending_restore_publication(
+        &mut self,
+        reservation: &mooncake_store_core::SegmentReservation,
+    ) -> Result<()> {
+        let allocation = AllocationSpan {
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        };
+        if self.allocation_id(&allocation) != Some(reservation.allocation_id) {
+            return Err(StoreError::Allocator(
+                "cannot hold a stale cold restore allocation".to_string(),
+            ));
+        }
+        self.remove_pending_allocation(&allocation);
+        self.pending_allocations.insert(
+            allocation,
+            PendingAllocation::RestorePublication {
+                allocation_id: reservation.allocation_id,
+            },
+        );
+        Ok(())
+    }
+
     fn ensure_pending_publication_capacity(
         &self,
         length_bytes: u64,
@@ -1661,6 +1784,7 @@ impl LocalAllocatorState {
     ) -> Option<PendingAllocation> {
         let pending = self.pending_allocations.remove(allocation)?;
         match &pending {
+            PendingAllocation::RestorePublication { .. } => {}
             PendingAllocation::Legacy { deadline_ms } => {
                 self.pending_deadlines.remove(&PendingDeadline {
                     deadline_ms: *deadline_ms,
@@ -1703,12 +1827,39 @@ impl LocalAllocatorState {
             };
             let should_clear = match self.pending_allocations.get(&allocation) {
                 Some(PendingAllocation::Legacy { .. }) => true,
-                Some(PendingAllocation::Publication { allocation_id, .. }) => {
+                Some(PendingAllocation::Publication { allocation_id, .. })
+                | Some(PendingAllocation::RestorePublication { allocation_id }) => {
                     replica.allocation_id.filter(|id| *id != 0) == Some(*allocation_id)
                 }
                 None => false,
             };
             if should_clear {
+                if let Some(identity) = self.allocation_identity(&allocation) {
+                    if let Some(attempt) = self.publication_provenance.get(&identity).cloned() {
+                        if self.publication_finalizations.len() >= 4096
+                            && !self.publication_finalizations.contains_key(&identity) {
+                            continue;
+                        }
+                        let newly_queued = !self.publication_finalizations.contains_key(&identity);
+                        self.publication_finalizations.entry(identity.clone()).or_insert_with(|| (
+                            mooncake_store_core::PublicationRevokeRequest {
+                                attempt,
+                                closed_receivers: Vec::new(),
+                                registration_generation: 0,
+                                receiver_permits: Vec::new(),
+                                superseded_before: None,
+                                allocation: AllocationRouteIdentity {
+                                    owner: runtime.clone(), segment_name: identity.segment_name.clone(),
+                                    offset_bytes: identity.offset_bytes, length_bytes: identity.length_bytes,
+                                    allocation_id: identity.allocation_id,
+                                },
+                            }, false,
+                        ));
+                        if newly_queued {
+                            registry::record_eviction_guard_event("publication_finalize", "queued");
+                        }
+                    }
+                }
                 self.remove_pending_allocation(&allocation);
             }
         }
@@ -1730,7 +1881,8 @@ impl LocalAllocatorState {
             .iter()
             .filter(|(allocation, pending)| match pending {
                 PendingAllocation::Legacy { deadline_ms } => *deadline_ms > now_ms,
-                PendingAllocation::Publication { allocation_id, .. } => {
+                PendingAllocation::Publication { allocation_id, .. }
+                | PendingAllocation::RestorePublication { allocation_id } => {
                     self.allocation_id(allocation) == Some(*allocation_id)
                 }
             })
@@ -1743,7 +1895,8 @@ impl LocalAllocatorState {
             .get(allocation)
             .is_some_and(|pending| match pending {
                 PendingAllocation::Legacy { deadline_ms } => *deadline_ms > now_ms,
-                PendingAllocation::Publication { allocation_id, .. } => {
+                PendingAllocation::Publication { allocation_id, .. }
+                | PendingAllocation::RestorePublication { allocation_id } => {
                     self.allocation_id(allocation) == Some(*allocation_id)
                 }
             })
@@ -1871,13 +2024,14 @@ impl LocalAllocatorState {
                         *confirmation_in_progress = true;
                         true
                     }
-                    PendingAllocation::Legacy { .. } | PendingAllocation::Publication { .. } => {
-                        false
-                    }
+                    PendingAllocation::Legacy { .. }
+                    | PendingAllocation::Publication { .. }
+                    | PendingAllocation::RestorePublication { .. } => false,
                 },
             );
             if matches_current {
                 candidates.push(PendingPublication {
+                    attempt: self.publication_provenance.get(&identity).cloned(),
                     identity,
                 });
             }
@@ -1910,10 +2064,10 @@ impl LocalAllocatorState {
                         *pending_next_attempt_at_ms = next_attempt_at_ms;
                         Some(previous)
                     }
-                    PendingAllocation::Legacy { .. } | PendingAllocation::Publication { .. } => {
-                        None
-                    }
-        });
+                    PendingAllocation::Legacy { .. }
+                    | PendingAllocation::Publication { .. }
+                    | PendingAllocation::RestorePublication { .. } => None,
+                });
         if let Some(previous_next_attempt_at_ms) = previous_next_attempt_at_ms {
             self.remove_pending_publication_ready(
                 previous_next_attempt_at_ms,
@@ -2047,6 +2201,7 @@ impl SegmentAllocator {
             })?;
             self.allocations.insert(offset_bytes, SegmentAllocation { length_bytes, allocation_id });
             return Ok(mooncake_store_core::SegmentReservation {
+                publication: None,
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
                 offset_bytes,
@@ -2082,6 +2237,7 @@ impl SegmentAllocator {
             },
         );
         Ok(mooncake_store_core::SegmentReservation {
+            publication: None,
             owner: owner.clone(),
             segment_name: segment_name.clone(),
             offset_bytes: offset,
@@ -2287,6 +2443,7 @@ impl PreparedObjectWrite<'_> {
 
 #[derive(Clone, Debug)]
 struct StorageRuntimeReservationRequest {
+    publication: Option<mooncake_store_core::PublicationAttempt>,
     storage_runtime: ClientRuntimeId,
     segment_name: Option<SegmentName>,
     length_bytes: u64,

@@ -42,6 +42,7 @@ struct TestAuthority {
     routes: Mutex<BTreeMap<String, ObjectRoute>>,
     delete_versions: Mutex<BTreeMap<String, RouteVersion>>,
     route_epoch: AtomicU64,
+    publication_calls: AtomicUsize,
 }
 
 impl TestAuthority {
@@ -52,6 +53,52 @@ impl TestAuthority {
 }
 
 impl mooncake_store_route::RouteAuthorityService for TestAuthority {
+    fn publication_control(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        operations: &[mooncake_store_core::PublicationControl],
+    ) -> mooncake_store_core::Result<
+        Vec<mooncake_store_core::Result<mooncake_store_core::PublicationControlReply>>,
+    > {
+        use mooncake_store_core::{
+            PublicationControl, PublicationControlReply, PublicationReceiverPermit,
+        };
+        self.publication_calls.fetch_add(1, Ordering::SeqCst);
+        if operations.iter().any(|operation| matches!(operation, PublicationControl::Enroll { publisher } if publisher.stable_id.0 == "typed-outer-error")) {
+            return Err(StoreError::Backpressure("typed outer error".to_string()));
+        }
+        Ok(operations
+            .iter()
+            .map(|operation| match operation {
+                PublicationControl::Enroll { publisher }
+                    if publisher.stable_id.0 == "typed-item-error" =>
+                {
+                    Err(StoreError::PublicationRetired(
+                        "typed item error".to_string(),
+                    ))
+                }
+                PublicationControl::Enroll { publisher } => Ok(PublicationControlReply::Enrolled(
+                    PublicationReceiverPermit {
+                        receiver: publisher.clone(),
+                        enrollment: publisher.epoch.0,
+                    },
+                )),
+                PublicationControl::PruneExisting { expected, .. } => {
+                    Ok(PublicationControlReply::Pruned(Box::new(CasResult {
+                        applied: false,
+                        current: Some(expected.as_ref().clone()),
+                        delete_version: None,
+                        version_floor: None,
+                    })))
+                }
+                _ => Err(StoreError::Unsupported(
+                    "test publication operation".to_string(),
+                )),
+            })
+            .collect())
+    }
+
     fn get_route(
         &self,
         _namespace: &str,
@@ -208,6 +255,7 @@ impl AllocatorService for TestAllocator {
         let offset_bytes = *next_offset;
         *next_offset += length_bytes.max(1);
         Ok(SegmentReservation {
+            publication: None,
             owner: owner.clone(),
             segment_name: SegmentName::new("auto-segment"),
             offset_bytes,
@@ -223,6 +271,7 @@ impl AllocatorService for TestAllocator {
         length_bytes: u64,
     ) -> mooncake_store_core::Result<SegmentReservation> {
         Ok(SegmentReservation {
+            publication: None,
             owner: owner.clone(),
             segment_name: segment_name.clone(),
             offset_bytes: 4_096,
@@ -1303,6 +1352,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: owner.clone(),
             segment_name: SegmentName::new("segment-a"),
             allocation_id: Some(73),
@@ -1352,6 +1402,7 @@ fn pending_publication_reservation_requires_explicit_allocator_support() {
     let specific = allocator.batch_reserve_specific_with_pending_publication(
         &owner,
         &[ReserveSpecificOp {
+            publication: None,
             segment_name: SegmentName::new("segment-a"),
             length_bytes: 64,
         }],
@@ -1566,6 +1617,7 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
             &lease,
             &owner,
             &[ReserveSpecificOp {
+                publication: None,
                 segment_name: SegmentName::new("segment-c"),
                 length_bytes: 48,
             }],
@@ -1585,6 +1637,7 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
             &lease,
             &owner,
             &[ReserveSpecificOp {
+                publication: None,
                 segment_name: SegmentName::new("segment-publication"),
                 length_bytes: 12,
             }],
@@ -2199,6 +2252,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     );
 
     let reservation = SegmentReservation {
+        publication: None,
         owner: runtime.clone(),
         segment_name: SegmentName::new("segment-r"),
         offset_bytes: 7,
@@ -2212,6 +2266,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     );
 
     let replica_error = try_replica_route(pb::ReplicaRoute {
+        publication: Vec::new(),
         owner: None,
         segment_name: "segment-a".to_string(),
         allocation_id: None,
@@ -2281,6 +2336,7 @@ fn object_route_round_trip_preserves_namespace_fields() {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner,
             segment_name: SegmentName::new("segment-a"),
             allocation_id: Some(91),
@@ -2321,6 +2377,93 @@ fn fail_stream_session_marks_session_closed_and_drains_waiters() {
     assert!(matches!(error, StoreError::Transport(_)));
     assert!(session.closed.load(Ordering::Relaxed));
     assert!(session.pending.lock().is_empty());
+}
+
+#[test]
+fn publication_control_typed_real_stream_preserves_mixed_errors_order_and_batch_limits() {
+    use mooncake_store_core::{PublicationControl, PublicationControlReply};
+    use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+    let authority = Arc::new(TestAuthority::default());
+    let handle = ControlPlaneHandle::spawn(
+        "127.0.0.1",
+        authority.clone(),
+        Arc::new(TestAllocator::default()),
+        Arc::new(TestEviction::default()),
+    )
+    .unwrap();
+    let client = ControlPlaneClient::new().unwrap();
+    let lease = sample_lease(handle.address());
+    let send = |operations| {
+        client.send_route_control(
+            &lease,
+            RouteControlRequest::Publication {
+                namespace: "typed-control".to_string(),
+                authority: ClientStableId::new("authority"),
+                operations,
+            },
+        )
+    };
+    let operations = (0..64)
+        .map(|index| PublicationControl::Enroll {
+            publisher: ClientRuntimeId::new(
+                if index == 31 {
+                    "typed-item-error".to_string()
+                } else {
+                    format!("typed-{index}")
+                },
+                ClientEpoch(index),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let RouteControlResponse::Publication(results) = send(operations.clone()).unwrap() else {
+        panic!("unexpected reply type")
+    };
+    assert_eq!(results.len(), 64);
+    for (index, result) in results.into_iter().enumerate() {
+        if index == 31 {
+            assert!(matches!(result, Err(StoreError::PublicationRetired(_))));
+        } else {
+            let PublicationControlReply::Enrolled(permit) = result.unwrap() else {
+                panic!("unexpected publication result")
+            };
+            assert_eq!(
+                permit.receiver,
+                ClientRuntimeId::new(format!("typed-{index}"), ClientEpoch(index as u64))
+            );
+            assert_eq!(permit.enrollment, index as u64);
+        }
+    }
+    let calls = authority.publication_calls.load(Ordering::SeqCst);
+    let mut oversized = operations;
+    oversized.push(oversized[0].clone());
+    assert!(send(oversized).is_err());
+    assert_eq!(authority.publication_calls.load(Ordering::SeqCst), calls);
+    let RouteControlResponse::Publication(empty) = send(Vec::new()).unwrap() else {
+        panic!("unexpected empty reply type")
+    };
+    assert!(empty.is_empty());
+    let expected = sample_route("prune-presence", 1, &sample_owner());
+    let RouteControlResponse::Publication(mut pruned) =
+        send(vec![PublicationControl::PruneExisting {
+            expected: Box::new(expected.clone()),
+            next: None,
+        }])
+        .unwrap()
+    else {
+        panic!("unexpected prune reply")
+    };
+    assert_eq!(pruned.len(), 1);
+    let PublicationControlReply::Pruned(result) = pruned.remove(0).unwrap() else {
+        panic!("unexpected prune result")
+    };
+    assert!(!result.applied);
+    assert_eq!(result.current, Some(expected));
+    assert!(matches!(
+        send(vec![PublicationControl::Enroll {
+            publisher: ClientRuntimeId::new("typed-outer-error", ClientEpoch(1))
+        }]),
+        Err(StoreError::Backpressure(_))
+    ));
 }
 
 #[test]
@@ -2405,7 +2548,10 @@ fn route_get_preserves_delete_marker_over_control_plane_transport() {
 
 #[test]
 fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
-    use mooncake_store_core::MetadataBackend;
+    use mooncake_store_core::{
+        MetadataBackend, PublicationAttempt, PublicationAttemptFields, PublicationControl,
+        PublicationControlReply,
+    };
     use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
     use mooncake_store_rs_metadata::InMemoryMetadataBackend;
     use mooncake_store_test_utils::transport::TestTransport;
@@ -2420,6 +2566,37 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
     let namespace = metadata.route_namespace();
     let authority = lease.runtime.stable_id.clone();
     let client = ControlPlaneClient::new().expect("control plane client should build");
+    let RouteControlResponse::Publication(mut enrolled) = client
+        .send_route_control(
+            &lease,
+            RouteControlRequest::Publication {
+                namespace: namespace.clone(),
+                authority: authority.clone(),
+                operations: vec![PublicationControl::Enroll {
+                    publisher: lease.runtime.clone(),
+                }],
+            },
+        )
+        .expect("fixture publisher should enroll")
+    else {
+        panic!("expected publication response");
+    };
+    let PublicationControlReply::Enrolled(permit) = enrolled.remove(0).unwrap() else {
+        panic!("expected receiver permit");
+    };
+    let fixture_route = |key: &ObjectKey, version, allocation_id| {
+        let mut route = sample_route(&key.0, version, &lease.runtime);
+        route.replicas[0].allocation_id = Some(allocation_id);
+        route.replicas[0].publication = Some(PublicationAttempt::new(PublicationAttemptFields {
+            publisher: lease.runtime.clone(),
+            sequence: version * 2 + u64::from(key.0 == "stale-marker"),
+            key: key.clone(),
+            primary: lease.runtime.clone(),
+            receivers: vec![lease.runtime.clone()],
+            permits: vec![permit.clone()],
+        }));
+        route
+    };
     let keys = [
         ObjectKey::new("missing-marker"),
         ObjectKey::new("stale-marker"),
@@ -2464,7 +2641,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
     replace(vec![RouteCasRequest {
         key: keys[1].clone(),
         expected: None,
-        next: Some(sample_route(&keys[1].0, 1, &lease.runtime)),
+        next: Some(fixture_route(&keys[1], 1, 1)),
     }]);
     replace(
         keys.iter()
@@ -2485,7 +2662,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
                 .map(|key| RouteCasRequest {
                     key: key.clone(),
                     expected: None,
-                    next: Some(sample_route(&key.0, version, &lease.runtime)),
+                    next: Some(fixture_route(key, version, 1)),
                 })
                 .collect(),
         );
@@ -2497,8 +2674,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
     replace(
         keys.iter()
             .map(|key| {
-                let mut route = sample_route(&key.0, 44, &lease.runtime);
-                route.replicas[0].allocation_id = Some(71);
+                let route = fixture_route(key, 44, 71);
                 RouteCasRequest {
                     key: key.clone(),
                     expected: None,
@@ -2690,6 +2866,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
 
         let reserve_any_error = service
             .batch_reserve_any(Request::new(pb::BatchReserveAnyRequest {
+                publication_attempts: Vec::new(),
                 owner: None,
                 length_bytes: vec![8, 16],
                 pending_publication: false,
@@ -2714,6 +2891,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .batch_reserve_specific(Request::new(pb::BatchReserveSpecificRequest {
                 owner: None,
                 entries: vec![pb::ReserveSpecificEntry {
+                    publication_attempt: Vec::new(),
                     segment_name: "segment-a".to_string(),
                     length_bytes: 32,
                 }],
@@ -2989,6 +3167,7 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
             &lease,
             &owner,
             &[ReserveSpecificOp {
+                publication: None,
                 segment_name: SegmentName::new("segment-z"),
                 length_bytes: 24,
             }],
@@ -3216,6 +3395,7 @@ fn allocator_reservation_rpcs_preserve_unrelated_route_rpc_progress() {
                                     owner,
                                     length_bytes: vec![16],
                                     pending_publication: false,
+                                    publication_attempts: Vec::new(),
                                 })
                                 .await
                                 .map(|_| ()),
@@ -3234,6 +3414,7 @@ fn allocator_reservation_rpcs_preserve_unrelated_route_rpc_progress() {
                                     entries: vec![pb::ReserveSpecificEntry {
                                         segment_name: "segment-a".to_string(),
                                         length_bytes: 16,
+                                        publication_attempt: Vec::new(),
                                     }],
                                     pending_publication: false,
                                 })

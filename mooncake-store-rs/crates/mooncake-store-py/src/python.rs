@@ -2036,6 +2036,7 @@ pub(crate) fn store_error_to_py(error: StoreError) -> PyErr {
     match error {
         StoreError::NotFound(message) => PyKeyError::new_err(message),
         StoreError::Conflict(message)
+        | StoreError::PublicationRetired(message)
         | StoreError::QuotaExceeded { message, .. }
         | StoreError::InvalidState(message)
         | StoreError::StaleEpoch(message)
@@ -2064,7 +2065,9 @@ fn soft_miss_status(error: &StoreError) -> i64 {
         StoreError::InvalidState(_) => -2,
         StoreError::Metadata(_) => -3,
         StoreError::Transport(_) => -4,
-        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } => -5,
+        StoreError::Conflict(_)
+        | StoreError::PublicationRetired(_)
+        | StoreError::QuotaExceeded { .. } => -5,
         StoreError::StaleEpoch(_) => -6,
         StoreError::Unsupported(_) => -7,
         StoreError::Allocator(_) => -8,
@@ -2572,6 +2575,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 allocation_id: None,
                 owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
                 segment_name: SegmentName::new("segment-z"),

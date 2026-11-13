@@ -1,4 +1,16 @@
 impl StoreClient {
+    fn retire_publication_reservations(
+        &self,
+        reservations: &[mooncake_store_core::SegmentReservation],
+    ) {
+        for reservation in reservations {
+            if let Some(attempt) = &reservation.publication {
+                self.route_directory.invalidate_publication(attempt);
+            }
+        }
+        self.release_reservations_or_enqueue(reservations, "publication_attempt_retired");
+    }
+
     fn replica_write_target(
         &self,
         storage_runtime: &ClientRuntimeId,
@@ -299,6 +311,7 @@ impl StoreClient {
             pending_publication: bool,
             any_indices: Vec<usize>,
             any_lengths: Vec<u64>,
+            any_publications: Vec<Option<mooncake_store_core::PublicationAttempt>>,
             specific_indices: Vec<usize>,
             specific_ops: Vec<ReserveSpecificOp>,
         }
@@ -322,6 +335,14 @@ impl StoreClient {
                         request.require_local_memory,
                     )
                     .and_then(|reservation| {
+                        let reservation = match &request.publication {
+                            Some(attempt) => self.allocator.lock().bind_publication(
+                                reservation,
+                                attempt.clone(),
+                                self.allocation_lifecycle,
+                            )?,
+                            None => reservation,
+                        };
                         self.resolve_reserved_replica_write_target(
                             &request.storage_runtime,
                             reservation,
@@ -374,6 +395,7 @@ impl StoreClient {
                     .specific_indices
                     .iter()
                     .map(|index| ReserveSpecificOp {
+                        publication: requests[*index].publication.clone(),
                         segment_name: requests[*index]
                             .segment_name
                             .clone()
@@ -382,6 +404,11 @@ impl StoreClient {
                     })
                     .collect::<Vec<_>>();
                 RemoteReservationJob {
+                    any_publications: group
+                        .any_indices
+                        .iter()
+                        .map(|index| requests[*index].publication.clone())
+                        .collect(),
                     storage_runtime,
                     lease: group.lease,
                     pending_publication: group.pending_publication,
@@ -395,6 +422,13 @@ impl StoreClient {
         let remote_results = run_bounded_parallel_jobs(remote_jobs, 8, move |job| {
             let any_results = if job.any_lengths.is_empty() {
                 None
+            } else if job.any_publications.iter().any(Option::is_some) {
+                Some(control_client.batch_reserve_any_with_publications(
+                    &job.lease,
+                    &job.storage_runtime,
+                    &job.any_lengths,
+                    &job.any_publications,
+                ))
             } else if job.pending_publication {
                 Some(control_client.batch_reserve_any_with_pending_publication(
                     &job.lease,
@@ -450,6 +484,16 @@ impl StoreClient {
                                     continue;
                                 }
                             };
+                            if requests[index].publication.is_some()
+                                && reservation.publication != requests[index].publication
+                            {
+                                self.release_unresolved_reservation(&reservation);
+                                resolved[index] = Some(Err(StoreError::Unsupported(
+                                    "allocation owner did not preserve publication provenance"
+                                        .to_string(),
+                                )));
+                                continue;
+                            }
                             resolved[index] = Some(self.resolve_reserved_replica_write_target(
                                 &job.storage_runtime,
                                 reservation,
@@ -487,6 +531,16 @@ impl StoreClient {
                                     continue;
                                 }
                             };
+                            if requests[index].publication.is_some()
+                                && reservation.publication != requests[index].publication
+                            {
+                                self.release_unresolved_reservation(&reservation);
+                                resolved[index] = Some(Err(StoreError::Unsupported(
+                                    "allocation owner did not preserve publication provenance"
+                                        .to_string(),
+                                )));
+                                continue;
+                            }
                             resolved[index] = Some(self.resolve_reserved_replica_write_target(
                                 &job.storage_runtime,
                                 reservation,
@@ -537,7 +591,7 @@ impl StoreClient {
         let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
         for (index, request) in requests.iter().enumerate() {
             if request.storage_runtime == self.lease.runtime {
-                self.allocator.lock().release(
+                self.storage_owner.release_with_publication_fence(
                     &request.storage_runtime,
                     &request.segment_name,
                     request.offset_bytes,
@@ -674,7 +728,7 @@ impl StoreClient {
         let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
         for (index, request) in requests.iter().enumerate() {
             if request.storage_runtime == self.lease.runtime {
-                if let Err(error) = self.allocator.lock().release(
+                if let Err(error) = self.storage_owner.release_with_publication_fence(
                     &request.storage_runtime,
                     &request.segment_name,
                     request.offset_bytes,

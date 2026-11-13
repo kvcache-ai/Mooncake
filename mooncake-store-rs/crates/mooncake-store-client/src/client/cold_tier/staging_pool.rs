@@ -1,3 +1,5 @@
+use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +41,7 @@ pub(in super::super) struct ColdRestoreStagingPool {
     free_spans: Mutex<Vec<FreeSpan>>,
     space_available: Condvar,
     segment_name: SegmentName,
+    next_ack_generation: AtomicU64,
     target_chunks: Vec<SegmentTargetChunk>,
     transport_endpoint: Option<String>,
     transport_segment_descriptor: Option<String>,
@@ -76,6 +79,16 @@ pub(in super::super) struct StagingPoolInitParams {
 
 impl ColdRestoreStagingPool {
     pub(in super::super) fn new(params: StagingPoolInitParams) -> Result<Arc<Self>> {
+        // ACK identity is independent of the physical transport registration.
+        // A fresh pool nonce also prevents an old process's ACK from matching.
+        let mut nonce = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut nonce))
+            .map_err(|error| StoreError::Allocator(format!("staging ACK nonce: {error}")))?;
+        let segment_name = SegmentName::new(format!(
+            "__staging_cold_restore__{:032x}",
+            u128::from_ne_bytes(nonce)
+        ));
         let capacity = params.total_bytes.max(ALLOC_ALIGNMENT as usize);
         let base = unsafe {
             libc::mmap(
@@ -145,7 +158,6 @@ impl ColdRestoreStagingPool {
             .filter(|s| !s.is_empty());
         let transport_segment_descriptor =
             params.transport.local_segment_descriptor().ok().flatten();
-        let segment_name = SegmentName::new("__staging_cold_restore__");
 
         info!(
             capacity,
@@ -162,6 +174,7 @@ impl ColdRestoreStagingPool {
             free_spans: Mutex::new(Vec::new()),
             space_available: Condvar::new(),
             segment_name,
+            next_ack_generation: AtomicU64::new(1),
             target_chunks,
             transport_endpoint,
             transport_segment_descriptor,
@@ -329,6 +342,7 @@ impl ColdRestoreStagingPool {
         }
     }
 
+    #[allow(deprecated)]
     fn build_slot(
         self: &Arc<Self>,
         offset: u64,
@@ -340,7 +354,16 @@ impl ColdRestoreStagingPool {
             pool: Arc::clone(self),
             addr,
             len: needed_bytes,
-            segment_name: self.segment_name.clone(),
+            // Reusing an address must never reuse a reader's ACK identity.
+            segment_name: SegmentName::new(format!(
+                "{}:{}",
+                self.segment_name.0,
+                self.next_ack_generation
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                        generation.checked_add(1)
+                    })
+                    .expect("staging ACK generation exhausted")
+            )),
             offset,
             alloc_len,
         }

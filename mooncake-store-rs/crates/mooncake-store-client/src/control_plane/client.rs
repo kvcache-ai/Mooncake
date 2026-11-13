@@ -200,6 +200,40 @@ impl ControlPlaneClient {
                 authority,
                 keys,
             } => self.send_route_batch_get(lease, namespace, authority, keys),
+            RouteControlRequest::Publication {
+                namespace,
+                authority,
+                operations,
+            } => {
+                let request = pb::PublicationControlRequest {
+                    namespace,
+                    authority: authority.0,
+                    operations: operations.iter().map(encode_publication_control).collect(),
+                };
+                let reply = self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                    request_id,
+                    body: Some(pb::control_stream_request::Body::Publication(
+                        request.clone(),
+                    )),
+                })?;
+                decode_error(reply.error)?;
+                let Some(pb::control_stream_reply::Body::Publication(reply)) = reply.body else {
+                    return Err(StoreError::Transport(
+                        "publication reply type mismatch".to_string(),
+                    ));
+                };
+                decode_error(reply.error)?;
+                ensure_batch_len("publication_control", operations.len(), reply.results.len())?;
+                let results = reply
+                    .results
+                    .into_iter()
+                    .map(|result| {
+                        decode_error(result.error)?;
+                        decode_publication_control_reply(&result.result)
+                    })
+                    .collect();
+                Ok(RouteControlResponse::Publication(results))
+            }
             RouteControlRequest::BatchContains {
                 namespace,
                 authority,
@@ -947,7 +981,7 @@ impl ControlPlaneClient {
         owner: &ClientRuntimeId,
         length_bytes: &[u64],
     ) -> Result<Vec<Result<SegmentReservation>>> {
-        self.batch_reserve_any_inner(lease, owner, length_bytes, false)
+        self.batch_reserve_any_inner(lease, owner, length_bytes, false, &[])
     }
 
     pub(crate) fn batch_reserve_any_with_pending_publication(
@@ -956,7 +990,17 @@ impl ControlPlaneClient {
         owner: &ClientRuntimeId,
         length_bytes: &[u64],
     ) -> Result<Vec<Result<SegmentReservation>>> {
-        self.batch_reserve_any_inner(lease, owner, length_bytes, true)
+        self.batch_reserve_any_inner(lease, owner, length_bytes, true, &[])
+    }
+
+    pub(crate) fn batch_reserve_any_with_publications(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+        attempts: &[Option<mooncake_store_core::PublicationAttempt>],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_any_inner(lease, owner, length_bytes, true, attempts)
     }
 
     fn batch_reserve_any_inner(
@@ -965,6 +1009,7 @@ impl ControlPlaneClient {
         owner: &ClientRuntimeId,
         length_bytes: &[u64],
         pending_publication: bool,
+        attempts: &[Option<mooncake_store_core::PublicationAttempt>],
     ) -> Result<Vec<Result<SegmentReservation>>> {
         let tracker = OperationTracker::new("control_allocator_batch_reserve_any");
         let result = (|| {
@@ -972,6 +1017,10 @@ impl ControlPlaneClient {
                 return Ok(Vec::new());
             }
             let request = pb::BatchReserveAnyRequest {
+                publication_attempts: attempts
+                    .iter()
+                    .map(|attempt| encode_publication(attempt.as_ref()))
+                    .collect(),
                 owner: Some(pb_runtime_id(owner)),
                 length_bytes: length_bytes.to_vec(),
                 pending_publication,
@@ -1055,6 +1104,7 @@ impl ControlPlaneClient {
             lease,
             owner,
             &[ReserveSpecificOp {
+                publication: None,
                 segment_name: segment_name.clone(),
                 length_bytes,
             }],
@@ -1077,6 +1127,7 @@ impl ControlPlaneClient {
             lease,
             owner,
             &[ReserveSpecificOp {
+                publication: None,
                 segment_name: segment_name.clone(),
                 length_bytes,
             }],
@@ -1124,6 +1175,7 @@ impl ControlPlaneClient {
                 entries: requests
                     .iter()
                     .map(|request| pb::ReserveSpecificEntry {
+                        publication_attempt: encode_publication(request.publication.as_ref()),
                         segment_name: request.segment_name.0.clone(),
                         length_bytes: request.length_bytes,
                     })

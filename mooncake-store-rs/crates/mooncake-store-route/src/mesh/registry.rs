@@ -277,6 +277,34 @@ pub(crate) fn authority_list_reuse_candidates(
     Ok(slot.table.list_reuse_candidates(reuse))
 }
 
+pub(crate) fn authority_publication_control(
+    namespace: &str,
+    authority: &ClientStableId,
+    operations: &[mooncake_store_core::PublicationControl],
+) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+    if operations.len() > 64 {
+        return Err(StoreError::InvalidState(
+            "publication control batch exceeds 64 items".to_string(),
+        ));
+    }
+    let mesh = route_mesh(namespace);
+    let mut slot = mesh
+        .authorities
+        .get_mut(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    let runtime = slot
+        .runtime
+        .clone()
+        .ok_or_else(|| not_attached(authority))?;
+    Ok(operations
+        .iter()
+        .map(|operation| slot.table.publication_control(&runtime, operation))
+        .collect())
+}
+
 pub(crate) fn authority_compare_and_swap(
     namespace: &str,
     authority: &ClientStableId,
@@ -292,6 +320,11 @@ pub(crate) fn authority_compare_and_swap(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
+    let runtime = slot
+        .runtime
+        .clone()
+        .ok_or_else(|| not_attached(authority))?;
+    slot.table.admit_publications(&runtime, key, next, false)?;
     Ok(slot.table.compare_and_swap(key, expected, next))
 }
 
@@ -299,7 +332,7 @@ pub(crate) fn authority_compare_and_swap_many(
     namespace: &str,
     authority: &ClientStableId,
     requests: &[RouteCasRequest],
-) -> Result<Vec<CasResult>> {
+) -> Result<Vec<Result<CasResult>>> {
     let mesh = route_mesh(namespace);
     let mut slot = mesh
         .authorities
@@ -308,7 +341,11 @@ pub(crate) fn authority_compare_and_swap_many(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
-    Ok(slot.table.compare_and_swap_many(requests))
+    let runtime = slot
+        .runtime
+        .clone()
+        .ok_or_else(|| not_attached(authority))?;
+    Ok(slot.table.compare_and_swap_many(&runtime, requests))
 }
 
 pub(crate) fn authority_replace(
@@ -325,6 +362,11 @@ pub(crate) fn authority_replace(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
+    let runtime = slot
+        .runtime
+        .clone()
+        .ok_or_else(|| not_attached(authority))?;
+    slot.table.admit_publications(&runtime, key, next, true)?;
     slot.table.replace(key, next);
     Ok(())
 }
@@ -341,6 +383,14 @@ pub(crate) fn authority_replace_many(
         .ok_or_else(|| not_attached(authority))?;
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
+    }
+    let runtime = slot
+        .runtime
+        .clone()
+        .ok_or_else(|| not_attached(authority))?;
+    for request in requests {
+        slot.table
+            .admit_publications(&runtime, &request.key, request.next.as_ref(), true)?;
     }
     slot.table.replace_many(requests);
     Ok(())
@@ -388,6 +438,7 @@ pub fn route_has_readable_replicas(namespace: &str, route: &ObjectRoute) -> bool
 
 #[derive(Default)]
 struct AuthoritySlot {
+    runtime: Option<ClientRuntimeId>,
     ref_count: usize,
     table: LocalRouteTable,
     service: Option<Arc<dyn RouteAuthorityService>>,
@@ -395,17 +446,23 @@ struct AuthoritySlot {
 
 pub(crate) fn register_local_authority(
     namespace: &str,
-    authority: &ClientStableId,
+    runtime: &ClientRuntimeId,
     delete_marker_budget_bytes: usize,
 ) {
+    let authority = &runtime.stable_id;
     let mesh = route_mesh(namespace);
     let mut slot = mesh
         .authorities
         .entry(authority.0.clone())
         .or_insert_with(|| AuthoritySlot {
+            runtime: Some(runtime.clone()),
             table: LocalRouteTable::with_delete_marker_budget(delete_marker_budget_bytes),
             ..AuthoritySlot::default()
         });
+    if slot.runtime.as_ref() != Some(runtime) {
+        slot.table = LocalRouteTable::with_delete_marker_budget(delete_marker_budget_bytes);
+        slot.runtime = Some(runtime.clone());
+    }
     slot.ref_count += 1;
     let snapshot = slot.table.delete_marker_snapshot();
     record_delete_marker_state(

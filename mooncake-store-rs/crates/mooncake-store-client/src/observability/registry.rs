@@ -1889,6 +1889,7 @@ pub(crate) fn cold_tier_error_kind(error: &mooncake_store_core::StoreError) -> &
         mooncake_store_core::StoreError::Unsupported(_) => "unsupported",
         mooncake_store_core::StoreError::QuotaExceeded { .. } => "quota_exceeded",
         mooncake_store_core::StoreError::Backpressure(_) => "backpressure",
+        mooncake_store_core::StoreError::PublicationRetired(_) => "publication_retired",
     }
 }
 
@@ -2037,6 +2038,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, (owner, tier))| ReplicaRoute {
+                    publication: None,
                     owner: ClientRuntimeId::new(*owner, ClientEpoch(1)),
                     segment_name: SegmentName::new(format!("segment-{index}")),
                     allocation_id: Some(index as u64),

@@ -1358,6 +1358,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new(owner_id, ClientEpoch(1)),
                 segment_name: SegmentName::new(seg_name),
                 allocation_id: None,

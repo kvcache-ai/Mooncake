@@ -26,6 +26,27 @@ impl LocalAuthorityAdapter {
 }
 
 impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
+    fn publication_control(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        operations: &[mooncake_store_core::PublicationControl],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+        let _guard = self.route_write_gate.lock();
+        if operations.iter().any(|operation| {
+            matches!(
+                operation,
+                mooncake_store_core::PublicationControl::Enroll { .. }
+                    | mooncake_store_core::PublicationControl::RegisterReceiver(_)
+                    | mooncake_store_core::PublicationControl::AdmitReceiver(_)
+            )
+        }) {
+            self.ensure_accepting_writes()?;
+        }
+        mooncake_store_route::LocalRouteAuthority::new(namespace, authority.clone())
+            .publication_control(operations)
+    }
+
     fn get_route(
         &self,
         namespace: &str,
@@ -162,11 +183,8 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
             Err(error) => return requests.iter().map(|_| Err(error.clone())).collect(),
         };
         match authority_compare_and_swap_many(namespace, authority, requests) {
-            Ok(results) => results.into_iter().map(Ok).collect(),
-            Err(error) => requests
-                .iter()
-                .map(|_| Err(StoreError::NotFound(error.to_string())))
-                .collect(),
+            Ok(results) => results,
+            Err(error) => requests.iter().map(|_| Err(error.clone())).collect(),
         }
     }
 
@@ -182,10 +200,7 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         };
         match authority_replace_many(namespace, authority, requests) {
             Ok(()) => requests.iter().map(|_| Ok(())).collect(),
-            Err(error) => requests
-                .iter()
-                .map(|_| Err(StoreError::NotFound(error.to_string())))
-                .collect(),
+            Err(error) => requests.iter().map(|_| Err(error.clone())).collect(),
         }
     }
 }
@@ -314,6 +329,25 @@ impl LocalAllocatorAdapter {
 }
 
 impl AllocatorService for LocalAllocatorAdapter {
+    fn requires_publication_provenance(&self) -> bool {
+        self.storage_owner.route_ops.publication_fencing_enabled()
+    }
+
+    fn bind_publication(
+        &self,
+        reservation: mooncake_store_core::SegmentReservation,
+        attempt: mooncake_store_core::PublicationAttempt,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        if reservation.owner != self.runtime {
+            return Err(StoreError::InvalidState(
+                "publication reservation owner changed".to_string(),
+            ));
+        }
+        self.allocator
+            .lock()
+            .bind_publication(reservation, attempt, self.allocation_lifecycle)
+    }
+
     fn reserve_any(
         &self,
         owner: &ClientRuntimeId,
@@ -359,15 +393,13 @@ impl AllocatorService for LocalAllocatorAdapter {
                 owner, self.runtime
             )));
         }
-        self.allocator
-            .lock()
-            .release(
-                owner,
-                segment_name,
-                offset_bytes,
-                length_bytes,
-                allocation_id,
-            )
+        self.storage_owner.release_with_publication_fence(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+        )
     }
 
     fn batch_reserve_any(
@@ -496,11 +528,10 @@ impl AllocatorService for LocalAllocatorAdapter {
                 })
                 .collect();
         }
-        let mut allocator = self.allocator.lock();
         requests
             .iter()
             .map(|request| {
-                allocator.release(
+                self.storage_owner.release_with_publication_fence(
                     owner,
                     &request.segment_name,
                     request.offset_bytes,

@@ -52,6 +52,18 @@ impl RouteOwnerPage {
 }
 
 pub(crate) trait RouteAuthorityClient: Send + Sync {
+    fn publication_control(
+        &self,
+        _lease: &ClientLease,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _operations: &[mooncake_store_core::PublicationControl],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+        Err(StoreError::Unsupported(
+            "publication control is unavailable".to_string(),
+        ))
+    }
+
     fn batch_get_routes(
         &self,
         lease: &ClientLease,
@@ -118,6 +130,17 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
 }
 
 pub trait RouteAuthorityService: Send + Sync {
+    fn publication_control(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _operations: &[mooncake_store_core::PublicationControl],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+        Err(StoreError::Unsupported(
+            "publication control is unavailable".to_string(),
+        ))
+    }
+
     fn get_route(
         &self,
         namespace: &str,

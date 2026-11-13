@@ -1,3 +1,63 @@
+macro_rules! delegate_publication_setup {
+    () => {
+        fn publication_fencing_enabled(&self) -> bool {
+            self.inner.publication_fencing_enabled()
+        }
+        fn invalidate_publication(&self, attempt: &mooncake_store_core::PublicationAttempt) {
+            self.inner.invalidate_publication(attempt)
+        }
+        fn prepare_publication(
+            &self,
+            observer: &mooncake_store_core::ClientLease,
+            key: &mooncake_store_core::ObjectKey,
+            sequence: u64,
+        ) -> mooncake_store_core::Result<mooncake_store_core::PublicationAttempt> {
+            self.inner.prepare_publication(observer, key, sequence)
+        }
+        fn publication_receivers(
+            &self,
+            observer: &mooncake_store_core::ClientLease,
+            key: &mooncake_store_core::ObjectKey,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ClientRuntimeId>> {
+            self.inner.publication_receivers(observer, key)
+        }
+        fn finalize_publications(
+            &self,
+            observer: &mooncake_store_core::ClientLease,
+            requests: &[mooncake_store_core::PublicationRevokeRequest],
+            released: bool,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::Result<()>>> {
+            self.inner
+                .finalize_publications(observer, requests, released)
+        }
+    };
+}
+
+macro_rules! delegate_publication_revoke {
+    () => {
+        fn revoke_publications(
+            &self,
+            observer: &mooncake_store_core::ClientLease,
+            requests: &[mooncake_store_core::PublicationRevokeRequest],
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::PublicationRevokeReply>> {
+            self.inner.revoke_publications(observer, requests)
+        }
+    };
+}
+
+mod full_lifecycle_cold_probe;
+mod full_lifecycle_delete_probe;
+mod full_lifecycle_offload_nof_boundary;
+mod full_lifecycle_publication_probe;
+mod full_lifecycle_restart_probe;
+mod full_restore_retry_tests;
+mod publication_fence_protocol_tests;
+mod publication_primary_loss_probe;
+mod review_retired_batch_conflict;
+mod route_cas_boundary_tests;
+mod route_clock_cold_read_tests;
+mod route_clock_offload_tests;
+mod route_snapshot_boundary_tests;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::fs;
@@ -155,6 +215,12 @@ struct CountingMetadataBackend {
 
 struct CountingRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
+    miss_bounded_reads: AtomicBool,
+    miss_full_reads: AtomicBool,
+    bounded_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    owner_visit_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    before_single_cas_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    after_single_cas_hook: Mutex<Option<Box<dyn FnOnce(&mooncake_store_core::CasResult) + Send>>>,
     injected_routes: Mutex<BTreeMap<String, ObjectRoute>>,
     get_object_routes_calls: AtomicUsize,
     bounded_reads: Arc<AtomicUsize>,
@@ -182,9 +248,74 @@ struct FinalizeFailureMetadataBackend {
 struct StaticAllocatorAdapter {
     runtime: ClientRuntimeId,
     allocator: Arc<Mutex<LocalAllocatorState>>,
+    storage_owner: Arc<StorageOwnerState>,
 }
 
 impl AllocatorService for StaticAllocatorAdapter {
+    fn bind_publication(
+        &self,
+        reservation: SegmentReservation,
+        attempt: mooncake_store_core::PublicationAttempt,
+    ) -> Result<SegmentReservation> {
+        if reservation.owner != self.runtime {
+            return Err(StoreError::InvalidState(
+                "publication reservation owner changed".to_string(),
+            ));
+        }
+        self.allocator.lock().bind_publication(
+            reservation,
+            attempt,
+            AllocationLifecycleConfig::default(),
+        )
+    }
+
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        lengths: &[u64],
+    ) -> Vec<Result<SegmentReservation>> {
+        lengths
+            .iter()
+            .map(|length| {
+                if *owner != self.runtime {
+                    return Err(StoreError::InvalidState(
+                        "allocator runtime changed".to_string(),
+                    ));
+                }
+                self.allocator.lock().reserve_any_with_pending_publication(
+                    owner,
+                    *length,
+                    test_future_expiry_ms(),
+                )
+            })
+            .collect()
+    }
+
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[crate::control_plane::ReserveSpecificOp],
+    ) -> Vec<Result<SegmentReservation>> {
+        requests
+            .iter()
+            .map(|request| {
+                if *owner != self.runtime {
+                    return Err(StoreError::InvalidState(
+                        "allocator runtime changed".to_string(),
+                    ));
+                }
+                self.allocator
+                    .lock()
+                    .reserve_specific_with_pending_publication(
+                        owner,
+                        &request.segment_name,
+                        request.length_bytes,
+                        test_future_expiry_ms(),
+                    )
+            })
+            .collect()
+    }
+
     fn reserve_any(
         &self,
         owner: &ClientRuntimeId,
@@ -230,7 +361,7 @@ impl AllocatorService for StaticAllocatorAdapter {
                 owner, self.runtime
             )));
         }
-        self.allocator.lock().release(
+        self.storage_owner.release_with_publication_fence(
             owner,
             segment_name,
             offset_bytes,
@@ -546,6 +677,12 @@ impl CountingRouteDirectory {
     fn new(inner: Arc<dyn RouteDirectory>) -> Self {
         Self {
             inner,
+            miss_bounded_reads: AtomicBool::new(false),
+            miss_full_reads: AtomicBool::new(false),
+            bounded_read_hook: Mutex::new(None),
+            owner_visit_hook: Mutex::new(None),
+            before_single_cas_hook: Mutex::new(None),
+            after_single_cas_hook: Mutex::new(None),
             injected_routes: Mutex::new(BTreeMap::new()),
             get_object_routes_calls: AtomicUsize::new(0),
             bounded_reads: Arc::new(AtomicUsize::new(0)),
@@ -2007,12 +2144,34 @@ impl MetadataBackend for CountingMetadataBackend {
 }
 
 impl RouteDirectory for CountingRouteDirectory {
+    delegate_publication_setup!();
+
+    fn revoke_publications(
+        &self,
+        observer: &ClientLease,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::PublicationRevokeReply>> {
+        self.allocation_reference_key_queries
+            .fetch_add(1, Ordering::Relaxed);
+        if self
+            .fail_allocation_reference_key_queries
+            .load(Ordering::Relaxed)
+        {
+            return Err(StoreError::Transport(
+                "injected allocation reference query failure".to_string(),
+            ));
+        }
+        self.inner.revoke_publications(observer, requests)
+    }
     fn get_object_route(
         &self,
         observer: &ClientLease,
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_full_reads.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         if let Some(route) = self.injected_route(key) {
             return Ok(Some(route));
         }
@@ -2035,6 +2194,9 @@ impl RouteDirectory for CountingRouteDirectory {
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_full_reads.load(Ordering::Relaxed) {
+            return Ok(vec![None; keys.len()]);
+        }
         let mut routes = self.inner.get_object_routes(observer, keys)?;
         for (key, route) in keys.iter().zip(routes.iter_mut()) {
             if let Some(injected) = self.injected_route(key) {
@@ -2050,6 +2212,13 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        let hook = self.bounded_read_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        if self.miss_bounded_reads.load(Ordering::Relaxed) {
+            return Ok(vec![None; keys.len()]);
+        }
         let mut routes = self.inner.get_object_routes_bounded(observer, keys)?;
         for (key, route) in keys.iter().zip(routes.iter_mut()) {
             if let Some(injected) = self.injected_route(key) {
@@ -2092,8 +2261,18 @@ impl RouteDirectory for CountingRouteDirectory {
         next: Option<&ObjectRoute>,
     ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
         self.single_cas_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .compare_and_swap_object_route(observer, key, expected, next)
+        let before = self.before_single_cas_hook.lock().take();
+        let after = self.after_single_cas_hook.lock().take();
+        if let Some(before) = before {
+            before();
+        }
+        let result = self
+            .inner
+            .compare_and_swap_object_route(observer, key, expected, next)?;
+        if let Some(after) = after {
+            after(&result);
+        }
+        Ok(result)
     }
 
     fn compare_and_swap_object_routes(
@@ -2134,6 +2313,10 @@ impl RouteDirectory for CountingRouteDirectory {
             .visit_routes_by_replica_owner_consistent(observer, owner, visitor)?;
         if let Some(injected) = self.injected_route_for_owner(owner) {
             visitor(injected)?;
+        }
+        let hook = self.owner_visit_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
         Ok(())
     }
@@ -2185,12 +2368,23 @@ impl RouteDirectory for CountingRouteDirectory {
             .get_allocation_route_reference_keys_consistent(observer, identities)
     }
 
+    fn get_allocation_route_references_consistent(
+        &self,
+        observer: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::AllocationRouteReferenceState>> {
+        self.inner
+            .get_allocation_route_references_consistent(observer, identities)
+    }
+
     fn metadata(&self) -> &dyn MetadataBackend {
         self.inner.metadata()
     }
 }
 
 impl RouteDirectory for EmptyConflictRouteDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -2951,6 +3145,31 @@ fn storage_config_with_bytes(storage_bytes: usize) -> LocalMemoryConfig {
         .alignment(1)
         .reclaim_grace_ms(0)
         .eviction_poll_interval(Duration::ZERO)
+}
+
+fn reserve_fenced_pending_for_test(client: &StoreClient, key: &ObjectKey) -> SegmentReservation {
+    let attempt = client
+        .publication_cohort(key)
+        .unwrap()
+        .expect("embedded publication cohort");
+    let mut allocator = client.allocator.lock();
+    let reservation = allocator
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .unwrap();
+    allocator
+        .bind_publication(reservation, attempt, client.allocation_lifecycle)
+        .unwrap()
+}
+
+fn renew_route_publication_for_test(client: &StoreClient, route: &mut ObjectRoute) {
+    let cohort = client
+        .publication_cohort(&route.key)
+        .expect("publication cohort should prepare");
+    for replica in &mut route.replicas {
+        replica.publication = client
+            .mint_publication(cohort.as_ref())
+            .expect("publication attempt should mint");
+    }
 }
 
 fn storage_config_with_background_eviction(
@@ -4198,6 +4417,7 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
         compatibility: writer.lease().compatibility.clone(),
         replicas: vec![
             ReplicaRoute {
+                publication: None,
                 owner: owner_a_v1.clone(),
                 segment_name: SegmentName::new("multi-replica-store-a-segment-v1"),
                 allocation_id: None,
@@ -4209,6 +4429,7 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
                 priority: 0,
             },
             ReplicaRoute {
+                publication: None,
                 owner: owner_b_v1.clone(),
                 segment_name: SegmentName::new("multi-replica-store-b-segment-v1"),
                 allocation_id: None,
@@ -6846,6 +7067,7 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
         .expect("reader build should succeed");
 
     let replica = ReplicaRoute {
+        publication: None,
         owner: store.runtime_id().clone(),
         segment_name: SegmentName::new("deadline-store-segment"),
         allocation_id: None,
@@ -8525,6 +8747,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .map(|offset| offset.saturating_add(1));
     divergent_route.replicas[0].segment_offset =
         divergent_route.replicas[0].segment_offset.saturating_add(1);
+    renew_route_publication_for_test(&writer, &mut divergent_route);
 
     crate::route_directory::authority_replace(
         &namespace,
@@ -8805,7 +9028,32 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
             GetRequest::new("hot-batch-b", &mut buf_b).tenant("tenant-a"),
             GetRequest::new("hot-batch-c", &mut buf_c).tenant("tenant-a"),
         ])
-        .expect("reader batch_get_into should succeed");
+        .unwrap_or_else(|error| {
+            let namespace = metadata.route_namespace();
+            eprintln!("batch read failed at now_ms={}", now_ms());
+            for client in [&storage, &router, &reader] {
+                eprintln!("runtime={} lease={:?}", client.runtime_id(), client.lease());
+                for key in ["hot-batch-a", "hot-batch-b", "hot-batch-c"] {
+                    let route = authority_get(
+                        &namespace,
+                        &client.runtime_id().stable_id,
+                        &client.scoped_key("tenant-a", key),
+                    );
+                    eprintln!(
+                        "authority={} key={key} route={route:?}",
+                        client.runtime_id()
+                    );
+                }
+            }
+            let allocator = storage.allocator.lock();
+            eprintln!(
+                "storage usage={:?} provenance={:?} pending={:?}",
+                allocator.usage_bytes(),
+                allocator.publication_provenance,
+                allocator.pending_allocations,
+            );
+            panic!("reader batch_get_into should succeed: {error:?}");
+        });
     assert_eq!(sizes, vec![7, 7, 7]);
     assert_eq!(&buf_a, b"alpha-1");
     assert_eq!(&buf_b, b"beta-11");
@@ -9146,6 +9394,7 @@ fn routed_batch_put_from_uses_bounded_recheck_for_empty_conflict() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: storage.lease().compatibility,
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: storage.runtime_id().clone(),
             segment_name: segment,
             allocation_id: None,
@@ -11879,6 +12128,7 @@ fn eviction_reclaims_stale_local_allocation_before_live_clock_victim() {
     moved_stale_route.version = stale_route.version.next();
     moved_stale_route.replicas[0].owner =
         ClientRuntimeId::new("evict-stale-successor", ClientEpoch(1));
+    renew_route_publication_for_test(&client, &mut moved_stale_route);
     let cas = client
         .route_directory
         .compare_and_swap_object_route(
@@ -11996,6 +12246,7 @@ fn eviction_stale_prepass_respects_pending_window_before_reclaiming_orphans() {
     moved_stale_route.version = stale_route.version.next();
     moved_stale_route.replicas[0].owner =
         ClientRuntimeId::new("tiny-stale-successor", ClientEpoch(1));
+    renew_route_publication_for_test(&client, &mut moved_stale_route);
     let cas = client
         .route_directory
         .compare_and_swap_object_route(
@@ -12008,6 +12259,7 @@ fn eviction_stale_prepass_respects_pending_window_before_reclaiming_orphans() {
     assert!(cas.applied, "stale route move should apply");
     client.allocator.lock().mark_pending_reservation(
         &SegmentReservation {
+            publication: None,
             owner: client.runtime_id().clone(),
             segment_name: stale_route.replicas[0].segment_name.clone(),
             offset_bytes: stale_route.replicas[0].segment_offset,
@@ -12092,6 +12344,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             allocation_id: Some(reservation.allocation_id),
@@ -12125,6 +12378,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: ClientRuntimeId::new("mixed-pending-successor", ClientEpoch(1)),
             segment_name: SegmentName::new("mixed-pending-successor-segment"),
             allocation_id: None,
@@ -12262,6 +12516,7 @@ fn eviction_reclaims_stale_local_allocation_even_with_tiny_scan_limit() {
     moved_stale_route.version = stale_route.version.next();
     moved_stale_route.replicas[0].owner =
         ClientRuntimeId::new("tiny-stale-successor", ClientEpoch(1));
+    renew_route_publication_for_test(&client, &mut moved_stale_route);
     let cas = client
         .route_directory
         .compare_and_swap_object_route(
@@ -12456,6 +12711,7 @@ fn eviction_victim_lookup_uses_bounded_route_read() {
     moved_route.version = route.version.next();
     moved_route.replicas[0].owner =
         ClientRuntimeId::new("bounded-victim-successor", ClientEpoch(1));
+    renew_route_publication_for_test(&client, &mut moved_route);
     let cas = client
         .route_directory
         .compare_and_swap_object_route(
@@ -12839,6 +13095,7 @@ fn eviction_pressure_can_reclaim_stale_allocation_before_reclaim_grace_deadline(
     moved_stale_route.version = stale_route.version.next();
     moved_stale_route.replicas[0].owner =
         ClientRuntimeId::new("grace-best-effort-successor", ClientEpoch(1));
+    renew_route_publication_for_test(&client, &mut moved_stale_route);
     let cas = client
         .route_directory
         .compare_and_swap_object_route(
@@ -12899,6 +13156,7 @@ fn clean_evict_and_reserve_reclaims_stale_before_live_materialized_route() {
     moved_stale_route.version = stale_route.version.next();
     moved_stale_route.replicas[0].owner =
         ClientRuntimeId::new("clean-reserve-stale-successor", ClientEpoch(1));
+    renew_route_publication_for_test(&client, &mut moved_stale_route);
     let cas = client
         .route_directory
         .compare_and_swap_object_route(
@@ -13052,6 +13310,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         }),
         Arc::new(StaticAllocatorAdapter {
             runtime: remote_owner.clone(),
+            storage_owner: test_storage_owner_state(&remote_owner, remote_allocator.clone()),
             allocator: remote_allocator,
         }),
         Arc::new(NoopEvictionService),
@@ -14024,7 +14283,7 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     client
@@ -14178,7 +14437,7 @@ fn dynamic_max_objects_shrink_evicts_until_tenant_fits_new_limit() {
         .live_client_sync_interval(Duration::ZERO)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     for index in 0..20 {
@@ -14279,7 +14538,7 @@ fn dynamic_max_objects_shrink_allows_non_worsening_overwrite() {
         .live_client_sync_interval(Duration::ZERO)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     for index in 0..20 {
@@ -14349,7 +14608,7 @@ fn non_default_tenant_without_policy_inherits_namespace_quota() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     let error = client
@@ -14390,7 +14649,7 @@ fn routing_only_tenant_policy_still_inherits_namespace_quota() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     let error = client
@@ -14433,7 +14692,7 @@ fn namespace_quota_overwrite_uses_committed_delta() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     client
@@ -14499,7 +14758,7 @@ fn remove_refunds_quota_when_delete_becomes_authoritative() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     client.put("key", b"12345678").expect("put should succeed");
@@ -14639,7 +14898,7 @@ fn tenant_local_quota_eviction_does_not_touch_other_tenants() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     client
@@ -14760,7 +15019,7 @@ fn tenant_local_quota_eviction_preserves_other_tenant_same_logical_key() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     client
@@ -14931,7 +15190,7 @@ fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("quota client should build");
 
     let error = client
@@ -15077,6 +15336,15 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
         .expect("writer memory should register");
     wait_for_runtime_visibility(&client, &owner);
 
+    let missing_preferred_attempts = || {
+        snapshot_metrics()
+            .preferred_segment_skip
+            .iter()
+            .find(|sample| sample.key.source == "tenant_policy" && sample.key.reason == "not_found")
+            .map(|sample| sample.value)
+            .unwrap_or(0)
+    };
+    let before_single = missing_preferred_attempts();
     let single = client
         .put("single-fallback", b"alpha")
         .expect("tenant-policy hint should fall back for put");
@@ -15084,7 +15352,13 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
         single.replicas[0].segment_name,
         SegmentName::new("seg-live")
     );
+    assert!(
+        missing_preferred_attempts() > before_single,
+        "put must attempt the missing tenant-policy segment before falling back"
+    );
+    assert_eq!(client.get("single-fallback").unwrap(), b"alpha");
 
+    let before_batch = missing_preferred_attempts();
     let batch = client
         .batch_put(&[PutRequest::new("batch-fallback", b"bravo")])
         .expect("tenant-policy hint should fall back for batch_put");
@@ -15092,11 +15366,11 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
         batch[0].replicas[0].segment_name,
         SegmentName::new("seg-live")
     );
-
-    let metrics = render_prometheus_metrics();
-    assert!(metrics.contains(
-        "mooncake_store_preferred_segment_skip_total{tenant=\"tenant-a\",source=\"tenant_policy\",reason=\"not_found\"} 2"
-    ));
+    assert!(
+        missing_preferred_attempts() > before_batch,
+        "batch_put must attempt the missing tenant-policy segment before falling back"
+    );
+    assert_eq!(client.get("batch-fallback").unwrap(), b"bravo");
 }
 
 #[test]
@@ -15684,6 +15958,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     let mut replaced_route = route.clone();
     replaced_route.key = replace_key.clone();
     replaced_route.version = route.version.next();
+    renew_route_publication_for_test(&client, &mut replaced_route);
     local_authority
         .replace_route(&namespace, &authority, &replace_key, Some(&replaced_route))
         .expect("single replace should succeed");
@@ -15871,18 +16146,28 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         .expect("rpc batch replace should succeed");
     assert!(rpc_replace[0].is_ok());
 
+    let cohort = client.publication_cohort(&scoped_key).unwrap();
     let rpc_reservations = control
-        .batch_reserve_any(&lease, client.runtime_id(), &[8, 16])
+        .batch_reserve_any_with_publications(
+            &lease,
+            client.runtime_id(),
+            &[8, 16],
+            &[
+                client.mint_publication(cohort.as_ref()).unwrap(),
+                client.mint_publication(cohort.as_ref()).unwrap(),
+            ],
+        )
         .expect("rpc reserve_any should succeed");
     let rpc_reservations = rpc_reservations
         .into_iter()
         .map(|result| result.expect("reserve_any item should succeed"))
         .collect::<Vec<_>>();
     let rpc_specific = control
-        .batch_reserve_specific(
+        .batch_reserve_specific_with_pending_publication(
             &lease,
             client.runtime_id(),
             &[crate::control_plane::ReserveSpecificOp {
+                publication: client.mint_publication(cohort.as_ref()).unwrap(),
                 segment_name: primary.clone(),
                 length_bytes: 8,
             }],
@@ -15921,7 +16206,12 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     assert!(release_results.iter().all(|result| result.is_ok()));
 
     let wrong_reserve = control
-        .batch_reserve_any(&lease, &wrong_owner, &[8])
+        .batch_reserve_any_with_publications(
+            &lease,
+            &wrong_owner,
+            &[8],
+            &[client.mint_publication(cohort.as_ref()).unwrap()],
+        )
         .expect("wrong-owner reserve should still reply");
     assert!(matches!(wrong_reserve[0], Err(StoreError::InvalidState(_))));
     let wrong_release = control
@@ -15969,7 +16259,12 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         Err(StoreError::InvalidState(_))
     ));
     let draining_rpc_reserve = control
-        .batch_reserve_any(&client.lease(), client.runtime_id(), &[8])
+        .batch_reserve_any_with_publications(
+            &client.lease(),
+            client.runtime_id(),
+            &[8],
+            &[client.mint_publication(cohort.as_ref()).unwrap()],
+        )
         .expect("draining reserve should still reply");
     assert!(matches!(
         draining_rpc_reserve[0],
@@ -16161,6 +16456,7 @@ fn pending_reclaims_split_cold_backing_from_hot_replica_releases() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: hot_owner.clone(),
             segment_name: SegmentName::new("split-reclaim-hot-segment"),
             allocation_id: None,
@@ -16344,18 +16640,33 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
         );
     };
 
+    let cohort = writer
+        .publication_cohort(&writer.scoped_key("default", "reservation-target"))
+        .unwrap();
     assert_released(
         writer
-            .reserve_storage_runtime_segment(storage.runtime_id(), 16, false)
+            .reserve_candidate(
+                &super::ReplicaPlacementTarget::StorageRuntime(storage.runtime_id().clone()),
+                16,
+                cohort.as_ref(),
+            )
             .map(|(target, _)| target),
     );
     assert_released(
         writer
-            .reserve_specific_segment(storage.runtime_id(), &segment, 16, false)
+            .reserve_candidate(
+                &super::ReplicaPlacementTarget::Segment {
+                    storage_runtime: storage.runtime_id().clone(),
+                    segment_name: segment.clone(),
+                },
+                16,
+                cohort.as_ref(),
+            )
             .map(|(target, _)| target),
     );
     let any_batch = writer
         .reserve_storage_runtime_segments_batch(&[StorageRuntimeReservationRequest {
+            publication: writer.mint_publication(cohort.as_ref()).unwrap(),
             storage_runtime: storage.runtime_id().clone(),
             segment_name: None,
             length_bytes: 16,
@@ -16371,6 +16682,7 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
     );
     let specific_batch = writer
         .reserve_storage_runtime_segments_batch(&[StorageRuntimeReservationRequest {
+            publication: writer.mint_publication(cohort.as_ref()).unwrap(),
             storage_runtime: storage.runtime_id().clone(),
             segment_name: Some(segment.clone()),
             length_bytes: 16,
@@ -16396,6 +16708,7 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
     }
     let local_batch = storage
         .reserve_storage_runtime_segments_batch(&[StorageRuntimeReservationRequest {
+            publication: writer.mint_publication(cohort.as_ref()).unwrap(),
             storage_runtime: storage.runtime_id().clone(),
             segment_name: None,
             length_bytes: 16,
@@ -16806,8 +17119,15 @@ fn unresolved_reservation_reclaim_does_not_treat_suspect_owner_as_unavailable() 
         .expect("writer memory should register");
     wait_for_membership_convergence(&[&storage, &writer]);
 
-    let reservation = writer
-        .reserve_segment_allocation(storage.runtime_id(), None, 16, false)
+    let cohort = writer
+        .publication_cohort(&writer.scoped_key("default", "suspect-reclaim"))
+        .unwrap();
+    let (_, reservation) = writer
+        .reserve_candidate(
+            &super::ReplicaPlacementTarget::StorageRuntime(storage.runtime_id().clone()),
+            16,
+            cohort.as_ref(),
+        )
         .expect("remote reservation should succeed");
     assert_eq!(storage.allocator.lock().usage_bytes().0, 16);
 
@@ -16860,6 +17180,7 @@ fn unresolved_reservation_reclaim_drops_after_owner_is_confirmed_unavailable() {
         .lock()
         .store(vec![unreachable_owner]);
     let reservation = SegmentReservation {
+        publication: None,
         owner: owner.clone(),
         segment_name: SegmentName::new("unavailable-owner-segment"),
         offset_bytes: 0,
@@ -16980,6 +17301,32 @@ fn bounded_parallel_jobs_handles_empty_and_single_job_inputs() {
     assert_eq!(single_results, vec![70]);
 }
 
+#[test]
+fn parallel_map_serial_limit_preserves_thread_order_and_errors() {
+    let caller = std::thread::current().id();
+    let results = run_bounded_parallel_jobs(vec![0usize, 1, 2], 1, |job| {
+        assert_eq!(std::thread::current().id(), caller);
+        if job == 1 {
+            Err("worker error")
+        } else {
+            Ok(job)
+        }
+    });
+    assert_eq!(results, vec![Ok(0), Err("worker error"), Ok(2)]);
+}
+
+#[test]
+fn parallel_map_propagates_worker_panics() {
+    for (jobs, limit) in [(vec![1usize], 8), (vec![0, 1, 2], 1), (vec![0, 1, 2], 2)] {
+        assert!(std::panic::catch_unwind(|| {
+            run_bounded_parallel_jobs(jobs, limit, |job| {
+                assert_ne!(job, 1, "injected worker panic");
+                job
+            })
+        })
+        .is_err());
+    }
+}
 #[test]
 fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
@@ -17372,9 +17719,25 @@ fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
         .enter_draining()
         .expect("store-a should publish its draining state");
 
-    let migrated = store_a
-        .evacuate_owned_replicas()
-        .expect("true client shrink should skip reclaim for unavailable old replica owners");
+    let migrated = store_a.evacuate_owned_replicas().unwrap_or_else(|error| {
+        eprintln!(
+            "initial version={:?} replicas={:?}",
+            initial.version, initial.replicas
+        );
+        let namespace = metadata.route_namespace();
+        for runtime in [
+            store_a.runtime_id(),
+            store_b.runtime_id(),
+            store_c.runtime_id(),
+            store_d.runtime_id(),
+        ] {
+            let route = authority_get(&namespace, &runtime.stable_id, &initial.key);
+            eprintln!("authority={runtime} route={route:?}");
+        }
+        panic!(
+            "true client shrink should skip reclaim for unavailable old replica owners: {error:?}"
+        );
+    });
     assert_eq!(migrated, 1);
 
     let active_runtimes = store_a
@@ -17602,6 +17965,7 @@ fn local_read_prefers_replica_target_offset_over_segment_offset() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: store.lease.compatibility.clone(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: store.runtime_id().clone(),
             segment_name: segment,
             allocation_id: None,
@@ -18107,6 +18471,7 @@ fn readable_replica_selection_prefers_local_survivor() {
         compatibility: local.lease().compatibility,
         replicas: vec![
             ReplicaRoute {
+                publication: None,
                 owner: remote.runtime_id().clone(),
                 segment_name: remote_segment,
                 allocation_id: None,
@@ -18118,6 +18483,7 @@ fn readable_replica_selection_prefers_local_survivor() {
                 priority: 0,
             },
             ReplicaRoute {
+                publication: None,
                 owner: local.runtime_id().clone(),
                 segment_name: local_segment.clone(),
                 allocation_id: None,
@@ -19095,6 +19461,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: owner.clone(),
             segment_name: primary.segment_name.clone(),
             allocation_id: None,
@@ -19137,6 +19504,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     let specific = adapter.batch_reserve_specific(
         &owner,
         &[crate::control_plane::ReserveSpecificOp {
+            publication: None,
             segment_name: primary.segment_name.clone(),
             length_bytes: 8,
         }],
@@ -19245,6 +19613,15 @@ fn drain_stale_release_waits_for_pending_publish_deadline() {
     let reservation = client
         .reserve_segment_allocation(client.runtime_id(), None, 32, true)
         .expect("reservation should succeed");
+    let attempt = client
+        .publication_cohort(&client.scoped_key("default", "pending-deadline"))
+        .unwrap()
+        .unwrap();
+    let reservation = client
+        .allocator
+        .lock()
+        .bind_publication(reservation, attempt, client.allocation_lifecycle)
+        .expect("pending reservation should bind publication provenance");
     let primary = client.segment_name().expect("primary segment should exist");
     client
         .drain_segment_internal(&primary, true)
@@ -19313,6 +19690,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: owner.clone(),
             segment_name: published.segment_name.clone(),
             allocation_id: None,
@@ -20147,6 +20525,19 @@ struct FailBeforeApplyRouteDirectory {
 }
 
 impl RouteDirectory for ApplyThenFailRouteDirectory {
+    delegate_publication_setup!();
+    fn revoke_publications(
+        &self,
+        observer: &ClientLease,
+        requests: &[mooncake_store_core::PublicationRevokeRequest],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::PublicationRevokeReply>> {
+        if self.confirmation_fails.load(Ordering::Relaxed) {
+            return Err(StoreError::Transport(
+                "injected publication confirmation failure".to_string(),
+            ));
+        }
+        self.inner.revoke_publications(observer, requests)
+    }
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -20193,6 +20584,8 @@ impl RouteDirectory for ApplyThenFailRouteDirectory {
 }
 
 impl RouteDirectory for ApplyBatchThenFailRouteDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -20244,6 +20637,8 @@ impl RouteDirectory for ApplyBatchThenFailRouteDirectory {
 }
 
 impl RouteDirectory for FailBeforeApplyRouteDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -20581,11 +20976,10 @@ fn pending_publication_recovery_releases_absent_identity_without_candidate_scan(
         directory.clone(),
         ColdTierOffloadPriorityConfig::default(),
     );
-    let reservation = client
-        .allocator
-        .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
-        .expect("reservation should create a tracked pending publication");
+    let reservation = reserve_fenced_pending_for_test(
+        &client,
+        &ObjectKey::new("default::pending-publication-absent"),
+    );
 
     assert_eq!(
         owner
@@ -20633,11 +21027,10 @@ fn pending_publication_authority_failures_are_shared_backed_off() {
         .register_local_memory()
         .expect("local memory should register");
 
-    client
-        .allocator
-        .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
-        .expect("reservation should create a due pending publication");
+    reserve_fenced_pending_for_test(
+        &client,
+        &ObjectKey::new("default::pending-publication-backoff"),
+    );
     let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
     directory
         .fail_allocation_reference_key_queries
@@ -20705,11 +21098,10 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
         directory.clone(),
         ColdTierOffloadPriorityConfig::default(),
     );
-    let reservation = client
-        .allocator
-        .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
-        .expect("reservation should create a tracked pending publication");
+    let reservation = reserve_fenced_pending_for_test(
+        &client,
+        &ObjectKey::new("default::pending-publication-exact"),
+    );
     let route = ObjectRoute {
         key: route_key,
         namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
@@ -20721,6 +21113,7 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: reservation.publication.clone(),
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             allocation_id: Some(reservation.allocation_id),
@@ -20794,11 +21187,7 @@ fn pending_publication_recovery_prepares_cold_backing_before_releasing_fence() {
         .expect("local memory should register");
 
     let route_key = ObjectKey::new("default::pending-publication-cold");
-    let reservation = client
-        .allocator
-        .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
-        .expect("reservation should create a tracked pending publication");
+    let reservation = reserve_fenced_pending_for_test(&client, &route_key);
     let route = ObjectRoute {
         key: route_key.clone(),
         namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
@@ -20810,6 +21199,7 @@ fn pending_publication_recovery_prepares_cold_backing_before_releasing_fence() {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: reservation.publication.clone(),
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             allocation_id: Some(reservation.allocation_id),
@@ -20947,11 +21337,10 @@ fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
         .register_local_memory()
         .expect("local memory should register");
 
-    let reservation = client
-        .allocator
-        .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
-        .expect("reservation should create a pending publication");
+    let reservation = reserve_fenced_pending_for_test(
+        &client,
+        &ObjectKey::new("default::delete-pending-queue-full"),
+    );
     let identity = AllocationIdentity {
         segment_name: reservation.segment_name.clone(),
         offset_bytes: reservation.offset_bytes,
@@ -21150,11 +21539,10 @@ fn delete_pending_retains_republished_exact_identity() {
         .register_local_memory()
         .expect("local memory should register");
 
-    let reservation = client
-        .allocator
-        .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
-        .expect("reservation should succeed");
+    let reservation = reserve_fenced_pending_for_test(
+        &client,
+        &ObjectKey::new("default::delete-pending-referenced"),
+    );
     let route = ObjectRoute {
         key: ObjectKey::new("default::delete-pending-referenced"),
         namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
@@ -21166,6 +21554,7 @@ fn delete_pending_retains_republished_exact_identity() {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: reservation.publication.clone(),
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             allocation_id: Some(reservation.allocation_id),
@@ -21260,6 +21649,7 @@ fn delete_reclaim_does_not_downgrade_unknown_owner_to_legacy_release() {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: owner.clone(),
             segment_name: SegmentName::new("delete-unknown-owner-segment"),
             allocation_id: Some(7),
@@ -21361,6 +21751,7 @@ fn put_retains_lifecycle_reservation_when_route_cas_reply_is_lost() {
     );
 
     let pending = PendingPublication {
+        attempt: None,
         identity: identity.clone(),
     };
     let references = client
@@ -21604,6 +21995,146 @@ fn capacity_pressure_forces_bounded_reclaim_of_untracked_allocation() {
             .expect("stale route lookup should succeed")
             .is_none(),
         "forced candidate reclaim must not republish the deleted route"
+    );
+}
+
+#[test]
+fn background_eviction_recovers_after_bounded_route_miss() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "bounded-route-miss")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new("bounded-route-miss-segment")))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(64)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("memory should register");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    for index in 0..4 {
+        let route = client
+            .put(&format!("live-{index}"), b"0123456789abcdef")
+            .expect("public put should fill local capacity");
+        wait_for_storage_clock_route(&client, &route, false);
+        owner.track_route(&route);
+    }
+    directory.miss_bounded_reads.store(true, Ordering::Relaxed);
+    let initial = owner
+        .evict_until_low_watermark(90, 50)
+        .expect("transient bounded miss should fail closed");
+    assert_eq!(initial, 0);
+    directory.miss_bounded_reads.store(false, Ordering::Relaxed);
+    sleep(Duration::from_millis(120));
+    let recovered = owner
+        .evict_until_low_watermark(90, 50)
+        .expect("healthy authorities should allow eviction again");
+    eprintln!(
+        "recovered={recovered} usage={} pending={} clock={}",
+        owner.allocator.lock().usage_bytes().0,
+        owner.pending_evictions.lock().len(),
+        owner
+            .hot_replicas
+            .clock
+            .lock()
+            .entries
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+    );
+    client.storage_owner = owner;
+    client
+        .put("after-recovery", b"fedcba9876543210")
+        .expect("public put must resume after the bounded lookup recovers");
+}
+
+#[test]
+fn repeated_public_put_recovers_after_clock_misses() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "clock-miss-queue")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new("clock-miss-queue-segment")))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(16 * 1024)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("memory should register");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    for index in 0..1024 {
+        let route = client
+            .put(&format!("queue-live-{index}"), b"0123456789abcdef")
+            .expect("public put should fill local capacity");
+        owner.track_route(&route);
+    }
+    directory.miss_bounded_reads.store(true, Ordering::Relaxed);
+    for _ in 0..4 {
+        assert_eq!(
+            owner
+                .evict_until_low_watermark(90, 50)
+                .expect("bounded miss"),
+            0,
+        );
+    }
+    directory.miss_bounded_reads.store(false, Ordering::Relaxed);
+    client.storage_owner = owner.clone();
+    let mut successful_writes = 0;
+    for index in 0..40 {
+        sleep(Duration::from_millis(120));
+        if client
+            .put(&format!("queue-recovered-{index}"), b"fedcba9876543210")
+            .is_ok()
+        {
+            successful_writes += 1;
+        }
+    }
+    eprintln!(
+        "successful_writes={successful_writes} usage={} pending={} clock={}",
+        owner.allocator.lock().usage_bytes().0,
+        owner.pending_evictions.lock().len(),
+        owner
+            .hot_replicas
+            .clock
+            .lock()
+            .entries
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+    );
+    assert_eq!(
+        successful_writes, 40,
+        "public writes must recover after the route lookup recovers"
+    );
+    assert!(
+        owner.pending_evictions.lock().is_empty(),
+        "recovery must drain the reclaim queue"
     );
 }
 
@@ -22318,6 +22849,8 @@ struct AppliedMigrationReplyLossDirectory {
     fail_once: AtomicBool,
 }
 impl RouteDirectory for AppliedMigrationReplyLossDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,

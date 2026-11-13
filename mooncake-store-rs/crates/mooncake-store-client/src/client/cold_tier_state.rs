@@ -147,7 +147,16 @@ struct ColdTierDeviceManager {
 
 struct ColdTierOffloadManager {
     queue: Mutex<PendingOffloadQueue>,
+    unconfirmed: Mutex<BTreeMap<PendingOffloadKey, PendingOffloadUnconfirmed>>,
     materializing: AtomicBool,
+}
+
+#[derive(Clone)]
+struct PendingOffloadUnconfirmed {
+    expected: RouteVersion,
+    next_route: ObjectRoute,
+    backing: mooncake_store_core::ColdBackingRoute,
+    length_bytes: i64,
 }
 
 #[derive(Default)]

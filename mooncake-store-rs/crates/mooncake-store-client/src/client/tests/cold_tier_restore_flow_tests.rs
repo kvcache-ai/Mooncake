@@ -842,6 +842,12 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
     let full_reads = Arc::new(AtomicUsize::new(0));
     client.route_directory = Arc::new(CountingRouteDirectory {
         inner: client.route_directory.clone(),
+        miss_bounded_reads: AtomicBool::new(false),
+        miss_full_reads: AtomicBool::new(false),
+        bounded_read_hook: Mutex::new(None),
+        owner_visit_hook: Mutex::new(None),
+        before_single_cas_hook: Mutex::new(None),
+        after_single_cas_hook: Mutex::new(None),
         injected_routes: Mutex::new(BTreeMap::new()),
         get_object_routes_calls: AtomicUsize::new(0),
         bounded_reads: bounded_reads.clone(),

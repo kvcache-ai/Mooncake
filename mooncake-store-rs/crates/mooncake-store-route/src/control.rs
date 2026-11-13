@@ -12,6 +12,11 @@ use crate::shim::{
 
 #[derive(Clone, Debug)]
 pub enum RouteControlRequest {
+    Publication {
+        namespace: String,
+        authority: ClientStableId,
+        operations: Vec<mooncake_store_core::PublicationControl>,
+    },
     BatchGet {
         namespace: String,
         authority: ClientStableId,
@@ -51,6 +56,7 @@ pub enum RouteControlRequest {
 impl RouteControlRequest {
     pub fn operation(&self) -> &'static str {
         match self {
+            Self::Publication { .. } => "control_route_publication",
             Self::BatchGet { .. } => "control_route_batch_get",
             Self::BatchContains { .. } => "control_route_batch_contains",
             Self::BatchCompareAndSwap { .. } => "control_route_batch_cas",
@@ -66,6 +72,7 @@ impl RouteControlRequest {
 
     pub fn item_count(&self) -> usize {
         match self {
+            Self::Publication { operations, .. } => operations.len(),
             Self::BatchGet { keys, .. } | Self::BatchContains { keys, .. } => keys.len(),
             Self::BatchCompareAndSwap { requests, .. } | Self::BatchReplace { requests, .. } => {
                 requests.len()
@@ -77,6 +84,9 @@ impl RouteControlRequest {
 
     pub fn empty_response(&self) -> Option<RouteControlResponse> {
         match self {
+            Self::Publication { operations, .. } if operations.is_empty() => {
+                Some(RouteControlResponse::Publication(Vec::new()))
+            }
             Self::BatchGet { keys, .. } if keys.is_empty() => {
                 Some(RouteControlResponse::BatchGet(Vec::new()))
             }
@@ -105,6 +115,7 @@ impl RouteControlRequest {
 
 #[derive(Clone, Debug)]
 pub enum RouteControlResponse {
+    Publication(Vec<Result<mooncake_store_core::PublicationControlReply>>),
     BatchGet(Vec<Result<RouteAuthorityRecord>>),
     BatchContains(Vec<Result<bool>>),
     BatchCompareAndSwap(Vec<Result<CasResult>>),
@@ -127,6 +138,13 @@ pub fn serve_route_control_request(
     request: RouteControlRequest,
 ) -> Result<RouteControlResponse> {
     match request {
+        RouteControlRequest::Publication {
+            namespace,
+            authority,
+            operations,
+        } => service
+            .publication_control(&namespace, &authority, &operations)
+            .map(RouteControlResponse::Publication),
         RouteControlRequest::BatchGet {
             namespace,
             authority,
@@ -202,6 +220,28 @@ impl RouteControlAuthorityClient {
 }
 
 impl RouteAuthorityClient for RouteControlAuthorityClient {
+    fn publication_control(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        operations: &[mooncake_store_core::PublicationControl],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::Publication {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                operations: operations.to_vec(),
+            },
+        )?;
+        let RouteControlResponse::Publication(replies) = response else {
+            return unexpected_response("publication_control");
+        };
+        ensure_batch_len("publication_control", operations.len(), replies.len())?;
+        Ok(replies)
+    }
+
     fn get_allocation_route_references(
         &self,
         lease: &ClientLease,

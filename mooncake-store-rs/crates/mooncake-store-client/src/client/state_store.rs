@@ -636,6 +636,7 @@ mod state_store_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: runtime.clone(),
                 segment_name: SegmentName("seg-0".to_string()),
                 allocation_id: None,
@@ -1272,6 +1273,260 @@ mod state_store_tests {
 }
 
 impl StorageOwnerState {
+    fn wake_publication_finalizations(&self) {
+        if self.allocator.lock().publication_finalizations.len() >= 64 {
+            if let Some(wake) = self.publication_finalization_wake.lock().as_ref() {
+                let _ = wake.try_send(AsyncEvictionMessage::FinalizePublications);
+            }
+        }
+    }
+
+    fn release_with_publication_fence(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+        allocation_id: u64,
+    ) -> Result<()> {
+        self.release_with_publication_fence_before(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+            None,
+        )
+    }
+
+    fn release_with_publication_fence_before(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+        allocation_id: u64,
+        superseded_before: Option<RouteVersion>,
+    ) -> Result<()> {
+        self.release_with_publication_fence_proof(
+            owner,
+            AllocationIdentity {
+                segment_name: segment_name.clone(),
+                offset_bytes,
+                length_bytes,
+                allocation_id,
+            },
+            superseded_before,
+            None,
+        )
+    }
+
+    fn release_with_publication_fence_proof(
+        &self,
+        owner: &ClientRuntimeId,
+        mut identity: AllocationIdentity,
+        superseded_before: Option<RouteVersion>,
+        closed: Option<&mooncake_store_core::PublicationRevokeRequest>,
+    ) -> Result<()> {
+        if identity.allocation_id == 0 {
+            identity.allocation_id = self
+                .allocator
+                .lock()
+                .allocation_identity(&AllocationSpan {
+                    segment_name: identity.segment_name.clone(),
+                    offset_bytes: identity.offset_bytes,
+                    length_bytes: identity.length_bytes,
+                })
+                .map_or(0, |identity| identity.allocation_id);
+        }
+        let segment_name = &identity.segment_name;
+        let offset_bytes = identity.offset_bytes;
+        let length_bytes = identity.length_bytes;
+        let allocation_id = identity.allocation_id;
+        let (attempt, authorized) = {
+            let allocator = self.allocator.lock();
+            (
+                allocator.publication_provenance.get(&identity).cloned(),
+                allocator.publication_release_authorized.contains(&identity),
+            )
+        };
+        if let Some(attempt) = attempt {
+            let authority_proof_error = |error: StoreError| {
+                StoreError::Backpressure(format!(
+                    "publication authority proof is indeterminate: {error}"
+                ))
+            };
+            let mut request = mooncake_store_core::PublicationRevokeRequest {
+                closed_receivers: Vec::new(),
+                registration_generation: 0,
+                receiver_permits: Vec::new(),
+                superseded_before,
+                attempt,
+                allocation: AllocationRouteIdentity {
+                    owner: owner.clone(),
+                    segment_name: segment_name.clone(),
+                    offset_bytes,
+                    length_bytes,
+                    allocation_id,
+                },
+            };
+            if let Some(closed) = closed {
+                if closed.attempt != request.attempt
+                    || closed.allocation != request.allocation
+                    || closed.superseded_before != request.superseded_before
+                    || closed.closed_receivers.is_empty()
+                {
+                    return Err(StoreError::InvalidState(
+                        "publication release proof identity mismatch".to_string(),
+                    ));
+                }
+                request = closed.clone();
+            } else if !authorized {
+                let mut replies = self
+                    .route_ops
+                    .revoke_publications(std::slice::from_ref(&request))
+                    .map_err(authority_proof_error)?;
+                if replies.iter().any(|reply| {
+                    reply.reference.state
+                        == mooncake_store_core::AllocationRouteReferenceState::Exact
+                }) {
+                    if let Some(current) = self
+                        .route_ops
+                        .load_route(&request.attempt.key)
+                        .map_err(authority_proof_error)?
+                    {
+                        if !current.replicas.iter().any(|replica| {
+                            replica.owner == *owner
+                                && replica.segment_name == *segment_name
+                                && replica.segment_offset == offset_bytes
+                                && replica.allocation_id == Some(allocation_id)
+                                && replica.length == length_bytes
+                        }) {
+                            request.superseded_before = Some(
+                                request
+                                    .superseded_before
+                                    .map_or(current.version, |version| {
+                                        version.max(current.version)
+                                    }),
+                            );
+                        }
+                    }
+                    if request.superseded_before.is_some() {
+                        replies = self
+                            .route_ops
+                            .revoke_publications(std::slice::from_ref(&request))
+                            .map_err(authority_proof_error)?;
+                    }
+                }
+                if replies.len() != 1
+                    || !replies[0].registration_closed
+                    || replies[0].reference.state
+                        != mooncake_store_core::AllocationRouteReferenceState::Absent
+                {
+                    return Err(StoreError::Backpressure(format!("publication is still referenced or indeterminate: allocation={allocation_id} superseded_before={:?} observations={replies:?}", request.superseded_before)));
+                }
+                request.closed_receivers = replies[0].registered_receivers.clone();
+                request.registration_generation = replies[0].registration_generation;
+                request.receiver_permits = replies[0].receiver_permits.clone();
+            } else if let Some((previous, _)) = self
+                .allocator
+                .lock()
+                .publication_finalizations
+                .get(&identity)
+            {
+                request.closed_receivers = previous.closed_receivers.clone();
+                request.registration_generation = previous.registration_generation;
+                request.receiver_permits = previous.receiver_permits.clone();
+            }
+            let mut allocator = self.allocator.lock();
+            if allocator.publication_finalizations.len() >= 4096
+                && !allocator.publication_finalizations.contains_key(&identity)
+            {
+                return Err(StoreError::Backpressure(
+                    "publication finalization queue is full".to_string(),
+                ));
+            }
+            allocator
+                .publication_release_authorized
+                .insert(identity.clone());
+            let newly_queued = !allocator.publication_finalizations.contains_key(&identity);
+            allocator
+                .publication_finalizations
+                .insert(identity.clone(), (request, true));
+            if newly_queued {
+                registry::record_eviction_guard_event("publication_finalize", "queued");
+            }
+        }
+        self.wake_publication_finalizations();
+        let mut allocator = self.allocator.lock();
+        allocator.release(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+        )?;
+        allocator.publication_provenance.remove(&identity);
+        allocator.publication_release_authorized.remove(&identity);
+        Ok(())
+    }
+
+    fn flush_publication_finalizations(&self) {
+        let ready = {
+            let mut allocator = self.allocator.lock();
+            let lower = allocator
+                .publication_finalization_cursor
+                .clone()
+                .map(std::ops::Bound::Excluded)
+                .unwrap_or(std::ops::Bound::Unbounded);
+            let mut ready = allocator
+                .publication_finalizations
+                .range((lower, std::ops::Bound::Unbounded))
+                .take(4096)
+                .map(|(identity, request)| (identity.clone(), request.clone()))
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                ready = allocator
+                    .publication_finalizations
+                    .iter()
+                    .take(4096)
+                    .map(|(identity, request)| (identity.clone(), request.clone()))
+                    .collect();
+            }
+            allocator.publication_finalization_cursor =
+                ready.last().map(|(identity, _)| identity.clone());
+            ready
+        };
+        for released in [false, true] {
+            let group = ready
+                .iter()
+                .filter(|(_, (_, state))| *state == released)
+                .collect::<Vec<_>>();
+            let requests = group
+                .iter()
+                .map(|(_, (request, _))| request.clone())
+                .collect::<Vec<_>>();
+            if requests.is_empty() {
+                continue;
+            }
+            let Ok(results) = self.route_ops.finalize_publications(&requests, released) else {
+                continue;
+            };
+            if results.len() != group.len() {
+                continue;
+            }
+            let mut allocator = self.allocator.lock();
+            for ((identity, original), result) in group.into_iter().zip(results) {
+                if result.is_ok()
+                    && allocator.publication_finalizations.get(identity) == Some(original)
+                {
+                    allocator.publication_finalizations.remove(identity);
+                    registry::record_eviction_guard_event("publication_finalize", "completed");
+                }
+            }
+        }
+    }
+
     fn report_route_hits(&self, keys: &[ObjectKey]) -> RouteTrafficReport {
         let report = self.hot_replicas.clock.lock().mark_hot_keys(keys);
         if !self.nof_backing_tracking_enabled {
@@ -1298,6 +1553,9 @@ impl StorageOwnerState {
                 nof_clock.sync_nof_route(route, &self.runtime, true);
             }
         }
+        drop(clock);
+        drop(allocator);
+        self.wake_publication_finalizations();
         RouteTrafficReport::new(routes.len(), bytes)
     }
 
@@ -1326,6 +1584,9 @@ impl StorageOwnerState {
                 .lock()
                 .sync_nof_route(route, &self.runtime, true);
         }
+        drop(clock);
+        drop(allocator);
+        self.wake_publication_finalizations();
     }
 
     fn untrack_route(&self, route: &ObjectRoute) {
@@ -1349,6 +1610,9 @@ impl StorageOwnerState {
                 .lock()
                 .sync_nof_route(route, &self.runtime, false);
         }
+        drop(clock);
+        drop(allocator);
+        self.wake_publication_finalizations();
     }
 
     fn enqueue_delete_pending(&self, entries: &[DeletePendingEntry]) -> Result<usize> {
@@ -1709,16 +1973,17 @@ impl StorageOwnerState {
                         offset_bytes: entry.identity.offset_bytes,
                         length_bytes: entry.identity.length_bytes,
                     };
+                    let current_identity = self.allocator.lock().allocation_identity(&allocation);
                     let release = {
-                        let mut allocator = self.allocator.lock();
-                        match allocator.allocation_identity(&allocation) {
-                            Some(current) if current == entry.identity => allocator.release(
-                                &self.runtime,
-                                &entry.identity.segment_name,
-                                entry.identity.offset_bytes,
-                                entry.identity.length_bytes,
-                                entry.identity.allocation_id,
-                            ),
+                        match current_identity {
+                            Some(current) if current == entry.identity => self
+                                .release_with_publication_fence(
+                                    &self.runtime,
+                                    &entry.identity.segment_name,
+                                    entry.identity.offset_bytes,
+                                    entry.identity.length_bytes,
+                                    entry.identity.allocation_id,
+                                ),
                             Some(_) | None => Ok(()),
                         }
                     };
@@ -1760,6 +2025,7 @@ impl StorageOwnerState {
                         continue;
                     };
                     let replica = ReplicaRoute {
+                        publication: None,
                         owner: self.runtime.clone(),
                         segment_name: entry.identity.segment_name.clone(),
                         allocation_id: Some(entry.identity.allocation_id),
@@ -1828,6 +2094,7 @@ impl StorageOwnerState {
         let started = Instant::now();
         let used_before = self.allocator.lock().usage_bytes().0;
         let result = (|| {
+            self.recover_owner_restore_publications();
             let mut evicted = self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)?;
             let _ = self.recover_due_pending_publications()?;
             evicted = evicted.saturating_add(
@@ -1851,6 +2118,8 @@ impl StorageOwnerState {
                     used_bytes.saturating_sub(low_watermark),
                     BACKGROUND_EVICTION_BATCH_SIZE,
                 )?;
+                // Foreground publication ACKs share this worker with eviction.
+                self.flush_publication_finalizations();
                 if reclaimed == 0 {
                     break;
                 }
@@ -1962,8 +2231,6 @@ impl StorageOwnerState {
             let Some(route) = route else {
                 if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
                     reclaimed = reclaimed.saturating_add(1);
-                } else {
-                    self.hot_replicas.clock.lock().remove_id(&victim);
                 }
                 continue;
             };
@@ -2069,9 +2336,24 @@ impl StorageOwnerState {
         let mut first_error = None;
         let mut evicted_replicas = 0usize;
         let mut evicted_bytes = 0u64;
+        let applied = prepared
+            .iter()
+            .zip(&results)
+            .filter_map(|((_, token, _), result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .filter(|cas| cas.applied)
+                    .map(|cas| self.capture_applied_eviction(token, cas))
+            })
+            .collect::<Vec<_>>();
+        let mut proofs = self.close_eviction_publications(&applied);
         for ((_, token, _), result) in prepared.into_iter().zip(results) {
             match result {
-                Ok(cas) if cas.applied => match self.commit_eviction(&token) {
+                Ok(cas) if cas.applied => match self.commit_eviction_with_proof(
+                    &self.capture_applied_eviction(&token, &cas),
+                    proofs.remove(&token.identity),
+                ) {
                     Ok(true) => {
                         reclaimed = reclaimed.saturating_add(1);
                         evicted_replicas = evicted_replicas.saturating_add(1);
@@ -2220,6 +2502,9 @@ impl StorageOwnerState {
         &self,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<bool> {
+        if self.recover_owner_restore_publications() > 0 {
+            return Ok(true);
+        }
         if self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)? > 0 {
             return Ok(true);
         }
@@ -2272,6 +2557,7 @@ impl StorageOwnerState {
     }
 
     pub(super) fn recover_due_pending_publications(&self) -> Result<usize> {
+        self.flush_publication_finalizations();
         const PENDING_PUBLICATION_CONFIRMATION_BATCH: usize = 64;
         const PENDING_PUBLICATION_LOCAL_RETRY_DELAY_MS: u64 = 1_000;
 
@@ -2297,10 +2583,34 @@ impl StorageOwnerState {
                 allocation_id: publication.identity.allocation_id,
             })
             .collect::<Vec<_>>();
-        let references = match self
-            .route_ops
-            .get_allocation_route_reference_keys_consistent(&identities)
-        {
+        let fenced_references = publications
+            .iter()
+            .zip(&identities)
+            .map(|(publication, identity)| {
+                let Some(attempt) = &publication.attempt else {
+                    return Ok(mooncake_store_core::AllocationRouteReference {
+                        state: mooncake_store_core::AllocationRouteReferenceState::Conflict,
+                        route_key: None,
+                    });
+                };
+                let request = mooncake_store_core::PublicationRevokeRequest {
+                    attempt: attempt.clone(),
+                    allocation: identity.clone(),
+                    closed_receivers: Vec::new(),
+                    registration_generation: 0,
+                    receiver_permits: Vec::new(),
+                    superseded_before: None,
+                };
+                let mut replies = self.route_ops.revoke_publications(&[request])?;
+                if replies.len() != 1 || !replies[0].registration_closed {
+                    return Err(StoreError::Transport(
+                        "incomplete publication revocation proof".to_string(),
+                    ));
+                }
+                Ok(replies.remove(0).reference)
+            })
+            .collect::<Result<Vec<_>>>();
+        let references = match fenced_references {
             Ok(references) if references.len() == publications.len() => references,
             Ok(references) => {
                 debug!(
@@ -2340,6 +2650,7 @@ impl StorageOwnerState {
                         continue;
                     };
                     let replica = ReplicaRoute {
+                        publication: None,
                         owner: self.runtime.clone(),
                         segment_name: publication.identity.segment_name.clone(),
                         allocation_id: Some(publication.identity.allocation_id),
@@ -2398,7 +2709,7 @@ impl StorageOwnerState {
                     }
                 }
                 mooncake_store_core::AllocationRouteReferenceState::Absent => {
-                    let release = self.allocator.lock().release(
+                    let release = self.release_with_publication_fence(
                         &self.runtime,
                         &publication.identity.segment_name,
                         publication.identity.offset_bytes,
@@ -2566,15 +2877,11 @@ impl StorageOwnerState {
         self.stale_candidate_reconcile_started_at_ms
             .store(scan_started_at_ms, std::sync::atomic::Ordering::Relaxed);
 
-        let (candidate_keys, tracked_identities, legacy_tracked_spans) = {
+        let candidate_keys = {
             let mut clock = self.hot_replicas.clock.lock();
-            (
-                clock.reclaim_candidate_keys(
-                    preferred_segment,
-                    self.offload_priority.eviction_scan_limit,
-                ),
-                clock.tracked_allocation_identities(),
-                clock.tracked_allocation_spans(),
+            clock.reclaim_candidate_keys(
+                preferred_segment,
+                self.offload_priority.eviction_scan_limit,
             )
         };
         let mut released = 0usize;
@@ -2604,14 +2911,20 @@ impl StorageOwnerState {
                 pending.keys().cloned().collect::<BTreeSet<_>>(),
             )
         };
-        let candidates = self.allocator.lock().untracked_reconcile_candidates(
-            &tracked_identities,
-            &legacy_tracked_spans,
-            &pending_evictions,
-            scan_started_at_ms,
-            preferred_segment,
-            PENDING_EVICTION_CONFIRMATION_BATCH,
-        );
+        let candidates = {
+            // Match publication's allocator -> CLOCK lock order so the candidate
+            // scan cannot combine new allocations with an older CLOCK snapshot.
+            let mut allocator = self.allocator.lock();
+            let clock = self.hot_replicas.clock.lock();
+            allocator.untracked_reconcile_candidates(
+                &clock.tracked_allocation_identities(),
+                &clock.tracked_allocation_spans(),
+                &pending_evictions,
+                scan_started_at_ms,
+                preferred_segment,
+                PENDING_EVICTION_CONFIRMATION_BATCH,
+            )
+        };
         let allocator_candidate_count = candidates.len();
         for identity in candidates {
             self.begin_untracked_candidate_confirmation(&identity);
@@ -2793,18 +3106,53 @@ impl StorageOwnerState {
         replica_index: usize,
         next: Option<ObjectRoute>,
     ) -> Result<bool> {
+        self.evict_route_replica_with_next_mode(victim, route, replica_index, next, false)
+    }
+
+    fn evict_route_replica_with_next_mode(
+        &self,
+        victim: &ClockEntryId,
+        route: &ObjectRoute,
+        replica_index: usize,
+        next: Option<ObjectRoute>,
+        existing_holder: bool,
+    ) -> Result<bool> {
         let Some(token) = self.begin_eviction(victim, route, replica_index, next.clone())? else {
             return Ok(false);
         };
-        let cas = match next.as_ref() {
-            Some(next_route) => {
-                self.route_ops
-                    .prune_route(&route.key, Some(route.version), next_route)
+        let token = if existing_holder {
+            let mut token = token;
+            token.kind = PendingEvictionKind::ExistingHolderCas;
+            if let Some(pending) = self.pending_evictions.lock().get_mut(&token.identity) {
+                pending.token.kind = token.kind;
             }
-            None => self.route_ops.delete_route(&route.key, Some(route.version)),
+            token
+        } else {
+            token
+        };
+        let cas = if existing_holder {
+            self.route_ops.evict_existing_route_replica(
+                route,
+                &route.replicas[replica_index],
+                next.as_ref(),
+            )
+        } else {
+            match next.as_ref() {
+                Some(next_route) => {
+                    self.route_ops
+                        .prune_route(&route.key, Some(route.version), next_route)
+                }
+                None => self.route_ops.delete_route(&route.key, Some(route.version)),
+            }
         };
         match cas {
-            Ok(cas) if cas.applied => self.commit_eviction(&token),
+            Ok(cas) if cas.applied => self.commit_applied_eviction(&token, &cas),
+            Ok(cas) if existing_holder && cas.current.is_none() => {
+                // Preserve the known prior version for a separately validated
+                // pinned-primary marker proof; this conflict alone cannot free.
+                self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
+                Ok(false)
+            }
             Ok(cas) => {
                 self.abort_eviction(&token, cas.current.as_ref());
                 Ok(false)
@@ -2876,6 +3224,7 @@ impl StorageOwnerState {
             kind: PendingEvictionKind::RouteCas,
             route_key: Some(route.key.clone()),
             expected_version: route.version,
+            superseded_before: None,
             evicted_replica: Some(evicted_replica),
             clock_id: Some(victim.clone()),
             next_route,
@@ -2945,10 +3294,12 @@ impl StorageOwnerState {
         }
         let token = EvictionToken {
             identity: identity.clone(),
-            kind: PendingEvictionKind::RouteCas,
+            kind: PendingEvictionKind::HistoricalClock,
             route_key: Some(victim.route_key.clone()),
             expected_version: RouteVersion(0),
+            superseded_before: None,
             evicted_replica: Some(ReplicaRoute {
+                publication: None,
                 owner: self.runtime.clone(),
                 segment_name: victim.segment_name.clone(),
                 allocation_id: Some(allocation_id),
@@ -3026,6 +3377,7 @@ impl StorageOwnerState {
                     kind: PendingEvictionKind::AllocationCandidate,
                     route_key: None,
                     expected_version: RouteVersion(0),
+                    superseded_before: None,
                     evicted_replica: None,
                     clock_id: None,
                     next_route: None,
@@ -3102,7 +3454,130 @@ impl StorageOwnerState {
         );
     }
 
+    fn commit_applied_eviction(
+        &self,
+        token: &EvictionToken,
+        cas: &mooncake_store_core::CasResult,
+    ) -> Result<bool> {
+        let token = self.capture_applied_eviction(token, cas);
+        self.commit_eviction(&token)
+    }
+
+    fn close_eviction_publications(
+        &self,
+        tokens: &[EvictionToken],
+    ) -> BTreeMap<AllocationIdentity, Result<mooncake_store_core::PublicationRevokeRequest>> {
+        let requests = {
+            let allocator = self.allocator.lock();
+            tokens
+                .iter()
+                .filter_map(|token| {
+                    allocator
+                        .publication_provenance
+                        .get(&token.identity)
+                        .map(|attempt| {
+                            (
+                                token.identity.clone(),
+                                mooncake_store_core::PublicationRevokeRequest {
+                                    attempt: attempt.clone(),
+                                    allocation: AllocationRouteIdentity {
+                                        owner: self.runtime.clone(),
+                                        segment_name: token.identity.segment_name.clone(),
+                                        offset_bytes: token.identity.offset_bytes,
+                                        length_bytes: token.identity.length_bytes,
+                                        allocation_id: token.identity.allocation_id,
+                                    },
+                                    closed_receivers: Vec::new(),
+                                    registration_generation: 0,
+                                    receiver_permits: Vec::new(),
+                                    superseded_before: token.superseded_before,
+                                },
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        if requests.is_empty() {
+            return BTreeMap::new();
+        }
+        let batch = requests
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>();
+        let results = match self.route_ops.revoke_publications_batch(&batch) {
+            Ok(results) if results.len() == requests.len() => results,
+            other => {
+                let error = other.err().unwrap_or_else(|| {
+                    StoreError::Transport("publication revocation reply count mismatch".to_string())
+                });
+                vec![Err(error); requests.len()]
+            }
+        };
+        requests
+            .into_iter()
+            .zip(results)
+            .map(|((identity, mut request), reply)| {
+                let proof = reply.and_then(|reply| {
+                    if !reply.registration_closed
+                        || reply.reference.state
+                            != mooncake_store_core::AllocationRouteReferenceState::Absent
+                    {
+                        return Err(StoreError::Backpressure(
+                            "publication is still referenced or indeterminate".to_string(),
+                        ));
+                    }
+                    request.closed_receivers = reply.registered_receivers;
+                    request.registration_generation = reply.registration_generation;
+                    request.receiver_permits = reply.receiver_permits;
+                    Ok(request)
+                });
+                (identity, proof)
+            })
+            .collect()
+    }
+
+    fn capture_applied_eviction(
+        &self,
+        token: &EvictionToken,
+        cas: &mooncake_store_core::CasResult,
+    ) -> EvictionToken {
+        let mut token = token.clone();
+        // Only an acknowledged mutation supplies a deletion bound. A missing read
+        // or an expected version alone cannot prove that a reference was removed.
+        token.superseded_before = match cas.current.as_ref() {
+            Some(current)
+                if token.route_key.as_ref() == Some(&current.key)
+                    && !current.replicas.iter().any(|replica| {
+                        replica.owner == self.runtime
+                            && replica.segment_name == token.identity.segment_name
+                            && replica.segment_offset == token.identity.offset_bytes
+                            && replica.length == token.identity.length_bytes
+                            && replica.allocation_id == Some(token.identity.allocation_id)
+                    }) =>
+            {
+                Some(current.version)
+            }
+            None if token.next_route.is_none() => cas
+                .delete_version
+                .filter(|version| *version >= token.expected_version)
+                .and_then(|version| version.0.checked_add(1).map(RouteVersion)),
+            _ => None,
+        };
+        if let Some(entry) = self.pending_evictions.lock().get_mut(&token.identity) {
+            entry.token.superseded_before = token.superseded_before;
+        }
+        token
+    }
+
     fn commit_eviction(&self, token: &EvictionToken) -> Result<bool> {
+        self.commit_eviction_with_proof(token, None)
+    }
+
+    fn commit_eviction_with_proof(
+        &self,
+        token: &EvictionToken,
+        proof: Option<Result<mooncake_store_core::PublicationRevokeRequest>>,
+    ) -> Result<bool> {
         if self
             .read_pin_registry
             .is_pinned(&token.identity.segment_name, token.identity.offset_bytes)
@@ -3115,21 +3590,26 @@ impl StorageOwnerState {
             .lock()
             .get(&token.identity)
             .is_some_and(|entry| entry.phase != PendingEvictionPhase::Prepared);
+        let current_identity = self.allocator.lock().allocation_identity(&AllocationSpan {
+            segment_name: token.identity.segment_name.clone(),
+            offset_bytes: token.identity.offset_bytes,
+            length_bytes: token.identity.length_bytes,
+        });
         let release_result = {
-            let mut allocator = self.allocator.lock();
-            match allocator.allocation_identity(&AllocationSpan {
-                segment_name: token.identity.segment_name.clone(),
-                offset_bytes: token.identity.offset_bytes,
-                length_bytes: token.identity.length_bytes,
-            }) {
-                Some(current) if current == token.identity => allocator
-                    .release(
-                        &self.runtime,
-                        &token.identity.segment_name,
-                        token.identity.offset_bytes,
-                        token.identity.length_bytes,
-                        token.identity.allocation_id,
-                    )
+            match current_identity {
+                Some(current) if current == token.identity => proof
+                    .as_ref()
+                    .map_or(Ok(None), |proof| {
+                        proof.as_ref().map(Some).map_err(Clone::clone)
+                    })
+                    .and_then(|closed| {
+                        self.release_with_publication_fence_proof(
+                            &self.runtime,
+                            token.identity.clone(),
+                            token.superseded_before,
+                            closed,
+                        )
+                    })
                     .map(|()| "released"),
                 Some(_) | None => Ok("identity_replaced"),
             }
@@ -3137,6 +3617,91 @@ impl StorageOwnerState {
         let release_outcome = match release_result {
             Ok(outcome) => outcome,
             Err(error) => {
+                if token.kind == PendingEvictionKind::ExistingHolderCas {
+                    if let (Some(key), Some(replica)) =
+                        (token.route_key.as_ref(), token.evicted_replica.as_ref())
+                    {
+                        if let Ok(Some(version)) =
+                            self.route_ops.get_existing_holder_delete_version(
+                                key,
+                                replica,
+                                token.expected_version,
+                            )
+                        {
+                            if let Some(bound) = version.0.checked_add(1).map(RouteVersion) {
+                                if token
+                                    .superseded_before
+                                    .is_none_or(|previous| bound > previous)
+                                {
+                                    let mut proven = token.clone();
+                                    proven.superseded_before = Some(bound);
+                                    if let Some(pending) =
+                                        self.pending_evictions.lock().get_mut(&token.identity)
+                                    {
+                                        pending.token.superseded_before = Some(bound);
+                                    }
+                                    // An actual pinned-primary marker survives a lost CAS
+                                    // reply; every receiver still decides under its slot lock.
+                                    return self.commit_eviction(&proven);
+                                }
+                            }
+                        }
+                    }
+                }
+                if matches!(
+                    token.kind,
+                    PendingEvictionKind::HistoricalClock | PendingEvictionKind::ExistingHolderCas
+                ) {
+                    if let Some(key) = token.route_key.as_ref() {
+                        if let Ok(Some(current)) = self.route_ops.load_route(key) {
+                            if current.key == *key
+                                && current.state == RouteState::Active
+                                && current.replicas.iter().any(|replica| {
+                                    replica.owner == self.runtime
+                                        && replica.segment_name == token.identity.segment_name
+                                        && replica.segment_offset == token.identity.offset_bytes
+                                        && replica.length == token.identity.length_bytes
+                                        && replica.allocation_id
+                                            == Some(token.identity.allocation_id)
+                                })
+                            {
+                                if let Some(victim) = token.clock_id.as_ref() {
+                                    let cold_backing_not_on_disk =
+                                            current.cold_backing.as_ref().is_none_or(|backing| {
+                                                backing.state
+                                                    == mooncake_store_core::ColdBackingState::PendingOffload
+                                            });
+                                    let delete_empty = cold_backing_not_on_disk
+                                        && !self.has_usable_cold_tier_device()?;
+                                    let prepared = if delete_empty {
+                                        Some(current.clone())
+                                    } else {
+                                        self.ensure_materialized_cold_backing_for_eviction(
+                                            &current,
+                                        )?
+                                    };
+                                    if let Some(current) = prepared {
+                                        if let Some(index) =
+                                            self.replica_index_for_victim(&current, victim)
+                                        {
+                                            let next = cold_tier::route_after_replica_eviction(
+                                                &current,
+                                                index,
+                                                delete_empty,
+                                            );
+                                            // Retired imports cannot repair this cohort. CAS
+                                            // the exact holder before deriving release proof.
+                                            self.abort_eviction(token, Some(&current));
+                                            return self.evict_route_replica_with_next_mode(
+                                                victim, &current, index, next, true,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
                 registry::record_eviction_guard_event("local_commit", "release_deferred");
                 debug!(
@@ -3177,7 +3742,7 @@ impl StorageOwnerState {
             offset_bytes = token.identity.offset_bytes,
             length_bytes = token.identity.length_bytes,
             expected_version = token.expected_version.0,
-            route_deleted = token.kind == PendingEvictionKind::RouteCas && token.next_route.is_none(),
+            route_deleted = matches!(token.kind, PendingEvictionKind::RouteCas | PendingEvictionKind::ExistingHolderCas) && token.next_route.is_none(),
             "dram_eviction_complete"
         );
         Ok(true)
@@ -3480,7 +4045,6 @@ impl StorageOwnerState {
             .next()
             .flatten()
         else {
-            self.hot_replicas.remove_key(key);
             return Ok(None);
         };
         self.sync_route(&route);
@@ -3494,15 +4058,20 @@ impl StorageOwnerState {
     fn rebuild_clock(&self) -> Result<()> {
         let tracker = OperationTracker::new("storage_owner_rebuild_clock");
         let result = (|| {
-            let mut clock = StorageClockState::for_runtime(&self.runtime);
             let mut route_count = 0usize;
-            self.route_ops
-                .visit_routes_by_replica_owner_consistent(&self.runtime, &mut |route| {
-                    clock.track_route(&route, &self.runtime);
+            self.route_ops.visit_routes_by_replica_owner_consistent(
+                &self.runtime,
+                &mut |route| {
+                    // Merge the snapshot without replacing concurrent publications or
+                    // access credits. Stale identities still require exact reclaim.
+                    self.hot_replicas
+                        .clock
+                        .lock()
+                        .track_route(&route, &self.runtime);
                     route_count = route_count.saturating_add(1);
                     Ok(())
-                })?;
-            *self.hot_replicas.clock.lock() = clock;
+                },
+            )?;
             debug!(
                 runtime = %self.runtime,
                 routes = route_count,
@@ -3705,7 +4274,8 @@ impl StorageClockState {
             self.upsert_replica(
                 route,
                 &ReplicaRoute {
-            allocation_id: None,
+                    publication: None,
+                    allocation_id: None,
                     owner: owner.clone(),
                     segment_name: nof_backing_clock_segment(target_id),
                     offset: None,

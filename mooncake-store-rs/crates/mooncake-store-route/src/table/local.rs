@@ -26,6 +26,7 @@ fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
 
 #[derive(Default)]
 pub(crate) struct LocalRouteTable {
+    publications: super::publication::PublicationLedger,
     routes: HashMap<String, ObjectRoute>,
     owner_index: HashMap<ClientRuntimeId, BTreeSet<String>>,
     allocation_start_index: HashMap<AllocationRouteStart, BTreeSet<String>>,
@@ -65,6 +66,215 @@ impl From<&ReplicaRoute> for AllocationRouteStart {
 }
 
 impl LocalRouteTable {
+    pub(crate) fn publication_control(
+        &mut self,
+        runtime: &ClientRuntimeId,
+        operation: &mooncake_store_core::PublicationControl,
+    ) -> Result<mooncake_store_core::PublicationControlReply> {
+        use mooncake_store_core::{
+            PublicationControl, PublicationControlReply, PublicationRevokeReply,
+        };
+        match operation {
+            PublicationControl::PruneExisting { expected, next } => {
+                let valid = expected
+                    .replicas
+                    .iter()
+                    .enumerate()
+                    .any(|(index, replica)| {
+                        if replica.allocation_id.is_none_or(|id| id == 0)
+                            || replica.publication.as_ref().is_none_or(|attempt| {
+                                attempt.key != expected.key || attempt.receivers.len() > 64
+                            })
+                            || expected
+                                .replicas
+                                .iter()
+                                .filter(|item| *item == replica)
+                                .count()
+                                != 1
+                        {
+                            return false;
+                        }
+                        if let Some(next) = next {
+                            let Some(version) = expected.version.0.checked_add(1) else {
+                                return false;
+                            };
+                            let mut projected = expected.as_ref().clone();
+                            projected.version = RouteVersion(version);
+                            projected.replicas.remove(index);
+                            projected.replicas.sort_by_key(|item| item.priority);
+                            for (priority, item) in projected.replicas.iter_mut().enumerate() {
+                                item.priority = priority as u16;
+                            }
+                            **next == projected
+                        } else {
+                            expected.replicas.len() == 1
+                                && expected.cold_backing.as_ref().is_none_or(|backing| {
+                                    backing.state == ColdBackingState::PendingOffload
+                                })
+                                && expected.nof_backing.is_none()
+                        }
+                    });
+                if !valid {
+                    return Err(StoreError::InvalidState(
+                        "invalid existing-holder eviction".to_string(),
+                    ));
+                }
+                // This full-route guard and the update share the table slot lock.
+                let current = self.get(&expected.key);
+                let result = if current.as_ref() != Some(expected.as_ref()) {
+                    CasResult {
+                        applied: false,
+                        delete_version: if current.is_none() {
+                            self.delete_marker(&expected.key)
+                        } else {
+                            None
+                        },
+                        current,
+                        version_floor: None,
+                    }
+                } else {
+                    self.compare_and_swap(&expected.key, Some(expected.version), next.as_deref())
+                };
+                Ok(PublicationControlReply::Pruned(Box::new(result)))
+            }
+
+            PublicationControl::Enroll { publisher } => self
+                .publications
+                .enroll(runtime, publisher)
+                .map(PublicationControlReply::Enrolled),
+            PublicationControl::MarkerProof { request, expected } => {
+                self.publications.validate_marker_proof(
+                    runtime,
+                    &request.attempt,
+                    &request.allocation,
+                )?;
+                let version = if self.get(&request.attempt.key).is_none() {
+                    self.delete_marker(&request.attempt.key)
+                        .filter(|version| version >= expected)
+                } else {
+                    None
+                };
+                Ok(PublicationControlReply::MarkerProof(version))
+            }
+            PublicationControl::Revoke(request) => {
+                let (receivers, generation, permits) = self.publications.revoke(
+                    runtime,
+                    &request.attempt,
+                    &request.allocation,
+                    request.registration_generation,
+                    &request.receiver_permits,
+                )?;
+                if let Some(version) = request.superseded_before {
+                    if let Some(current) = self.get(&request.attempt.key) {
+                        if current.version < version
+                            && current.replicas.iter().any(|replica| {
+                                replica.publication.as_ref() == Some(&request.attempt)
+                                    && replica.owner == request.allocation.owner
+                                    && replica.segment_name == request.allocation.segment_name
+                                    && replica.segment_offset == request.allocation.offset_bytes
+                                    && replica.length == request.allocation.length_bytes
+                                    && replica.allocation_id
+                                        == Some(request.allocation.allocation_id)
+                            })
+                        {
+                            self.compare_and_swap(
+                                &request.attempt.key,
+                                Some(current.version),
+                                None,
+                            );
+                        }
+                    }
+                }
+                let reference = self
+                    .allocation_route_reference_keys(std::slice::from_ref(&request.allocation))?
+                    .into_iter()
+                    .next()
+                    .expect("one allocation has one observation");
+                Ok(PublicationControlReply::Revoked(PublicationRevokeReply {
+                    reference,
+                    registered_receivers: receivers,
+                    registration_closed: true,
+                    registration_generation: generation,
+                    receiver_permits: permits,
+                }))
+            }
+            PublicationControl::RegisterReceiver(registration) => {
+                let route = self.get(&registration.attempt.key).ok_or_else(|| {
+                    StoreError::PublicationRetired(
+                        "publication is no longer referenced at its primary".to_string(),
+                    )
+                })?;
+                if !route
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.publication.as_ref() == Some(&registration.attempt))
+                {
+                    return Err(StoreError::PublicationRetired(
+                        "primary route has changed publication".to_string(),
+                    ));
+                }
+                self.publications
+                    .register_receiver(runtime, registration)
+                    .map(PublicationControlReply::Registered)
+            }
+            PublicationControl::AdmitReceiver(registration) => {
+                self.publications.admit_receiver(runtime, registration)?;
+                Ok(PublicationControlReply::Admitted)
+            }
+            PublicationControl::Finalize { request, released } => {
+                self.publications.finalize(
+                    runtime,
+                    &request.attempt,
+                    &request.allocation,
+                    *released,
+                    request.registration_generation,
+                    &request.receiver_permits,
+                )?;
+                Ok(PublicationControlReply::Finalized)
+            }
+        }
+    }
+
+    pub(crate) fn admit_publications(
+        &mut self,
+        runtime: &ClientRuntimeId,
+        key: &ObjectKey,
+        next: Option<&ObjectRoute>,
+        imported_update: bool,
+    ) -> Result<()> {
+        let Some(route) = next else {
+            return Ok(());
+        };
+        let current = self.routes.get(&key.0);
+        for replica in &route.replicas {
+            let existing_reference = current.and_then(|current| {
+                current.replicas.iter().find(|existing| {
+                    existing.owner == replica.owner
+                        && existing.segment_name == replica.segment_name
+                        && existing.segment_offset == replica.segment_offset
+                        && existing.length == replica.length
+                        && existing.allocation_id == replica.allocation_id
+                })
+            });
+            let Some(attempt) = &replica.publication else {
+                if existing_reference.is_none() {
+                    return Err(StoreError::PublicationRetired(
+                        "new allocation reference requires publication provenance".to_string(),
+                    ));
+                }
+                continue;
+            };
+            if existing_reference
+                .is_some_and(|existing| existing.publication.as_ref() == Some(attempt))
+            {
+                continue;
+            }
+            self.publications
+                .admit(runtime, attempt, route, imported_update)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_delete_marker_budget(budget_bytes: usize) -> Self {
         Self {
             delete_markers: DeleteMarkerStore::new(budget_bytes),
@@ -368,11 +578,18 @@ impl LocalRouteTable {
         result
     }
 
-    pub(crate) fn compare_and_swap_many(&mut self, requests: &[RouteCasRequest]) -> Vec<CasResult> {
+    pub(crate) fn compare_and_swap_many(
+        &mut self,
+        runtime: &ClientRuntimeId,
+        requests: &[RouteCasRequest],
+    ) -> Vec<Result<CasResult>> {
         requests
             .iter()
             .map(|request| {
-                self.compare_and_swap(&request.key, request.expected, request.next.as_ref())
+                self.admit_publications(runtime, &request.key, request.next.as_ref(), false)
+                    .map(|()| {
+                        self.compare_and_swap(&request.key, request.expected, request.next.as_ref())
+                    })
             })
             .collect()
     }
@@ -669,6 +886,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::mooncake_v1(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg".to_string()),
                 allocation_id: None,

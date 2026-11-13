@@ -23,6 +23,13 @@ pub struct LocalRouteAuthority {
 }
 
 impl LocalRouteAuthority {
+    pub fn publication_control(
+        &self,
+        operations: &[mooncake_store_core::PublicationControl],
+    ) -> Result<Vec<Result<mooncake_store_core::PublicationControlReply>>> {
+        super::registry::authority_publication_control(&self.namespace, &self.authority, operations)
+    }
+
     pub fn new(namespace: impl Into<String>, authority: ClientStableId) -> Self {
         Self {
             namespace: namespace.into(),
@@ -105,7 +112,10 @@ impl LocalRouteAuthority {
         authority_compare_and_swap(&self.namespace, &self.authority, key, expected, next)
     }
 
-    pub fn compare_and_swap_routes(&self, requests: &[RouteCasRequest]) -> Result<Vec<CasResult>> {
+    pub fn compare_and_swap_routes(
+        &self,
+        requests: &[RouteCasRequest],
+    ) -> Result<Vec<Result<CasResult>>> {
         authority_compare_and_swap_many(&self.namespace, &self.authority, requests)
     }
 

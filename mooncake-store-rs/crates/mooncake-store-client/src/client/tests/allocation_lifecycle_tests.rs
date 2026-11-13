@@ -1,13 +1,14 @@
 use super::*;
 
 #[test]
-#[ignore = "known late-publication race: expired absence does not fence a delayed CAS"]
 fn expired_pending_publication_cannot_publish_after_owner_reuses_span() {
     struct BeforePublishGate {
         inner: Arc<dyn RouteDirectory>,
         gate: Arc<(StdMutex<(bool, bool)>, Condvar)>,
     }
     impl RouteDirectory for BeforePublishGate {
+        delegate_publication_setup!();
+        delegate_publication_revoke!();
         fn get_object_route(
             &self,
             observer: &ClientLease,
@@ -112,8 +113,29 @@ fn expired_pending_publication_cannot_publish_after_owner_reuses_span() {
     sleep(Duration::from_millis(
         publication_deadline.saturating_sub(now_ms()) + 20,
     ));
+    let original_identity = owner
+        .allocator
+        .lock()
+        .pending_publication_ready
+        .values()
+        .flat_map(|identities| identities.iter())
+        .next()
+        .cloned()
+        .expect("pending publication must carry an allocation identity");
     let recovered = owner.storage_owner.recover_due_pending_publications();
     let replacement = owner.put("late-publication-replacement", b"abcdefghijklmnop");
+    let pinned_replacement = replacement.as_ref().ok().map(|route| {
+        let replica = &route.replicas[0];
+        assert_eq!(replica.segment_name, original_identity.segment_name);
+        assert_eq!(replica.segment_offset, original_identity.offset_bytes);
+        assert_ne!(replica.allocation_id, Some(original_identity.allocation_id));
+        // Keep a later legitimate retry from evicting the replacement under test.
+        owner
+            .storage_owner
+            .read_pin_registry
+            .pin(&replica.segment_name, replica.segment_offset);
+        (replica.segment_name.clone(), replica.segment_offset)
+    });
     {
         let mut state = lock.lock().expect("gate lock should succeed");
         state.1 = true;
@@ -147,6 +169,12 @@ fn expired_pending_publication_cannot_publish_after_owner_reuses_span() {
             b"0123456789abcdef",
             "expired publication must not publish an allocation already reused by the owner",
         );
+    }
+    if let Some((segment, offset)) = pinned_replacement {
+        owner
+            .storage_owner
+            .read_pin_registry
+            .unpin(&segment, offset);
     }
 }
 
@@ -239,6 +267,7 @@ fn explicit_move_lost_cas_reply_retains_published_target_allocation() {
         let replica = &published.replicas[0];
         allocator.mark_pending_publication(
             &mooncake_store_core::SegmentReservation {
+                publication: None,
                 owner: target.runtime_id().clone(),
                 segment_name: replica.segment_name.clone(),
                 offset_bytes: replica.segment_offset,
@@ -398,6 +427,8 @@ impl AppliedReplyFaultRouteDirectory {
 }
 
 impl RouteDirectory for AppliedReplyFaultRouteDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,

@@ -94,6 +94,7 @@ impl StorageOwnerState {
                 super::super::PendingColdDeleteQueue::default(),
             ),
             pending_delete_next_due_at_ms: AtomicU64::new(u64::MAX),
+            publication_finalization_wake: parking_lot::Mutex::new(None),
             pending_publication_authority_retry: parking_lot::Mutex::new(
                 super::super::PendingPublicationAuthorityRetry::default(),
             ),
@@ -111,6 +112,7 @@ impl StorageOwnerState {
             owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::new(
                 restore_max_distinct_flights,
             ),
+            pending_restore_publications: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             cold_restore_io_tracker: super::super::ColdRestoreIoTracker::default(),
             eviction_ready_signal: super::super::EvictionReadySignal::default(),
             read_pin_registry: super::super::ReadPinRegistry::default(),

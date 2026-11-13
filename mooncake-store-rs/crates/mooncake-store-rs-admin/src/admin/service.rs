@@ -3305,6 +3305,7 @@ mod tests {
         let mut replicas = Vec::new();
         if !source_segment.is_empty() {
             replicas.push(ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
                 segment_name: SegmentName::new(source_segment),
                 allocation_id: None,
@@ -3318,6 +3319,7 @@ mod tests {
         }
         for (index, segment) in target_segments.iter().enumerate() {
             replicas.push(ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("storage-b", ClientEpoch(1)),
                 segment_name: SegmentName::new(*segment),
                 allocation_id: None,
@@ -3517,6 +3519,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 segment_name: SegmentName::new("segment-a"),
                 allocation_id: None,
@@ -3584,6 +3587,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 segment_name: SegmentName::new("segment-a"),
                 allocation_id: None,
@@ -3781,6 +3785,7 @@ mod tests {
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: vec![ReplicaRoute {
+                        publication: None,
                         owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
                         segment_name: SegmentName::new("segment-a"),
                         allocation_id: None,

@@ -3,6 +3,7 @@
 pub(crate) mod async_mirror;
 mod directory;
 mod local_authority;
+mod publication;
 pub(crate) mod read_repair;
 pub(crate) mod registry;
 pub(crate) mod selection;

@@ -840,6 +840,7 @@ fn parse_json_body<T: Default + DeserializeOwned>(body: &[u8]) -> Result<T, Stri
 fn http_store_error(error: StoreError) -> String {
     match error {
         StoreError::Conflict(message)
+        | StoreError::PublicationRetired(message)
         | StoreError::QuotaExceeded { message, .. }
         | StoreError::StaleEpoch(message) => http_error_response("409 Conflict", &message),
         StoreError::NotFound(message) => http_error_response("404 Not Found", &message),
@@ -1164,6 +1165,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("storage-b", ClientEpoch(1)),
                 segment_name: SegmentName::new("segment-b"),
                 allocation_id: None,
@@ -1560,6 +1562,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 segment_name: SegmentName::new("hot-segment-a"),
                 allocation_id: None,
@@ -1996,6 +1999,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 segment_name: SegmentName::new("segment-a"),
                 allocation_id: None,

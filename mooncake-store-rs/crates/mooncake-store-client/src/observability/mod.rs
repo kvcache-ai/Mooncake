@@ -1394,9 +1394,9 @@ mod tests {
     #[test]
     fn eviction_guard_metrics_are_exported_before_any_candidate_is_seen() {
         let _guard = metrics_test_lock().lock();
-        registry::reset_metrics();
+        let registry = registry::new_metrics_registry();
 
-        let metrics = render_prometheus_metrics();
+        let metrics = render_prometheus_metrics_with_registry(&registry);
         assert!(metrics.contains(
             "# HELP mooncake_store_eviction_guard_event_total Eviction guard lifecycle events by source and outcome."
         ));

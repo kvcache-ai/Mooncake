@@ -49,6 +49,8 @@ impl CasErrorRouteDirectory {
 }
 
 impl RouteDirectory for CasErrorRouteDirectory {
+    delegate_publication_setup!();
+    delegate_publication_revoke!();
     fn get_object_route(
         &self,
         observer: &ClientLease,
@@ -145,6 +147,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![
             ReplicaRoute {
+                publication: None,
                 owner: source_owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
                 allocation_id: None,
@@ -156,6 +159,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
                 priority: 0,
             },
             ReplicaRoute {
+                publication: None,
                 owner: replica_b_owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
                 allocation_id: None,
@@ -177,6 +181,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
         &SegmentName::new("seg-a"),
         vec![
             ReplicaRoute {
+                publication: None,
                 owner: target_c_owner.clone(),
                 segment_name: SegmentName::new("seg-c"),
                 allocation_id: None,
@@ -188,6 +193,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
                 priority: 99,
             },
             ReplicaRoute {
+                publication: None,
                 owner: target_d_owner.clone(),
                 segment_name: SegmentName::new("seg-d"),
                 allocation_id: None,
@@ -239,6 +245,7 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![
             ReplicaRoute {
+                publication: None,
                 owner: source_owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
                 allocation_id: None,
@@ -250,6 +257,7 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
                 priority: 0,
             },
             ReplicaRoute {
+                publication: None,
                 owner: replica_b_owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
                 allocation_id: None,
@@ -270,6 +278,7 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
         &current,
         &SegmentName::new("seg-a"),
         ReplicaRoute {
+            publication: None,
             owner: target_c_owner.clone(),
             segment_name: SegmentName::new("seg-c"),
             allocation_id: None,
@@ -316,6 +325,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: source_owner,
             segment_name: SegmentName::new("seg-a"),
             allocation_id: None,
@@ -335,6 +345,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         &current,
         &SegmentName::new("seg-missing"),
         vec![ReplicaRoute {
+            publication: None,
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-b"),
             allocation_id: None,
@@ -353,6 +364,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         &current,
         &SegmentName::new("seg-a"),
         vec![ReplicaRoute {
+            publication: None,
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-a"),
             allocation_id: None,
@@ -371,6 +383,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         replicas: vec![
             current.replicas[0].clone(),
             ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("store-c", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg-b"),
                 allocation_id: None,
@@ -389,6 +402,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         &current_with_existing_target,
         &SegmentName::new("seg-a"),
         vec![ReplicaRoute {
+            publication: None,
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-b"),
             allocation_id: None,
@@ -407,6 +421,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         &current,
         &SegmentName::new("seg-a"),
         ReplicaRoute {
+            publication: None,
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-a"),
             allocation_id: None,
@@ -2379,6 +2394,7 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![
             ReplicaRoute {
+                publication: None,
                 owner: source_owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
                 allocation_id: None,
@@ -2390,6 +2406,7 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
                 priority: 0,
             },
             ReplicaRoute {
+                publication: None,
                 owner: replica_b_owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
                 allocation_id: None,
@@ -2442,6 +2459,7 @@ fn explicit_source_selector_rejects_missing_or_owner_mismatched_replicas() {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             owner: source_owner.clone(),
             segment_name: SegmentName::new("seg-a"),
             allocation_id: None,

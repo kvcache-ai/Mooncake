@@ -6,9 +6,9 @@ use super::super::{
     ObjectRoute, OperationTracker, PendingOffloadCasContext, PendingOffloadCasOutcome,
     PendingOffloadEntry, PendingOffloadKey, PendingOffloadMaterialization, PendingOffloadPayload,
     PendingOffloadPrepareOutcome, PendingOffloadQueue, PendingOffloadQueueSnapshot,
-    PendingOffloadReadyRoute, PersistentStorageBackend, Result, RouteCasRequest, RouteState,
-    RouteVersion, StorageOwnerState, StoreError, DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS,
-    DEFAULT_PENDING_OFFLOAD_RETRY_MAX_MS,
+    PendingOffloadReadyRoute, PendingOffloadUnconfirmed, PersistentStorageBackend, Result,
+    RouteCasRequest, RouteState, RouteVersion, StorageOwnerState, StoreError,
+    DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS, DEFAULT_PENDING_OFFLOAD_RETRY_MAX_MS,
 };
 use super::{
     backend_remove_cold_payload, backend_remove_pending_source, backend_store_cold_payload_batch,
@@ -161,12 +161,9 @@ fn publish_initial_write_backing(
         enqueue_pending_offload(storage_owner, &next);
         Ok(Some(next))
     } else {
-        match cas.current.as_ref() {
-            Some(current) => {
-                storage_owner.sync_route(current);
-                enqueue_pending_offload(storage_owner, current);
-            }
-            None => storage_owner.hot_replicas.remove_key(&route.key),
+        if let Some(current) = cas.current.as_ref() {
+            storage_owner.sync_route(current);
+            enqueue_pending_offload(storage_owner, current);
         }
         Ok(None)
     }
@@ -274,9 +271,8 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         enqueue_pending_offload(storage_owner, &next);
         Ok(Some(next))
     } else {
-        match cas.current.as_ref() {
-            Some(current) => storage_owner.sync_route(current),
-            None => storage_owner.hot_replicas.remove_key(&route.key),
+        if let Some(current) = cas.current.as_ref() {
+            storage_owner.sync_route(current);
         }
         Ok(None)
     }
@@ -581,8 +577,10 @@ pub(in super::super) fn prepare_pending_offload_entry(
     if super::cold_tier_disabled() {
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     }
+    if reconcile_unconfirmed_pending_offload(storage_owner, &entry.key)? {
+        return Ok(PendingOffloadPrepareOutcome::Refreshed(entry));
+    }
     let Some(route) = route else {
-        storage_owner.hot_replicas.remove_key(&entry.key.route_key);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
     let refreshed_pending_entry = route
@@ -808,8 +806,6 @@ pub(in super::super) fn clear_unavailable_pending_cold_backing(
         storage_owner.sync_route(&next);
     } else if let Some(current) = cas.current.as_ref() {
         storage_owner.sync_route(current);
-    } else {
-        storage_owner.hot_replicas.remove_key(&route.key);
     }
     Ok(())
 }
@@ -886,15 +882,9 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
         }
         Err(error) => {
             cas_tracker.finish_with_result("error", 0);
-            let reserved_release_bytes = rollback_ready_pending_offloads(
-                storage_owner,
-                backend.as_ref(),
-                pending,
-                &ready,
-                reserved_release_bytes,
-            )?;
-            settle_pending_offload_batch(storage_owner, pending, 0, reserved_release_bytes)?;
-            return Err(error);
+            std::iter::repeat_with(|| Err(error.clone()))
+                .take(ready.len())
+                .collect()
         }
     };
     let outcome = apply_pending_offload_cas_results(
@@ -1300,32 +1290,83 @@ fn cas_pending_offload_routes(
     storage_owner.route_ops.publish_routes(&cas_requests)
 }
 
-fn rollback_ready_pending_offloads(
+fn confirm_pending_offload(
     storage_owner: &StorageOwnerState,
-    backend: &dyn PersistentStorageBackend,
-    pending: &[PendingOffloadMaterialization],
-    ready: &[PendingOffloadReadyRoute],
-    mut reserved_release_bytes: i64,
-) -> Result<i64> {
-    for ready in ready {
-        // A failed batch call has an unknown publication outcome. Provider-managed NoF
-        // locators are idempotent and have no Mooncake capacity reservation, so retain them
-        // for route confirmation/retry rather than risking an applied route pointing at data
-        // we just deleted. Local Cold Tier keeps its established reservation rollback path.
-        if !pending[ready.index].transient_nof {
-            remove_unpublished_persistent_backing(storage_owner, &ready.materialized_cold_backing);
-        }
-        reserved_release_bytes = checked_add_cold_tier_bytes(
-            reserved_release_bytes,
-            pending_offload_payload_len_i64(&pending[ready.index])?,
-            "cold tier reserved release exceeds accounting range",
-        )?;
-        let _ = backend_remove_pending_source(backend, &pending[ready.index].cold_backing);
-        storage_owner
-            .pending_offloads
-            .retry(pending[ready.index].entry.clone());
+    pending: &PendingOffloadUnconfirmed,
+) -> Result<CasResult> {
+    // Repeating the same CAS fences the original attempt before any payload cleanup.
+    let mut cas = storage_owner.route_ops.compare_and_swap_route(
+        &pending.next_route.key,
+        Some(pending.expected),
+        Some(&pending.next_route),
+    )?;
+    if cas
+        .current
+        .as_ref()
+        .and_then(materialized_cold_backing)
+        .is_some_and(|current| persistent_backing_contains_target(&current, &pending.backing))
+    {
+        cas.applied = true;
     }
-    Ok(reserved_release_bytes)
+    Ok(cas)
+}
+
+fn reconcile_unconfirmed_pending_offload(
+    storage_owner: &StorageOwnerState,
+    key: &PendingOffloadKey,
+) -> Result<bool> {
+    let pending = storage_owner
+        .pending_offloads
+        .unconfirmed
+        .lock()
+        .get(key)
+        .cloned();
+    let Some(pending) = pending else {
+        return Ok(false);
+    };
+    let cas = confirm_pending_offload(storage_owner, &pending)?;
+    // Publication is terminal; an ambiguous accounting reply must not replay its delta.
+    storage_owner
+        .pending_offloads
+        .unconfirmed
+        .lock()
+        .remove(key);
+    let settlement = storage_owner.apply_cold_tier_usage_delta(
+        cold_tier_device_id(&pending.backing),
+        if cas.applied { pending.length_bytes } else { 0 },
+        -pending.length_bytes,
+    );
+    if cas.applied {
+        if let Some(current) = cas.current.as_ref().and_then(materialized_cold_backing) {
+            for target in persistent_backing_targets(&pending.backing) {
+                if !persistent_backing_contains_target(&current, &target) {
+                    remove_unpublished_persistent_backing(storage_owner, &target);
+                }
+            }
+        }
+    } else {
+        remove_unpublished_persistent_backing(storage_owner, &pending.backing);
+    }
+    if let Ok(backend) = storage_owner
+        .cold_tier_devices
+        .backend_for(&pending.backing)
+    {
+        let _ = backend_remove_pending_source(backend.as_ref(), &pending.backing);
+    }
+    if let Some(current) = cas.current.as_ref() {
+        storage_owner.sync_route(current);
+    } else if cas.applied {
+        storage_owner.sync_route(&pending.next_route);
+    }
+    if let Err(error) = settlement {
+        storage_owner.pending_offloads.complete(key);
+        return Err(error);
+    }
+    if cas.applied {
+        storage_owner.eviction_ready_signal.signal();
+        storage_owner.cold_tier_devices.pressure_decrement_pending();
+    }
+    Ok(true)
 }
 
 fn apply_pending_offload_cas_results(
@@ -1371,14 +1412,52 @@ fn apply_pending_offload_cas_result(
 ) -> Result<i64> {
     let pending = &context.pending[ready.index];
     let length_bytes = pending_offload_payload_len_i64(pending)?;
+    let cas = match cas_result {
+        Ok(cas) => cas,
+        Err(error) => {
+            let unconfirmed = PendingOffloadUnconfirmed {
+                expected: pending.route.version,
+                next_route: ready.next_route.clone(),
+                backing: ready.materialized_cold_backing.clone(),
+                length_bytes,
+            };
+            match confirm_pending_offload(storage_owner, &unconfirmed) {
+                Ok(cas) => cas,
+                Err(_) => {
+                    storage_owner
+                        .pending_offloads
+                        .unconfirmed
+                        .lock()
+                        .insert(pending.entry.key.clone(), unconfirmed);
+                    registry::record_cold_tier_operation(
+                        "offload",
+                        "error",
+                        registry::cold_tier_error_kind(&error),
+                    );
+                    if context.first_error.is_none() {
+                        *context.first_error = Some(error);
+                    }
+                    storage_owner.pending_offloads.retry(pending.entry.clone());
+                    return Ok(reserved_release_bytes);
+                }
+            }
+        }
+    };
     let reserved_release_bytes = checked_add_cold_tier_bytes(
         reserved_release_bytes,
         length_bytes,
         "cold tier reserved release exceeds accounting range",
     )?;
     let _ = backend_remove_pending_source(context.backend, &pending.cold_backing);
-    match cas_result {
-        Ok(cas) if cas.applied => {
+    match cas {
+        cas if cas.applied => {
+            if let Some(current) = cas.current.as_ref().and_then(materialized_cold_backing) {
+                context.outcome.cleanup.extend(
+                    persistent_backing_targets(&ready.materialized_cold_backing)
+                        .into_iter()
+                        .filter(|target| !persistent_backing_contains_target(&current, target)),
+                );
+            }
             context.outcome.used_add_bytes = checked_add_cold_tier_bytes(
                 context.outcome.used_add_bytes,
                 length_bytes,
@@ -1386,10 +1465,10 @@ fn apply_pending_offload_cas_result(
             )?;
             context.outcome.materialized = context.outcome.materialized.saturating_add(1);
             registry::record_cold_tier_operation("offload", "materialized", "none");
-            storage_owner.sync_route(&ready.next_route);
+            storage_owner.sync_route(cas.current.as_ref().unwrap_or(&ready.next_route));
             storage_owner.pending_offloads.complete(&pending.entry.key);
         }
-        Ok(cas) => {
+        cas => {
             let current_backing = cas.current.as_ref().and_then(materialized_cold_backing);
             if let Some(current) = current_backing
                 .as_ref()
@@ -1420,26 +1499,6 @@ fn apply_pending_offload_cas_result(
                 storage_owner.sync_route(current);
             }
             storage_owner.pending_offloads.complete(&pending.entry.key);
-        }
-        Err(error) => {
-            // Per-item errors can also represent a lost CAS reply. See the batch-error path
-            // above for why provider-managed NoF payloads are retained until retry confirms the
-            // route; definite conflicts are handled by the preceding branch and cleaned up.
-            if !pending.transient_nof {
-                context
-                    .outcome
-                    .cleanup
-                    .push(ready.materialized_cold_backing.clone());
-            }
-            registry::record_cold_tier_operation(
-                "offload",
-                "error",
-                registry::cold_tier_error_kind(&error),
-            );
-            if context.first_error.is_none() {
-                *context.first_error = Some(error);
-            }
-            storage_owner.pending_offloads.retry(pending.entry.clone());
         }
     }
     Ok(reserved_release_bytes)
@@ -1633,6 +1692,7 @@ impl ColdTierOffloadManager {
     pub(in super::super) fn new(priority: ColdTierOffloadPriorityConfig) -> Self {
         Self {
             queue: Mutex::new(PendingOffloadQueue::new(priority)),
+            unconfirmed: Mutex::new(BTreeMap::new()),
             materializing: AtomicBool::new(false),
         }
     }
@@ -1662,6 +1722,14 @@ impl ColdTierOffloadManager {
     }
 
     pub(in super::super) fn replace(&self, queue: PendingOffloadQueue) {
+        let mut queue = queue;
+        for (key, pending) in self.unconfirmed.lock().iter() {
+            queue.push(
+                key.route_key.clone(),
+                pending.expected,
+                Some(pending.backing.length),
+            );
+        }
         let mut guard = self.queue.lock();
         let prev_in_flight = std::mem::take(&mut guard.in_flight);
         *guard = queue;

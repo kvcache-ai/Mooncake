@@ -42,6 +42,7 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::mooncake_v1(),
         replicas: vec![ReplicaRoute {
+            publication: None,
             segment_name: SegmentName::new(segment),
             owner: make_creator(),
             offset: Some(0),

@@ -1110,6 +1110,11 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::ReserveAnyRequest>,
     ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
         let request = request.into_inner();
+        if self.allocator.requires_publication_provenance() {
+            return Err(Status::failed_precondition(
+                "publication provenance is required; upgrade the writer",
+            ));
+        }
         let allocator = self.allocator.clone();
         let result = run_blocking_allocator("reserve_any", move || {
             request
@@ -1166,14 +1171,44 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             Status::invalid_argument("control plane batch reserve_any request is missing owner")
         })?;
         let length_bytes = request.length_bytes;
+        if !request.publication_attempts.is_empty()
+            && request.publication_attempts.len() != length_bytes.len()
+        {
+            return Err(Status::invalid_argument(
+                "publication attempt count does not match reservations",
+            ));
+        }
+        let attempts = request
+            .publication_attempts
+            .iter()
+            .map(|bytes| decode_publication(bytes))
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if self.allocator.requires_publication_provenance()
+            && (attempts.len() != length_bytes.len() || attempts.iter().any(Option::is_none))
+        {
+            return Err(Status::failed_precondition(
+                "publication provenance is required; upgrade the writer",
+            ));
+        }
         let pending_publication = request.pending_publication;
         let allocator = self.allocator.clone();
         let results = run_blocking_allocator("batch reserve_any", move || {
-            if pending_publication {
+            let results = if pending_publication {
                 allocator.batch_reserve_any_with_pending_publication(&owner, &length_bytes)
             } else {
                 allocator.batch_reserve_any(&owner, &length_bytes)
-            }
+            };
+            results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    result.and_then(|reservation| match attempts.get(index).cloned().flatten() {
+                        Some(attempt) => allocator.bind_publication(reservation, attempt),
+                        None => Ok(reservation),
+                    })
+                })
+                .collect::<Vec<_>>()
         })
         .await?;
         let replies = results
@@ -1197,6 +1232,11 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::ReserveSpecificRequest>,
     ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
         let request = request.into_inner();
+        if self.allocator.requires_publication_provenance() {
+            return Err(Status::failed_precondition(
+                "publication provenance is required; upgrade the writer",
+            ));
+        }
         let allocator = self.allocator.clone();
         let result = run_blocking_allocator("reserve_specific", move || {
             request
@@ -1215,6 +1255,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                             .batch_reserve_specific_with_pending_publication(
                                 &owner,
                                 &[ReserveSpecificOp {
+                                    publication: None,
                                     segment_name: SegmentName::new(request.segment_name),
                                     length_bytes: request.length_bytes,
                                 }],
@@ -1264,19 +1305,40 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let entries = request
             .entries
             .into_iter()
-            .map(|entry| ReserveSpecificOp {
-                segment_name: SegmentName::new(entry.segment_name),
-                length_bytes: entry.length_bytes,
+            .map(|entry| {
+                Ok(ReserveSpecificOp {
+                    publication: decode_publication(&entry.publication_attempt)?,
+                    segment_name: SegmentName::new(entry.segment_name),
+                    length_bytes: entry.length_bytes,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if self.allocator.requires_publication_provenance()
+            && entries.iter().any(|entry| entry.publication.is_none())
+        {
+            return Err(Status::failed_precondition(
+                "publication provenance is required; upgrade the writer",
+            ));
+        }
         let pending_publication = request.pending_publication;
         let allocator = self.allocator.clone();
         let results = run_blocking_allocator("batch reserve_specific", move || {
-            if pending_publication {
+            let results = if pending_publication {
                 allocator.batch_reserve_specific_with_pending_publication(&owner, &entries)
             } else {
                 allocator.batch_reserve_specific(&owner, &entries)
-            }
+            };
+            results
+                .into_iter()
+                .zip(&entries)
+                .map(|(result, entry)| {
+                    result.and_then(|reservation| match &entry.publication {
+                        Some(attempt) => allocator.bind_publication(reservation, attempt.clone()),
+                        None => Ok(reservation),
+                    })
+                })
+                .collect::<Vec<_>>()
         })
         .await?;
         let replies = results
@@ -1437,8 +1499,55 @@ where
         })
 }
 
+fn handle_publication_control(
+    service: &GrpcControlPlaneService,
+    request: pb::PublicationControlRequest,
+) -> std::result::Result<pb::PublicationControlReply, Box<Status>> {
+    if request.operations.len() > 64 {
+        return Err(Box::new(Status::invalid_argument(
+            "publication control batch exceeds 64 items",
+        )));
+    }
+    let operations = request
+        .operations
+        .iter()
+        .map(|bytes| {
+            decode_publication_control(bytes)
+                .map_err(|error| Box::new(Status::invalid_argument(error.to_string())))
+        })
+        .collect::<std::result::Result<Vec<mooncake_store_core::PublicationControl>, _>>()?;
+    let results = service.authority.publication_control(
+        &request.namespace,
+        &ClientStableId::new(request.authority),
+        &operations,
+    );
+    match results {
+        Ok(results) => Ok(pb::PublicationControlReply {
+            results: results
+                .into_iter()
+                .map(|result| match result {
+                    Ok(result) => pb::PublicationControlResult {
+                        result: encode_publication_control_reply(&result),
+                        error: None,
+                    },
+                    Err(error) => pb::PublicationControlResult {
+                        result: Vec::new(),
+                        error: Some(pb_error(error)),
+                    },
+                })
+                .collect(),
+            error: None,
+        }),
+        Err(error) => Ok(pb::PublicationControlReply {
+            results: Vec::new(),
+            error: Some(pb_error(error)),
+        }),
+    }
+}
+
 fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'static str {
     match request.body.as_ref() {
+        Some(pb::control_stream_request::Body::Publication(_)) => "publication_control",
         Some(pb::control_stream_request::Body::RouteGet(_)) => "batch_get_routes",
         Some(pb::control_stream_request::Body::RouteContains(_)) => "batch_contains_routes",
         Some(pb::control_stream_request::Body::RouteCas(_)) => "batch_compare_and_swap_routes",
@@ -1577,6 +1686,11 @@ pub(super) async fn handle_control_stream_request(
 ) -> pb::ControlStreamReply {
     let request_id = request.request_id;
     let response = match request.body {
+        Some(pb::control_stream_request::Body::Publication(batch)) => {
+            handle_publication_control(service, batch)
+                .map_err(|error| *error)
+                .map(pb::control_stream_reply::Body::Publication)
+        }
         Some(pb::control_stream_request::Body::RouteGet(batch)) => service
             .batch_get_routes(Request::new(batch))
             .await
@@ -1670,6 +1784,7 @@ mod owner_page_tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                publication: None,
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("segment-a"),
                 allocation_id: None,

@@ -35,6 +35,20 @@ pub(crate) trait AuthorityService: mooncake_store_route::RouteAuthorityService {
 impl<T> AuthorityService for T where T: mooncake_store_route::RouteAuthorityService {}
 
 pub(crate) trait AllocatorService: Send + Sync {
+    fn requires_publication_provenance(&self) -> bool {
+        false
+    }
+
+    fn bind_publication(
+        &self,
+        _reservation: SegmentReservation,
+        _attempt: mooncake_store_core::PublicationAttempt,
+    ) -> Result<SegmentReservation> {
+        Err(StoreError::Unsupported(
+            "allocator does not support publication provenance".to_string(),
+        ))
+    }
+
     fn reserve_any(&self, owner: &ClientRuntimeId, length_bytes: u64)
         -> Result<SegmentReservation>;
 
@@ -199,6 +213,7 @@ impl MigrationService for UnsupportedMigrationService {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReserveSpecificOp {
+    pub publication: Option<mooncake_store_core::PublicationAttempt>,
     pub segment_name: SegmentName,
     pub length_bytes: u64,
 }
