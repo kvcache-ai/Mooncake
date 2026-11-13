@@ -32,9 +32,8 @@ use crate::mesh::registry::{
 };
 use crate::mesh::selection::{
     authority_candidates, merge_authority_candidates, owner_scan_authority_candidates,
-    ranked_authorities,
-    ranked_merged_authorities, ranked_top_authorities, retained_authority_candidates,
-    select_authorities_for_requests, RouteAuthoritySelection,
+    ranked_authorities, ranked_merged_authorities, ranked_top_authorities,
+    retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::{record_cas_outcome, record_delete_marker_event};
 use crate::shim::{

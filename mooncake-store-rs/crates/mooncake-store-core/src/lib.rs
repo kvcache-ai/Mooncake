@@ -45,6 +45,5 @@ pub use route::{
     TenantQuotaState, TenantRoutePolicy,
 };
 pub use traits::{
-    MetadataBackend, PlacementStrategy, RouteDirectory, RouteOwnerScanStatus,
-    RouteReplicaReference,
+    MetadataBackend, PlacementStrategy, RouteDirectory, RouteOwnerScanStatus, RouteReplicaReference,
 };
