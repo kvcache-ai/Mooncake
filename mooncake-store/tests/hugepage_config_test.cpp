@@ -87,34 +87,40 @@ TEST_F(HugepageConfigTest, UnsetSizeDefaultsTo2Mb) {
     EXPECT_EQ(config.page_size, 2ULL * 1024 * 1024);
 }
 
-TEST_F(HugepageConfigTest, AcceptsLegacyByteSizeSyntaxForSupportedSizes) {
+TEST_F(HugepageConfigTest, AcceptsByteSizeSyntaxForSupportedSizes) {
     struct Case {
         const char* value;
         size_t expected;
     };
     const Case cases[] = {
-        {"2MB", 2ULL * 1024 * 1024},     {"512MB", 512ULL * 1024 * 1024},
-        {"1GB", 1024ULL * 1024 * 1024},  {" 2 mb ", 2ULL * 1024 * 1024},
-        {"+512M", 512ULL * 1024 * 1024}, {"0.5GB", 512ULL * 1024 * 1024},
-        {"2048K", 2ULL * 1024 * 1024},
+        {"2MB", 2ULL * 1024 * 1024},       {"512MB", 512ULL * 1024 * 1024},
+        {"1GB", 1024ULL * 1024 * 1024},    {" 2 mb ", 2ULL * 1024 * 1024},
+        {"+512M", 512ULL * 1024 * 1024},   {"0.5GB", 512ULL * 1024 * 1024},
+        {"2048K", 2ULL * 1024 * 1024},     {"2MiB", 2ULL * 1024 * 1024},
+        {"512MiB", 512ULL * 1024 * 1024},  {"1GiB", 1024ULL * 1024 * 1024},
+        {"0.5 GiB", 512ULL * 1024 * 1024}, {"2048kib", 2ULL * 1024 * 1024},
     };
 
     use_hugepage.Set("1");
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
         hugepage_size.Set(entry.value);
+        ::testing::internal::CaptureStderr();
 
         const HugepageConfig config = HugepageConfig::FromEnvironment();
+        const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_TRUE(config.enabled);
         EXPECT_EQ(config.page_size, entry.expected);
+        EXPECT_EQ(logs.find("Invalid MC_STORE_HUGEPAGE_SIZE"),
+                  std::string::npos);
     }
 }
 
 TEST_F(HugepageConfigTest, InvalidSizesWarnAndFallBackTo2Mb) {
     use_hugepage.Set("1");
-    for (const char* value :
-         {"", " ", "2MiB", "2MBjunk", "1e999", "infinite", "256MB", "1.5GB"}) {
+    for (const char* value : {"", " ", "2XiB", "2MBjunk", "1e999", "infinite",
+                              "256MB", "1.5GB", "256MiB", "1.5GiB"}) {
         SCOPED_TRACE(value);
         hugepage_size.Set(value);
         ::testing::internal::CaptureStderr();
@@ -126,7 +132,8 @@ TEST_F(HugepageConfigTest, InvalidSizesWarnAndFallBackTo2Mb) {
         EXPECT_EQ(config.page_size, 2ULL * 1024 * 1024);
         EXPECT_NE(logs.find("Invalid MC_STORE_HUGEPAGE_SIZE='"),
                   std::string::npos);
-        EXPECT_NE(logs.find("Supported: 2MB, 512MB, 1GB. Fallback to 2MB."),
+        EXPECT_NE(logs.find("Supported: 2MB/2MiB, 512MB/512MiB, 1GB/1GiB. "
+                            "Fallback to 2MB."),
                   std::string::npos);
     }
 }

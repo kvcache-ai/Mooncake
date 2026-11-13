@@ -57,7 +57,7 @@ MmapArenaConfig MmapArenaConfig::FromEnvironment(bool enabled_by_flag,
     config.hugepages_explicitly_requested =
         HugepageConfig::FromEnvironment().enabled;
 
-    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
+    // Supports human-readable sizes via string_to_byte_size(): "20GiB", "16GB",
     // etc.
     if (!env_pool_size.empty()) {
         const uint64_t parsed = string_to_byte_size(env_pool_size);
