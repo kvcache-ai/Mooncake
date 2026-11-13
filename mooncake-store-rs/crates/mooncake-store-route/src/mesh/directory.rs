@@ -2208,6 +2208,8 @@ mod owner_page_contract_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -2251,6 +2253,8 @@ mod owner_page_contract_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -2279,6 +2283,8 @@ mod owner_page_contract_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
@@ -2312,6 +2318,8 @@ mod owner_page_contract_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
@@ -3615,6 +3623,8 @@ mod snapshot_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -3647,6 +3657,8 @@ mod snapshot_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false

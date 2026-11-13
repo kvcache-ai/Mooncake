@@ -79,7 +79,7 @@ pub(crate) fn owner_scan_authority_candidates(
     observer: &ClientLease,
 ) -> Result<Vec<ClientLease>> {
     let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
-    let leases = membership.live_clients(true, "owner_route_scan")?;
+    let leases = membership.live_clients(false, "owner_route_scan")?;
     membership.reconcile_suspects(&leases);
     Ok(deduplicate_authority_candidates(
         leases
