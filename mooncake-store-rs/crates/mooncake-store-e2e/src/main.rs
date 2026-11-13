@@ -308,6 +308,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &mut target_upgrade,
         &router_replica,
         &reader,
+        &planner,
         value_size,
     )?;
     target_c.register_local_memory()?;
@@ -1447,6 +1448,7 @@ fn verify_hot_upgrade(
     writer_upgrade: &mut StoreClient,
     routed_writer: &StoreClient,
     reader: &StoreClient,
+    planner: &PlacementPlanner,
     value_size: usize,
 ) -> Result<()> {
     writer_a.enter_draining()?;
@@ -1458,6 +1460,29 @@ fn verify_hot_upgrade(
         Some(now_ms() + 5_000),
     )?;
     writer_upgrade.activate()?;
+
+    // Lifecycle publication is synchronous, but placement uses a membership
+    // snapshot refreshed in the background. Wait for the routing client to
+    // observe the handoff before testing its two-replica write.
+    let membership_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let candidates =
+            planner.ranked_candidates(routed_writer, &ObjectRef::new("upgrade-routed-key"))?;
+        if candidates.len() >= 2
+            && candidates.contains(writer_upgrade.runtime_id())
+            && !candidates.contains(writer_a.runtime_id())
+        {
+            break;
+        }
+        if Instant::now() >= membership_deadline {
+            return Err(StoreError::InvalidState(format!(
+                "hot-upgrade placement did not converge: old={} successor={} candidates={candidates:?}",
+                writer_a.runtime_id(),
+                writer_upgrade.runtime_id(),
+            )));
+        }
+        sleep(Duration::from_millis(10));
+    }
 
     let preserved = payload("upgrade-preserved", value_size);
     let promoted = payload("upgrade-promoted", value_size);
