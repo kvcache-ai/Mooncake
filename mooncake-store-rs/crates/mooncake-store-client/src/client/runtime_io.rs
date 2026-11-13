@@ -1963,7 +1963,6 @@ impl StoreClient {
                     Ok(())
                 })?;
 
-            flush_reclaims(self)?;
             let live_allocations = self.current_owned_allocations(owner_scan_status)?;
             let _ = self.release_stale_local_allocations(&live_allocations)?;
             flush_reclaims(self)?;

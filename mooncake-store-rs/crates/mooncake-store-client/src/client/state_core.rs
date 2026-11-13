@@ -159,6 +159,10 @@ impl SuspectRuntimeCache {
         self.suspects.contains_key(runtime)
     }
 
+    pub(crate) fn clear(&mut self, runtime: &ClientRuntimeId) {
+        self.suspects.remove(runtime);
+    }
+
     pub(crate) fn reconcile_with_leases(&mut self, leases: &[ClientLease]) {
         let now = Instant::now();
         self.suspects.retain(|runtime, entry| {

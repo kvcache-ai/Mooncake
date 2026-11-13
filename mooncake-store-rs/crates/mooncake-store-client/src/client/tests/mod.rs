@@ -17098,7 +17098,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
 }
 
 #[test]
-fn true_client_shrink_ignores_unreachable_route_authority() {
+fn true_client_shrink_blocks_on_unreachable_route_authority() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("shrink-dead-auth-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("shrink-dead-auth-b-segment"));
@@ -17217,22 +17217,22 @@ fn true_client_shrink_ignores_unreachable_route_authority() {
         })
         .expect("dead authority lease should publish");
 
-    let migrated = store_a
-        .evacuate_owned_replicas()
-        .expect("true client shrink should ignore unreachable mirrored authorities");
-    assert_eq!(migrated, owned_keys.len());
-
+    let result = store_a.evacuate_owned_replicas();
+    assert!(
+        result.is_err(),
+        "true client shrink must stop when owner-route coverage is incomplete"
+    );
     for key in owned_keys {
         let route = router
             .query_route(&key)
-            .expect("post-shrink route query should succeed")
-            .expect("post-shrink route should exist");
+            .expect("route query should succeed")
+            .expect("route should exist");
         assert!(
             route
                 .replicas
                 .iter()
                 .all(|replica| replica.owner != *store_a.runtime_id()),
-            "post-shrink route still references evacuated runtime"
+            "known routes should still migrate before incomplete coverage blocks completion"
         );
         assert_eq!(
             reader.get(&key).expect("reader get should succeed"),
@@ -17257,9 +17257,15 @@ fn evacuation_blocks_stale_release_after_incomplete_owner_scan() {
         .register_local_memory()
         .expect("local memory should register");
     let payload = vec![7u8; 64];
+    let object_key = ObjectKey::new("default::incomplete-owner-scan-key");
     client
         .put("incomplete-owner-scan-key", &payload)
         .expect("seed put should succeed");
+    let route = client
+        .route_directory
+        .get_object_route(&client.lease, &object_key)
+        .expect("seed route lookup should succeed")
+        .expect("seed route should exist");
     let used_before = client
         .list_segments()
         .expect("segment listing should succeed")
@@ -17320,18 +17326,81 @@ fn evacuation_blocks_stale_release_after_incomplete_owner_scan() {
     );
     client.route_directory = route_directory;
 
-    let result = client.evacuate_owned_replicas();
-    assert!(
-        result.is_err(),
-        "evacuation must stop when owner-route coverage is incomplete"
+    let route_ops = mooncake_store_route::RouteOperations::new(
+        client.route_directory.clone(),
+        client.lease.clone(),
     );
-    let used_after = client
-        .list_segments()
-        .expect("segment listing should succeed")
-        .into_iter()
-        .map(|segment| segment.used_bytes)
-        .sum::<u64>();
-    assert_eq!(used_after, used_before);
+    let mut partial_routes = Vec::new();
+    let status = route_ops
+        .visit_routes_by_replica_owner_with_status(&client.lease.runtime, &mut |route| {
+            partial_routes.push(route);
+            Ok(())
+        })
+        .expect("owner status scan should return partial coverage");
+    assert_eq!(
+        status,
+        mooncake_store_core::RouteOwnerScanStatus::Incomplete
+    );
+    assert!(partial_routes.is_empty());
+
+    authority_replace(
+        &metadata.route_namespace(),
+        &empty_authority.runtime.stable_id,
+        &object_key,
+        Some(&route),
+    )
+    .expect("healthy authority route should publish");
+    let mut healthy_partial_routes = Vec::new();
+    let partial_status = route_ops
+        .visit_routes_by_replica_owner_with_status(&client.lease.runtime, &mut |route| {
+            healthy_partial_routes.push(route);
+            Ok(())
+        })
+        .expect("partial owner scan should return status");
+    assert_eq!(
+        partial_status,
+        mooncake_store_core::RouteOwnerScanStatus::Incomplete
+    );
+    assert_eq!(healthy_partial_routes, vec![route]);
+    authority_replace(
+        &metadata.route_namespace(),
+        &empty_authority.runtime.stable_id,
+        &object_key,
+        None,
+    )
+    .expect("healthy authority route should be removed");
+
+    let mut legacy_routes = Vec::new();
+    assert!(
+        route_ops
+            .visit_routes_by_replica_owner(&client.lease.runtime, &mut |route| {
+                legacy_routes.push(route);
+                Ok(())
+            })
+            .is_err(),
+        "legacy owner visitor must reject incomplete coverage"
+    );
+    assert!(
+        route_ops
+            .list_routes_by_replica_owner(&client.lease.runtime)
+            .is_err(),
+        "legacy owner list must reject incomplete coverage"
+    );
+
+    for attempt in 0..2 {
+        let result = client.evacuate_owned_replicas();
+        assert!(
+            result.is_err(),
+            "evacuation attempt {attempt} must stop when owner-route coverage is incomplete"
+        );
+        let used_after = client
+            .list_segments()
+            .expect("segment listing should succeed")
+            .into_iter()
+            .map(|segment| segment.used_bytes)
+            .sum::<u64>();
+        assert_eq!(used_after, used_before);
+    }
 }
 
 #[test]
