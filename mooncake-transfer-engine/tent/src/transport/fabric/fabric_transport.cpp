@@ -759,8 +759,14 @@ Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
     {
         std::shared_lock<std::shared_mutex> guard(buffers_mutex_);
         auto it = buffers_.find(desc.addr);
-        if (it != buffers_.end() && it->second->length == desc.length)
+        if (it != buffers_.end()) {
+            if (it->second->length != desc.length) {
+                return Status::InvalidArgument(
+                    "Fabric buffer address already registered with a "
+                    "different length" LOC_MARK);
+            }
             buffer = it->second;
+        }
     }
     if (!buffer) {
         CHECK_STATUS(
@@ -771,6 +777,11 @@ Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
         }
         std::unique_lock<std::shared_mutex> guard(buffers_mutex_);
         auto& slot = buffers_[desc.addr];
+        if (slot && slot->length != desc.length) {
+            return Status::InvalidArgument(
+                "Fabric buffer address already registered with a "
+                "different length" LOC_MARK);
+        }
         if (slot) retired_.push_back(slot);
         slot = buffer;
     }
@@ -814,6 +825,11 @@ Status FabricTransport::removeMemoryBuffer(BufferDesc& desc) {
         std::unique_lock<std::shared_mutex> guard(buffers_mutex_);
         auto it = buffers_.find(desc.addr);
         if (it == buffers_.end()) return Status::OK();
+        if (it->second->length != desc.length) {
+            return Status::InvalidArgument(
+                "Fabric buffer address registered with a different "
+                "length" LOC_MARK);
+        }
         buffer = std::move(it->second);
         buffers_.erase(it);
         // In-flight tasks may still hold the buffer; its MRs close when the
@@ -848,7 +864,8 @@ Status FabricTransport::removeMemoryBuffer(BufferDesc& desc) {
 
 bool FabricTransport::tracksLocalBuffer(const BufferDesc& desc) const {
     std::shared_lock<std::shared_mutex> guard(buffers_mutex_);
-    return buffers_.count(desc.addr) > 0;
+    auto it = buffers_.find(desc.addr);
+    return it != buffers_.end() && it->second->length == desc.length;
 }
 
 }  // namespace tent

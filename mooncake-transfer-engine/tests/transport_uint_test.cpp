@@ -2391,6 +2391,45 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
 #endif
 
 #ifdef USE_TENT
+TEST(TransferEngineTentCompatibilityTest, EfaProtocolPinsRequiredFabric) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar tent_conf(
+        "MC_TENT_CONF",
+        R"({"policy":[{"name":"tcp-only","segment_type":"memory","transports":["tcp"]}],"transports":{"tcp":{"enable":true},"rdma":{"enable":true},"hp_tcp":{"enable":true},"shm":{"enable":true},"fabric":{"provider":"tcp","devices":["lo"]}},"metrics":{"enabled":false}})");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    const std::vector<std::string> devices{"efa0", "efa1"};
+    TransferEngine engine(false, devices);
+    const int result =
+        engine.init(P2PHANDSHAKE, "tent-efa-pinning", "", 0, "efa");
+#ifdef USE_FABRIC
+    EXPECT_TRUE(result == 0 || result == ERR_CONTEXT) << result;
+    const auto* config = TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(config, nullptr);
+    EXPECT_EQ(config->get("transports/fabric/provider", ""), "efa");
+    EXPECT_EQ(config->getArray<std::string>("transports/fabric/devices"),
+              devices);
+#else
+    EXPECT_EQ(result, ERR_NOT_IMPLEMENTED);
+#endif
+}
+
+TEST(TransferEngineTentCompatibilityTest, ForceTcpEnvOverridesEfaProtocol) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar tent_conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    const std::vector<std::string> devices{"efa0"};
+    TransferEngine engine(false, devices);
+    EXPECT_EQ(engine.init(P2PHANDSHAKE, "tent-efa-force-tcp", "", 0, "efa"), 0);
+    const auto* config = TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(config, nullptr);
+    EXPECT_TRUE(config->get("transports/force_tcp", false));
+    EXPECT_FALSE(config->get("transports/force_fabric", true));
+}
+
 TEST(TransferEngineTentCompatibilityTest,
      InstallTransportReturnsCompatibilityHandle) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
