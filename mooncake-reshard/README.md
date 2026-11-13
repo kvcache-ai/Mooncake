@@ -323,6 +323,55 @@ lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
 semantics. Legacy logical planning permits omission for compatibility; the
 Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
 
+A descriptor defaults to `components=(KEY, VALUE)`. Single-component resources
+can declare `LATENT`, `CONV`, or `SSM`; their shard-unit width is `key_head_dim`
+(`value_head_dim` remains the width of `VALUE`). Components share the descriptor's
+layer set, dtype and ownership. Use separate resources for different dtypes or
+shard axes, such as a BF16 convolution buffer and an FP32 recurrent state.
+Existing K/V JSON and canonical identities remain unchanged.
+
+For MLA, declare one global latent unit and explicit TP replicas, so the planner
+chooses one source replica per target. For recurrent state, use `page_size=1`
+and let the framework map request slots to rows. GDN convolution Q/K/V groups
+must be separate resources because each group is independently TP-sharded.
+`NHD_STRIDED` permits a row pitch larger than its contiguous head/dimension
+payload; `nbytes` describes the physical span including gaps. Storage offsets
+can select a group within a fused allocation. The ordinary `NHD` contract
+continues to require dense rows. These are byte-copy layouts, not dtype
+conversion, quantization, or arbitrary tensor transposition.
+
+Overlap checks for equal row strides are independent of row capacity. Validation
+is capped at 1,000,000 candidate-pair/expanded-interval work units per call;
+mixed-stride layouts exceeding that budget fail before their rows are expanded.
+
+Bindings with independent lifetimes must register regions with
+`owner_id=binding.digest`. Validation and execution, including cached results,
+require that claim to remain active on every region. Omitting `owner_id` retains
+the legacy runtime-wide claim, which authorizes all matching local bindings until
+released. Other owner IDs can pin memory but do not authorize binding execution.
+
+The framework retains responsibility for token-page and state-slot mappings,
+cache lifetime, coordinating all resources, and withholding request completion
+until every required resource writer succeeds. Mooncake does not infer model
+architecture or treat recurrent state as token-indexed KV.
+
+For a recurrent-state operation, the snapshot's row interval identifies the
+selected state slots in a framework-defined logical order, not all tokens of
+the requests. Source and target must agree on that order and on the state
+checkpoint; the framework supplies fingerprints that bind those semantics.
+Physical slot IDs can differ: export resolved ranges mapping each logical row
+to its local slot, or use `resolve_contiguous_runtime_binding` with an explicit
+`first_token_offset` for a contiguous run of rows, including `NHD_STRIDED` views.
+Only the selected payload bytes are copied; padding and other fused groups
+remain untouched. One operation covers one resource, so a hybrid request with
+K/V, convolution and recurrent state needs a framework-level completion barrier
+across those resources.
+
+These extensions apply to runtime-to-runtime transfers. Store reshard currently
+accepts only `(KEY, VALUE)` with an `NHD` descriptor and rejects state resources
+and `NHD_STRIDED` descriptors. Existing K/V model-domain keys, Store layout and
+manifest identities, and JSON encodings are preserved.
+
 The KV-cache implementation is split by responsibility:
 
 - `snapshot.py` defines content identity;
@@ -344,6 +393,40 @@ maps target DP ranks round-robin over the source placement's available DP ranks.
 public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
+
+## Weight reshard CPU overhead
+
+Weight planning and execution use call-local fragment indexes and membership
+sets to avoid repeated linear scans. Indexed lookups retain full fragment
+equality checks. Operation views share construction-time accumulators instead
+of repeatedly hashing executor keys containing long fragment tuples.
+
+Within one bind call, executor construction reuses runtime binding attestations
+created for the exact same placement and binding objects. This reuse does not
+cache validation across calls or extend allocation lifetimes. Canonical rank
+encoding retains the existing identity fields and serialized representation.
+
+Segment iteration advances N-dimensional offsets incrementally, with a direct
+range iterator for eligible one-dimensional regions. Batch lowering constructs
+bounded innermost runs for eligible canonical regions, advancing prefixes lazily
+and accumulating short runs within one operation up to the configured batch
+size. It preserves segment order and keeps different operations' allocation
+ranges separate. Custom region subclasses and unsupported stride
+or loop shapes continue through the segment iterator. Segment-budget rejection
+still occurs before a batch is produced; batching does not raise the budget.
+
+These implementation choices reduce Python bookkeeping while preserving
+coverage, bounds, canonical identities, and allocation lifetime contracts.
+Integer geometry normalization reuses exact immutable tuples only after checking
+every element and its minimum value. Lists and other supported sequences retain
+their existing normalization and validation behavior; no metadata is cached
+across bindings or generations.
+Strict geometry iteration uses the native `zip(strict=True)` implementation on
+Python 3.10 and newer, including its iterator construction and error semantics;
+the compatibility implementation remains available for older runtimes.
+End-to-end startup also includes framework initialization, model allocation,
+transport, and serving readiness; it must be measured separately from these
+CPU paths.
 
 Run the reshard tests from the repository root:
 

@@ -1360,6 +1360,52 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
     EXPECT_NE(response.body.find(batch_sample), std::string::npos);
 }
 
+TEST_F(MasterMetricsTest, KeyGroupMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.configure_key_groups("state:suffix:_state,kv:suffix:_k");
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    WrappedMasterService service_(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "key_group_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& [key, length] :
+         std::vector<std::pair<std::string, uint64_t>>{
+             {"a_k", 1024}, {"b_k", 1024}, {"a_state", 4096}, {"c", 512}}) {
+        ASSERT_TRUE(
+            service_.PutStart(client_id, key, length, config).has_value());
+        ASSERT_TRUE(service_
+                        .PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                                ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_key_count_by_group{group=\"kv\"} 2"),
+              std::string::npos);
+    EXPECT_NE(
+        serialized.find("master_value_bytes_by_group{group=\"state\"} 4096"),
+        std::string::npos);
+    EXPECT_NE(
+        serialized.find("master_value_bytes_by_group{group=\"other\"} 512"),
+        std::string::npos);
+
+    ASSERT_EQ(4, service_.RemoveAll());
+    serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_value_bytes_by_group{group=\"kv\"} 0"),
+              std::string::npos);
+
+    metrics.configure_key_groups("");
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

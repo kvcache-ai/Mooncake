@@ -17,12 +17,16 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "common/hash_utils.h"
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -31,11 +35,22 @@ namespace mooncake {
 
 class TransferMetadata;
 
+// DTK VMM fabric handle: handle type 0x8, fixed-size shareable blob.
+constexpr auto kDtkFabricHandleType =
+    static_cast<hipMemAllocationHandleType>(0x8);
+constexpr size_t kDtkFabricHandleBytes = 512;
+using DtkFabricHandle = std::array<unsigned char, kDtkFabricHandleBytes>;
+
+// Shared with RDMA under ENABLE_MULTI_PROTOCOL: when HyLink is installed,
+// device memory registration is delegated to HyLink, which rejects
+// allocations it cannot export.
+bool isDtkDeviceMemory(void* addr);
+bool localSegmentHasHylink(const std::shared_ptr<TransferMetadata>& metadata);
+
 // Hylink transport for Hygon DCU memory over HSL (Hygon Scale-up Link).
 // HSL connects DCUs directly, including across machines, and does not use
-// an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle (allocation type
-// 0x8, 512 bytes). An imported fabric address can be granted access only
-// once and only to one device, so each GPU maps its own address.
+// an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle (handle type
+// 0x8, kDtkFabricHandleBytes).
 class HylinkTransport : public Transport {
    public:
     HylinkTransport();
@@ -79,10 +94,13 @@ class HylinkTransport : public Transport {
     const char* getName() const override { return "hylink"; }
 
    private:
+    // DTK fabric compatibility: keep a distinct, stable handle blob for
+    // each imported mapping until that mapping is closed.
     struct OpenedMapping {
         void* shm_addr = nullptr;
         uint64_t length = 0;
         hipMemGenericAllocationHandle_t fabric_handle = nullptr;
+        std::unique_ptr<DtkFabricHandle> shareable;
     };
 
     struct PendingTransfer {
@@ -99,12 +117,8 @@ class HylinkTransport : public Transport {
     hipStream_t acquireStream(int device_id);
     void closeMapping(OpenedMapping& mapping);
 
-    // target -> remote buffer -> local device. An imported fabric VA accepts
-    // hipMemSetAccess only once and only for one device, so each GPU maps
-    // its own address.
-    using RelocateMap = std::unordered_map<
-        uint64_t,
-        std::unordered_map<uint64_t, std::unordered_map<int, OpenedMapping>>>;
+    using RelocateMap = std::unordered_map<std::pair<uint64_t, uint64_t>,
+                                           OpenedMapping, PairHash>;
 
     RWSpinlock remap_lock_;
     RelocateMap remap_;

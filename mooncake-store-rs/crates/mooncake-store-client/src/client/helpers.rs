@@ -55,6 +55,7 @@ fn validate_replica_checksum(replica: &ReplicaRoute, payload: &[u8]) -> Result<(
     )))
 }
 
+#[allow(dead_code)]
 fn flatten_slices(buffers: &[&[u8]]) -> Vec<u8> {
     let total = buffers.iter().map(|buffer| buffer.len()).sum();
     let mut payload = Vec::with_capacity(total);

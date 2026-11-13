@@ -131,17 +131,11 @@ int AscendDirectTransport::install(std::string& local_server_name,
             << ret;
         return ret;
     }
-    ret = metadata_->updateLocalSegmentDesc();
-    if (ret) {
-        LOG(ERROR) << "cannot publish segments, "
-                      "check the availability of metadata storage, ret: "
-                   << ret;
-        return ret;
-    }
-
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
+    exec_params.local_engine_device_ids = local_engine_device_ids_;
+    exec_params.base_port = base_port_;
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
@@ -154,8 +148,18 @@ int AscendDirectTransport::install(std::string& local_server_name,
             << ret;
         return ret;
     }
+    ret = metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        LOG(ERROR) << "cannot publish segments, "
+                      "check the availability of metadata storage, ret: "
+                   << ret;
+        return ret;
+    }
 
-    if (agent_mode_ && roce_mode_) {
+    // RoceDummyRealSliceDispatcher is the sunset path for a standalone holder
+    // that still sets HCCL_INTRA_ROCE_ENABLE. roce:device and roce:host stay
+    // on DefaultSliceDispatcher even when agent_mode publishes every NPU.
+    if (agent_mode_ && IsHcclIntraRoceEnabled()) {
         dispatcher_ = std::make_unique<RoceDummyRealSliceDispatcher>(
             transfer_executor_.get(), local_engine_contexts_,
             local_engine_device_ids_);
@@ -164,6 +168,12 @@ int AscendDirectTransport::install(std::string& local_server_name,
             transfer_executor_.get(), local_engine_contexts_,
             local_engine_device_ids_);
     }
+    LOG(INFO) << "AscendDirectTransport: dispatcher="
+              << (agent_mode_ && IsHcclIntraRoceEnabled()
+                      ? "RoceDummyRealSliceDispatcher"
+                      : "DefaultSliceDispatcher")
+              << ", agent_mode=" << agent_mode_ << ", roce_mode=" << roce_mode_
+              << ", local_devices=" << local_engine_device_ids_.size();
     return 0;
 }
 
@@ -347,6 +357,11 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
+    // TENT drives local-copy completion from the transport status path; do the
+    // same here instead of running a per-engine completion thread.
+    if (transfer_executor_) {
+        transfer_executor_->pollLocalCopies();
+    }
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
@@ -446,14 +461,23 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
 
 int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
+    // Unregistering can run on a thread that never bound a context, such as the
+    // signal handling thread that unmounts the store segments on Ctrl-C. There
+    // is then nothing to put back, and deregisterMem binds the context each
+    // handle was registered with regardless of what the caller has bound.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "aclrtGetCurrentContext failed while unregistering memory "
+               "(no ACL context on this thread), errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     int ret = transfer_executor_->deregisterMem(addr);
     if (ret != 0) {

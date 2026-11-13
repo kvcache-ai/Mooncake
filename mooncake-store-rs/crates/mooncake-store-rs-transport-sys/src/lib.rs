@@ -687,6 +687,7 @@ pub mod tent {
         _shim: DynamicLibrary,
         load_config_from_file: unsafe extern "C" fn(*const c_char),
         set_config: unsafe extern "C" fn(*const c_char, *const c_char),
+        prepare_ascend: unsafe extern "C" fn(c_int) -> c_int,
         create_engine: unsafe extern "C" fn() -> TentEngineHandle,
         destroy_engine: unsafe extern "C" fn(TentEngineHandle),
         segment_name: unsafe extern "C" fn(TentEngineHandle, *mut c_char, usize) -> c_int,
@@ -704,6 +705,11 @@ pub mod tent {
         register_memory: unsafe extern "C" fn(TentEngineHandle, *mut c_void, usize) -> c_int,
         unregister_memory: unsafe extern "C" fn(TentEngineHandle, *mut c_void, usize) -> c_int,
         platform_free_memory: unsafe extern "C" fn(*mut c_void, usize) -> c_int,
+        ascend_host_alloc: unsafe extern "C" fn(usize) -> *mut c_void,
+        ascend_host_free: unsafe extern "C" fn(*mut c_void),
+        acl_pointer_is_device: unsafe extern "C" fn(*mut c_void) -> c_int,
+        acl_memcpy_d2h: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int,
+        acl_memcpy_h2d: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int,
         probe_rdma_max_mr_size: unsafe extern "C" fn() -> u64,
         allocate_batch: unsafe extern "C" fn(TentEngineHandle, usize) -> BatchId,
         free_batch: unsafe extern "C" fn(TentEngineHandle, BatchId) -> c_int,
@@ -727,6 +733,7 @@ pub mod tent {
         Some(TentApi {
             load_config_from_file: load_symbol(tent_shared, "tent_load_config_from_file")?,
             set_config: load_symbol(tent_shared, "tent_set_config")?,
+            prepare_ascend: load_symbol(shim, "mooncake_tent_prepare_ascend")?,
             create_engine: load_symbol(tent_shared, "tent_create_engine")?,
             destroy_engine: load_symbol(tent_shared, "tent_destroy_engine")?,
             segment_name: load_symbol(tent_shared, "tent_segment_name")?,
@@ -740,6 +747,11 @@ pub mod tent {
             register_memory: load_symbol(tent_shared, "tent_register_memory")?,
             unregister_memory: load_symbol(tent_shared, "tent_unregister_memory")?,
             platform_free_memory: load_symbol(shim, "mooncake_tent_platform_free_memory")?,
+            ascend_host_alloc: load_symbol(shim, "mooncake_tent_ascend_host_alloc")?,
+            ascend_host_free: load_symbol(shim, "mooncake_tent_ascend_host_free")?,
+            acl_pointer_is_device: load_symbol(shim, "mooncake_tent_acl_pointer_is_device")?,
+            acl_memcpy_d2h: load_symbol(shim, "mooncake_tent_acl_memcpy_d2h")?,
+            acl_memcpy_h2d: load_symbol(shim, "mooncake_tent_acl_memcpy_h2d")?,
             probe_rdma_max_mr_size: load_symbol(shim, "mooncake_tent_probe_rdma_max_mr_size")?,
             allocate_batch: load_symbol(tent_shared, "tent_allocate_batch")?,
             free_batch: load_symbol(tent_shared, "tent_free_batch")?,
@@ -761,6 +773,12 @@ pub mod tent {
         if let Some(api) = api() {
             (api.set_config)(key, value);
         }
+    }
+
+    /// Bind ACL (aclInit once + aclrtSetDevice) on the calling thread before
+    /// creating a TENT engine whose ascend_direct transport is enabled.
+    pub unsafe extern "C" fn tentPrepareAscend(device_id: c_int) -> c_int {
+        api().map_or(-1, |api| (api.prepare_ascend)(device_id))
     }
 
     pub unsafe extern "C" fn tent_create_engine() -> TentEngineHandle {
@@ -837,6 +855,42 @@ pub mod tent {
         addr: *mut c_void,
     ) -> c_int {
         api().map_or(-1, |api| (api.free_memory)(engine, addr))
+    }
+
+    /// Allocate host memory through the Ascend store allocator. With
+    /// ASCEND_USE_SHMEM=1 this returns a memfd-backed mapping that same-host
+    /// peers can import (transfers become local copies).
+    pub unsafe extern "C" fn tentAscendHostAlloc(size: usize) -> *mut c_void {
+        api().map_or(std::ptr::null_mut(), |api| (api.ascend_host_alloc)(size))
+    }
+
+    pub unsafe extern "C" fn tentAscendHostFree(addr: *mut c_void) {
+        if let Some(api) = api() {
+            if !addr.is_null() {
+                (api.ascend_host_free)(addr);
+            }
+        }
+    }
+
+    /// 1 = device memory, 0 = host memory, negative = unknown/ACL unavailable.
+    pub unsafe extern "C" fn tentAclPointerIsDevice(addr: *mut c_void) -> c_int {
+        api().map_or(-1, |api| (api.acl_pointer_is_device)(addr))
+    }
+
+    pub unsafe extern "C" fn tentAclMemcpyD2H(
+        dst: *mut c_void,
+        src: *const c_void,
+        len: usize,
+    ) -> c_int {
+        api().map_or(-1, |api| (api.acl_memcpy_d2h)(dst, src, len))
+    }
+
+    pub unsafe extern "C" fn tentAclMemcpyH2D(
+        dst: *mut c_void,
+        src: *const c_void,
+        len: usize,
+    ) -> c_int {
+        api().map_or(-1, |api| (api.acl_memcpy_h2d)(dst, src, len))
     }
 
     pub unsafe extern "C" fn tent_register_memory(

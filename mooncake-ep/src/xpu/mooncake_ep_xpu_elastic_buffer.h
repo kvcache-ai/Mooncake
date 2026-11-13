@@ -17,6 +17,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,10 +34,12 @@ namespace xpu_ep {
 
 // Intel XPU implementation of the native ElasticBuffer (DeepEP V2 API) that
 // mooncake_elastic_buffer.ElasticBuffer drives, with the CUDA methods' names
-// and arguments. Every rank is on one node and reached over Level Zero IPC:
-// there is no IBGDA, NCCL or hybrid (scale-out) mode, and those arguments are
-// rejected rather than ignored. The constructor additionally takes the
-// torch.xpu stream (`sycl_queue`) to allocate on.
+// and arguments. Peers on the node are reached over Level Zero IPC; ranks on
+// other nodes, when built with the verbs path, through a host proxy's RDMA
+// writes, as in MooncakeEpXpuBuffer. Either way dispatch and combine are
+// flat, over all ranks: there is no IBGDA, NCCL or hierarchical (scale-out)
+// mode, and those arguments are rejected rather than ignored. The constructor
+// additionally takes the torch.xpu stream (`sycl_queue`) to allocate on.
 //
 // The kernels run on the caller's stream. Setting
 // MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE (experimental, off by
@@ -62,22 +65,35 @@ class MooncakeEpXpuElasticBuffer {
     bool using_nccl() const { return false; }
     bool ibgda_disabled() const { return true; }
     bool use_fast_path() const;
-    // One node: (scale-out, scale-up) = (1, num_ranks).
-    std::tuple<int, int> get_physical_domain_size() const {
-        return {1, num_ranks_};
-    }
+    // (nodes, ranks per node), as init_rdma found them; (1, num_ranks)
+    // without it.
+    std::tuple<int, int> get_physical_domain_size() const;
+    // Always flat: (scale-out, scale-up) = (1, num_ranks).
     std::tuple<int, int> get_logical_domain_size() const {
         return {1, num_ranks_};
     }
 
     // Two buffer halves, each sized for the larger of a dispatch and a
-    // combine of this shape (see ElasticHalfLayout).
+    // combine of this shape (see ElasticHalfLayout), with the regions for
+    // ranks on other nodes if allow_hybrid_mode is set and num_ranks > 1.
     static int64_t calculate_buffer_size(int num_ranks,
                                          int64_t num_max_tokens_per_rank,
                                          int64_t hidden, int64_t num_topk,
                                          bool use_fp8_dispatch,
                                          bool allow_hybrid_mode,
                                          bool allow_multiple_reduction);
+
+    // Ranks on other nodes, as in MooncakeEpXpuBuffer: init_rdma registers
+    // the buffer with the nearest NIC and creates a queue pair for each rank
+    // r with remote[r] set, returning what peers need to connect to it;
+    // connect_rdma connects to the active ones from every rank's init_rdma
+    // result. Both come before sync_nvlink_ipc_handles (the Level Zero IPC
+    // import), which then leaves remote ranks unmapped and requires every
+    // active one to be connected.
+    static bool rdma_available();
+    std::vector<int32_t> init_rdma(const std::vector<int>& remote);
+    void connect_rdma(const std::vector<std::vector<int32_t>>& infos,
+                      const std::vector<int>& active_ranks_mask);
 
     std::vector<int32_t> get_ipc_handle();
     void sync_nvlink_ipc_handles(
@@ -124,6 +140,7 @@ class MooncakeEpXpuElasticBuffer {
 
    private:
     struct Half {
+        int idx;
         int* ready;
         int* next_ready;
         uint8_t* staging;
@@ -139,6 +156,12 @@ class MooncakeEpXpuElasticBuffer {
     std::optional<XpuEventHandle> finish(sycl::queue& q, sycl::event done,
                                          bool async_with_compute_stream);
     int maxWgs(int num_sms) const;
+    PeerView peerView() const;
+    // Has the proxy write the puts `plan` returns once `after` completes.
+    void submitPuts(sycl::event after,
+                    std::function<std::vector<ProxyPut>()> plan);
+    // Waits for the proxy's writes (with mu_ not held).
+    void drainProxy();
 
     int rank_, num_ranks_;
     size_t half_stride_;
@@ -158,6 +181,19 @@ class MooncakeEpXpuElasticBuffer {
     // it, so calls run in issue order whichever streams they come from.
     sycl::event last_event_;
     std::optional<sycl::queue> last_queue_;
+
+    // Ranks on other nodes, and those connected over RDMA.
+    std::vector<int> remote_;
+    std::vector<int> connected_;
+    std::vector<int> rdma_ranks_;  // connected, in rank order
+    bool hybrid_ = false;          // some rank is connected
+    int* d_remote_ = nullptr;      // device copy of connected_
+    // For each buffer half, what the send kernels sent to each rank: the
+    // proxy reads it after the call has moved on to the other half.
+    int* host_counts_ = nullptr;
+#if MOONCAKE_EP_XPU_RDMA
+    std::unique_ptr<XpuEpProxy> proxy_;
+#endif
 };
 
 }  // namespace xpu_ep

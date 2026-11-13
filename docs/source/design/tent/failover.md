@@ -189,7 +189,7 @@ The harness — why a fake `Transport` is enough, how fakes are swapped in, and 
 * Derived (merged) alias tasks must follow their owner's recovered route and must not cause a duplicate physical submission.
 * Exhausting `max_failover_attempts` (including `0` and `1`) must surface `FAILED` and must not touch a transport beyond the budget.
 * `failover_count` is per-task: one failing request must not spend another request's budget.
-* With `enable_auto_failover_on_poll=false`, status polling is observational; `progressBatch` / `waitTransferCompletion` / `transferSync` still recover.
+* With `enable_auto_failover_on_poll=false`, status polling is observational; `progressBatch` / `waitTransferCompletion` / `submitAndWaitTransfer` still recover.
 
 Submit-stage recovery is exercised through the same FakeTransport harness with `force_submit_fail` backends (see `SubmitStageFailureFailsOverToSecondary` and friends in `engine_failover_e2e_test.cpp`).
 

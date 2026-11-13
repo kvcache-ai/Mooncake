@@ -10,12 +10,15 @@
 namespace mooncake {
 
 constexpr size_t kCudaIpcHandleSize = 64;
+constexpr size_t kCudaDeviceUuidSize = 16;
 
 struct CudaIpcBufferHandle {
     std::array<uint8_t, kCudaIpcHandleSize> handle{};
     uint64_t offset = 0;
     uint64_t size = 0;
     int32_t device_id = -1;
+    std::array<uint8_t, kCudaDeviceUuidSize> device_uuid{};
+    bool has_device_uuid = false;
 };
 
 struct CudaIpcShmBufferRef {
@@ -38,7 +41,8 @@ struct CudaIpcReadRequest {
 
 }  // namespace mooncake
 
-YLT_REFL(mooncake::CudaIpcBufferHandle, handle, offset, size, device_id);
+YLT_REFL(mooncake::CudaIpcBufferHandle, handle, offset, size, device_id,
+         device_uuid, has_device_uuid);
 YLT_REFL(mooncake::CudaIpcShmBufferRef, ptr, size);
 YLT_REFL(mooncake::CudaIpcWriteRequest, key, metadata, payload);
 YLT_REFL(mooncake::CudaIpcReadRequest, key, destination, source_offset, size);

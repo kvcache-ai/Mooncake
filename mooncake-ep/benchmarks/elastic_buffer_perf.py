@@ -13,7 +13,8 @@ Typical single-node usage:
       mooncake-ep/benchmarks/elastic_buffer_perf.py --route alltoall
 
 On Intel GPUs the same command runs over torch.xpu, the xccl backend and Level
-Zero IPC (one node only; pass --transport ipc or leave it at auto).
+Zero IPC, with RDMA to remote ranks (pass --transport ipc or leave it at
+auto).
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "ibgda", "nccl", "ipc"),
         default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
         help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA. "
-        "XPU supports only auto/ipc (single node).",
+        "XPU supports only auto/ipc.",
     )
     parser.add_argument(
         "--route",

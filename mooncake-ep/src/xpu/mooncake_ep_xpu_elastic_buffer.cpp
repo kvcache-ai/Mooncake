@@ -71,9 +71,10 @@ MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
     const std::string& transport, const std::vector<int32_t>& nccl_unique_id,
     uint64_t stream_ptr)
     : rank_(rank), num_ranks_(num_ranks), queue_(*asQueue(stream_ptr)) {
-    // Shape hints, the hybrid switch (a single node never needs it), and the
-    // RDMA and SM knobs have nothing to act on here. Every slot is assigned in
-    // token order, so dispatch is deterministic either way.
+    // Shape hints, the hybrid switch (it only sizes the buffer, see
+    // calculate_buffer_size: ranks on other nodes take the same flat path),
+    // and the RDMA and SM knobs have nothing to act on here. Every slot is
+    // assigned in token order, so dispatch is deterministic either way.
     (void)num_max_tokens_per_rank;
     (void)hidden;
     (void)num_topk;
@@ -85,8 +86,8 @@ MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
     (void)num_allocated_qps;
     (void)num_cpu_timeout_secs;
     XPU_EP_CHECK(transport == "auto" || transport == "ipc",
-                 "the XPU ElasticBuffer supports only transport='ipc' (one "
-                 "node over Level Zero IPC), got '" +
+                 "the XPU ElasticBuffer supports only transport='ipc' (Level "
+                 "Zero IPC on the node, RDMA across nodes), got '" +
                      transport + "'");
     XPU_EP_CHECK(nccl_unique_id.empty(),
                  "the XPU ElasticBuffer has no NCCL transport");
@@ -138,8 +139,17 @@ void MooncakeEpXpuElasticBuffer::destroy() {
         last_event_.wait();
     }
     queue_.wait();
+    drainProxy();
+#if MOONCAKE_EP_XPU_RDMA
+    proxy_.reset();  // deregisters the buffer before it is freed
+#endif
     if (workspace_) sycl::free(workspace_, queue_);
+    if (d_remote_) sycl::free(d_remote_, queue_);
+    if (host_counts_) sycl::free(host_counts_, queue_);
     workspace_ = nullptr;
+    d_remote_ = nullptr;
+    host_counts_ = nullptr;
+    hybrid_ = false;
     ipc_.reset();
 }
 
@@ -155,13 +165,97 @@ int64_t MooncakeEpXpuElasticBuffer::calculate_buffer_size(
     int num_ranks, int64_t num_max_tokens_per_rank, int64_t hidden,
     int64_t num_topk, bool use_fp8_dispatch, bool allow_hybrid_mode,
     bool allow_multiple_reduction) {
-    (void)allow_hybrid_mode;
     (void)allow_multiple_reduction;
-    const ElasticHalfLayout hl(num_ranks,
-                               static_cast<int>(num_max_tokens_per_rank),
-                               default_msg(hidden, num_topk, use_fp8_dispatch),
-                               static_cast<int>(hidden));
+    const ElasticHalfLayout hl(
+        num_ranks, static_cast<int>(num_max_tokens_per_rank),
+        default_msg(hidden, num_topk, use_fp8_dispatch),
+        static_cast<int>(hidden), allow_hybrid_mode && num_ranks > 1);
     return static_cast<int64_t>(2 * hl.bytes);
+}
+
+std::tuple<int, int> MooncakeEpXpuElasticBuffer::get_physical_domain_size()
+    const {
+    if (remote_.empty()) return {1, num_ranks_};
+    // Assumes every node has as many ranks as this one.
+    const int local =
+        static_cast<int>(std::count(remote_.begin(), remote_.end(), 0));
+    return {(num_ranks_ + local - 1) / local, local};
+}
+
+bool MooncakeEpXpuElasticBuffer::rdma_available() {
+    return MOONCAKE_EP_XPU_RDMA != 0;
+}
+
+std::vector<int32_t> MooncakeEpXpuElasticBuffer::init_rdma(
+    const std::vector<int>& remote) {
+    checkAlive();
+    XPU_EP_CHECK(
+        static_cast<int>(remote.size()) == num_ranks_ && !remote[rank_],
+        "remote must have one entry per rank, 0 for this rank");
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        last_event_.wait();
+    }
+    queue_.wait();
+    drainProxy();
+    remote_ = remote;
+    connected_.clear();
+    rdma_ranks_.clear();
+    hybrid_ = false;
+#if MOONCAKE_EP_XPU_RDMA
+    proxy_.reset();
+    proxy_ = std::make_unique<XpuEpProxy>(queue_.get_device(),
+                                          ipc_->zeContext(), ipc_->base(),
+                                          2 * half_stride_, rank_, remote);
+    return proxy_->localInfo();
+#else
+    XPU_EP_CHECK(false,
+                 "built without the verbs path (no rdma-core with "
+                 "ibv_reg_dmabuf_mr)");
+    return {};
+#endif
+}
+
+void MooncakeEpXpuElasticBuffer::connect_rdma(
+    const std::vector<std::vector<int32_t>>& infos,
+    const std::vector<int>& active_ranks_mask) {
+    checkAlive();
+#if MOONCAKE_EP_XPU_RDMA
+    XPU_EP_CHECK(proxy_ != nullptr, "connect_rdma needs init_rdma first");
+    XPU_EP_CHECK(static_cast<int>(active_ranks_mask.size()) == num_ranks_,
+                 "active_ranks_mask must have one entry per rank");
+    connected_.clear();
+    rdma_ranks_.clear();
+    hybrid_ = false;
+    proxy_->connect(infos, active_ranks_mask);
+    std::vector<int> connected(num_ranks_, 0);
+    for (int r = 0; r < num_ranks_; ++r) {
+        // There is no fallback path: a rank the kernels can neither map nor
+        // reach through the proxy would have its tokens dropped.
+        XPU_EP_CHECK(
+            !remote_[r] || !active_ranks_mask[r] || proxy_->connected(r),
+            "rank " + std::to_string(r) +
+                " is on another node and could not be connected "
+                "over RDMA");
+        if (!proxy_->connected(r)) continue;
+        connected[r] = 1;
+        rdma_ranks_.push_back(r);
+    }
+    if (!d_remote_) {
+        d_remote_ = sycl::malloc_device<int>(num_ranks_, queue_);
+        host_counts_ = sycl::malloc_host<int>(2 * num_ranks_, queue_);
+        XPU_EP_CHECK(d_remote_ && host_counts_, "RDMA path allocation failed");
+    }
+    queue_.memcpy(d_remote_, connected.data(), num_ranks_ * sizeof(int)).wait();
+    connected_ = std::move(connected);
+    hybrid_ = !rdma_ranks_.empty();
+#else
+    (void)infos;
+    (void)active_ranks_mask;
+    XPU_EP_CHECK(false,
+                 "built without the verbs path (no rdma-core with "
+                 "ibv_reg_dmabuf_mr)");
+#endif
 }
 
 std::vector<int32_t> MooncakeEpXpuElasticBuffer::get_ipc_handle() {
@@ -180,11 +274,22 @@ void MooncakeEpXpuElasticBuffer::sync_nvlink_ipc_handles(
         last_event_.wait();
     }
     queue_.wait();
-    ipc_->importPeers(remote_handles, active_ranks_mask);
+    drainProxy();
+    // Ranks on other nodes are reached over RDMA, and must be connected.
+    std::vector<int> active = active_ranks_mask;
+    for (size_t r = 0; r < remote_.size() && r < active.size(); ++r) {
+        if (!remote_[r] || !active[r]) continue;
+        XPU_EP_CHECK(r < connected_.size() && connected_[r],
+                     "rank " + std::to_string(r) +
+                         " is on another node and not connected over RDMA "
+                         "(connect_rdma)");
+        active[r] = 0;
+    }
+    ipc_->importPeers(remote_handles, active);
     XPU_EP_CHECK(ipc_->allPeersAccessible(),
-                 "the XPU ElasticBuffer needs every active rank on this node "
-                 "and reachable over Level Zero IPC; multi-node (hybrid) "
-                 "mode is not supported");
+                 "the XPU ElasticBuffer needs every active rank either on "
+                 "this node and reachable over Level Zero IPC, or on another "
+                 "node and connected over RDMA (init_rdma, connect_rdma)");
 }
 
 sycl::queue& MooncakeEpXpuElasticBuffer::queueFor(uint64_t stream_ptr) {
@@ -232,16 +337,40 @@ int MooncakeEpXpuElasticBuffer::maxWgs(int num_sms) const {
     return std::min(num_sms, max_wgs_);
 }
 
+PeerView MooncakeEpXpuElasticBuffer::peerView() const {
+    return PeerView{ipc_->base(), ipc_->peerBases(),
+                    hybrid_ ? d_remote_ : nullptr};
+}
+
+void MooncakeEpXpuElasticBuffer::submitPuts(
+    sycl::event after, std::function<std::vector<ProxyPut>()> plan) {
+#if MOONCAKE_EP_XPU_RDMA
+    proxy_->submit(std::move(after), std::move(plan));
+#else
+    (void)after;
+    (void)plan;
+    XPU_EP_CHECK(false, "built without the verbs path");
+#endif
+}
+
+void MooncakeEpXpuElasticBuffer::drainProxy() {
+#if MOONCAKE_EP_XPU_RDMA
+    if (proxy_) proxy_->drain();
+#endif
+}
+
 MooncakeEpXpuElasticBuffer::Half MooncakeEpXpuElasticBuffer::takeHalf(
     size_t need_bytes) {
     XPU_EP_CHECK(need_bytes <= half_stride_,
                  "ElasticBuffer too small for this shape; size it with "
-                 "ElasticBuffer.get_buffer_size_hint()");
+                 "ElasticBuffer.get_buffer_size_hint() (if ranks span nodes, "
+                 "with LOCAL_WORLD_SIZE or MC_EP_RANKS_PER_NODE set, or "
+                 "allow_hybrid_mode=True)");
     auto* base = static_cast<uint8_t*>(ipc_->base());
     const int cur = buffer_idx_;
     buffer_idx_ ^= 1;
     const size_t ready_bytes = round_up(num_ranks_ * kLineBytes, 4096);
-    return {reinterpret_cast<int*>(base + cur * half_stride_),
+    return {cur, reinterpret_cast<int*>(base + cur * half_stride_),
             reinterpret_cast<int*>(base + (cur ^ 1) * half_stride_),
             base + cur * half_stride_ + ready_bytes};
 }
@@ -306,7 +435,8 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
     sycl::queue& q = queueFor(compute_stream_ptr);
 
     const ElasticMsgLayout m(hidden, x_element_size, num_sf_packs, num_topk);
-    const ElasticHalfLayout hl(num_ranks_, num_max_tokens_per_rank, m, hidden);
+    const ElasticHalfLayout hl(num_ranks_, num_max_tokens_per_rank, m, hidden,
+                               hybrid_);
 
     std::lock_guard<std::mutex> lock(mu_);
     const Half half = takeHalf(hl.ready_bytes + hl.dispatch_end);
@@ -334,7 +464,8 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
     a.scratch = {reinterpret_cast<int*>(workspace_ + kRecvCountOffset),
                  reinterpret_cast<int*>(workspace_ + kExpertCountOffset),
                  reinterpret_cast<int*>(workspace_ + kDoneOffset)};
-    a.peers = PeerView{ipc_->base(), ipc_->peerBases(), nullptr};
+    a.peers = peerView();
+    if (hybrid_) a.host_counts = host_counts_ + half.idx * num_ranks_;
     a.num_tokens = num_tokens;
     a.hidden = hidden;
     a.elem_size = x_element_size;
@@ -352,7 +483,19 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
     a.timeout_ticks = timeout_ticks_;
     a.max_wgs = maxWgs(num_sms);
 
-    return finish(q, elastic_dispatch(launch_q, a), async_with_compute_stream);
+    if (!hybrid_)
+        return finish(q, elastic_dispatch(launch_q, a),
+                      async_with_compute_stream);
+    // The proxy reads this half's host_counts once the send part completes.
+    // The next call on this half cannot overwrite them first: it starts after
+    // the next call's recv part, which waits on ranks on other nodes, and
+    // they cannot get that far without this call's writes.
+    submitPuts(elastic_dispatch_send(launch_q, a),
+               [a, base = ipc_->base(), ranks = rdma_ranks_] {
+                   return elastic_dispatch_puts(a, base, ranks);
+               });
+    return finish(q, elastic_dispatch_recv(launch_q, a),
+                  async_with_compute_stream);
 }
 
 std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
@@ -394,7 +537,7 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
 
     const ElasticHalfLayout hl(num_ranks_, num_max_tokens_per_rank,
                                ElasticMsgLayout(hidden, kBf16Size, 0, num_topk),
-                               hidden);
+                               hidden, hybrid_);
 
     std::lock_guard<std::mutex> lock(mu_);
     const Half half = takeHalf(hl.ready_bytes + hl.combine_end);
@@ -412,7 +555,8 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
     a.next_ready = half.next_ready;
     a.staging = half.staging;
     a.done_counter = reinterpret_cast<int*>(workspace_ + kDoneOffset);
-    a.peers = PeerView{ipc_->base(), ipc_->peerBases(), nullptr};
+    a.peers = peerView();
+    if (hybrid_) a.host_counts = host_counts_ + half.idx * num_ranks_;
     a.num_input_tokens = num_input_tokens;
     a.num_combined_tokens = num_combined_tokens;
     a.hidden = hidden;
@@ -425,7 +569,15 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
     a.timeout_ticks = timeout_ticks_;
     a.max_wgs = maxWgs(num_sms);
 
-    return finish(q, elastic_combine(launch_q, a), async_with_compute_stream);
+    if (!hybrid_)
+        return finish(q, elastic_combine(launch_q, a),
+                      async_with_compute_stream);
+    submitPuts(elastic_combine_send(launch_q, a),
+               [a, base = ipc_->base(), ranks = rdma_ranks_] {
+                   return elastic_combine_puts(a, base, ranks);
+               });
+    return finish(q, elastic_combine_recv(launch_q, a),
+                  async_with_compute_stream);
 }
 
 }  // namespace xpu_ep

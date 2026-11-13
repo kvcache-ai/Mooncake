@@ -108,6 +108,7 @@ static void ThrowStatus(const Status& s, const char* where) {
             throw MetadataError(full_msg);
         case Status::Code::kRpcServiceError:
         case Status::Code::kRpcConnectionError:
+        case Status::Code::kRpcFunctionNotFound:
             throw RpcServiceError(full_msg);
         case Status::Code::kNotImplemented:
             throw NotImplementedError(full_msg);
@@ -744,6 +745,21 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "cancel_transfer");
             },
             py::arg("batch_id"), py::arg("task_id"))
+
+        // ---------------------------------------------------------------------
+        // blocking wait
+        // ---------------------------------------------------------------------
+        .def(
+            "wait_transfer",
+            [](TransferEngine& self, BatchID batch_id,
+               uint64_t timeout_ms) -> std::vector<TransferStatus> {
+                py::gil_scoped_release release;
+                std::vector<TransferStatus> status_list;
+                auto s = self.waitTransfer(batch_id, &status_list, timeout_ms);
+                ThrowStatus(s, "wait_transfer");
+                return status_list;
+            },
+            py::arg("batch_id"), py::arg("timeout_ms") = 0)
 
         // ---------------------------------------------------------------------
         // notification send/receive

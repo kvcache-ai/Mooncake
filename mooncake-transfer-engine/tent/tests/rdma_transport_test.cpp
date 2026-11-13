@@ -86,6 +86,8 @@ class RdmaTransportTestPeer {
         transport.local_buffer_manager_.setTopology(topology);
         transport.params_ = std::make_shared<RdmaParams>();
         transport.conf_ = std::make_shared<Config>();
+        // Exercise smart-mode accounting and EWMA updates explicitly.
+        transport.conf_->set("transports/rdma/enable_smart_scheduling", true);
     }
 
     static void bindMetadata(RdmaTransport& transport,

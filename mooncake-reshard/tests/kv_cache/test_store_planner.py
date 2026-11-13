@@ -1,5 +1,6 @@
 """KV logical coverage, manifest identity and TP/PP reshard planning."""
 
+import hashlib
 from dataclasses import replace
 
 import pytest
@@ -45,7 +46,7 @@ def test_upload_and_load_cover_selected_dp_and_all_target_heads(source_tp, targe
             [
                 (layer, component, head)
                 for layer in part.layer_ids
-                for component in KVCacheComponent
+                for component in target.descriptor.components
                 for head in range(part.head_start, part.head_start + part.head_count)
             ]
             if part.rank.dp == 1
@@ -78,6 +79,29 @@ def test_shared_domain_excludes_layout_and_format_but_includes_semantics():
         replace(first, layout=_layout(fmt=FORMATS[1])).model_domain
         == first.model_domain
     )
+
+
+def test_existing_store_identities_and_wire_are_preserved():
+    # Golden values from main before descriptors gained a components field.
+    manifest = _manifest()
+    assert manifest.layout.digest == (
+        "c952d5800bcc290ec8589ca025e51976f08cc8e1c468203001f2f2fcb321576d"
+    )
+    assert manifest.digest == (
+        "cd0d8b699eca760acbab6664a57681f25dfcf17b8f98ec0c988cd70d750e6697"
+    )
+    for value, expected in (
+        (
+            kv_cache_store_layout_to_json(manifest.layout),
+            "c81002ccef8cf255da7be950622020ef042c825c165e8473af9945ade0d77c6e",
+        ),
+        (
+            kv_cache_store_manifest_to_json(manifest),
+            "54967de639b4890b4d49e3d509c96136954b4dbe4734e42442c60cb23e9b2a54",
+        ),
+    ):
+        assert '"components"' not in value
+        assert hashlib.sha256(value.encode()).hexdigest() == expected
 
 
 def test_layout_is_independent_of_worker_names_and_selected_dp():

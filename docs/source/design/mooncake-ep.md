@@ -154,7 +154,9 @@ PID namespace. `MC_EP_RANKS_PER_NODE=n` instead places rank `r` on node
 `r // n`, which decides for each pair of ranks on a host whether they use IPC
 or RDMA: with `n=1` every peer is reached over RDMA, with `n=4` on 8 XPUs
 pairs within each group of four use IPC and pairs across them RDMA. RDMA
-between peers on the node needs an RDMA NIC per XPU.
+between peers on the node needs an RDMA NIC per XPU. One such host can thus
+test both paths; finding nodes from the host words of the handles, and RDMA
+between hosts, still need two.
 
 (mooncake-ep-intel-xpu-elastic)=
 #### `ElasticBuffer` on Intel XPU
@@ -169,8 +171,21 @@ both can be used in one process. As on CUDA, only
 on the expert side, rounding that partial sum to BF16 once, before one row per
 rank travels back. It differs from CUDA in that:
 
-- It runs on one node only, over Level Zero IPC. `transport` must be `"auto"`
-  or `"ipc"`, and a group that spans nodes raises an error.
+- Ranks are reached as by `Buffer`: over RDMA, when the build has the verbs
+  path, if they are on another node (another host or PID namespace, or
+  another group of `MC_EP_RANKS_PER_NODE` ranks, see above), and over Level
+  Zero IPC otherwise. RDMA never stands in for IPC that fails. `transport`
+  must be `"auto"` or `"ipc"`, which covers both.
+- There is no Python fallback. If ranks on another node need RDMA and the
+  build lacks the verbs path, or any rank fails to set up or connect it, every
+  rank raises; a rank that cannot map a peer on its node over IPC raises too.
+- Dispatch and combine are flat over all ranks: `get_logical_domain_size()`
+  is `(1, num_ranks)`. `get_buffer_size_hint()`, which sizes the buffer when
+  `num_bytes` is not given, reserves room for ranks on other nodes when
+  `allow_hybrid_mode` is `True` (the default) or the ranks span nodes, judged
+  from `MC_EP_RANKS_PER_NODE`, else `MOONCAKE_EP_NUM_LOCAL_RANKS` or
+  `LOCAL_WORLD_SIZE`. `allow_hybrid_mode` has no other effect.
+  `get_physical_domain_size()` reports (nodes, ranks per node) as above.
 - Slots are assigned in token order, so dispatch is deterministic whatever
   `deterministic` is set to.
 - Kernels run on the caller's `torch.xpu` stream, also with
@@ -332,11 +347,11 @@ python python/tests/ep/test_mooncake_ep.py
 # Intel XPU correctness test (exact payloads, hooks, two batches, timeouts)
 python python/tests/ep/test_mooncake_ep_xpu.py --num-ranks 4 --num-experts 256
 
-# Intel XPU ElasticBuffer correctness test (one node; --fp8 also checks
-# FP8 (x, sf) dispatch)
+# Intel XPU ElasticBuffer correctness test (--fp8 also checks FP8 (x, sf)
+# dispatch)
 torchrun --standalone --nproc_per_node=4 python/tests/ep/test_elastic_buffer.py --quick
 
-# Intel XPU ElasticBuffer benchmark (one node)
+# Intel XPU ElasticBuffer benchmark
 torchrun --standalone --nproc_per_node=4 mooncake-ep/benchmarks/elastic_buffer_perf.py
 
 # Host-only test of the dispatch bookkeeping shared by every backend
