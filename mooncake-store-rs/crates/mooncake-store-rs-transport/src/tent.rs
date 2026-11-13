@@ -25,6 +25,11 @@ pub struct TentEngineConfig {
     redis_username: Option<String>,
     redis_password: Option<String>,
     redis_db_index: Option<String>,
+    /// ACL device bound for TENT's ascend_direct transport. `None` for host
+    /// transports; `Some(device)` means "ascend mode": ACL bring-up before
+    /// engine creation and Store-RS-provided aligned host memory (TENT has no
+    /// host allocator for ascend_direct).
+    ascend_device: Option<i32>,
 }
 
 impl TentEngineConfig {
@@ -55,6 +60,55 @@ impl TentEngineConfig {
     pub fn redis_db_index(mut self, db_index: impl Into<String>) -> Self {
         self.redis_db_index = Some(db_index.into());
         self
+    }
+
+    pub fn ascend_device(mut self, device: i32) -> Self {
+        self.ascend_device = Some(device);
+        self
+    }
+
+    pub fn ascend_device_id(&self) -> Option<i32> {
+        self.ascend_device
+    }
+
+    /// TENT's ascend_direct transport derives the HIXL listen IP from the
+    /// local segment name, and with non-p2p metadata (redis) TENT otherwise
+    /// falls back to a random logical name which is not a valid IP. Materialize
+    /// an "<host>:<port>" identity for ascend engines, allocating a free RPC
+    /// port when the caller did not pin one.
+    fn materialize_ascend_identity(&self) -> Result<Self> {
+        if self.ascend_device.is_none() {
+            return Ok(self.clone());
+        }
+        let mut config = self.clone();
+        let host = config
+            .overrides
+            .get("rpc_server_hostname")
+            .cloned()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let configured_port = config
+            .overrides
+            .get("rpc_server_port")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        let port = if configured_port == 0 {
+            pick_free_tcp_port()?
+        } else {
+            configured_port
+        };
+        config
+            .overrides
+            .insert("rpc_server_port".to_string(), port.to_string());
+        let segment_name = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        config
+            .overrides
+            .insert("local_segment_name".to_string(), segment_name);
+        Ok(config)
     }
 
     fn rdma_enabled(&self) -> bool {
@@ -114,6 +168,7 @@ impl std::fmt::Debug for TentEngineConfig {
                 &self.redis_password.as_ref().map(|_| "<redacted>"),
             )
             .field("redis_db_index", &self.redis_db_index)
+            .field("ascend_device", &self.ascend_device)
             .finish()
     }
 }
@@ -144,20 +199,36 @@ pub struct TentEngine {
     registered_regions: Mutex<BTreeMap<usize, usize>>,
     owned_allocations: Mutex<BTreeMap<usize, TentOwnedAllocation>>,
     generation: AtomicU64,
+    ascend_device: Option<i32>,
 }
 
 unsafe impl Send for TentEngine {}
 unsafe impl Sync for TentEngine {}
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TentAllocationOwner {
+    /// Allocated by TENT (tent_allocate_memory) and freed through TENT.
+    Tent,
+    /// Allocated by Store-RS on the host (ascend mode fallback when the
+    /// Ascend store allocator is unavailable); freed with std::alloc::dealloc.
+    Host,
+    /// Allocated by the Ascend store allocator (ascend_allocate_memory). When
+    /// ASCEND_USE_SHMEM=1 the mapping is memfd-backed and same-host peers can
+    /// import it, which makes their transfers local copies.
+    AscendHost,
+}
+
 #[derive(Copy, Clone, Debug)]
 struct TentOwnedAllocation {
     generation: u64,
     size: usize,
+    owner: TentAllocationOwner,
 }
 
 impl TentEngine {
     pub fn new(config: &TentEngineConfig) -> Result<Self> {
-        let raw = Self::create_engine_handle(config)?;
+        let config = config.materialize_ascend_identity()?;
+        let raw = Self::create_engine_handle(&config)?;
         Ok(Self {
             raw: RwLock::new(raw),
             config: config.clone(),
@@ -168,6 +239,7 @@ impl TentEngine {
             registered_regions: Mutex::new(BTreeMap::new()),
             owned_allocations: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
+            ascend_device: config.ascend_device_id(),
         })
     }
 
@@ -176,6 +248,12 @@ impl TentEngine {
             .lock()
             .expect("tent engine create lock poisoned");
         let _env = TentRedisEnvGuard::apply(config);
+        if let Some(device_id) = config.ascend_device_id() {
+            // TENT's ascend_direct install needs an ACL device bound to the
+            // creating thread (aclrtGetCurrentContext in initEngines).
+            let rc = unsafe { ffi::tentPrepareAscend(device_id) };
+            check_zero(rc, "mooncake_tent_prepare_ascend")?;
+        }
         config.apply()?;
         let raw = unsafe { ffi::tent_create_engine() };
         if raw.is_null() {
@@ -215,7 +293,12 @@ impl TentEngine {
             .collect::<Vec<_>>())
     }
 
-    fn mark_owned_allocation(&self, addr: *mut c_void, size: usize) -> Result<()> {
+    fn mark_owned_allocation(
+        &self,
+        addr: *mut c_void,
+        size: usize,
+        owner: TentAllocationOwner,
+    ) -> Result<()> {
         self.owned_allocations
             .lock()
             .map_err(|_| Self::lock_error("tent owned_allocations"))?
@@ -224,6 +307,7 @@ impl TentEngine {
                 TentOwnedAllocation {
                     generation: self.current_generation(),
                     size,
+                    owner,
                 },
             );
         Ok(())
@@ -302,13 +386,32 @@ impl TentEngine {
     }
 
     pub fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {
+        if self.ascend_device.is_some() {
+            // TENT's allocateLocalMemory() only knows MNNVL/SHM/RDMA/UB/
+            // FABRIC/TCP allocators (transfer_engine_impl.cpp:813-869); with
+            // only ascend_direct installed it fails with
+            // "Not supported type in memory options". Mirror the C++ Store:
+            // use the Ascend store allocator (ascend_allocate_memory), which
+            // returns either aclrtMallocHost memory or, with
+            // ASCEND_USE_SHMEM=1, a memfd mapping that same-host peers import
+            // so their transfers become local copies. Fall back to our own
+            // 2 MiB-aligned host allocation if the allocator is unavailable.
+            let addr = unsafe { ffi::tentAscendHostAlloc(size) };
+            if !addr.is_null() {
+                self.mark_owned_allocation(addr, size, TentAllocationOwner::AscendHost)?;
+                return Ok(addr);
+            }
+            let addr = allocate_host_aligned(size)?;
+            self.mark_owned_allocation(addr, size, TentAllocationOwner::Host)?;
+            return Ok(addr);
+        }
         let location = to_cstring("location", location)?;
         let mut addr = std::ptr::null_mut();
         let rc = unsafe {
             ffi::tent_allocate_memory(self.engine_handle()?, &mut addr, size, location.as_ptr())
         };
         check_zero(rc, "tent_allocate_memory")?;
-        self.mark_owned_allocation(addr, size)?;
+        self.mark_owned_allocation(addr, size, TentAllocationOwner::Tent)?;
         Ok(addr)
     }
 
@@ -322,6 +425,16 @@ impl TentEngine {
             let rc = unsafe { ffi::tent_free_memory(self.engine_handle()?, addr) };
             return check_zero(rc, "tent_free_memory");
         };
+        if allocation.owner == TentAllocationOwner::AscendHost {
+            unsafe { ffi::tentAscendHostFree(addr) };
+            return Ok(());
+        }
+        if allocation.owner == TentAllocationOwner::Host {
+            let layout = host_allocation_layout(allocation.size)?;
+            // SAFETY: allocated by allocate_host_aligned with this layout.
+            unsafe { std::alloc::dealloc(addr.cast(), layout) };
+            return Ok(());
+        }
         if allocation.generation == self.current_generation() {
             let rc = unsafe { ffi::tent_free_memory(self.engine_handle()?, addr) };
             return check_zero(rc, "tent_free_memory");
@@ -542,6 +655,47 @@ fn read_engine_string(
     let rc = unsafe { function(engine, buffer.as_mut_ptr(), buffer.len()) };
     check_zero(rc, operation)?;
     Ok(read_string(&buffer))
+}
+
+fn pick_free_tcp_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+        StoreError::Transport(format!("failed to reserve an RPC port: {error}"))
+    })?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| StoreError::Transport(format!("failed to read local addr: {error}")))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+const ASCEND_HOST_MEMORY_ALIGNMENT: usize = 2 * 1024 * 1024;
+
+fn host_allocation_layout(size: usize) -> Result<std::alloc::Layout> {
+    std::alloc::Layout::from_size_align(size.max(1), ASCEND_HOST_MEMORY_ALIGNMENT).map_err(
+        |error| {
+            StoreError::Allocator(format!(
+                "invalid host allocation layout for {size} bytes: {error}"
+            ))
+        },
+    )
+}
+
+/// Allocate zeroed, 2 MiB-aligned host memory for TENT's ascend_direct
+/// transport. Touching the pages is required: TENT's registration NUMA probe
+/// (Platform::getLocation) cannot classify unmapped pages, and ADXL requires a
+/// 2 MiB-aligned host address.
+fn allocate_host_aligned(size: usize) -> Result<*mut c_void> {
+    let size = size.max(1);
+    let layout = host_allocation_layout(size)?;
+    // SAFETY: layout is a valid non-zero-sized allocation layout.
+    let addr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if addr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: addr points at a live allocation of `size` bytes.
+    unsafe { std::ptr::write_bytes(addr, 0, size) };
+    Ok(addr.cast())
 }
 
 fn read_string(buffer: &[c_char]) -> String {

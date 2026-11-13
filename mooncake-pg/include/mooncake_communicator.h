@@ -68,9 +68,11 @@ struct MooncakePGContext {
     std::unique_ptr<AgentHost> agent_host;
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    // Created in order: StrongStream -> DTS -> workspace -> recovery worker.
+    // Destroyed in reverse order.
+    std::unique_ptr<StrongStream> device_collective_strong_stream;
     std::unique_ptr<DeviceTransferService> device_transfer_service;
     std::unique_ptr<DeviceCollectiveWorkspace> device_collective_workspace;
-    std::unique_ptr<StrongStream> device_collective_strong_stream;
     std::unique_ptr<DeviceCollectiveRecoveryWorker>
         device_collective_recovery_worker;
 #endif

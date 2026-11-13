@@ -17,6 +17,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <vector>
 
 namespace mooncake {
 namespace xpu_ep {
@@ -26,7 +27,16 @@ namespace xpu_ep {
 struct PeerView {
     void* local_base;
     void* const* peer_bases;  // device table, nullptr for an unmapped rank
+    // Hybrid path only (else null): device table, 1 for a rank on another
+    // node that is connected over RDMA. Such a rank is unmapped; it pushes
+    // to this rank through its proxy and is pushed to through this rank's.
+    const int* remote;
 };
+
+// Counts the proxy needs to size its writes, written by the send kernels to
+// host memory (hybrid path only). Indexed by rank, and for an unreduced
+// combine at kHostCellsOffset + local_expert * num_ranks + rank.
+constexpr size_t kHostCellsOffset = 1024;
 
 // One dispatch's slice of the receive table (see recv_table_ints), for a
 // dispatch given top-k weights; all null otherwise.
@@ -55,6 +65,7 @@ struct DispatchArgs {
     int* counter_per_expert;
     int* counter_per_rank;
     int* done_counter;
+    int* host_counts;  // hybrid: tokens sent to each remote rank
     RecvTable recv;
     PeerView peers;
     int num_tokens, hidden, num_topk, num_max_dispatch_tokens_per_rank;
@@ -75,6 +86,8 @@ struct CombineArgs {
     int* ready;
     int* next_ready;
     uint8_t* staging;
+    uint8_t* inbox;    // hybrid: rows remote ranks wrote here
+    int* host_counts;  // hybrid: rows staged for each remote rank
     int* done_counter;
     RecvTable recv;  // set: rows are pre-reduced with the dispatch's weights
     PeerView peers;
@@ -91,7 +104,30 @@ struct CombineArgs {
 sycl::event dispatch_send(sycl::queue& q, const DispatchArgs& args);
 sycl::event dispatch_recv(sycl::queue& q, const DispatchArgs& args);
 sycl::event combine_send(sycl::queue& q, const CombineArgs& args);
+// On the hybrid path, first waits for every peer's flag in a kernel of one
+// work-group: on the B60, more than about 96 work-groups polling slow the
+// NIC's writes into this GPU more than tenfold. `q` must be in-order.
 sycl::event combine_recv(sycl::queue& q, const CombineArgs& args);
+
+// One RDMA WRITE of the hybrid path, from this rank's EP buffer into rank
+// `rank`'s, at offsets from the two buffers' bases (the same layout on every
+// rank). bytes == 0 writes `value` instead (a flag).
+struct ProxyPut {
+    int rank;
+    uint64_t offset;
+    uint64_t remote_offset;
+    uint32_t bytes;
+    uint32_t value;
+};
+
+// After dispatch_send (combine_send) with host_counts set, the writes that
+// take what it staged for each rank in `ranks` (on other nodes) to where that
+// rank's dispatch_recv (combine_recv) reads it, then set its flag. `base` is
+// this rank's peers.local_base.
+std::vector<ProxyPut> dispatch_puts(const DispatchArgs& a, const void* base,
+                                    const std::vector<int>& ranks);
+std::vector<ProxyPut> combine_puts(const CombineArgs& a, const void* base,
+                                   const std::vector<int>& ranks);
 
 }  // namespace xpu_ep
 }  // namespace mooncake

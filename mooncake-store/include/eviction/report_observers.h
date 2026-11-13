@@ -12,6 +12,8 @@ namespace eviction {
 // which may also have freed memory outside the run.
 class MetricsObserver final : public EvictionObserver {
    public:
+    bool SupportsParallel() const override { return true; }
+
     void OnRunEnd(const Scope& scope, const Report& report) override;
 };
 
@@ -21,6 +23,8 @@ class LogObserver final : public EvictionObserver {
    public:
     // `offload_cap` is how many offloads a run may queue, for the warning.
     explicit LogObserver(long offload_cap) : offload_cap_(offload_cap) {}
+
+    bool SupportsParallel() const override { return true; }
 
     void OnRunEnd(const Scope& scope, const Report& report) override;
 

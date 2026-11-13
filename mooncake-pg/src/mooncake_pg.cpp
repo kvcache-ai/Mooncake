@@ -83,7 +83,8 @@ mooncakePgResult_t setLastError(const PGError& error) {
         case PGErrorCode::InternalError:
             return set(mooncakePgInternalError);
     }
-    PG_ASSERT(false, "unknown PGErrorCode: ", static_cast<int>(error.code));
+    detail::throwPGAssertFailure("unknown PGErrorCode: ",
+                                 static_cast<int>(error.code));
 }
 
 template <typename Function>

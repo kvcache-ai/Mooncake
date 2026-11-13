@@ -1168,16 +1168,12 @@ class MasterService {
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
-    // Caller must hold client_mutex_.
-    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
-        const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
+    void ClearInvalidHandlesLocked();
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // every tenant. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
@@ -1369,13 +1365,10 @@ class MasterService {
         const std::chrono::system_clock::time_point& ttl);
     struct StaleHandleCleanupPlan {
         std::vector<ReplicaID> removed_ids;
-        std::vector<Replica::Descriptor> remaining;
         bool would_invalidate{false};
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
-        const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
-        const;
+        const ObjectMetadata& metadata) const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -1424,10 +1417,9 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client no longer retains resources.
-    bool CleanupStaleHandles(
-        const std::string& key, const TenantId& tenant_id,
-        ObjectMetadata& metadata, route::ObjectState& state,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
+    bool CleanupStaleHandles(const std::string& key, const TenantId& tenant_id,
+                             ObjectMetadata& metadata,
+                             route::ObjectState& state);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (promotion-task cancellation) instead of
     // duplicating it.
@@ -1505,9 +1497,7 @@ class MasterService {
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
     // with OBJECT_ALREADY_EXISTS.
-    auto CleanupStaleBeforeWrite(
-        const char* why, MetadataAccessorRW& accessor,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
         -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission
@@ -1515,11 +1505,8 @@ class MasterService {
     // after one forced bucket eviction. Memory or NoF exhaustion is left to
     // the background eviction, so it cannot delete unrelated DFS data. Each
     // attempt takes the key afresh, since recovery evicts other keys.
-    auto AdmitWithDfsRecovery(
-        const ReplicateConfig& config,
-        const std::function<
-            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
-                bool* dfs_allocation_failed)>& admit)
+    template <typename Admit>
+    auto AdmitWithDfsRecovery(const ReplicateConfig& config, const Admit& admit)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
     // The first step of an accessor that holds a key by name: drops the held
     // object's memory replicas whose segment is gone, and the object with them
@@ -1681,18 +1668,17 @@ class MasterService {
         // Holds the key only while it holds an object, and leaves that object
         // as it is, without the invalid-replica cleanup: for a pass that acts
         // on what the object's own state says, such as an expiry sweep.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           AsIs)
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id, AsIs)
             : service_(service),
-              object_id_(std::move(object_id)),
-              ns_(service_->namespaces_.Lookup(object_id_.tenant_id)),
+              ns_(service_->namespaces_.Lookup(object_id.tenant_id)),
               guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
-                                    : ns_->objects.Write(object_id_.user_key)) {
-        }
+                                    : ns_->objects.Write(object_id.user_key)) {}
 
         // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
-            : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id)
+            : MetadataAccessorRW(service, object_id, AsIs{}) {
             // Invalid memory replicas go first, which may tear the object down.
             if (IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
@@ -1704,12 +1690,11 @@ class MasterService {
         };
         // Holds the key whether or not it holds an object, creating the
         // namespace if needed, so the caller can publish one under it.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           CreateKey options)
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id, CreateKey options)
             : service_(service),
-              object_id_(std::move(object_id)),
-              ns_(&service_->namespaces_.GetOrCreate(object_id_.tenant_id)),
-              guard_(ns_->objects.WriteKey(object_id_.user_key)) {
+              ns_(&service_->namespaces_.GetOrCreate(object_id.tenant_id)),
+              guard_(ns_->objects.WriteKey(object_id.user_key)) {
             if (options.cleanup_invalid && IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
             }
@@ -1724,7 +1709,6 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
             : service_(service),
-              object_id_{tenant_id, ref.key},
               ns_(service_->namespaces_.Lookup(tenant_id)),
               guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
                                     : ns_->objects.Write(ref)) {}
@@ -1750,9 +1734,9 @@ class MasterService {
             return IsPublished() && guard_->state().replication_task;
         }
 
-        const std::string& GetKey() const { return object_id_.user_key; }
-        // The tenant the object was resolved under.
-        const TenantId& GetTenantId() const { return object_id_.tenant_id; }
+        // The held key and its tenant; only while a key is held.
+        const std::string& GetKey() const { return guard_->key(); }
+        const TenantId& GetTenantId() const { return ns_->id(); }
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return guard_->ref(); }
 
@@ -1816,7 +1800,6 @@ class MasterService {
 
        private:
         MasterService* service_;
-        ObjectIdentity object_id_;
         // Null when the namespace does not exist; a namespace stays put once
         // created, so the pointer outlives the guard.
         metadata::Namespace* ns_;
@@ -2278,9 +2261,15 @@ class MasterService {
     // Gated snapshots for the call sites that capture a pre-mutation medium
     // set. They run on hot metadata paths, so skip the VisitReplicas walk
     // entirely when no publisher is listening.
-    std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
-        return KvEventsEnabled() ? KvMediaForMetadata(metadata)
-                                 : std::vector<std::string>{};
+    // Cleanup paths recover previously announced media only for invalid
+    // COMPLETE replicas selected by their own removal predicate.
+    std::vector<std::string> KvMediaSnapshot(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_include_invalid =
+            {}) {
+        return KvEventsEnabled()
+                   ? KvMediaForMetadata(metadata, should_include_invalid)
+                   : std::vector<std::string>{};
     }
     std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForRemoval(metadata)
@@ -2289,7 +2278,8 @@ class MasterService {
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata);
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_include_invalid = {});
     // Removal paths may run after replicas have transitioned to PROCESSING or
     // REMOVED. Keep their former medium visible as a conservative hint even
     // though only COMPLETE replicas count as currently available media.

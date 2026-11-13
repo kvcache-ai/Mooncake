@@ -6,6 +6,17 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
+// The bundled asio enables co_await on clang (and icpx, which is clang based)
+// only with the pre-C++20 coroutines TS, although it implements awaitable on
+// C++20 coroutines (ASIO_HAS_STD_COROUTINE) for every compiler defining
+// __GNUC__. Enable it for the relay below. It only gates the header-only
+// awaitable/co_spawn/use_awaitable templates, none of which the separately
+// compiled asio uses.
+#if defined(__clang__) && defined(__cpp_impl_coroutine) && \
+    !defined(ASIO_HAS_CO_AWAIT)
+#define ASIO_HAS_CO_AWAIT 1
+#endif
+
 #include <gtest/gtest.h>
 
 #include <algorithm>

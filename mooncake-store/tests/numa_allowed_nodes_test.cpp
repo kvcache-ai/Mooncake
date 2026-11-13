@@ -11,6 +11,10 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include "common/client_buffer_allocation.h"
@@ -96,6 +100,62 @@ TEST_F(NumaAllowedNodesTest, SegmentedBufferNeedsTheFilteredNodes) {
     void* ptr = allocate_buffer_numa_segments(2 * kRegion, filtered);
     ASSERT_NE(ptr, nullptr);
     munmap(ptr, 2 * kRegion);
+}
+
+// True if /proc/self/smaps lists flag (e.g. "hg") in the VmFlags of the VMA
+// containing addr.
+bool VmaHasFlag(const void* addr, const std::string& flag) {
+    std::ifstream smaps("/proc/self/smaps");
+    const auto target = reinterpret_cast<uintptr_t>(addr);
+    bool in_vma = false;
+    for (std::string line; std::getline(smaps, line);) {
+        unsigned long start = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%lx-%lx ", &start, &end) == 2) {
+            in_vma = start <= target && target < end;
+        } else if (in_vma && line.rfind("VmFlags:", 0) == 0) {
+            return (line + " ").find(" " + flag + " ") != std::string::npos;
+        }
+    }
+    return false;
+}
+
+// With base pages the segment is 2MB-aligned and MADV_HUGEPAGE, so the NIC
+// can map it with THPs instead of 512x as many 4KB entries.
+TEST_F(NumaAllowedNodesTest, BasePageSegmentedBufferRequestsThp) {
+    if (access("/sys/kernel/mm/transparent_hugepage/enabled", F_OK) != 0) {
+        GTEST_SKIP() << "THP is not available";
+    }
+    EXPECT_EQ(allocate_buffer_numa_segments(kRegion + getpagesize(),
+                                            {allowed_.front()}, getpagesize()),
+              nullptr);
+    const size_t size = 4 * kRegion;
+    void* ptr =
+        allocate_buffer_numa_segments(size, {allowed_.front()}, getpagesize());
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % kRegion, 0u);
+    EXPECT_TRUE(VmaHasFlag(ptr, "hg"));
+    munmap(ptr, size);
+}
+
+// Each region starts on a 2MB boundary, and a size that would split a huge
+// page between two bindings is rejected.
+TEST_F(NumaAllowedNodesTest, BasePageRegionsStartOnHugePageBoundaries) {
+    if (allowed_.size() < 2) GTEST_SKIP() << "needs two allowed NUMA nodes";
+    if (access("/sys/kernel/mm/transparent_hugepage/enabled", F_OK) != 0) {
+        GTEST_SKIP() << "THP is not available";
+    }
+    const std::vector<int> nodes = {allowed_[0], allowed_[1]};
+    EXPECT_EQ(allocate_buffer_numa_segments(3 * kRegion, nodes, getpagesize()),
+              nullptr);
+
+    const size_t size = 4 * kRegion;
+    void* ptr = allocate_buffer_numa_segments(size, nodes, getpagesize());
+    ASSERT_NE(ptr, nullptr);
+    char* second = static_cast<char*>(ptr) + size / 2;
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(second) % kRegion, 0u);
+    EXPECT_TRUE(VmaHasFlag(ptr, "hg"));
+    EXPECT_TRUE(VmaHasFlag(second, "hg"));
+    munmap(ptr, size);
 }
 
 // numactl --membind: binding the segment would override the task policy, so

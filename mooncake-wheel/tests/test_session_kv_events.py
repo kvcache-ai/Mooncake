@@ -97,6 +97,39 @@ def session_store(request, tmp_path):
             context.term()
 
 
+def test_memory_eviction_retracts_last_replica(session_store):
+    msgpack = pytest.importorskip("msgpack")
+    store, _, subscriber = session_store
+    keys = [f"eviction-{i}" for i in range(31)]
+    value = bytes(1024 * 1024)
+    for key in keys:
+        assert store.put(key, value) == 0
+
+    # 31 MiB crosses the 32 MiB pool's default high watermark. Observe
+    # actual metadata removal before checking its asynchronous event.
+    deadline = time.monotonic() + 10
+    while all(store.batch_is_exist(keys)):
+        assert time.monotonic() < deadline, "Memory eviction did not run"
+        time.sleep(0.2)  # Existence queries must not keep the 100 ms lease alive.
+
+    stored, removed = set(), set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if subscriber.poll(50):
+            for event in msgpack.unpackb(subscriber.recv_multipart()[2], raw=False)[1]:
+                assert event["medium"] == "cpu"
+                if event["event_type"] == "stored":
+                    stored.add(event["object_key"])
+                elif event["event_type"] == "removed":
+                    removed.add(event["object_key"])
+    evicted = {
+        key for key, exists in zip(keys, store.batch_is_exist(keys)) if not exists
+    }
+    assert stored == set(keys)
+    assert evicted
+    assert removed == evicted
+
+
 def tagged(*ids):
     from mooncake.store import ReplicateConfig
 

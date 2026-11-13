@@ -5,9 +5,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mooncake_store_core::{
-    CasResult, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor,
-    ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteVersion,
-    SegmentName, SegmentReservation, SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor, ObjectKey,
+    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteVersion, SegmentName,
+    SegmentReservation, SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
 };
 use parking_lot::Mutex;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -50,6 +51,7 @@ pub(crate) trait AllocatorService: Send + Sync {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> Result<()>;
 
     fn batch_reserve_any(
@@ -60,6 +62,21 @@ pub(crate) trait AllocatorService: Send + Sync {
         length_bytes
             .iter()
             .map(|length| self.reserve_any(owner, *length))
+            .collect()
+    }
+
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        _owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Vec<Result<SegmentReservation>> {
+        length_bytes
+            .iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "allocator does not support pending-publication reservations".to_string(),
+                ))
+            })
             .collect()
     }
 
@@ -76,6 +93,21 @@ pub(crate) trait AllocatorService: Send + Sync {
             .collect()
     }
 
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        _owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Vec<Result<SegmentReservation>> {
+        requests
+            .iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "allocator does not support pending-publication reservations".to_string(),
+                ))
+            })
+            .collect()
+    }
+
     fn batch_release(&self, owner: &ClientRuntimeId, requests: &[ReleaseOp]) -> Vec<Result<()>> {
         requests
             .iter()
@@ -85,6 +117,7 @@ pub(crate) trait AllocatorService: Send + Sync {
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )
             })
             .collect()
@@ -103,10 +136,36 @@ impl RouteTrafficReport {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct DeletePendingEntry {
+    pub route_key: ObjectKey,
+    pub identity: Option<AllocationRouteIdentity>,
+    pub cold_backing: Option<ColdDeleteTarget>,
+    pub reclaim_grace_ms: u64,
+    pub prepare_only: bool,
+    pub expected_route_version: Option<mooncake_store_core::RouteVersion>,
+}
+
+/// Physical cold-backing target carried by a unified delete-pending entry.
+///
+/// Only Ord-friendly fields are kept so the entry stays usable in the shutdown
+/// retention BTreeSet and as a ReclaimQueue identity. The route authority is
+/// the source of truth for eligibility; this identifies what to delete.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ColdDeleteTarget {
+    pub owner: ClientRuntimeId,
+    pub cold_tier_id: String,
+    pub object_locator: String,
+    pub length: u64,
+    pub checksum: Option<u64>,
+}
+
 pub(crate) trait EvictionService: Send + Sync {
     fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<RouteTrafficReport>;
 
     fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<RouteTrafficReport>;
+
+    fn batch_notify_delete_pending(&self, entries: &[DeletePendingEntry]) -> Result<usize>;
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +208,7 @@ pub(crate) struct ReleaseOp {
     pub segment_name: SegmentName,
     pub offset_bytes: u64,
     pub length_bytes: u64,
+    pub allocation_id: u64,
 }
 
 pub(crate) struct ControlPlaneClient {

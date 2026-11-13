@@ -262,6 +262,17 @@ class TestHttpMetadataServer {
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
+     NullSharedConfigPreventsExplicitConstruction) {
+    std::shared_ptr<Config> config;
+
+    TransferEngine engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      InvalidInlineConfigPreventsDefaultConstruction) {
     EnvVarGuard conf_guard("MC_TENT_CONF", "{");
     EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");

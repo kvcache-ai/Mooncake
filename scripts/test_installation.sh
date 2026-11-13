@@ -43,6 +43,8 @@ cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cp python/tests/store/test_fast_copy.py test_env/tests/
 cp -r python/tests/ssd test_env/ssd_tests
+mkdir -p test_env/store_tests
+cp python/tests/store/test_structured_ranges_properties.py test_env/store_tests/
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
@@ -59,7 +61,7 @@ python unit_tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
-python -m pytest reshard_tests ssd_tests -q
+python -m pytest reshard_tests ssd_tests store_tests -q
 
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable

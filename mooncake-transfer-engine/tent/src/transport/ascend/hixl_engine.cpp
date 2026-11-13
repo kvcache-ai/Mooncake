@@ -14,18 +14,45 @@
 
 #include "tent/transport/ascend/hixl_engine.h"
 
-#include <algorithm>
+#include <mutex>
+#include <type_traits>
 #include <utility>
 
 #include <glog/logging.h>
 #include <hixl/hixl.h>
 
 #include "tent/common/status.h"
-#include "tent/transport/ascend/resource_config.h"
 
 namespace mooncake {
 namespace tent {
 namespace {
+
+// MemDesc::local_only requires CANN 9.3 or newer (hixl::MemDesc grew the
+// field in that release). Older toolkits have no way to say that a range must
+// not be exported, so a buffer the upper layer marked as local stays remotely
+// reachable there, as it did before this flag existed. Warn once: the fallback
+// is a toolkit limitation, not a per-registration event, and it would otherwise
+// flood the log when a process registers many buffers.
+template <typename T, typename = void>
+struct HasLocalOnly : std::false_type {};
+template <typename T>
+struct HasLocalOnly<T, std::void_t<decltype(std::declval<T&>().local_only)>>
+    : std::true_type {};
+
+template <typename T>
+void SetMemDescLocalOnly(T& mem_desc, bool local_only) {
+    if constexpr (HasLocalOnly<T>::value) {
+        mem_desc.local_only = local_only;
+    } else {
+        (void)mem_desc;
+        if (local_only) {
+            LOG_FIRST_N(WARNING, 1)
+                << "This CANN release has no MemDesc::local_only (requires "
+                   "CANN 9.3 or newer); registering a local-only buffer as "
+                   "remotely accessible";
+        }
+    }
+}
 
 class RealHixlVendor final : public HixlEngine::Vendor {
    public:
@@ -42,11 +69,12 @@ class RealHixlVendor final : public HixlEngine::Vendor {
 
     void Finalize() override { hixl_.Finalize(); }
 
-    uint32_t RegisterMem(uint64_t addr, size_t len, bool host,
+    uint32_t RegisterMem(uint64_t addr, size_t len, bool host, bool local_only,
                          void*& handle) override {
         hixl::MemDesc mem_desc{};
         mem_desc.addr = addr;
         mem_desc.len = len;
+        SetMemDescLocalOnly(mem_desc, local_only);
         hixl::MemHandle mem_handle = nullptr;
         auto status = hixl_.RegisterMem(
             mem_desc, host ? hixl::MEM_HOST : hixl::MEM_DEVICE, mem_handle);
@@ -123,19 +151,6 @@ HixlEngine::VendorFactory g_vendor_factory =
     return std::make_unique<RealHixlVendor>();
 };
 
-void DisconnectRemotes(HixlEngine::Vendor& vendor,
-                       std::vector<std::string>& remotes) {
-    for (const auto& remote : remotes) {
-        const auto status =
-            vendor.Disconnect(remote, kAscendTimeoutDisconnectMs);
-        if (status != kHixlOk && status != kHixlNotConnected) {
-            LOG(WARNING) << "Disconnect " << remote
-                         << " before teardown failed, status=" << status;
-        }
-    }
-    remotes.clear();
-}
-
 }  // namespace
 
 void HixlEngine::SetVendorFactory(VendorFactory factory) {
@@ -159,17 +174,19 @@ std::unique_ptr<HixlEngine::Vendor> HixlEngine::CreateVendor() {
 }
 
 HixlEngine::ContextGuard::ContextGuard(aclrtContext target) {
-    ok_ = (aclrtGetCurrentContext(&saved_) == ACL_ERROR_NONE);
-    if (!ok_) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return;
+    // A thread that never bound a context has nothing to restore, which is not
+    // an error: teardown reaches this engine from the signal handling thread on
+    // Ctrl-C, and the engine binds the context its own calls need below.
+    if (aclrtGetCurrentContext(&saved_) != ACL_ERROR_NONE) {
+        saved_ = nullptr;
     }
     if (target != nullptr && aclrtSetCurrentContext(target) != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtSetCurrentContext failed, errmsg: "
                    << aclGetRecentErrMsg();
-        ok_ = false;
+        return;
     }
+    // ok() still promises that some context is bound for the guarded calls.
+    ok_ = target != nullptr || saved_ != nullptr;
 }
 
 HixlEngine::ContextGuard::~ContextGuard() {
@@ -183,7 +200,7 @@ HixlEngine::~HixlEngine() { finalize(); }
 Status HixlEngine::initialize(
     const std::string& name, aclrtContext context, int32_t device_id,
     const std::map<std::string, std::string>& options) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     name_ = name;
     context_ = context;
     device_id_ = device_id;
@@ -210,17 +227,18 @@ Status HixlEngine::initialize(
 }
 
 void HixlEngine::finalize() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!vendor_) {
         addr_to_handle_.clear();
-        remotes_.clear();
         initialized_ = false;
         return;
     }
+    // HIXL 9.2.0 allows DeregisterMem while AutoConnect sessions are up (the
+    // restriction was removed in f4bbabd6), and Finalize() tears down the
+    // remaining sessions, so no pre-disconnect is needed. A caller without a
+    // bound context is tolerated: each registration is deregistered under the
+    // context it was registered with, and there is nothing to restore.
     ContextGuard guard(context_);
-    // AutoConnect leaves sessions up on the success path. HIXL requires
-    // those sessions to be gone before DeregisterMem / Finalize.
-    DisconnectRemotes(*vendor_, remotes_);
     for (auto& [addr, handle] : addr_to_handle_) {
         (void)addr;
         (void)vendor_->DeregisterMem(handle);
@@ -231,8 +249,9 @@ void HixlEngine::finalize() {
     initialized_ = false;
 }
 
-Status HixlEngine::registerMem(void* addr, size_t length, bool host) {
-    std::lock_guard<std::mutex> lock(mutex_);
+Status HixlEngine::registerMem(void* addr, size_t length, bool host,
+                               bool local_only) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!vendor_) {
         return Status::InternalError("HIXL engine is not initialized" LOC_MARK);
     }
@@ -250,11 +269,12 @@ Status HixlEngine::registerMem(void* addr, size_t length, bool host) {
     }
     void* handle = nullptr;
     auto status = vendor_->RegisterMem(reinterpret_cast<uint64_t>(addr), length,
-                                       host, handle);
+                                       host, local_only, handle);
     if (status != kHixlOk) {
         LOG(ERROR) << "RegisterMem failed, addr: " << addr
                    << ", length: " << length
                    << ", mem type: " << (host ? "host" : "device")
+                   << ", local_only: " << local_only
                    << ", device_id: " << device_id_ << ", status: " << status
                    << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("Register failed" LOC_MARK);
@@ -264,7 +284,7 @@ Status HixlEngine::registerMem(void* addr, size_t length, bool host) {
 }
 
 Status HixlEngine::deregisterMem(void* addr) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     auto it = addr_to_handle_.find(addr);
     if (!vendor_ || it == addr_to_handle_.end()) {
         return Status::OK();
@@ -273,7 +293,11 @@ Status HixlEngine::deregisterMem(void* addr) {
     if (!guard.ok()) {
         return Status::InternalError("Set ACL context failed" LOC_MARK);
     }
-    DisconnectRemotes(*vendor_, remotes_);
+    // HIXL 9.2.0 allows unregistering while AutoConnect sessions are up. It
+    // does not notify the peer and does not guard in-flight transfers, so a
+    // buffer may only be unregistered while no transfer still uses it: TENT
+    // deregisters at teardown after quiesce(), and a runtime
+    // removeMemoryBuffer() is the caller's contract.
     auto status = vendor_->DeregisterMem(it->second);
     addr_to_handle_.erase(it);
     if (status != kHixlOk) {
@@ -285,12 +309,10 @@ Status HixlEngine::deregisterMem(void* addr) {
     return Status::OK();
 }
 
-void HixlEngine::rollbackMem(void* addr) { (void)deregisterMem(addr); }
-
 Status HixlEngine::transferAsync(const std::string& remote, bool write,
                                  const std::vector<HixlOpDesc>& descs,
                                  void*& req) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     req = nullptr;
     if (!vendor_) {
         return Status::InternalError("HIXL engine is not initialized" LOC_MARK);
@@ -299,6 +321,9 @@ Status HixlEngine::transferAsync(const std::string& remote, bool write,
     if (!guard.ok()) {
         return Status::InternalError("Set ACL context failed" LOC_MARK);
     }
+    // AutoConnect builds the session inside HIXL on first use. A failure is
+    // reported to the caller and the next submission tries again; HIXL handles
+    // its own reconnect/session state, so nothing is cached or forgotten here.
     auto status = vendor_->TransferAsync(remote, write, descs, req);
     if (status != kHixlOk) {
         LOG(ERROR) << "TransferAsync failed to " << remote
@@ -306,14 +331,11 @@ Status HixlEngine::transferAsync(const std::string& remote, bool write,
                    << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("TransferAsync failed" LOC_MARK);
     }
-    if (std::find(remotes_.begin(), remotes_.end(), remote) == remotes_.end()) {
-        remotes_.push_back(remote);
-    }
     return Status::OK();
 }
 
 Status HixlEngine::getTransferStatus(void* req, HixlXferState& status) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!vendor_) {
         status = HixlXferState::Failed;
         return Status::InternalError("HIXL engine is not initialized" LOC_MARK);
@@ -333,7 +355,13 @@ Status HixlEngine::getTransferStatus(void* req, HixlXferState& status) {
 
 Status HixlEngine::disconnectOnTimeout(const std::string& remote,
                                        int32_t timeout_ms) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // HIXL serializes the calls of one peer internally: DestroyClient holds
+    // that remote's client mutex, and a racing submit observes NOT_CONNECTED
+    // (the transport maps it to FAILED/TIMEOUT), so Disconnect does not need to
+    // stop submits/polls to the other peers. A shared lock therefore keeps
+    // vendor_ alive across finalize() without freezing the transfer workers for
+    // up to the disconnect timeout, which an exclusive lock would.
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!vendor_) {
         return Status::OK();
     }

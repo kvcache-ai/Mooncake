@@ -79,7 +79,7 @@ class RpcClient {
     explicit RpcClient(
         std::chrono::milliseconds request_timeout = kDefaultRequestTimeout,
         std::chrono::milliseconds connect_timeout = kConnectTimeout);
-    ~RpcClient() = default;
+    ~RpcClient() { shutdown(); }
 
     template <auto Func, typename Req>
     PGResult<ResponseT<Func>> call(
@@ -88,12 +88,14 @@ class RpcClient {
         auto client = createSyncClient();
         auto request_timeout = timeout.value_or(state_->request_timeout);
 
-        auto ec = async_simple::coro::syncAwait(client->connect(addr));
+        auto ec = async_simple::coro::syncAwait(
+            client->connect(addr).via(&client->get_executor()));
         if (ec) {
             return makeRpcFailure<Func>(ec.message());
         }
         auto rpc_result = async_simple::coro::syncAwait(
-            client->call_for<Func>(request_timeout, std::move(req)));
+            client->call_for<Func>(request_timeout, std::move(req))
+                .via(&client->get_executor()));
         if (!rpc_result) {
             return makeRpcFailure<Func>(rpc_result.error().msg);
         }
@@ -106,7 +108,8 @@ class RpcClient {
     }
 
     // Async call with transport failures and the response delivered through
-    // one PGResult. The callback is not invoked after shutdown begins.
+    // one PGResult. Shutdown suppresses pending callbacks and waits for any
+    // callback already running before returning.
     template <auto Func, typename Req, typename Callback>
     void callAsync(const std::string& addr, Req req, Callback cb) {
         static_assert(
@@ -127,7 +130,9 @@ class RpcClient {
     bool isConnected(const std::string& addr) const;
     bool tryReconnect(const std::string& addr);
 
-    void shutdown() { state_->shutdown.store(true, std::memory_order_release); }
+    // Called by the owner, outside RPC callbacks. Drains in-flight tasks before
+    // the owner (which callbacks may capture) can be destroyed.
+    void shutdown();
 
    private:
     struct SharedState {
@@ -137,6 +142,8 @@ class RpcClient {
               connect_timeout(connect_timeout) {}
 
         std::mutex mutex;
+        std::condition_variable drained;
+        size_t pending_tasks = 0;
         std::unordered_map<std::string,
                            std::shared_ptr<coro_rpc::coro_rpc_client>>
             clients;
@@ -151,18 +158,21 @@ class RpcClient {
                       const std::string& addr);
 
     // Spawn a coroutine on the global I/O executor.
-    static void spawn(async_simple::coro::Lazy<void> task);
+    void spawn(async_simple::coro::Lazy<void> task);
 
-    // Create a coro_rpc_client with local io_context (for sync call()).
+    // Create an uncached client for sync call().
     std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient();
 
     // Fire-and-forget coroutine: connect, send_request, discard result.
     template <auto Func, typename Req>
     static async_simple::coro::Lazy<void> sendCoroutine(
-        std::shared_ptr<SharedState> state, const std::string& addr, Req req) {
+        std::shared_ptr<SharedState> state, std::string addr, Req req) {
         if (state->shutdown.load(std::memory_order_acquire)) co_return;
         auto client = co_await getOrCreateClient(state, addr);
         if (!client) co_return;
+        // Initiating a write must not race the socket executor's close path.
+        co_await coro_io::post([] {}, &client->get_executor());
+        if (state->shutdown.load(std::memory_order_acquire)) co_return;
         try {
             coro_rpc::request_config_t config;
             config.request_timeout_duration = state->request_timeout;
@@ -180,7 +190,7 @@ class RpcClient {
     // Async call coroutine: connect, send_request, invoke callback.
     template <auto Func, typename Req, typename Callback>
     static async_simple::coro::Lazy<void> callAsyncCoroutine(
-        std::shared_ptr<SharedState> state, const std::string& addr, Req req,
+        std::shared_ptr<SharedState> state, std::string addr, Req req,
         Callback cb) {
         if (state->shutdown.load(std::memory_order_acquire)) co_return;
 
@@ -202,6 +212,7 @@ class RpcClient {
             complete(makeRpcFailure<Func>("failed to connect to " + addr));
             co_return;
         }
+        co_await coro_io::post([] {}, &client->get_executor());
         if (state->shutdown.load(std::memory_order_acquire)) co_return;
 
         coro_rpc::request_config_t config;

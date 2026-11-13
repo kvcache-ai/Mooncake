@@ -4,7 +4,7 @@
 #include <transport/device/device_ops.cuh>
 
 #include "device_comm/device_utils/d2h_request_slot_types.h"
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_utils/device_timeout.cuh"
 
 namespace mooncake {
@@ -12,13 +12,13 @@ namespace mooncake {
 template <typename Request, typename Reply>
 __device__ __forceinline__ bool
 D2HRequestSlot<Request, Reply>::RequestHandle::poll(Reply* response) const {
-    PG_DEVICE_ASSERT(slot_ && sequence_ != 0 &&
-                     device::mc_ld_acquire_u64(&slot_->submitted_sequence_) ==
-                         sequence_);
+    PG_ASSERT(slot_ && sequence_ != 0 &&
+              device::mc_ld_acquire_u64(&slot_->submitted_sequence_) ==
+                  sequence_);
     const uint64_t replied =
         device::mc_ld_acquire_u64(&slot_->replied_sequence_);
     if (replied != sequence_) {
-        PG_DEVICE_ASSERT(replied < sequence_);
+        PG_ASSERT(replied < sequence_);
         return false;
     }
     if (response) *response = slot_->reply_;
@@ -49,7 +49,7 @@ __device__ __forceinline__ bool D2HRequestSlot<Request, Reply>::waitUntilIdle(
     while (true) {
         const uint64_t replied = device::mc_ld_acquire_u64(&replied_sequence_);
         if (replied == submitted) return true;
-        PG_DEVICE_ASSERT(replied < submitted);
+        PG_ASSERT(replied < submitted);
         if (deviceTimedOut(start_ticks, timeout_ticks)) return false;
     }
 }
@@ -71,10 +71,10 @@ __device__ __forceinline__
     while (true) {
         const uint64_t replied = device::mc_ld_acquire_u64(&replied_sequence_);
         if (replied == submitted) break;
-        PG_DEVICE_ASSERT(replied < submitted);
+        PG_ASSERT(replied < submitted);
         if (deviceTimedOut(start_ticks, timeout_ticks)) return {};
     }
-    PG_DEVICE_ASSERT(submitted != UINT64_MAX);
+    PG_ASSERT(submitted != UINT64_MAX);
 
     const uint64_t sequence = submitted + 1;
     request_ = request;

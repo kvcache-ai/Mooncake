@@ -202,6 +202,9 @@ class TentMetrics {
     // Runtime enable flag (atomic for thread-safe access with minimal overhead)
     static inline std::atomic<bool> runtime_enabled_{true};
 
+    // Serializes process-wide initialize/shutdown and protects config_.
+    std::mutex lifecycle_mutex_;
+
     std::atomic<bool> initialized_{false};
     MetricsConfig config_;
     // Port the HTTP server actually bound to, 0 until a successful bind. Kept
@@ -213,9 +216,9 @@ class TentMetrics {
     friend class TentMetricsTestPeer;
 
     // Published only after every bounded accounting label has a resolved
-    // cell. initialize() marks initialized_ before registration to serialize
-    // concurrent initializers, so accounting starts need this separate ready
-    // barrier to avoid pairing a dropped early start with a later finish.
+    // cell and the metrics subsystem is fully initialized. Starts use this
+    // separate barrier so shutdown can reject new pairs while allowing already
+    // started pairs to finish before initialized_ is cleared.
     std::atomic<bool> accounting_ready_{false};
 
     static constexpr size_t kSerializationFormatCount = 2;

@@ -229,20 +229,26 @@ pip install mooncake-transfer-engine-musa
 - An AWS instance with EFA (for example p5 or p6).
 - AWS EFA driver and libfabric. Verify with `fi_info -p efa`, and keep
   `/opt/amazon/efa/lib` on `LD_LIBRARY_PATH`.
-- CUDA 12.1–12.9 or CUDA 13 if you use the GPU-aware EFA wheels.
+- No separate package: the default wheels include the EFA transport since
+  0.3.14. Install the one that matches your CUDA version.
 
 **Installation**
 
 ```bash
-# GPU memory transfers with CUDA 12
-pip install mooncake-transfer-engine-efa
+# CUDA 12
+pip install mooncake-transfer-engine
 
-# GPU memory transfers with CUDA 13
-pip install mooncake-transfer-engine-efa-cuda13
+# CUDA 13
+pip install mooncake-transfer-engine-cuda13
 
-# CPU/DRAM-only transfers
-pip install mooncake-transfer-engine-efa-non-cuda
+# No CUDA (host memory, or Neuron HBM on Trainium)
+pip install mooncake-transfer-engine-non-cuda
 ```
+
+Select the transport with `protocol=efa`: `MOONCAKE_PROTOCOL=efa` in SGLang,
+or `"mooncake_protocol":"efa"` in vLLM's `kv_connector_extra_config`. The
+`mooncake-transfer-engine-efa*` packages are no longer needed and stop at
+0.3.13.post1.
 
 See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md)
 for prerequisites and configuration.

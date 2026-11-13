@@ -14,6 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+
 #include "tent/metrics/tent_metrics.h"
 
 #if TENT_METRICS_ENABLED
@@ -60,6 +63,22 @@ class PortOccupier {
     uint16_t port_ = 0;
 };
 
+MetricsConfig makeTestConfig(uint16_t port) {
+    MetricsConfig config;
+    config.enabled = true;
+    config.http_host = "127.0.0.1";
+    config.http_port = port;
+    config.http_server_threads = 1;
+    config.report_interval_seconds = 0;
+    return config;
+}
+
+class TentMetricsInitializationTest : public ::testing::Test {
+   protected:
+    void SetUp() override { TentMetrics::instance().shutdown(); }
+    void TearDown() override { TentMetrics::instance().shutdown(); }
+};
+
 // When the configured metrics port is already in use (e.g. another rank was
 // mistakenly given the same port), initialize() must NOT falsely report a
 // listening endpoint. It degrades to log-only metrics: init still succeeds,
@@ -68,11 +87,7 @@ TEST(TentMetricsHttpServer, DegradesToLogOnlyWhenConfiguredPortBusy) {
     PortOccupier occupier;
     ASSERT_GT(occupier.port(), 0);
 
-    MetricsConfig config;
-    config.enabled = true;
-    config.http_host = "127.0.0.1";
-    config.http_port = occupier.port();
-    config.report_interval_seconds = 0;  // no periodic reporting thread
+    MetricsConfig config = makeTestConfig(occupier.port());
 
     auto& metrics = TentMetrics::instance();
     Status status = metrics.initialize(config);
@@ -96,6 +111,82 @@ TEST(TentMetricsHttpServer, DegradesToLogOnlyWhenConfiguredPortBusy) {
     EXPECT_NE(summary.find("start failures: 1"), std::string::npos);
 
     metrics.shutdown();
+}
+
+TEST_F(TentMetricsInitializationTest,
+       RepeatedInitializationRequiresEquivalentConfig) {
+    PortOccupier occupier;
+    ASSERT_GT(occupier.port(), 0);
+
+    auto& metrics = TentMetrics::instance();
+    MetricsConfig config = makeTestConfig(occupier.port());
+    ASSERT_TRUE(metrics.initialize(config).ok());
+    EXPECT_TRUE(metrics.initialize(config).ok());
+
+    auto expect_conflict = [&](const char* field,
+                               const MetricsConfig& conflicting) {
+        Status status = metrics.initialize(conflicting);
+        EXPECT_TRUE(status.IsInvalidArgument())
+            << field << ": " << status.ToString();
+    };
+
+    MetricsConfig conflicting = config;
+    conflicting.enabled = false;
+    expect_conflict("enabled", conflicting);
+
+    conflicting = config;
+    conflicting.http_host = "0.0.0.0";
+    expect_conflict("http_host", conflicting);
+
+    conflicting = config;
+    conflicting.http_port =
+        config.http_port == 65535 ? config.http_port - 1 : config.http_port + 1;
+    expect_conflict("http_port", conflicting);
+
+    conflicting = config;
+    conflicting.http_server_threads = 2;
+    expect_conflict("http_server_threads", conflicting);
+
+    conflicting = config;
+    conflicting.report_interval_seconds = 1;
+    expect_conflict("report_interval_seconds", conflicting);
+
+    metrics.shutdown();
+    conflicting = config;
+    conflicting.enabled = false;
+    EXPECT_TRUE(metrics.initialize(conflicting).ok());
+    EXPECT_FALSE(TentMetrics::isEnabled());
+}
+
+TEST_F(TentMetricsInitializationTest,
+       ConcurrentConflictingInitializersRejectOne) {
+    PortOccupier occupier;
+    ASSERT_GT(occupier.port(), 0);
+
+    MetricsConfig first = makeTestConfig(occupier.port());
+    MetricsConfig second = first;
+    second.enabled = false;
+
+    std::atomic<bool> start{false};
+    Status first_status;
+    Status second_status;
+    std::thread first_thread([&]() {
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        first_status = TentMetrics::instance().initialize(first);
+    });
+    std::thread second_thread([&]() {
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        second_status = TentMetrics::instance().initialize(second);
+    });
+    start.store(true, std::memory_order_release);
+    first_thread.join();
+    second_thread.join();
+
+    EXPECT_NE(first_status.ok(), second_status.ok());
+    EXPECT_TRUE(first_status.IsInvalidArgument() ||
+                second_status.IsInvalidArgument());
 }
 
 }  // namespace

@@ -229,6 +229,14 @@ static inline bool isCudaMemory(void* ptr) {
     auto ret = cudaPointerGetAttributes(&attr, ptr);
     return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
 }
+
+// cudaMemset/cudaMemcpy on another GPU's memory fail with "invalid argument"
+// unless that GPU is current, and bench threads may touch any GPU.
+static inline void useCudaDeviceOf(void* ptr) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess)
+        cudaSetDevice(attr.device);
+}
 #endif
 
 #ifdef USE_HIP
@@ -298,6 +306,7 @@ static inline void fillData(void* addr, size_t length, uint8_t seed) {
 #endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
+        useCudaDeviceOf(addr);
         auto err = cudaMemset(addr, seed, length);
         LOG_ASSERT(err == cudaSuccess)
             << "cudaMemset failed: " << cudaGetErrorString(err);
@@ -364,6 +373,7 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
+        useCudaDeviceOf(addr);
         std::vector<uint8_t> act_data(length);
         cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
         if (memcmp(act_data.data(), ref_data.data(), length)) {

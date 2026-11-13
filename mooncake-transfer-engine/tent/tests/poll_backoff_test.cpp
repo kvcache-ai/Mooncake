@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Backoff policy for transferSync() / waitTransferCompletion().
+// Backoff policy for submitAndWaitTransfer() / waitTransferCompletion().
 //
 // Both used to poll progressBatch() in a `while (true)` with no pause, and
 // progressBatch takes progress_mutex_ every time, so the spin contended with

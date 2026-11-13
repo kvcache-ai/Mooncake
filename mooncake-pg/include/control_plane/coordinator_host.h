@@ -5,6 +5,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -100,7 +101,9 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
 class CoordinatorHost {
    public:
     CoordinatorHost(const std::string& host_ip, int max_world_size,
-                    int64_t fault_reconciliation_window_us);
+                    int64_t fault_reconciliation_window_us,
+                    std::optional<DeviceAllReduceAlgorithm>
+                        all_reduce_algorithm = std::nullopt);
 
     ~CoordinatorHost();
 
@@ -144,6 +147,8 @@ class CoordinatorHost {
     void postViewUpdateAck(GroupId group_id, GlobalRank rank, uint64_t epoch,
                            bool applied);
 
+    void postTransferEndpointUpdateAck(TransferEndpointUpdateAck ack);
+
    private:
     CentralizedCoordinatorStateMachine state_machine_;
     SerializedExecutor executor_;
@@ -177,6 +182,7 @@ class CoordinatorHost {
 
     void runEffects(const std::vector<CoordinatorEffect>& effects);
     void pushViewUpdate(const PushViewUpdate& effect);
+    void pushTransferEndpointUpdate(const PushTransferEndpointUpdate& effect);
 
     template <auto Method, typename Push>
     void pushToAgent(GlobalRank rank, const Push& msg) {

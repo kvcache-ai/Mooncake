@@ -28,6 +28,14 @@ find_package(
 target_include_directories(tentpy PRIVATE ${Python3_INCLUDE_DIRS})
 target_link_libraries(tentpy PUBLIC tent_link_group)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # tentpy statically embeds the TENT Ascend HIXL transport, which carries CANN's
+  # inline ge::StatusFactory symbols. Keep them local for the same reason as
+  # libtransfer_engine.so (see mooncake-transfer-engine/src/CMakeLists.txt).
+  target_link_options(tentpy PRIVATE
+                      "LINKER:--exclude-libs,libtent_xport_ascend_direct.a")
+endif()
+
 if(BUILD_UNIT_TESTS)
   add_test(
     NAME tent_python_guards_test
@@ -36,4 +44,12 @@ if(BUILD_UNIT_TESTS)
       "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mooncake-common:$<TARGET_FILE_DIR:tent_metrics>:$ENV{LD_LIBRARY_PATH}"
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_python_guards.py)
+
+  add_test(
+    NAME tent_python_wait_transfer_test
+    COMMAND
+      ${CMAKE_COMMAND} -E env "PYTHONPATH=$<TARGET_FILE_DIR:tentpy>"
+      "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mooncake-common:$<TARGET_FILE_DIR:tent_metrics>:$ENV{LD_LIBRARY_PATH}"
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_python_wait_transfer.py)
 endif()

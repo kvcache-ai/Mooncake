@@ -45,11 +45,20 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    // 0/false: buffered; packed/true/1: packed direct writes;
+    // aligned: aligned direct writes
+    // (BucketBackendConfig::aligned_direct_write).
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_BUCKET_MAX_TOTAL_SIZE);
+    // Comma-separated per-disk quotas, positionally aligned with the disk
+    // list in MOONCAKE_OFFLOAD_FILE_STORAGE_PATH. Kept as a string because it
+    // is a list, not a scalar.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY);

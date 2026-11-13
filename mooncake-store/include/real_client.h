@@ -1460,6 +1460,12 @@ class RealClient : public PyClient {
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
 
+    // DFS replicas whose fs adapter accepts arbitrary host read buffers are
+    // read straight into host destinations; device destinations, more than
+    // IOV_MAX destinations and other DFS adapters keep the staging buffer.
+    bool can_use_direct_dfs_read(const Replica::Descriptor &replica,
+                                 const std::vector<void *> &buffers) const;
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

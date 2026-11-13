@@ -20,7 +20,8 @@
 #include "ha/common/redis/redis_test_utils.h"
 
 DEFINE_string(redis_endpoint, "",
-              "Redis endpoint for OpLog KV tests, e.g. 127.0.0.1:6379");
+              "Redis primary endpoint with exactly one replica for OpLog KV "
+              "tests, e.g. 127.0.0.1:6379");
 #endif
 
 namespace mooncake::test {
@@ -60,7 +61,40 @@ TEST(RedisHaKvBackendTest, CreateRevisionCompareIsRejected) {
                             .expected_value = "",
                             .expected_revision = 1});
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, backend.Txn(txn));
+    EXPECT_EQ(KvWriteStatus::kRejected, backend.TxnWithResult(txn).status);
 }
+
+TEST(RedisHaKvBackendTest, CrossClusterTransactionIsRejectedBeforeConnecting) {
+    RedisHaKvBackend backend;
+    KvTxn txn;
+    txn.compares.push_back({.key = "/oplog/clusterA/prefix",
+                            .kind = KvCompareKind::kKeyNotExists,
+                            .expected_value = ""});
+    txn.puts.push_back({.key = "/oplog/clusterB/batch", .value = "batch"});
+    const auto result = backend.TxnWithResult(txn);
+    EXPECT_EQ(KvWriteStatus::kRejected, result.status);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error);
+}
+
+#ifndef STORE_USE_REDIS
+TEST(RedisHaKvBackendTest, WritesRemainUnavailableWithoutRedisSupport) {
+    RedisHaKvBackend backend;
+    const std::string key = "/oplog/clusterA/key";
+    KvTxn txn;
+    txn.puts.push_back({.key = key, .value = "value"});
+    for (const auto& result : {backend.PutWithResult(key, "value"),
+                               backend.DeleteRangeWithResult(key, key + "0"),
+                               backend.TxnWithResult(txn)}) {
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, result.error);
+        EXPECT_EQ(KvWriteStatus::kRejected, result.status);
+    }
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+              backend.Put(key, "value"));
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+              backend.DeleteRange(key, key + "0"));
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, backend.Txn(txn));
+}
+#endif
 
 #ifdef STORE_USE_REDIS
 
@@ -142,6 +176,75 @@ TEST_F(RedisOpLogBackendTest, CompareAndSwapAndBinaryValue) {
     ASSERT_NE(reply, nullptr);
     ASSERT_EQ(REDIS_REPLY_STRING, reply->type);
     EXPECT_EQ(binary_value, std::string(reply->str, reply->len));
+}
+
+TEST_F(RedisOpLogBackendTest, AllWritesReportReplicationAcknowledgement) {
+    const std::string key = "/oplog/" + cluster_id_ + "/ack";
+    const auto put = backend_->PutWithResult(key, "value");
+    ASSERT_EQ(KvWriteStatus::kCommitted, put.status);
+    EXPECT_EQ(1u, put.replicas_required);
+    EXPECT_EQ(1u, put.replicas_acked);
+
+    KvTxn txn;
+    txn.compares.push_back({.key = key,
+                            .kind = KvCompareKind::kValueEquals,
+                            .expected_value = "value"});
+    txn.puts.push_back({.key = key, .value = "next"});
+    const auto changed = backend_->TxnWithResult(txn);
+    ASSERT_EQ(KvWriteStatus::kCommitted, changed.status);
+    EXPECT_EQ(1u, changed.replicas_acked);
+    const auto failed = backend_->TxnWithResult(txn);
+    EXPECT_EQ(KvWriteStatus::kCompareFailed, failed.status);
+    EXPECT_EQ(0u, failed.replicas_acked);
+
+    const auto deleted = backend_->DeleteRangeWithResult(key, key + "0");
+    ASSERT_EQ(KvWriteStatus::kCommitted, deleted.status);
+    EXPECT_EQ(1u, deleted.replicas_acked);
+}
+
+TEST_F(RedisOpLogBackendTest,
+       InsufficientReplicasLeaveWrittenDataForReconciliation) {
+    RedisHaKvBackend backend(
+        {.replicas_required = 2,
+         .replica_ack_timeout = std::chrono::milliseconds(20)});
+    ASSERT_EQ(ErrorCode::OK, backend.Connect(FLAGS_redis_endpoint));
+    const std::string key = "/oplog/" + cluster_id_ + "/unconfirmed";
+    const auto result = backend.PutWithResult(key, "written");
+    EXPECT_EQ(KvWriteStatus::kOutcomeUnknown, result.status);
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error);
+    EXPECT_EQ(2u, result.replicas_required);
+    EXPECT_LT(result.replicas_acked, result.replicas_required);
+    std::string value;
+    ASSERT_EQ(ErrorCode::OK, backend.Get(key, value));
+    EXPECT_EQ("written", value);
+}
+
+TEST_F(RedisOpLogBackendTest, InvalidIndexIsDetectedBeforeAnyWrite) {
+    auto context = testing::ConnectRedisForTest(FLAGS_redis_endpoint);
+    ASSERT_TRUE(context.has_value());
+    const std::string index =
+        "mooncake-store/{" + cluster_id_ + "}/oplog-index";
+    testing::RedisReplyPtr set_index(static_cast<redisReply*>(redisCommand(
+        context.value().get(), "SET %b invalid", index.data(), index.size())));
+    ASSERT_NE(nullptr, set_index);
+    ASSERT_EQ(REDIS_REPLY_STATUS, set_index->type);
+
+    const std::string key = "/oplog/" + cluster_id_ + "/unwritten";
+    KvTxn txn;
+    txn.puts.push_back({.key = key, .value = "value"});
+    for (const auto& result :
+         {backend_->PutWithResult(key, "value"), backend_->TxnWithResult(txn),
+          backend_->DeleteRangeWithResult(key, key + "0")}) {
+        EXPECT_EQ(KvWriteStatus::kFailedBeforeCommit, result.status);
+        EXPECT_EQ(0u, result.replicas_acked);
+    }
+    std::string value;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, backend_->Get(key, value));
+
+    testing::RedisReplyPtr cleanup(static_cast<redisReply*>(redisCommand(
+        context.value().get(), "DEL %b", index.data(), index.size())));
+    ASSERT_NE(nullptr, cleanup);
+    EXPECT_EQ(REDIS_REPLY_INTEGER, cleanup->type);
 }
 
 TEST_F(RedisOpLogBackendTest, RangeIsOrderedAndPaginated) {

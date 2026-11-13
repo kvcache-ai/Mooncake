@@ -267,12 +267,10 @@ def _build_transfer_edges(
                     if boundary > head
                 ]
             )
-            if len(edges) + 2 > 100_000:
+            if len(edges) + len(descriptor.components) > 100_000:
                 raise ValueError("KV-cache logical plan edge limit exceeded")
-            for component, head_dim in (
-                (KVCacheComponent.KEY, descriptor.key_head_dim),
-                (KVCacheComponent.VALUE, descriptor.value_head_dim),
-            ):
+            for component in descriptor.components:
+                head_dim = descriptor.head_dim(component)
                 edges.append(
                     KVCacheTransferEdge(
                         source_participant_id=selected.participant_id,

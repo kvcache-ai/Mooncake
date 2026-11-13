@@ -188,8 +188,8 @@ class EvictorTest : public ::testing::Test {
 
     // Declared first, so it outlives the replicas it gave out.
     std::shared_ptr<OffsetBufferAllocator> allocator_ =
-        std::make_shared<OffsetBufferAllocator>("segment", 0x100000000ULL,
-                                                64 * 1024 * 1024, "segment");
+        std::make_shared<OffsetBufferAllocator>(
+            "segment", 0x100000000ULL, 64 * 1024 * 1024, "segment", "tcp");
     metadata::NamespaceTable namespaces_{[](const TenantId& tenant_id) {
         return std::make_unique<metadata::Namespace>(tenant_id);
     }};

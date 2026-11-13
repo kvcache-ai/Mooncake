@@ -106,7 +106,16 @@ class RdmaContext {
     // everything else goes through ibv_reg_mr. Returns nullptr on failure
     // (including a failed dma-buf registration of an exportable buffer, which
     // makes the caller drop RDMA for that buffer and stage instead).
-    MemReg registerMemReg(void *addr, size_t length, int access);
+    // A shared export is borrowed; its owner closes it after all NICs finish.
+    // An empty shared export skips export and uses the ordinary MR path.
+    MemReg registerMemReg(void *addr, size_t length, int access,
+                          const DmabufExport *shared_export = nullptr);
+
+    Status exportDmabuf(void *addr, size_t length, DmabufExport &out) {
+        return dmabuf_exporter_
+                   ? dmabuf_exporter_(addr, length, out)
+                   : Platform::getLoader().exportDmabuf(addr, length, out);
+    }
 
     // True when this context can register dma-buf exported device memory.
     bool supportsDmabuf() const { return verbs_.ibv_reg_dmabuf_mr != nullptr; }

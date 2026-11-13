@@ -15,10 +15,13 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
+#include <thread>
 
 #include "transfer_engine.h"
 #include "transport/cxi_transport/cxi_transport.h"
@@ -227,6 +230,38 @@ class CXITransportTest : public ::testing::Test {
     std::string metadata_server_;
     std::string local_server_name_;
 };
+
+// Keep this before the other transport tests so libfabric's first
+// initialization runs while another thread is calling mmap/munmap.
+// Run this test in a fresh process when checking monitor initialization.
+TEST_F(CXITransportTest, InitWithConcurrentMemoryMapping) {
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> mappings{0};
+    std::atomic<bool> mapping_failed{false};
+    std::thread allocator([&] {
+        while (!stop.load()) {
+            constexpr size_t size = 64 * 1024;
+            void *addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (addr == MAP_FAILED || munmap(addr, size) != 0) {
+                mapping_failed.store(true);
+                break;
+            }
+            mappings.fetch_add(1);
+        }
+    });
+    while (mappings.load() == 0 && !mapping_failed.load()) {
+        std::this_thread::yield();
+    }
+
+    auto s = createEngine(4 * 1024 * 1024);
+    destroyEngine(s);
+    s.engine.reset();
+    stop.store(true);
+    allocator.join();
+    EXPECT_FALSE(mapping_failed.load());
+    EXPECT_GT(mappings.load(), 0u);
+}
 
 // Test 1: Verify CXI transport can be installed
 TEST_F(CXITransportTest, InstallTransport) {
@@ -455,8 +490,10 @@ TEST_F(CXITransportTest, StressMultipleBatches) {
                 << " did not complete";
         }
 
+        // A task can report COMPLETED while its completion callback is still
+        // unwinding; freeBatchID then defers cleanup, which is also valid.
         s = setup.engine->freeBatchID(batch_id);
-        ASSERT_TRUE(s.ok());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
 
     destroyEngine(setup);
