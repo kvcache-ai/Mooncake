@@ -37,6 +37,9 @@ struct JitCompileOutput {
     std::string cubin;
     std::string log;
     double compiler_sec = 0.0;
+    // True only for a normal compiler exit that is safe to cache for this
+    // input.
+    bool cacheable_failure = false;
 };
 
 class JitCompiler {
@@ -44,6 +47,12 @@ class JitCompiler {
     virtual ~JitCompiler() = default;
 
     virtual std::string compiler_id() const = 0;
+    virtual bool probe_compiler_id(std::string* id, std::string* error) const {
+        if (id == nullptr) return false;
+        (void)error;
+        *id = compiler_id();
+        return true;
+    }
     virtual std::vector<std::string> compile_options(
         const JitCompileConfig& config) const = 0;
     virtual bool compile_to_cubin(const JitCompileInput& input,

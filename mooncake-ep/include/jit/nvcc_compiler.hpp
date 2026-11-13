@@ -16,6 +16,7 @@ namespace jit {
 class NvccCompiler final : public JitCompiler {
    public:
     std::string compiler_id() const override;
+    bool probe_compiler_id(std::string* id, std::string* error) const override;
     std::vector<std::string> compile_options(
         const JitCompileConfig& config) const override;
     bool compile_to_cubin(const JitCompileInput& input,
