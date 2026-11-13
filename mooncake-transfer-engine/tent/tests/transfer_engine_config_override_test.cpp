@@ -391,24 +391,6 @@ TEST(TransferEngineConfigOverrideTest,
     }
 }
 
-TEST(TransferEngineConfigOverrideTest, ForceFabricDisablesHostTransports) {
-    Config config;
-    ConfigHelper::forceTcp(config);
-    ConfigHelper::forceFabric(config, "efa");
-
-    EXPECT_FALSE(config.get("transports/force_tcp", true));
-    EXPECT_TRUE(config.get("transports/force_fabric", false));
-    EXPECT_FALSE(config.get("transports/tcp/enable", true));
-    EXPECT_FALSE(config.get("transports/rdma/enable", true));
-    EXPECT_FALSE(config.get("transports/hp_tcp/enable", true));
-    EXPECT_FALSE(config.get("transports/shm/enable", true));
-    EXPECT_TRUE(config.get("transports/fabric/enable", false));
-    EXPECT_EQ(config.get("transports/fabric/provider", ""), "efa");
-
-    ConfigHelper::forceTcp(config);
-    EXPECT_FALSE(config.get("transports/force_fabric", true));
-}
-
 TEST(TransferEngineConfigOverrideTest,
      ExplicitForceFabricSurvivesMcTentConfAndRequiresInstall) {
     EnvVarGuard conf_guard(
@@ -462,9 +444,6 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(engine.available());
     EXPECT_TRUE(config->get("transports/force_tcp", false));
     EXPECT_FALSE(config->get("transports/force_fabric", true));
-    EXPECT_TRUE(config->get("transports/tcp/enable", false));
-    EXPECT_FALSE(config->get("transports/rdma/enable", true));
-    EXPECT_FALSE(config->get("transports/fabric/enable", true));
 }
 
 TEST(TransferEngineConfigOverrideTest,

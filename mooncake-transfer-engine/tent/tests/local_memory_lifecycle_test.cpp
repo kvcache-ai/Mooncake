@@ -22,7 +22,7 @@
 #include <vector>
 #include <algorithm>
 #include <utility>
-#include <unordered_map>
+#include <unordered_set>
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -86,9 +86,8 @@ class FailOnceFreeTransport : public Transport {
 
 class FailOnceRemoveTransport : public Transport {
    public:
-    explicit FailOnceRemoveTransport(TransportType type, bool fail = false,
-                                     bool scrub_on_remove = true)
-        : type(type), fail(fail), scrub_on_remove(scrub_on_remove) {}
+    explicit FailOnceRemoveTransport(TransportType type, bool fail = false)
+        : type(type), fail(fail) {}
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
         desc.transports.push_back(type);
         return Status::OK();
@@ -97,11 +96,9 @@ class FailOnceRemoveTransport : public Transport {
         ++remove_calls;
         if (std::exchange(fail, false))
             return Status::InternalError("injected drain failure");
-        if (scrub_on_remove) {
-            desc.transports.erase(std::remove(desc.transports.begin(),
-                                              desc.transports.end(), type),
-                                  desc.transports.end());
-        }
+        desc.transports.erase(
+            std::remove(desc.transports.begin(), desc.transports.end(), type),
+            desc.transports.end());
         return Status::OK();
     }
     Status allocateLocalMemory(void** addr, size_t size,
@@ -118,13 +115,12 @@ class FailOnceRemoveTransport : public Transport {
     const char* getName() const override { return "fail-once-remove"; }
     TransportType type;
     bool fail;
-    bool scrub_on_remove;
     int remove_calls = 0, allocate_calls = 0, free_calls = 0;
 };
 
 class FabricRegistrationTransport : public FailOnceRemoveTransport {
    public:
-    enum class Mode { kFail, kSkip, kRegister };
+    enum class Mode { kFail, kRegister };
 
     explicit FabricRegistrationTransport(Mode mode)
         : FailOnceRemoveTransport(FABRIC), mode(mode) {}
@@ -134,34 +130,23 @@ class FabricRegistrationTransport : public FailOnceRemoveTransport {
         if (mode == Mode::kFail) {
             return Status::InternalError("injected Fabric failure" LOC_MARK);
         }
-        if (mode == Mode::kSkip) return Status::OK();
-        auto [it, inserted] = tracked.emplace(desc.addr, desc.length);
-        if (!inserted && it->second != desc.length) {
-            return Status::InvalidArgument(
-                "injected Fabric length mismatch" LOC_MARK);
-        }
+        tracked.insert(desc.addr);
         if (options.perm == kLocalReadWrite) return Status::OK();
         return FailOnceRemoveTransport::addMemoryBuffer(desc, options);
     }
 
     Status removeMemoryBuffer(BufferDesc& desc) override {
-        auto it = tracked.find(desc.addr);
-        if (it != tracked.end() && it->second != desc.length) {
-            return Status::InvalidArgument(
-                "injected Fabric length mismatch" LOC_MARK);
-        }
         auto status = FailOnceRemoveTransport::removeMemoryBuffer(desc);
         if (status.ok()) tracked.erase(desc.addr);
         return status;
     }
 
     bool tracksLocalBuffer(const BufferDesc& desc) const override {
-        auto it = tracked.find(desc.addr);
-        return it != tracked.end() && it->second == desc.length;
+        return tracked.count(desc.addr) > 0;
     }
 
     Mode mode;
-    std::unordered_map<uint64_t, size_t> tracked;
+    std::unordered_set<uint64_t> tracked;
 };
 
 std::shared_ptr<Config> makeConfig() {
@@ -369,138 +354,59 @@ TEST(LocalMemoryLifecycle, FailedUnregisterRetainsRegistrationForRetry) {
 }
 
 TEST(LocalMemoryLifecycle, RequiredFabricRegistrationIsNotBestEffort) {
-    for (auto mode : {FabricRegistrationTransport::Mode::kFail,
-                      FabricRegistrationTransport::Mode::kSkip,
-                      FabricRegistrationTransport::Mode::kRegister}) {
-        SCOPED_TRACE(static_cast<int>(mode));
-        for (auto permission : {kGlobalReadWrite, kLocalReadWrite}) {
-            SCOPED_TRACE(static_cast<int>(permission));
-            auto config = makeConfig();
-            config->set("transports/fabric/enable", false);
-            TransferEngineImpl engine(config);
-            ASSERT_TRUE(engine.available());
-            config->set("transports/force_fabric", true);
-            auto fabric = std::make_shared<FabricRegistrationTransport>(mode);
-            auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
-            auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
-            engine.swapTransportForTest(FABRIC, fabric);
-            engine.swapTransportForTest(TCP, tcp);
-            engine.swapTransportForTest(MLU, mlu);
-
-            std::vector<char> buffer(4096);
-            MemoryOptions options;
-            options.perm = permission;
-            auto status = engine.registerLocalMemory({buffer.data()},
-                                                     {buffer.size()}, options);
-            if (mode != FabricRegistrationTransport::Mode::kRegister) {
-                EXPECT_FALSE(status.ok());
-                EXPECT_TRUE(
-                    TransferEngineImplTestPeer::localBuffers(engine).empty());
-                EXPECT_EQ(fabric->remove_calls, 1);
-                EXPECT_EQ(mlu->remove_calls, 1);
-                EXPECT_EQ(
-                    tcp->remove_calls,
-                    mode == FabricRegistrationTransport::Mode::kSkip ? 1 : 0);
-                continue;
-            }
-
-            ASSERT_TRUE(status.ok()) << status.ToString();
-            const auto buffers =
-                TransferEngineImplTestPeer::localBuffers(engine);
-            ASSERT_EQ(buffers.size(), 1u);
-            const auto& registered = buffers.front().transports;
-            EXPECT_EQ(std::find(registered.begin(), registered.end(), FABRIC) !=
-                          registered.end(),
-                      permission != kLocalReadWrite);
-            ASSERT_TRUE(
-                engine.unregisterLocalMemory(buffer.data(), buffer.size())
-                    .ok());
-            EXPECT_TRUE(
-                TransferEngineImplTestPeer::localBuffers(engine).empty());
-        }
-    }
-}
-
-TEST(LocalMemoryLifecycle, RequiredFabricRollbackFailureRetainsRetryRecord) {
-    auto config = makeConfig();
-    TransferEngineImpl engine(config);
-    ASSERT_TRUE(engine.available());
-    config->set("transports/force_fabric", true);
-    auto fabric = std::make_shared<FabricRegistrationTransport>(
-        FabricRegistrationTransport::Mode::kFail);
-    auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
-    auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU, true);
-    engine.swapTransportForTest(FABRIC, fabric);
-    engine.swapTransportForTest(TCP, tcp);
-    engine.swapTransportForTest(MLU, mlu);
-
-    std::vector<char> buffer(4096);
-    EXPECT_FALSE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
-    EXPECT_EQ(mlu->remove_calls, 1);
-    EXPECT_EQ(fabric->remove_calls, 1);
-    EXPECT_EQ(tcp->remove_calls, 0);
-    SegmentInfo info;
-    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
-    EXPECT_TRUE(info.buffers.empty());
-    const auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
-    ASSERT_EQ(buffers.size(), 1u);
-    EXPECT_TRUE(buffers.front().internal);
-    EXPECT_EQ(buffers.front().transports, std::vector<TransportType>{MLU});
-
-    ASSERT_TRUE(
-        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
-    EXPECT_EQ(mlu->remove_calls, 2);
-    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
-}
-
-TEST(LocalMemoryLifecycle, RequiredFabricRejectsSameAddressDifferentLength) {
-    for (bool vector_api : {false, true}) {
-        SCOPED_TRACE(vector_api);
+    {
         auto config = makeConfig();
+        config->set("transports/fabric/enable", false);
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        config->set("transports/force_fabric", true);
+        auto fabric = std::make_shared<FabricRegistrationTransport>(
+            FabricRegistrationTransport::Mode::kFail);
+        auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
+        auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
+        engine.swapTransportForTest(FABRIC, fabric);
+        engine.swapTransportForTest(TCP, tcp);
+        engine.swapTransportForTest(MLU, mlu);
+
+        std::vector<char> buffer(4096);
+        EXPECT_FALSE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+        EXPECT_EQ(fabric->remove_calls, 1);
+        EXPECT_EQ(mlu->remove_calls, 1);
+        EXPECT_EQ(tcp->remove_calls, 0);
+    }
+
+    for (auto permission : {kGlobalReadWrite, kLocalReadWrite}) {
+        SCOPED_TRACE(static_cast<int>(permission));
+        auto config = makeConfig();
+        config->set("transports/fabric/enable", false);
         TransferEngineImpl engine(config);
         ASSERT_TRUE(engine.available());
         config->set("transports/force_fabric", true);
         auto fabric = std::make_shared<FabricRegistrationTransport>(
             FabricRegistrationTransport::Mode::kRegister);
         auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
-        auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU, false, false);
+        auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
         engine.swapTransportForTest(FABRIC, fabric);
         engine.swapTransportForTest(TCP, tcp);
         engine.swapTransportForTest(MLU, mlu);
 
-        std::vector<char> buffer(8192);
-        if (vector_api) {
-            EXPECT_FALSE(
-                engine
-                    .registerLocalMemory({buffer.data(), buffer.data()},
-                                         {buffer.size(), buffer.size() / 2})
-                    .ok());
-            EXPECT_TRUE(
-                TransferEngineImplTestPeer::localBuffers(engine).empty());
-            EXPECT_TRUE(fabric->tracked.empty());
-            EXPECT_EQ(mlu->remove_calls, 2);
-            EXPECT_EQ(fabric->remove_calls, 2);
-            continue;
-        }
-
-        ASSERT_TRUE(
-            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
-        EXPECT_FALSE(
-            engine.registerLocalMemory(buffer.data(), buffer.size() / 2).ok());
-        EXPECT_FALSE(
-            engine.registerLocalMemory(buffer.data(), buffer.size() / 2).ok());
+        std::vector<char> buffer(4096);
+        MemoryOptions options;
+        options.perm = permission;
+        auto status = engine.registerLocalMemory({buffer.data()},
+                                                 {buffer.size()}, options);
+        ASSERT_TRUE(status.ok()) << status.ToString();
         const auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
         ASSERT_EQ(buffers.size(), 1u);
-        EXPECT_EQ(buffers.front().length, buffer.size());
-        ASSERT_EQ(fabric->tracked.size(), 1u);
-        EXPECT_EQ(fabric->tracked.begin()->second, buffer.size());
-        EXPECT_EQ(mlu->remove_calls, 2);
-        EXPECT_EQ(fabric->remove_calls, 0);
-
+        const auto& registered = buffers.front().transports;
+        EXPECT_EQ(std::find(registered.begin(), registered.end(), FABRIC) !=
+                      registered.end(),
+                  permission != kLocalReadWrite);
         ASSERT_TRUE(
             engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
         EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
-        EXPECT_TRUE(fabric->tracked.empty());
     }
 }
 
