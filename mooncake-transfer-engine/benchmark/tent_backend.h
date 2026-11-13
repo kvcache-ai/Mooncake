@@ -82,6 +82,8 @@ class TENTBenchRunner : public BenchRunner {
                    ((thread_id / seg_type_mix_.size()) / count);
     }
 
+    Status getSelectionStats(SelectionStats& stats) const;
+
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                  uint64_t batch_size) const {
         const int local_thread_id = localTargetThreadId(thread_id);

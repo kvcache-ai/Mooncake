@@ -755,6 +755,11 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     return workers_->getDeviceSelector()->getNicLoadStats(stats);
 }
 
+Status RdmaTransport::getSelectionStats(SelectionStats& stats) const {
+    stats = workers_->getDeviceSelector()->getSelectionStats();
+    return Status::OK();
+}
+
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
     // Warm-up is a plain ibv_reg_mr; dma-buf device memory has no host pages.
