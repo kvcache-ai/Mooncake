@@ -30,6 +30,7 @@
 // Requires EFA hardware (fi_info -p efa) AND at least one CUDA GPU.  Self-
 // skips cleanly when either is absent.
 
+#include "cuda_driver.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <gflags/gflags.h>
@@ -200,7 +201,7 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
     if (device_count < 2) GTEST_SKIP() << "At least two CUDA GPUs required";
 
     CUdevice device_zero;
-    ASSERT_EQ(cuDeviceGet(&device_zero, 0), CUDA_SUCCESS);
+    ASSERT_EQ(MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&device_zero, 0), CUDA_SUCCESS);
 
     auto setup = createEngine(1);
     EngineCleanup cleanup(this, setup);
@@ -208,8 +209,8 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
 
     unsigned int flags = 0;
     int device_zero_active_before = 0;
-    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags,
-                                         &device_zero_active_before),
+    ASSERT_EQ(MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxGetState)(
+                  device_zero, &flags, &device_zero_active_before),
               CUDA_SUCCESS);
 
     auto segment_desc =
@@ -230,11 +231,11 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
     CUcontext before_context = nullptr;
     CUcontext after_context = nullptr;
     std::thread submitter([&] {
-        before_result = cuCtxGetCurrent(&before_context);
+        before_result = MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&before_context);
         transfer_ok = submitAndWait(setup.engine.get(), setup.segment_id,
                                     setup.dev_buf, remote_base + destination,
                                     kDataLength, TransferRequest::WRITE);
-        after_result = cuCtxGetCurrent(&after_context);
+        after_result = MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&after_context);
     });
     submitter.join();
 
@@ -246,8 +247,8 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
         << "loopback copy changed the caller's CUDA context";
 
     int device_zero_active_after = 0;
-    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags,
-                                         &device_zero_active_after),
+    ASSERT_EQ(MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxGetState)(
+                  device_zero, &flags, &device_zero_active_after),
               CUDA_SUCCESS);
     if (!device_zero_active_before) {
         EXPECT_EQ(device_zero_active_after, 0)

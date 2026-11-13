@@ -14,8 +14,13 @@ if(USE_XPU)
                         "(libze_loader)")
   endif()
   pybind11_add_module(
-    _ep MODULE ep_py.cpp xpu/mooncake_ep_xpu_buffer.cpp xpu/xpu_ipc.cpp
-    xpu/xpu_ep_kernels.cpp xpu/mooncake_ep_xpu_elastic_buffer.cpp
+    _ep
+    MODULE
+    ep_py.cpp
+    xpu/mooncake_ep_xpu_buffer.cpp
+    xpu/xpu_ipc.cpp
+    xpu/xpu_ep_kernels.cpp
+    xpu/mooncake_ep_xpu_elastic_buffer.cpp
     xpu/xpu_ep_elastic_kernels.cpp)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_XPU=1)
   set(_ep_xpu_sycl_flags -fsycl)
@@ -94,9 +99,7 @@ if(USE_XPU)
 endif()
 
 set(MOONCAKE_EP_HOST_SOURCES
-    ep_py.cpp
-    ../benchmarks/legacy_buffer_perf.cpp
-    mooncake_ep_buffer.cpp
+    ep_py.cpp ../benchmarks/legacy_buffer_perf.cpp mooncake_ep_buffer.cpp
     mooncake_ep_elastic_buffer.cpp)
 
 set(MOONCAKE_EP_DEVICE_SOURCES
@@ -195,9 +198,8 @@ if(USE_CUDA)
   foreach(header IN LISTS MOONCAKE_EP_JIT_TRANSFER_HEADERS)
     get_filename_component(header_dir "${header}" DIRECTORY)
     file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header_dir}")
-    configure_file(
-      "${MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR}/${header}"
-      "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header}" COPYONLY)
+    configure_file("${MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR}/${header}"
+                   "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header}" COPYONLY)
   endforeach()
 
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_config.h.in"
@@ -207,27 +209,27 @@ if(USE_CUDA)
   # then pass through auditwheel while this library is injected afterwards.
   add_library(mooncake_ep_device SHARED ${MOONCAKE_EP_DEVICE_SOURCES}
                                         ${MOONCAKE_EP_JIT_SOURCES})
-  set_target_properties(mooncake_ep_device PROPERTIES
-                        POSITION_INDEPENDENT_CODE ON)
+  set_target_properties(mooncake_ep_device PROPERTIES POSITION_INDEPENDENT_CODE
+                                                      ON)
   if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
-    set_target_properties(mooncake_ep_device PROPERTIES
-                          CUDA_ARCHITECTURES "80;90;103")
+    set_target_properties(mooncake_ep_device PROPERTIES CUDA_ARCHITECTURES
+                                                        "80;90;103")
   else()
-    set_target_properties(mooncake_ep_device PROPERTIES
-                          CUDA_ARCHITECTURES "80;90")
+    set_target_properties(mooncake_ep_device PROPERTIES CUDA_ARCHITECTURES
+                                                        "80;90")
   endif()
   target_include_directories(
-    mooncake_ep_device PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include
-    ${MOONCAKE_EP_JIT_GENERATED_DIR})
+    mooncake_ep_device
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/include
+            ${MOONCAKE_EP_JIT_GENERATED_DIR})
   target_compile_options(
-    mooncake_ep_device PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-g0>
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    mooncake_ep_device
+    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-g0>
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   target_link_libraries(mooncake_ep_device PRIVATE CUDA::cudart
-                                                   CUDA::cuda_driver
                                                    ${CMAKE_DL_LIBS})
   if(USE_NCCL_DEVICE)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
@@ -243,14 +245,17 @@ elseif(USE_MUSA)
   else()
     set(_ep_musa_compiler_hint /usr/local/musa/bin)
   endif()
-  find_program(_ep_musa_compiler NAMES mcc HINTS "${_ep_musa_compiler_hint}")
+  find_program(
+    _ep_musa_compiler
+    NAMES mcc
+    HINTS "${_ep_musa_compiler_hint}")
   if(NOT _ep_musa_compiler)
     message(FATAL_ERROR "USE_MUSA=ON requires the MUSA compiler (mcc)")
   endif()
   set(_ep_musa_depfile_supported FALSE)
-  if(CMAKE_GENERATOR MATCHES "^Ninja" OR
-     (CMAKE_GENERATOR MATCHES "Makefiles" AND
-      CMAKE_VERSION VERSION_GREATER_EQUAL 3.20))
+  if(CMAKE_GENERATOR MATCHES "^Ninja"
+     OR (CMAKE_GENERATOR MATCHES "Makefiles" AND CMAKE_VERSION
+                                                 VERSION_GREATER_EQUAL 3.20))
     set(_ep_musa_depfile_supported TRUE)
   endif()
 
@@ -266,23 +271,14 @@ elseif(USE_MUSA)
     endif()
     add_custom_command(
       OUTPUT "${_ep_device_object}"
-      COMMAND "${_ep_musa_compiler}"
-              -x musa
-              -std=c++20
-              -O3
-              -fPIC
-              -DUSE_MUSA
-              -DMOONCAKE_EP_USE_MUSA=1
-              -MMD
-              -MT "${_ep_device_object}"
-              -MF "${_ep_device_depfile}"
-              --cuda-gpu-arch=mp_21
-              --cuda-gpu-arch=mp_31
-              "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
-              "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
-              -c "${_ep_device_source}" -o "${_ep_device_object}"
-      DEPENDS "${_ep_device_source}"
-      ${_ep_musa_depfile_argument}
+      COMMAND
+        "${_ep_musa_compiler}" -x musa -std=c++20 -O3 -fPIC -DUSE_MUSA
+        -DMOONCAKE_EP_USE_MUSA=1 -MMD -MT "${_ep_device_object}" -MF
+        "${_ep_device_depfile}" --cuda-gpu-arch=mp_21 --cuda-gpu-arch=mp_31
+        "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+        "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
+        -c "${_ep_device_source}" -o "${_ep_device_object}"
+      DEPENDS "${_ep_device_source}" ${_ep_musa_depfile_argument}
       COMMENT "Compiling Mooncake EP MUSA device source ${_ep_device_name}"
       VERBATIM)
     set_source_files_properties("${_ep_device_object}"
@@ -293,10 +289,8 @@ elseif(USE_MACA)
   # MACA legacy EP kernels use the SDK cu-bridge nvcc front-end. mxcc is used
   # for the PG worker, but does not provide CUDA compatibility headers such as
   # cooperative_groups.h required by these translation units.
-  set(MOONCAKE_EP_SOURCES
-      ep_py.cpp
-      ../benchmarks/legacy_buffer_perf.cpp
-      mooncake_ep_buffer.cpp)
+  set(MOONCAKE_EP_SOURCES ep_py.cpp ../benchmarks/legacy_buffer_perf.cpp
+                          mooncake_ep_buffer.cpp)
   # The elastic kernel contains NVIDIA PTX inline assembly and is not part of
   # the legacy Buffer API exercised on MACA.
   set(_ep_maca_device_sources
@@ -308,10 +302,13 @@ elseif(USE_MACA)
   else()
     set(_ep_maca_root /opt/maca)
   endif()
-  find_program(_ep_maca_compiler NAMES nvcc
-               HINTS "${_ep_maca_root}/tools/cu-bridge/bin")
+  find_program(
+    _ep_maca_compiler
+    NAMES nvcc
+    HINTS "${_ep_maca_root}/tools/cu-bridge/bin")
   if(NOT _ep_maca_compiler)
-    message(FATAL_ERROR "USE_MACA=ON requires the MACA cu-bridge compiler (nvcc)")
+    message(
+      FATAL_ERROR "USE_MACA=ON requires the MACA cu-bridge compiler (nvcc)")
   endif()
   foreach(_ep_device_source IN LISTS _ep_maca_device_sources)
     get_filename_component(_ep_device_name "${_ep_device_source}" NAME_WE)
@@ -319,14 +316,13 @@ elseif(USE_MACA)
         "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_maca.o")
     add_custom_command(
       OUTPUT "${_ep_device_object}"
-      COMMAND "${_ep_maca_compiler}"
-              -std=c++17 -O3 -Xcompiler=-fPIC
-              -DUSE_MACA -DMOONCAKE_EP_USE_MACA=1
-              -include cuda_bf16.h
-              "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
-              "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
-              "-I${_ep_maca_root}/tools/cu-bridge/include"
-              -c "${_ep_device_source}" -o "${_ep_device_object}"
+      COMMAND
+        "${_ep_maca_compiler}" -std=c++17 -O3 -Xcompiler=-fPIC -DUSE_MACA
+        -DMOONCAKE_EP_USE_MACA=1 -include cuda_bf16.h
+        "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+        "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
+        "-I${_ep_maca_root}/tools/cu-bridge/include" -c "${_ep_device_source}"
+        -o "${_ep_device_object}"
       DEPENDS "${_ep_device_source}"
       COMMENT "Compiling Mooncake EP MACA device source ${_ep_device_name}"
       VERBATIM)
@@ -354,9 +350,15 @@ endif()
 
 target_include_directories(_ep PRIVATE ${Python3_INCLUDE_DIRS})
 if(USE_CUDA)
-  target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
-                                    gflags::gflags mooncake_ep_device
-                                    CUDA::cudart)
+  target_link_libraries(
+    _ep
+    PRIVATE transfer_engine
+            ibverbs
+            mlx5
+            glog::glog
+            gflags::gflags
+            mooncake_ep_device
+            CUDA::cudart)
 else()
   target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
                                     gflags::gflags)

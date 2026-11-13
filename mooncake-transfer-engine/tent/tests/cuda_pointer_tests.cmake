@@ -13,8 +13,7 @@ if(TARGET tent_transport_hint_test AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             TENT_TEST_CUDA_POINTER_QUERY)
   target_link_options(
     tent_transport_hint_test PRIVATE
-    "-Wl,--wrap=${cuda_pointer_platform_loader}"
-    "-Wl,--wrap=cuPointerGetAttributes")
+    "-Wl,--wrap=${cuda_pointer_platform_loader}" "-Wl,--wrap=dlsym")
 endif()
 
 # Link the platform base objects directly to avoid a static archive cycle.
@@ -27,12 +26,8 @@ target_link_libraries(cuda_pointer_test_runtime
                       PUBLIC platform_cuda tent_common glog::glog numa ibverbs)
 
 set(cuda_pointer_wrapped_symbols
-    cuInit
-    cuDeviceGet
-    cuPointerGetAttributes
-    cuPointerGetAttribute
-    cuCtxGetCurrent
-    cuCtxSetCurrent
+    dlopen
+    dlsym
     cudaGetDeviceCount
     cudaRuntimeGetVersion
     cudaGetDevice
@@ -54,7 +49,7 @@ endforeach()
 add_library(cuda_pointer_test_plugin SHARED
             ${CMAKE_CURRENT_LIST_DIR}/../plugins/cuda/cuda_plugin.cpp)
 target_link_libraries(cuda_pointer_test_plugin PRIVATE tent_common CUDA::cudart
-                                                       CUDA::cuda_driver)
+                                                       ${CMAKE_DL_LIBS})
 target_link_options(cuda_pointer_test_plugin PRIVATE
                     ${cuda_pointer_wrap_options})
 set_target_properties(

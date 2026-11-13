@@ -15,7 +15,7 @@
 #ifndef TENT_PLATFORM_CUDA_UTILS_H
 #define TENT_PLATFORM_CUDA_UTILS_H
 
-#include <cuda.h>
+#include "cuda_driver.h"
 
 #include <mutex>
 
@@ -27,7 +27,7 @@ namespace tent {
 inline CUresult cudaDriverInitResult() {
     static std::once_flag flag;
     static CUresult result = CUDA_ERROR_NOT_INITIALIZED;
-    std::call_once(flag, []() { result = cuInit(0); });
+    std::call_once(flag, []() { result = MOONCAKE_CUDA_SYMBOL(cuInit)(0); });
     return result;
 }
 
@@ -64,7 +64,8 @@ inline CUresult getCudaPointerInfo(const void* ptr, CudaPointerInfo& info) {
                                         CU_POINTER_ATTRIBUTE_IS_MANAGED,
                                         CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
     void* values[] = {&mem_type, &managed, &device};
-    res = cuPointerGetAttributes(3, attributes, values, (CUdeviceptr)ptr);
+    res = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttributes)(3, attributes, values,
+                                                       (CUdeviceptr)ptr);
     if (res != CUDA_SUCCESS) return res;
     if (managed > 1 ||
         (mem_type != 0 && mem_type != CU_MEMORYTYPE_HOST &&
@@ -86,7 +87,7 @@ inline CUresult getCudaPointerInfo(const void* ptr, CudaPointerInfo& info) {
     if (result.isCuda()) {
         if (device < 0) return CUDA_ERROR_INVALID_DEVICE;
         CUdevice cu_device;
-        res = cuDeviceGet(&cu_device, device);
+        res = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cu_device, device);
         if (res != CUDA_SUCCESS) return res;
         result.device = device;
     }

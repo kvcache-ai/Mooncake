@@ -7,12 +7,12 @@
 static CUresult cuMemCreateTryFabric(CUmemGenericAllocationHandle *handle,
                                      size_t size, CUmemAllocationProp *prop,
                                      unsigned long long flags) {
-    CUresult err = cuMemCreate(handle, size, prop, flags);
+    CUresult err = MOONCAKE_CUDA_SYMBOL(cuMemCreate)(handle, size, prop, flags);
     if ((prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
         (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED)) {
         prop->requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
             prop->requestedHandleTypes & ~CU_MEM_HANDLE_TYPE_FABRIC);
-        err = cuMemCreate(handle, size, prop, flags);
+        err = MOONCAKE_CUDA_SYMBOL(cuMemCreate)(handle, size, prop, flags);
     }
     return err;
 }
@@ -23,13 +23,13 @@ namespace {
 
 MemoryBackendType ProbeAllocatorBackend(int device_id) {
     CUdevice dev;
-    CUresult res = cuDeviceGet(&dev, device_id);
+    CUresult res = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&dev, device_id);
     if (res != CUDA_SUCCESS) {
         return MemoryBackendType::unknown;
     }
 
     int fabric_attr = 0;
-    res = cuDeviceGetAttribute(
+    res = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
         &fabric_attr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
     if (res != CUDA_SUCCESS || !fabric_attr) {
         return MemoryBackendType::use_cudamalloc;
@@ -44,9 +44,9 @@ MemoryBackendType ProbeAllocatorBackend(int device_id) {
     CUmemGenericAllocationHandle handle;
     size_t size = 4096;
 
-    res = cuMemCreate(&handle, size, &prop, 0);
+    res = MOONCAKE_CUDA_SYMBOL(cuMemCreate)(&handle, size, &prop, 0);
     if (res == CUDA_SUCCESS) {
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return MemoryBackendType::use_cumemcreate;
     }
     return MemoryBackendType::use_cudamalloc;
@@ -60,7 +60,7 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
     CUmemGenericAllocationHandle handle;
     void *ptr = nullptr;
     int flag = 0;
-    CUresult result = cuDeviceGet(&currentDev, device);
+    CUresult result = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&currentDev, device);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuDeviceGet failed: " << result << "\n";
         return nullptr;
@@ -70,7 +70,7 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
     prop.location.id = currentDev;
 
     int fabric_supported = 0;
-    result = cuDeviceGetAttribute(
+    result = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
         &fabric_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
         currentDev);
     if (result != CUDA_SUCCESS) {
@@ -81,7 +81,7 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
     }
 
-    result = cuDeviceGetAttribute(
+    result = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
         currentDev);
     if (result != CUDA_SUCCESS) {
@@ -89,8 +89,8 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         return nullptr;
     }
     if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
-    result = cuMemGetAllocationGranularity(&granularity, &prop,
-                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
+        &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemGetAllocationGranularity failed: " << result;
         return nullptr;
@@ -102,17 +102,19 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         std::cerr << "cuMemCreateTryFabric failed: " << result;
         return nullptr;
     }
-    result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)((CUdeviceptr *)&ptr,
+                                                       size, granularity, 0, 0);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemAddressReserve failed: " << result;
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
-    result = cuMemMap((CUdeviceptr)ptr, size, 0, handle, 0);
+    result =
+        MOONCAKE_CUDA_SYMBOL(cuMemMap)((CUdeviceptr)ptr, size, 0, handle, 0);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemMap failed: " << result;
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
     int device_count;
@@ -123,12 +125,13 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         accessDesc[idx].location.id = idx;
         accessDesc[idx].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     }
-    result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc, device_count);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)((CUdeviceptr)ptr, size,
+                                                  accessDesc, device_count);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemSetAccess failed: " << result;
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
     return ptr;
@@ -142,19 +145,21 @@ void FreeFabricMemory(void *ptr, ssize_t ssize, int device,
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
     if (!ptr) return;
-    auto result = cuMemRetainAllocationHandle(&handle, ptr);
+    auto result =
+        MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(&handle, ptr);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemRetainAllocationHandle failed: " << result << "\n";
         return;
     }
     // Not all runtimes accept a NULL base output; always pass a real pointer.
     CUdeviceptr base = 0;
-    result = cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(&base, &size,
+                                                        (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
     }
-    cuMemRelease(handle);
+    MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
 }
 
 }  // namespace

@@ -44,6 +44,7 @@ bool fail_restore_context;
 CUcontext current_context;
 int current_device;
 char allocation[64];
+int cuda_driver_handle;
 
 class CudaPointerTest : public testing::Test {
    protected:
@@ -157,6 +158,33 @@ cudaError_t __wrap_cudaFree(void*) {
     ++frees;
     return fail_free ? cudaErrorUnknown : cudaSuccess;
 }
+// Intercept the loader so fault injection also applies to the CUDA plugin DSO.
+void* __real_dlopen(const char* filename, int flags);
+void* __real_dlsym(void* handle, const char* name);
+
+void* __wrap_dlopen(const char* filename, int flags) {
+    if (filename && std::strcmp(filename, "libcuda.so.1") == 0)
+        return &cuda_driver_handle;
+    return __real_dlopen(filename, flags);
+}
+
+void* __wrap_dlsym(void* handle, const char* name) {
+    if (handle != &cuda_driver_handle) return __real_dlsym(handle, name);
+    if (std::strcmp(name, "cuInit") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuInit);
+    if (std::strcmp(name, "cuDeviceGet") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuDeviceGet);
+    if (std::strcmp(name, "cuPointerGetAttributes") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuPointerGetAttributes);
+    if (std::strcmp(name, "cuPointerGetAttribute") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuPointerGetAttribute);
+    if (std::strcmp(name, "cuCtxGetCurrent") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuCtxGetCurrent);
+    if (std::strcmp(name, "cuCtxSetCurrent") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuCtxSetCurrent);
+    return nullptr;
+}
+
 void __wrap_numa_free(void*, size_t) { ++host_frees; }
 int __wrap_numa_move_pages(int, unsigned long, void**, const int*, int*, int) {
     ++numa_probes;

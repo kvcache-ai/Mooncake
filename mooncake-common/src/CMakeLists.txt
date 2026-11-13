@@ -1,7 +1,6 @@
 find_package(yaml-cpp REQUIRED)
 find_path(ASIO_INCLUDE_DIR asio.hpp
-  HINTS ${yalantinglibs_SOURCE_DIR}/include/ylt/thirdparty
-)
+          HINTS ${yalantinglibs_SOURCE_DIR}/include/ylt/thirdparty)
 if(NOT ASIO_INCLUDE_DIR)
   message(FATAL_ERROR "standalone Asio headers not found")
 endif()
@@ -58,3 +57,5 @@ if(BUILD_SHARED_LIBS)
   set_target_properties(mooncake_common PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_common DESTINATION lib)
 endif()
+
+install(FILES ../include/cuda_driver.h DESTINATION include)

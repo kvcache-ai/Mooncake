@@ -13,7 +13,7 @@
 #include <jit/jit_utils.hpp>
 #include <jit/nvcc_compiler.hpp>
 
-#include <cuda.h>
+#include "cuda_driver.h"
 
 #include <algorithm>
 #include <chrono>
@@ -355,8 +355,8 @@ std::filesystem::path temporary_cubin_path(
 std::string cu_error_string(CUresult result) {
     const char* name = nullptr;
     const char* message = nullptr;
-    cuGetErrorName(result, &name);
-    cuGetErrorString(result, &message);
+    MOONCAKE_CUDA_SYMBOL(cuGetErrorName)(result, &name);
+    MOONCAKE_CUDA_SYMBOL(cuGetErrorString)(result, &message);
     std::ostringstream out;
     out << (name == nullptr ? "CUDA_ERROR_UNKNOWN" : name);
     if (message != nullptr) out << ": " << message;
@@ -396,18 +396,20 @@ JitKernelStatus load_function(const std::string& key, const std::string& cubin,
     // Load outside the mutex so unrelated threads are not blocked by CUDA
     // linking.
     CUmodule module = nullptr;
-    CUresult rc = cuInit(0);
+    CUresult rc = MOONCAKE_CUDA_SYMBOL(cuInit)(0);
     if (rc == CUDA_SUCCESS)
-        rc = cuModuleLoadDataEx(&module, cubin.data(), 0, nullptr, nullptr);
+        rc = MOONCAKE_CUDA_SYMBOL(cuModuleLoadDataEx)(&module, cubin.data(), 0,
+                                                      nullptr, nullptr);
     if (rc != CUDA_SUCCESS) {
         if (error != nullptr) *error = cu_error_string(rc);
         return JitKernelStatus::kLoadFailed;
     }
 
-    rc = cuModuleGetFunction(function, module, entry_name.c_str());
+    rc = MOONCAKE_CUDA_SYMBOL(cuModuleGetFunction)(function, module,
+                                                   entry_name.c_str());
     if (rc != CUDA_SUCCESS) {
         if (error != nullptr) *error = cu_error_string(rc);
-        cuModuleUnload(module);
+        MOONCAKE_CUDA_SYMBOL(cuModuleUnload)(module);
         return JitKernelStatus::kLoadFailed;
     }
 
@@ -415,7 +417,7 @@ JitKernelStatus load_function(const std::string& key, const std::string& cubin,
     auto [it, inserted] =
         g_modules.emplace(key, LoadedKernelModule{module, *function});
     if (!inserted) {
-        cuModuleUnload(module);
+        MOONCAKE_CUDA_SYMBOL(cuModuleUnload)(module);
         *function = it->second.function;
     }
     return JitKernelStatus::kLaunched;
@@ -423,7 +425,7 @@ JitKernelStatus load_function(const std::string& key, const std::string& cubin,
 
 JitKernelStatus configure_smem(CUfunction function, int dynamic_smem_bytes,
                                std::string* error) {
-    CUresult rc = cuFuncSetAttribute(
+    CUresult rc = MOONCAKE_CUDA_SYMBOL(cuFuncSetAttribute)(
         function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         dynamic_smem_bytes);
     if (rc != CUDA_SUCCESS) {
@@ -509,7 +511,7 @@ CUresult launch_function(CUfunction function, const JitKernelVariant& variant,
         (variant.cluster_dim_x > 1 || variant.cluster_dim_y > 1 ||
          variant.cluster_dim_z > 1);
     if (!variant.cooperative && !needs_cluster) {
-        return cuLaunchKernel(
+        return MOONCAKE_CUDA_SYMBOL(cuLaunchKernel)(
             function, variant.num_blocks, 1, 1, variant.block_dim, 1, 1,
             static_cast<unsigned int>(variant.dynamic_smem_bytes),
             reinterpret_cast<CUstream>(stream),
@@ -550,9 +552,9 @@ CUresult launch_function(CUfunction function, const JitKernelVariant& variant,
     config.attrs = attrs;
     config.numAttrs = num_attrs;
 
-    return cuLaunchKernelEx(&config, function,
-                            single_arg ? single_arg_array : nullptr,
-                            single_arg ? nullptr : extra);
+    return MOONCAKE_CUDA_SYMBOL(cuLaunchKernelEx)(
+        &config, function, single_arg ? single_arg_array : nullptr,
+        single_arg ? nullptr : extra);
 }
 
 JitKernelStatus try_fast_launch(const FastCacheKey& fast_key,
@@ -879,10 +881,10 @@ JitKernelStatus resolve_launch_target(int* device, CUcontext* context,
         return JitKernelStatus::kUnsupportedDevice;
     }
 
-    CUresult rc = cuCtxGetCurrent(context);
+    CUresult rc = MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(context);
     if (rc == CUDA_SUCCESS && *context == nullptr) {
         cudaFree(nullptr);
-        rc = cuCtxGetCurrent(context);
+        rc = MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(context);
     }
     if (rc != CUDA_SUCCESS || *context == nullptr) {
         if (error != nullptr)

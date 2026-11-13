@@ -30,7 +30,7 @@
 #include <vector>
 
 #ifdef USE_CUDA
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -47,9 +47,7 @@ thread_local int pointer_queries = 0;
 thread_local int queries_before_failure = 0;
 }  // namespace
 
-extern "C" CUresult __real_cuPointerGetAttributes(
-    unsigned int count, CUpointer_attribute* attributes, void** values,
-    CUdeviceptr ptr);
+extern "C" void* __real_dlsym(void* handle, const char* name);
 
 extern "C" CUresult __wrap_cuPointerGetAttributes(
     unsigned int count, CUpointer_attribute* attributes, void** values,
@@ -57,7 +55,19 @@ extern "C" CUresult __wrap_cuPointerGetAttributes(
     if (watched_pointer && ptr == watched_pointer &&
         ++pointer_queries > queries_before_failure)
         return CUDA_ERROR_INVALID_CONTEXT;
-    return __real_cuPointerGetAttributes(count, attributes, values, ptr);
+    static const auto real =
+        reinterpret_cast<decltype(&cuPointerGetAttributes)>(
+            __real_dlsym(mooncake::cuda_driver_detail::driverLibrary(),
+                         "cuPointerGetAttributes"));
+    return real ? real(count, attributes, values, ptr)
+                : CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND;
+}
+
+extern "C" void* __wrap_dlsym(void* handle, const char* name) {
+    void* symbol = __real_dlsym(handle, name);
+    if (symbol && std::strcmp(name, "cuPointerGetAttributes") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuPointerGetAttributes);
+    return symbol;
 }
 #endif
 

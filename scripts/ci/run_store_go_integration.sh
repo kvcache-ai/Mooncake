@@ -77,19 +77,7 @@ fi
 
 # Link cudart if CUDA is available (needed for D2H staging in mooncake_store).
 if [ -d /usr/local/cuda/lib64 ]; then
-    export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"
-fi
-# USE_CUDA links transfer_engine against the CUDA Driver API in addition to the
-# runtime API. Reuse the exact driver library that CMake selected.
-if grep -q '^USE_CUDA:BOOL=ON$' "$GITHUB_WORKSPACE/build/CMakeCache.txt"; then
-    cuda_driver_library=$(sed -n \
-        's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' \
-        "$GITHUB_WORKSPACE/build/CMakeCache.txt")
-    if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
-        echo "CMake did not resolve the CUDA driver library" >&2
-        exit 1
-    fi
-    export CGO_LDFLAGS="$CGO_LDFLAGS -L$(dirname "$cuda_driver_library") -lcuda"
+    export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart -ldl"
 fi
 # The KV events publisher is optional and linked when libzmq is installed.
 if ldconfig -p 2>/dev/null | grep -q libzmq; then

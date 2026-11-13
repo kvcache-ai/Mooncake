@@ -650,8 +650,8 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     // we must register at segment granularity for correct IPC relocation.
     CUdeviceptr base_ptr = 0;
     size_t alloc_size = 0;
-    CUresult cu_err =
-        cuMemGetAddressRange(&base_ptr, &alloc_size, (CUdeviceptr)addr);
+    CUresult cu_err = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+        &base_ptr, &alloc_size, (CUdeviceptr)addr);
     if (cu_err != CUDA_SUCCESS) {
         LOG(ERROR) << "IntraNodeNvlinkTransport: cuMemGetAddressRange failed "
                    << "for addr " << addr << " (error " << cu_err << ")";
@@ -672,9 +672,9 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
         // cuMemRetainAllocationHandle only succeeds for those, so use it to
         // tell the user why registration failed.
         CUmemGenericAllocationHandle vmm_handle;
-        if (cuMemRetainAllocationHandle(&vmm_handle, (void *)base_ptr) ==
-            CUDA_SUCCESS) {
-            cuMemRelease(vmm_handle);
+        if (MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(
+                &vmm_handle, (void *)base_ptr) == CUDA_SUCCESS) {
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(vmm_handle);
             LOG(ERROR)
                 << "IntraNodeNvlinkTransport: buffer " << addr
                 << " is a virtual-memory (cuMemCreate) allocation, which has "
@@ -703,8 +703,8 @@ int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
                                                     bool update_metadata) {
     CUdeviceptr base_ptr = 0;
     size_t alloc_size = 0;
-    CUresult cu_err =
-        cuMemGetAddressRange(&base_ptr, &alloc_size, (CUdeviceptr)addr);
+    CUresult cu_err = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+        &base_ptr, &alloc_size, (CUdeviceptr)addr);
 
     void *key_ptr = addr;
     if (cu_err == CUDA_SUCCESS) {

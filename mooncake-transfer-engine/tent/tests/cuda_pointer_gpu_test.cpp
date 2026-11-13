@@ -64,9 +64,10 @@ TEST(CudaPointerGpuTest, RealAllocationsCopiesAndContextRestoration) {
 
     CUcontext custom = nullptr;
 #if CUDA_VERSION >= 13000
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxCreate(&custom, nullptr, 0, 0));
+    ASSERT_EQ(CUDA_SUCCESS,
+              MOONCAKE_CUDA_SYMBOL(cuCtxCreate)(&custom, nullptr, 0, 0));
 #else
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxCreate(&custom, 0, 0));
+    ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxCreate)(&custom, 0, 0));
 #endif
     for (void* ptr : {device, managed}) {
         EXPECT_EQ(ptr == managed ? MTYPE_UNKNOWN : MTYPE_CUDA,
@@ -76,7 +77,8 @@ TEST(CudaPointerGpuTest, RealAllocationsCopiesAndContextRestoration) {
         EXPECT_EQ(src, dst);
         ASSERT_EQ(0, plugin.memcpy_sync(nullptr, dst.data(), ptr, dst.size()));
         CUcontext restored = nullptr;
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&restored));
+        ASSERT_EQ(CUDA_SUCCESS,
+                  MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&restored));
         EXPECT_EQ(custom, restored);
         auto locations = platform.getLocation(ptr, src.size());
         if (ptr == managed) {
@@ -89,22 +91,22 @@ TEST(CudaPointerGpuTest, RealAllocationsCopiesAndContextRestoration) {
     // A fresh worker must still have no current context after the copy.
     std::thread worker([&] {
         CUcontext before = nullptr, after = nullptr;
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&before));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&before));
         ASSERT_EQ(nullptr, before);
         EXPECT_EQ(MTYPE_CPU, platform.getMemoryType(src.data()));
         EXPECT_EQ(MTYPE_UNKNOWN, platform.getMemoryType(managed));
         ASSERT_TRUE(platform.copy(dst.data(), managed, dst.size()).ok());
         EXPECT_EQ(src, dst);
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&after));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&after));
         EXPECT_EQ(nullptr, after);
         ASSERT_EQ(0,
                   plugin.memcpy_sync(nullptr, dst.data(), managed, dst.size()));
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&after));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&after));
         EXPECT_EQ(nullptr, after);
     });
     worker.join();
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxSetCurrent(nullptr));
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxDestroy(custom));
+    ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(nullptr));
+    ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxDestroy)(custom));
     ASSERT_EQ(cudaSuccess, cudaSetDevice(0));
     EXPECT_FALSE(platform.free(pinned, src.size()).ok());
     EXPECT_EQ(cudaSuccess, cudaFreeHost(pinned));

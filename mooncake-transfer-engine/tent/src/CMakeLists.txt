@@ -3,8 +3,10 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 add_library(tent_interface INTERFACE)
 target_include_directories(
   tent_interface
-  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
-            $<INSTALL_INTERFACE:include>)
+  INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../mooncake-common/include>
+    $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
 # ascend_affinity.h lives next to the shared allocator implementation, but TENT
@@ -13,7 +15,9 @@ target_compile_features(tent_interface INTERFACE cxx_std_20)
 if(USE_ASCEND OR USE_ASCEND_DIRECT)
   target_include_directories(
     tent_interface
-    INTERFACE ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator)
+    INTERFACE
+      ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator
+  )
 endif()
 
 if(TARGET asio_shared)
@@ -27,7 +31,7 @@ if(USE_CUDA)
   target_compile_definitions(tent_interface INTERFACE USE_CUDA)
   target_include_directories(tent_interface
                              INTERFACE ${CUDAToolkit_INCLUDE_DIRS})
-  target_link_libraries(tent_interface INTERFACE CUDA::cudart)
+  target_link_libraries(tent_interface INTERFACE CUDA::cudart ${CMAKE_DL_LIBS})
 else()
   message(STATUS "CUDA: Disabled")
 endif()
@@ -115,8 +119,8 @@ else()
   message(STATUS "RDMA: Disabled")
 endif()
 
-# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already
-# resolve libfabric in mooncake-common/common.cmake.
+# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already resolve
+# libfabric in mooncake-common/common.cmake.
 if(USE_FABRIC
    OR USE_EFA
    OR USE_CXI)
@@ -140,7 +144,8 @@ if(USE_FABRIC
     # USE_EFA/USE_CXI wheel builds may provision libfabric headers only (the
     # classic engine dlopens the library at runtime). With no linkable library,
     # build TENT without its fabric transport instead of failing the configure.
-    message(WARNING "libfabric library not found; TENT fabric transport disabled")
+    message(
+      WARNING "libfabric library not found; TENT fabric transport disabled")
     set(TENT_WITH_FABRIC
         OFF
         CACHE INTERNAL "")
@@ -151,7 +156,8 @@ if(USE_FABRIC
         CACHE INTERNAL "")
     message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
     target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
-    target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+    target_include_directories(tent_interface
+                               INTERFACE ${LIBFABRIC_INCLUDE_DIR})
     target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
   endif()
 else()

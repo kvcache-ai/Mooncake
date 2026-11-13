@@ -37,7 +37,7 @@
 #define SYS_pidfd_getfd 438 /* since Linux 5.6 */
 #endif
 
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 
 #include "tent/common/status.h"
@@ -55,10 +55,10 @@ static Status buildCUmemAllocationProp(CUmemAllocationHandleType handle_type,
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.requestedHandleTypes = handle_type;
     CUdevice device;
-    CHECK_CU(cuDeviceGet(&device, device_id));
+    CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&device, device_id));
     prop.location.id = device;
     int flag = 0;
-    CHECK_CU(cuDeviceGetAttribute(
+    CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
         device));
     if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
@@ -67,8 +67,8 @@ static Status buildCUmemAllocationProp(CUmemAllocationHandleType handle_type,
 
 static Status roundGranularity(CUmemAllocationProp &prop, size_t granularity,
                                size_t &size) {
-    CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop,
-                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
+        &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     size = (size + granularity - 1) & ~(granularity - 1);
     if (size == 0) size = granularity;
     return Status::OK();
@@ -94,7 +94,8 @@ static Status buildEgmAllocationProp(CUmemAllocationHandleType handle_type,
 static bool isEgmAllocation(CUmemGenericAllocationHandle handle,
                             CUmemAllocationHandleType handle_type) {
     CUmemAllocationProp prop = {};
-    if (cuMemGetAllocationPropertiesFromHandle(&prop, handle) != CUDA_SUCCESS)
+    if (MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationPropertiesFromHandle)(
+            &prop, handle) != CUDA_SUCCESS)
         return false;
     return prop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA &&
            (prop.requestedHandleTypes & handle_type);
@@ -129,7 +130,7 @@ static bool supportFabricMem() {
 
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
-        auto result = cuDeviceGetAttribute(
+        auto result = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
             &device_support_fabric_mem,
             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device_id);
         if (result != CUDA_SUCCESS || !device_support_fabric_mem) {
@@ -536,11 +537,13 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
             "Unrecognized location - neither cpu or cuda: " + location.type());
 
     CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
+    auto result = MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(
+        &handle, (void *)desc.addr);
     if (is_host) {
         bool egm = egm_enabled_ && result == CUDA_SUCCESS &&
                    isEgmAllocation(handle, handle_type_);
-        if (result == CUDA_SUCCESS && !egm) cuMemRelease(handle);
+        if (result == CUDA_SUCCESS && !egm)
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         if (!egm) {
             // Plain host memory: usable as the local side of a transfer
             // (dram_to_gpu) but not addressable by peers.
@@ -561,7 +564,8 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     if (is_host) {
         // EGM buffer: take the properties (NUMA node, handle types) from
         // the allocation itself; the probed location may be a wildcard.
-        CHECK_CU(cuMemGetAllocationPropertiesFromHandle(&prop, handle));
+        CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationPropertiesFromHandle)(
+            &prop, handle));
     } else {
         CHECK_STATUS(
             buildCUmemAllocationProp(handle_type_, prop, location.index()));
@@ -570,15 +574,15 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
     if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
         int shared_fd;
-        result =
-            cuMemExportToShareableHandle(&shared_fd, handle, handle_type_, 0);
+        result = MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle)(
+            &shared_fd, handle, handle_type_, 0);
         if (result == CUDA_SUCCESS)
             desc.mnnvl_handle =
                 std::to_string(getpid()) + "-" + std::to_string(shared_fd);
     } else {
         CUmemFabricHandle export_handle;
-        result = cuMemExportToShareableHandle(&export_handle, handle,
-                                              handle_type_, 0);
+        result = MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle)(
+            &export_handle, handle, handle_type_, 0);
         if (result == CUDA_SUCCESS)
             desc.mnnvl_handle =
                 serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
@@ -586,7 +590,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     // The exported handle stays valid for the lifetime of the allocation;
     // drop the reference taken by cuMemRetainAllocationHandle so the memory
     // can actually be freed once the buffer is unregistered and released.
-    cuMemRelease(handle);
+    MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
     if (result != CUDA_SUCCESS)
         return Status::InternalError(
             std::string("cuMemExportToShareableHandle: cuResult ") +
@@ -594,8 +598,8 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
     void *real_addr;
     size_t real_size;
-    result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
-                                  (CUdeviceptr)desc.addr);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+        (CUdeviceptr *)&real_addr, &real_size, (CUdeviceptr)desc.addr);
     if (result != CUDA_SUCCESS) {
         LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed: "
                      << result;
@@ -643,7 +647,7 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
 
     CUmemGenericAllocationHandle handle;
     void *ptr = nullptr;
-    auto result = cuMemCreate(&handle, size, &prop, 0);
+    auto result = MOONCAKE_CUDA_SYMBOL(cuMemCreate)(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         // return Status::InternalError(std::string("cuMemCreate: ") +
         //                              std::to_string(result) + LOC_MARK);
@@ -655,18 +659,20 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
         return Platform::getLoader().allocate(addr, size, options);
     }
 
-    result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)((CUdeviceptr *)&ptr,
+                                                       size, granularity, 0, 0);
     if (result != CUDA_SUCCESS) {
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return Status::InternalError(
             std::string("cuMemAddressReserve: cuResult ") +
             std::to_string(result) + LOC_MARK);
     }
 
-    result = cuMemMap((CUdeviceptr)ptr, size, 0, handle, 0);
+    result =
+        MOONCAKE_CUDA_SYMBOL(cuMemMap)((CUdeviceptr)ptr, size, 0, handle, 0);
     if (result != CUDA_SUCCESS) {
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return Status::InternalError(std::string("cuMemMap: cuResult ") +
                                      std::to_string(result) + LOC_MARK);
     }
@@ -675,9 +681,9 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     auto cuda_err = cudaGetDeviceCount(&device_count);
     if (cuda_err != cudaSuccess) {
         // Teardown order: unmap, release, then free VA range.
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
         return Status::InternalError(std::string("cudaGetDeviceCount: ") +
                                      cudaGetErrorString(cuda_err) + LOC_MARK);
     }
@@ -696,13 +702,13 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
         accessDesc.push_back(host_access);
     }
 
-    result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc.data(),
-                            accessDesc.size());
+    result = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(
+        (CUdeviceptr)ptr, size, accessDesc.data(), accessDesc.size());
     if (result != CUDA_SUCCESS) {
         // Teardown order: unmap, release, then free VA range.
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
         return Status::InternalError(std::string("cuMemSetAccess: cuResult ") +
                                      std::to_string(result) + LOC_MARK);
     }
@@ -710,7 +716,7 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     // The mapping holds its own reference to the physical allocation; drop
     // the creator reference so freeLocalMemory's unmap + release actually
     // returns the memory instead of leaking one reference per allocation.
-    result = cuMemRelease(handle);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
     if (result != CUDA_SUCCESS) {
         LOG(WARNING) << "MnnvlTransport: cuMemRelease after mapping failed: "
                      << result;
@@ -733,11 +739,12 @@ Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     // mapping, and cuMemUnmap/cuMemAddressFree need the full range.
     size_t mapped_size = it->second;
     CUmemGenericAllocationHandle handle;
-    CHECK_CU(cuMemRetainAllocationHandle(&handle, addr));
+    CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(&handle, addr));
     // Teardown order: unmap, release, then free VA range.
-    CHECK_CU(cuMemUnmap((CUdeviceptr)addr, mapped_size));
-    CHECK_CU(cuMemRelease(handle));
-    CHECK_CU(cuMemAddressFree((CUdeviceptr)addr, mapped_size));
+    CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)addr, mapped_size));
+    CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle));
+    CHECK_CU(
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)addr, mapped_size));
     allocate_set_.erase(it);
     return Status::OK();
 }
@@ -832,8 +839,9 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             // one that takes a pointer. Passing &local_fd fails with
             // CUDA_ERROR_UNKNOWN. The imported handle holds its own
             // reference, so the fd is closed right away either way.
-            auto import_result = cuMemImportFromShareableHandle(
-                &handle, (void *)(uintptr_t)local_fd, handle_type_);
+            auto import_result =
+                MOONCAKE_CUDA_SYMBOL(cuMemImportFromShareableHandle)(
+                    &handle, (void *)(uintptr_t)local_fd, handle_type_);
             close(local_fd);
             if (import_result != CUDA_SUCCESS) {
                 return Status::InternalError(
@@ -849,13 +857,13 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             }
             CUmemFabricHandle export_handle;
             memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
-            CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
-                                                    handle_type_));
+            CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemImportFromShareableHandle)(
+                &handle, &export_handle, handle_type_));
         }
-        CHECK_CU(cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, buffer->length,
-                                     0, 0, 0));
-        CHECK_CU(
-            cuMemMap((CUdeviceptr)mnnvl_addr, buffer->length, 0, handle, 0));
+        CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(
+            (CUdeviceptr *)&mnnvl_addr, buffer->length, 0, 0, 0));
+        CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemMap)((CUdeviceptr)mnnvl_addr,
+                                                buffer->length, 0, handle, 0));
         int device_count;
         cudaGetDeviceCount(&device_count);
         CUmemAccessDesc accessDesc[device_count];
@@ -864,8 +872,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             accessDesc[device_id].location.id = device_id;
             accessDesc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         }
-        CHECK_CU(cuMemSetAccess((CUdeviceptr)mnnvl_addr, buffer->length,
-                                accessDesc, device_count));
+        CHECK_CU(MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(
+            (CUdeviceptr)mnnvl_addr, buffer->length, accessDesc, device_count));
         OpenedMnnvlEntry mnnvl_entry;
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;

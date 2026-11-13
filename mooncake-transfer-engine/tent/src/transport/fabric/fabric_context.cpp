@@ -65,17 +65,18 @@ class ScopedPrimaryContext {
    public:
     explicit ScopedPrimaryContext(int ordinal) {
         CUcontext primary = nullptr;
-        if (!ensureCudaDriverInit() || cuCtxGetCurrent(&previous_) ||
-            cuDeviceGet(&device_, ordinal) ||
-            cuDevicePrimaryCtxRetain(&primary, device_))
+        if (!ensureCudaDriverInit() ||
+            MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&previous_) ||
+            MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&device_, ordinal) ||
+            MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRetain)(&primary, device_))
             return;
         retained_ = true;
-        ok_ = cuCtxSetCurrent(primary) == CUDA_SUCCESS;
+        ok_ = MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(primary) == CUDA_SUCCESS;
     }
     ~ScopedPrimaryContext() {
         if (!retained_) return;
-        cuCtxSetCurrent(previous_);
-        cuDevicePrimaryCtxRelease(device_);
+        MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(previous_);
+        MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(device_);
     }
     ScopedPrimaryContext(const ScopedPrimaryContext&) = delete;
     ScopedPrimaryContext& operator=(const ScopedPrimaryContext&) = delete;

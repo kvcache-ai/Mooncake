@@ -27,7 +27,7 @@ static bool checkSupportFabricMem() {
 
     for (int dev = 0; dev < num_devices; ++dev) {
         int supported = 0;
-        cuDeviceGetAttribute(
+        MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
             &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
         if (!supported) return false;
     }

@@ -79,9 +79,11 @@ bool supportFabricMem() {
 
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         CUdevice cu_device;
-        if (cuDeviceGet(&cu_device, device_id) != CUDA_SUCCESS) return false;
+        if (MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cu_device, device_id) !=
+            CUDA_SUCCESS)
+            return false;
         int supported = 0;
-        if (cuDeviceGetAttribute(
+        if (MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
                 &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                 cu_device) != CUDA_SUCCESS ||
             !supported)
@@ -275,9 +277,11 @@ struct P2pMappingImpl : P2pMapping {
         }
 #if defined(USE_CUDA)
         if (kind == P2pHandleKind::Fabric) {
-            cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), size);
-            cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size);
-            cuMemRelease(handle);
+            MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(reinterpret_cast<CUdeviceptr>(ptr),
+                                             size);
+            MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(
+                reinterpret_cast<CUdeviceptr>(ptr), size);
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         } else {
             cudaIpcCloseMemHandle(ptr);
         }
@@ -405,7 +409,7 @@ void* importIpcMemory(const std::vector<int32_t>& payload) {
 std::vector<int32_t> exportFabricMemory(CUmemGenericAllocationHandle handle,
                                         size_t bytes) {
     CUmemFabricHandle exported;
-    const auto result = cuMemExportToShareableHandle(
+    const auto result = MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle)(
         &exported, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "[P2P] cuMemExportToShareableHandle(FABRIC) failed: "
@@ -424,26 +428,27 @@ std::unique_ptr<P2pMapping> importFabricMemory(
     auto mapping = std::make_unique<P2pMappingImpl>();
     if (cudaGetDevice(&mapping->import_device) != cudaSuccess) return nullptr;
     CUmemGenericAllocationHandle handle = 0;
-    auto result = cuMemImportFromShareableHandle(&handle, &exported,
-                                                 CU_MEM_HANDLE_TYPE_FABRIC);
+    auto result = MOONCAKE_CUDA_SYMBOL(cuMemImportFromShareableHandle)(
+        &handle, &exported, CU_MEM_HANDLE_TYPE_FABRIC);
     if (result != CUDA_SUCCESS) return nullptr;
     CUdeviceptr address = 0;
-    result = cuMemAddressReserve(&address, size, 0, 0, 0);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(&address, size, 0, 0, 0);
     if (result != CUDA_SUCCESS) {
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
-    result = cuMemMap(address, size, 0, handle, 0);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemMap)(address, size, 0, handle, 0);
     if (result != CUDA_SUCCESS) {
-        cuMemAddressFree(address, size);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(address, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
     mapping->ptr = reinterpret_cast<void*>(address);
     mapping->kind = P2pHandleKind::Fabric;
     mapping->size = size;
     mapping->handle = handle;
-    result = cuMemSetAccess(address, size, access, device_count);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(address, size, access,
+                                                  device_count);
     if (result != CUDA_SUCCESS) return nullptr;
     return mapping;
 }
@@ -461,31 +466,32 @@ std::vector<int32_t> exportP2pMemory(void* ptr, size_t bytes) {
         attributes.type != cudaMemoryTypeDevice || attributes.device != device)
         return {};
     CUmemGenericAllocationHandle handle = 0;
-    if (cuMemRetainAllocationHandle(&handle, ptr) == CUDA_SUCCESS) {
+    if (MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(&handle, ptr) ==
+        CUDA_SUCCESS) {
         CUmemAllocationProp properties{};
         size_t granularity = 0;
-        if (cuMemGetAllocationPropertiesFromHandle(&properties, handle) !=
-                CUDA_SUCCESS ||
+        if (MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationPropertiesFromHandle)(
+                &properties, handle) != CUDA_SUCCESS ||
             properties.location.type != CU_MEM_LOCATION_TYPE_DEVICE ||
             properties.location.id != device ||
             !(properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) ||
-            cuMemGetAllocationGranularity(&granularity, &properties,
-                                          CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+            MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
+                &granularity, &properties, CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
                 CUDA_SUCCESS ||
             granularity == 0 ||
             reinterpret_cast<uintptr_t>(ptr) % granularity != 0 ||
             bytes % granularity != 0) {
-            cuMemRelease(handle);
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
             return {};
         }
         auto payload = exportFabricMemory(handle, bytes);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return encodeP2pHandle(P2pHandleKind::Fabric, std::move(payload));
     }
     CUdeviceptr base = 0;
     size_t allocated_size = 0;
-    if (cuMemGetAddressRange(&base, &allocated_size,
-                             reinterpret_cast<CUdeviceptr>(ptr)) !=
+    if (MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+            &base, &allocated_size, reinterpret_cast<CUdeviceptr>(ptr)) !=
             CUDA_SUCCESS ||
         base != reinterpret_cast<CUdeviceptr>(ptr) || bytes > allocated_size)
         return {};
@@ -581,7 +587,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
 
             CUdevice cu_dev;
-            CUresult res = cuDeviceGet(&cu_dev, device_id);
+            CUresult res =
+                MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cu_dev, device_id);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR) << "[EP P2P] cuDeviceGet failed: " << res;
                 return nullptr;
@@ -594,14 +601,14 @@ class P2pDeviceTransportImpl : public P2pTransport {
             prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 
             int rdma_capable = 0;
-            cuDeviceGetAttribute(
+            MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
                 &rdma_capable,
                 CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
                 cu_dev);
             if (rdma_capable) prop.allocFlags.gpuDirectRDMACapable = 1;
 
             size_t granularity = 0;
-            res = cuMemGetAllocationGranularity(
+            res = MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
                 &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR) << "[EP P2P] cuMemGetAllocationGranularity failed: "
@@ -612,26 +619,28 @@ class P2pDeviceTransportImpl : public P2pTransport {
             size_t fabric_alloc_size = std::max(
                 granularity, (bytes + granularity - 1) & ~(granularity - 1));
             CUmemGenericAllocationHandle fabric_mem_handle{};
-            res = cuMemCreate(&fabric_mem_handle, fabric_alloc_size, &prop, 0);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemCreate)(
+                &fabric_mem_handle, fabric_alloc_size, &prop, 0);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR) << "[EP P2P] cuMemCreate(FABRIC) failed: " << res;
                 return nullptr;
             }
 
             CUdeviceptr reserved = 0;
-            res = cuMemAddressReserve(&reserved, fabric_alloc_size, granularity,
-                                      0, 0);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(
+                &reserved, fabric_alloc_size, granularity, 0, 0);
             if (res != CUDA_SUCCESS) {
-                cuMemRelease(fabric_mem_handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(fabric_mem_handle);
                 LOG(ERROR) << "[EP P2P] cuMemAddressReserve failed: " << res;
                 return nullptr;
             }
 
-            res =
-                cuMemMap(reserved, fabric_alloc_size, 0, fabric_mem_handle, 0);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemMap)(reserved, fabric_alloc_size, 0,
+                                                 fabric_mem_handle, 0);
             if (res != CUDA_SUCCESS) {
-                cuMemAddressFree(reserved, fabric_alloc_size);
-                cuMemRelease(fabric_mem_handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(reserved,
+                                                       fabric_alloc_size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(fabric_mem_handle);
                 LOG(ERROR) << "[EP P2P] cuMemMap failed: " << res;
                 return nullptr;
             }
@@ -644,12 +653,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 access[i].location.id = i;
                 access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             }
-            res = cuMemSetAccess(reserved, fabric_alloc_size, access.data(),
-                                 device_count);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(
+                reserved, fabric_alloc_size, access.data(), device_count);
             if (res != CUDA_SUCCESS) {
-                cuMemUnmap(reserved, fabric_alloc_size);
-                cuMemAddressFree(reserved, fabric_alloc_size);
-                cuMemRelease(fabric_mem_handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(reserved, fabric_alloc_size);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(reserved,
+                                                       fabric_alloc_size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(fabric_mem_handle);
                 LOG(ERROR) << "[EP P2P] cuMemSetAccess failed: " << res;
                 return nullptr;
             }
@@ -701,9 +711,10 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
             FabricAllocation allocation = it->second;
             fabric_allocations_.erase(it);
-            cuMemUnmap(allocation.ptr, allocation.size);
-            cuMemAddressFree(allocation.ptr, allocation.size);
-            cuMemRelease(allocation.handle);
+            MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(allocation.ptr, allocation.size);
+            MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(allocation.ptr,
+                                                   allocation.size);
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(allocation.handle);
             return;
         }
 #endif
@@ -719,9 +730,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 return {};
             }
             CUmemFabricHandle export_handle;
-            CUresult res =
-                cuMemExportToShareableHandle(&export_handle, it->second.handle,
-                                             CU_MEM_HANDLE_TYPE_FABRIC, 0);
+            CUresult res = MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle)(
+                &export_handle, it->second.handle, CU_MEM_HANDLE_TYPE_FABRIC,
+                0);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR)
                     << "[EP P2P] cuMemExportToShareableHandle(FABRIC) failed: "
@@ -821,7 +832,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 return -1;
             }
             CUmemGenericAllocationHandle handle;
-            CUresult res = cuMemImportFromShareableHandle(
+            CUresult res = MOONCAKE_CUDA_SYMBOL(cuMemImportFromShareableHandle)(
                 &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR) << "[EP P2P] fabric IPC import failed for rank "
@@ -830,18 +841,21 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 return -1;
             }
             CUdeviceptr peer_reserved = 0;
-            res = cuMemAddressReserve(&peer_reserved, mapped_size, 0, 0, 0);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(
+                &peer_reserved, mapped_size, 0, 0, 0);
             if (res != CUDA_SUCCESS) {
-                cuMemRelease(handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
                 LOG(ERROR) << "[EP P2P] fabric address reserve failed for rank "
                            << rank << ": " << res;
                 staged = {};
                 return -1;
             }
-            res = cuMemMap(peer_reserved, mapped_size, 0, handle, 0);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemMap)(peer_reserved, mapped_size, 0,
+                                                 handle, 0);
             if (res != CUDA_SUCCESS) {
-                cuMemAddressFree(peer_reserved, mapped_size);
-                cuMemRelease(handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(peer_reserved,
+                                                       mapped_size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
                 LOG(ERROR) << "[EP P2P] fabric mapping failed for rank " << rank
                            << ": " << res;
                 staged = {};
@@ -855,12 +869,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 access[i].location.id = i;
                 access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             }
-            res = cuMemSetAccess(peer_reserved, mapped_size, access.data(),
-                                 device_count);
+            res = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(
+                peer_reserved, mapped_size, access.data(), device_count);
             if (res != CUDA_SUCCESS) {
-                cuMemUnmap(peer_reserved, mapped_size);
-                cuMemAddressFree(peer_reserved, mapped_size);
-                cuMemRelease(handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(peer_reserved, mapped_size);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(peer_reserved,
+                                                       mapped_size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
                 LOG(ERROR) << "[EP P2P] fabric access setup failed for rank "
                            << rank << ": " << res;
                 staged = {};
@@ -944,11 +959,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
 #if defined(USE_CUDA)
             auto& old_mapping = fabric_peer_mappings_[rank];
             if (old_mapping.ptr != nullptr && old_mapping.ptr != next_ptr) {
-                cuMemUnmap(reinterpret_cast<CUdeviceptr>(old_mapping.ptr),
-                           old_mapping.size);
-                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(old_mapping.ptr),
-                                 old_mapping.size);
-                cuMemRelease(old_mapping.handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(
+                    reinterpret_cast<CUdeviceptr>(old_mapping.ptr),
+                    old_mapping.size);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(
+                    reinterpret_cast<CUdeviceptr>(old_mapping.ptr),
+                    old_mapping.size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(old_mapping.handle);
                 old_mapping = {};
             }
             if (staged.owns_mapping) {
@@ -990,11 +1007,11 @@ class P2pDeviceTransportImpl : public P2pTransport {
         if (staged.owns_mapping && staged.ptr != nullptr) {
             if (use_fabric_mem_) {
 #if defined(USE_CUDA)
-                cuMemUnmap(reinterpret_cast<CUdeviceptr>(staged.ptr),
-                           staged.size);
-                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(staged.ptr),
-                                 staged.size);
-                cuMemRelease(staged.fabric_handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(
+                    reinterpret_cast<CUdeviceptr>(staged.ptr), staged.size);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(
+                    reinterpret_cast<CUdeviceptr>(staged.ptr), staged.size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(staged.fabric_handle);
 #endif
             } else {
                 const auto status = cudaIpcCloseMemHandle(staged.ptr);
@@ -1041,11 +1058,11 @@ class P2pDeviceTransportImpl : public P2pTransport {
 #if defined(USE_CUDA)
             auto& mapping = fabric_peer_mappings_[rank];
             if (mapping.ptr != nullptr) {
-                cuMemUnmap(reinterpret_cast<CUdeviceptr>(mapping.ptr),
-                           mapping.size);
-                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(mapping.ptr),
-                                 mapping.size);
-                cuMemRelease(mapping.handle);
+                MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(
+                    reinterpret_cast<CUdeviceptr>(mapping.ptr), mapping.size);
+                MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(
+                    reinterpret_cast<CUdeviceptr>(mapping.ptr), mapping.size);
+                MOONCAKE_CUDA_SYMBOL(cuMemRelease)(mapping.handle);
                 mapping = {};
             }
 #endif
@@ -1110,8 +1127,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 }
 
                 CUmemGenericAllocationHandle handle;
-                CUresult res = cuMemImportFromShareableHandle(
-                    &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+                CUresult res =
+                    MOONCAKE_CUDA_SYMBOL(cuMemImportFromShareableHandle)(
+                        &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
                 if (res != CUDA_SUCCESS) {
                     LOG(ERROR)
                         << "[EP P2P] cuMemImportFromShareableHandle(FABRIC) "
@@ -1122,9 +1140,10 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 }
 
                 CUdeviceptr peer_reserved = 0;
-                res = cuMemAddressReserve(&peer_reserved, mapped_size, 0, 0, 0);
+                res = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(
+                    &peer_reserved, mapped_size, 0, 0, 0);
                 if (res != CUDA_SUCCESS) {
-                    cuMemRelease(handle);
+                    MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
                     LOG(ERROR)
                         << "[EP P2P] cuMemAddressReserve peer fabric mapping "
                            "failed for rank "
@@ -1132,10 +1151,12 @@ class P2pDeviceTransportImpl : public P2pTransport {
                     all_peers_accessible_ = false;
                     break;
                 }
-                res = cuMemMap(peer_reserved, mapped_size, 0, handle, 0);
+                res = MOONCAKE_CUDA_SYMBOL(cuMemMap)(peer_reserved, mapped_size,
+                                                     0, handle, 0);
                 if (res != CUDA_SUCCESS) {
-                    cuMemAddressFree(peer_reserved, mapped_size);
-                    cuMemRelease(handle);
+                    MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(peer_reserved,
+                                                           mapped_size);
+                    MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
                     LOG(ERROR) << "[EP P2P] cuMemMap peer fabric mapping "
                                   "failed for rank "
                                << dst << ": " << res;
@@ -1143,12 +1164,14 @@ class P2pDeviceTransportImpl : public P2pTransport {
                     break;
                 }
 
-                res = cuMemSetAccess(peer_reserved, mapped_size, access.data(),
-                                     device_count);
+                res = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(
+                    peer_reserved, mapped_size, access.data(), device_count);
                 if (res != CUDA_SUCCESS) {
-                    cuMemUnmap(peer_reserved, mapped_size);
-                    cuMemAddressFree(peer_reserved, mapped_size);
-                    cuMemRelease(handle);
+                    MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(peer_reserved,
+                                                     mapped_size);
+                    MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(peer_reserved,
+                                                           mapped_size);
+                    MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
                     LOG(ERROR) << "[EP P2P] cuMemSetAccess peer fabric mapping "
                                   "failed for rank "
                                << dst << ": " << res;
@@ -1432,11 +1455,11 @@ class P2pDeviceTransportImpl : public P2pTransport {
              ++i) {
             auto& mapping = fabric_peer_mappings_[i];
             if (mapping.ptr == nullptr) continue;
-            cuMemUnmap(reinterpret_cast<CUdeviceptr>(mapping.ptr),
-                       mapping.size);
-            cuMemAddressFree(reinterpret_cast<CUdeviceptr>(mapping.ptr),
-                             mapping.size);
-            cuMemRelease(mapping.handle);
+            MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(
+                reinterpret_cast<CUdeviceptr>(mapping.ptr), mapping.size);
+            MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(
+                reinterpret_cast<CUdeviceptr>(mapping.ptr), mapping.size);
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(mapping.handle);
             mapping = {};
             if (peer_ptrs_host_ && peer_ptrs_host_[i] != local_ptr_) {
                 peer_ptrs_host_[i] = nullptr;
@@ -1447,9 +1470,10 @@ class P2pDeviceTransportImpl : public P2pTransport {
     void cleanupFabricAllocations() {
         for (const auto& entry : fabric_allocations_) {
             const auto& allocation = entry.second;
-            cuMemUnmap(allocation.ptr, allocation.size);
-            cuMemAddressFree(allocation.ptr, allocation.size);
-            cuMemRelease(allocation.handle);
+            MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(allocation.ptr, allocation.size);
+            MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(allocation.ptr,
+                                                   allocation.size);
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(allocation.handle);
         }
         fabric_allocations_.clear();
     }

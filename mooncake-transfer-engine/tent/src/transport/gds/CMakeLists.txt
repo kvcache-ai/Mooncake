@@ -9,6 +9,6 @@ if((CUDAToolkit_FOUND OR USE_XPU_GDS)
   # The transport only calls cuFile; the CUDA runtime is linked for NVIDIA GDS
   # builds, not for the cuFile-compatible library used by USE_XPU_GDS.
   if(NOT USE_XPU_GDS)
-    target_link_libraries(tent_xport_gds PUBLIC CUDA::cuda_driver CUDA::cudart)
+    target_link_libraries(tent_xport_gds PUBLIC CUDA::cudart)
   endif()
 endif()
