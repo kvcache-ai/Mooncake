@@ -26,6 +26,7 @@
 #include "p2p/ha/oplog/oplog_replicator.h"
 #include "p2p/ha/oplog/p2p_oplog_applier.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
@@ -1422,7 +1423,28 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidDatabaseIndex) {
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store.Init());
 }
 
-TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
+class RedisPromotionTest : public RedisOpLogStoreTest {
+   protected:
+    void SetUp() override {
+        RedisOpLogStoreTest::SetUp();
+        if (IsSkipped()) return;
+        auto& status = HAStatusManager::instance();
+        status.Reset();
+        status.Configure(true, cluster_id_, "test-primary");
+        status.SetRoleState("primary", "STARTING");
+    }
+
+    void TearDown() override {
+        RedisOpLogStoreTest::TearDown();
+        HAStatusManager::instance().Reset();
+    }
+};
+
+class RedisPromotionSequenceTest
+    : public RedisPromotionTest,
+      public ::testing::WithParamInterface<uint64_t> {};
+
+TEST_P(RedisPromotionSequenceTest, NewWritesPreserveUnappliedCommittedEntries) {
     {
         auto old_writer = CreateWriter();
         for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
@@ -1441,9 +1463,28 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     config.oplog.data_dir = "127.0.0.1:notaport";
 
     P2PMasterService promoted(config);
-    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 0),
+    // Empty metadata isolates sequence initialization from metadata replay.
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, GetParam()),
               ErrorCode::OK);
+    ASSERT_NE(promoted.GetOpLogManager(), nullptr);
     EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 3);
+    const auto expect_diagnosis = [&] {
+        const auto report = HAStatusManager::instance().GetDoctorReport();
+        const auto issue = std::find_if(
+            report.issues.begin(), report.issues.end(), [](const auto& item) {
+                return item.code == "PROMOTION_CATCHUP_INCOMPLETE";
+            });
+        if (GetParam() < 3) {
+            ASSERT_NE(issue, report.issues.end());
+            EXPECT_NE(issue->message.find("oplog_applied_sequence_id=" +
+                                          std::to_string(GetParam()) +
+                                          ", oplog_latest_sequence_id=3"),
+                      std::string::npos);
+        } else {
+            EXPECT_EQ(issue, report.issues.end());
+        }
+    };
+    expect_diagnosis();
 
     auto sequence = promoted.GetOpLogManager()->AppendAndPersist(
         OpType::PUT_END, "new-primary", "new-payload", true);
@@ -1454,6 +1495,8 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     uint64_t latest = 0;
     ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
     EXPECT_EQ(latest, 4);
+    // New writes must not clear or rewrite the original promotion event.
+    expect_diagnosis();
     for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
         OpLogEntry entry;
         ASSERT_EQ(reader->ReadOpLog(sequence_id, entry), ErrorCode::OK);
@@ -1464,6 +1507,151 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     ASSERT_EQ(reader->ReadOpLog(4, new_entry), ErrorCode::OK);
     EXPECT_EQ(new_entry.object_key, "new-primary");
     EXPECT_EQ(new_entry.payload, "new-payload");
+}
+
+INSTANTIATE_TEST_SUITE_P(RestoredProgress, RedisPromotionSequenceTest,
+                         ::testing::Values(0, 1, 3));
+
+TEST_F(RedisPromotionTest, BatchLimitPromotionPreservesTailAndReportsCatchup) {
+    // Keep background delivery paused so the real Promote() loop does all
+    // replay. The counting reader still executes the real Redis scans.
+    class PausedNotifier : public OpLogChangeNotifier {
+       public:
+        ErrorCode Start(uint64_t, EntryCallback, ErrorCallback,
+                        MaintenanceCallback = {}) override {
+            return ErrorCode::OK;
+        }
+        void Stop() override {}
+        bool IsHealthy() const override { return true; }
+    };
+    class CountingReader : public RedisOpLogStore {
+       public:
+        CountingReader(const P2PHotStandbyConfig& config,
+                       std::atomic<size_t>& batch_reads)
+            : RedisOpLogStore(config.cluster_id, config.redis_endpoint, false,
+                              10, config.redis_password, config.redis_username),
+              batch_reads_(batch_reads) {}
+        std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
+            const std::string&, size_t = 1000) override {
+            return std::make_unique<PausedNotifier>();
+        }
+        ErrorCode ReadOpLogSinceWithProgress(
+            uint64_t start, size_t limit, std::vector<OpLogEntry>& entries,
+            OpLogReadProgress& progress) override {
+            EXPECT_EQ(start, batch_reads_.fetch_add(1) * 1000);
+            EXPECT_EQ(limit, 1000u);
+            return RedisOpLogStore::ReadOpLogSinceWithProgress(
+                start, limit, entries, progress);
+        }
+
+       private:
+        std::atomic<size_t>& batch_reads_;
+    };
+
+    P2PHotStandbyConfig standby_config;
+    standby_config.cluster_id = cluster_id_;
+    standby_config.oplog_store_type = OpLogStoreType::REDIS;
+    standby_config.redis_endpoint = redis_endpoint_;
+    standby_config.redis_username = redis_username_;
+    standby_config.redis_password = redis_password_;
+    // Promotion's fixed scan limit must not use the background poll setting.
+    standby_config.oplog_poll_batch_size = 5000;
+    std::atomic<size_t> batch_reads{0};
+    P2PHotStandbyService standby(standby_config, [&] {
+        auto reader =
+            std::make_unique<CountingReader>(standby_config, batch_reads);
+        EXPECT_EQ(reader->Init(), ErrorCode::OK);
+        return reader;
+    });
+    auto& status = HAStatusManager::instance();
+    status.SetRoleState("standby", "WATCHING");
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+
+    constexpr uint64_t kCaughtUp = 100 * 1000;
+    constexpr uint64_t kLatest = kCaughtUp + 1;
+    const UUID first_client{1, 1};
+    const UUID tail_client{2, 2};
+    const auto make_registration = [&](uint64_t sequence, UUID client) {
+        auto entry = MakeEntry(sequence, "", OpType_REGISTER_CLIENT);
+        entry.payload = SerializeP2PPayload(
+            RegisterClientPayload{client, "127.0.0.1", 50051, {}});
+        entry.checksum = static_cast<uint32_t>(
+            XXH32(entry.payload.data(), entry.payload.size(), 0));
+        return entry;
+    };
+    const auto first = make_registration(1, first_client);
+    const auto tail = make_registration(kLatest, tail_client);
+    {
+        auto writer = CreateWriter();
+        ASSERT_EQ(writer->WriteOpLog(first, true), ErrorCode::OK);
+        // Sparse committed IDs exercise 100 real scan batches without
+        // constructing 100,000 unrelated metadata records.
+        ASSERT_EQ(writer->UpdateLatestSequenceId(kCaughtUp), ErrorCode::OK);
+        ASSERT_EQ(writer->WriteOpLog(tail, true), ErrorCode::OK);
+    }
+    ASSERT_EQ(standby.GetLatestAppliedSequenceId(), 0u);
+    EXPECT_EQ(batch_reads.load(), 0u);
+    EXPECT_EQ(status.SerializeDoctorJson().find("PROMOTION_CATCHUP_INCOMPLETE"),
+              std::string::npos);
+
+    ASSERT_EQ(standby.Promote(), ErrorCode::OK);
+    EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
+    EXPECT_EQ(batch_reads.load(), 100u);
+    const auto applied = standby.GetLatestAppliedSequenceId();
+    ASSERT_EQ(applied, kCaughtUp);
+    const auto metadata = standby.ExportMetadata();
+    ASSERT_EQ(metadata.clients.size(), 1u);
+    EXPECT_EQ(metadata.clients.count(first_client), 1u);
+    EXPECT_EQ(metadata.clients.count(tail_client), 0u);
+
+    P2PMasterConfig master_config;
+    master_config.oplog.enabled = true;
+    master_config.oplog.store_type = "redis";
+    master_config.cluster_id = cluster_id_;
+    master_config.redis.endpoint = redis_endpoint_;
+    master_config.redis.username = redis_username_;
+    master_config.redis.password = redis_password_;
+    status.SetRoleState("primary", "STARTING");
+    P2PMasterService promoted(master_config);
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(metadata, applied),
+              ErrorCode::OK);
+    status.SetLeader("test-primary", 1);
+    status.SetRoleState("primary", "RUNNING");
+    const auto expect_diagnosis = [&] {
+        const auto report = status.GetDoctorReport();
+        EXPECT_EQ(report.health, "degraded");
+        const auto issue = std::find_if(
+            report.issues.begin(), report.issues.end(), [](const auto& item) {
+                return item.code == "PROMOTION_CATCHUP_INCOMPLETE";
+            });
+        ASSERT_NE(issue, report.issues.end());
+        EXPECT_NE(issue->message.find("oplog_applied_sequence_id=100000, "
+                                      "oplog_latest_sequence_id=100001"),
+                  std::string::npos);
+    };
+    expect_diagnosis();
+
+    P2PRegisterClientRequest request;
+    request.client_id = UUID{3, 3};
+    request.ip_address = "127.0.0.1";
+    request.rpc_port = 50051;
+    ASSERT_TRUE(promoted.RegisterClient(request).has_value());
+    ASSERT_NE(promoted.GetOpLogManager(), nullptr);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), kLatest + 1);
+    ASSERT_TRUE(promoted.GetOpLogManager()->DrainWriting(5000).drained);
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, kLatest + 1);
+    for (const auto& original :
+         {first, tail, make_registration(kLatest + 1, request.client_id)}) {
+        OpLogEntry stored;
+        ASSERT_EQ(reader->ReadOpLog(original.sequence_id, stored),
+                  ErrorCode::OK);
+        EXPECT_EQ(stored.op_type, original.op_type);
+        EXPECT_EQ(stored.payload, original.payload);
+    }
+    expect_diagnosis();
 }
 
 TEST_F(RedisOpLogStoreTest, PromotionWriterStartSkipsSnapshotCoveredGap) {
