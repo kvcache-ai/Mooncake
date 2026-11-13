@@ -11,6 +11,7 @@
 #include <unistd.h>
 #endif
 #include "multi_transport.h"
+#include "transfer_engine_impl.h"
 #include "transfer_metadata.h"
 #include "config.h"
 
@@ -577,6 +578,21 @@ TEST_F(BatchCounterWait, SecondSubmitRejectedWhenEventEnabled) {
     ASSERT_TRUE(submit(legacy, {1}).ok());
     rdma->finish(1);
     ASSERT_TRUE(submit(legacy, {1}).ok());
+#endif
+}
+
+TEST_F(BatchCounterWait, EventBatchRejectsSubmitWithNotify) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    TransferEngineImpl engine(false);
+    Transport::TransferRequest request{};
+    request.length = 1;
+    TransferMetadata::NotifyDesc notify{"peer", "msg"};
+    EXPECT_TRUE(engine.submitTransferWithNotify(b, {request}, notify)
+                    .IsInvalidArgument());
 #endif
 }
 

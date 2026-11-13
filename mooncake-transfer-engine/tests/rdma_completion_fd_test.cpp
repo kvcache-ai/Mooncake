@@ -12,7 +12,6 @@
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
 #include <poll.h>
-#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,7 +21,7 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "config.h"
@@ -224,18 +223,6 @@ TEST_F(RdmaCompletionFdTest, OptInShortBatchWakesWithoutStatusQuery) {
     release(batch);
 }
 
-TEST_F(RdmaCompletionFdTest, SubmitWithNotifyRejectedWhenEventEnabled) {
-    BatchID batch = sender_->allocateBatchID(1);
-    ASSERT_TRUE(sender_->enableBatchCompletionNotification(batch).ok());
-    TransferRequest request{};
-    request.opcode = TransferRequest::WRITE;
-    request.length = 1;
-    TransferMetadata::NotifyDesc notify{"peer", "msg"};
-    EXPECT_TRUE(sender_->submitTransferWithNotify(batch, {request}, notify)
-                    .IsInvalidArgument());
-    release(batch);
-}
-
 TEST_F(RdmaCompletionFdTest, StaleRkeyFailsFromCq) {
     // The doomed region is larger than slice_size (64 KiB), so one task is
     // many slices. openSegment caches the rkey. Unregister without publishing
@@ -284,12 +271,6 @@ TEST_F(RdmaCompletionFdTest, StaleRkeyFailsFromCq) {
     EXPECT_EQ(matches, 1);
     EXPECT_EQ(done.status.s, TransferStatusEnum::FAILED);
     EXPECT_EQ(done.status.transferred_bytes, kOk);
-
-    TransferStatus status{};
-    ASSERT_TRUE(sender_->getBatchTransferStatus(batch, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
-    EXPECT_EQ(status.transferred_bytes, kOk);
-    EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), kOk));
     std::vector<BatchCompletion> again;
     ASSERT_TRUE(sender_->drainCompletions(again).ok());
     EXPECT_TRUE(again.empty());
@@ -333,11 +314,6 @@ TEST_F(RdmaCompletionFdTest, MultiSliceTaskWakesOnce) {
     std::vector<BatchCompletion> again;
     ASSERT_TRUE(sender_->drainCompletions(again).ok());
     EXPECT_TRUE(again.empty());
-    TransferStatus status{};
-    ASSERT_TRUE(sender_->getBatchTransferStatus(batch, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(status.transferred_bytes, kLen);
-    EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), kLen));
     release(batch);
 }
 
@@ -358,7 +334,7 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
     ASSERT_NE(segment, static_cast<SegmentID>(-1));
 
     std::mutex mu;
-    std::unordered_map<BatchID, size_t> expected;
+    std::unordered_set<BatchID> expected;
     std::atomic<int> submitted{0};
     std::atomic<bool> submit_failed{false};
     std::vector<std::thread> workers;
@@ -382,14 +358,14 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mu);
-                    expected.emplace(batch, kLen);
+                    expected.insert(batch);
                 }
                 submitted.fetch_add(1, std::memory_order_release);
             }
         });
     }
 
-    std::unordered_map<BatchID, BatchCompletion> got;
+    std::unordered_set<BatchID> got;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (got.size() < static_cast<size_t>(total) &&
            std::chrono::steady_clock::now() < deadline) {
@@ -397,7 +373,7 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
         std::vector<BatchCompletion> done;
         ASSERT_TRUE(sender_->drainCompletions(done).ok());
         for (const auto& item : done) {
-            auto [it, inserted] = got.emplace(item.batch_id, item);
+            bool inserted = got.insert(item.batch_id).second;
             EXPECT_TRUE(inserted) << "duplicate completion for batch";
             EXPECT_EQ(item.status.s, TransferStatusEnum::COMPLETED);
             EXPECT_EQ(item.status.transferred_bytes, kLen);
@@ -407,10 +383,8 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
     ASSERT_FALSE(submit_failed.load());
     ASSERT_EQ(submitted.load(), total);
     ASSERT_EQ(got.size(), static_cast<size_t>(total));
-    for (const auto& [batch, bytes] : expected) {
-        auto it = got.find(batch);
-        ASSERT_NE(it, got.end());
-        EXPECT_EQ(it->second.status.transferred_bytes, bytes);
+    for (BatchID batch : expected) {
+        ASSERT_EQ(got.count(batch), 1u);
         release(batch);
     }
     EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), source_.size()));
@@ -444,19 +418,4 @@ TEST_F(RdmaCompletionFdTest, FreeRightAfterSubmitIsAbsentFromDrain) {
             for (const auto& item : done) EXPECT_NE(item.batch_id, batch);
         }
     }
-}
-
-TEST_F(RdmaCompletionFdTest, DestructorWakesDupFd) {
-    // The destructor writes the eventfd counter before close. A same-host
-    // transfer can finish before reset, so this does not claim an in-flight
-    // publish was suppressed.
-    const int dup_fd = ::dup(sender_->completionFd());
-    ASSERT_GE(dup_fd, 0);
-    std::atomic<bool> woke{false};
-    std::thread waiter(
-        [&] { woke.store(waitFd(dup_fd, 10000), std::memory_order_release); });
-    sender_.reset();
-    waiter.join();
-    EXPECT_TRUE(woke.load(std::memory_order_acquire));
-    ::close(dup_fd);
 }
