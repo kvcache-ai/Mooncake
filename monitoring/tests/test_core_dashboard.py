@@ -1,4 +1,4 @@
-"""Structural contract for the Classic TE + Store + Master dashboard."""
+"""Structural contract for the TE + Store + Master dashboard."""
 
 from __future__ import annotations
 
@@ -220,6 +220,38 @@ class CoreDashboardContractTest(unittest.TestCase):
                 "raw_pointer",
             ):
                 self.assertNotIn(forbidden, serialized)
+
+    def test_overview_stats_use_instant_queries(self) -> None:
+        # Range queries with lastNotNull keep showing stale values after
+        # heartbeat data disappears; instant queries go blank instead.
+        for panel in self.panels:
+            if panel["type"] != "stat":
+                continue
+            for target in panel["targets"]:
+                self.assertTrue(target.get("instant"), panel["title"])
+                self.assertFalse(target.get("range"), panel["title"])
+
+    def test_blank_stats_report_no_data(self) -> None:
+        for panel in self.panels:
+            if panel["type"] != "stat":
+                continue
+            no_value = panel["fieldConfig"]["defaults"].get("noValue")
+            self.assertIn(no_value, ("Unknown", "No data"), panel["title"])
+            if "p99" in panel["title"]:
+                self.assertEqual(no_value, "No data", panel["title"])
+
+    def test_timeseries_colors_use_positional_palette(self) -> None:
+        # palette-classic-by-name assigns the same colour to identically
+        # named series across panels; positional palette keeps them apart.
+        for panel in self.panels:
+            if panel["type"] != "timeseries":
+                continue
+            color = panel["fieldConfig"]["defaults"]["color"]
+            self.assertEqual(color["mode"], "palette-classic", panel["title"])
+
+    def test_transfer_engine_is_named_te_consistently(self) -> None:
+        serialized = json.dumps(self.dashboard)
+        self.assertNotIn("Classic TE", serialized)
 
 
 if __name__ == "__main__":

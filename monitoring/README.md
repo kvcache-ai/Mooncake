@@ -40,7 +40,7 @@ The Prometheus and Grafana services are configured to run inside Docker containe
     Grafana is pre-configured with the Prometheus datasource and two dashboards:
 
 - **Mooncake Master Dashboard** (`mooncake.json`) retains the existing Master-only view.
-- **Mooncake Core | Classic TE, Store & Master** (`mooncake-core.json`) adds the unified Overview, Store, Classic Transfer Engine, and Master view. Use its datasource, job, instance, and Store operation selectors to narrow the displayed targets.
+- **Mooncake Core | TE, Store & Master** (`mooncake-core.json`) adds the unified Overview, Store, Classic Transfer Engine, and Master view. Use its datasource, job, instance, and Store operation selectors to narrow the displayed targets.
 
 ### Configuration
 
@@ -84,7 +84,7 @@ Once both Prometheus and `mooncake_master` are running, you can go to the Promet
 
 ## 3. Scraping Store Clients and the Classic Transfer Engine
 
-The Master scrape target alone is enough for the Master panels. Store and Classic TE panels require separate opt-in client endpoints. Enable the client-local HTTP server as described in the [Observability guide](../docs/source/getting_started/observability.md), then enable Classic TE metrics in each client process that should export them:
+The Master scrape target alone is enough for the Master panels. Store and TE panels require separate opt-in client endpoints. Enable the client-local HTTP server as described in the [Observability guide](../docs/source/getting_started/observability.md), then enable TE metrics in each client process that should export them:
 
 ```bash
 export MC_TE_METRIC=1
@@ -111,7 +111,7 @@ scrape_configs:
       - targets: ['client-a:9400', 'client-b:9400']
 ```
 
-The Store and Classic TE endpoints can belong to the same process but remain independent scrape targets. The dashboard does not join their series or treat them as the same measurement boundary. `MC_TE_METRIC` is not supported with TENT; this dashboard intentionally uses Classic TE `mooncake_te_*` series, not TENT metric names.
+The Store and TE endpoints can belong to the same process but remain independent scrape targets. The dashboard does not join their series or treat them as the same measurement boundary. `MC_TE_METRIC` is not supported with TENT; this dashboard intentionally uses TE `mooncake_te_*` series, not TENT metric names.
 
 ## 4. Reading the Core Dashboard
 
