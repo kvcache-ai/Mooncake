@@ -37,6 +37,15 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+add_executable(file_sink_test file_sink_test.cpp)
+target_include_directories(
+  file_sink_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+          ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(file_sink_test PRIVATE mooncake_traffic_file_sink
+                                             gtest gtest_main pthread)
+add_test(NAME file_sink_test COMMAND file_sink_test)
+
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
