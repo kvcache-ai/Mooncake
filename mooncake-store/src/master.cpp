@@ -9,6 +9,7 @@
 #include <memory>   // For std::unique_ptr
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -345,6 +346,8 @@ DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
     }
     return true;
 });
+DEFINE_uint32(ha_redis_expected_replicas_per_shard, 0,
+              "Expected replica membership per Redis shard; must be positive");
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
@@ -684,6 +687,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetUInt32(
+        "ha_redis_expected_replicas_per_shard",
+        &master_config.ha_redis_expected_replicas_per_shard,
+        FLAGS_ha_redis_expected_replicas_per_shard);
     default_config.GetInt64("ha_leader_lease_ttl_sec",
                             &master_config.ha_leader_lease_ttl_sec,
                             FLAGS_ha_leader_lease_ttl_sec);
@@ -1129,6 +1136,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.ha_leader_lease_ttl_sec = FLAGS_ha_leader_lease_ttl_sec;
     }
+    if (google::GetCommandLineFlagInfo("ha_redis_expected_replicas_per_shard",
+                                       &info) &&
+        !info.is_default) {
+        master_config.ha_redis_expected_replicas_per_shard =
+            FLAGS_ha_redis_expected_replicas_per_shard;
+    }
+    if (master_config.enable_ha && master_config.ha_backend_type == "redis" &&
+        master_config.ha_redis_expected_replicas_per_shard == 0) {
+        LOG(FATAL) << "ha_redis_expected_replicas_per_shard must be positive";
+    }
     if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
         master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
         LOG(FATAL) << "ha_leader_lease_ttl_sec must be in ["
@@ -1546,9 +1563,13 @@ int main(int argc, char* argv[]) {
     if (!master_config.ha_backend_connstring.empty() &&
         !master_config.etcd_endpoints.empty() &&
         master_config.ha_backend_connstring != master_config.etcd_endpoints) {
+        const std::string_view ha_backend_connstring_for_log =
+            master_config.ha_backend_type == "redis"
+                ? std::string_view{"<Redis endpoints>"}
+                : std::string_view{master_config.ha_backend_connstring};
         LOG(WARNING) << "Both ha_backend_connstring and etcd_endpoints are "
                      << "set. Using ha_backend_connstring="
-                     << master_config.ha_backend_connstring
+                     << ha_backend_connstring_for_log
                      << " for HA coordinator setup";
     }
     if (master_config.memory_allocator != "cachelib" &&
@@ -1612,6 +1633,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    const std::string_view ha_backend_connstring_for_log =
+        master_config.ha_backend_type == "redis"
+            ? std::string_view{"<Redis endpoints>"}
+            : std::string_view{ha_backend_connstring};
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -1644,7 +1669,7 @@ int main(int argc, char* argv[]) {
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
-        << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", ha_backend_connstring=" << ha_backend_connstring_for_log
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", etcd_max_send_message_bytes="

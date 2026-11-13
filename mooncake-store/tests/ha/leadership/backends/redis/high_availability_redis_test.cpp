@@ -31,6 +31,7 @@ ha::HABackendSpec MakeRedisBackendSpec(const std::string& endpoint,
         .type = ha::HABackendType::REDIS,
         .connstring = endpoint,
         .cluster_namespace = cluster_namespace,
+        .ha_redis_expected_replicas_per_shard = 1,
     };
 }
 

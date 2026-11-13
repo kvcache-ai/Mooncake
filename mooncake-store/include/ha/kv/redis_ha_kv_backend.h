@@ -3,7 +3,7 @@
 #include <mutex>
 #include <string>
 
-#include "ha/common/redis/redis_connection.h"
+#include "ha/common/redis/redis_cluster_client.h"
 #include "ha/kv/ha_kv_backend.h"
 
 namespace mooncake {
@@ -17,8 +17,8 @@ class RedisHaKvBackend : public HaKvBackend {
     // minimum ACK count. All writes, including the legacy methods, require
     // exactly this count; WAIT 1 returning 2 is an unknown outcome. Callers
     // supplying a policy must ensure it matches the deployment's membership.
-    // Task 2 adds topology validation; the default factory supports only a
-    // primary with exactly one replica until that integration is available.
+    // Cluster mode validates the configured count against discovered
+    // membership.
     explicit RedisHaKvBackend(
         KvWriteDurabilityPolicy policy = {.replicas_required = 1})
         : write_policy_(policy) {}
@@ -51,7 +51,7 @@ class RedisHaKvBackend : public HaKvBackend {
     const KvWriteDurabilityPolicy write_policy_;
     std::mutex mu_;
     std::string connstring_;
-    ha::common::redis::RedisContextPtr context_;
+    std::unique_ptr<ha::common::redis::RedisClusterClient> client_;
 };
 
 }  // namespace mooncake

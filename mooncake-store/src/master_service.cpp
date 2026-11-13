@@ -733,6 +733,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 .type = backend_type.value(),
                 .connstring = config.ha_backend_connstring,
                 .cluster_namespace = cluster_id_,
+                .ha_redis_expected_replicas_per_shard =
+                    config.ha_redis_expected_replicas_per_shard,
             });
             if (!backend) {
                 throw std::runtime_error(fmt::format(
