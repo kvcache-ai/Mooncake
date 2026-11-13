@@ -30,8 +30,8 @@ inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
     const auto write_time =
         std::chrono::system_clock::time_point(std::chrono::seconds(1));
     return guard.Publish(UUID{1, 2}, write_time, 128, std::vector<Replica>{},
-                         std::nullopt, false, ObjectDataType::UNKNOWN, group_id,
-                         TenantId(), guard.key());
+                         std::nullopt, false, ObjectDataType::UNKNOWN,
+                         group_id);
 }
 
 // Publishes that envelope under `key` and returns its generation, or 0 when

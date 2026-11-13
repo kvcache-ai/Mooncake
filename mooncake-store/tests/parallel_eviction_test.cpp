@@ -50,7 +50,7 @@ class ShardedLeaseIndexTest : public ::testing::Test {
                               ReplicaStatus::COMPLETE);
         (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(replicas), std::nullopt, hard_pin,
-                            ObjectDataType::UNKNOWN, group, TenantId{}, key);
+                            ObjectDataType::UNKNOWN, group);
         SpinLocker locker(&guard.metadata().lock);
         guard.metadata().lease_->SetDeadline(deadline);
     }
@@ -89,7 +89,7 @@ TEST_F(ShardedLeaseIndexTest,
                               ReplicaStatus::COMPLETE);
         (void)guard->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                              std::move(replicas), std::nullopt, false,
-                             ObjectDataType::UNKNOWN, "", TenantId{}, "a");
+                             ObjectDataType::UNKNOWN, "");
         SpinLocker locker(&guard->metadata().lock);
         guard->metadata().lease_->SetDeadline(now_ - std::chrono::seconds(10));
     }
@@ -519,7 +519,7 @@ class ParallelEvictorNativeTest : public ::testing::Test {
                               ReplicaStatus::COMPLETE);
         (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(replicas), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, group, TenantId{}, key);
+                            ObjectDataType::UNKNOWN, group);
         SpinLocker locker(&guard.metadata().lock);
         guard.metadata().lease_->SetDeadline(
             live ? Clock::now() + std::chrono::hours(1) : Clock::time_point{});
@@ -629,8 +629,7 @@ TEST_F(ParallelEvictorNativeTest, GroupIsNotSplitByGoal) {
                               ReplicaStatus::COMPLETE);
         (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(replicas), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, "", TenantId{},
-                            "k" + std::to_string(i));
+                            ObjectDataType::UNKNOWN, "");
         SpinLocker locker(&guard.metadata().lock);
         guard.metadata().lease_->SetDeadline(
             Clock::time_point{metadata::LeaseEvictionIndex::kBucketWidth});
@@ -656,7 +655,7 @@ TEST_F(ParallelEvictorNativeTest,
                               ReplicaStatus::COMPLETE);
         (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(replicas), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, "", TenantId{}, key);
+                            ObjectDataType::UNKNOWN, "");
         SpinLocker locker(&guard.metadata().lock);
         guard.metadata().lease_->SetDeadline(deadline);
     };

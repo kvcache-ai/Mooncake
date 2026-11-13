@@ -55,8 +55,7 @@ std::unique_ptr<ObjectMetadata> MakeEnvelope(size_t length,
                                              std::vector<Replica>&& replicas) {
     return std::make_unique<ObjectMetadata>(
         UUID{1, 2}, kWriteTime, length, std::move(replicas), std::nullopt,
-        false, ObjectDataType::UNKNOWN, std::string(kGroupId), TenantId(),
-        "part-test-key");
+        false, ObjectDataType::UNKNOWN, std::string(kGroupId));
 }
 
 }  // namespace
