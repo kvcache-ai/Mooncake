@@ -426,7 +426,14 @@ int TEBenchRunner::allocateBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     const bool use_shm = engine_->getTransport("shm") != nullptr;
     if (XferBenchConfig::seg_type == "DRAM") {
-        int num_buffers = numa_num_configured_nodes();
+        // One buffer per NUMA node that has memory. Grace systems (GB200,
+        // GH200) expose many memory-less GPU nodes; binding to them fails
+        // mbind() with EINVAL and the target exits.
+        std::vector<int> mem_nodes;
+        for (int n = 0; n < numa_num_configured_nodes(); ++n) {
+            if (numa_node_size64(n, nullptr) > 0) mem_nodes.push_back(n);
+        }
+        int num_buffers = static_cast<int>(mem_nodes.size());
         pinned_buffer_list_.resize(num_buffers, nullptr);
 #ifdef __linux__
         IsolatedLayout isolated{};
@@ -450,7 +457,8 @@ int TEBenchRunner::allocateBuffers() {
 #endif
         }
         for (int i = 0; i < num_buffers; ++i) {
-            std::string location = "cpu:" + std::to_string(i);
+            const int node = mem_nodes[i];
+            std::string location = "cpu:" + std::to_string(node);
             if (dram_backing_ == DramBacking::kSharedMemory) {
                 mooncake::SharedMemoryOptions opt;
                 // Populate after pinning; MAP_POPULATE here would first-touch
@@ -465,28 +473,28 @@ int TEBenchRunner::allocateBuffers() {
                     engine_->allocateSharedMemory(total_buffer_size, opt);
                 if (pinned_buffer_list_[i]) {
                     bindShmBufferToNode(pinned_buffer_list_[i],
-                                        total_buffer_size, i);
+                                        total_buffer_size, node);
                     location = cpuLocationFromPages(pinned_buffer_list_[i],
-                                                    total_buffer_size, i);
+                                                    total_buffer_size, node);
                 }
             } else if (dram_backing_ == DramBacking::kMmap) {
                 pinned_buffer_list_[i] =
-                    allocateHugepageOnNode(total_buffer_size, i);
+                    allocateHugepageOnNode(total_buffer_size, node);
                 if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i],
-                                                    total_buffer_size, i);
+                                                    total_buffer_size, node);
                 }
             } else {
 #ifdef __linux__
                 pinned_buffer_list_[i] =
-                    allocateDramOnNode(total_buffer_size, i, isolated);
+                    allocateDramOnNode(total_buffer_size, node, isolated);
 #else
                 pinned_buffer_list_[i] =
-                    allocateDramOnNode(total_buffer_size, i);
+                    allocateDramOnNode(total_buffer_size, node);
 #endif
                 if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i],
-                                                    total_buffer_size, i);
+                                                    total_buffer_size, node);
                 }
             }
             if (!pinned_buffer_list_[i]) return -1;
