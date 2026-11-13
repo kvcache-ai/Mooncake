@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -1067,6 +1068,98 @@ TEST_F(RedisGracefulShutdownTest, SigtermBeforePromotionReleasesLease) {
     ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(5)));
     ExpectRegistryRemoved(instance_id);
     ExpectPromptSuccessor(leader, version, start);
+}
+
+class RedisOpLogStopTest : public RedisGracefulShutdownTest {
+   protected:
+    void ConfigureMasters(MasterRunnerConfig& config) override {
+        RedisGracefulShutdownTest::ConfigureMasters(config);
+        // clientctl follows the elected RPC address; keep heartbeats on it.
+        // The graceful-shutdown tests above cover dedicated heartbeat ports.
+        config.heartbeat_rpc_port_base = 0;
+    }
+
+    bool StartWriterClient(ClientCtlProcess& client) {
+        return client.Start() &&
+               client.SendAndWait(
+                   "create c_writes " + std::to_string(kClientPortBase + 30),
+                   "Successfully created client: c_writes",
+                   std::chrono::seconds(30));
+    }
+
+    std::jthread StartWrites(ClientCtlProcess& client, std::string prefix,
+                             std::atomic<size_t>& last_written) {
+        return std::jthread([&client, prefix = std::move(prefix),
+                             &last_written](std::stop_token stop) {
+            for (size_t n = 1; !stop.stop_requested(); ++n) {
+                const auto key = prefix + std::to_string(n);
+                // Role changes can fail a command; SendAndWait logs details.
+                if (client.SendAndWait("put c_writes " + key + " value",
+                                       "Successfully put value for key: " + key,
+                                       std::chrono::seconds(2))) {
+                    last_written.store(n);
+                }
+                // Also bound retries if clientctl exits or rejects immediately.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    std::string WaitForCommittedWrite(const std::string& prefix,
+                                      const std::atomic<size_t>& last_written,
+                                      size_t after) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto n = last_written.load();
+            if (n > after) {
+                const auto key = prefix + std::to_string(n);
+                if (WaitForReplicaOpLog(key, std::chrono::seconds(2))) {
+                    return key;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return {};
+    }
+};
+
+TEST_F(RedisOpLogStopTest, SigtermDuringContinuousWrites) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    const auto instance_id = RegistryInstance(leader);
+    ASSERT_FALSE(instance_id.empty());
+
+    ClientCtlProcess client(/*index=*/30, FLAGS_out_dir);
+    ASSERT_TRUE(StartWriterClient(client));
+    std::atomic<size_t> last_written{0};
+    const std::string prefix = "sigterm_writes_";
+    // Stop/join before client and last_written are destroyed, including ASSERT.
+    auto writes = StartWrites(client, prefix, last_written);
+    ASSERT_FALSE(WaitForCommittedWrite(prefix, last_written, 2).empty());
+
+    const auto log_offset = MasterLogEndOffset(leader);
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(5)));
+    ExpectPromptSuccessor(leader, version, start);
+    ASSERT_FALSE(HasFatalFailure());
+    ExpectRegistryRemoved(instance_id);
+    EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kMasterPortBase + leader)));
+    EXPECT_TRUE(WaitForMasterLogOrderSince(
+        leader, "P2P primary shutdown OpLog drain completed", "released=1",
+        log_offset, std::chrono::seconds(1)));
+    EXPECT_TRUE(WaitForMasterLogSince(leader, "HA shutdown completed",
+                                      log_offset, std::chrono::seconds(1)));
+    WaitForLeaderServiceReady();
+    // Local/degraded put success is insufficient: require a newer committed
+    // PUBLISH_ROUTE after the successor is ready, using the same running
+    // client.
+    ASSERT_FALSE(
+        WaitForCommittedWrite(prefix, last_written, last_written.load())
+            .empty());
 }
 
 TEST_F(RedisChaosTest, LeaderKilledFailover) {
