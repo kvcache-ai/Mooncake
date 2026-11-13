@@ -69,8 +69,6 @@ class SimplePeerGroup {
              i += block.size()) {
             if (i == self_) continue;
             const auto& peer = peers.atIndex(i < self_ ? i : i - 1);
-            PG_ASSERT(state.transfer_handle->routeType(peer.global_rank) ==
-                      DeviceRouteType::P2p);
             const auto remote = [&](uint64_t offset) {
                 return static_cast<uint64_t*>(
                     state.transfer_handle->remotePtr(peer.global_rank, offset));
@@ -80,6 +78,7 @@ class SimplePeerGroup {
             c.send_buffer = static_cast<char*>(state.transfer_handle->remotePtr(
                 peer.global_rank,
                 peer.workspace_offset + channel_offset + self_ * slice_bytes));
+            PG_ASSERT(c.send_buffer != nullptr);
             c.recv_buffer = workspace.buffer + channel_offset + i * slice_bytes;
             c.persistent = state.peer_progress +
                            uint64_t{channel} * layout.max_group_size + c.rank;

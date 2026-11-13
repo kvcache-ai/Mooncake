@@ -85,9 +85,9 @@ PGResult<TwoShotAllReducePlan> TwoShotAllReduceAlgorithm::buildPlan(
                               participant.endpoint.two_shot->version ==
                                   kTwoShotEndpointVersion,
                           "Active peer has no compatible two-shot capability");
-        PG_TRY(auto route,
-               transfer_service_.routeType(participant.global_rank));
-        PG_VALIDATE_STATE(route == DeviceRouteType::P2p,
+        PG_TRY(auto direct, transfer_service_.isDirectlyAddressable(
+                                participant.global_rank));
+        PG_VALIDATE_STATE(direct,
                           "TwoShot requires a direct P2P route to every peer");
         plan.remote_peers[remote_index++] = participant.asPeer();
     }

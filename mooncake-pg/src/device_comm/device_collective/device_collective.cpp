@@ -178,7 +178,7 @@ DeviceCollectiveRuntime::~DeviceCollectiveRuntime() noexcept {
 }
 
 DeviceGroupEndpoint DeviceCollectiveRuntime::localEndpoint() const {
-    const auto* p2p = transfer_service_.p2pRoute();
+    const auto* p2p = transfer_service_.findRoute<P2pRoute>();
     return DeviceGroupEndpoint{
         .view_epoch_signal = view_epoch_signals_.offset(),
         .view_epoch_signal_count = static_cast<uint32_t>(active_ranks_count_),
