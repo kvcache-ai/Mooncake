@@ -4,6 +4,7 @@
 
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -456,6 +457,114 @@ TEST(BatchOpLogPruningWorkerTest, StartsAndRetriesWhenInitialFloorReadFails) {
     uint64_t errors = 0;
     ASSERT_TRUE(value >> errors);
     EXPECT_EQ(1u, errors);
+}
+
+TEST(BatchOpLogPruningWorkerTest,
+     FreshWorkerResumesPublishedFloorWithoutNewSnapshot) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "resume-check";
+    backend.Put("/oplog/resume-check/snapshot/compaction_floor", "20");
+    for (uint64_t i = 1; i <= 25; ++i)
+        backend.Put(BuildBatchRecordKey(cluster, i), "payload");
+    backend.Put(BuildDurablePrefixKey(cluster), "protected");
+    backend.Put(BuildBatchRecordKey("other-cluster", 1), "protected");
+    OpLogBatchStorage storage(cluster, backend);
+    bool deleted = false;
+    {
+        BatchOpLogPruningWorker first(storage, 10, 50);
+        ASSERT_EQ(ErrorCode::OK, first.RunOneChunk(deleted));
+        ASSERT_TRUE(deleted);
+    }
+    {
+        BatchOpLogPruningWorker replacement(storage, 10, 50);
+        ASSERT_EQ(ErrorCode::OK, replacement.RunOneChunk(deleted));
+        ASSERT_TRUE(deleted);
+        EXPECT_EQ(ErrorCode::OK, replacement.RunOneChunk(deleted));
+        EXPECT_FALSE(deleted);
+    }
+    EXPECT_EQ(2u, backend.delete_calls());
+    EXPECT_EQ(2u, backend.range_calls());
+    EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 20)));
+    EXPECT_TRUE(backend.Has(BuildBatchRecordKey(cluster, 21)));
+    EXPECT_TRUE(backend.Has(BuildDurablePrefixKey(cluster)));
+    EXPECT_TRUE(backend.Has(BuildBatchRecordKey("other-cluster", 1)));
+}
+
+TEST(BatchOpLogPruningWorkerTest, DeletesFinalUint64BatchWithoutOverflow) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "max-id-check";
+    const auto max = std::numeric_limits<uint64_t>::max();
+    backend.Put("/oplog/max-id-check/snapshot/compaction_floor",
+                std::to_string(max));
+    backend.Put(BuildBatchRecordKey(cluster, max - 1), "payload");
+    backend.Put(BuildBatchRecordKey(cluster, max), "payload");
+    backend.Put(BuildDurablePrefixKey(cluster), "protected");
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10, 50);
+    bool deleted = false;
+    ASSERT_EQ(ErrorCode::OK, worker.RunOneChunk(deleted));
+    EXPECT_TRUE(deleted);
+    EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, max)));
+    EXPECT_TRUE(backend.Has(BuildDurablePrefixKey(cluster)));
+    EXPECT_EQ(ErrorCode::OK, worker.RunOneChunk(deleted));
+    EXPECT_FALSE(deleted);
+}
+
+TEST(BatchOpLogPruningWorkerTest, StopInterruptsLongPacingWait) {
+    BlockingDeleteRangeHaKvBackend backend;
+    const std::string cluster = "pacing-stop-check";
+    backend.Put("/oplog/pacing-stop-check/snapshot/compaction_floor", "100");
+    backend.Put(BuildBatchRecordKey(cluster, 1), "payload");
+    backend.Put(BuildBatchRecordKey(cluster, 100), "payload");
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10, 1);
+    backend.BlockDelete();
+    ASSERT_EQ(ErrorCode::OK, worker.Start());
+    const bool entered = backend.WaitForDelete();
+    backend.AllowDelete();
+    ASSERT_TRUE(entered);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (backend.delete_calls() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_EQ(1u, backend.delete_calls());
+    const auto start = std::chrono::steady_clock::now();
+    worker.Stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(1));
+    EXPECT_TRUE(backend.Has(BuildBatchRecordKey(cluster, 100)));
+}
+
+TEST(BatchOpLogPruningWorkerTest,
+     SaturatedPacingWaitRemainsInterruptibleAndDoesNotSkipDelay) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "overflow-check";
+    backend.Put("/oplog/overflow-check/snapshot/compaction_floor",
+                std::to_string(std::numeric_limits<uint64_t>::max()));
+    backend.Put(BuildBatchRecordKey(cluster, 1), "payload");
+    backend.Put(
+        BuildBatchRecordKey(cluster, std::numeric_limits<uint64_t>::max()),
+        "payload");
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10000000000ULL, 1);
+    ASSERT_EQ(ErrorCode::OK, worker.Start());
+    const auto first_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend.delete_calls() == 0 &&
+           std::chrono::steady_clock::now() < first_deadline)
+        std::this_thread::yield();
+    const auto observe_until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (backend.delete_calls() < 2 &&
+           std::chrono::steady_clock::now() < observe_until)
+        std::this_thread::yield();
+    const auto stopping = std::chrono::steady_clock::now();
+    worker.Stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - stopping,
+              std::chrono::seconds(1));
+    EXPECT_EQ(1u, backend.delete_calls())
+        << "A 10-billion-second pacing interval must wait";
 }
 
 }  // namespace

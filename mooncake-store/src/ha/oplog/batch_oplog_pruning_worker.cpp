@@ -198,8 +198,18 @@ bool BatchOpLogPruningWorker::WaitFor(Clock::duration duration,
                                       WaitState state) {
     wait_state_.store(state);
     std::unique_lock wait_lock(wait_mutex_);
-    wait_condition_.wait_for(wait_lock, duration,
-                             [this] { return stop_requested_.load(); });
+    // A saturated relative duration can overflow when wait_for adds now().
+    // Wait in bounded steps without constructing an overflowing deadline.
+    while (duration > Clock::duration::zero() && !stop_requested_.load()) {
+        const auto step =
+            std::min(duration, Clock::duration(std::chrono::hours(24)));
+        const auto began = Clock::now();
+        wait_condition_.wait_for(wait_lock, step,
+                                 [this] { return stop_requested_.load(); });
+        const auto elapsed = Clock::now() - began;
+        duration =
+            elapsed >= duration ? Clock::duration::zero() : duration - elapsed;
+    }
     wait_state_.store(WaitState::kNone);
     return !stop_requested_.load();
 }
