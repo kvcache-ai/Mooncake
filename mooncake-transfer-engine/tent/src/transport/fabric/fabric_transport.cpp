@@ -749,14 +749,10 @@ Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
             cuda_device =
                 getCudaDeviceForPtr(reinterpret_cast<void*>(desc.addr));
 #endif
-        if (cuda_device < 0) {
-            return Status::NotImplemented(
-                "Fabric CUDA registration requires FI_HMEM and a valid "
-                "device" LOC_MARK);
-        }
+        // Leave it to other transports.
+        if (cuda_device < 0) return Status::OK();
     } else if (mtype != MTYPE_CPU) {
-        return Status::NotImplemented(
-            "Fabric only supports CPU and CUDA memory" LOC_MARK);
+        return Status::OK();
     }
 
     std::shared_ptr<FabricLocalBuffer> buffer;

@@ -1150,7 +1150,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             if (registered_transports.empty() && !first_error.ok()) {
                 return first_error;
             }
-            if (fabric_required && options.perm == kLocalReadWrite) {
+            if (fabric_required) {
                 for (const auto& desc : descs) {
                     if (transport_list_[FABRIC]->tracksLocalBuffer(desc)) {
                         continue;

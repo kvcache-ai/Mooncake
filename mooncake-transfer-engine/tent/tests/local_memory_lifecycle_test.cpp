@@ -130,6 +130,7 @@ class FabricRegistrationTransport : public FailOnceRemoveTransport {
         if (mode == Mode::kFail) {
             return Status::InternalError("injected Fabric failure" LOC_MARK);
         }
+        if (desc.addr == skip_addr) return Status::OK();
         tracked.insert(desc.addr);
         if (options.perm == kLocalReadWrite) return Status::OK();
         return FailOnceRemoveTransport::addMemoryBuffer(desc, options);
@@ -146,6 +147,7 @@ class FabricRegistrationTransport : public FailOnceRemoveTransport {
     }
 
     Mode mode;
+    uint64_t skip_addr = 0;
     std::unordered_set<uint64_t> tracked;
 };
 
@@ -407,7 +409,45 @@ TEST(LocalMemoryLifecycle, RequiredFabricRegistrationIsNotBestEffort) {
         ASSERT_TRUE(
             engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
         EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+
+        std::vector<char> skipped(4096);
+        fabric->skip_addr = reinterpret_cast<uint64_t>(skipped.data());
+        status = engine.registerLocalMemory({buffer.data(), skipped.data()},
+                                            {buffer.size(), skipped.size()},
+                                            options);
+        EXPECT_FALSE(status.ok()) << status.ToString();
+        EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+        EXPECT_TRUE(fabric->tracked.empty());
+        EXPECT_EQ(fabric->remove_calls, 3);
+        EXPECT_EQ(mlu->remove_calls, 3);
+        EXPECT_EQ(tcp->remove_calls, 3);
     }
+}
+
+TEST(LocalMemoryLifecycle, OptionalFabricSkipKeepsOtherTransports) {
+    auto config = makeConfig();
+    config->set("transports/fabric/enable", false);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto fabric = std::make_shared<FabricRegistrationTransport>(
+        FabricRegistrationTransport::Mode::kRegister);
+    auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
+    engine.swapTransportForTest(FABRIC, fabric);
+    engine.swapTransportForTest(MLU, mlu);
+
+    std::vector<char> buffer(4096);
+    fabric->skip_addr = reinterpret_cast<uint64_t>(buffer.data());
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
+    ASSERT_EQ(buffers.size(), 1u);
+    const auto& registered = buffers.front().transports;
+    EXPECT_TRUE(std::find(registered.begin(), registered.end(), MLU) !=
+                registered.end());
+    EXPECT_TRUE(std::find(registered.begin(), registered.end(), FABRIC) ==
+                registered.end());
+    EXPECT_TRUE(fabric->tracked.empty());
+    ASSERT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(LocalMemoryLifecycle, InternalHostAllocationDoesNotImplicitlySelectMlu) {
