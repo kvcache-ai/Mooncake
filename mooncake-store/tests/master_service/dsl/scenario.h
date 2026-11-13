@@ -1955,10 +1955,14 @@ ObjectsSpec<> Objects(std::initializer_list<std::string> keys);
 
 struct ReadableObjectCountSpec {
     ObjectsSpecData objects;
-    size_t expected;
+    size_t min_expected;
+    size_t max_expected;
 };
 
 ReadableObjectCountSpec ReadableCount(ObjectsSpec<> objects, size_t expected);
+ReadableObjectCountSpec ReadableCountBetween(ObjectsSpec<> objects,
+                                             size_t min_expected,
+                                             size_t max_expected);
 
 struct KeyExistsSpec {
     std::string key;
