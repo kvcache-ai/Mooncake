@@ -507,8 +507,18 @@ Status ProxyManager::transferEventLoop(
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
-    const size_t kStageBuffers =
-        std::min(chunk_count_, static_cast<size_t>(16));
+    if (request.length == 0) return Status::OK();
+    // Each pin/unpin of a remote buffer is a control RPC. Only reserve slots
+    // this request can use; small transfers need one, not the entire pipeline.
+    const size_t request_chunks =
+        request.length / chunk_size_ + (request.length % chunk_size_ != 0);
+    const bool gpu_staging =
+        (local_staging && LocationParser(task.params[1]).type() == "cuda") ||
+        (remote_staging && LocationParser(task.params[2]).type() == "cuda");
+    // Four GPU slots overlap the three copy stages without paying for 16
+    // serial Pin/Unpin RPCs. Keep the existing window for host staging.
+    const size_t kStageBuffers = std::min(
+        {chunk_count_, size_t{gpu_staging ? 4u : 16u}, request_chunks});
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
@@ -835,7 +845,10 @@ Status ProxyManager::transferEventLoop(
             if (swept_progress)
                 idle_sweeps = 0;
             else
-                waitBeforeNextPoll(idle_sweeps++);
+                // Remote completion polls are cheap enough to exhaust the
+                // hot phase before a GPU/RPC round trip. Delay sleeping, but
+                // retain bounded backoff for stalled peers.
+                waitBeforeNextPoll(idle_sweeps++ / (gpu_staging ? 8 : 1));
             swept_progress = false;
             sweep_remaining = event_queue.size();
         }

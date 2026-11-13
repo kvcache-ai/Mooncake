@@ -198,7 +198,13 @@ TEST(ProxyShutdownTimeout, TimedOutDrainHandsResourcesToDeferredTeardown) {
 
     // 64-byte chunks over a 128-byte request: two chunks, each with its own
     // local-stage batch that will never leave PENDING.
-    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 2);
+    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 10);
+    // Leave only the two slots this request needs. Reserving the entire
+    // pipeline would fail before either transfer reaches the transport.
+    std::vector<uint64_t> occupied(8);
+    for (auto& addr : occupied) {
+        ASSERT_TRUE(manager->pinStageBuffer(kWildcardLocation, addr).ok());
+    }
     Request request;
     request.opcode = Request::WRITE;
     request.source = source.data();
@@ -221,6 +227,9 @@ TEST(ProxyShutdownTimeout, TimedOutDrainHandsResourcesToDeferredTeardown) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_GE(fake_tcp->submit_calls.load(std::memory_order_acquire), 2);
+    for (auto addr : occupied) {
+        EXPECT_TRUE(manager->unpinStageBuffer(addr).ok());
+    }
 
     // The destructor must come back once the configured deadline expires:
     // well past kDrainTimeoutMs, but nowhere near the 30s default (let alone
