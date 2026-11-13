@@ -246,7 +246,8 @@ DistributedStorageBackend::GetOrOpenShard(
         if (existing != shard_files_.end()) shard = existing->second.get();
     }
     if (shard) {
-        std::lock_guard shard_lock(shard->mutex);
+        std::lock_guard admission(shard->admission_mutex);
+        std::shared_lock shard_lock(shard->mutex);
         // Only the exact path validated when this fd was opened can bypass
         // normalization. Aliases and changed descriptors take the full
         // validation path below. Cache entries live until backend teardown.
@@ -279,6 +280,7 @@ DistributedStorageBackend::GetOrOpenShard(
     // File validation and opening may block. Serialize them only with this
     // shard's initialization and non-batched I/O, leaving other cached shards
     // available.
+    std::lock_guard admission(shard->admission_mutex);
     std::lock_guard shard_lock(shard->mutex);
     auto file_path = path.string();
     if (shard->fd >= 0) {
@@ -327,9 +329,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ReopenShardLocked(
     if (shard.path.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Drop the stale descriptor first. The caller holds shard.mutex, which
-    // serializes all I/O on this shard, so no other thread can be reading or
-    // writing through the old fd while we close it.
+    // Drop the stale descriptor first. The caller holds shard.mutex
+    // exclusively, so no reader or writer can use the old fd while we close it.
     if (shard.fd >= 0) {
         (void)fs_adapter_->CloseFile(shard.fd);
         shard.fd = -1;
@@ -489,7 +490,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
                    << shard.error();
         return tl::make_unexpected(shard.error());
     }
-    std::lock_guard lock((*shard)->mutex);
+    std::unique_lock admission((*shard)->admission_mutex);
+    std::unique_lock lock((*shard)->mutex, std::defer_lock);
+    std::shared_lock read_lock((*shard)->mutex, std::defer_lock);
+    if (!write && fs_adapter_->SupportsConcurrentReadAt()) {
+        read_lock.lock();
+    } else {
+        lock.lock();
+    }
+    admission.unlock();
     const auto count = static_cast<int>(op.iovs.size());
     const auto offset = op.file_offset;
     auto result =
@@ -501,9 +510,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
         // A cached descriptor can go stale (fd invalidated, shard file
         // rotated). Reopen once under the shard lock and retry before
         // surfacing the failure. A short transfer below is treated as genuine
-        // corruption and not retried. The lock already serializes shard I/O, so
-        // the reopen adds no cost to the success path. Only adapters whose I/O
-        // faults are fd-recoverable (POSIX) opt in via SupportsFdReopen.
+        // corruption and not retried. Readers must leave shared mode before
+        // closing the fd, and the exclusive lock waits for every other reader.
+        // Only fd-recoverable adapters opt in via SupportsFdReopen.
+        if (read_lock.owns_lock()) {
+            read_lock.unlock();
+            admission.lock();
+            lock.lock();
+            admission.unlock();
+        }
         LOG(WARNING) << "DFS " << op_name << " failed for key " << op.key
                      << ", error=" << result.error() << ", reopening shard "
                      << op.descriptor.shard_idx;
