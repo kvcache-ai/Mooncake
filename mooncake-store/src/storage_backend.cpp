@@ -6187,59 +6187,57 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
 
     // Step 2: Perform disk I/O without holding any locks
     // Allocations and data file are kept alive by shared_ptr refs in read_plans
+    thread_local char padding_sink[RecordHeader::kValueAlignment];
     for (const auto& plan : read_plans) {
-        // Read header first.  The CRC is NOT verified here: records are
-        // CRC-validated once during recovery, and during normal operation
-        // a key only becomes visible after its write completed, so the
-        // hot read path stays checksum-free.
+        // A window starting at the value's first byte is read together with
+        // the header and key in one call; a window further in takes a second
+        // read so its preceding value bytes are never read.
+        const auto key_len = static_cast<uint32_t>(plan.key.size());
+        const uint32_t padding = RecordHeader::ValuePadding(key_len);
+        const bool contiguous =
+            plan.value_offset == 0 && plan.dest_slice.size > 0;
+
         char hdr_buf[RecordHeader::SIZE];
-        iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
-        auto read_header_result =
-            plan.data_file->vector_read(&header_iov, 1, plan.offset);
-        if (!read_header_result) {
-            LOG(ERROR) << "Failed to read header for key: " << plan.key
-                       << ", error: " << read_header_result.error();
-            return tl::make_unexpected(read_header_result.error());
+        std::string stored_key(key_len, '\0');
+        iovec iovs[4];
+        int iovcnt = 0;
+        iovs[iovcnt++] = {hdr_buf, sizeof(hdr_buf)};
+        iovs[iovcnt++] = {stored_key.data(), key_len};
+        uint64_t expected = RecordHeader::SIZE + key_len;
+        if (contiguous) {
+            if (padding > 0) {
+                iovs[iovcnt++] = {padding_sink, padding};
+                expected += padding;
+            }
+            iovs[iovcnt++] = {plan.dest_slice.ptr, plan.dest_slice.size};
+            expected += plan.dest_slice.size;
         }
 
-        if (read_header_result.value() != RecordHeader::SIZE) {
-            LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
+        auto head_read = plan.data_file->vector_read(iovs, iovcnt, plan.offset);
+        if (!head_read) {
+            LOG(ERROR) << "Failed to read record for key: " << plan.key
+                       << ", error: " << head_read.error();
+            return tl::make_unexpected(head_read.error());
+        }
+        if (head_read.value() != expected) {
+            LOG(ERROR) << "Record read size mismatch for key: " << plan.key
+                       << ", expected: " << expected
+                       << ", got: " << head_read.value();
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
-        // Validate header matches metadata
+        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
         if (!header.ValidateAgainstMetadata(plan.value_size)) {
             LOG(ERROR) << "Stored value_len mismatch for key: " << plan.key
                        << ", metadata: " << plan.value_size
                        << ", header: " << header.value_len;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
+        auto validated = header.ValidateKey(plan.key, stored_key);
+        if (!validated) return tl::make_unexpected(validated.error());
 
-        // Read key from disk
-        std::string stored_key(header.key_len, '\0');
-        iovec key_iov = {stored_key.data(), header.key_len};
-        auto read_key_result = plan.data_file->vector_read(
-            &key_iov, 1, plan.offset + RecordHeader::SIZE);
-        if (!read_key_result) {
-            LOG(ERROR) << "Failed to read key for: " << plan.key
-                       << ", error: " << read_key_result.error();
-            return tl::make_unexpected(read_key_result.error());
-        }
+        if (contiguous || plan.dest_slice.size == 0) continue;
 
-        if (read_key_result.value() != header.key_len) {
-            LOG(ERROR) << "Key read size mismatch for: " << plan.key;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-
-        // Validate key matches expected
-        auto validate_result = header.ValidateKey(plan.key, stored_key);
-        if (!validate_result) {
-            return tl::make_unexpected(validate_result.error());
-        }
-
-        // Read only the requested value window. The header and key are still
-        // checked so a span read cannot return bytes from the wrong record.
         iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
         const uint64_t value_pos =
             plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len) +
