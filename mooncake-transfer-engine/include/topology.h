@@ -163,6 +163,15 @@ class Topology {
         resolved_hca_peer_affinity_by_local_;
 };
 
+// For each location in `matrix` (e.g. "cuda:3"), the indices into
+// `device_names` of its preferred HCAs, in preference order and without
+// duplicates. `device_names` is the transport's opened device list, so an
+// index names both the NIC and its slot in a buffer's lkey/rkey arrays.
+// Preferred HCAs absent from `device_names` are skipped; a location left with
+// none is omitted rather than mapped to an empty vector.
+std::unordered_map<std::string, std::vector<size_t>> buildPreferredNicIndexMap(
+    const TopologyMatrix &matrix, const std::vector<std::string> &device_names);
+
 }  // namespace mooncake
 
 #endif  // TOPOLOGY_H

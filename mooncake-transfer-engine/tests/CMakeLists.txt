@@ -797,3 +797,19 @@ add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
 target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
+
+# MC_RDMA_NIC_SELECTION: hardware-free map, knob and sparse-MR routing tests.
+add_executable(rdma_nic_selection_test ${WORKSPACE}/rdma_nic_selection_test.cpp)
+target_link_libraries(rdma_nic_selection_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_nic_selection_test COMMAND rdma_nic_selection_test)
+
+# Needs GPUs and RDMA NICs; skips unless MC_RUN_RDMA_GPU_TESTS is set.
+if(USE_CUDA OR USE_HIP)
+  add_executable(rdma_local_nic_gpu_test
+                 ${WORKSPACE}/rdma_local_nic_gpu_test.cpp)
+  target_link_libraries(rdma_local_nic_gpu_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+  add_test(NAME rdma_local_nic_gpu_test COMMAND rdma_local_nic_gpu_test)
+  set_tests_properties(rdma_local_nic_gpu_test PROPERTIES LABELS "rdma;gpu")
+endif()

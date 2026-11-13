@@ -28,6 +28,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -38,6 +39,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
 #include "hip_device_guard.h"
 #include "memory_location.h"
 #include "topology.h"
@@ -400,8 +402,9 @@ void RdmaTransport::notifyWorkerThread() {
     }
 }
 
-int RdmaTransport::preTouchMemory(void *addr, size_t length) {
-    if (context_list_.size() == 0) {
+int RdmaTransport::preTouchMemory(void *addr, size_t length,
+                                  size_t context_index) {
+    if (context_index >= context_list_.size()) {
         // At least one context is required for pre-touch.
         return 0;
     }
@@ -435,8 +438,9 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
         }
         void *block_addr = static_cast<char *>(addr) + offset;
         threads.emplace_back([this, thread_i, block_addr, block_size,
-                              &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+                              context_index, &thread_results]() {
+            int ret = context_list_[context_index]->preTouchMemory(block_addr,
+                                                                   block_size);
             thread_results[thread_i] = ret;
         });
         offset += block_size;
@@ -492,6 +496,44 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     }
 
     std::string resolved_name = name;
+
+    // The HCAs this buffer is registered on, as indices into context_list_.
+    // By default every HCA. With MC_RDMA_NIC_SELECTION=local, GPU memory is
+    // registered only on the HCAs the topology prefers for its GPU. Skipped
+    // HCAs keep their slots in the published lkey/rkey arrays with zero keys,
+    // which device selection already skips, so a device index still names the
+    // same NIC in context_list_, the segment's devices and every key array.
+    // Host memory (cpu:N, segments:..., or an unresolved "*") keeps every HCA:
+    // a NUMA node's preferred set is not a GPU rail group.
+    std::vector<size_t> registration_nics;
+    bool narrowed = false;
+    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+        std::string location = name;
+        if (name == kWildcardLocation) {
+            // For device memory this is a pointer-attribute query; it does not
+            // depend on the pages having been touched.
+            const auto entries = getMemoryLocation(addr, length, true);
+            if (!entries.empty()) location = entries[0].location;
+        }
+        if (location.rfind(GPU_PREFIX, 0) == 0) {
+            auto it = local_nic_map_.find(location);
+            if (it == local_nic_map_.end()) {
+                // Fail closed rather than silently registering on every HCA.
+                LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no opened "
+                              "topology-preferred HCA for "
+                           << location << " (buffer " << addr
+                           << "); check the topology and device filters, or "
+                              "set MC_RDMA_NIC_SELECTION=all";
+                return ERR_DEVICE_NOT_FOUND;
+            }
+            registration_nics = it->second;
+            narrowed = true;
+        }
+    }
+    if (!narrowed) {
+        registration_nics.resize(context_list_.size());
+        std::iota(registration_nics.begin(), registration_nics.end(), 0);
+    }
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -620,8 +662,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // not a "committed" chunk, so rollbackChunks() below must not touch its
     // (never-added) metadata, but its partial MRs still need releasing.
     auto unregisterChunkMRs = [&](void *chunk_addr) {
-        for (auto &context : context_list_) {
-            int ret = context->unregisterMemoryRegion(chunk_addr);
+        for (size_t i : registration_nics) {
+            int ret = context_list_[i]->unregisterMemoryRegion(chunk_addr);
             if (ret)
                 LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
                              << chunk_addr << " (ret=" << ret << ")";
@@ -674,7 +716,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         if (do_pre_touch) {
             // Parallel pre-touch the memory to speed up registration.
-            int ret = preTouchMemory(chunk_addr, chunk_len);
+            int ret = preTouchMemory(chunk_addr, chunk_len,
+                                     registration_nics.front());
             if (ret != 0) {
                 // pre-touch is before MR registration for chunk ci, so ci has
                 // no MR/metadata yet: roll back only committed chunks [0, ci).
@@ -693,7 +736,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         if (!force_sequential) {
             use_parallel_reg = globalConfig().parallel_reg_mr;
             if (use_parallel_reg == -1) {
-                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+                use_parallel_reg = registration_nics.size() > 1 && do_pre_touch;
             }
         }
 
@@ -701,11 +744,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         if (use_parallel_reg) {
             std::vector<std::thread> reg_threads;
-            reg_threads.reserve(context_list_.size());
+            reg_threads.reserve(registration_nics.size());
             std::vector<int> ret_codes(context_list_.size(), 0);
             const int ar = access_rights;  // Local copy for lambda capture
 
-            for (size_t i = 0; i < context_list_.size(); ++i) {
+            for (size_t i : registration_nics) {
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
@@ -728,7 +771,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 }
             }
         } else {
-            for (size_t i = 0; i < context_list_.size(); ++i) {
+            for (size_t i : registration_nics) {
                 int ret = context_list_[i]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
@@ -753,7 +796,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
                       << chunks.size() << ", addr=" << chunk_addr
                       << ", length=" << chunk_len
-                      << ", contexts=" << context_list_.size()
+                      << ", contexts=" << registration_nics.size() << "/"
+                      << context_list_.size()
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
         }
@@ -767,11 +811,29 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).
+        // One slot per context; HCAs the chunk was not registered on keep a
+        // zero key (and are not queried, which would log a missing MR).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+        buffer_desc.lkey.assign(context_list_.size(), 0);
+        if (remote_accessible) buffer_desc.rkey.assign(context_list_.size(), 0);
+        for (size_t i : registration_nics) {
+            buffer_desc.lkey[i] = context_list_[i]->lkey(chunk_addr);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+                buffer_desc.rkey[i] = context_list_[i]->rkey(chunk_addr);
+        }
+        // A narrowed HCA can still record a region without an MR (a NIC that
+        // is not Data Direct-paired with the GPU), which could leave the
+        // chunk reachable through no HCA at all.
+        if (narrowed &&
+            std::all_of(buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
+                        [](BufferDesc::mr_key_t key) { return key == 0; })) {
+            LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no topology-preferred "
+                          "HCA of "
+                       << resolved_name << " holds an MR for " << chunk_addr
+                       << "; fix the topology or set MC_RDMA_NIC_SELECTION=all";
+            unregisterChunkMRs(chunk_addr);
+            rollbackChunks(ci);
+            return ERR_DEVICE_NOT_FOUND;
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -1779,6 +1841,27 @@ int RdmaTransport::initializeRdmaResources() {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
+    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+        // Index by context_list_ slot. A failed RNIC keeps its placeholder
+        // slot but disableDevice() already removed it from every preferred
+        // list, so it never enters the map.
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (const auto &context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ = buildPreferredNicIndexMap(local_topology_->getMatrix(),
+                                                   context_names);
+        for (const auto &entry : local_nic_map_) {
+            if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
+            std::string nic_list;
+            for (size_t i : entry.second) {
+                if (!nic_list.empty()) nic_list += ",";
+                nic_list += context_names[i];
+            }
+            LOG(INFO) << "RdmaTransport: MC_RDMA_NIC_SELECTION=local, "
+                      << entry.first << " registers on [" << nic_list << "]";
+        }
+    }
     return 0;
 }
 
@@ -1807,6 +1890,29 @@ bool isSelectableRdmaBuffer(
     return true;
 }
 
+// Translates a topology HCA index into the segment's device slot, which also
+// indexes every buffer's lkey/rkey arrays. The two agree on the publishing
+// side, where Topology::disableDevice() keeps indices stable. A peer, however,
+// rebuilds the topology from the published matrix, which omits HCAs that
+// failed to open or were disabled at runtime, so its resolve() compacts the
+// indices of the HCAs after them while devices and keys keep one slot per
+// context. Resolving by name keeps a selection on the NIC it names instead of
+// the NIC (and keys) in the shifted slot. Negative error codes pass through.
+int topologyIndexToDeviceId(const RdmaTransport::SegmentDesc *desc,
+                            int topology_id) {
+    if (topology_id < 0 || desc->devices.empty()) return topology_id;
+    const auto &hca_list = desc->topology.getHcaList();
+    const size_t index = static_cast<size_t>(topology_id);
+    if (index >= hca_list.size()) return ERR_DEVICE_NOT_FOUND;
+    const auto &hca = hca_list[index];
+    if (index < desc->devices.size() && desc->devices[index].name == hca)
+        return topology_id;
+    for (size_t i = 0; i < desc->devices.size(); ++i) {
+        if (desc->devices[i].name == hca) return static_cast<int>(i);
+    }
+    return ERR_DEVICE_NOT_FOUND;
+}
+
 int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
                        const TransferMetadata::BufferDesc &buffer,
                        uint64_t offset, std::string_view hint,
@@ -1815,17 +1921,20 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     // Drop topology candidates without valid keys for this buffer before the
     // selection rule applies. An entry that exists but has no such candidate
     // fails rather than falling back to the wildcard entry, which would leave
-    // the buffer's location or the peer-affinity mapping.
+    // the buffer's location or the peer-affinity mapping. Topology indices
+    // are translated to device slots before any key lookup.
     const std::function<bool(int)> device_filter = [desc, &buffer](int id) {
-        return RdmaTransport::hasValidKeys(desc, buffer, id);
+        return RdmaTransport::hasValidKeys(desc, buffer,
+                                           topologyIndexToDeviceId(desc, id));
     };
     if (by_local_hca) {
         const auto location = resolveBufferLocation(buffer, offset);
         int device_id = desc->topology.selectDeviceByLocalHca(
             location, local_hca, retry_count, device_filter);
-        if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
-        return desc->topology.selectDeviceByLocalHca(
-            kWildcardLocation, local_hca, retry_count, device_filter);
+        if (device_id == ERR_DEVICE_NOT_FOUND)
+            device_id = desc->topology.selectDeviceByLocalHca(
+                kWildcardLocation, local_hca, retry_count, device_filter);
+        return topologyIndexToDeviceId(desc, device_id);
     }
 
     std::string location = buffer.name;
@@ -1840,19 +1949,22 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     // location miss, making the wildcard attempt unreachable. A hinted HCA
     // without valid keys for the buffer is treated like an unknown hint name.
     if (!hint.empty()) {
-        int device_id = desc->topology.getDeviceIndex(location, hint);
+        int device_id = topologyIndexToDeviceId(
+            desc, desc->topology.getDeviceIndex(location, hint));
         if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
             return device_id;
-        device_id = desc->topology.getDeviceIndex(kWildcardLocation, hint);
+        device_id = topologyIndexToDeviceId(
+            desc, desc->topology.getDeviceIndex(kWildcardLocation, hint));
         if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
             return device_id;
     }
 
     int device_id =
         desc->topology.selectDevice(location, retry_count, device_filter);
-    if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
-    return desc->topology.selectDevice(kWildcardLocation, retry_count,
-                                       device_filter);
+    if (device_id == ERR_DEVICE_NOT_FOUND)
+        device_id = desc->topology.selectDevice(kWildcardLocation, retry_count,
+                                                device_filter);
+    return topologyIndexToDeviceId(desc, device_id);
 }
 
 int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,

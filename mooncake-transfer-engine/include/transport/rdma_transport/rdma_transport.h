@@ -139,7 +139,9 @@ class RdmaTransport : public Transport {
     int refreshLocalDeviceDesc(const std::string &device_name, uint32_t lid,
                                const std::string &gid);
 
-    int preTouchMemory(void *addr, size_t length);
+    // Pre-touches through context_list_[context_index], which must be a NIC
+    // the buffer is being registered on.
+    int preTouchMemory(void *addr, size_t length, size_t context_index = 0);
 
    public:
     virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -215,6 +217,11 @@ class RdmaTransport : public Transport {
         ClassicCongestionControlMode::kUninitialized};
 #endif
     std::shared_ptr<Topology> local_topology_;
+    // MC_RDMA_NIC_SELECTION=local: GPU location (e.g. "cuda:0") -> indices into
+    // context_list_ of its topology-preferred HCAs that opened. Built once in
+    // initializeRdmaResources() and read-only afterwards, so registration
+    // reads it without a lock. Empty in the default ALL mode.
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
     // "192.168.0.y:port") for NIC path construction, while
