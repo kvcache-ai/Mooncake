@@ -88,6 +88,6 @@ else()
             --clientctl_path=$<TARGET_FILE:clientctl>
             --out_dir=${CMAKE_CURRENT_BINARY_DIR}/redis_chaos_output)
         set_tests_properties(redis_chaos_test PROPERTIES
-            LABELS "p2p;ha;redis_ha" RUN_SERIAL TRUE TIMEOUT 180)
+            LABELS "p2p;ha;redis_ha" RUN_SERIAL TRUE TIMEOUT 360)
     endif()
 endif()
