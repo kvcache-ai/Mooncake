@@ -15,7 +15,7 @@ use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, MetadataBackend,
     ObjectKey, Result, SegmentLifecycleState, SegmentName, StoreError, TenantObjectAccountingState,
     TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
-    TenantQuotaReservationState,
+    TenantQuotaReservationState, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
 };
 use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_rs_transport::{TentEngine, TentEngineConfig};
@@ -72,6 +72,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "multi-tenant".to_string(),
             "dynamic-membership".to_string(),
         ]);
+
+    if lifecycle_only_e2e() && lifecycle_disabled_e2e() {
+        return Err(StoreError::InvalidState(
+            "lifecycle-only E2E requires allocation lifecycle capability".to_string(),
+        )
+        .into());
+    }
+    if lifecycle_only_e2e() {
+        run_minimal_lifecycle_delete_reclaim(metadata, redis_port, rdma_mode.enabled, value_size)?;
+        println!("e2e ok: remote allocation lifecycle delete reclaim (lifecycle-only mode)");
+        return Ok(());
+    }
+    if lifecycle_write_bench_only() {
+        run_minimal_lifecycle_write_benchmark(
+            metadata,
+            redis_port,
+            rdma_mode.enabled,
+            value_size,
+            batch_bench_iters,
+        )?;
+        println!("e2e ok: TCP/TENT routed write benchmark (benchmark-only mode)");
+        return Ok(());
+    }
 
     let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment", rdma_mode.enabled)?;
     let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment", rdma_mode.enabled)?;
@@ -430,7 +453,7 @@ fn build_client(
         .state(state)
         .activate_on_local_memory_registration()
         .tenant(tenant)
-        .compatibility(CompatibilityDescriptor::default())
+        .compatibility(e2e_compatibility())
         .local_memory(memory)
         .with_tent(transport.engine)
         .transport_factory(transport.factory);
@@ -457,7 +480,7 @@ fn build_routed_client(
         .state(state)
         .activate_on_local_memory_registration()
         .tenant(tenant)
-        .compatibility(CompatibilityDescriptor::default())
+        .compatibility(e2e_compatibility())
         .local_memory(memory)
         .with_tent(transport.engine)
         .transport_factory(transport.factory)
@@ -1980,4 +2003,219 @@ struct OwnedItem {
     tenant: String,
     key: String,
     value: Vec<u8>,
+}
+
+fn run_minimal_lifecycle_write_benchmark(
+    metadata: Arc<RedisMetadataBackend>,
+    redis_port: u16,
+    rdma_enable: bool,
+    value_size: usize,
+    iterations: usize,
+) -> Result<()> {
+    let owner_bundle = build_tent_bundle(redis_port, "lifecycle-bench-owner", rdma_enable)?;
+    let router_bundle = build_tent_bundle(redis_port, "lifecycle-bench-router", rdma_enable)?;
+    let tenant = "tenant-lifecycle-write-bench";
+    let owner_memory = LocalMemoryConfig::new()
+        .storage_bytes(MEMORY_BYTES)
+        .scratch_bytes(SCRATCH_BYTES)
+        .location("cpu:0")
+        .numa_aware(false);
+    let router_memory = LocalMemoryConfig::new()
+        .storage_bytes(32 * 1024)
+        .scratch_bytes(SCRATCH_BYTES)
+        .location("cpu:0")
+        .numa_aware(false);
+    let mut owner = build_client(
+        metadata.clone(),
+        "lifecycle-bench-owner",
+        ClientLifecycleState::Active,
+        owner_bundle,
+        owner_memory,
+        tenant,
+        &[("storage", "true"), ("role", "owner")],
+    )?;
+    let mut router = build_routed_client(
+        metadata.clone(),
+        "lifecycle-bench-router",
+        ClientLifecycleState::Active,
+        router_bundle,
+        router_memory,
+        tenant,
+        &[("storage", "false"), ("role", "router")],
+        PlacementPlanner::new(metadata).require_label("storage", "true"),
+        1,
+        None,
+    )?;
+    owner.register_local_memory()?;
+    router.register_local_memory()?;
+    heartbeat_clients(&mut [&mut owner, &mut router])?;
+    // Batch sizes share this owner/router and retain prior runtime state.
+    // This is a sequence measurement, not an independent performance comparison.
+    run_batch_put_benchmark(&mut router, value_size, iterations, &mut [&mut owner])
+}
+
+fn run_minimal_lifecycle_delete_reclaim(
+    metadata: Arc<RedisMetadataBackend>,
+    redis_port: u16,
+    rdma_enable: bool,
+    value_size: usize,
+) -> Result<()> {
+    let owner_bundle = build_tent_bundle(redis_port, "lifecycle-delete-owner", rdma_enable)?;
+    let router_bundle = build_tent_bundle(redis_port, "lifecycle-delete-router", rdma_enable)?;
+    let reader_bundle = build_tent_bundle(redis_port, "lifecycle-delete-reader", rdma_enable)?;
+    let tenant = "tenant-lifecycle-delete";
+    let owner_memory = LocalMemoryConfig::new()
+        .storage_bytes(value_size.saturating_mul(2))
+        .scratch_bytes(value_size.saturating_mul(2))
+        .location("cpu:0")
+        .reclaim_grace_ms(0)
+        .numa_aware(false);
+    let client_memory = LocalMemoryConfig::new()
+        .storage_bytes(32 * 1024)
+        .scratch_bytes(value_size.saturating_mul(2))
+        .location("cpu:0")
+        .numa_aware(false);
+    let mut owner = build_client(
+        metadata.clone(),
+        "lifecycle-delete-owner",
+        ClientLifecycleState::Active,
+        owner_bundle,
+        owner_memory,
+        tenant,
+        &[("storage", "true"), ("role", "owner")],
+    )?;
+    let mut router = build_routed_client(
+        metadata.clone(),
+        "lifecycle-delete-router",
+        ClientLifecycleState::Active,
+        router_bundle,
+        client_memory.clone(),
+        tenant,
+        &[("storage", "false"), ("role", "router")],
+        PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+        1,
+        None,
+    )?;
+    let mut reader = build_client(
+        metadata,
+        "lifecycle-delete-reader",
+        ClientLifecycleState::Active,
+        reader_bundle,
+        client_memory,
+        tenant,
+        &[("storage", "false"), ("role", "reader")],
+    )?;
+    owner.register_local_memory()?;
+    router.register_local_memory()?;
+    reader.register_local_memory()?;
+    heartbeat_clients(&mut [&mut owner, &mut router, &mut reader])?;
+    verify_remote_lifecycle_delete_reclaim(&router, &owner, &reader, value_size)
+}
+
+fn verify_remote_lifecycle_delete_reclaim(
+    router: &StoreClient,
+    owner: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(owner.runtime_id().storage_key());
+    let first_value = payload("remote-lifecycle-delete-a", value_size);
+    let first_route = router.put_with_policy("remote-lifecycle-delete-a", &first_value, &policy)?;
+    let first_replica = first_route.replicas.first().ok_or_else(|| {
+        StoreError::InvalidState("remote lifecycle route has no replica".to_string())
+    })?;
+    if first_replica.owner != *owner.runtime_id() {
+        return Err(StoreError::InvalidState(format!(
+            "remote lifecycle write selected {} instead of {}",
+            first_replica.owner,
+            owner.runtime_id()
+        )));
+    }
+    let first_offset = first_replica.segment_offset;
+    ensure_payload(
+        "remote lifecycle initial read",
+        &first_value,
+        &reader.get("remote-lifecycle-delete-a")?,
+    )?;
+
+    router.remove("remote-lifecycle-delete-a", true)?;
+    let visibility_deadline = Instant::now() + Duration::from_secs(10);
+    while router.is_exist("remote-lifecycle-delete-a")? {
+        if Instant::now() >= visibility_deadline {
+            return Err(StoreError::InvalidState(
+                "remote lifecycle route remains visible after mirror convergence".to_string(),
+            ));
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let used_bytes = owner
+            .list_segments()?
+            .iter()
+            .map(|segment| segment.used_bytes)
+            .sum::<u64>();
+        if used_bytes == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(StoreError::InvalidState(format!(
+                "remote lifecycle owner did not reclaim deleted allocation within 10s: used_bytes={used_bytes}"
+            )));
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    let replacement = payload("remote-lifecycle-delete-b", value_size);
+    let second_route =
+        router.put_with_policy("remote-lifecycle-delete-b", &replacement, &policy)?;
+    let second_replica = second_route.replicas.first().ok_or_else(|| {
+        StoreError::InvalidState("remote lifecycle replacement has no replica".to_string())
+    })?;
+    if second_replica.owner != *owner.runtime_id() || second_replica.segment_offset != first_offset
+    {
+        return Err(StoreError::InvalidState(format!(
+            "remote lifecycle did not reuse owner allocation: owner={} offset={} expected_owner={} expected_offset={first_offset}",
+            second_replica.owner,
+            second_replica.segment_offset,
+            owner.runtime_id(),
+        )));
+    }
+    ensure_payload(
+        "remote lifecycle replacement read",
+        &replacement,
+        &reader.get("remote-lifecycle-delete-b")?,
+    )?;
+    Ok(())
+}
+
+fn e2e_env_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn lifecycle_only_e2e() -> bool {
+    e2e_env_enabled("MC_STORE_RS_E2E_LIFECYCLE_ONLY")
+}
+
+fn lifecycle_write_bench_only() -> bool {
+    e2e_env_enabled("MC_STORE_RS_E2E_WRITE_BENCH_ONLY")
+}
+
+fn e2e_compatibility() -> CompatibilityDescriptor {
+    let mut compatibility = CompatibilityDescriptor::default();
+    if lifecycle_disabled_e2e() {
+        compatibility
+            .capabilities
+            .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    }
+    compatibility
+}
+
+fn lifecycle_disabled_e2e() -> bool {
+    e2e_env_enabled("MC_STORE_RS_E2E_DISABLE_ALLOCATION_LIFECYCLE")
 }

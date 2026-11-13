@@ -10,6 +10,7 @@
 //   - StoreClientBuilder rejection / validation paths
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use mooncake_store_core::{ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId};
 use mooncake_store_rs_metadata::InMemoryMetadataBackend;
@@ -21,7 +22,7 @@ use crate::{
 
 use super::super::{
     align_up_u64, control_bind_host, flatten_slices, payload_checksum, scatter_into_buffers,
-    LiveClientCache, StoreState,
+    LiveClientCache, StoreState, RETAINED_MEMBERSHIP_TTL,
 };
 use super::{storage_config, test_future_expiry_ms};
 
@@ -508,6 +509,32 @@ fn live_client_cache_store_empty_list_produces_some_empty_snapshot() {
         snap.is_some(),
         "snapshot must be Some even after storing empty list"
     );
+}
+
+#[test]
+fn live_client_cache_expires_retained_snapshot_after_ttl() {
+    let mut cache = LiveClientCache::default();
+    let lease_a = ClientLease {
+        runtime: ClientRuntimeId::new("a", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: mooncake_store_core::CompatibilityDescriptor::default(),
+        endpoints: mooncake_store_core::ClientEndpointSet::default(),
+        expires_at_ms: u64::MAX,
+    };
+    let lease_b = ClientLease {
+        runtime: ClientRuntimeId::new("b", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: mooncake_store_core::CompatibilityDescriptor::default(),
+        endpoints: mooncake_store_core::ClientEndpointSet::default(),
+        expires_at_ms: u64::MAX,
+    };
+
+    cache.store(vec![lease_a]);
+    cache.store(vec![lease_b.clone()]);
+    cache.retained_at = Instant::now().checked_sub(RETAINED_MEMBERSHIP_TTL);
+    cache.store(vec![lease_b.clone()]);
+
+    assert_eq!(cache.retained_snapshot(), Some(vec![lease_b]));
 }
 
 // ===========================================================================

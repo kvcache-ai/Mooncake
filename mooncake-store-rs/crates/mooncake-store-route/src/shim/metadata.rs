@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientRuntimeId, MetadataBackend, NamespaceScope, ObjectKey,
-    ObjectRoute, Result, ReuseIdentity, RouteDirectory, RouteVersion,
+    ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteDirectory, RouteReplicaReference,
+    RouteVersion,
 };
 
 use crate::metrics::record_cas_outcome;
@@ -31,6 +32,25 @@ impl RouteDirectory for MetadataRouteDirectory {
         self.metadata.get_object_route(key)
     }
 
+    fn confirm_replica_reference(
+        &self,
+        _observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> Result<RouteReplicaReference> {
+        match self.metadata.get_object_route(key)? {
+            Some(route)
+                if route
+                    .replicas
+                    .iter()
+                    .any(|candidate| replica_has_same_allocation_identity(candidate, replica)) =>
+            {
+                Ok(RouteReplicaReference::Referenced(Box::new(route)))
+            }
+            Some(_) | None => Ok(RouteReplicaReference::Absent),
+        }
+    }
+
     fn compare_and_swap_object_route(
         &self,
         _observer: &ClientLease,
@@ -42,7 +62,7 @@ impl RouteDirectory for MetadataRouteDirectory {
             .metadata
             .compare_and_swap_object_route(key, expected, next);
         if let Ok(cas) = &result {
-            record_cas_outcome(cas, next, key);
+            record_cas_outcome(cas);
         }
         result
     }
@@ -84,4 +104,14 @@ impl RouteDirectory for MetadataRouteDirectory {
     ) -> Result<Vec<ObjectRoute>> {
         self.metadata.list_reuse_candidates(reuse)
     }
+}
+
+fn replica_has_same_allocation_identity(candidate: &ReplicaRoute, expected: &ReplicaRoute) -> bool {
+    candidate.owner == expected.owner
+        && candidate.segment_name == expected.segment_name
+        && candidate.segment_offset == expected.segment_offset
+        && candidate.allocation_id == expected.allocation_id
+        && expected
+            .allocation_id
+            .is_some_and(|allocation_id| allocation_id != 0)
 }

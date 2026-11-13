@@ -179,6 +179,13 @@ fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AllocationLifecycleOwnerMode {
+    Lifecycle,
+    Legacy,
+    Unknown,
+}
+
 impl StoreClient {
     /// Write one object with its complete namespace, QoS, and replication policy.
     ///
@@ -361,6 +368,78 @@ impl StoreClient {
         }
     }
 
+
+
+    /// Prepare every lifecycle-capable allocation owner before deleting the route.
+    /// The same owner-local queue used by post-delete notifications is used as the
+    /// durable token store; `prepare_only` keeps a token alive while the old route
+    /// is still referenced and makes retries idempotent.
+    fn prepare_route_storage_reclaim(&self, route: &ObjectRoute) -> Result<()> {
+        let mut local = Vec::new();
+        let mut remote = BTreeMap::<ClientRuntimeId, Vec<DeletePendingEntry>>::new();
+        for replica in &route.replicas {
+            let Some(allocation_id) = replica.allocation_id.filter(|id| *id != 0) else {
+                continue;
+            };
+            let entry = DeletePendingEntry {
+                route_key: route.key.clone(),
+                identity: Some(mooncake_store_core::AllocationRouteIdentity {
+                    owner: replica.owner.clone(),
+                    segment_name: replica.segment_name.clone(),
+                    offset_bytes: replica.segment_offset,
+                    length_bytes: replica.length,
+                    allocation_id,
+                }),
+                cold_backing: None,
+                reclaim_grace_ms: self.local_memory.reclaim_grace_ms,
+                prepare_only: true,
+                expected_route_version: Some(route.version),
+            };
+            match self.allocation_lifecycle_owner_mode(&replica.owner) {
+                AllocationLifecycleOwnerMode::Lifecycle if replica.owner == self.lease.runtime => {
+                    local.push(entry);
+                }
+                AllocationLifecycleOwnerMode::Lifecycle => {
+                    remote.entry(replica.owner.clone()).or_default().push(entry);
+                }
+                AllocationLifecycleOwnerMode::Legacy => {}
+                AllocationLifecycleOwnerMode::Unknown => {
+                    // Preserve the main-branch compatibility path while membership
+                    // refresh resolves the owner capability. The post-delete
+                    // notification path will hand off to a lifecycle owner when it
+                    // becomes known; no destructive release is performed here.
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        storage_owner = %replica.owner,
+                        key = %route.key.0,
+                        allocation_id,
+                        "deferring delete prepare until allocation-owner capability is known"
+                    );
+                }
+            }
+        }
+        if !local.is_empty() {
+            self.storage_owner.enqueue_delete_pending(&local)?;
+        }
+        for (owner, entries) in remote {
+            let lease = self.lookup_runtime_lease(&owner)?;
+            if !lease.compatibility.supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY) {
+                return Err(StoreError::Unsupported(format!(
+                    "allocation owner {} does not support owner-local delete reclaim",
+                    owner
+                )));
+            }
+            self.control_client.batch_notify_delete_pending(&lease, &entries)?;
+        }
+        Ok(())
+    }
+
+
+
+
+
+
+
     pub(super) fn remove_object_route_with_retry(
         &self,
         object_id: &LogicalObjectId,
@@ -381,8 +460,10 @@ impl StoreClient {
                 };
             };
             let has_nof = !self.storage_owner.cold_tier_devices.nof_targets.is_empty();
+            let has_cold_backing = route.cold_backing.is_some();
             if route.state != RouteState::Active
                 && !(has_nof && route.state == RouteState::Deleting)
+                && !(has_cold_backing && route.state == RouteState::Deleting)
             {
                 return if force {
                     Ok(())
@@ -392,6 +473,53 @@ impl StoreClient {
             }
 
             attempt = attempt.saturating_add(1);
+            if route.state == RouteState::Active {
+                self.prepare_route_storage_reclaim(&route)?;
+            }
+            if !has_nof && has_cold_backing {
+                if route.state == RouteState::Deleting {
+                    // A re-delete of an already-Deleting cold route re-arms the
+                    // owner-local reclaim token (idempotent: the queue dedups by
+                    // cold target and the drain is a version-fenced point lookup).
+                    // This recovers the window where a prior delete was killed
+                    // between the route CAS and the enqueue, which under
+                    // EmbeddedWrh has no index-scan fallback.
+                    self.dispatch_cold_backing_delete(&route);
+                    return Ok(());
+                }
+                let mut deleting = route.clone();
+                deleting.version = route.version.next();
+                deleting.state = RouteState::Deleting;
+                if let Some(backing) = deleting.cold_backing.as_mut() {
+                    backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
+                }
+                let quota_reservation =
+                    self.reserve_tenant_quota_for_delete(object_id, object_key, &route)?;
+                let cas = self.route_ops().compare_and_swap_route(
+                    object_key,
+                    Some(route.version),
+                    Some(&deleting),
+                )?;
+                if cas.applied {
+                    self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
+                    self.storage_owner.sync_route(&deleting);
+                    self.dispatch_cold_backing_delete(&deleting);
+                    return Ok(());
+                }
+                let _ = self.abort_tenant_quota_reservation(
+                    quota_reservation.as_ref(),
+                    "cold_route_delete_compare_and_swap_conflict",
+                );
+                current = self.retry_route_delete_conflict(
+                    &route,
+                    cas.current,
+                    force,
+                    attempt,
+                    tenant,
+                    key,
+                )?;
+                continue;
+            }
             if has_nof && route.state == RouteState::Active {
                 let mut deleting = route.clone();
                 deleting.version = route.version.next();
@@ -430,15 +558,7 @@ impl StoreClient {
             };
             if cas.applied {
                 self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
-                if let Err(error) = self.schedule_route_reclaim(&route) {
-                    warn!(
-                        runtime = %self.lease.runtime,
-                        tenant,
-                        key,
-                        error = %error,
-                        "route delete reclaim scheduling failed after authoritative delete"
-                    );
-                }
+                self.schedule_reclaim_after_logical_remove(&route);
                 return Ok(());
             }
 
@@ -786,6 +906,208 @@ impl StoreClient {
             })
             .collect()
     }
+    fn allocation_lifecycle_owner_mode(
+        &self,
+        owner: &ClientRuntimeId,
+    ) -> AllocationLifecycleOwnerMode {
+        if *owner == self.lease.runtime {
+            return if self
+                .lease
+                .compatibility
+                .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY)
+            {
+                AllocationLifecycleOwnerMode::Lifecycle
+            } else {
+                AllocationLifecycleOwnerMode::Legacy
+            };
+        }
+        self.live_client_cache
+            .lock()
+            .snapshot()
+            .into_iter()
+            .flatten()
+            .find(|lease| lease.runtime == *owner)
+            .map_or(AllocationLifecycleOwnerMode::Unknown, |lease| {
+                if lease
+                    .compatibility
+                    .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY)
+                {
+                    AllocationLifecycleOwnerMode::Lifecycle
+                } else {
+                    AllocationLifecycleOwnerMode::Legacy
+                }
+            })
+    }
+
+    fn schedule_reclaim_after_logical_remove(&self, route: &ObjectRoute) {
+        let mut legacy_route = route.clone();
+        legacy_route.replicas.clear();
+        legacy_route.cold_backing = None;
+        let mut local_entries = Vec::new();
+        let mut remote_entries = Vec::new();
+        let reclaim_grace_ms = self.local_memory.reclaim_grace_ms;
+
+        for replica in &route.replicas {
+            let Some(allocation_id) = replica.allocation_id.filter(|allocation_id| *allocation_id != 0)
+            else {
+                legacy_route.replicas.push(replica.clone());
+                continue;
+            };
+            let entry = DeletePendingEntry {
+                route_key: route.key.clone(),
+                identity: Some(mooncake_store_core::AllocationRouteIdentity {
+                    owner: replica.owner.clone(),
+                    segment_name: replica.segment_name.clone(),
+                    offset_bytes: replica.segment_offset,
+                    length_bytes: replica.length,
+                    allocation_id,
+                }),
+                cold_backing: None,
+                reclaim_grace_ms,
+                prepare_only: false,
+                expected_route_version: Some(route.version),
+            };
+            match self.allocation_lifecycle_owner_mode(&replica.owner) {
+                AllocationLifecycleOwnerMode::Lifecycle => {
+                    if replica.owner == self.lease.runtime {
+                        local_entries.push(entry);
+                    } else {
+                        remote_entries.push(entry);
+                    }
+                }
+                AllocationLifecycleOwnerMode::Legacy => legacy_route.replicas.push(replica.clone()),
+                AllocationLifecycleOwnerMode::Unknown => {
+                    // A stale membership cache must not downgrade an upgraded owner to
+                    // the destructive legacy reclaim path. The async resolver refreshes
+                    // membership and notifies a lifecycle-capable owner when it returns.
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        storage_owner = %replica.owner,
+                        key = %route.key.0,
+                        allocation_id,
+                        "deferring delete reclaim until allocation-owner capability is known"
+                    );
+                    remote_entries.push(entry);
+                }
+            }
+        }
+
+        if !local_entries.is_empty() {
+            if let Err(error) = self.storage_owner.enqueue_delete_pending(&local_entries) {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    entries = local_entries.len(),
+                    error = %error,
+                    "best-effort local delete pending notification failed"
+                );
+            }
+        }
+        self.retain_remote_delete_pending_for_shutdown(&remote_entries);
+        self.async_delete_pending.enqueue(&remote_entries);
+
+        if !legacy_route.replicas.is_empty() {
+            if let Err(error) = self.schedule_route_reclaim(&legacy_route) {
+                warn!(
+                    runtime = %self.lease.runtime,
+                    key = %route.key.0,
+                    error = %error,
+                    "legacy route delete reclaim scheduling failed after authoritative delete"
+                );
+            }
+        }
+        self.dispatch_cold_backing_delete(route);
+    }
+
+    /// Dispatch the cold backing delete for `route` through the same durable
+    /// owner-local pending-delete queue used for DRAM allocations. Called from
+    /// both the cold-backed authoritative delete path and the post-delete
+    /// storage reclaim scheduler, so a short-lived writer that shuts down
+    /// before draining cannot leak the cold backing's used_bytes. A remote
+    /// owner receives it via the shutdown-retained delete-pending notification.
+    fn dispatch_cold_backing_delete(&self, route: &ObjectRoute) {
+        let Some(cold_backing) = route.cold_backing.as_ref() else {
+            return;
+        };
+        // Preserve the prior local untrack of the cold-only route view.
+        let mut cold_backing_route = route.clone();
+        cold_backing_route.replicas.clear();
+        self.storage_owner.untrack_route(&cold_backing_route);
+        let cold_entry = DeletePendingEntry {
+            route_key: route.key.clone(),
+            identity: None,
+            cold_backing: Some(crate::control_plane::ColdDeleteTarget {
+                owner: cold_backing.owner.clone(),
+                cold_tier_id: cold_backing.cold_tier_id.clone(),
+                object_locator: cold_backing.object_locator.clone(),
+                length: cold_backing.length,
+                checksum: cold_backing.checksum,
+            }),
+            reclaim_grace_ms: self.local_memory.reclaim_grace_ms,
+            prepare_only: false,
+            expected_route_version: Some(route.version),
+        };
+        if cold_backing.owner == self.lease.runtime {
+            if let Err(error) = self
+                .storage_owner
+                .enqueue_delete_pending(std::slice::from_ref(&cold_entry))
+            {
+                warn!(
+                    runtime = %self.lease.runtime,
+                    key = %route.key.0,
+                    error = %error,
+                    "local cold delete pending enqueue failed after authoritative delete"
+                );
+            }
+        } else {
+            self.retain_remote_delete_pending_for_shutdown(std::slice::from_ref(&cold_entry));
+            self.async_delete_pending.enqueue(std::slice::from_ref(&cold_entry));
+        }
+    }
+
+    fn retain_remote_delete_pending_for_shutdown(&self, entries: &[DeletePendingEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let overflow = {
+            let mut state = self.state.lock();
+            state.pending_delete_notifications.extend(entries.iter().cloned());
+            if state.pending_delete_notifications.len() <= PENDING_DELETE_SHUTDOWN_FLUSH_CAPACITY {
+                BTreeSet::new()
+            } else {
+                std::mem::take(&mut state.pending_delete_notifications)
+            }
+        };
+        if !overflow.is_empty() {
+            self.flush_remote_delete_pending_now(overflow);
+        }
+    }
+
+    fn flush_remote_delete_pending_now(&self, entries: BTreeSet<DeletePendingEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut forced = entries.into_iter().collect::<Vec<_>>();
+        for entry in &mut forced {
+            entry.reclaim_grace_ms = 0;
+        }
+        flush_async_delete_pending(
+            &self.lease.runtime,
+            self.metadata.as_ref(),
+            self.control_client.as_ref(),
+            &self.live_client_cache,
+            &forced,
+        );
+    }
+
+    fn flush_pending_delete_notifications_on_shutdown(&self) {
+        let entries = {
+            let mut state = self.state.lock();
+            std::mem::take(&mut state.pending_delete_notifications)
+        };
+        self.flush_remote_delete_pending_now(entries);
+    }
+
+
 }
 
 impl MooncakeCompatibilityFacade for StoreClient {
@@ -2076,6 +2398,10 @@ impl Drop for StoreClient {
         self.membership_sync.shutdown();
         self._async_eviction.shutdown();
         self.async_replica_tracking.shutdown();
+        self.async_delete_pending.shutdown();
+        if self.owns_local_state_lifecycle {
+            self.flush_pending_delete_notifications_on_shutdown();
+        }
         self.async_route_hit_reporting.shutdown();
         if self.owns_local_state_lifecycle
             && self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
@@ -2149,6 +2475,7 @@ impl Drop for StoreClient {
             let _ = memory.release_scratch(transport);
         }
     }
+
 }
 
 impl StoreClient {

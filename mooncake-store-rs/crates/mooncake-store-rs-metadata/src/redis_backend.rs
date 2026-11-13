@@ -968,9 +968,12 @@ struct RedisConnectionLease<'a> {
 
 impl RedisConnectionPool {
     fn new(client: redis::Client) -> Self {
-        let slots = (0..redis_connection_pool_size())
-            .map(|_| Mutex::new(None))
-            .collect();
+        Self::with_size(client, redis_connection_pool_size())
+    }
+
+    fn with_size(client: redis::Client, size: usize) -> Self {
+        assert!(size > 0, "redis connection pool must not be empty");
+        let slots = (0..size).map(|_| Mutex::new(None)).collect();
         Self {
             client,
             slots,
@@ -2027,6 +2030,7 @@ impl MetadataBackend for RedisMetadataBackend {
                 segment_name: segment.clone(),
                 offset_bytes: result.1 as u64,
                 length_bytes,
+                allocation_id: 0,
             }),
             _ if result.1 == -1 => Err(StoreError::NotFound(key)),
             _ if result.1 == -2 => Err(StoreError::InvalidState(format!(
@@ -3229,7 +3233,7 @@ mod tests {
         redis_connection_pool_size, redis_error_diagnostic_hint, redis_io_timeout,
         redis_retry_attempts, redis_retry_delay, resolve_redis_auth, scan_keys_bounded,
         should_log_redis_diagnostic_occurrence, should_retry_readonly_redis_error,
-        MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
+        MetadataKeyspace, RedisConnectionPool, RedisMetadataBackend, RedisMetadataConfig,
         DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECTION_POOL_SIZE,
         DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS,
         DEFAULT_REDIS_RETRY_DELAY, DEFAULT_TENANT_QUOTA_TERMINAL_TTL,
@@ -3399,6 +3403,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: sample_runtime(),
                 segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
                 offset: Some(32),
                 segment_offset: 32,
                 length: 12,
@@ -6024,6 +6029,33 @@ mod tests {
             wins.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "exactly one insert CAS must win"
+        );
+    }
+
+    #[test]
+    fn redis_backend_route_cas_completes_with_single_connection() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let mut backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-single-connection-cas")),
+        )
+        .expect("redis backend");
+        let client = redis::Client::open(server.url()).expect("redis client");
+        backend.connection_pool = Arc::new(RedisConnectionPool::with_size(client, 1));
+
+        let key = ObjectKey::new("single-connection-key");
+        let mut route = sample_route(1);
+        route.key = key.clone();
+        let result = backend
+            .compare_and_swap_object_route(&key, None, Some(&route))
+            .expect("CAS must not require a second pooled connection");
+
+        assert!(result.applied);
+        assert_eq!(
+            backend.get_object_route(&key).unwrap().unwrap().version,
+            RouteVersion(1)
         );
     }
 

@@ -47,6 +47,7 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
             offset: Some(0),
             segment_offset: 0,
             length: 64,
+            allocation_id: None,
             checksum: None,
             tier: ReplicaTier::Dram,
             priority: 0,

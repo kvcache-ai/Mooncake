@@ -17,8 +17,10 @@ service ControlPlaneService {
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
   rpc ListRoutesByReplicaOwner(ListRoutesByReplicaOwnerRequest) returns (ListRoutesByReplicaOwnerReply);
+  rpc GetAllocationRouteReferences(GetAllocationRouteReferencesRequest) returns (GetAllocationRouteReferencesReply);
   rpc BatchReportRouteHits(BatchReportRouteHitsRequest) returns (BatchReportRouteHitsReply);
   rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
+  rpc BatchNotifyDeletePending(BatchNotifyDeletePendingRequest) returns (BatchNotifyDeletePendingReply);
   rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
   rpc GetMigrationExecutionStatus(GetMigrationExecutionStatusRequest) returns (GetMigrationExecutionStatusReply);
   rpc TriggerColdTierOffload(TriggerColdTierOffloadRequest) returns (TriggerColdTierOffloadReply);
@@ -45,6 +47,7 @@ enum ErrorKind {
   ERROR_KIND_ALLOCATOR = 6;
   ERROR_KIND_METADATA = 7;
   ERROR_KIND_TRANSPORT = 8;
+  ERROR_KIND_BACKPRESSURE = 9;
 }
 
 message ErrorDetail {
@@ -118,6 +121,7 @@ message ReplicaRoute {
   optional uint64 checksum = 6;
   ReplicaTier tier = 7;
   uint32 priority = 8;
+  optional uint64 allocation_id = 9;
 }
 
 message ColdBackingRoute {
@@ -174,6 +178,7 @@ message CasResult {
   bool applied = 1;
   ObjectRoute current = 2;
   optional uint64 version_floor = 3;
+  optional uint64 delete_version = 4;
 }
 
 message SegmentReservation {
@@ -181,6 +186,7 @@ message SegmentReservation {
   string segment_name = 2;
   uint64 offset_bytes = 3;
   uint64 length_bytes = 4;
+  uint64 allocation_id = 5;
 }
 
 message GetRouteRequest {
@@ -192,6 +198,7 @@ message GetRouteRequest {
 message GetRouteReply {
   ObjectRoute route = 1;
   ErrorDetail error = 2;
+  optional uint64 delete_version = 3;
 }
 
 message BatchGetRoutesRequest {
@@ -262,6 +269,8 @@ message ReplaceRouteReply {
 message RouteReplaceEntry {
   string key = 1;
   ObjectRoute next = 2;
+  // Delete-marker version for replacement without a live route, not a CAS precondition.
+  optional uint64 delete_version = 3;
 }
 
 message BatchReplaceRoutesRequest {
@@ -277,6 +286,7 @@ message BatchReplaceRoutesReply {
 message ReserveAnyRequest {
   ClientRuntimeId owner = 1;
   uint64 length_bytes = 2;
+  bool pending_publication = 3;
 }
 
 message ReserveAnyReply {
@@ -287,6 +297,7 @@ message ReserveAnyReply {
 message BatchReserveAnyRequest {
   ClientRuntimeId owner = 1;
   repeated uint64 length_bytes = 2;
+  bool pending_publication = 3;
 }
 
 message BatchReserveAnyReply {
@@ -297,6 +308,7 @@ message ReserveSpecificRequest {
   ClientRuntimeId owner = 1;
   string segment_name = 2;
   uint64 length_bytes = 3;
+  bool pending_publication = 4;
 }
 
 message ReserveSpecificReply {
@@ -312,6 +324,7 @@ message ReserveSpecificEntry {
 message BatchReserveSpecificRequest {
   ClientRuntimeId owner = 1;
   repeated ReserveSpecificEntry entries = 2;
+  bool pending_publication = 3;
 }
 
 message BatchReserveSpecificReply {
@@ -323,6 +336,7 @@ message ReleaseRequest {
   string segment_name = 2;
   uint64 offset_bytes = 3;
   uint64 length_bytes = 4;
+  uint64 allocation_id = 5;
 }
 
 message ReleaseReply {
@@ -333,6 +347,7 @@ message ReleaseEntry {
   string segment_name = 1;
   uint64 offset_bytes = 2;
   uint64 length_bytes = 3;
+  uint64 allocation_id = 4;
 }
 
 message BatchReleaseRequest {
@@ -350,12 +365,43 @@ message ListRoutesByReplicaOwnerRequest {
   ClientRuntimeId owner = 3;
   optional string cursor = 4;
   uint32 limit = 5;
+  optional uint64 snapshot_epoch = 6;
 }
 
 message ListRoutesByReplicaOwnerReply {
   repeated ObjectRoute routes = 1;
   ErrorDetail error = 2;
   optional string next_cursor = 3;
+  optional uint64 snapshot_epoch = 4;
+}
+
+message AllocationRouteIdentity {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset_bytes = 3;
+  uint64 length_bytes = 4;
+  uint64 allocation_id = 5;
+}
+
+message AllocationRouteReferenceState {
+  oneof state {
+    bool absent = 1;
+    bool exact = 2;
+    bool conflict = 3;
+  }
+  string route_key = 4;
+}
+
+message GetAllocationRouteReferencesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated AllocationRouteIdentity identities = 3;
+  bool include_route_key = 4;
+}
+
+message GetAllocationRouteReferencesReply {
+  repeated AllocationRouteReferenceState references = 1;
+  ErrorDetail error = 2;
 }
 
 message BatchReportRouteHitsRequest {
@@ -372,6 +418,24 @@ message BatchTrackReplicaRoutesRequest {
 }
 
 message BatchTrackReplicaRoutesReply {
+  uint64 accepted = 1;
+  ErrorDetail error = 2;
+}
+
+message DeletePendingEntry {
+  string route_key = 1;
+  AllocationRouteIdentity identity = 2;
+  uint64 reclaim_grace_ms = 3;
+  bool prepare_only = 4;
+  optional uint64 expected_route_version = 5;
+  ColdBackingRoute cold_backing = 6;
+}
+
+message BatchNotifyDeletePendingRequest {
+  repeated DeletePendingEntry entries = 1;
+}
+
+message BatchNotifyDeletePendingReply {
   uint64 accepted = 1;
   ErrorDetail error = 2;
 }
@@ -582,6 +646,8 @@ message PinForReadReply {
 message ControlStreamRequest {
   uint64 request_id = 1;
   oneof body {
+    BatchNotifyDeletePendingRequest eviction_notify_delete_pending = 14;
+
     BatchGetRoutesRequest route_get = 2;
     BatchCompareAndSwapRoutesRequest route_cas = 3;
     BatchReplaceRoutesRequest route_replace = 4;
@@ -598,6 +664,8 @@ message ControlStreamRequest {
 message ControlStreamReply {
   uint64 request_id = 1;
   oneof body {
+    BatchNotifyDeletePendingReply eviction_notify_delete_pending = 14;
+
     BatchGetRoutesReply route_get = 2;
     BatchCompareAndSwapRoutesReply route_cas = 3;
     BatchReplaceRoutesReply route_replace = 4;
