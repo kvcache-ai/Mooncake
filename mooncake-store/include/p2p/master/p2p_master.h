@@ -28,8 +28,8 @@ class P2PMaster {
     static void HandleSignal(int signal);
     int RunStandalone();
     int RunWithHA();
-    static void DrainOpLogAfterStepdown(OpLogManager& manager,
-                                        uint32_t timeout_ms);
+    static bool DrainOpLogBeforeStop(OpLogManager& manager, uint32_t timeout_ms,
+                                     const char* reason = "stepdown");
     int RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                             P2PMasterRpcService& service,
                             std::function<void()> before_start = {},

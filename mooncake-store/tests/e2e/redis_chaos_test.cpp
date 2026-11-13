@@ -23,9 +23,11 @@
 #include <vector>
 
 #include "e2e_utils.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p/ha/oplog/redis_oplog_store.h"
+#include "p2p/master/p2p_master_client.h"
 #include "process_handler.h"
 #include "p2p/ha/p2p_master_view.h"
 #include "../p2p/redis_test_utils.h"
@@ -754,6 +756,82 @@ TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
         WaitForMasterLog(leader, "released=1", std::chrono::seconds(1)));
     EXPECT_TRUE(WaitForMasterLog(leader, "HA shutdown completed",
                                  std::chrono::seconds(1)));
+}
+
+TEST_F(RedisGracefulShutdownTest,
+       SigtermDrainsAcknowledgedRouteBeforeTakeover) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    const auto client_id = generate_uuid();
+    P2PMasterClient client(client_id);
+    client.SetHeartbeatRpcPort(55051 + leader);
+    ASSERT_EQ(
+        client.Connect("127.0.0.1:" + std::to_string(kMasterPortBase + leader)),
+        ErrorCode::OK);
+    P2PSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "sigterm-drain";
+    segment.size = 4096;
+    segment.memory_type = MemoryType::DRAM;
+    ASSERT_TRUE(client
+                    .RegisterClient({.client_id = client_id,
+                                     .segments = {segment},
+                                     .ip_address = "127.0.0.1",
+                                     .rpc_port = kClientPortBase})
+                    .has_value());
+    ASSERT_TRUE(client
+                    .Heartbeat({.client_id = client_id,
+                                .service_state = P2PClientServiceState::ONLINE})
+                    .has_value());
+
+    auto [host, port] = ParseRedisEndpoint();
+    auto ctx = std::unique_ptr<redisContext, decltype(&redisFree)>(
+        redisConnect(host.c_str(), port), redisFree);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx.get(), FLAGS_redis_username,
+                                         FLAGS_redis_password));
+    const auto log_offset = MasterLogEndOffset(leader);
+    // Redis 6 also supports PAUSE (all commands). Keep this below both the
+    // 3s command/drain timeout and the 10s lease. RPC and cached HTTP status
+    // remain live, so an acknowledgement with pending writes proves that the
+    // request has returned before persistence, without client-side republish.
+    RedisReplyPtr paused(
+        (redisReply*)redisCommand(ctx.get(), "CLIENT PAUSE 2000"));
+    ASSERT_TRUE(paused && paused->type == REDIS_REPLY_STATUS);
+    const std::string key = "acknowledged_before_sigterm";
+    ASSERT_TRUE(client
+                    .PublishRoute({.key = key,
+                                   .object_size = 128,
+                                   .client_id = client_id,
+                                   .segment_id = segment.id})
+                    .has_value());
+    coro_http::coro_http_client http;
+    auto response = http.get(
+        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/status");
+    ASSERT_EQ(response.status, 200);
+    HAStatusSnapshot status;
+    struct_json::from_json(status, response.resp_body);
+    ASSERT_GT(status.oplog_writer_pending_writes, 0u);
+
+    ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(8)));
+    EXPECT_TRUE(WaitForMasterLogOrderSince(
+        leader, "P2P primary shutdown OpLog drain completed", "released=1",
+        log_offset, std::chrono::seconds(1)));
+    ASSERT_TRUE(WaitForReplicaOpLog(key, std::chrono::seconds(2)));
+    int next_leader = -1;
+    ViewVersionId next_version = 0;
+    ASSERT_TRUE(WaitForNewLeader(leader, version, next_leader, next_version));
+    WaitForLeaderServiceReady();
+    client.SetHeartbeatRpcPort(55051 + next_leader);
+    ASSERT_EQ(client.Connect("127.0.0.1:" +
+                             std::to_string(kMasterPortBase + next_leader)),
+              ErrorCode::OK);
+    // Query the recovered metadata directly: no re-registration or publish.
+    const auto owners = client.GetKeyClients(key);
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1u);
+    EXPECT_EQ(owners->front().client_id, client_id);
 }
 
 TEST_F(RedisGracefulShutdownTest, PrimaryStepDownReleasesLeaseBeforeTTL) {

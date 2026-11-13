@@ -577,7 +577,13 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
         server_->register_handler<&GatedRpcHandler::WaitForRelease>(&handler_);
 
         std::packaged_task<int()> run([this] {
-            return master_->RunActiveRpcServers(*server_, *service_);
+            return master_->RunActiveRpcServers(
+                *server_, *service_, {},
+                [this] {
+                    handler_exited_before_drain_ = handler_.HasExited();
+                    after_stop_called_ = true;
+                },
+                [this] { return shutdown_requested_.load(); });
         });
         run_result_ = run.get_future();
         run_thread_ = std::thread(std::move(run));
@@ -657,6 +663,9 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
     std::future<int> run_result_;
     std::future<void> request_result_;
     std::future<void> stop_result_;
+    std::atomic<bool> shutdown_requested_{false};
+    std::atomic<bool> after_stop_called_{false};
+    bool handler_exited_before_drain_{false};
 };
 
 TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
@@ -680,6 +689,7 @@ TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
     EXPECT_EQ(stop_result_.wait_for(std::chrono::milliseconds(0)),
               std::future_status::timeout);
     EXPECT_FALSE(handler_.HasExited());
+    EXPECT_FALSE(after_stop_called_.load());
 
     handler_.Release();
     ASSERT_EQ(run_result_.wait_for(kTimeout), std::future_status::ready);
@@ -688,10 +698,35 @@ TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
     const int run_result = run_result_.get();
     EXPECT_TRUE(run_result == 0 || run_result == -1);
     EXPECT_TRUE(handler_.HasExited());
+    EXPECT_TRUE(after_stop_called_.load());
+    EXPECT_TRUE(handler_exited_before_drain_);
     ASSERT_EQ(stop_result_.wait_for(kTimeout), std::future_status::ready);
     stop_result_.get();
     ASSERT_EQ(request_result_.wait_for(kTimeout), std::future_status::ready);
     request_result_.get();
+    if (heartbeat_port_ > 0) {
+        EXPECT_TRUE(WaitForListenerClosed(heartbeat_port_));
+    }
+}
+
+TEST_P(P2PMasterRpcShutdownTest, ShutdownDrainsOnlyAfterInFlightRpcReturns) {
+    std::packaged_task<void()> request([this] {
+        (void)async_simple::coro::syncAwait(
+            client_->call_for<&GatedRpcHandler::WaitForRelease>(kTimeout));
+    });
+    request_result_ = request.get_future();
+    request_thread_ = std::thread(std::move(request));
+    ASSERT_EQ(handler_.WaitForEntry(kTimeout), std::future_status::ready);
+    shutdown_requested_ = true;
+    ASSERT_TRUE(WaitForListenerClosed(server_->port()));
+    EXPECT_FALSE(after_stop_called_.load());
+    EXPECT_EQ(run_result_.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    handler_.Release();
+    ASSERT_EQ(run_result_.wait_for(kTimeout), std::future_status::ready);
+    EXPECT_EQ(run_result_.get(), 0);
+    EXPECT_TRUE(after_stop_called_.load());
+    EXPECT_TRUE(handler_exited_before_drain_);
     if (heartbeat_port_ > 0) {
         EXPECT_TRUE(WaitForListenerClosed(heartbeat_port_));
     }
@@ -752,8 +787,8 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
                 HAStatusManager::instance().SetRoleState("primary", "RUNNING");
             },
             [oplog_manager, &drain_timeout_ms] {
-                P2PMaster::DrainOpLogAfterStepdown(*oplog_manager,
-                                                   drain_timeout_ms.load());
+                P2PMaster::DrainOpLogBeforeStop(*oplog_manager,
+                                                drain_timeout_ms.load());
             },
             /*stopping=*/{},
             [&stepdown_requested] { return stepdown_requested.load(); });
@@ -907,7 +942,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainDiagnosticsSurviveDemotionAndRecover) {
     };
 
     // Exercise the same drain/diagnostic path as the real HA supervisor.
-    P2PMaster::DrainOpLogAfterStepdown(manager, 1234);
+    P2PMaster::DrainOpLogBeforeStop(manager, 1234);
     EXPECT_EQ(store->last_timeout_ms, 1234u);
     auto report = read_doctor();
     auto issue = find_drain(report);
@@ -945,7 +980,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainDiagnosticsSurviveDemotionAndRecover) {
     // A later successful drain clears this failure and its last_error.
     status.SetRoleState("primary", "RUNNING");
     store->result = {true, 0, 0, 13, 13};
-    P2PMaster::DrainOpLogAfterStepdown(manager, 3000);
+    P2PMaster::DrainOpLogBeforeStop(manager, 3000);
     report = read_doctor();
     EXPECT_EQ(find_drain(report), report.issues.end());
     EXPECT_EQ(report.health, "ok");
@@ -953,16 +988,30 @@ TEST_F(P2PMasterRpcTest, StepdownDrainDiagnosticsSurviveDemotionAndRecover) {
 
     // Recovery must not erase an unrelated, more recent error.
     store->result = {false, 2, 1, 10, 13};
-    P2PMaster::DrainOpLogAfterStepdown(manager, 0);
+    P2PMaster::DrainOpLogBeforeStop(manager, 0);
     status.SetLastError("unrelated registry failure");
     store->result = {true, 0, 0, 13, 13};
-    P2PMaster::DrainOpLogAfterStepdown(manager, 3000);
+    P2PMaster::DrainOpLogBeforeStop(manager, 3000);
     report = read_doctor();
     EXPECT_EQ(find_drain(report), report.issues.end());
     EXPECT_EQ(read_last_error(), "unrelated registry failure");
 
     store->result = {false, 2, 1, 10, 13};
-    P2PMaster::DrainOpLogAfterStepdown(manager, 0);
+    EXPECT_FALSE(P2PMaster::DrainOpLogBeforeStop(manager, 50, "shutdown"));
+    EXPECT_NE(read_last_error().find("shutdown OpLog drain incomplete"),
+              std::string::npos);
+    // A successful drain clears an older drain failure from either reason.
+    store->result = {true, 0, 0, 13, 13};
+    EXPECT_TRUE(P2PMaster::DrainOpLogBeforeStop(manager, 3000));
+    EXPECT_TRUE(read_last_error().empty());
+    store->result = {false, 2, 1, 10, 13};
+    EXPECT_FALSE(P2PMaster::DrainOpLogBeforeStop(manager, 0));
+    store->result = {true, 0, 0, 13, 13};
+    EXPECT_TRUE(P2PMaster::DrainOpLogBeforeStop(manager, 3000, "shutdown"));
+    EXPECT_TRUE(read_last_error().empty());
+
+    store->result = {false, 2, 1, 10, 13};
+    P2PMaster::DrainOpLogBeforeStop(manager, 0);
     status
         .ClearDoctorIssues();  // Explicit clearing keeps its original meaning.
     report = read_doctor();

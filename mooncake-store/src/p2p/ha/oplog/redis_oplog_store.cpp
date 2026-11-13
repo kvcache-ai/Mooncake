@@ -301,7 +301,7 @@ void RedisOpLogStore::RequestStopWriting() {
 
 OpLogDrainResult RedisOpLogStore::DrainWriting(uint32_t timeout_ms) {
     OpLogDrainResult result;
-    if (!enable_write_ || !async_running_.load()) {
+    if (!enable_write_) {
         return result;
     }
 
@@ -315,7 +315,9 @@ OpLogDrainResult RedisOpLogStore::DrainWriting(uint32_t timeout_ms) {
     };
 
     snapshot();
-    if (result.drained || timeout_ms == 0) {
+    // A lease-loss cancellation can win just before drain starts. Report the
+    // actual pending work instead of the default successful result.
+    if (result.drained || !async_running_.load() || timeout_ms == 0) {
         return result;
     }
     // A leadership-loss cancellation during an active stepdown drain must not
