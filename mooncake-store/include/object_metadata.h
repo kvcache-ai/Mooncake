@@ -116,6 +116,10 @@ struct ObjectMetadata {
     const std::string user_key;
     const uint8_t key_group;
 
+    // Exact completion identity for writes crossing an object lifecycle
+    // boundary.
+    HeapOptional<ObjectWriteAttempt> object_storage_write_attempt;
+
     // Committed attribution only; protected by the key's lock.
     std::string session_id;
     struct PendingSessionTag {

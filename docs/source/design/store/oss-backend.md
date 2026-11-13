@@ -6,7 +6,8 @@ The object-storage backend extends Mooncake Store's client-owned offload path
 to key-based storage services, such as OSS and S3, through service-specific
 adapters. It uses the same `LOCAL_DISK` replica model as local-file and NVMe KV
 backends: the master records an owner and the requesting client reads through
-that owner. Object storage is not a separate first-class replica type here.
+that owner. Object storage is not a separate first-class replica type in this offload path.
+For synchronous first-class replicas, see [同步对象存储副本](object-storage-sync.md).
 
 This document describes the OSS adapter implementation. Its signing protocol
 is OSS-specific. S3-compatible services use the separate S3 adapter

@@ -95,6 +95,12 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
  */
 class MasterClient {
    public:
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(
+        const std::string&, ObjectUploadOutcome);
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const std::string&, const ObjectWriteAttempt&);
+
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),

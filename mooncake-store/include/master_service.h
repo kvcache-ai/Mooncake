@@ -28,6 +28,8 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "storage/distributed/object_replica_io.h"
+#include "storage/distributed/object_replica_state.h"
 #include "allocation_strategy.h"
 #include "background_worker.h"
 #include "client_liveness.h"
@@ -114,6 +116,17 @@ class MasterService {
     using BatchOpLogWriterFactory =
         std::function<std::unique_ptr<OrderedOpLogWriter>(
             OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
+
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(const UUID&,
+                                                            const std::string&,
+                                                            ObjectUploadOutcome,
+                                                            const TenantId&);
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const UUID&, const std::string&, const ObjectWriteAttempt&,
+        const TenantId&);
+    tl::expected<void, ErrorCode> RestoreObjectStorage(
+        const ObjectReplicaSnapshot&);
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -2312,6 +2325,47 @@ class MasterService {
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
+
+    tl::expected<void, ErrorCode> AwaitObjectMutations();
+    auto RemoveObjectImpl(const std::string&, const TenantId&, bool, bool)
+        -> tl::expected<void, ErrorCode>;
+    uint64_t object_storage_last_sequence_{0};
+    ObjectStorageConfig object_storage_config_;
+    std::shared_ptr<ObjectStorageAdapter> object_storage_adapter_;
+    std::unique_ptr<StandbyMetadataStore> object_uploads_;
+    std::mutex object_storage_mutex_;
+    std::unordered_map<std::string, uint64_t> object_upload_sequences_;
+    std::string object_cleanup_cursor_;
+    std::string object_scan_cursor_;
+    std::chrono::steady_clock::time_point object_cleanup_after_{};
+    void InitObjectStorage(const MasterServiceConfig&);
+    void MaintainObjectStorage();
+    tl::expected<void, ErrorCode> AuthorizeObjectStorage(const UUID&,
+                                                         const TenantId&,
+                                                         const std::string&,
+                                                         uint64_t,
+                                                         std::vector<Replica>&);
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+        AwaitObjectAuthorization(
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>);
+    tl::expected<void, ErrorCode> CommitObjectStorage(const UUID&,
+                                                      const ObjectMeta&,
+                                                      const TenantId&,
+                                                      ReplicaType);
+    tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t);
+    tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
+    CommitObjectAware(OrderedOpLogWriter::Reservation&&, OpLogEntry,
+                      DurableFinalizeCallback);
+    auto PutStartImpl(const UUID&, const std::string&, const TenantId&,
+                      uint64_t, const ReplicateConfig&)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto UpsertStartImpl(const UUID&, const std::string&, const TenantId&,
+                         uint64_t, const ReplicateConfig&)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutEndImpl(const UUID&, const ObjectMeta&, const TenantId&,
+                    ReplicaType, bool persist = true,
+                    WeightStoreManager::ImportWriteGuard* admission = nullptr)
+        -> tl::expected<void, ErrorCode>;
 
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;

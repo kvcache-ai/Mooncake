@@ -1367,6 +1367,7 @@ class RealClient : public PyClient {
 
     struct SessionRangeReadPlan {
         std::vector<SessionRangeReadRequest> memory_requests;
+        std::vector<SessionRangeReadRequest> object_requests;
         std::vector<SessionRangeReadRequest> dfs_requests;
         std::vector<SessionRangeReadRequest> local_disk_requests;
         std::vector<SessionRangeReadRequest> disk_requests;
@@ -1398,6 +1399,9 @@ class RealClient : public PyClient {
     SessionRangeReadPlan classify_session_range_read_requests(
         std::vector<SessionRangeReadRequest> requests,
         std::vector<int> &results);
+
+    void execute_session_object_range_reads(
+        const std::vector<SessionRangeReadRequest> &, std::vector<int> &);
 
     void execute_session_memory_range_reads(
         const std::vector<SessionRangeReadRequest> &requests,

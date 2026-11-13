@@ -466,6 +466,48 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
+tl::expected<ObjectStorageConfig, ErrorCode>
+WrappedMasterService::GetObjectStorageConfig() {
+    return execute_rpc(
+        "GetObjectStorageConfig",
+        [&] { return master_service_.GetObjectStorageConfig(); }, [](auto&) {},
+        [] {}, [] {});
+}
+tl::expected<void, ErrorCode> WrappedMasterService::FinishObjectStorageUpload(
+    const UUID& writer, const std::string& name, ObjectUploadOutcome outcome,
+    const std::string& tenant) {
+    return execute_rpc(
+        "FinishObjectStorageUpload",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& id) {
+                    return master_service_.FinishObjectStorageUpload(
+                        writer, name, outcome, id);
+                });
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+tl::expected<void, ErrorCode> WrappedMasterService::RevokeObjectStorageWrite(
+    const UUID& writer, const std::string& key,
+    const ObjectWriteAttempt& attempt, const std::string& tenant) {
+    return execute_rpc(
+        "RevokeObjectStorageWrite",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& id) {
+                    return master_service_.RevokeObjectStorageWrite(
+                        writer, key, attempt, id);
+                });
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
@@ -2083,6 +2125,9 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::GetObjectStorageConfig,
+        &WrappedMasterService::FinishObjectStorageUpload,
+        &WrappedMasterService::RevokeObjectStorageWrite,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,

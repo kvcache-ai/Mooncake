@@ -23,6 +23,19 @@ class HttpMetadataServer;
 class WrappedMasterService {
    public:
     store::GatherReadDirectory gather_directory;
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> RestoreObjectStorage(
+        const ObjectReplicaSnapshot& snapshot) {
+        return master_service_.RestoreObjectStorage(snapshot);
+    }
+
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(
+        const UUID&, const std::string&, ObjectUploadOutcome,
+        const std::string& tenant_id = "default");
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const UUID&, const std::string&, const ObjectWriteAttempt&,
+        const std::string& tenant_id = "default");
+
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();

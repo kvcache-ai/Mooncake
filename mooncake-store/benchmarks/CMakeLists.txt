@@ -17,7 +17,7 @@ target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
-                                                       mooncake_store)
+                                                      mooncake_store)
 
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
@@ -43,7 +43,7 @@ target_link_libraries(
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
-                                                       gflags::gflags)
+                                                      gflags::gflags)
 endif()
 
 # Add BatchEvict benchmark executable
@@ -69,3 +69,7 @@ target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
 # Add group index write path benchmark executable
 add_executable(group_index_contention_bench group_index_contention_bench.cpp)
 target_link_libraries(group_index_contention_bench PRIVATE mooncake_store)
+
+add_executable(object_storage_bench object_storage_bench.cpp)
+target_link_libraries(object_storage_bench PRIVATE mooncake_store
+                                                   gflags::gflags glog::glog)

@@ -1,4 +1,6 @@
 #pragma once
+#include <optional>
+#include "config/object_storage_config.h"
 
 #include <map>
 #include <span>
@@ -18,6 +20,10 @@ namespace mooncake {
 class OssObjectStorageAdapter : public ObjectStorageAdapter {
    public:
     explicit OssObjectStorageAdapter(std::string key_prefix);
+    explicit OssObjectStorageAdapter(ObjectReplicaTarget target)
+        : OssObjectStorageAdapter(target.prefix) {
+        target_ = std::move(target);
+    }
     ~OssObjectStorageAdapter() override = default;
 
     tl::expected<void, ErrorCode> Put(const std::string& logical_key,
@@ -52,6 +58,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<size_t, ErrorCode> GetSize(const std::string& logical_key);
 
    private:
+    std::optional<ObjectReplicaTarget> target_;
     struct Response {
         long status = 0;
         size_t transferred = 0;

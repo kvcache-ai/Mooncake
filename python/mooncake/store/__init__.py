@@ -16,6 +16,7 @@ _CPP_EXPORTS = frozenset(
         "ReplicaStatus",
         "MemoryDescriptor",
         "DiskDescriptor",
+        "ObjectStorageDescriptor",
         "ReplicaDescriptor",
         "Descriptor",
         "TaskType",

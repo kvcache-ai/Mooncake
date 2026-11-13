@@ -18,6 +18,7 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    bool object_storage_commit_pending{false};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
