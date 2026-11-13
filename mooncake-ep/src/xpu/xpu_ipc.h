@@ -35,6 +35,7 @@ class XpuIpcBuffer {
     XpuIpcBuffer& operator=(const XpuIpcBuffer&) = delete;
 
     void* base() const { return base_; }
+    ze_context_handle_t zeContext() const { return ze_ctx_; }
 
     // [pid, size, pid-namespace id, ipc handle words...], exchanged by the
     // caller.

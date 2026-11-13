@@ -330,14 +330,18 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 
 ### Intra-Node NVLink (nvlink_intra)
 
-**Description:** NVIDIA NVLink for GPU-to-GPU communication within a single node.
+**Description:** GPU-to-GPU copies within a single node through CUDA IPC. Despite the name, the copy
+uses whatever peer-to-peer path the driver provides: NVLink when present, otherwise PCIe P2P.
 
 **Use When:**
 - Local GPU-to-GPU transfers are needed
 - Maximizing intra-node GPU bandwidth
+- PCIe-only nodes without an RDMA NIC, where the automatic selection otherwise falls back to TCP
 
 **Requirements:**
-- NVIDIA NVLink hardware
+- GPU peer-to-peer access between the GPUs involved: NVLink, or PCIe P2P on PCIe-only systems.
+  Check with `nvidia-smi topo -p2p r`; only a pair reported as `OK` can use this transport
+  (`NS`, `CNS`, `GNS`, `TNS`, or `U` all indicate P2P is unavailable).
 - Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
 - Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
 - Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
@@ -349,6 +353,31 @@ export MC_INTRANODE_NVLINK=true
 ```
 
 **Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
+
+On a node with no HCA, that TCP fallback stages every GPU buffer through host memory and a TCP
+socket, so it is far slower than a direct peer copy. For example, on 8x H200 NVL PCIe
+(the PCIe-baseboard variant: PCIe Gen5, no NVLink, no RDMA NIC), a 1 GiB GPU-to-GPU
+`transfer_sync_write` with the 0.3.14 wheel measured:
+
+| Transport | GPU pair | Bandwidth |
+|---|---|---|
+| TCP (default when no HCA) | same CPU socket | 1.3 GB/s |
+| `nvlink_intra` (`MC_INTRANODE_NVLINK=true`) | same CPU socket | 52 GB/s |
+| `nvlink_intra` (`MC_INTRANODE_NVLINK=true`) | across CPU sockets | 37 GB/s |
+
+Independently reproduced on 8x NVIDIA RTX PRO 5000 72GB Blackwell (PCIe Gen5, no NVLink,
+`nvidia-smi topo -p2p r` all `OK`), built from source at `main` with `-DUSE_CUDA=ON
+-DUSE_INTRA_NVLINK=ON`: 52.6 GB/s (same CPU socket) and 38.8 GB/s (across CPU sockets) for the
+same 1 GiB `transfer_sync_write`, with a full byte comparison of the received buffer. The engine
+log shows `Using Intra-Node NVLink transport (MC_INTRANODE_NVLINK set)` and
+`using cudaMemcpyBatchAsync (CUDA >= 13.0 path)` in both runs.
+
+Two-process setup notes: `P2PHANDSHAKE` discovery relies on the Python `get_rpc_port()` flow.
+The C++ `transfer_engine_bench` needs an etcd metadata server instead
+(`--metadata_server=host:2379`): with `MC_INTRANODE_NVLINK` set the engine installs only this
+transport, and no transport then starts the handshake daemon on the default port. Running both
+peers in the same container (`docker run --ipc=host`) satisfies the IPC/PID namespace
+requirement.
 
 ### HIP Transport (hip)
 
@@ -412,7 +441,7 @@ export MC_INTRANODE_NVLINK=true
 
 ### Ascend Transport (ascend)
 
-**Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
+**Description:** Huawei Ascend NPU communication using the Ascend Direct transport (ADXL engine). The legacy HCCL transport is deprecated and is no longer built.
 
 **Use When:**
 - Working with Huawei Ascend NPUs
@@ -420,11 +449,11 @@ export MC_INTRANODE_NVLINK=true
 
 **Requirements:**
 - Huawei Ascend NPU hardware
-- HCCL runtime
+- Ascend CANN toolkit with ADXL/HIXL support
 
 **Documentation:**
 - [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+- [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
 
 ### Hylink Transport (hylink)
 

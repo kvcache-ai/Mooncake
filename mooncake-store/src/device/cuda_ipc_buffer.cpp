@@ -25,6 +25,40 @@ bool AddOverflows(uint64_t a, uint64_t b) {
 
 void ClearCudaError() { cudaGetLastError(); }
 
+tl::expected<int32_t, ErrorCode> ResolveCudaDevice(
+    const CudaIpcBufferHandle &handle) {
+    if (!handle.has_device_uuid) {
+        if (handle.device_id < 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return handle.device_id;
+    }
+
+    if (cuInit(0) != CUDA_SUCCESS) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    int device_count = 0;
+    if (cuDeviceGetCount(&device_count) != CUDA_SUCCESS) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    for (int device_id = 0; device_id < device_count; ++device_id) {
+        CUdevice device = 0;
+        CUuuid uuid{};
+        if (cuDeviceGet(&device, device_id) != CUDA_SUCCESS ||
+            cuDeviceGetUuid(&uuid, device) != CUDA_SUCCESS) {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        static_assert(sizeof(uuid.bytes) == kCudaDeviceUuidSize,
+                      "Unexpected CUDA UUID size");
+        if (std::memcmp(uuid.bytes, handle.device_uuid.data(),
+                        kCudaDeviceUuidSize) == 0) {
+            return device_id;
+        }
+    }
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+}
+
 using CuMemGetAddressRangeFn = CUresult (*)(CUdeviceptr *, size_t *,
                                             CUdeviceptr);
 
@@ -114,6 +148,16 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
     exported.offset = offset;
     exported.size = payload_size;
     exported.device_id = attr.device;
+    CUdevice device = 0;
+    CUuuid uuid{};
+    if (cuDeviceGet(&device, attr.device) != CUDA_SUCCESS ||
+        cuDeviceGetUuid(&uuid, device) != CUDA_SUCCESS) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    static_assert(sizeof(uuid.bytes) == kCudaDeviceUuidSize,
+                  "Unexpected CUDA UUID size");
+    std::memcpy(exported.device_uuid.data(), uuid.bytes, kCudaDeviceUuidSize);
+    exported.has_device_uuid = true;
     return exported;
 #else
     (void)ptr;
@@ -178,14 +222,18 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize,
                   "Unexpected CUDA IPC handle size");
 
-    if (handle.size == 0 || handle.device_id < 0 ||
-        AddOverflows(handle.offset, handle.size)) {
+    if (handle.size == 0 || AddOverflows(handle.offset, handle.size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto resolved_device = ResolveCudaDevice(handle);
+    if (!resolved_device.has_value()) {
+        return tl::unexpected(resolved_device.error());
     }
 
     int current_device = -1;
     cudaGetDevice(&current_device);
-    if (cudaSetDevice(handle.device_id) != cudaSuccess) {
+    if (cudaSetDevice(*resolved_device) != cudaSuccess) {
         ClearCudaError();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -216,7 +264,7 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     }
 
     auto *ptr = static_cast<char *>(base) + handle.offset;
-    return CudaIpcBufferMapping(base, ptr, handle.device_id);
+    return CudaIpcBufferMapping(base, ptr, *resolved_device);
 #else
     (void)handle;
     return tl::unexpected(ErrorCode::INVALID_PARAMS);

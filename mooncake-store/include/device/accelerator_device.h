@@ -20,6 +20,7 @@ enum class AcceleratorVendor {
     kAscend,
     kSunrise,
     kIntel,
+    kMlu,
 };
 
 enum class MemoryKind {

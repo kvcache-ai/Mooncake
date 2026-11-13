@@ -42,9 +42,6 @@
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #endif
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-#include "transport/ascend_transport/hccl_transport/hccl_transport.h"
-#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
@@ -586,6 +583,82 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+static Status lookupTask(BatchID batch_id, size_t task_id,
+                         const Transport::TransferTask*& task) {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    const auto& batch_desc = Transport::toBatchDesc(batch_id);
+    if (task_id >= batch_desc.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+    task = &batch_desc.task_list[task_id];
+    return Status::OK();
+}
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+static TaskCongestionState stateWithTaskFailure(
+    const Transport::TransferTask& task, TaskCongestionState state) {
+    return state == TaskCongestionState::kNormal &&
+                   __atomic_load_n(&task.failed_slice_count,
+                                   __ATOMIC_ACQUIRE) != 0
+               ? TaskCongestionState::kUnknown
+               : state;
+}
+#endif
+
+Status MultiTransport::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    const Transport::TransferTask* task_ptr;
+    auto status = lookupTask(batch_id, task_id, task_ptr);
+    if (!status.ok()) return status;
+    state = TaskCongestionState::kUnknown;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto& task = *task_ptr;
+    auto observation = std::atomic_load_explicit(&task.congestion_observation,
+                                                 std::memory_order_acquire);
+    if (observation) {
+        state = stateWithTaskFailure(task, observation->state());
+    } else if (task.rdma_congestion_control_mode.observed &&
+               task.rdma_congestion_control_mode.value !=
+                   TaskCongestionControllerMode::kOff &&
+               __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) ==
+                   0) {
+        state = TaskCongestionState::kNormal;
+    }
+#endif
+    return Status::OK();
+}
+
+Status MultiTransport::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    const Transport::TransferTask* task_ptr;
+    auto status = lookupTask(batch_id, task_id, task_ptr);
+    if (!status.ok()) return status;
+    const auto& task = *task_ptr;
+    detail = TaskCongestionDetail{};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    auto observation = std::atomic_load_explicit(&task.congestion_observation,
+                                                 std::memory_order_acquire);
+    if (observation) {
+        detail = observation->detail();
+        detail.state = stateWithTaskFailure(task, detail.state);
+    } else if (task.rdma_congestion_control_mode.observed) {
+        detail.attempt_kind = TaskCongestionAttemptKind::kRdma;
+        detail.controller_mode = task.rdma_congestion_control_mode;
+        if (__atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) == 0)
+            detail.state = task.rdma_congestion_control_mode.value ==
+                                   TaskCongestionControllerMode::kOff
+                               ? TaskCongestionState::kUnknown
+                               : TaskCongestionState::kNormal;
+    } else if (task.transport_) {
+        detail.attempt_kind = TaskCongestionAttemptKind::kOther;
+    }
+#else
+    if (task.transport_)
+        detail.attempt_kind = TaskCongestionAttemptKind::kOther;
+#endif
+    return Status::OK();
+}
+
 Status MultiTransport::getScatterRequestStatuses(
     BatchID batch_id, size_t task_id,
     std::vector<TransferStatusEnum>& request_statuses) {
@@ -624,7 +697,8 @@ Status MultiTransport::getScatterRequestStatuses(
 }
 
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
-                                              TransferStatus& status) {
+                                              TransferStatus& status,
+                                              bool walk_tasks) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
@@ -642,7 +716,8 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     // Timeout and failure inspection still use the per-task path.
     const uint64_t finished =
         batch_desc.finished_task_count.load(std::memory_order_acquire);
-    if (batch_desc.counter_eligible && globalConfig().slice_timeout <= 0 &&
+    if (!walk_tasks && batch_desc.counter_eligible &&
+        globalConfig().slice_timeout <= 0 &&
         !batch_desc.has_failure.load(std::memory_order_acquire) &&
         finished < task_count) {
         // Skip the per-task walk. transferred_bytes stays 0 (a valid lower
@@ -753,11 +828,6 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_ASCEND_DIRECT
     else if (std::string(proto) == "ascend") {
         transport = new AscendDirectTransport();
-    }
-#endif
-#ifdef USE_ASCEND
-    else if (std::string(proto) == "ascend") {
-        transport = new HcclTransport();
     }
 #endif
 #ifdef USE_ASCEND_HETEROGENEOUS

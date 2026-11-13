@@ -136,6 +136,14 @@ class FileSystemAdapter {
     // serialized shard I/O.
     virtual bool SupportsBatchIo() const { return false; }
 
+    // Whether ReadAt/BatchReadAt accept iovecs pointing at arbitrary writable
+    // host memory, with any length and file offset, without caller-side
+    // alignment, padding or buffer registration. Callers may then read
+    // straight into user destinations instead of an intermediate buffer.
+    // Adapters with such constraints (e.g. O_DIRECT, registered iov memory)
+    // must leave this false unless they satisfy them internally.
+    virtual bool SupportsArbitraryHostReadBuffers() const { return false; }
+
     // Batched positional I/O. Adapters may override these to keep several
     // requests in flight; the defaults issue one WriteAt/ReadAt per request,
     // in order. Return exactly one result per request, in the same order,

@@ -31,6 +31,16 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/tcp/tcp_transport.h"
 
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static std::shared_ptr<tent::ControlService> metadata(
+        tent::TransferEngineImpl& engine) {
+        return engine.metadata_;
+    }
+};
+}  // namespace mooncake
+
 namespace {
 thread_local size_t fail_allocation_size = 0;
 std::atomic<int> injected_failures{0};
@@ -133,37 +143,31 @@ class TcpRegression : public testing::Test {
         config->set("transports/shm/enable", false);
         config->set("transports/tcp/max_concurrent_tasks", 1);
         config->set("transports/tcp/max_retry_count", 0);
+        config->set("transports/tcp/allow_unsafe_legacy_data_rpc", true);
         engine = std::make_unique<TransferEngineImpl>(config);
         ASSERT_TRUE(engine->available());
         tcp = std::make_shared<ControlledTcp>();
-        metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+        metadata = ::mooncake::TransferEngineImplTestPeer::metadata(*engine);
         auto name = engine->getSegmentName();
-        ASSERT_TRUE(tcp->install(name, metadata, nullptr, config).ok());
+        // Drop the engine-owned TCP transport first; its destructor closes the
+        // shared registry. Install the controlled replacement on the same
+        // RPC-facing ControlService so both v1 and v2 exercise real leases.
         engine->swapTransportForTest(TCP, tcp);
+        ASSERT_TRUE(tcp->install(name, metadata, nullptr, config).ok());
         ASSERT_TRUE(engine->registerLocalMemory(data.data(), data.size()).ok());
-        ASSERT_TRUE(metadata->segmentManager()
-                        .updateLocal([&](SegmentDesc& desc) {
-                            desc.type = SegmentType::Memory;
-                            desc.rpc_server_addr = name;
-                            BufferDesc buffer;
-                            buffer.addr =
-                                reinterpret_cast<uint64_t>(data.data());
-                            buffer.length = data.size();
-                            std::get<MemorySegmentDesc>(desc.detail)
-                                .buffers.push_back(buffer);
-                            return Status::OK();
-                        })
-                        .ok());
     }
 
     void TearDown() override {
         if (tcp) {
             tcp->resume.set_value();
-            EXPECT_TRUE(tcp->uninstall().ok());
+            EXPECT_TRUE(tcp->quiesce().ok());
         }
         if (engine && engine->available()) {
             EXPECT_TRUE(
                 engine->unregisterLocalMemory(data.data(), data.size()).ok());
+        }
+        if (tcp) {
+            EXPECT_TRUE(tcp->uninstall().ok());
         }
     }
 
@@ -212,7 +216,7 @@ TEST_F(TcpRegression, WorkerThrowFailsBatchAndNextRequestCompletes) {
     std::fill_n(data.data(), 4096, 'W');
     injected_failures = 0;
     // libstdc++ reserve(n) allocates n + one terminating byte.
-    TcpTransportTestPeer::arm(*tcp, sizeof(XferDataDesc) + 4096 + 1);
+    TcpTransportTestPeer::arm(*tcp, kTcpDataV2HeaderBytes + 4096 + 1);
     for (auto expected : {FAILED, COMPLETED}) {
         auto batch = engine->allocateBatch(1);
         ASSERT_TRUE(engine->submitTransfer(batch, {writeRequest(4096)}).ok());
@@ -291,8 +295,9 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
     calls = 0;
     injected_failures = 0;
     for (auto opcode : {Request::READ, Request::WRITE}) {
-        for (size_t length : {tcpMaxTransferBytes(opcode) + 1,
-                              std::numeric_limits<size_t>::max()}) {
+        const size_t v1_cap =
+            opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+        for (size_t length : {v1_cap + 1, std::numeric_limits<size_t>::max()}) {
             auto call = opcode == Request::READ ? ControlClient::recvData
                                                 : ControlClient::sendData;
             EXPECT_NO_THROW({
@@ -303,10 +308,29 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
             });
         }
     }
+    const TcpDataPlaneIdentity identity{{1, 1}, 1};
+    for (size_t length :
+         {kTcpMaxWriteV2Bytes + 1, std::numeric_limits<size_t>::max()}) {
+        EXPECT_TRUE(ControlClient::sendDataV2(
+                        address, reinterpret_cast<uint64_t>(data.data()),
+                        data.data(), length, identity)
+                        .IsInvalidArgument());
+    }
+    for (size_t length :
+         {kTcpMaxReadBytes + 1, std::numeric_limits<size_t>::max()}) {
+        EXPECT_TRUE(ControlClient::recvDataV2(
+                        address, reinterpret_cast<uint64_t>(data.data()),
+                        data.data(), length, identity)
+                        .IsInvalidArgument());
+    }
     EXPECT_EQ(injected_failures.load(), 0);
     EXPECT_EQ(calls.load(), 0);
     EXPECT_EQ(kTcpMaxWriteBytes + sizeof(XferDataDesc),
               std::numeric_limits<uint32_t>::max());
+    EXPECT_EQ(kTcpMaxWriteV2Bytes + kTcpDataV2HeaderBytes,
+              std::numeric_limits<uint32_t>::max());
+    EXPECT_EQ(tcpMaxTransferBytes(Request::WRITE), kTcpMaxWriteV2Bytes);
+    EXPECT_EQ(tcpMaxTransferBytes(Request::READ), kTcpMaxReadBytes);
     EXPECT_TRUE(receiver.stop().ok());
 }
 
