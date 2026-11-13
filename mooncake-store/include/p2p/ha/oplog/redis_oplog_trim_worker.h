@@ -26,7 +26,7 @@ struct RedisOpLogTrimWorkerConfig {
     std::string redis_password;
     int redis_db_index{0};
     std::chrono::seconds registry_ttl{10};
-    std::chrono::seconds interval{60};
+    std::chrono::seconds interval{10};
     uint64_t retention_entries{100000};
     uint64_t delete_batch_size{10000};
     uint32_t min_snapshot_ready_standby_count{1};
@@ -59,8 +59,8 @@ class RedisOpLogTrimWorker {
                               uint64_t& sequence_id) const;
     ErrorCode AdvanceTrimmed(redisContext* ctx, uint64_t target,
                              uint64_t& sequence_id) const;
-    ErrorCode CollectGarbage(redisContext* ctx, uint64_t trimmed,
-                             uint64_t& deleted_to) const;
+    ErrorCode CollectGarbage(redisContext* ctx, uint64_t latest,
+                             uint64_t trimmed, uint64_t& deleted_to) const;
 
     RedisOpLogTrimWorkerConfig config_;
     std::mutex mutex_;

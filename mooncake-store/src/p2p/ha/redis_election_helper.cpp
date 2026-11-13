@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <random>
 #include <sstream>
+#include <utility>
 
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
@@ -51,28 +52,6 @@ int64_t CurrentTimestampMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-std::string FormatPollLeaderError(const redisContext* context,
-                                  const redisReply* reply) {
-    std::ostringstream stream;
-    if (!reply) {
-        stream << "null reply";
-    } else {
-        stream << "reply_type=" << reply->type;
-        if (reply->type == REDIS_REPLY_ERROR && reply->str) {
-            stream << ", redis_error=" << std::string(reply->str, reply->len);
-        }
-    }
-    if (context) {
-        stream << ", ctx_err=" << context->err;
-        if (context->errstr[0] != '\0') {
-            stream << ", ctx_errstr=" << context->errstr;
-        }
-    } else {
-        stream << ", ctx=null";
-    }
-    return stream.str();
 }
 
 bool ParseElectionValue(const std::string& value, std::string& address,
@@ -230,6 +209,10 @@ ErrorCode RedisElectionHelper::Connect() {
     return ErrorCode::OK;
 }
 
+void RedisElectionHelper::SetShouldElect(ShouldElect should_elect) {
+    should_elect_ = std::move(should_elect);
+}
+
 // ============================================================
 // ElectLeader — blocks until this node wins election
 // ============================================================
@@ -242,6 +225,15 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
     ScopeGuard operation([this] { EndBlockingOperation(); });
     const auto election_start = std::chrono::steady_clock::now();
     while (!cancel_election_) {
+        if (should_elect_ && !should_elect_()) {
+            HAStatusManager::instance().SetDoctorIssue(
+                "ELECTION_NOT_READY",
+                "ShouldElect rejected this leader attempt");
+            WaitForElectionCancellation(std::chrono::milliseconds(200));
+            continue;
+        }
+        HAStatusManager::instance().SetDoctorIssue("ELECTION_NOT_READY");
+
         HAMetricManager::instance().inc_election_attempts();
         bool connected = false;
         {
@@ -279,7 +271,8 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
             HAStatusManager::instance().SetDoctorIssue("LEADERSHIP_LOST");
             {
                 std::lock_guard<std::mutex> lock(election_mutex_);
-                PublishLeaderEvent(master_address, version);
+                PublishLeaderEvent("elected:" + master_address + ":" +
+                                   std::to_string(version));
             }
             HAMetricManager::instance().set_election_is_leader(true);
             HAMetricManager::instance().observe_election_duration_ms(
@@ -356,7 +349,9 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         if (!current || current->type != REDIS_REPLY_STRING) {
             LOG(WARNING)
                 << "TryElectOnce: failed to read the election result after "
-                   "reconnect";
+                   "reconnect"
+                << ", error="
+                << RedisUtil::FormatCommandError(election_ctx_, current.get());
             return ElectionAttemptResult::ERROR;
         }
         std::string value(current->str, current->len);
@@ -379,6 +374,14 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         }
         LOG(WARNING) << "TryElectOnce: election result after reconnect does "
                         "not match this attempt";
+        return ElectionAttemptResult::ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        HAMetricManager::instance().inc_election_failures();
+        LOG(WARNING) << "TryElectOnce: election script failed, error="
+                     << RedisUtil::FormatCommandError(election_ctx_,
+                                                      reply.get());
         return ElectionAttemptResult::ERROR;
     }
 
@@ -613,7 +616,7 @@ bool RedisElectionHelper::PollLeaderOnce(redisContext*& context) {
         context, "GET %b", master_view_key_.data(), master_view_key_.size()));
     if (!reply ||
         (reply->type != REDIS_REPLY_STRING && reply->type != REDIS_REPLY_NIL)) {
-        const auto error = FormatPollLeaderError(context, reply.get());
+        const auto error = RedisUtil::FormatCommandError(context, reply.get());
         LOG_EVERY_N(WARNING, 30)
             << "WatchLeader: polling GET failed; reconnecting on next poll"
             << ", key=" << master_view_key_ << ", error=" << error;
@@ -666,8 +669,10 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
                 our_value_.data(), our_value_.size()));
 
             if (!reply) {
-                LOG(ERROR)
-                    << "KeepLeader: Lua renewal failed (connection error)";
+                LOG(ERROR) << "KeepLeader: Lua renewal failed"
+                           << ", error="
+                           << RedisUtil::FormatCommandError(election_ctx_,
+                                                            reply.get());
                 if (Reconnect(election_ctx_)) {
                     // Re-run the ownership check and renewal atomically after
                     // reconnect. GET followed by EXPIRE would allow another
@@ -681,17 +686,27 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
                         renewed = true;
                     } else {
                         LOG(WARNING) << "KeepLeader: Lua renewal failed after "
-                                        "reconnect, key may have changed";
+                                        "reconnect, "
+                                        "key may have changed"
+                                     << ", error="
+                                     << RedisUtil::FormatCommandError(
+                                            election_ctx_, retry.get());
                     }
                 }
             } else if (reply->type == REDIS_REPLY_INTEGER &&
                        reply->integer == 1) {
                 // Renewal succeeded
                 renewed = true;
+            } else if (reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "KeepLeader: Lua renewal failed"
+                           << ", error="
+                           << RedisUtil::FormatCommandError(election_ctx_,
+                                                            reply.get());
             } else {
                 // Key no longer ours
-                LOG(WARNING)
-                    << "KeepLeader: lost leadership (key no longer ours)";
+                LOG(WARNING) << "KeepLeader: lost leadership (key no longer "
+                                "ours)"
+                             << ", reply_type=" << reply->type;
             }
         }
 
@@ -731,6 +746,40 @@ void RedisElectionHelper::CancelElection() {
     cancel_cv_.notify_all();
 }
 
+ErrorCode RedisElectionHelper::ReleaseLeader() {
+    std::lock_guard<std::mutex> lock(election_mutex_);
+    if (our_value_.empty()) {
+        return ErrorCode::OK;
+    }
+    if ((!election_ctx_ || election_ctx_->err) && !Reconnect(election_ctx_)) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    static constexpr const char* kReleaseScript =
+        "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; "
+        "return redis.call('DEL', KEYS[1])";
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        election_ctx_, "EVAL %s 1 %b %b", kReleaseScript,
+        master_view_key_.data(), master_view_key_.size(), our_value_.data(),
+        our_value_.size()));
+    if (!reply || reply->type != REDIS_REPLY_INTEGER ||
+        (reply->integer != 0 && reply->integer != 1)) {
+        LOG(WARNING) << "ReleaseLeader: failed to release Redis leadership"
+                     << ", error="
+                     << RedisUtil::FormatCommandError(election_ctx_,
+                                                      reply.get());
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    LOG(INFO) << "ReleaseLeader: Redis leadership release completed"
+              << ", released=" << reply->integer;
+    if (reply->integer == 1) {
+        PublishLeaderEvent("released");
+    }
+    our_value_.clear();
+    return ErrorCode::OK;
+}
+
 void RedisElectionHelper::Shutdown() {
     {
         std::lock_guard<std::mutex> lock(operation_mutex_);
@@ -761,9 +810,10 @@ ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
                                                   master_view_key_.data(),
                                                   master_view_key_.size()));
 
-    if (!reply) {
-        LOG(ERROR) << "GetMasterView: GET failed (connection error) at "
-                   << redis_endpoint_;
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "GetMasterView: GET failed at " << redis_endpoint_
+                   << ", error="
+                   << RedisUtil::FormatCommandError(election_ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -799,18 +849,18 @@ ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
 // Internal helpers
 // ============================================================
 
-void RedisElectionHelper::PublishLeaderEvent(const std::string& master_address,
-                                             ViewVersionId epoch) {
+void RedisElectionHelper::PublishLeaderEvent(const std::string& event) {
     // TBase does not broadcast PUBLISH invoked inside EVAL through its proxy,
-    // so publish from the client after the atomic election script succeeds.
-    const std::string event =
-        "elected:" + master_address + ":" + std::to_string(epoch);
+    // so publish from the client after an atomic ownership update succeeds.
     RedisReplyPtr reply((redisReply*)redisCommand(
         election_ctx_, "PUBLISH %b %b", leader_event_channel_.data(),
         leader_event_channel_.size(), event.data(), event.size()));
-    if (!reply) {
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
         LOG(WARNING) << "PublishLeaderEvent: PUBLISH failed; polling will "
-                        "detect the leader change";
+                        "detect the leader change"
+                     << ", error="
+                     << RedisUtil::FormatCommandError(election_ctx_,
+                                                      reply.get());
     }
 }
 
@@ -860,10 +910,9 @@ bool RedisElectionHelper::BeginBlockingOperation() {
 
 bool RedisElectionHelper::BeginKeepAliveOperation() {
     std::lock_guard<std::mutex> lock(operation_mutex_);
-    if (shutting_down_ || keep_alive_operation_active_) {
+    if (shutting_down_ || cancel_keep_alive_ || keep_alive_operation_active_) {
         return false;
     }
-    cancel_keep_alive_ = false;
     keep_alive_operation_active_ = true;
     ++active_blocking_operations_;
     return true;

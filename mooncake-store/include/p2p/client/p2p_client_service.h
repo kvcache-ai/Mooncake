@@ -320,6 +320,7 @@ class P2PClientService final {
    private:
     bool IsHAMode(const std::string& master_server_entry) const;
     void SetMasterDiscoveryConfig(const P2PClientConfig& config);
+    int GetHeartbeatFailureThreshold() const;
     ErrorCode ResolveMasterAddress(const std::string& master_server_entry,
                                    std::string& master_address);
 
@@ -652,7 +653,9 @@ class P2PClientService final {
         std::string redis_username;
         std::string redis_password;
         int redis_db_index = 0;
-        int redis_master_view_ttl_sec = 4;
+        int redis_master_view_ttl_sec = 4;  // Redis master_view TTL in seconds.
+        // Master-side Redis master_view refresh interval. Must be less than
+        // redis_master_view_ttl_sec.
         int redis_heartbeat_interval_sec = 1;
     };
     std::unique_ptr<P2PMasterView> master_view_;

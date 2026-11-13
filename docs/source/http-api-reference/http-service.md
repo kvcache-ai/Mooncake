@@ -45,6 +45,27 @@ to avoid a separate time series for each error message. The metrics are
 computed from the same local snapshot as `/ha/doctor`, including diagnoses
 derived from elapsed time.
 
+#### `/server_info`
+
+Returns the Store build identity used by the current process. This endpoint is
+served by the shared read-only HTTP handlers, so it is available to a P2P HA
+standby as well as the active master.
+
+**Method**: `GET`
+**Content-Type**: `text/plain; version=0.0.4`
+**Response**: Build identity containing at least `store_version` and
+`architecture`
+
+**Example**:
+```bash
+curl http://localhost:8080/server_info
+```
+
+```text
+store_version=0.5.0
+architecture=p2p
+```
+
 #### `/metrics/summary`
 Human-readable metrics summary with key performance indicators.
 

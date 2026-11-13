@@ -42,7 +42,7 @@ class P2PMasterService final {
    public:
     explicit P2PMasterService(const P2PMasterConfig& config,
                               ViewVersionId view_version = 0);
-    ~P2PMasterService() = default;
+    ~P2PMasterService();
 
     P2PClientManager& GetClientManager() { return *client_manager_; }
     const P2PClientManager& GetClientManager() const {

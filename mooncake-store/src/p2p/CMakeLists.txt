@@ -30,6 +30,7 @@ set(MOONCAKE_STORE_P2P_MASTER_SOURCES
     ha/oplog/p2p_hot_standby_service.cpp
     ha/oplog/p2p_standby_snapshot_service.cpp
     ha/standby_state_machine.cpp
+    ha/p2p_election_readiness.cpp
     ha/ha_status.cpp
     ha/p2p_status_http_server.cpp
 )

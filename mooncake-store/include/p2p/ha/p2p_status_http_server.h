@@ -38,7 +38,7 @@ class P2PStatusHttpServer {
 
 // Registers the read-only diagnostic handlers shared by the per-term status
 // server and the active P2PMasterRpcService HTTP server: /ha/status,
-// /ha/doctor, /metrics, /metrics/summary and /health.
+// /ha/doctor, /server_info, /metrics, /metrics/summary and /health.
 void RegisterStatusHttpHandlers(coro_http::coro_http_server& server);
 
 }  // namespace mooncake

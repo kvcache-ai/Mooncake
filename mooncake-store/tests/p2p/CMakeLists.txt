@@ -60,6 +60,7 @@ add_p2p_master_test(p2p_master_metrics_test p2p_master_metrics_test.cpp)
 add_p2p_master_test(client_metrics_aggregator_test client_metrics_aggregator_test.cpp)
 add_p2p_master_test(p2p_segment_manager_test p2p_segment_manager_test.cpp)
 add_p2p_master_test(p2p_client_manager_test p2p_client_manager_test.cpp)
+add_p2p_master_test(p2p_election_readiness_test ha/p2p_election_readiness_test.cpp)
 add_p2p_master_test(p2p_client_meta_test p2p_client_meta_test.cpp)
 set_tests_properties(p2p_master_rpc_test p2p_master_http_endpoints_test
     PROPERTIES LABELS "p2p;master;integration")

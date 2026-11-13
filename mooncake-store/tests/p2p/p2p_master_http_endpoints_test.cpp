@@ -1,7 +1,7 @@
 /**
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
- *        (GET /health, GET /get_key_count, GET /get_all_keys,
+ *        (GET /health, GET /server_info, GET /get_key_count, GET /get_all_keys,
  *         GET /batch_query_routes, GET /metrics, GET /ha/status, GET
  * /ha/doctor).
  *
@@ -22,6 +22,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -66,6 +67,13 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         http_base_url_ = "http://127.0.0.1:" + std::to_string(http_port);
         LOG(INFO) << "P2P master HTTP server at " << http_base_url_;
         ASSERT_EQ(HttpGet(http_base_url_ + "/health").status, 200);
+
+        const auto server_info = HttpGet(http_base_url_ + "/server_info");
+        ASSERT_EQ(server_info.status, 200);
+        EXPECT_NE(server_info.resp_body.find("store_version="),
+                  std::string::npos);
+        EXPECT_NE(server_info.resp_body.find("architecture=p2p"),
+                  std::string::npos);
 
         // Register one client owning two P2P segments so tests can also
         // exercise keys with replicas on multiple segments.
@@ -135,6 +143,12 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         auto resp =
             client.post(url, "", coro_http::req_content_type::octet_stream);
         return {resp.status, std::string(resp.resp_body)};
+    }
+
+    static int64_t UnixTimeMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
     }
 
     static std::vector<std::string> SplitLines(std::string_view body) {
@@ -324,15 +338,372 @@ TEST_F(P2PMasterHttpEndpointsTest,
 #endif  // STORE_USE_REDIS
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
-    std::atomic<bool> stepdown_called{false};
-    wrapped_->SetStepdownCallback(
-        [&stepdown_called] { stepdown_called.store(true); });
+    HAStatusResetGuard reset_guard;
+    std::atomic<uint32_t> cooldown_sec{0};
+    std::atomic<uint32_t> drain_timeout_ms{0};
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+    std::promise<P2PMasterRpcService::StepdownRequest> accepted_request;
+    auto accepted = accepted_request.get_future();
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            cooldown_sec.store(request.cooldown_sec);
+            drain_timeout_ms.store(request.drain_timeout_ms);
+            accepted_request.set_value(request);
+        });
+    service.init();
 
-    const auto response = HttpPost(http_base_url_ + "/ha/stepdown");
+    const auto before_ms = UnixTimeMs();
+    const auto steady_before = std::chrono::steady_clock::now();
+    const auto response =
+        HttpPost("http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+                 "/ha/stepdown");
+    const auto steady_after = std::chrono::steady_clock::now();
+    const auto after_ms = UnixTimeMs();
     ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
     const auto body = ParseJson(response.resp_body, "stepdown");
     EXPECT_TRUE(body["success"].asBool());
-    EXPECT_TRUE(stepdown_called.load());
+    EXPECT_TRUE(body["already_requested"].isBool());
+    EXPECT_FALSE(body["already_requested"].asBool());
+    EXPECT_EQ(body["cooldown_sec"].asUInt(), 30u);
+    EXPECT_EQ(cooldown_sec.load(), 30u);
+    EXPECT_EQ(body["drain_timeout_ms"].asUInt(), 3000u);
+    EXPECT_EQ(drain_timeout_ms.load(), 3000u);
+    ASSERT_TRUE(body["election_paused_until_ms"].isInt64());
+    const auto deadline_ms = body["election_paused_until_ms"].asInt64();
+    EXPECT_GE(deadline_ms, before_ms + 30000);
+    EXPECT_LE(deadline_ms, after_ms + 30000);
+    ASSERT_EQ(accepted.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    const auto request = accepted.get();
+    EXPECT_EQ(request.election_paused_until_ms, deadline_ms);
+    EXPECT_GE(request.election_paused_until,
+              steady_before + std::chrono::seconds(30));
+    EXPECT_LE(request.election_paused_until,
+              steady_after + std::chrono::seconds(30));
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
+    HAStatusResetGuard reset_guard;
+    std::atomic<uint32_t> callback_count{0};
+    std::atomic<uint32_t> cooldown_sec{0};
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            cooldown_sec.store(request.cooldown_sec);
+            callback_count.fetch_add(1);
+        });
+    service.init();
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+        "/ha/stepdown?cooldown_sec=";
+    for (const auto* value : {"-1", "abc", "1x", "1.5", "3601", "4294967296"}) {
+        const auto response = HttpPost(url + value);
+        EXPECT_EQ(response.status, 400) << value << ": " << response.resp_body;
+        EXPECT_EQ(callback_count.load(), 0u);
+    }
+    // Rejected parameters must not latch the one-shot stepdown flag.
+    const auto accepted = HttpPost(url + "7");
+    ASSERT_EQ(accepted.status, 200) << accepted.resp_body;
+    EXPECT_EQ(
+        ParseJson(accepted.resp_body, "stepdown")["cooldown_sec"].asUInt(), 7u);
+    EXPECT_EQ(cooldown_sec.load(), 7u);
+    EXPECT_EQ(callback_count.load(), 1u);
+    const auto deadline_ms =
+        ParseJson(accepted.resp_body, "stepdown")["election_paused_until_ms"]
+            .asInt64();
+    // A later retry must not refresh the deadline, even with the same cooldown.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto retry = HttpPost(url + "7");
+    ASSERT_EQ(retry.status, 200) << retry.resp_body;
+    EXPECT_EQ(ParseJson(retry.resp_body, "stepdown")["election_paused_until_ms"]
+                  .asInt64(),
+              deadline_ms);
+    // A duplicate request must not overwrite the accepted cooldown.
+    const auto duplicate = HttpPost(url + "0");
+    ASSERT_EQ(duplicate.status, 200) << duplicate.resp_body;
+    const auto duplicate_body = ParseJson(duplicate.resp_body, "stepdown");
+    EXPECT_TRUE(duplicate_body["success"].asBool());
+    EXPECT_TRUE(duplicate_body["already_requested"].asBool());
+    EXPECT_EQ(duplicate_body["cooldown_sec"].asUInt(), 7u);
+    EXPECT_EQ(duplicate_body["drain_timeout_ms"].asUInt(), 3000u);
+    EXPECT_EQ(duplicate_body["election_paused_until_ms"].asInt64(),
+              deadline_ms);
+    EXPECT_EQ(cooldown_sec.load(), 7u);
+    EXPECT_EQ(callback_count.load(), 1u);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesDrainTimeout) {
+    HAStatusResetGuard reset_guard;
+    std::atomic<uint32_t> callback_count{0};
+    std::atomic<uint32_t> cooldown_sec{0};
+    std::atomic<uint32_t> drain_timeout_ms{0};
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            cooldown_sec.store(request.cooldown_sec);
+            drain_timeout_ms.store(request.drain_timeout_ms);
+            callback_count.fetch_add(1);
+        });
+    service.init();
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+        "/ha/stepdown?cooldown_sec=7&drain_timeout_ms=";
+    for (const auto* value :
+         {"-1", "abc", "1x", "1.5", "30001", "4294967296"}) {
+        const auto response = HttpPost(url + value);
+        EXPECT_EQ(response.status, 400) << value << ": " << response.resp_body;
+        EXPECT_NE(
+            ParseJson(response.resp_body, "stepdown")["error"].asString().find(
+                "drain_timeout_ms"),
+            std::string::npos);
+        EXPECT_EQ(callback_count.load(), 0u);
+    }
+    // Invalid requests must not prevent a later valid request.
+    const auto accepted = HttpPost(url + "1234");
+    ASSERT_EQ(accepted.status, 200) << accepted.resp_body;
+    const auto body = ParseJson(accepted.resp_body, "stepdown");
+    EXPECT_EQ(body["cooldown_sec"].asUInt(), 7u);
+    EXPECT_EQ(body["drain_timeout_ms"].asUInt(), 1234u);
+    EXPECT_EQ(cooldown_sec.load(), 7u);
+    EXPECT_EQ(drain_timeout_ms.load(), 1234u);
+    EXPECT_EQ(callback_count.load(), 1u);
+    const auto duplicate = HttpPost(url + "0");
+    ASSERT_EQ(duplicate.status, 200) << duplicate.resp_body;
+    const auto duplicate_body = ParseJson(duplicate.resp_body, "stepdown");
+    EXPECT_TRUE(duplicate_body["success"].asBool());
+    EXPECT_TRUE(duplicate_body["already_requested"].asBool());
+    EXPECT_EQ(duplicate_body["cooldown_sec"].asUInt(), 7u);
+    EXPECT_EQ(duplicate_body["drain_timeout_ms"].asUInt(), 1234u);
+    EXPECT_EQ(drain_timeout_ms.load(), 1234u);
+    EXPECT_EQ(callback_count.load(), 1u);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       ConcurrentStepdownRequestsKeepFirstParameters) {
+    HAStatusResetGuard reset_guard;
+    constexpr auto kTimeout = std::chrono::seconds(3);
+    constexpr size_t kRequests = 4;
+    std::atomic<uint32_t> callback_count{0};
+    std::atomic<uint32_t> accepted_cooldown{0};
+    std::atomic<uint32_t> accepted_drain{0};
+    std::atomic<int64_t> accepted_deadline_ms{0};
+    std::promise<void> callback_entered;
+    auto entered = callback_entered.get_future();
+    std::promise<void> release_callback;
+    auto released = release_callback.get_future().share();
+    std::promise<void> start_requests;
+    auto start = start_requests.get_future().share();
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            if (callback_count.fetch_add(1) == 0) {
+                accepted_cooldown.store(request.cooldown_sec);
+                accepted_drain.store(request.drain_timeout_ms);
+                accepted_deadline_ms.store(request.election_paused_until_ms);
+                callback_entered.set_value();
+            }
+            released.wait();
+        });
+    service.init();
+    const std::string base_url =
+        "http://127.0.0.1:" + std::to_string(service.GetHttpPort());
+    const std::string url = base_url + "/ha/stepdown";
+    // Establish all four connections before blocking any HTTP worker: one
+    // worker also runs the accept loop. Each request reuses its connection.
+    std::vector<std::unique_ptr<coro_http::coro_http_client>> clients;
+    for (size_t i = 0; i < kRequests; ++i) {
+        clients.emplace_back(std::make_unique<coro_http::coro_http_client>());
+        ASSERT_EQ(clients.back()->get(base_url + "/health").status, 200);
+    }
+    std::vector<std::future<HttpResponse>> requests;
+    {
+        // Unblock the callback before any request future is destroyed, even
+        // if an assertion below fails.
+        struct ReleaseGatesOnExit {
+            std::promise<void>& start;
+            std::promise<void>& callback;
+            bool started{false};
+            void StartRequests() {
+                start.set_value();
+                started = true;
+            }
+            ~ReleaseGatesOnExit() {
+                if (!started) {
+                    start.set_value();
+                }
+                callback.set_value();
+            }
+        } release_guard{start_requests, release_callback};
+        for (size_t i = 0; i < kRequests; ++i) {
+            requests.emplace_back(std::async(std::launch::async, [&, i] {
+                start.wait();
+                auto response = clients[i]->post(
+                    url + "?cooldown_sec=" + std::to_string(7 + i) +
+                        "&drain_timeout_ms=" + std::to_string(1234 + i * 1000),
+                    "", coro_http::req_content_type::octet_stream);
+                return HttpResponse{response.status,
+                                    std::string(response.resp_body)};
+            }));
+        }
+        release_guard.StartRequests();
+        const auto entered_status = entered.wait_for(kTimeout);
+        EXPECT_EQ(entered_status, std::future_status::ready);
+        if (entered_status == std::future_status::ready) {
+            const size_t first = accepted_cooldown.load() - 7;
+            EXPECT_LT(first, kRequests);
+            for (size_t i = 0; i < requests.size(); ++i) {
+                if (i != first) {
+                    // Retries must complete while the first callback is still
+                    // waiting for active RPC handlers to stop.
+                    EXPECT_EQ(requests[i].wait_for(kTimeout),
+                              std::future_status::ready);
+                }
+            }
+            EXPECT_EQ(callback_count.load(), 1u);
+        }
+    }
+    size_t first_responses = 0;
+    for (auto& request : requests) {
+        const auto response = request.get();
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        const auto body = ParseJson(response.resp_body, "stepdown");
+        EXPECT_TRUE(body["success"].asBool());
+        EXPECT_TRUE(body["already_requested"].isBool());
+        if (!body["already_requested"].asBool()) {
+            ++first_responses;
+        }
+        EXPECT_EQ(body["cooldown_sec"].asUInt(), accepted_cooldown.load());
+        EXPECT_EQ(body["drain_timeout_ms"].asUInt(), accepted_drain.load());
+        EXPECT_TRUE(body["election_paused_until_ms"].isInt64());
+        EXPECT_GT(accepted_deadline_ms.load(), 0);
+        EXPECT_EQ(body["election_paused_until_ms"].asInt64(),
+                  accepted_deadline_ms.load());
+    }
+    EXPECT_EQ(first_responses, 1u);
+    EXPECT_EQ(callback_count.load(), 1u);
+    // A cached request does not bypass parameter or role validation.
+    EXPECT_EQ(HttpPost(url + "?drain_timeout_ms=30001").status, 400);
+    HAStatusManager::instance().SetRoleState("standby", "STEPPED_DOWN");
+    EXPECT_EQ(HttpPost(url).status, 503);
+    EXPECT_EQ(callback_count.load(), 1u);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointAcceptsParameterBounds) {
+    HAStatusResetGuard reset_guard;
+    for (const uint32_t seconds : {0u, 3600u}) {
+        std::atomic<uint32_t> cooldown_sec{1};
+        std::atomic<uint32_t> drain_timeout_ms{1};
+        const uint32_t timeout_ms = seconds == 0 ? 0 : 30000;
+        P2PMasterConfig config;
+        config.ha.enabled = true;
+        config.metrics.enable_reporting = false;
+        config.metrics.http_port = 0;
+        P2PMasterRpcService service(config);
+        HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+        service.SetStepdownCallback(
+            [&](const P2PMasterRpcService::StepdownRequest& request) {
+                cooldown_sec.store(request.cooldown_sec);
+                drain_timeout_ms.store(request.drain_timeout_ms);
+            });
+        service.init();
+        const auto before_ms = UnixTimeMs();
+        const auto response = HttpPost(
+            "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+            "/ha/stepdown?cooldown_sec=" + std::to_string(seconds) +
+            "&drain_timeout_ms=" + std::to_string(timeout_ms));
+        const auto after_ms = UnixTimeMs();
+        ASSERT_EQ(response.status, 200) << response.resp_body;
+        EXPECT_EQ(cooldown_sec.load(), seconds);
+        EXPECT_EQ(
+            ParseJson(response.resp_body, "stepdown")["cooldown_sec"].asUInt(),
+            seconds);
+        EXPECT_EQ(drain_timeout_ms.load(), timeout_ms);
+        EXPECT_EQ(ParseJson(response.resp_body, "stepdown")["drain_timeout_ms"]
+                      .asUInt(),
+                  timeout_ms);
+        const auto body = ParseJson(response.resp_body, "stepdown");
+        ASSERT_TRUE(body["election_paused_until_ms"].isInt64());
+        const auto deadline_ms = body["election_paused_until_ms"].asInt64();
+        EXPECT_GE(deadline_ms,
+                  before_ms + static_cast<int64_t>(seconds) * 1000);
+        EXPECT_LE(deadline_ms, after_ms + static_cast<int64_t>(seconds) * 1000);
+    }
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointRequiresRunningPrimary) {
+    HAStatusResetGuard reset_guard;
+    std::atomic<uint32_t> callback_count{0};
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest&) {
+            callback_count.fetch_add(1);
+        });
+    service.init();
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+        "/ha/stepdown";
+    auto& status = HAStatusManager::instance();
+    struct RejectedState {
+        bool ha_enabled;
+        const char* role;
+        const char* state;
+    };
+    const RejectedState rejected_states[] = {
+        {false, "primary", "RUNNING"},
+        {true, "standby", "RUNNING"},
+        {true, "standby", "WATCHING"},
+        {true, "promoting", "PROMOTING"},
+        // The active HTTP server is already listening while metadata recovery
+        // runs with primary/STARTING, before business RPCs start.
+        {true, "primary", "STARTING"},
+        {true, "primary", "STOPPED"},
+        {true, "standby", "STEPPED_DOWN"},
+    };
+    for (const auto& rejected : rejected_states) {
+        SCOPED_TRACE(::testing::Message() << "ha=" << rejected.ha_enabled
+                                          << ", role=" << rejected.role
+                                          << ", state=" << rejected.state);
+        status.Configure(rejected.ha_enabled, config.cluster_id, "127.0.0.1:0");
+        status.SetRoleState(rejected.role, rejected.state);
+        const auto response = HttpPost(url);
+        EXPECT_EQ(response.status, 503) << response.resp_body;
+        const auto body = ParseJson(response.resp_body, "stepdown");
+        EXPECT_FALSE(body["success"].asBool());
+        EXPECT_NE(body["error"].asString().find("primary/RUNNING"),
+                  std::string::npos);
+        EXPECT_EQ(callback_count.load(), 0u);
+    }
+    // Rejected requests must not latch the stepdown request: becoming ready
+    // should allow a subsequent request to reach the callback exactly once.
+    status.SetRoleState("primary", "RUNNING");
+    const auto response = HttpPost(url);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    EXPECT_TRUE(ParseJson(response.resp_body, "stepdown")["success"].asBool());
+    EXPECT_EQ(callback_count.load(), 1u);
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {

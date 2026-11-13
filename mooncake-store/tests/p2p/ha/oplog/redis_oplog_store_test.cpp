@@ -526,6 +526,28 @@ TEST_F(RedisOpLogStoreTest, DrainWritingReturnsAfterLeaseLossStopRequest) {
     writer->StopWriting();
 }
 
+TEST_F(RedisOpLogStoreTest,
+       CancelledWriterDoesNotReportPendingWritesAsDrained) {
+    auto writer = CreateWriter();
+    // A missing seq=1 keeps seq=2 uncommitted without relying on Redis timing.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(2), false), ErrorCode::OK);
+    const auto start = std::chrono::steady_clock::now();
+    const auto timed_out = writer->DrainWriting(50);
+    EXPECT_FALSE(timed_out.drained);
+    EXPECT_EQ(timed_out.inflight_count, 1u);
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(1));
+
+    // Cancellation can precede entry to DrainWriting, not only interrupt it.
+    writer->RequestStopWriting();
+    const auto cancelled = writer->DrainWriting(5000);
+    EXPECT_FALSE(cancelled.drained);
+    EXPECT_EQ(cancelled.inflight_count, 1u);
+    EXPECT_EQ(cancelled.committed_sequence_id, 0u);
+    EXPECT_EQ(cancelled.max_known_sequence_id, 2u);
+    writer->StopWriting();
+}
+
 TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
     for (int i = 0; i < 50; ++i) {
         SCOPED_TRACE(i);

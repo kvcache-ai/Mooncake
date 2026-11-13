@@ -28,6 +28,9 @@ namespace {
 
 constexpr const char* kEtcdPrefix = "etcd://";
 constexpr const char* kRedisPrefix = "redis://";
+constexpr int kDefaultHeartbeatFailureThreshold = 10;
+constexpr int kMinHAHeartbeatFailureThreshold = 2;
+constexpr int kHeartbeatIntervalMs = 1000;
 
 // Max retries when AsyncWriteRevoke or AsyncUnPinKey fails on the forward path
 // (e.g. after TE write failure, or read cleanup). LEASE_EXPIRED is treated as
@@ -230,8 +233,12 @@ ErrorCode P2PClientService::StartHeartbeat() {
 }
 
 void P2PClientService::HeartbeatThreadMain() {
-    constexpr int kMaxHeartbeatFailCount = 10;
-    constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
+    const int max_heartbeat_fail_count = GetHeartbeatFailureThreshold();
+    const auto kHeartbeatInterval =
+        std::chrono::milliseconds(kHeartbeatIntervalMs);
+    LOG(INFO) << "P2P heartbeat thread start"
+              << ", max_heartbeat_fail_count=" << max_heartbeat_fail_count
+              << ", master_entry=" << master_server_entry_;
     int heartbeat_fail_count = 0;
 
     while (true) {
@@ -260,10 +267,10 @@ void P2PClientService::HeartbeatThreadMain() {
                 }
             } else {
                 LOG(ERROR) << "Failed to send heartbeat to P2P master";
-                if (heartbeat_fail_count < kMaxHeartbeatFailCount) {
+                if (heartbeat_fail_count < max_heartbeat_fail_count) {
                     ++heartbeat_fail_count;
                 }
-                if (heartbeat_fail_count == kMaxHeartbeatFailCount &&
+                if (heartbeat_fail_count == max_heartbeat_fail_count &&
                     HandleEventLocked(ClientEvent::MASTER_UNREACHABLE) ==
                         ErrorCode::OK) {
                     heartbeat_fail_count = 0;
@@ -348,6 +355,23 @@ ErrorCode P2PClientService::ReconnectToMaster() {
     }
     LOG(INFO) << "Reconnected to P2P master via " << master_server_entry_;
     return ErrorCode::OK;
+}
+
+int P2PClientService::GetHeartbeatFailureThreshold() const {
+    if (!IsHAMode(master_server_entry_) ||
+        master_server_entry_.rfind(kRedisPrefix, 0) != 0) {
+        return kDefaultHeartbeatFailureThreshold;
+    }
+
+    const int ttl_sec = master_discovery_config_.redis_master_view_ttl_sec;
+    if (ttl_sec <= 0) {
+        return kDefaultHeartbeatFailureThreshold;
+    }
+
+    const int64_t threshold =
+        static_cast<int64_t>(ttl_sec) * 1000 + kHeartbeatIntervalMs - 1;
+    return static_cast<int>(std::max<int>(kMinHAHeartbeatFailureThreshold,
+                                          threshold / kHeartbeatIntervalMs));
 }
 
 void P2PClientService::initTeEndpoint() {

@@ -1,6 +1,7 @@
 #include "p2p/master/p2p_rpc_service.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <sstream>
@@ -22,6 +23,30 @@
 namespace mooncake {
 
 namespace {
+
+constexpr uint32_t kDefaultStepDownCooldownSec = 30;
+constexpr uint32_t kMaxStepDownCooldownSec = 3600;
+constexpr uint32_t kDefaultStepDownDrainTimeoutMs = 3000;
+constexpr uint32_t kMaxStepDownDrainTimeoutMs = 30000;
+
+tl::expected<uint32_t, std::string> ParseUint32Query(std::string_view value,
+                                                     uint32_t default_value,
+                                                     uint32_t max_value,
+                                                     std::string_view name) {
+    if (value.empty()) {
+        return default_value;
+    }
+    uint32_t parsed = 0;
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc{} || end != value.data() + value.size() ||
+        parsed > max_value) {
+        return tl::make_unexpected(std::string(name) +
+                                   " must be an integer in [0, " +
+                                   std::to_string(max_value) + "]");
+    }
+    return parsed;
+}
 
 std::string GetMasterMetricsSummary() {
     std::string summary =
@@ -45,17 +70,23 @@ P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
         buildHostNameWithPort(config.rpc.address, config.rpc.port),
         config.oplog.latest_stall_timeout_sec,
         config.oplog.catchup_stall_timeout_sec);
+    P2PMasterMetricManager::instance().set_component_info(
+        "p2p_master", GetMooncakeStoreVersion(), MOONCAKE_STORE_ARCHITECTURE);
 }
 
 P2PMasterRpcService::~P2PMasterRpcService() {
-    metric_report_running_ = false;
+    http_server_.stop();
+    {
+        std::lock_guard<std::mutex> lock(metric_report_mutex_);
+        metric_report_running_ = false;
+    }
+    metric_report_cv_.notify_all();
     if (metric_report_thread_.joinable()) {
         metric_report_thread_.join();
     }
-    http_server_.stop();
 }
 
-void P2PMasterRpcService::SetStepdownCallback(std::function<void()> callback) {
+void P2PMasterRpcService::SetStepdownCallback(StepdownCallback callback) {
     stepdown_callback_ = std::move(callback);
 }
 
@@ -67,8 +98,10 @@ void P2PMasterRpcService::init() {
             while (metric_report_running_) {
                 const std::string metrics_summary = GetMasterMetricsSummary();
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(kP2PMetricReportIntervalSeconds));
+                std::unique_lock<std::mutex> lock(metric_report_mutex_);
+                metric_report_cv_.wait_for(
+                    lock, std::chrono::seconds(kP2PMetricReportIntervalSeconds),
+                    [this] { return !metric_report_running_.load(); });
             }
         });
     }
@@ -110,6 +143,29 @@ void P2PMasterRpcService::init_http_server() {
         POST>("/ha/stepdown", [this](coro_http_request& req,
                                      coro_http_response& resp) {
         resp.add_header("Content-Type", "application/json; charset=utf-8");
+        const auto cooldown = ParseUint32Query(
+            req.get_query_value("cooldown_sec"), kDefaultStepDownCooldownSec,
+            kMaxStepDownCooldownSec, "cooldown_sec");
+        if (!cooldown) {
+            LOG_EVERY_N(WARNING, 30)
+                << "Rejected P2P master stepdown: " << cooldown.error();
+            resp.set_status_and_content(
+                status_type::bad_request,
+                "{\"success\":false,\"error\":\"" + cooldown.error() + "\"}");
+            return;
+        }
+        const auto drain_timeout =
+            ParseUint32Query(req.get_query_value("drain_timeout_ms"),
+                             kDefaultStepDownDrainTimeoutMs,
+                             kMaxStepDownDrainTimeoutMs, "drain_timeout_ms");
+        if (!drain_timeout) {
+            LOG_EVERY_N(WARNING, 30)
+                << "Rejected P2P master stepdown: " << drain_timeout.error();
+            resp.set_status_and_content(status_type::bad_request,
+                                        "{\"success\":false,\"error\":\"" +
+                                            drain_timeout.error() + "\"}");
+            return;
+        }
         if (!stepdown_callback_) {
             resp.set_status_and_content(
                 status_type::service_unavailable,
@@ -117,17 +173,67 @@ void P2PMasterRpcService::init_http_server() {
                 "installed\"}");
             return;
         }
-        if (stepdown_requested_.exchange(true)) {
+        const auto status = HAStatusManager::instance().Snapshot();
+        if (!status.ha_enabled || status.role != "primary" ||
+            status.state != "RUNNING") {
+            LOG_EVERY_N(WARNING, 30)
+                << "Rejected P2P master stepdown: requires HA-enabled "
+                   "primary/RUNNING"
+                << ", ha_enabled=" << status.ha_enabled
+                << ", role=" << status.role << ", state=" << status.state;
             resp.set_status_and_content(
                 status_type::service_unavailable,
-                "{\"success\":false,\"error\":\"stepdown already requested\"}");
+                "{\"success\":false,\"error\":\"stepdown requires HA-enabled "
+                "primary/RUNNING\"}");
             return;
         }
-        LOG(INFO) << "P2P master stepdown requested";
-        stepdown_callback_();
+        StepdownRequest request{*cooldown, *drain_timeout};
+        bool already_requested;
+        {
+            std::lock_guard<std::mutex> lock(stepdown_mutex_);
+            already_requested = stepdown_request_.has_value();
+            if (already_requested) {
+                request = *stepdown_request_;
+            } else {
+                const auto duration =
+                    std::chrono::seconds(request.cooldown_sec);
+                request.election_paused_until =
+                    std::chrono::steady_clock::now() + duration;
+                request.election_paused_until_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        (std::chrono::system_clock::now() + duration)
+                            .time_since_epoch())
+                        .count();
+                stepdown_request_ = request;
+            }
+        }
+        if (already_requested) {
+            VLOG(1) << "P2P master stepdown request already pending"
+                    << ", cooldown_sec=" << request.cooldown_sec
+                    << ", drain_timeout_ms=" << request.drain_timeout_ms
+                    << ", election_paused_until_ms="
+                    << request.election_paused_until_ms
+                    << ", requested_cooldown_sec=" << *cooldown
+                    << ", requested_drain_timeout_ms=" << *drain_timeout;
+        } else {
+            LOG(INFO) << "P2P master stepdown requested"
+                      << ", cooldown_sec=" << request.cooldown_sec
+                      << ", drain_timeout_ms=" << request.drain_timeout_ms
+                      << ", election_paused_until_ms="
+                      << request.election_paused_until_ms;
+            stepdown_callback_(request);
+        }
         resp.set_status_and_content(
             status_type::ok,
-            "{\"success\":true,\"message\":\"stepdown accepted\"}");
+            "{\"success\":true,\"message\":\"stepdown "
+            "accepted\",\"cooldown_sec\":" +
+                std::to_string(request.cooldown_sec) +
+                ",\"drain_timeout_ms\":" +
+                std::to_string(request.drain_timeout_ms) +
+                ",\"election_paused_until_ms\":" +
+                std::to_string(request.election_paused_until_ms) +
+                ",\"already_requested\":" +
+                (already_requested ? "true" : "false") + "}");
     });
 
     http_server_.set_http_handler<GET>(

@@ -20,6 +20,13 @@
 
 namespace mooncake {
 
+P2PMasterService::~P2PMasterService() {
+    // Expiry callbacks access metadata members. Stop them before teardown.
+    if (client_manager_) {
+        client_manager_->Stop();
+    }
+}
+
 P2PMasterService::P2PMasterService(const P2PMasterConfig& config,
                                    ViewVersionId view_version)
     : max_client_per_key_(config.routes.max_clients_per_key),

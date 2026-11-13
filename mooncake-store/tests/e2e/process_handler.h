@@ -2,6 +2,7 @@
 
 #include <sys/types.h>
 
+#include <chrono>
 #include <optional>
 #include <string>
 
@@ -42,6 +43,8 @@ struct MasterRunnerConfig {
     std::string oplog_data_dir;
     std::optional<int> max_client_per_key;
     int standby_snapshot_service_port_base = 0;
+    int metrics_port_base = 0;
+    int heartbeat_rpc_port_base = 0;
 };
 
 class MasterProcessHandler {
@@ -76,6 +79,9 @@ class MasterProcessHandler {
 
     // Kill the master process.
     bool kill();
+
+    // Send SIGTERM and require a normal exit within the timeout.
+    bool terminate(std::chrono::seconds timeout);
 
     // Pause/resume the process without destroying its memory state.
     bool suspend();

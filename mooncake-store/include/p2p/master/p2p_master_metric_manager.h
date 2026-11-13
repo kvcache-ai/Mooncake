@@ -23,6 +23,12 @@ class P2PMasterMetricManager {
 
     ~P2PMasterMetricManager();
 
+    // Publishes the immutable build identity as an info gauge. This is called
+    // once by the master RPC service before /metrics can be scraped.
+    void set_component_info(const std::string& component_name,
+                            const std::string& component_version,
+                            const std::string& architecture);
+
     P2PMasterMetricManager(const P2PMasterMetricManager&) = delete;
     P2PMasterMetricManager& operator=(const P2PMasterMetricManager&) = delete;
     P2PMasterMetricManager(P2PMasterMetricManager&&) = delete;
@@ -237,6 +243,9 @@ class P2PMasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+    // Build identity labels; the value is fixed at 1.
+    ylt::metric::dynamic_gauge_3t component_info_;
+    bool component_info_initialized_{false};
 
     // Client RPC Metrics (register/unregister requests + failures)
     ylt::metric::counter_t register_client_requests_;

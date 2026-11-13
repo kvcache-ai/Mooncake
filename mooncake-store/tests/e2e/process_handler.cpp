@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 namespace mooncake {
@@ -126,8 +127,19 @@ bool MasterProcessHandler::start() {
                                          rpc_address_arg, rpc_port_arg};
 
 #if defined(MOONCAKE_STORE_CLIENT_P2P)
-        args.emplace_back("--enable_metric_reporting=false");
-        args.emplace_back("--metrics_port=0");
+        if (config_.metrics_port_base > 0) {
+            args.emplace_back(
+                "--metrics_port=" +
+                std::to_string(config_.metrics_port_base + index_));
+        } else {
+            args.emplace_back("--enable_metric_reporting=false");
+            args.emplace_back("--metrics_port=0");
+        }
+        if (config_.heartbeat_rpc_port_base > 0) {
+            args.emplace_back(
+                "--heartbeat-rpc-port=" +
+                std::to_string(config_.heartbeat_rpc_port_base + index_));
+        }
 
         if (config_.max_client_per_key.has_value()) {
             args.emplace_back("--max-client-per-key=" +
@@ -217,6 +229,39 @@ bool MasterProcessHandler::start() {
 
         return true;
     }
+}
+
+bool MasterProcessHandler::terminate(std::chrono::seconds timeout) {
+    if (master_pid_ == 0 || ::kill(master_pid_, SIGTERM) != 0) {
+        LOG(ERROR) << "[m" << index_ << "] Failed to send SIGTERM"
+                   << ", pid=" << master_pid_ << ", error=" << strerror(errno);
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int status = 0;
+        const auto result = waitpid(master_pid_, &status, WNOHANG);
+        if (result == master_pid_) {
+            master_pid_ = 0;
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                return true;
+            }
+            LOG(ERROR) << "[m" << index_ << "] Abnormal exit after SIGTERM"
+                       << ", wait_status=" << status;
+            return false;
+        }
+        if (result < 0 && errno != EINTR) {
+            LOG(ERROR) << "[m" << index_ << "] waitpid failed after SIGTERM"
+                       << ", error=" << strerror(errno);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    LOG(ERROR) << "[m" << index_ << "] SIGTERM exit timed out"
+               << ", timeout_sec=" << timeout.count();
+    return false;
 }
 
 bool MasterProcessHandler::kill() {

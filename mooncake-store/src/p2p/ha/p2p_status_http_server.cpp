@@ -7,6 +7,7 @@
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
 #include "p2p/master/p2p_master_metric_manager.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -36,6 +37,13 @@ void RegisterStatusHttpHandlers(coro_http::coro_http_server& server) {
     });
 
     server.set_http_handler<GET>(
+        "/server_info", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok,
+                                        GetMooncakeStoreBuildInfo());
+        });
+
+    server.set_http_handler<GET>(
         "/metrics/summary",
         [](coro_http_request& req, coro_http_response& resp) {
             std::string summary =
@@ -61,6 +69,10 @@ void P2PStatusHttpServer::Start() {
     server_ = std::make_unique<coro_http::coro_http_server>(
         /*thread_num=*/1, port_, host_);
     RegisterStatusHttpHandlers(*server_);
+    // Component info is process scoped. Initialize it before the supervisor
+    // HTTP server becomes reachable so standby /metrics scrapes are complete.
+    P2PMasterMetricManager::instance().set_component_info(
+        "p2p_master", GetMooncakeStoreVersion(), MOONCAKE_STORE_ARCHITECTURE);
 
     auto result = server_->async_start();
     if (result.hasResult()) {

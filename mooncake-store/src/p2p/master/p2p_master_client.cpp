@@ -6,7 +6,51 @@
 
 #include "common.h"
 
+#include <chrono>
+#include <gflags/gflags.h>
+
+DEFINE_int32(heartbeat_rpc_timeout_ms, 1000,
+             "Per-call timeout (ms) for client heartbeat RPC to master. "
+             "Lets the client fail each heartbeat cycle quickly when the "
+             "master is unreachable and reach the failure threshold faster.");
+
+static bool ValidateHeartbeatRpcTimeoutMs(const char* flag_name,
+                                          int32_t value) {
+    if (value <= 0) {
+        LOG(ERROR) << flag_name << " must be greater than 0";
+        return false;
+    }
+    return true;
+}
+
+DEFINE_validator(heartbeat_rpc_timeout_ms, &ValidateHeartbeatRpcTimeoutMs);
+
 namespace mooncake {
+
+P2PMasterClient::P2PMasterClient(const UUID& client_id,
+                                 P2PMasterClientMetric* metrics)
+    : client_id_(client_id), metrics_(metrics) {
+    coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        pool_conf.client_config.socket_config =
+            coro_io::ib_socket_t::config_t{};
+    }
+    client_pools_ =
+        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+            pool_conf);
+
+    auto heartbeat_pool_conf = pool_conf;
+    const auto timeout =
+        std::chrono::milliseconds(FLAGS_heartbeat_rpc_timeout_ms);
+    heartbeat_pool_conf.connect_retry_count = 0;
+    heartbeat_pool_conf.reconnect_wait_time = timeout;
+    heartbeat_pool_conf.client_config.connect_timeout_duration = timeout;
+    heartbeat_pool_conf.client_config.request_timeout_duration = timeout;
+    heartbeat_client_pools_ =
+        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+            heartbeat_pool_conf);
+}
 
 template <>
 struct RpcNameTraits<&P2PMasterRpcService::ExistKey> {
@@ -131,10 +175,11 @@ ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
             client_addr_param_ = master_addr;
             if (heartbeat_rpc_port_ > 0) {
                 const auto host = getHostNameWithoutPort(master_addr);
-                heartbeat_accessor_.SetClientPool(client_pools_->at(
+                heartbeat_accessor_.SetClientPool(heartbeat_client_pools_->at(
                     buildHostNameWithPort(host, heartbeat_rpc_port_)));
             } else {
-                heartbeat_accessor_.SetClientPool(client_pool);
+                heartbeat_accessor_.SetClientPool(
+                    heartbeat_client_pools_->at(master_addr));
             }
         }
 
@@ -362,9 +407,15 @@ tl::expected<P2PHeartbeatResponse, ErrorCode> P2PMasterClient::Heartbeat(
     const P2PHeartbeatRequest& req) {
     ScopedVLogTimer timer(1, "P2PMasterClient::Heartbeat");
     timer.LogRequest("client_id=", client_id_);
-    auto result =
-        invoke_rpc_via<&P2PMasterRpcService::Heartbeat, P2PHeartbeatResponse>(
-            heartbeat_accessor_, req);
+    auto result = invoke_rpc_via_config<&P2PMasterRpcService::Heartbeat,
+                                        P2PHeartbeatResponse>(
+        heartbeat_accessor_,
+        coro_rpc::request_config_t{
+            .request_timeout_duration =
+                std::chrono::milliseconds(FLAGS_heartbeat_rpc_timeout_ms),
+            .request_attachment = {},
+            .resp_attachment_buf = {}},
+        req);
     timer.LogResponseExpected(result);
     return result;
 }

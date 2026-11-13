@@ -22,6 +22,7 @@
 
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_election_readiness.h"
 #include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/ha/p2p_master_view.h"
@@ -35,7 +36,22 @@
 #include "common.h"
 
 namespace mooncake {
+
+std::atomic<bool> P2PMaster::shutdown_requested_{false};
+
+void P2PMaster::RequestShutdown() {
+    shutdown_requested_.store(true, std::memory_order_release);
+}
+
+bool P2PMaster::IsShutdownRequested() {
+    return shutdown_requested_.load(std::memory_order_acquire);
+}
+
+void P2PMaster::HandleSignal(int signal) { RequestShutdown(); }
+
 namespace {
+
+constexpr uint32_t kShutdownDrainTimeoutMs = 3000;
 
 std::unique_ptr<coro_rpc::coro_rpc_server> CreateRpcServer(
     const P2PMasterConfig& config) {
@@ -167,7 +183,7 @@ class ScopedStandbyRegistryProviders final {
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version,
-    std::function<void()> stepdown_callback = {}) {
+    P2PMasterRpcService::StepdownCallback stepdown_callback = {}) {
     auto service = std::make_unique<P2PMasterRpcService>(config, view_version);
     if (stepdown_callback) {
         service->SetStepdownCallback(std::move(stepdown_callback));
@@ -181,12 +197,61 @@ struct P2PPrimaryDemotionHandoff {
     uint64_t sequence_id{0};
 };
 
+bool WaitForElectionPause(std::chrono::steady_clock::time_point deadline,
+                          const std::function<bool()>& stopping) {
+    bool waited = false;
+    while (!stopping()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            if (waited) {
+                LOG(INFO) << "HA election pause completed";
+            }
+            return true;
+        }
+        if (!waited) {
+            LOG(INFO) << "HA election paused after stepdown"
+                      << ", remaining_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - now)
+                             .count();
+            waited = true;
+        }
+        std::this_thread::sleep_until(
+            std::min(deadline, now + std::chrono::milliseconds(100)));
+    }
+    return false;
+}
+
 }  // namespace
 
 int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                                    P2PMasterRpcService& p2p_service,
                                    std::function<void()> before_start,
-                                   std::function<void()> after_stop) {
+                                   std::function<void()> after_stop,
+                                   std::function<bool()> stopping,
+                                   std::function<bool()> stepping_down) {
+    auto is_stopping = [&stopping] { return stopping && stopping(); };
+    std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
+    auto finish = [&] {
+        // Join all admitted handlers before draining. The expiry monitor can
+        // also enqueue unregister entries, so stop it while the writer and
+        // leader renewal are still running. HTTP metadata endpoints are
+        // read-only.
+        server.stop();
+        if (heartbeat_server) {
+            heartbeat_server->stop();
+            heartbeat_server.reset();
+        }
+        p2p_service.GetMasterService().GetClientManager().Stop();
+        if (after_stop) {
+            after_stop();
+        }
+    };
+    if (is_stopping()) {
+        finish();
+        return 0;
+    }
+
     const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
     RegisterP2PRpcService(server, p2p_service,
                           /*include_heartbeat=*/!dedicated_heartbeat);
@@ -194,7 +259,6 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
         before_start();
     }
 
-    std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
     if (dedicated_heartbeat) {
         heartbeat_server.emplace(
             std::max<uint32_t>(1u, config_.rpc.heartbeat_thread_num),
@@ -207,9 +271,7 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
         if (heartbeat_result.hasResult()) {
             LOG(ERROR) << "Failed to start heartbeat RPC server: "
                        << heartbeat_result.result().value();
-            if (after_stop) {
-                after_stop();
-            }
+            finish();
             return -1;
         }
     }
@@ -219,32 +281,62 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
         LOG(ERROR) << "Failed to start P2P master RPC server: "
                    << server_result.result().value();
         // A concurrent stop can also complete the future during startup.
-        server.stop();
-        if (heartbeat_server) {
-            heartbeat_server->stop();
-            heartbeat_server.reset();
-        }
-        if (after_stop) {
-            after_stop();
-        }
+        finish();
         return -1;
     }
+    while (!is_stopping() && !server_result.hasResult()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (is_stopping()) {
+        finish();
+        return 0;
+    }
     auto error = std::move(server_result).get();
-    LOG(ERROR) << "P2P master RPC server stopped: " << error;
-    // The start futures only wait for accept loops. Stop and destroy each
-    // server so every in-flight RPC returns before callers drain OpLog state.
-    server.stop();
-    if (heartbeat_server) {
-        heartbeat_server->stop();
-        heartbeat_server.reset();
+    // Closing the listener for voluntary stepdown cancels its accept loop.
+    // An unexpected exit, including lease loss, must remain an error.
+    if (stepping_down && stepping_down() &&
+        error == coro_rpc::errc::operation_canceled) {
+        LOG(INFO) << "P2P master RPC server stopped for active stepdown: "
+                  << error.message();
+    } else {
+        LOG(ERROR) << "P2P master RPC server stopped: " << error.message();
     }
-    // Stepdown drains the OpLog only after this point, when no active RPC
-    // handler can admit or mutate metadata. This preserves kvpool's shutdown
-    // ordering without stopping the writer before confirmed writes drain.
-    if (after_stop) {
-        after_stop();
-    }
+    finish();
     return 0;
+}
+
+bool P2PMaster::DrainOpLogBeforeStop(OpLogManager& manager, uint32_t timeout_ms,
+                                     const char* reason) {
+    const std::string prefix = std::string("P2P primary ") + reason;
+    LOG(INFO) << prefix << " OpLog drain started"
+              << ", drain_timeout_ms=" << timeout_ms;
+    const auto drain = manager.DrainWriting(timeout_ms);
+    auto& status = HAStatusManager::instance();
+    const std::string error_prefix = prefix + " OpLog drain incomplete";
+    if (drain.drained) {
+        status.SetDoctorIssue("OPLOG_DRAIN_INCOMPLETE");
+        status.ClearLastErrorIfPrefix(
+            "P2P primary stepdown OpLog drain incomplete");
+        status.ClearLastErrorIfPrefix(
+            "P2P primary shutdown OpLog drain incomplete");
+        LOG(INFO) << prefix << " OpLog drain completed"
+                  << ", drain_timeout_ms=" << timeout_ms
+                  << ", committed_sequence_id=" << drain.committed_sequence_id
+                  << ", max_known_sequence_id=" << drain.max_known_sequence_id;
+        return true;
+    }
+    std::string error = error_prefix +
+                        ", drain_timeout_ms=" + std::to_string(timeout_ms) +
+                        ", queued=" + std::to_string(drain.queued_count) +
+                        ", inflight=" + std::to_string(drain.inflight_count) +
+                        ", committed_sequence_id=" +
+                        std::to_string(drain.committed_sequence_id) +
+                        ", max_known_sequence_id=" +
+                        std::to_string(drain.max_known_sequence_id);
+    LOG(WARNING) << error;
+    status.SetDoctorIssue("OPLOG_DRAIN_INCOMPLETE", error);
+    status.SetLastError(std::move(error));
+    return false;
 }
 
 int P2PMaster::RunStandalone() {
@@ -256,16 +348,19 @@ int P2PMaster::RunStandalone() {
     HAStatusManager::instance().SetRoleState("disabled", "STANDALONE");
     auto server = CreateRpcServer(config_);
     auto active_service = CreateActiveService(config_, /*view_version=*/0);
-    return RunActiveRpcServers(*server, *active_service);
+    return RunActiveRpcServers(
+        *server, *active_service, /*before_start=*/{}, /*after_stop=*/{},
+        [this] { return P2PMaster::IsShutdownRequested(); });
 }
 
 int P2PMaster::RunWithHA() {
+    auto stopping = [] { return P2PMaster::IsShutdownRequested(); };
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/true, config_.cluster_id, "",
         config_.oplog.latest_stall_timeout_sec,
         config_.oplog.catchup_stall_timeout_sec);
-#ifdef STORE_USE_REDIS
     std::string master_instance_id;
+#ifdef STORE_USE_REDIS
     if (config_.oplog.enabled &&
         config_.ha.election_backend == ElectionBackend::REDIS) {
         master_instance_id = GenerateMasterInstanceId();
@@ -275,8 +370,15 @@ int P2PMaster::RunWithHA() {
     const std::string local_endpoint =
         buildHostNameWithPort(config_.rpc.address, config_.rpc.port);
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
-    while (true) {
-        HAStatusManager::instance().ClearDoctorIssues();
+    // Preserve the accepted request's deadline across active/standby rounds.
+    // The HTTP callback writes it before publishing the stepdown flag; the
+    // next round reads it after the active service has been destroyed.
+    std::chrono::steady_clock::time_point election_paused_until{};
+    while (!stopping()) {
+        // The previous primary's drain result must remain visible after
+        // demotion; clear it on a successful drain instead of hiding it here.
+        HAStatusManager::instance().ClearDoctorIssues(
+            /*preserve_stepdown_drain=*/true);
         // Read-only diagnostics must be reachable in every role. A standby
         // blocks inside ElectLeader below, so start the diagnostic server
         // before the active (primary-only) HTTP server exists.
@@ -314,8 +416,12 @@ int P2PMaster::RunWithHA() {
             master_view = std::move(etcd_view);
         }
         if (connect_result != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to initialize P2P master view: "
-                       << toString(connect_result);
+            const std::string error =
+                std::string("Failed to initialize P2P master view: ") +
+                toString(connect_result);
+            HAStatusManager::instance().SetRoleState("starting", "FAILED");
+            HAStatusManager::instance().SetLastError(error);
+            LOG(ERROR) << error;
             return -1;
         }
 
@@ -415,12 +521,98 @@ int P2PMaster::RunWithHA() {
 #endif
         }
 
+#ifdef STORE_USE_REDIS
+        if (standby && config_.ha.election_backend == ElectionBackend::REDIS) {
+            auto* redis_view =
+                dynamic_cast<P2PRedisMasterView*>(master_view.get());
+            if (redis_view) {
+                redis_view->SetShouldElect([this,
+                                            self_instance_id =
+                                                master_instance_id,
+                                            standby = standby.get()] {
+                    if (P2PMaster::IsShutdownRequested()) {
+                        return false;
+                    }
+                    const auto self_status = standby->GetSyncStatus();
+                    auto readiness_decision =
+                        EvaluateP2PElectionStandbyReadiness(
+                            self_status.state, self_status.primary_seq_id_known,
+                            self_status.primary_seq_id,
+                            self_status.applied_seq_id,
+                            config_.oplog.election_max_standby_lag_entries);
+                    if (!readiness_decision.should_wait) {
+                        HAStatusManager::instance().SetElectionReadinessBlocked(
+                            false);
+                        return true;
+                    }
+                    if (self_status.state == StandbyState::WATCHING) {
+                        HAStatusManager::instance().SetElectionReadinessBlocked(
+                            true, readiness_decision.lag_entries,
+                            config_.oplog.election_max_standby_lag_entries);
+                    } else {
+                        HAStatusManager::instance().SetElectionReadinessBlocked(
+                            false);
+                    }
+                    LOG_EVERY_N(WARNING, 30)
+                        << "P2P election attempt blocked by standby readiness"
+                        << ", self_instance_id=" << self_instance_id
+                        << ", self_endpoint=" << config_.rpc.address
+                        << ", standby_state="
+                        << StandbyStateToString(self_status.state)
+                        << ", self_applied_sequence_id="
+                        << self_status.applied_seq_id
+                        << ", latest_sequence_id_known="
+                        << self_status.primary_seq_id_known
+                        << ", latest_sequence_id=" << self_status.primary_seq_id
+                        << ", lag_entries=" << readiness_decision.lag_entries
+                        << ", max_lag_entries="
+                        << config_.oplog.election_max_standby_lag_entries;
+                    return false;
+                });
+            }
+        }
+#endif
+        // Keep standby replication and diagnostics running during cooldown.
+        if (!WaitForElectionPause(election_paused_until, stopping)) {
+            LOG(INFO) << "HA shutdown requested during election pause";
+            return 0;
+        }
+        if (standby) {
+            if (!WaitForP2PElectionReadiness(config_, master_instance_id,
+                                             *standby, stopping)) {
+                LOG(INFO) << "HA shutdown requested during election readiness "
+                             "wait";
+                return 0;
+            }
+        }
+
+        LOG(INFO) << "Trying to elect self as leader...";
         EtcdLeaseId lease_id = 0;
         ViewVersionId view_version = 0;
-        master_view->ElectLeader(local_endpoint, view_version, lease_id);
+        std::atomic<bool> election_done{false};
+        std::thread election_thread([&] {
+            master_view->ElectLeader(local_endpoint, view_version, lease_id);
+            election_done.store(true, std::memory_order_release);
+        });
+        while (!election_done.load(std::memory_order_acquire) && !stopping()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (stopping()) {
+            master_view->CancelElection();
+        }
+        election_thread.join();
+        if (stopping()) {
+            // Election may have won before cancellation; release only our view.
+            const auto release_result = master_view->ReleaseLeader();
+            LOG(INFO) << "HA shutdown requested during election"
+                      << ", release_result=" << toString(release_result);
+            return 0;
+        }
 
         std::atomic<bool> leadership_lost{false};
         std::atomic<bool> active_stepdown_requested{false};
+        // Published with active_stepdown_requested's release/acquire pair.
+        uint32_t stepdown_drain_timeout_ms = 0;
         std::atomic<OpLogManager*> primary_oplog_manager{nullptr};
         const auto stop_for_leadership_loss = [&server, &leadership_lost,
                                                &primary_oplog_manager] {
@@ -436,22 +628,40 @@ int P2PMaster::RunWithHA() {
             }
             server->stop();
         };
-        const auto stop_for_active_stepdown = [&server,
-                                               &active_stepdown_requested] {
-            // Active stepdown is voluntary: close the write request entry
-            // first, then let RunActiveRpcServers wait for accepted handlers
-            // and drain confirmed writes while this primary still renews its
-            // lease.
-            active_stepdown_requested.store(true, std::memory_order_release);
-            server->stop();
-        };
+        const auto stop_for_active_stepdown =
+            [&server, &active_stepdown_requested, &election_paused_until,
+             &stepdown_drain_timeout_ms](
+                const P2PMasterRpcService::StepdownRequest& request) {
+                election_paused_until = request.election_paused_until;
+                stepdown_drain_timeout_ms = request.drain_timeout_ms;
+                // Active stepdown is voluntary: close the write request entry
+                // first, then let RunActiveRpcServers wait for accepted
+                // handlers and drain confirmed writes while this primary still
+                // renews its lease.
+                active_stepdown_requested.store(true,
+                                                std::memory_order_release);
+                server->stop();
+            };
         auto keep_leader_thread = std::thread(
             [view = master_view.get(), lease_id, stop_for_leadership_loss] {
                 view->KeepLeader(lease_id);
                 stop_for_leadership_loss();
             });
-        std::this_thread::sleep_for(
-            std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds()));
+        const auto retire_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds());
+        while (!stopping() &&
+               std::chrono::steady_clock::now() < retire_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (stopping()) {
+            master_view->CancelKeepAlive(lease_id);
+            keep_leader_thread.join();
+            const auto release_result = master_view->ReleaseLeader();
+            LOG(INFO) << "HA shutdown requested before promotion"
+                      << ", release_result=" << toString(release_result);
+            return 0;
+        }
 
 #ifdef STORE_USE_REDIS
         HAStatusManager::instance().SetRoleState("promoting", "PROMOTING");
@@ -481,33 +691,45 @@ int P2PMaster::RunWithHA() {
             standby.reset();
         }
 
+        if (stopping()) {
+            master_view->CancelKeepAlive(lease_id);
+            keep_leader_thread.join();
+            const auto release_result = master_view->ReleaseLeader();
+            LOG(INFO) << "HA shutdown requested during promotion"
+                      << ", release_result=" << toString(release_result);
+            return 0;
+        }
+
         HAStatusManager::instance().SetRoleState("primary", "STARTING");
-        auto drain_after_stepdown = [&active_stepdown_requested,
-                                     &leadership_lost, &primary_oplog_manager] {
-            if (!active_stepdown_requested.load(std::memory_order_acquire) ||
-                leadership_lost.load(std::memory_order_acquire)) {
+        // A late SIGTERM during another exit path must not report a graceful
+        // shutdown unless the admitted writes were actually drained.
+        bool graceful_drain_complete = !config_.oplog.enabled;
+        auto drain_before_stop = [&active_stepdown_requested, &leadership_lost,
+                                  &primary_oplog_manager,
+                                  &stepdown_drain_timeout_ms,
+                                  &graceful_drain_complete, stopping] {
+            const bool shutdown = stopping();
+            if (!shutdown &&
+                !active_stepdown_requested.load(std::memory_order_acquire)) {
                 return;
             }
-            if (auto* manager =
-                    primary_oplog_manager.load(std::memory_order_acquire)) {
-                auto drain = manager->DrainWriting(3000);
-                if (!drain.drained) {
-                    LOG(WARNING)
-                        << "P2P primary stepdown OpLog drain incomplete"
-                        << ", queued=" << drain.queued_count
-                        << ", inflight=" << drain.inflight_count
-                        << ", committed_sequence_id="
-                        << drain.committed_sequence_id
-                        << ", max_known_sequence_id="
-                        << drain.max_known_sequence_id;
-                } else {
-                    LOG(INFO) << "P2P primary stepdown OpLog drain completed"
-                              << ", committed_sequence_id="
-                              << drain.committed_sequence_id
-                              << ", max_known_sequence_id="
-                              << drain.max_known_sequence_id;
-                }
+            auto* manager =
+                primary_oplog_manager.load(std::memory_order_acquire);
+            if (!manager) {
+                return;
             }
+            // Graceful shutdown must not cancel accepted writes before drain.
+            // Lease loss still cancels immediately, including during this wait.
+            if (leadership_lost.load(std::memory_order_acquire)) {
+                graceful_drain_complete = false;
+                LOG(WARNING)
+                    << "Skipping graceful OpLog drain after lease loss";
+                return;
+            }
+            graceful_drain_complete = DrainOpLogBeforeStop(
+                *manager,
+                shutdown ? kShutdownDrainTimeoutMs : stepdown_drain_timeout_ms,
+                shutdown ? "shutdown" : "stepdown");
         };
         auto stepdown_callback = stop_for_active_stepdown;
         // The active service serves the full HTTP surface (including
@@ -650,7 +872,12 @@ int P2PMaster::RunWithHA() {
 #endif
         const int run_result = RunActiveRpcServers(
             *server, *active_service, std::move(mark_primary),
-            std::move(drain_after_stepdown));
+            std::move(drain_before_stop), stopping,
+            [&active_stepdown_requested, &leadership_lost] {
+                return active_stepdown_requested.load(
+                           std::memory_order_acquire) &&
+                       !leadership_lost.load(std::memory_order_acquire);
+            });
 #ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
 #endif
@@ -667,6 +894,9 @@ int P2PMaster::RunWithHA() {
         if (auto* manager =
                 primary_oplog_manager.load(std::memory_order_acquire)) {
             manager->StopWriting();
+            if (stopping()) {
+                primary_oplog_manager.store(nullptr, std::memory_order_release);
+            }
         }
         if (primary_snapshot_server) {
             primary_snapshot_server->stop();
@@ -735,6 +965,29 @@ int P2PMaster::RunWithHA() {
         }
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();
+        if (stopping()) {
+            const auto release_result = master_view->ReleaseLeader();
+            HAStatusManager::instance().SetRoleState("primary", "STOPPED");
+            if (!graceful_drain_complete) {
+                // The drain path already reports queue/sequence details. This
+                // aggregate log and exit status distinguish incomplete
+                // shutdown.
+                LOG(ERROR)
+                    << "HA shutdown completed with incomplete OpLog drain"
+                    << ", release_result=" << toString(release_result);
+                return -1;
+            }
+            LOG(INFO) << "HA shutdown completed"
+                      << ", release_result=" << toString(release_result);
+            return 0;
+        }
+        if (active_stepdown_requested.load(std::memory_order_acquire)) {
+            // Release only after RPC handlers, OpLog writes, and keepalive have
+            // stopped.
+            const auto release_result = master_view->ReleaseLeader();
+            LOG(INFO) << "HA primary stepdown completed"
+                      << ", release_result=" << toString(release_result);
+        }
         active_service.reset();
         if (run_result != 0) {
             return run_result;
@@ -746,7 +999,19 @@ int P2PMaster::RunWithHA() {
 P2PMaster::P2PMaster(const P2PMasterConfig& config) : config_(config) {}
 
 int P2PMaster::Run() {
-    return config_.ha.enabled ? RunWithHA() : RunStandalone();
+    // TODO(P2P HA): graceful HA shutdown currently supports Redis only.
+    // The etcd view does not implement CancelElection(), so SIGINT/SIGTERM
+    // during an etcd election can leave RunWithHA() waiting for that thread.
+    const auto previous_sigint_handler = std::signal(SIGINT, HandleSignal);
+    const auto previous_sigterm_handler = std::signal(SIGTERM, HandleSignal);
+    const int result = config_.ha.enabled ? RunWithHA() : RunStandalone();
+    if (previous_sigint_handler != SIG_ERR) {
+        std::signal(SIGINT, previous_sigint_handler);
+    }
+    if (previous_sigterm_handler != SIG_ERR) {
+        std::signal(SIGTERM, previous_sigterm_handler);
+    }
+    return result;
 }
 
 }  // namespace mooncake

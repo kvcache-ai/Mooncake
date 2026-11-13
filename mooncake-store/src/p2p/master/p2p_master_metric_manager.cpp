@@ -17,6 +17,17 @@ P2PMasterMetricManager& P2PMasterMetricManager::instance() {
 
 P2PMasterMetricManager::~P2PMasterMetricManager() = default;
 
+void P2PMasterMetricManager::set_component_info(
+    const std::string& component_name, const std::string& component_version,
+    const std::string& architecture) {
+    if (component_info_initialized_) {
+        return;
+    }
+    component_info_.update({component_name, component_version, architecture},
+                           1);
+    component_info_initialized_ = true;
+}
+
 P2PMasterMetricManager::P2PMasterMetricManager()
     // Initialize Gauges
     : mem_allocated_size_(
@@ -44,6 +55,9 @@ P2PMasterMetricManager::P2PMasterMetricManager()
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
+      component_info_("mooncake_component_info",
+                      "Mooncake component metadata information",
+                      {"component_name", "component_version", "architecture"}),
 
       // Initialize client RPC counters (requests / failures)
       register_client_requests_("master_register_client_requests",
@@ -776,6 +790,8 @@ std::string P2PMasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_write_route_partial_successes_);
     serialize_metric(batch_get_write_route_items_);
     serialize_metric(batch_get_write_route_failed_items_);
+
+    serialize_metric(component_info_);
 
     std::string cluster_part;
     client_metrics_aggregator_.Serialize(cluster_part);

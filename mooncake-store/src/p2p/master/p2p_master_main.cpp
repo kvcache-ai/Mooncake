@@ -53,8 +53,13 @@ DEFINE_string(redis_password, "", "Redis AUTH password");
 DEFINE_int32(redis_db_index, 0, "Redis database index");
 DEFINE_int32(redis_master_view_ttl_sec, 4, "Redis leader key TTL in seconds");
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
-             "Redis leader heartbeat interval in seconds");
+             "Redis leader heartbeat interval in seconds; must be less than "
+             "redis_master_view_ttl_sec");
 DEFINE_bool(enable_oplog, false, "Enable P2P metadata OpLog");
+DEFINE_uint64(
+    election_max_standby_lag_entries, 0,
+    "Maximum allowed latest-applied OpLog lag before a P2P standby joins "
+    "leader election; 0 requires the standby to catch up to latest");
 DEFINE_string(oplog_store_type, "localfs",
               "P2P OpLog backend: localfs or redis");
 DEFINE_string(oplog_data_dir, "/tmp/mooncake_oplog",
@@ -75,7 +80,7 @@ DEFINE_uint32(oplog_async_write_batch_size, 64,
               "Maximum entries in a Redis OpLog pipeline batch");
 DEFINE_bool(enable_oplog_auto_trim, false,
             "Enable primary-side Redis OpLog auto trim in P2P HA mode");
-DEFINE_uint32(oplog_auto_trim_interval_sec, 60,
+DEFINE_uint32(oplog_auto_trim_interval_sec, 10,
               "Interval in seconds for Redis OpLog auto trim");
 DEFINE_uint64(oplog_trim_retention_entries, 100000,
               "Number of recent OpLog entries to retain before auto trim");
@@ -158,6 +163,9 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
                     &config.redis.heartbeat_interval_seconds,
                     config.redis.heartbeat_interval_seconds);
     source.GetBool("enable_oplog", &config.oplog.enabled, config.oplog.enabled);
+    source.GetUInt64("election_max_standby_lag_entries",
+                     &config.oplog.election_max_standby_lag_entries,
+                     config.oplog.election_max_standby_lag_entries);
     source.GetString("oplog_store_type", &config.oplog.store_type,
                      config.oplog.store_type);
     source.GetString("oplog_data_dir", &config.oplog.data_dir,
@@ -250,6 +258,8 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
     APPLY_OVERRIDE(redis_heartbeat_interval_sec,
                    config.redis.heartbeat_interval_seconds);
     APPLY_OVERRIDE(enable_oplog, config.oplog.enabled);
+    APPLY_OVERRIDE(election_max_standby_lag_entries,
+                   config.oplog.election_max_standby_lag_entries);
     APPLY_OVERRIDE(oplog_store_type, config.oplog.store_type);
     APPLY_OVERRIDE(oplog_data_dir, config.oplog.data_dir);
     APPLY_OVERRIDE(oplog_async_queue_max_entries,
