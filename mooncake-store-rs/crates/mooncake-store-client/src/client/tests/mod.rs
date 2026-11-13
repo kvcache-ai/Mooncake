@@ -1,3 +1,8 @@
+mod route_cas_boundary_tests;
+mod route_clock_cold_read_tests;
+mod route_clock_offload_tests;
+mod route_snapshot_boundary_tests;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::fs;
@@ -156,6 +161,10 @@ struct CountingMetadataBackend {
 struct CountingRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
     miss_bounded_reads: AtomicBool,
+    miss_full_reads: AtomicBool,
+    bounded_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    before_single_cas_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    after_single_cas_hook: Mutex<Option<Box<dyn FnOnce(&mooncake_store_core::CasResult) + Send>>>,
     injected_routes: Mutex<BTreeMap<String, ObjectRoute>>,
     get_object_routes_calls: AtomicUsize,
     bounded_reads: Arc<AtomicUsize>,
@@ -548,6 +557,10 @@ impl CountingRouteDirectory {
         Self {
             inner,
             miss_bounded_reads: AtomicBool::new(false),
+            miss_full_reads: AtomicBool::new(false),
+            bounded_read_hook: Mutex::new(None),
+            before_single_cas_hook: Mutex::new(None),
+            after_single_cas_hook: Mutex::new(None),
             injected_routes: Mutex::new(BTreeMap::new()),
             get_object_routes_calls: AtomicUsize::new(0),
             bounded_reads: Arc::new(AtomicUsize::new(0)),
@@ -2015,6 +2028,9 @@ impl RouteDirectory for CountingRouteDirectory {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_full_reads.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         if let Some(route) = self.injected_route(key) {
             return Ok(Some(route));
         }
@@ -2037,6 +2053,9 @@ impl RouteDirectory for CountingRouteDirectory {
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_full_reads.load(Ordering::Relaxed) {
+            return Ok(vec![None; keys.len()]);
+        }
         let mut routes = self.inner.get_object_routes(observer, keys)?;
         for (key, route) in keys.iter().zip(routes.iter_mut()) {
             if let Some(injected) = self.injected_route(key) {
@@ -2052,6 +2071,10 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        let hook = self.bounded_read_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         if self.miss_bounded_reads.load(Ordering::Relaxed) {
             return Ok(vec![None; keys.len()]);
         }
@@ -2097,8 +2120,18 @@ impl RouteDirectory for CountingRouteDirectory {
         next: Option<&ObjectRoute>,
     ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
         self.single_cas_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .compare_and_swap_object_route(observer, key, expected, next)
+        let before = self.before_single_cas_hook.lock().take();
+        let after = self.after_single_cas_hook.lock().take();
+        if let Some(before) = before {
+            before();
+        }
+        let result = self
+            .inner
+            .compare_and_swap_object_route(observer, key, expected, next)?;
+        if let Some(after) = after {
+            after(&result);
+        }
+        Ok(result)
     }
 
     fn compare_and_swap_object_routes(

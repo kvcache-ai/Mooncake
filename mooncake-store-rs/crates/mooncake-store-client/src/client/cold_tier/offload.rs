@@ -161,12 +161,9 @@ fn publish_initial_write_backing(
         enqueue_pending_offload(storage_owner, &next);
         Ok(Some(next))
     } else {
-        match cas.current.as_ref() {
-            Some(current) => {
-                storage_owner.sync_route(current);
-                enqueue_pending_offload(storage_owner, current);
-            }
-            None => storage_owner.hot_replicas.remove_key(&route.key),
+        if let Some(current) = cas.current.as_ref() {
+            storage_owner.sync_route(current);
+            enqueue_pending_offload(storage_owner, current);
         }
         Ok(None)
     }
@@ -274,9 +271,8 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         enqueue_pending_offload(storage_owner, &next);
         Ok(Some(next))
     } else {
-        match cas.current.as_ref() {
-            Some(current) => storage_owner.sync_route(current),
-            None => storage_owner.hot_replicas.remove_key(&route.key),
+        if let Some(current) = cas.current.as_ref() {
+            storage_owner.sync_route(current);
         }
         Ok(None)
     }
@@ -582,7 +578,6 @@ pub(in super::super) fn prepare_pending_offload_entry(
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     }
     let Some(route) = route else {
-        storage_owner.hot_replicas.remove_key(&entry.key.route_key);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     };
     let refreshed_pending_entry = route
@@ -808,8 +803,6 @@ pub(in super::super) fn clear_unavailable_pending_cold_backing(
         storage_owner.sync_route(&next);
     } else if let Some(current) = cas.current.as_ref() {
         storage_owner.sync_route(current);
-    } else {
-        storage_owner.hot_replicas.remove_key(&route.key);
     }
     Ok(())
 }

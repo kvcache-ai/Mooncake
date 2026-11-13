@@ -2564,15 +2564,11 @@ impl StorageOwnerState {
         self.stale_candidate_reconcile_started_at_ms
             .store(scan_started_at_ms, std::sync::atomic::Ordering::Relaxed);
 
-        let (candidate_keys, tracked_identities, legacy_tracked_spans) = {
+        let candidate_keys = {
             let mut clock = self.hot_replicas.clock.lock();
-            (
-                clock.reclaim_candidate_keys(
-                    preferred_segment,
-                    self.offload_priority.eviction_scan_limit,
-                ),
-                clock.tracked_allocation_identities(),
-                clock.tracked_allocation_spans(),
+            clock.reclaim_candidate_keys(
+                preferred_segment,
+                self.offload_priority.eviction_scan_limit,
             )
         };
         let mut released = 0usize;
@@ -2602,14 +2598,20 @@ impl StorageOwnerState {
                 pending.keys().cloned().collect::<BTreeSet<_>>(),
             )
         };
-        let candidates = self.allocator.lock().untracked_reconcile_candidates(
-            &tracked_identities,
-            &legacy_tracked_spans,
-            &pending_evictions,
-            scan_started_at_ms,
-            preferred_segment,
-            PENDING_EVICTION_CONFIRMATION_BATCH,
-        );
+        let candidates = {
+            // Match publication's allocator -> CLOCK lock order so the candidate
+            // scan cannot combine new allocations with an older CLOCK snapshot.
+            let mut allocator = self.allocator.lock();
+            let clock = self.hot_replicas.clock.lock();
+            allocator.untracked_reconcile_candidates(
+                &clock.tracked_allocation_identities(),
+                &clock.tracked_allocation_spans(),
+                &pending_evictions,
+                scan_started_at_ms,
+                preferred_segment,
+                PENDING_EVICTION_CONFIRMATION_BATCH,
+            )
+        };
         let allocator_candidate_count = candidates.len();
         for identity in candidates {
             self.begin_untracked_candidate_confirmation(&identity);
@@ -3478,7 +3480,6 @@ impl StorageOwnerState {
             .next()
             .flatten()
         else {
-            self.hot_replicas.remove_key(key);
             return Ok(None);
         };
         self.sync_route(&route);
