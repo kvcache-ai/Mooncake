@@ -144,7 +144,11 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         attr.sq_sig_all = false;
         attr.qp_type = IBV_QPT_RC;
         attr.qp_context = this;
-        attr.cap.max_send_wr = attr.cap.max_recv_wr = max_wr_depth;
+        attr.cap.max_send_wr = max_wr_depth;
+        // These QPs only carry one-sided READ/WRITE and never post a receive,
+        // so MC_MAX_RECV_WR may shrink the unused receive queue.
+        const size_t max_recv_wr = globalConfig().max_recv_wr;
+        attr.cap.max_recv_wr = max_recv_wr ? max_recv_wr : max_wr_depth;
         attr.cap.max_send_sge = attr.cap.max_recv_sge = max_sge_per_wr;
         attr.cap.max_inline_data = max_inline_bytes;
         qp_list_[i] = ibv_create_qp(context_.pd(), &attr);

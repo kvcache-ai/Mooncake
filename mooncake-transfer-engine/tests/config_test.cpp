@@ -1098,6 +1098,66 @@ TEST_F(RdmaWorkerIdleSpinEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.rdma_worker_idle_spin_us, 19u);
 }
 
+// --- MC_MAX_RECV_WR (1-65535, clamped to device max_qp_wr) ---
+
+class MaxRecvWrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_RECV_WR"); }
+};
+
+TEST_F(MaxRecvWrEnvTest, UnsetKeepsRecvDepthEqualToMaxWr) {
+    ::unsetenv("MC_MAX_RECV_WR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_recv_wr, 0u);  // 0 => endpoint uses max_wr
+}
+
+TEST_F(MaxRecvWrEnvTest, ValidOverride) {
+    ASSERT_EQ(::setenv("MC_MAX_RECV_WR", "16", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_recv_wr, 16u);
+    ASSERT_EQ(::setenv("MC_MAX_RECV_WR", "65535", 1), 0);
+    GlobalConfig config_max;
+    loadGlobalConfig(config_max);
+    EXPECT_EQ(config_max.max_recv_wr, 65535u);
+}
+
+TEST_F(MaxRecvWrEnvTest, OutOfRangeIsIgnored) {
+    for (const char* bad : {"0", "-1", "65536", "abc"}) {
+        ASSERT_EQ(::setenv("MC_MAX_RECV_WR", bad, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.max_recv_wr, 0u) << "MC_MAX_RECV_WR=" << bad;
+    }
+}
+
+TEST_F(MaxRecvWrEnvTest, ClampedToDeviceMaxQpWr) {
+    // updateGlobalConfig() mutates the process-wide config; restore it.
+    auto& config = globalConfig();
+    const GlobalConfig saved = config;
+    ibv_device_attr attr{};
+    attr.max_qp = 1 << 20;
+    attr.max_cq = 1 << 20;
+    attr.max_qp_wr = 1024;
+    attr.max_sge = 64;
+    attr.max_cqe = 1 << 20;
+    attr.max_mr_size = UINT64_MAX;
+
+    config.max_recv_wr = 4096;
+    updateGlobalConfig(attr);
+    EXPECT_EQ(config.max_recv_wr, 1024u);
+
+    config.max_recv_wr = 16;
+    updateGlobalConfig(attr);
+    EXPECT_EQ(config.max_recv_wr, 16u);
+
+    config.max_recv_wr = 0;  // unset stays unset
+    updateGlobalConfig(attr);
+    EXPECT_EQ(config.max_recv_wr, 0u);
+    config = saved;
+}
+
 // --- MC_MAX_RD_ATOMIC / MC_MAX_DEST_RD_ATOMIC (1-255, clamped to device) ---
 
 class RdAtomicEnvTest : public ::testing::Test {
