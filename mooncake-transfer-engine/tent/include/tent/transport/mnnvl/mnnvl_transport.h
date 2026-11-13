@@ -15,6 +15,7 @@
 #ifndef MNNVL_TRANSPORT_H_
 #define MNNVL_TRANSPORT_H_
 
+#include <atomic>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "tent/common/cuda_fabric_compat.h"
@@ -89,21 +90,24 @@ class MnnvlTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
-    const char *getName() const override { return "mnnvl"; }
+    virtual const char *getName() const { return "mnnvl"; }
     bool supportsGlobalAddressing() const override { return true; }
-    Status allocateLocalMemory(void **addr, size_t size,
-                               MemoryOptions &options) override;
-    Status freeLocalMemory(void *addr, size_t size) override;
     Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
     Status unmapRemoteMemory(SegmentID peer, void *address) override;
+
+    virtual Status allocateLocalMemory(void **addr, size_t size,
+                                       MemoryOptions &options);
+
+    virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
     void startTransfer(std::vector<MnnvlTask *> &tasks, MnnvlSubBatch *batch);
 
-    Status relocateSharedMemoryAddress(uint64_t &address, uint64_t length,
+    Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
-    Status getOrMapRemoteMemory(uint64_t &address, uint64_t length,
-                                SegmentID peer, bool fixed_address);
+
+    Status mapVmmMemory(uint64_t &address, size_t size, SegmentID peer,
+                        bool fixed_address, int device);
 
     Status setPeerAccess();
 
@@ -114,20 +118,25 @@ class MnnvlTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
     CudaPlatform *platform_;
 
-    using Memory = std::shared_ptr<CudaSharedMemory>;
-    using HashMap =
-        std::unordered_map<SegmentID, std::unordered_map<uint64_t, Memory>>;
-
     RWSpinlock relocate_lock_;
-    HashMap relocate_map_;
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
 
     std::mutex allocate_mutex_;
-    std::unordered_map<void *, Memory> allocate_set_;
-    std::unordered_map<uint64_t, Memory> registered_memory_;
+    // VMM allocations owned by this transport: base address -> mapped extent
+    // (rounded to the allocation granularity), needed to unmap on free.
+    std::unordered_map<void *, size_t> allocate_set_;
+    // Only allocations explicitly requested through global_address live here.
+    // Explicit uninstall requires callers to release these allocations first.
+    std::unordered_map<void *, std::unique_ptr<CudaSharedMemory>>
+        gva_allocations_;
+    using VmmMap = std::unordered_map<
+        SegmentID,
+        std::unordered_map<uint64_t, std::shared_ptr<CudaSharedMemory>>>;
+    VmmMap vmm_mappings_;
     uint64_t async_memcpy_threshold_;
+    bool supported_;
     CUmemAllocationHandleType handle_type_;
 
     bool host_register_;

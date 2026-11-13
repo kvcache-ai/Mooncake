@@ -917,10 +917,17 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
         if (it->addr == addr) {
             if (it->options.global_address) {
                 auto segment = metadata_->segmentManager().getLocal();
-                if (segment && segment->findBuffer(
-                                   reinterpret_cast<uint64_t>(addr), it->size))
-                    return Status::InvalidArgument(
-                        "Unregister GVA memory before freeing it" LOC_MARK);
+                if (segment) {
+                    const auto base = reinterpret_cast<uint64_t>(addr);
+                    for (const auto& buffer :
+                         std::get<MemorySegmentDesc>(segment->detail).buffers) {
+                        if (buffer.addr < base + it->size &&
+                            base < buffer.addr + buffer.length)
+                            return Status::InvalidArgument(
+                                "Unregister GVA memory before freeing "
+                                "it" LOC_MARK);
+                    }
+                }
             }
             auto status = it->transport->freeLocalMemory(addr, it->size);
             if (!status.ok()) {

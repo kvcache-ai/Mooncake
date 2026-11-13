@@ -108,17 +108,14 @@ class CUDAStreamPool {
     std::vector<std::unique_ptr<DevicePool>> devicePools_;
 };
 
-// CUDA allocation/export/import owner shared by the link transports.
+// VMM allocation and mapping resources. CUDA IPC remains transport-owned.
 class CudaSharedMemory {
    public:
     static Status create(const CUmemAllocationProp& properties, size_t size,
                          std::unique_ptr<CudaSharedMemory>* out);
-    static Status retain(void* address, std::unique_ptr<CudaSharedMemory>* out);
     static Status importHandle(const std::string& handle,
                                CUmemAllocationHandleType type, size_t size,
                                std::unique_ptr<CudaSharedMemory>* out);
-    static Status importIpcHandle(const std::string& handle, size_t size,
-                                  std::unique_ptr<CudaSharedMemory>* out);
     ~CudaSharedMemory();
     CudaSharedMemory(const CudaSharedMemory&) = delete;
     CudaSharedMemory& operator=(const CudaSharedMemory&) = delete;
@@ -131,7 +128,6 @@ class CudaSharedMemory {
     uint64_t address() const { return (uint64_t)address_; }
     size_t size() const { return size_; }
     bool mapped() const { return mapped_; }
-    bool isIpc() const { return ipc_; }
 
     static CUmemAccessDesc deviceAccess(int device);
     static Status allDeviceAccess(std::vector<CUmemAccessDesc>* access);
@@ -139,6 +135,7 @@ class CudaSharedMemory {
    private:
     CudaSharedMemory() = default;
     Status setSize(size_t size, const CUmemAllocationProp& properties);
+    Status unmap();
     CUmemGenericAllocationHandle handle_ = 0;
     CUdeviceptr address_ = 0;
     size_t size_ = 0;
@@ -147,8 +144,6 @@ class CudaSharedMemory {
     int export_fd_ = -1;
     bool reserved_ = false;
     std::atomic<bool> mapped_{false};
-    bool ipc_ = false;
-    cudaIpcMemHandle_t ipc_handle_{};
 };
 
 class CudaPlatform : public Platform {

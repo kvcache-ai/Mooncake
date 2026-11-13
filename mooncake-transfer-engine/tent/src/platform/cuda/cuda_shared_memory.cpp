@@ -88,29 +88,6 @@ Status CudaSharedMemory::create(const CUmemAllocationProp& properties,
     return Status::OK();
 }
 
-Status CudaSharedMemory::retain(void* address,
-                                std::unique_ptr<CudaSharedMemory>* out) {
-    if (!address || !out)
-        return Status::InvalidArgument(
-            "Invalid CUDA memory reference" LOC_MARK);
-    auto memory = std::unique_ptr<CudaSharedMemory>(new CudaSharedMemory);
-    auto retained = cuMemRetainAllocationHandle(&memory->handle_, address);
-    if (retained != CUDA_SUCCESS) memory->handle_ = 0;
-    CHECK_STATUS(
-        cudaStatus(cuMemGetAddressRange(&memory->address_, &memory->size_,
-                                        (CUdeviceptr)address),
-                   "cuMemGetAddressRange"));
-    memory->mapped_size_ = memory->size_;
-    if (retained != CUDA_SUCCESS) {
-        memory->handle_ = 0;
-        CHECK_CUDA(
-            cudaIpcGetMemHandle(&memory->ipc_handle_, (void*)memory->address_));
-        memory->ipc_ = true;
-    }
-    *out = std::move(memory);
-    return Status::OK();
-}
-
 Status CudaSharedMemory::importHandle(const std::string& handle,
                                       CUmemAllocationHandleType type,
                                       size_t size,
@@ -153,9 +130,11 @@ Status CudaSharedMemory::importHandle(const std::string& handle,
         if (decoded.size() != sizeof(CUmemFabricHandle))
             return Status::InvalidArgument(
                 "Invalid CUDA fabric handle" LOC_MARK);
-        CHECK_STATUS(cudaStatus(cuMemImportFromShareableHandle(
-                                    &memory->handle_, decoded.data(), type),
-                                "cuMemImportFromShareableHandle"));
+        CUmemFabricHandle fabric;
+        memcpy(&fabric, decoded.data(), sizeof(fabric));
+        CHECK_STATUS(cudaStatus(
+            cuMemImportFromShareableHandle(&memory->handle_, &fabric, type),
+            "cuMemImportFromShareableHandle"));
     } else {
         return Status::NotImplemented(
             "Unsupported CUDA shared handle type" LOC_MARK);
@@ -169,29 +148,10 @@ Status CudaSharedMemory::importHandle(const std::string& handle,
     return Status::OK();
 }
 
-Status CudaSharedMemory::importIpcHandle(
-    const std::string& handle, size_t size,
-    std::unique_ptr<CudaSharedMemory>* out) {
-    if (!out || !size)
-        return Status::InvalidArgument("Invalid CUDA IPC arguments" LOC_MARK);
-    std::vector<unsigned char> decoded;
-    deserializeBinaryData(handle, decoded);
-    if (decoded.size() != sizeof(cudaIpcMemHandle_t))
-        return Status::InvalidArgument("Invalid CUDA IPC handle" LOC_MARK);
-    auto memory = std::unique_ptr<CudaSharedMemory>(new CudaSharedMemory);
-    memcpy(&memory->ipc_handle_, decoded.data(), sizeof(cudaIpcMemHandle_t));
-    memory->ipc_ = true;
-    memory->size_ = memory->mapped_size_ = size;
-    *out = std::move(memory);
-    return Status::OK();
-}
-
 Status CudaSharedMemory::exportHandle(CUmemAllocationHandleType type,
                                       std::string* out) {
     if (!out) return Status::InvalidArgument("Handle output is null" LOC_MARK);
-    if (ipc_) {
-        *out = serializeBinaryData(&ipc_handle_, sizeof(ipc_handle_));
-    } else if (type == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+    if (type == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
         if (export_fd_ < 0)
             CHECK_STATUS(cudaStatus(
                 cuMemExportToShareableHandle(&export_fd_, handle_, type, 0),
@@ -211,17 +171,6 @@ Status CudaSharedMemory::exportHandle(CUmemAllocationHandleType type,
 
 Status CudaSharedMemory::map(const std::vector<CUmemAccessDesc>& access,
                              uint64_t requested_address) {
-    if (ipc_) {
-        if (mapped_ || requested_address)
-            return Status::NotImplemented(
-                "CUDA IPC cannot select a fixed virtual address" LOC_MARK);
-        void* address = nullptr;
-        CHECK_CUDA(cudaIpcOpenMemHandle(&address, ipc_handle_,
-                                        cudaIpcMemLazyEnablePeerAccess));
-        address_ = (CUdeviceptr)address;
-        mapped_ = true;
-        return Status::OK();
-    }
     if (!handle_ || reserved_ || access.empty() ||
         (granularity_ && requested_address % granularity_) ||
         mapped_size_ > UINT64_MAX - requested_address)
@@ -232,47 +181,64 @@ Status CudaSharedMemory::map(const std::vector<CUmemAccessDesc>& access,
                                        (CUdeviceptr)requested_address, 0),
                    "cuMemAddressReserve"));
     reserved_ = true;
-    if (requested_address && address() != requested_address)
-        return Status::InvalidArgument(
+    Status status;
+    if (requested_address && address() != requested_address) {
+        status = Status::InvalidArgument(
             "CUDA could not reserve the requested global address" LOC_MARK);
-    CHECK_STATUS(cudaStatus(cuMemMap(address_, mapped_size_, 0, handle_, 0),
-                            "cuMemMap"));
-    mapped_ = true;
-    return setAccess(access);
+    } else {
+        status = cudaStatus(cuMemMap(address_, mapped_size_, 0, handle_, 0),
+                            "cuMemMap");
+        if (status.ok()) {
+            mapped_ = true;
+            status = setAccess(access);
+        }
+    }
+    if (!status.ok()) {
+        auto cleanup = unmap();
+        if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
+    }
+    return status;
 }
 
 Status CudaSharedMemory::setAccess(const std::vector<CUmemAccessDesc>& access) {
     if (!mapped_ || access.empty())
         return Status::InvalidArgument("CUDA region is not mapped" LOC_MARK);
-    if (ipc_) return Status::OK();
     return cudaStatus(
         cuMemSetAccess(address_, mapped_size_, access.data(), access.size()),
         "cuMemSetAccess");
 }
 
-Status CudaSharedMemory::release() {
+Status CudaSharedMemory::unmap() {
     if (mapped_) {
-        if (ipc_)
-            CHECK_CUDA(cudaIpcCloseMemHandle((void*)address_));
-        else
-            CHECK_STATUS(
-                cudaStatus(cuMemUnmap(address_, mapped_size_), "cuMemUnmap"));
+        CHECK_STATUS(
+            cudaStatus(cuMemUnmap(address_, mapped_size_), "cuMemUnmap"));
         mapped_ = false;
-    }
-    if (handle_) {
-        CHECK_STATUS(cudaStatus(cuMemRelease(handle_), "cuMemRelease"));
-        handle_ = 0;
     }
     if (reserved_) {
         CHECK_STATUS(cudaStatus(cuMemAddressFree(address_, mapped_size_),
                                 "cuMemAddressFree"));
         reserved_ = false;
+        address_ = 0;
+    }
+    return Status::OK();
+}
+
+Status CudaSharedMemory::release() {
+    // A failed unmap keeps the mapping state available for retry. Releasing
+    // the generic handle and closing the exported fd are independent of it.
+    Status first = unmap();
+    if (handle_) {
+        auto status = cudaStatus(cuMemRelease(handle_), "cuMemRelease");
+        if (status.ok())
+            handle_ = 0;
+        else if (first.ok())
+            first = status;
     }
     if (export_fd_ >= 0) {
         close(export_fd_);
         export_fd_ = -1;
     }
-    return Status::OK();
+    return first;
 }
 
 CudaSharedMemory::~CudaSharedMemory() {

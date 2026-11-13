@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include "cuda_memory_test.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -38,7 +39,7 @@ class MnnvlTransportTestPeer {
     static std::shared_ptr<CudaSharedMemory> mapping(MnnvlTransport& transport,
                                                      SegmentID peer,
                                                      uint64_t address) {
-        return transport.relocate_map_.at(peer).at(address);
+        return transport.vmm_mappings_.at(peer).at(address);
     }
 
     static Status relocate(MnnvlTransport& transport, uint64_t& address,
@@ -66,12 +67,16 @@ class PeerFdExporter {
     PeerFdExporter() {
         if (pipe(ready_pipe_) != 0 || pipe(stop_pipe_) != 0) return;
 
+        auto ready_arg = std::to_string(ready_pipe_[1]);
+        auto stop_arg = std::to_string(stop_pipe_[0]);
         pid_t child = fork();
         if (child < 0) return;
         if (child == 0) {
             close(ready_pipe_[0]);
             close(stop_pipe_[1]);
-            _exit(childMain(ready_pipe_[1], stop_pipe_[0]));
+            execl("/proc/self/exe", "mnnvl_transport_test", "--export-posix-fd",
+                  ready_arg.c_str(), stop_arg.c_str(), nullptr);
+            _exit(127);
         }
 
         close(ready_pipe_[1]);
@@ -90,6 +95,7 @@ class PeerFdExporter {
         if (stop_pipe_[1] >= 0) close(stop_pipe_[1]);
     }
 
+    static int runChild(int ready, int stop) { return childMain(ready, stop); }
     bool forkOk() const { return child_pid_ > 0; }
     bool valid() const { return valid_; }
     // 0 = exported fine; 1 = no CUDA device or no POSIX-FD VMM support.
@@ -379,5 +385,81 @@ TEST(MnnvlTransportTest, PosixSharedMemoryCreationMappingAndTeardown) {
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
+TEST(MnnvlVmmMemoryTest, SameAddressKernelAccessAndReuse) {
+    cuda_memory_test::roundTrip(MNNVL);
+}
+
+TEST(MnnvlVmmMemoryTest, ExplicitUninstallPreservesLiveGvaAllocation) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto conf = cuda_memory_test::config(MNNVL);
+    MnnvlTransport transport;
+    std::string name = "allocation_lifecycle";
+    ASSERT_TRUE(transport.install(name, metadata, nullptr, conf).ok());
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cuda:0";
+    options.global_address = cuda_memory_test::kAddress;
+    void* memory = nullptr;
+    auto status = transport.allocateLocalMemory(&memory, 4096, options);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_FALSE(transport.uninstall().ok());
+    ASSERT_EQ(cudaMemset(memory, 0x35, 4096), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_TRUE(transport.freeLocalMemory(memory, 4096).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlVmmMemoryTest, OrdinaryAllocationSurvivesExplicitUninstall) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    MnnvlTransport transport;
+    std::string name = "ordinary_lifecycle";
+    ASSERT_TRUE(
+        transport
+            .install(name, metadata, nullptr, cuda_memory_test::config(MNNVL))
+            .ok());
+    MemoryOptions options;
+    options.location = "cuda:0";
+    options.type = MNNVL;
+    void* memory = nullptr;
+    ASSERT_TRUE(transport.allocateLocalMemory(&memory, 4096, options).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+    ASSERT_EQ(cudaMemset(memory, 0x35, 4096), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_TRUE(transport.freeLocalMemory(memory, 4096).ok());
+}
+
+TEST(MnnvlVmmMemoryTest, ExternalCudaMallocIsSkippedFromDifferentDevice) {
+    int devices = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&devices), cudaSuccess);
+    ASSERT_GT(devices, 0);
+    ASSERT_EQ(cudaSetDevice(devices > 1 ? 1 : 0), cudaSuccess);
+    void* memory = nullptr;
+    ASSERT_EQ(cudaMalloc(&memory, 4096), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    MnnvlTransport transport;
+    BufferDesc desc;
+    desc.addr = (uint64_t)memory;
+    desc.length = 4096;
+    desc.location = devices > 1 ? "cuda:1" : "cuda:0";
+    MemoryOptions options;
+    auto status = transport.addMemoryBuffer(desc, options);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_TRUE(desc.transports.empty());
+    EXPECT_TRUE(desc.mnnvl_handle.empty());
+    ASSERT_EQ(cudaFree(memory), cudaSuccess);
+}
+
 }  // namespace tent
 }  // namespace mooncake
+
+int main(int argc, char** argv) {
+    if (argc == 4 && !std::strcmp(argv[1], "--export-posix-fd"))
+        return mooncake::tent::PeerFdExporter::runChild(std::atoi(argv[2]),
+                                                        std::atoi(argv[3]));
+    int child = mooncake::tent::cuda_memory_test::childMain(argc, argv);
+    if (child >= 0) return child;
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
