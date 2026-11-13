@@ -121,6 +121,7 @@ class BufferLeaseNative
     std::shared_ptr<BufferHandle> handle_;
     size_t requested_size_ = 0;
     bool closed_ = false;
+    bool releasing_ = false;
     std::atomic<size_t> exports_{0};
 };
 
@@ -223,10 +224,15 @@ BufferLeaseNative::~BufferLeaseNative() {
 
 uintptr_t BufferLeaseNative::ptr() const {
     if (!handle_) throw std::runtime_error("buffer lease is closed");
+    if (releasing_)
+        throw std::runtime_error("buffer lease release is in progress");
     return reinterpret_cast<uintptr_t>(handle_->ptr());
 }
 
 py::object BufferLeaseNative::buffer() {
+    if (closed_ || releasing_) {
+        throw std::runtime_error("buffer lease is closed or releasing");
+    }
     auto view = std::make_shared<BufferLeaseViewNative>(shared_from_this(),
                                                         requested_size_);
     return py::memoryview(py::cast(view));
@@ -251,16 +257,26 @@ void BufferLeaseNative::release() { release_lease(true); }
 
 void BufferLeaseNative::release_lease(bool check_exported_views) {
     if (closed_) return;
+    if (releasing_) {
+        throw std::runtime_error("buffer lease release is already in progress");
+    }
     if (check_exported_views && exports_.load(std::memory_order_acquire) != 0) {
         throw std::runtime_error(
             "cannot release buffer while exported views exist");
     }
-    auto pool = pool_;
-    if (pool && handle_) {
-        pool->release_internal(handle_);
+    releasing_ = true;
+    try {
+        auto pool = pool_;
+        if (pool && handle_) {
+            pool->release_internal(handle_);
+        }
+    } catch (...) {
+        releasing_ = false;
+        throw;
     }
     pool_.reset();
     closed_ = true;
+    releasing_ = false;
 }
 
 BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
@@ -477,13 +493,18 @@ void BufferPoolNative::release_internal(std::shared_ptr<BufferHandle> &handle) {
             throw std::runtime_error("buffer lease is not active");
         }
         region = regions_.at(ptr);
+    }
+    if (region.overflow_registered) {
+        // Do not make the region reusable until unregistration succeeds. A
+        // failure keeps the lease and capacity owned so release can be retried.
+        unregister_overflow_unlocked(region);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         regions_.erase(ptr);
         if (total_bytes_ >= region.size) total_bytes_ -= region.size;
         in_use_.erase(ptr);
         ++release_count_;
-    }
-    if (region.overflow_registered) {
-        unregister_overflow_unlocked(region);
     }
     region.handle.reset();
     handle.reset();
