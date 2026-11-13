@@ -87,6 +87,16 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
 
     bool applied = true;
     switch (entry.op_type) {
+        case OpType::OBJECT_STORAGE_MUTATION: {
+            ObjectReplicaMutation mutation;
+            if (struct_pack::deserialize_to(mutation, entry.payload) !=
+                struct_pack::errc::ok) {
+                return false;
+            }
+            applied = metadata_store_->ApplyObjectReplicaMutation(
+                entry.tenant_id, entry.object_key, mutation);
+            break;
+        }
         case OpType::PUT_END:
             ApplyPutEnd(entry);
             break;

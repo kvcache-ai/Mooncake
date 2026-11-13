@@ -57,6 +57,12 @@ pub(in super::super) struct StagingSlot {
 
 unsafe impl Send for StagingSlot {}
 
+impl StagingSlot {
+    pub(in super::super) fn io_len(&self) -> usize {
+        self.alloc_len as usize
+    }
+}
+
 impl Drop for StagingSlot {
     fn drop(&mut self) {
         self.pool.release(self.offset, self.alloc_len);

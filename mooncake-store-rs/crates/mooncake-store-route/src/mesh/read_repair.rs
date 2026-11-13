@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use mooncake_store_core::{ClientLease, ObjectKey, ObjectRoute, RouteCasRequest};
+use mooncake_store_core::{ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RouteVersion};
 use tracing::warn;
 
 use crate::mesh::selection::RouteAuthoritySelection;
@@ -11,6 +11,28 @@ const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
 const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
 const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RouteAuthorityValue {
+    Route(Box<ObjectRoute>),
+    DeleteMarker(RouteVersion),
+}
+
+impl RouteAuthorityValue {
+    pub(crate) fn version(&self) -> RouteVersion {
+        match self {
+            Self::Route(route) => route.version,
+            Self::DeleteMarker(version) => *version,
+        }
+    }
+
+    pub(crate) fn into_route(self) -> Option<ObjectRoute> {
+        match self {
+            Self::Route(route) => Some(*route),
+            Self::DeleteMarker(_) => None,
+        }
+    }
+}
+
 pub(crate) type RouteReadRepairState = Vec<RouteAuthorityObservation>;
 
 #[derive(Clone, Default)]
@@ -18,7 +40,7 @@ pub(crate) enum RouteAuthorityObservation {
     #[default]
     Unobserved,
     Missing,
-    Present(Box<ObjectRoute>),
+    Present(RouteAuthorityValue),
 }
 
 pub(crate) fn set_repair_observation(
@@ -33,37 +55,71 @@ pub(crate) fn set_repair_observation(
 
 pub(crate) fn repair_request(
     key: &ObjectKey,
-    best: &ObjectRoute,
+    best: &RouteAuthorityValue,
     observed: &RouteAuthorityObservation,
 ) -> Option<RouteCasRequest> {
-    match observed {
+    let expected = match observed {
         RouteAuthorityObservation::Missing => {
             record_route_repair_metric(ROUTE_REPAIR_MISSING_AUTHORITY);
-            Some(RouteCasRequest {
-                key: key.clone(),
-                expected: None,
-                next: Some(best.clone()),
-            })
+            None
         }
-        RouteAuthorityObservation::Present(current) if current.version < best.version => {
+        RouteAuthorityObservation::Present(current) if current.version() < best.version() => {
             record_route_repair_metric(ROUTE_REPAIR_STALE_AUTHORITY);
-            Some(RouteCasRequest {
-                key: key.clone(),
-                expected: Some(current.version),
-                next: Some(best.clone()),
-            })
+            Some(current.version())
         }
         RouteAuthorityObservation::Present(current)
-            if current.version == best.version && current.as_ref() != best =>
+            if current.version() == best.version() && current != best =>
         {
             record_route_repair_metric(ROUTE_REPAIR_DIVERGENT_AUTHORITY);
-            Some(RouteCasRequest {
-                key: key.clone(),
-                expected: Some(current.version),
-                next: Some(best.clone()),
-            })
+            Some(current.version())
         }
-        _ => None,
+        _ => return None,
+    };
+    Some(match best {
+        RouteAuthorityValue::Route(route) => RouteCasRequest {
+            key: key.clone(),
+            expected,
+            next: Some(route.as_ref().clone()),
+        },
+        RouteAuthorityValue::DeleteMarker(version) => RouteCasRequest {
+            key: key.clone(),
+            expected: Some(*version),
+            next: None,
+        },
+    })
+}
+
+pub(crate) fn merge_authority_value(
+    current: &mut Option<RouteAuthorityValue>,
+    candidate: RouteAuthorityValue,
+    authority: &str,
+    key: &ObjectKey,
+    namespace: &str,
+) {
+    let Some(existing) = current.as_mut() else {
+        *current = Some(candidate);
+        return;
+    };
+    if candidate.version() > existing.version() {
+        *existing = candidate;
+        return;
+    }
+    if candidate.version() != existing.version() {
+        return;
+    }
+    match (existing, candidate) {
+        (existing, RouteAuthorityValue::DeleteMarker(version)) => {
+            *existing = RouteAuthorityValue::DeleteMarker(version);
+        }
+        (RouteAuthorityValue::Route(existing), RouteAuthorityValue::Route(candidate)) => {
+            if existing == &candidate {
+                return;
+            }
+            let mut route = Some(existing.as_ref().clone());
+            merge_fresher_route(&mut route, *candidate, authority, key, namespace);
+            **existing = route.expect("merging a present route retains a route");
+        }
+        (RouteAuthorityValue::DeleteMarker(_), RouteAuthorityValue::Route(_)) => {}
     }
 }
 
@@ -142,7 +198,7 @@ pub(crate) fn merge_route_listing(
 pub(crate) fn compute_backfill_requests(
     keys: &[ObjectKey],
     selections: &[RouteAuthoritySelection],
-    resolved: &[Option<ObjectRoute>],
+    resolved: &[Option<RouteAuthorityValue>],
     repairs: &[RouteReadRepairState],
 ) -> BTreeMap<String, (ClientLease, Vec<RouteCasRequest>)> {
     debug_assert_eq!(keys.len(), resolved.len());
@@ -201,6 +257,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg".to_string()),
+                allocation_id: None,
                 segment_offset: 0,
                 length: 100,
                 checksum: Some(42),
@@ -227,6 +284,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("other-owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("other-seg".to_string()),
+                allocation_id: None,
                 segment_offset: 0,
                 length: 200,
                 checksum: Some(99),
@@ -241,7 +299,7 @@ mod tests {
 
     #[test]
     fn repair_request_missing_generates_insert() {
-        let best = test_route("key-a", 3);
+        let best = RouteAuthorityValue::Route(Box::new(test_route("key-a", 3)));
         let result = repair_request(
             &ObjectKey::new("key-a".to_string()),
             &best,
@@ -255,11 +313,11 @@ mod tests {
     #[test]
     fn repair_request_stale_generates_update() {
         let stale = test_route("key-a", 1);
-        let best = test_route("key-a", 3);
+        let best = RouteAuthorityValue::Route(Box::new(test_route("key-a", 3)));
         let result = repair_request(
             &ObjectKey::new("key-a".to_string()),
             &best,
-            &RouteAuthorityObservation::Present(Box::new(stale)),
+            &RouteAuthorityObservation::Present(RouteAuthorityValue::Route(Box::new(stale))),
         );
         let req = result.expect("should generate repair");
         assert_eq!(req.expected, Some(RouteVersion(1)));
@@ -269,11 +327,11 @@ mod tests {
     #[test]
     fn repair_request_divergent_same_version() {
         let divergent = test_route_different_replica("key-a", 3);
-        let best = test_route("key-a", 3);
+        let best = RouteAuthorityValue::Route(Box::new(test_route("key-a", 3)));
         let result = repair_request(
             &ObjectKey::new("key-a".to_string()),
             &best,
-            &RouteAuthorityObservation::Present(Box::new(divergent)),
+            &RouteAuthorityObservation::Present(RouteAuthorityValue::Route(Box::new(divergent))),
         );
         let req = result.expect("should generate repair for divergent");
         assert_eq!(req.expected, Some(RouteVersion(3)));
@@ -281,11 +339,11 @@ mod tests {
 
     #[test]
     fn repair_request_up_to_date_returns_none() {
-        let best = test_route("key-a", 3);
+        let best = RouteAuthorityValue::Route(Box::new(test_route("key-a", 3)));
         let result = repair_request(
             &ObjectKey::new("key-a".to_string()),
             &best,
-            &RouteAuthorityObservation::Present(Box::new(best.clone())),
+            &RouteAuthorityObservation::Present(best.clone()),
         );
         assert!(result.is_none());
     }
@@ -333,6 +391,25 @@ mod tests {
     }
 
     #[test]
+    fn merge_fresher_route_preserves_allocation_generation_over_legacy_copy() {
+        let mut legacy = test_route("key", 1);
+        legacy.replicas[0].allocation_id = None;
+        let mut generated = legacy.clone();
+        generated.replicas[0].allocation_id = Some(7);
+
+        let mut current = Some(legacy);
+        merge_fresher_route(
+            &mut current,
+            generated,
+            "auth-a",
+            &ObjectKey::new("key".to_string()),
+            "",
+        );
+
+        assert_eq!(current.unwrap().replicas[0].allocation_id, Some(7));
+    }
+
+    #[test]
     fn merge_route_listing_dedup_by_key() {
         let mut routes = BTreeMap::new();
         let old = test_route("key-x", 1);
@@ -359,14 +436,21 @@ mod tests {
                 authorities: vec![auth_a.clone(), auth_b.clone()],
             },
         ];
-        let resolved = vec![Some(test_route("k1", 3)), Some(test_route("k2", 2))];
+        let resolved = vec![
+            Some(RouteAuthorityValue::Route(Box::new(test_route("k1", 3)))),
+            Some(RouteAuthorityValue::Route(Box::new(test_route("k2", 2)))),
+        ];
         let repairs = vec![
             vec![
-                RouteAuthorityObservation::Present(Box::new(test_route("k1", 3))),
+                RouteAuthorityObservation::Present(RouteAuthorityValue::Route(Box::new(
+                    test_route("k1", 3),
+                ))),
                 RouteAuthorityObservation::Missing,
             ],
             vec![
-                RouteAuthorityObservation::Present(Box::new(test_route("k2", 2))),
+                RouteAuthorityObservation::Present(RouteAuthorityValue::Route(Box::new(
+                    test_route("k2", 2),
+                ))),
                 RouteAuthorityObservation::Missing,
             ],
         ];
@@ -375,5 +459,69 @@ mod tests {
         let (_, (lease, reqs)) = backfills.into_iter().next().unwrap();
         assert_eq!(lease.runtime.stable_id.0, "auth-b");
         assert_eq!(reqs.len(), 2);
+    }
+    #[test]
+    fn delete_marker_wins_same_version_in_both_merge_orders() {
+        let key = ObjectKey::new("key");
+        let live = RouteAuthorityValue::Route(Box::new(test_route("key", 3)));
+        let marker = RouteAuthorityValue::DeleteMarker(RouteVersion(3));
+        for (first, second) in [(live.clone(), marker.clone()), (marker.clone(), live)] {
+            let mut current = Some(first);
+            merge_authority_value(&mut current, second, "authority", &key, "");
+            assert_eq!(current, Some(marker.clone()));
+        }
+    }
+
+    #[test]
+    fn newer_live_route_supersedes_delete_marker_in_both_merge_orders() {
+        let key = ObjectKey::new("key");
+        let live = test_route("key", 4);
+        let value = RouteAuthorityValue::Route(Box::new(live.clone()));
+        let marker = RouteAuthorityValue::DeleteMarker(RouteVersion(3));
+        for (first, second) in [(marker.clone(), value.clone()), (value, marker)] {
+            let mut current = Some(first);
+            merge_authority_value(&mut current, second, "authority", &key, "");
+            assert_eq!(
+                current.and_then(RouteAuthorityValue::into_route),
+                Some(live.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn authority_merge_preserves_allocation_generation_over_legacy_copy() {
+        let key = ObjectKey::new("key");
+        let legacy = test_route("key", 4);
+        let mut generated = legacy.clone();
+        generated.replicas[0].allocation_id = Some(7);
+        let mut current = Some(RouteAuthorityValue::Route(Box::new(legacy)));
+        merge_authority_value(
+            &mut current,
+            RouteAuthorityValue::Route(Box::new(generated.clone())),
+            "authority",
+            &key,
+            "",
+        );
+        assert_eq!(
+            current.and_then(RouteAuthorityValue::into_route),
+            Some(generated)
+        );
+    }
+
+    #[test]
+    fn delete_marker_repairs_missing_and_stale_without_wrapping_a_route() {
+        let key = ObjectKey::new("key");
+        let marker = RouteAuthorityValue::DeleteMarker(RouteVersion(3));
+        for observed in [
+            RouteAuthorityObservation::Missing,
+            RouteAuthorityObservation::Present(RouteAuthorityValue::Route(Box::new(test_route(
+                "key", 1,
+            )))),
+        ] {
+            let request = repair_request(&key, &marker, &observed).expect("marker needs repair");
+            assert_eq!(request.key, key);
+            assert_eq!(request.expected, Some(RouteVersion(3)));
+            assert_eq!(request.next, None);
+        }
     }
 }

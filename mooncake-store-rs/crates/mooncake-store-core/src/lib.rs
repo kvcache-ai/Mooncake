@@ -16,7 +16,10 @@ pub use cold_tier::{
     ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
     ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec, ColdTierUsageDelta,
 };
-pub use compat::CompatibilityDescriptor;
+pub use compat::{
+    CompatibilityDescriptor, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
+    ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+};
 pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};
 pub use identity::{
@@ -30,7 +33,8 @@ pub use identity_codec::{
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
     RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
     SegmentTargetChunk, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
@@ -40,4 +44,4 @@ pub use route::{
     TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaReservationState,
     TenantQuotaState, TenantRoutePolicy,
 };
-pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory};
+pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory, RouteReplicaReference};

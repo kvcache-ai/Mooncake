@@ -1375,7 +1375,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && use_hugepage_;
+            (protocol == "rdma" || protocol == "efa") && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(

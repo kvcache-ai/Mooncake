@@ -21,8 +21,10 @@
 
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #if NCCL_VERSION_CODE < 23004
 #error "Mooncake NCCL DeviceTransport requires NCCL 2.30.4 or newer"
@@ -118,6 +120,10 @@ bool decodeUniqueId(const std::vector<int32_t>& encoded, ncclUniqueId* id) {
 
 class NcclDeviceTransportImpl final : public NcclTransport {
    public:
+    explicit NcclDeviceTransportImpl(
+        std::weak_ptr<NcclStatusCallback> status_callback = {})
+        : status_callback_(std::move(status_callback)) {}
+
     ~NcclDeviceTransportImpl() override { abort(); }
 
     std::vector<int32_t> createUniqueId() override {
@@ -186,17 +192,22 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             comm_ = nullptr;
             return -1;
         }
-
         // Establish the smallest possible rank-wide status path immediately
         // after communicator creation. While this CUDA/NCCL control path stays
         // healthy, subsequent capability decisions can be made uniformly.
-        if (reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
+        const bool callback_status_path = !status_callback_.expired();
+        const bool control_stream_ready =
+            reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
                                                       cudaStreamNonBlocking),
-                            "cudaStreamCreateWithFlags(control)") != 0 ||
+                            "cudaStreamCreateWithFlags(control)") == 0;
+        const bool status_buffer_ready =
+            control_stream_ready &&
             reportCudaError(
                 cudaMalloc(reinterpret_cast<void**>(&collective_status_),
                            sizeof(int)),
-                "cudaMalloc(collective status)") != 0) {
+                "cudaMalloc(collective status)") == 0;
+        if (!callback_status_path &&
+            (!control_stream_ready || !status_buffer_ready)) {
             abortPartialInitialization();
             return -1;
         }
@@ -204,7 +215,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
         bool local_capabilities_valid =
             reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
-                            "ncclCommQueryProperties") == 0;
+                            "ncclCommQueryProperties") == 0 &&
+            control_stream_ready && status_buffer_ready;
         if (local_capabilities_valid && !comm_properties.deviceApiSupport) {
             LOG(ERROR) << "[Device NCCL] communicator does not support the "
                           "device API";
@@ -664,6 +676,17 @@ class NcclDeviceTransportImpl final : public NcclTransport {
     };
 
     bool collectiveAllSucceeded(bool local_success) {
+        if (auto status_callback = status_callback_.lock()) {
+            bool callback_local_success = local_success;
+            if (!control_stream_ ||
+                reportCudaError(
+                    cudaStreamSynchronize(control_stream_),
+                    "cudaStreamSynchronize(before CPU status agreement)") !=
+                    0) {
+                callback_local_success = false;
+            }
+            return (*status_callback)(callback_local_success);
+        }
         int value = local_success ? 1 : 0;
         if (reportCudaError(
                 cudaMemcpyAsync(collective_status_, &value, sizeof(value),
@@ -694,6 +717,7 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 
     cudaStream_t control_stream_ = nullptr;
     int* collective_status_ = nullptr;
+    std::weak_ptr<NcclStatusCallback> status_callback_;
 
     uint64_t next_registration_id_ = 1;
     std::unordered_map<uint64_t, WindowRecord> registrations_;
@@ -704,6 +728,12 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 
 std::unique_ptr<NcclTransport> createNcclDeviceTransport() {
     return std::make_unique<NcclDeviceTransportImpl>();
+}
+
+std::unique_ptr<NcclTransport> createNcclDeviceTransportWithStatusCallback(
+    std::weak_ptr<NcclStatusCallback> status_callback) {
+    return std::make_unique<NcclDeviceTransportImpl>(
+        std::move(status_callback));
 }
 
 }  // namespace device

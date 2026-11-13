@@ -2802,6 +2802,26 @@ Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {
     return Status::OK();
 }
 
+Status TransferEngineImpl::cancelQueuedOwners(BatchID batch_id) {
+    if (!runtime_queue_config_.enabled) return Status::OK();
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!isBatchAlive(batch_id)) {
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    }
+    auto* batch = reinterpret_cast<Batch*>(batch_id);
+    // Submitted owners are already on a transport; the caller cancels those
+    // through the transport and they release their window slot when polled.
+    std::vector<QueueOwnerId> owner_ids;
+    for (const auto& entry : queued_owners_) {
+        if (entry.second.batch == batch && !entry.second.in_dispatch_window)
+            owner_ids.push_back(entry.first);
+    }
+    for (const auto owner_id : owner_ids) {
+        CHECK_STATUS(cancelQueuedOwner(owner_id));
+    }
+    return Status::OK();
+}
+
 Status TransferEngineImpl::detachQueuedOwnersOfBatch(
     Batch* batch, TransferStatusEnum terminal_status) {
     std::vector<QueueOwnerId> owner_ids;
@@ -3878,43 +3898,70 @@ class BatchGuard {
 };
 }  // namespace
 
-Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
-    BatchGuard batch_guard(*this, batch_id);
-    TransferStatus xfer_status;
-    for (uint64_t poll_count = 0;; ++poll_count) {
-        CHECK_STATUS(progressBatch(batch_id, xfer_status));
-        if (xfer_status.s != PENDING) {
-            // Deliberately dropping the free status, as the pre-existing code
-            // did: callers of this path get the transfer outcome, not the
-            // cleanup outcome. transferSync() propagates it instead.
-            (void)batch_guard.reset();
-            return xfer_status.s == COMPLETED
-                       ? Status::OK()
-                       : Status::InternalError(
-                             "Transfer failed: " +
-                             std::to_string((int)xfer_status.s));
-        }
-        waitBeforeNextPoll(poll_count);
-    }
-}
-
-Status TransferEngineImpl::transferSync(
+Status TransferEngineImpl::submitAndWaitTransfer(
     const std::vector<Request>& request_list) {
     auto batch_id = allocateBatch(request_list.size());
+    if (!batch_id)
+        return Status::TooManyRequests(
+            "No free batch slot for a synchronous transfer" LOC_MARK);
     BatchGuard batch_guard(*this, batch_id);
     CHECK_STATUS(submitTransfer(batch_id, request_list));
-    for (uint64_t poll_count = 0;; ++poll_count) {
-        TransferStatus xfer_status;
-        CHECK_STATUS(progressBatch(batch_id, xfer_status));
-        if (xfer_status.s == COMPLETED) break;
-        if (xfer_status.s != PENDING) {
-            CHECK_STATUS(batch_guard.reset());
-            return Status::InternalError(
-                "Transfer via stage buffer failed" LOC_MARK);
-        }
-        waitBeforeNextPoll(poll_count);
-    }
+    CHECK_STATUS(waitTransfer(batch_id));
     return batch_guard.reset();
+}
+
+Status TransferEngineImpl::waitTransfer(
+    BatchID batch_id, std::vector<TransferStatus>* status_list,
+    uint64_t timeout_ms) {
+    // A deadline beyond a year is treated as unbounded: converting a larger
+    // unsigned value to the clock duration overflows.
+    constexpr auto kMaxTimeout =
+        std::chrono::milliseconds(std::chrono::hours(24 * 365));
+    const auto deadline =
+        timeout_ms > static_cast<uint64_t>(kMaxTimeout.count())
+            ? std::chrono::steady_clock::time_point::max()
+            : std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
+    const auto timed_out = [&] {
+        return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
+    };
+
+    TransferStatus overall_status{};
+    for (uint64_t poll_count = 0;; ++poll_count) {
+        CHECK_STATUS(progressBatch(batch_id, overall_status));
+        if (overall_status.s != PENDING) break;
+        if (!timed_out()) {
+            waitBeforeNextPoll(poll_count);
+            continue;
+        }
+
+        // Stop admitting more of this batch before looking at its tasks:
+        // polling below frees dispatch window slots, and a refill would start
+        // another owner of a batch that is being torn down.
+        CHECK_STATUS(cancelQueuedOwners(batch_id));
+        std::vector<TransferStatus> task_status;
+        CHECK_STATUS(getTransferStatus(batch_id, task_status));
+        for (size_t task_id = 0; task_id < task_status.size(); ++task_id)
+            if (task_status[task_id].s == PENDING)
+                (void)cancelTransfer(batch_id, task_id);
+        CHECK_STATUS(refillDispatchWindow());
+        if (!status_list)
+            return Status::TimedOut("waitTransfer timed out" LOC_MARK);
+        return getTransferStatus(batch_id, *status_list);
+    }
+
+    if (status_list) return getTransferStatus(batch_id, *status_list);
+    return overall_status.s == COMPLETED
+               ? Status::OK()
+               : Status::InternalError(
+                     "Transfer via stage buffer failed" LOC_MARK);
+}
+
+Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
+    BatchGuard batch_guard(*this, batch_id);
+    auto status = waitTransfer(batch_id);
+    (void)batch_guard.reset();
+    return status;
 }
 
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {

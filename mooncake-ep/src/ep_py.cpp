@@ -153,8 +153,26 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
              py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
              py::arg("num_gpu_timeout_secs"), py::arg("transport") = "ibgda",
-             py::arg("nccl_unique_id") = std::vector<int32_t>{})
-        .def("destroy", &MooncakeElasticBuffer::destroy)
+             py::arg("nccl_unique_id") = std::vector<int32_t>{},
+             py::call_guard<py::gil_scoped_release>())
+        .def(py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t,
+                      bool, bool, bool, bool, bool, int, int, int, int,
+                      std::string, std::vector<int32_t>, std::vector<int32_t>,
+                      std::function<bool(bool)>>(),
+             py::arg("transport_rank"), py::arg("capacity_ranks"),
+             py::arg("logical_rank"), py::arg("logical_num_ranks"),
+             py::arg("num_buffer_bytes"), py::arg("num_max_tokens_per_rank"),
+             py::arg("hidden"), py::arg("num_topk"),
+             py::arg("use_fp8_dispatch"), py::arg("deterministic"),
+             py::arg("allow_hybrid_mode"), py::arg("allow_multiple_reduction"),
+             py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
+             py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
+             py::arg("num_gpu_timeout_secs"), py::arg("transport"),
+             py::arg("nccl_unique_id"), py::arg("logical_to_transport_slots"),
+             py::arg("init_status_callback") = std::function<bool(bool)>{},
+             py::call_guard<py::gil_scoped_release>())
+        .def("destroy", &MooncakeElasticBuffer::destroy,
+             py::call_guard<py::gil_scoped_release>())
         .def("using_nccl", &MooncakeElasticBuffer::using_nccl)
         .def_static("calculate_buffer_size",
                     &MooncakeElasticBuffer::calculate_buffer_size)
@@ -167,6 +185,10 @@ PYBIND11_MODULE(_ep, m) {
         .def("ibgda_disabled", &MooncakeElasticBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeElasticBuffer::use_fast_path)
         .def("reconfigure_nccl", &MooncakeElasticBuffer::reconfigure_nccl)
+        .def("reconfigure_nccl_membership",
+             &MooncakeElasticBuffer::reconfigure_nccl_membership)
+        .def("set_ibgda_membership",
+             &MooncakeElasticBuffer::set_ibgda_membership)
         .def("update_local_qpns", &MooncakeElasticBuffer::update_local_qpns)
         .def("is_roce", &MooncakeElasticBuffer::is_roce)
         .def("sync_ibgda_peers", &MooncakeElasticBuffer::sync_ibgda_peers)
@@ -177,6 +199,10 @@ PYBIND11_MODULE(_ep, m) {
         .def("get_ipc_handle", &MooncakeElasticBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
+        .def("connect_peer", &MooncakeElasticBuffer::connect_peer,
+             py::call_guard<py::gil_scoped_release>())
+        .def("disconnect_peer", &MooncakeElasticBuffer::disconnect_peer)
+        .def("drain_queue_pairs", &MooncakeElasticBuffer::drain_queue_pairs)
         .def("dispatch", &MooncakeElasticBuffer::dispatch)
         .def("combine", &MooncakeElasticBuffer::combine);
 #endif

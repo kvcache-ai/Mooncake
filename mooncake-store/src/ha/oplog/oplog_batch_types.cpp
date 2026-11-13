@@ -91,6 +91,11 @@ bool ValidateOpLogBatchEntry(const OpLogEntry& entry, std::string* reason) {
         SetReason(reason, "tenant_id is empty or invalid");
         return false;
     }
+    if (entry.op_type == OpType::OBJECT_STORAGE_MUTATION &&
+        entry.object_key.empty()) {
+        SetReason(reason, "object storage mutation requires a non-empty key");
+        return false;
+    }
     return ValidateOpLogEntrySize(entry, reason);
 }
 

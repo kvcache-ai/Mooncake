@@ -1,13 +1,37 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
 use mooncake_store_core::{ClientLease, ClientLifecycleState, ObjectKey, Result, RouteCasRequest};
 
 use crate::shim::RouteMembershipProvider;
-use crate::util::{compatibility_matches, route_capable, route_weight, weighted_rendezvous_score};
+use crate::util::{
+    compatibility_matches, route_authority_lifetime, route_capable, route_weight,
+    weighted_rendezvous_score, RouteAuthorityLifetime,
+};
 
 const ROUTE_SCOPE_LABEL: &str = "route_scope";
 
 #[derive(Clone)]
 pub(crate) struct RouteAuthoritySelection {
     pub(crate) authorities: Vec<ClientLease>,
+}
+
+fn authority_rank_cmp(
+    left_lifetime: RouteAuthorityLifetime,
+    left_score: f64,
+    left_lease: &ClientLease,
+    right_lifetime: RouteAuthorityLifetime,
+    right_score: f64,
+    right_lease: &ClientLease,
+) -> Ordering {
+    left_lifetime.cmp(&right_lifetime).then_with(|| {
+        left_score.total_cmp(&right_score).then_with(|| {
+            left_lease
+                .runtime
+                .stable_id
+                .cmp(&right_lease.runtime.stable_id)
+        })
+    })
 }
 
 pub(crate) fn active_route_leases(
@@ -33,23 +57,54 @@ pub(crate) fn authority_candidates(
     observer: &ClientLease,
     force_refresh: bool,
 ) -> Result<Vec<ClientLease>> {
-    use std::collections::BTreeMap;
-
     let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
+    Ok(deduplicate_authority_candidates(
+        active_route_leases(membership, force_refresh)?
+            .into_iter()
+            .filter(|lease| compatibility_matches(observer, lease))
+            .filter(|lease| {
+                route_scope.as_ref().is_none_or(|scope| {
+                    lease
+                        .endpoints
+                        .labels
+                        .get(ROUTE_SCOPE_LABEL)
+                        .is_some_and(|candidate| candidate == scope)
+                })
+            }),
+    ))
+}
+
+pub(crate) fn retained_authority_candidates(
+    membership: &dyn RouteMembershipProvider,
+    observer: &ClientLease,
+) -> Result<Vec<ClientLease>> {
+    let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
+    Ok(deduplicate_authority_candidates(
+        membership
+            .retained_live_clients("retained_live_client_snapshot")?
+            .into_iter()
+            .filter(|lease| {
+                lease.state == ClientLifecycleState::Active
+                    && route_capable(lease)
+                    && compatibility_matches(observer, lease)
+            })
+            .filter(|lease| {
+                route_scope.as_ref().is_none_or(|scope| {
+                    lease
+                        .endpoints
+                        .labels
+                        .get(ROUTE_SCOPE_LABEL)
+                        .is_some_and(|candidate| candidate == scope)
+                })
+            }),
+    ))
+}
+
+fn deduplicate_authority_candidates(
+    leases: impl IntoIterator<Item = ClientLease>,
+) -> Vec<ClientLease> {
     let mut candidates = BTreeMap::<String, ClientLease>::new();
-    for lease in active_route_leases(membership, force_refresh)? {
-        if !compatibility_matches(observer, &lease) {
-            continue;
-        }
-        if route_scope.as_ref().is_some_and(|scope| {
-            lease
-                .endpoints
-                .labels
-                .get(ROUTE_SCOPE_LABEL)
-                .is_none_or(|candidate| candidate != scope)
-        }) {
-            continue;
-        }
+    for lease in leases {
         let stable_id = lease.runtime.stable_id.0.clone();
         match candidates.get(&stable_id) {
             Some(current) if current.runtime.epoch >= lease.runtime.epoch => {}
@@ -58,7 +113,14 @@ pub(crate) fn authority_candidates(
             }
         }
     }
-    Ok(candidates.into_values().collect())
+    candidates.into_values().collect()
+}
+
+pub(crate) fn merge_authority_candidates(
+    current: &[ClientLease],
+    retained: &[ClientLease],
+) -> Vec<ClientLease> {
+    deduplicate_authority_candidates(current.iter().chain(retained).cloned())
 }
 
 pub(crate) fn ranked_authorities(
@@ -70,6 +132,7 @@ pub(crate) fn ranked_authorities(
         .iter()
         .map(|lease| {
             (
+                route_authority_lifetime(lease),
                 weighted_rendezvous_score(
                     namespace,
                     &key.0,
@@ -81,11 +144,9 @@ pub(crate) fn ranked_authorities(
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        left.0
-            .total_cmp(&right.0)
-            .then_with(|| left.1.runtime.stable_id.cmp(&right.1.runtime.stable_id))
+        authority_rank_cmp(left.0, left.1, &left.2, right.0, right.1, &right.2)
     });
-    ranked.into_iter().map(|(_, lease)| lease).collect()
+    ranked.into_iter().map(|(_, _, lease)| lease).collect()
 }
 
 pub(crate) fn ranked_top_authorities(
@@ -94,31 +155,49 @@ pub(crate) fn ranked_top_authorities(
     key: &ObjectKey,
     limit: usize,
 ) -> Vec<ClientLease> {
-    let mut top = Vec::<(f64, ClientLease)>::with_capacity(limit.min(candidates.len()));
+    let mut top = Vec::<(RouteAuthorityLifetime, f64, ClientLease)>::with_capacity(
+        limit.min(candidates.len()),
+    );
     for lease in candidates {
+        let lifetime = route_authority_lifetime(lease);
         let score = weighted_rendezvous_score(
             namespace,
             &key.0,
             &lease.runtime.stable_id.0,
             route_weight(lease),
         );
-        let insert_at = top.partition_point(|(current_score, current_lease)| {
-            current_score
-                .total_cmp(&score)
-                .then_with(|| {
-                    current_lease
-                        .runtime
-                        .stable_id
-                        .cmp(&lease.runtime.stable_id)
-                })
-                .is_lt()
+        let insert_at = top.partition_point(|(current_lifetime, current_score, current_lease)| {
+            authority_rank_cmp(
+                *current_lifetime,
+                *current_score,
+                current_lease,
+                lifetime,
+                score,
+                lease,
+            )
+            .is_lt()
         });
         if insert_at < limit {
-            top.insert(insert_at, (score, lease.clone()));
+            top.insert(insert_at, (lifetime, score, lease.clone()));
             top.truncate(limit);
         }
     }
-    top.into_iter().map(|(_, lease)| lease).collect()
+    top.into_iter().map(|(_, _, lease)| lease).collect()
+}
+
+pub(crate) fn ranked_merged_authorities(
+    namespace: &str,
+    current: &[ClientLease],
+    retained: &[ClientLease],
+    key: &ObjectKey,
+    limit: usize,
+) -> Vec<ClientLease> {
+    ranked_top_authorities(
+        namespace,
+        &merge_authority_candidates(current, retained),
+        key,
+        limit,
+    )
 }
 
 pub(crate) fn select_authorities_for_requests(
@@ -180,6 +259,10 @@ mod tests {
         make_lease_with_labels(id, &[("route", "true")])
     }
 
+    fn make_ephemeral_lease(id: &str) -> ClientLease {
+        make_lease_with_labels(id, &[("route", "true"), ("route_ephemeral", "true")])
+    }
+
     fn make_lease_with_labels(id: &str, labels: &[(&str, &str)]) -> ClientLease {
         let mut endpoint_labels = BTreeMap::new();
         for (k, v) in labels {
@@ -227,6 +310,43 @@ mod tests {
         let key = ObjectKey::new("key".to_string());
         let top = ranked_top_authorities("ns", &candidates, &key, 2);
         assert_eq!(top.len(), 2);
+    }
+
+    #[test]
+    fn merged_candidates_keep_the_highest_epoch_per_stable_id() {
+        let current = vec![make_lease_epoch("shared", 1), make_lease("current")];
+        let retained = vec![make_lease_epoch("shared", 3), make_lease("retained")];
+
+        let merged = merge_authority_candidates(&current, &retained);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|lease| lease.runtime.stable_id.0 == "shared")
+                .expect("shared authority should remain")
+                .runtime
+                .epoch,
+            ClientEpoch(3)
+        );
+    }
+
+    #[test]
+    fn merged_authorities_are_ranked_once_before_truncation() {
+        let current = vec![make_lease("current-a"), make_lease("current-b")];
+        let retained = vec![make_lease("retained-a"), make_lease("retained-b")];
+        let key = ObjectKey::new("merged-ranking-key".to_string());
+
+        let actual = ranked_merged_authorities("ns", &current, &retained, &key, 2);
+        let expected = ranked_top_authorities(
+            "ns",
+            &merge_authority_candidates(&current, &retained),
+            &key,
+            2,
+        );
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
     }
 
     #[test]
@@ -311,6 +431,87 @@ mod tests {
         let key = ObjectKey::new("test-key".to_string());
         let ranked = ranked_authorities("ns", &[heavy.clone(), light.clone()], &key);
         assert_eq!(ranked[0].runtime.stable_id.0, "heavy");
+    }
+
+    #[test]
+    fn durable_authorities_rank_before_ephemeral_authorities() {
+        let durable = make_lease_with_labels(
+            "durable",
+            &[
+                ("route", "true"),
+                ("route_ephemeral", "false"),
+                ("route_weight", "0.001"),
+            ],
+        );
+        let ephemeral = make_lease_with_labels(
+            "ephemeral",
+            &[
+                ("route", "true"),
+                ("route_ephemeral", "true"),
+                ("route_weight", "1000"),
+            ],
+        );
+        let key = ObjectKey::new("test-key".to_string());
+
+        let ranked = ranked_authorities("ns", &[ephemeral, durable], &key);
+
+        assert_eq!(ranked[0].runtime.stable_id.0, "durable");
+    }
+
+    #[test]
+    fn explicit_durable_then_legacy_then_ephemeral_for_rolling_upgrade() {
+        let durable = make_lease_with_labels(
+            "durable",
+            &[("route", "true"), ("route_ephemeral", "false")],
+        );
+        let legacy = make_lease("legacy");
+        let ephemeral = make_ephemeral_lease("ephemeral");
+        let key = ObjectKey::new("test-key".to_string());
+
+        let ranked = ranked_authorities("ns", &[ephemeral, legacy, durable], &key);
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|lease| lease.runtime.stable_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["durable", "legacy", "ephemeral"]
+        );
+    }
+
+    #[test]
+    fn ephemeral_authorities_fill_topk_after_durable_authorities() {
+        let durable = make_lease_with_labels(
+            "durable",
+            &[("route", "true"), ("route_ephemeral", "false")],
+        );
+        let ephemeral_a = make_ephemeral_lease("ephemeral-a");
+        let ephemeral_b = make_ephemeral_lease("ephemeral-b");
+        let key = ObjectKey::new("test-key".to_string());
+
+        let top = ranked_top_authorities("ns", &[ephemeral_a, durable, ephemeral_b], &key, 2);
+
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].runtime.stable_id.0, "durable");
+        assert!(top[1]
+            .endpoints
+            .labels
+            .get("route_ephemeral")
+            .is_some_and(|value| value == "true"));
+    }
+
+    #[test]
+    fn ephemeral_authorities_remain_eligible_without_durable_authorities() {
+        let ephemeral_a = make_ephemeral_lease("ephemeral-a");
+        let ephemeral_b = make_ephemeral_lease("ephemeral-b");
+        let key = ObjectKey::new("test-key".to_string());
+
+        let top = ranked_top_authorities("ns", &[ephemeral_a, ephemeral_b], &key, 2);
+
+        assert_eq!(top.len(), 2);
+        assert!(top
+            .iter()
+            .all(|lease| route_authority_lifetime(lease) == RouteAuthorityLifetime::Ephemeral));
     }
 
     #[test]

@@ -16,7 +16,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace mooncake {
@@ -95,6 +97,8 @@ struct NcclDeviceContextAccess;
 }  // namespace detail
 
 class NcclDeviceTransportImpl;
+
+using NcclStatusCallback = std::function<bool(bool)>;
 
 // Opaque token for one collectively registered symmetric buffer. The token
 // does not own the allocation; deregister it before freeing the buffer.
@@ -215,6 +219,8 @@ class NcclTransport {
 
 // Create the CUDA-only NCCL LSA/GIN device transport.
 std::unique_ptr<NcclTransport> createNcclDeviceTransport();
+std::unique_ptr<NcclTransport> createNcclDeviceTransportWithStatusCallback(
+    std::weak_ptr<NcclStatusCallback> status_callback);
 
 }  // namespace device
 }  // namespace mooncake
