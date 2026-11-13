@@ -1071,6 +1071,8 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
     status.SetOpLogProgress(100, 200);
     EXPECT_EQ(doctor()["health"].asString(), "ok");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Repeating the current role must preserve the stall timer.
+    status.SetRoleState("standby", "WATCHING");
     // More backlog cannot restart the timer.
     status.SetOpLogProgress(100, 300);
     auto report = doctor();
@@ -1097,7 +1099,11 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
     EXPECT_EQ(report["issues"][0]["code"].asString(),
               std::string("OPLOG_READ_FAILED"));
     status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    EXPECT_EQ(doctor()["issues"].size(), 2u);
     status.SetDoctorIssue("OPLOG_READ_FAILED");
+    report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_CATCHUP_STALLED");
 
     // Applied progress restarts the timer without requiring a new latest.
     status.SetOpLogProgress(101, std::nullopt);
