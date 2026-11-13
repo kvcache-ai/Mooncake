@@ -22,6 +22,7 @@ namespace {
 
 constexpr int kConnectTimeoutMs = 5000;
 constexpr int kCommandTimeoutMs = 3000;
+constexpr auto kQueueWarningInterval = std::chrono::seconds(5);
 
 bool IsRedisOkStatus(const redisReply* reply) {
     return reply && reply->type == REDIS_REPLY_STATUS && reply->str &&
@@ -213,9 +214,9 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
     {
         std::lock_guard<std::mutex> lock(async_mutex_);
         if (!async_running_.load()) {
-            LOG(ERROR) << "RedisOpLogStore: write queue is not running"
-                       << ", sequence_id=" << entry.sequence_id
-                       << ", sync=" << sync;
+            VLOG(1) << "RedisOpLogStore: write queue is not running"
+                    << ", sequence_id=" << entry.sequence_id
+                    << ", sync=" << sync;
             return ErrorCode::INTERNAL_ERROR;
         }
 
@@ -226,14 +227,24 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
             if (!sync && inflight_writes_.size() >= async_queue_max_entries_) {
                 dropped_sequences_.insert(entry.sequence_id);
                 async_cv_.notify_one();
-                LOG(WARNING)
-                    << "RedisOpLogStore: async queue overflow"
-                    << ", sequence_id=" << entry.sequence_id
-                    << ", queue_size=" << inflight_writes_.size() << ", mode="
-                    << (async_queue_overflow_mode_ ==
-                                OpLogAsyncQueueOverflowMode::BYPASS
-                            ? "bypass"
-                            : "reject");
+                ++queue_overflows_since_last_log_;
+                const auto now = std::chrono::steady_clock::now();
+                if (next_queue_warning_at_ ==
+                        std::chrono::steady_clock::time_point{} ||
+                    now >= next_queue_warning_at_) {
+                    LOG(WARNING) << "RedisOpLogStore: async queue overflow"
+                                 << ", sequence_id=" << entry.sequence_id
+                                 << ", queue_size=" << inflight_writes_.size()
+                                 << ", mode="
+                                 << (async_queue_overflow_mode_ ==
+                                             OpLogAsyncQueueOverflowMode::BYPASS
+                                         ? "bypass"
+                                         : "reject")
+                                 << ", occurrences_since_last_log="
+                                 << queue_overflows_since_last_log_;
+                    queue_overflows_since_last_log_ = 0;
+                    next_queue_warning_at_ = now + kQueueWarningInterval;
+                }
                 if (async_queue_overflow_mode_ ==
                     OpLogAsyncQueueOverflowMode::BYPASS) {
                     HAMetricManager::instance().inc_oplog_queue_bypassed();
@@ -263,9 +274,14 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
         std::chrono::milliseconds(kSyncWaitTimeoutMs),
         [&] { return pending->done || !async_running_.load(); });
     if (!completed || !pending->done) {
-        if (async_running_.load()) {
-            HAMetricManager::instance().inc_oplog_sync_wait_timeouts();
+        if (!async_running_.load()) {
+            // StopWriting reports unfinished writes once during cleanup;
+            // cancellation is not a timeout and must not flood ERROR logs.
+            VLOG(1) << "RedisOpLogStore::WriteOpLog: sync wait cancelled"
+                    << ", sequence_id=" << entry.sequence_id;
+            return ErrorCode::INTERNAL_ERROR;
         }
+        HAMetricManager::instance().inc_oplog_sync_wait_timeouts();
         // TODO(P2P HA): Return an explicit commit-unknown status; this entry
         // remains pending and may still be committed.
         LOG(ERROR) << "RedisOpLogStore::WriteOpLog: sync wait timed out"
