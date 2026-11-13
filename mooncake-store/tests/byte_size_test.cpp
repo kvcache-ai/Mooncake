@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
+
 using namespace mooncake;
 
 TEST(UtilsTest, ByteSizeToString) {
@@ -31,4 +34,26 @@ TEST(UtilsTest, StringToByteSize) {
     EXPECT_FALSE(try_string_to_byte_size("-5").has_value());
     EXPECT_FALSE(try_string_to_byte_size("16XB").has_value());
     EXPECT_EQ(string_to_byte_size("-5"), 0);
+}
+
+TEST(UtilsTest, StringToByteSizeRejectsNonFinite) {
+    EXPECT_FALSE(try_string_to_byte_size("inf").has_value());
+    EXPECT_FALSE(try_string_to_byte_size("infinity").has_value());
+    EXPECT_FALSE(try_string_to_byte_size("nan").has_value());
+    EXPECT_FALSE(try_string_to_byte_size("1e999").has_value());
+    EXPECT_FALSE(try_string_to_byte_size("nan B").has_value());
+    EXPECT_EQ(string_to_byte_size("inf"), 0);
+    EXPECT_EQ(string_to_byte_size("nan"), 0);
+}
+
+TEST(UtilsTest, ByteSizeInfiniteRoundTrip) {
+    constexpr uint64_t kUint64Max = std::numeric_limits<uint64_t>::max();
+    constexpr uint64_t kInt64Max =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    EXPECT_EQ(byte_size_to_string(kUint64Max), "infinite");
+    EXPECT_EQ(byte_size_to_string(kInt64Max), "infinite");
+
+    auto parsed = try_string_to_byte_size("infinite");
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(byte_size_to_string(parsed.value()), "infinite");
 }
