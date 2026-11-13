@@ -126,11 +126,17 @@ void WrappedMasterService::SetBatchOpLogTerminalCallback(
 }
 
 void WrappedMasterService::StopBatchOpLogWriter() {
+    TestFailPoint::Wait("supervisor_before_oplog_writer_stop");
     master_service_.StopBatchOpLogWriter();
 }
 
 void WrappedMasterService::StopHttpMetadataCleanup() {
     master_service_.StopHttpMetadataCleanup();
+}
+
+void WrappedMasterService::StopKvcsCapacityRefresh() {
+    TestFailPoint::Wait("supervisor_before_kvcs_drain");
+    master_service_.StopKvcsCapacityRefresh();
 }
 
 void WrappedMasterService::MarkReadyForServing() {

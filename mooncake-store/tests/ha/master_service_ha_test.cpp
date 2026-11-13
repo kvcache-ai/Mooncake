@@ -177,6 +177,10 @@ class HaKvcsWatermarkDriver final : public KvcsDriver {
     uint64_t MaxValueSize() const override { return 4 * 1024 * 1024; }
     tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() override {
+        {
+            std::lock_guard lock(mutex_);
+            ++refresh_count_;
+        }
         return std::vector<KvcsMountpointStat>{{.index = 1,
                                                 .id = "target-mp",
                                                 .total_bytes = 100,
@@ -190,11 +194,35 @@ class HaKvcsWatermarkDriver final : public KvcsDriver {
     }
     KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
         {
-            std::lock_guard lock(mutex_);
+            std::unique_lock lock(mutex_);
             deleted_keys_.insert(deleted_keys_.end(), keys.begin(), keys.end());
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return !block_deletes_; });
+        }
+        return KvcsIoResults(keys.size());
+    }
+
+    void BlockDeletes() {
+        std::lock_guard lock(mutex_);
+        block_deletes_ = true;
+    }
+
+    void ReleaseDeletes() {
+        {
+            std::lock_guard lock(mutex_);
+            block_deletes_ = false;
         }
         cv_.notify_all();
-        return KvcsIoResults(keys.size());
+    }
+
+    size_t DeletedKeyCount() const {
+        std::lock_guard lock(mutex_);
+        return deleted_keys_.size();
+    }
+
+    size_t RefreshCount() const {
+        std::lock_guard lock(mutex_);
+        return refresh_count_;
     }
 
     bool WaitForDelete(std::chrono::milliseconds timeout) {
@@ -210,6 +238,8 @@ class HaKvcsWatermarkDriver final : public KvcsDriver {
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    bool block_deletes_{false};
+    size_t refresh_count_{0};
     std::vector<ObjectKey> deleted_keys_;
 };
 
@@ -1314,6 +1344,71 @@ TEST_F(MasterServiceHATest, KvcsWatermarkUsesOpLogForMetadataRemoval) {
     ASSERT_TRUE(remaining);
     ASSERT_EQ(remaining->replicas.size(), 1u);
     EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+}
+
+TEST_F(MasterServiceHATest, KvcsDrainWaitsForDeleteBeforeStoppingOpLog) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(1)
+                      .set_default_kv_soft_pin_ttl(1)
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("kvcs_watermark_drain")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto writer =
+        InstallGatedWriter(service, std::make_shared<FakeBatchHaKvBackend>());
+    const auto segment = PrepareSimpleSegment(service);
+    auto driver = std::make_unique<HaKvcsWatermarkDriver>();
+    auto* driver_state = driver.get();
+    driver_state->BlockDeletes();
+    MasterServiceTestPeer peer(service);
+    peer.ConfigureKvcsCapacityForTesting(std::make_unique<KvcsCapacityProvider>(
+                                             1, "target-mp", std::move(driver)),
+                                         true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    const std::string key = "kvcs-watermark-drain";
+    ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant, 64,
+                                 replicate));
+    ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                               ReplicaType::ALL));
+    ASSERT_TRUE(writer->PauseCallbacksAfter(1));
+    peer.StartKvcsCapacityRefreshForTesting();
+    peer.ScheduleKvcsCapacityRefreshForTesting();
+    const bool delete_entered =
+        driver_state->WaitForDelete(std::chrono::seconds(1));
+    if (!delete_entered) driver_state->ReleaseDeletes();
+    ASSERT_TRUE(delete_entered);
+
+    std::promise<void> drain_started;
+    auto drain = std::async(std::launch::async, [&] {
+        drain_started.set_value();
+        service.StopKvcsCapacityRefresh();
+    });
+    drain_started.get_future().wait();
+    EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    driver_state->ReleaseDeletes();
+    ASSERT_EQ(drain.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    drain.get();
+    EXPECT_EQ(driver_state->RefreshCount(), 1u);
+
+    // The accepted delete can still enqueue its metadata removal: the
+    // supervisor must stop the writer only after this drain has returned.
+    ASSERT_TRUE(writer->WaitForSubmittedCount(2, std::chrono::seconds(1)));
+    ASSERT_TRUE(writer->RunCallbacksThrough(2));
+    auto remaining = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+    peer.ScheduleKvcsCapacityRefreshForTesting();
+    service.StopKvcsCapacityRefresh();
+    EXPECT_EQ(driver_state->DeletedKeyCount(), 1u);
+    EXPECT_EQ(driver_state->RefreshCount(), 1u);
 }
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};

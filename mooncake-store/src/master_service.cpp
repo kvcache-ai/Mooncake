@@ -983,7 +983,7 @@ MasterService::~MasterService() {
     }
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
-    kvcs_capacity_refresh_worker_.Stop();
+    StopKvcsCapacityRefresh();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -11643,6 +11643,10 @@ void MasterService::StopHttpMetadataCleanup() {
     }
     http_metadata_cleanup_cv_.notify_all();
     http_metadata_cleanup_thread_.join();
+}
+
+void MasterService::StopKvcsCapacityRefresh() {
+    kvcs_capacity_refresh_worker_.Stop();
 }
 
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {

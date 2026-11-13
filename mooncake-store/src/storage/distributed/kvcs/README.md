@@ -114,6 +114,16 @@ metadata unchanged for a later refresh. A crash after provider delete but
 before the OpLog record becomes durable can temporarily leave a stale DFS
 replica, which is reconciled by the existing explicit-Get miss path.
 
+Before voluntarily releasing HA leadership, the supervisor stops scheduling
+KVCS capacity refreshes and joins the current eviction pass while the OpLog
+writer is still running. This orders local eviction work before the handoff;
+it does not fence a provider request after lease loss or an SDK timeout.
+Cross-primary deletion requires the provider to atomically delete only the
+selected object version. The public KVCS 0.6.0 Low Level delete API accepts
+only keys and has no version condition. Version-conditional deletion and its
+integration remain prerequisites for HA watermark eviction across leadership
+changes. A local key lock or a leadership check before Delete is insufficient.
+
 Deployments should configure the KVCS GC watermark to 100%. Current KVCS
 cannot fully disable automatic GC, so this only makes provider-side deletion
 very unlikely; it is not a correctness guarantee. If KVCS removes a value,
