@@ -76,16 +76,16 @@ namespace mooncake {
     constexpr double kMiB = kKiB * 1024.0;
     constexpr double kGiB = kMiB * 1024.0;
     constexpr double kTiB = kGiB * 1024.0;
-    if (unit == "KB" || unit == "K") {
+    if (unit == "KIB" || unit == "KB" || unit == "K") {
         return static_cast<uint64_t>(value * kKiB);
     }
-    if (unit == "MB" || unit == "M") {
+    if (unit == "MIB" || unit == "MB" || unit == "M") {
         return static_cast<uint64_t>(value * kMiB);
     }
-    if (unit == "GB" || unit == "G") {
+    if (unit == "GIB" || unit == "GB" || unit == "G") {
         return static_cast<uint64_t>(value * kGiB);
     }
-    if (unit == "TB" || unit == "T") {
+    if (unit == "TIB" || unit == "TB" || unit == "T") {
         return static_cast<uint64_t>(value * kTiB);
     }
     if (unit == "B" || unit.empty()) {
