@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/struct_json/json_reader.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -669,6 +670,47 @@ class RedisGracefulShutdownTest : public RedisChaosTest {
         config.heartbeat_rpc_port_base = 55051;
     }
 
+    bool WaitForSnapshotReadiness(int index, const std::string& role,
+                                  bool ready, std::chrono::seconds timeout) {
+        RedisMasterRegistry registry(FLAGS_redis_cluster_id,
+                                     FLAGS_redis_endpoint, FLAGS_redis_username,
+                                     FLAGS_redis_password, 0);
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(kMasterPortBase + index);
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            coro_http::coro_http_client client;
+            auto response =
+                client.get("http://127.0.0.1:" + std::to_string(54051 + index) +
+                           "/ha/status");
+            if (response.status == 200) {
+                HAStatusSnapshot status;
+                struct_json::from_json(status, response.resp_body);
+                if (status.role == role && status.snapshot_ready == ready &&
+                    status.state ==
+                        (role == "primary" ? "RUNNING" : "WATCHING")) {
+                    std::vector<RedisMasterRegistryEntry> entries;
+                    if (registry.DiscoverAlive(std::chrono::seconds(10),
+                                               entries) == ErrorCode::OK) {
+                        for (const auto& entry : entries) {
+                            // Registry readiness counts standby snapshot
+                            // sources; primary fallback availability is
+                            // reported in HTTP.
+                            if (entry.master_endpoint == endpoint &&
+                                entry.role == role &&
+                                entry.snapshot_ready ==
+                                    (role == "standby" && ready)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    }
+
     std::string RegistryInstance(int index) {
         RedisMasterRegistry registry(FLAGS_redis_cluster_id,
                                      FLAGS_redis_endpoint, FLAGS_redis_username,
@@ -890,6 +932,12 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
     ViewVersionId version = 0;
     ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
     WaitForLeaderServiceReady();
+    for (int i = 0; i < kMasterNum; ++i) {
+        ASSERT_TRUE(
+            WaitForSnapshotReadiness(i, i == leader ? "primary" : "standby",
+                                     true, std::chrono::seconds(3)))
+            << i;
+    }
     const auto log_offset = MasterLogEndOffset(leader);
     const auto start = std::chrono::steady_clock::now();
     const std::string url =
@@ -910,6 +958,8 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
     EXPECT_TRUE(WaitForMasterLogSince(
         leader, "OpLog drain completed, drain_timeout_ms=1234", log_offset,
         std::chrono::seconds(1)));
+    ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", true,
+                                         std::chrono::seconds(3)));
 
     // Standby diagnostics remain reachable while election is paused.
     coro_http::coro_http_client status_client;
@@ -944,6 +994,44 @@ TEST_F(RedisGracefulShutdownTest, StepdownCooldownDoesNotBlockShutdown) {
     EXPECT_TRUE(WaitForMasterLogSince(
         leader, "HA shutdown requested during election pause", log_offset,
         std::chrono::seconds(1)));
+}
+
+class RedisSnapshotDisabledTest : public RedisGracefulShutdownTest {
+   protected:
+    void ConfigureMasters(MasterRunnerConfig& config) override {
+        RedisGracefulShutdownTest::ConfigureMasters(config);
+        config.standby_snapshot_service_port_base = 0;
+    }
+};
+
+TEST_F(RedisSnapshotDisabledTest, ReadinessStaysFalseAcrossStepdown) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    for (int i = 0; i < kMasterNum; ++i) {
+        ASSERT_TRUE(
+            WaitForSnapshotReadiness(i, i == leader ? "primary" : "standby",
+                                     false, std::chrono::seconds(3)))
+            << i;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    coro_http::coro_http_client client;
+    auto response =
+        client.post("http://127.0.0.1:" + std::to_string(54051 + leader) +
+                        "/ha/stepdown?cooldown_sec=30",
+                    "", coro_http::req_content_type::octet_stream);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    ExpectPromptSuccessor(leader, version, start);
+    ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", false,
+                                         std::chrono::seconds(3)));
+    int successor = -1;
+    ViewVersionId next_version = 0;
+    ASSERT_TRUE(
+        WaitForLeader(successor, next_version, std::chrono::seconds(3)));
+    ASSERT_NE(successor, leader);
+    ASSERT_TRUE(WaitForSnapshotReadiness(successor, "primary", false,
+                                         std::chrono::seconds(15)));
 }
 
 TEST_F(RedisGracefulShutdownTest, StandbySigtermPreservesLeader) {

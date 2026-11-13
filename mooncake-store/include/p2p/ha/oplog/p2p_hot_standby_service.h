@@ -122,7 +122,10 @@ class P2PHotStandbyService {
         return metadata_store_.get();
     }
     const std::string& GetClusterId() const { return config_.cluster_id; }
+    // Metadata readiness is also used by in-process snapshot sources.
     bool IsReadyForSnapshot() const;
+    // External advertisement additionally requires a started RPC server.
+    bool CanServeSnapshot() const;
 
    private:
     friend struct mooncake::test::P2PHotStandbyServiceTestAccess;
@@ -176,6 +179,10 @@ class P2PHotStandbyService {
 
     std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> snapshot_server_;
+    // StopSnapshotServer cannot hold mutex_ while joining snapshot handlers.
+    // Publish availability separately so heartbeat readers never race the
+    // pointer.
+    std::atomic<bool> snapshot_server_running_{false};
 };
 
 }  // namespace mooncake

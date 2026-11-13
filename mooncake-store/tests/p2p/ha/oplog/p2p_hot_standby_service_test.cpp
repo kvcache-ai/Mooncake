@@ -1028,6 +1028,43 @@ TEST_F(P2PHotStandbyServiceTest,
     source.Stop();
 }
 
+TEST_F(P2PHotStandbyServiceTest, SnapshotReadinessRequiresEnabledServer) {
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    EXPECT_FALSE(standby.CanServeSnapshot());
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    EXPECT_TRUE(standby.IsReadyForSnapshot());
+    EXPECT_FALSE(standby.CanServeSnapshot());
+    standby.Stop();
+    EXPECT_FALSE(standby.CanServeSnapshot());
+}
+
+TEST_F(P2PHotStandbyServiceTest, SnapshotReadinessFollowsServerLifecycle) {
+    auto config = MakeStandbyConfig();
+    config.snapshot_service_port = AllocateLoopbackPort();
+    ASSERT_NE(config.snapshot_service_port, 0);
+    P2PHotStandbyService standby(config);
+    EXPECT_FALSE(standby.CanServeSnapshot());
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    EXPECT_TRUE(standby.CanServeSnapshot());
+
+    P2PStandbySnapshotClient client;
+    P2PStandbyMetadataStore metadata;
+    uint64_t baseline = 0;
+    ASSERT_EQ(client.Bootstrap(
+                  "127.0.0.1:" + std::to_string(config.snapshot_service_port),
+                  kClusterId, &metadata, baseline, 256),
+              ErrorCode::OK);
+    ASSERT_EQ(standby.Promote(), ErrorCode::OK);
+    EXPECT_FALSE(standby.CanServeSnapshot());
+    standby.Stop();
+    EXPECT_FALSE(standby.CanServeSnapshot());
+
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    EXPECT_TRUE(standby.CanServeSnapshot());
+    standby.Stop();
+    EXPECT_FALSE(standby.CanServeSnapshot());
+}
+
 TEST_F(P2PHotStandbyServiceTest, SnapshotServerRejectsOccupiedPort) {
     P2PHotStandbyService first(MakeStandbyConfig());
     ASSERT_EQ(first.Start(), ErrorCode::OK);
@@ -1038,8 +1075,10 @@ TEST_F(P2PHotStandbyServiceTest, SnapshotServerRejectsOccupiedPort) {
     config.snapshot_service_port = snapshot.Port();
     P2PHotStandbyService second(config);
     EXPECT_EQ(second.Start(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_FALSE(second.CanServeSnapshot());
 
     second.Stop();
+    EXPECT_FALSE(second.CanServeSnapshot());
     first.Stop();
 }
 

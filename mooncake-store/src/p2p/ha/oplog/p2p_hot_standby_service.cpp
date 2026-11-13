@@ -580,6 +580,12 @@ bool P2PHotStandbyService::IsReadyForSnapshot() const {
            applied_sequence_id >= trimmed_sequence_id;
 }
 
+bool P2PHotStandbyService::CanServeSnapshot() const {
+    return snapshot_server_running_.load(std::memory_order_acquire) &&
+           IsReadyForSnapshot() &&
+           snapshot_server_running_.load(std::memory_order_acquire);
+}
+
 uint64_t P2PHotStandbyService::GetLatestAppliedSequenceId() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return GetLocalLastAppliedSequenceIdLocked();
@@ -799,10 +805,12 @@ ErrorCode P2PHotStandbyService::StartSnapshotServer() {
                    << ", port=" << config_.snapshot_service_port;
         return ErrorCode::INTERNAL_ERROR;
     }
+    snapshot_server_running_.store(true, std::memory_order_release);
     return ErrorCode::OK;
 }
 
 void P2PHotStandbyService::StopSnapshotServer() {
+    snapshot_server_running_.store(false, std::memory_order_release);
     if (snapshot_server_) {
         snapshot_server_->stop();
     }

@@ -134,7 +134,7 @@ void UpdateHAStatusFromStandby(P2PHotStandbyService& standby) {
                           status.primary_seq_id_known
                               ? std::optional<uint64_t>(status.primary_seq_id)
                               : std::nullopt);
-    ha_status.SetSnapshotReady(standby.IsReadyForSnapshot());
+    ha_status.SetSnapshotReady(standby.CanServeSnapshot());
     ha_status.SetDoctorIssue(
         "OPLOG_APPLY_FAILED",
         status.apply_healthy
@@ -155,7 +155,11 @@ class ScopedStandbyRegistryProviders final {
                 UpdateHAStatusFromStandby(standby);
                 return standby.GetLatestAppliedSequenceId();
             },
-            [&standby] { return standby.IsReadyForSnapshot(); });
+            [&standby] {
+                const bool ready = standby.CanServeSnapshot();
+                HAStatusManager::instance().SetSnapshotReady(ready);
+                return ready;
+            });
     }
 
     ~ScopedStandbyRegistryProviders() { Reset(); }
@@ -177,6 +181,12 @@ class ScopedStandbyRegistryProviders final {
     RedisMasterRegistryHeartbeat* registry_heartbeat_;
 };
 #endif
+
+struct SnapshotReadinessResetOnExit {
+    ~SnapshotReadinessResetOnExit() {
+        HAStatusManager::instance().SetSnapshotReady(false);
+    }
+};
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version,
@@ -350,6 +360,7 @@ int P2PMaster::RunStandalone() {
 }
 
 int P2PMaster::RunWithHA() {
+    const SnapshotReadinessResetOnExit snapshot_readiness_reset;
     auto stopping = [] { return P2PMaster::IsShutdownRequested(); };
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/true, config_.cluster_id, "",
@@ -371,6 +382,7 @@ int P2PMaster::RunWithHA() {
     // next round reads it after the active service has been destroyed.
     std::chrono::steady_clock::time_point election_paused_until{};
     while (!stopping()) {
+        HAStatusManager::instance().SetSnapshotReady(false);
         // The previous primary's drain result must remain visible after
         // demotion; clear it on a successful drain instead of hiding it here.
         HAStatusManager::instance().ClearDoctorIssues(
@@ -511,7 +523,7 @@ int P2PMaster::RunWithHA() {
                         *master_registry_heartbeat, *standby);
                 UpdateHAStatusFromStandby(*standby);
                 master_registry_heartbeat->UpdateRole(
-                    "standby", standby->IsReadyForSnapshot());
+                    "standby", standby->CanServeSnapshot());
             }
 #endif
         }
@@ -659,6 +671,12 @@ int P2PMaster::RunWithHA() {
         }
 
 #ifdef STORE_USE_REDIS
+        // Wait for old standby callbacks before publishing the new role and
+        // readiness; otherwise an in-flight heartbeat can overwrite them.
+        standby_registry_providers.reset();
+#endif
+        HAStatusManager::instance().SetSnapshotReady(false);
+#ifdef STORE_USE_REDIS
         HAStatusManager::instance().SetRoleState("promoting", "PROMOTING");
         if (master_registry_heartbeat) {
             master_registry_heartbeat->UpdateRole("promoting", false);
@@ -680,9 +698,6 @@ int P2PMaster::RunWithHA() {
             promoted_sequence_id = standby->GetLatestAppliedSequenceId();
             promoted_metadata = standby->ExportMetadata();
             UpdateHAOpLogProgress(promoted_sequence_id, promoted_sequence_id);
-#ifdef STORE_USE_REDIS
-            standby_registry_providers.reset();
-#endif
             standby.reset();
         }
 
@@ -696,6 +711,7 @@ int P2PMaster::RunWithHA() {
         }
 
         HAStatusManager::instance().SetRoleState("primary", "STARTING");
+        HAStatusManager::instance().SetSnapshotReady(false);
         // A late SIGTERM during another exit path must not report a graceful
         // shutdown unless the admitted writes were actually drained.
         bool graceful_drain_complete = !config_.oplog.enabled;
@@ -836,11 +852,13 @@ int P2PMaster::RunWithHA() {
         }
 
 #endif
-        auto mark_primary_running = [primary_service =
-                                         &active_service->GetMasterService()] {
-            UpdatePrimaryHAOpLogProgress(*primary_service);
-            HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-        };
+        auto mark_primary_running =
+            [primary_service = &active_service->GetMasterService(),
+             snapshot_ready = primary_snapshot_server != nullptr] {
+                UpdatePrimaryHAOpLogProgress(*primary_service);
+                HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+                HAStatusManager::instance().SetSnapshotReady(snapshot_ready);
+            };
 #ifdef STORE_USE_REDIS
         auto mark_redis_registry = [&master_registry_heartbeat,
                                     primary_service =
@@ -872,6 +890,7 @@ int P2PMaster::RunWithHA() {
                            std::memory_order_acquire) &&
                        !leadership_lost.load(std::memory_order_acquire);
             });
+        HAStatusManager::instance().SetSnapshotReady(false);
 #ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
 #endif
