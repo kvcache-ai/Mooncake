@@ -723,17 +723,6 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     hipPointerAttribute_t hipAttr{};
     hipError_t hipRes = hipPointerGetAttributes(&hipAttr, addr);
 
-    // Managed memory is also rejected here: it can be device-resident, and
-    // the ibv_reg_mr() fallback below would register it as host memory.
-    if (globalConfig().rdma_host_only && hipRes == hipSuccess &&
-        hipAttr.type != hipMemoryTypeHost &&
-        hipAttr.type != hipMemoryTypeUnregistered) {
-        LOG(ERROR) << "RDMA host-only mode requires host memory; GPU "
-                      "buffers must be copied to pinned CPU staging before "
-                      "registration";
-        return ERR_INVALID_ARGUMENT;
-    }
-
     if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
         hipAttr.type == hipMemoryTypeUnregistered) {
         // Host memory — standard ibv_reg_mr() path.
