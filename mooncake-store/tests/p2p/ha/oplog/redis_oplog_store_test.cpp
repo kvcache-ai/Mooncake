@@ -1022,6 +1022,46 @@ class RedisOpLogDoctorTest : public RedisOpLogStoreTest {
     std::unique_ptr<RedisOpLogStore> writer_;
 };
 
+TEST_F(RedisOpLogDoctorTest, StopWritingPreventsRetryAfterRedisRecovers) {
+    auto& metrics = HAMetricManager::instance();
+    const auto retries = metrics.get_oplog_write_retries_total();
+    std::future<ErrorCode> pending;
+    {
+        // Also cancel the synchronous write before future destruction on
+        // ASSERT.
+        struct StopWriter {
+            RedisOpLogStore& writer;
+            ~StopWriter() { writer.StopWriting(); }
+        } cleanup{*writer_};
+        pending = std::async(std::launch::async, [&] {
+            return writer_->WriteOpLog(MakeEntry(1), true);
+        });
+        // The fixture denies seq=1. Observe a failed retry, not only admission.
+        ASSERT_TRUE(WaitUntil([&] {
+            return metrics.get_oplog_write_retries_total() >= retries + 2;
+        }));
+        EXPECT_TRUE(HasFailureCount(1));
+        writer_->RequestStopWriting();
+        ASSERT_EQ(pending.wait_for(std::chrono::seconds(1)),
+                  std::future_status::ready);
+        EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    }
+    // Restore access only after joining: an in-flight SET may otherwise
+    // succeed.
+    const auto stopped_retries = metrics.get_oplog_write_retries_total();
+    ASSERT_TRUE(AllowEntries("*"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(metrics.get_oplog_write_retries_total(), stopped_retries);
+    OpLogEntry stored;
+    EXPECT_EQ(writer_->ReadOpLog(1, stored), ErrorCode::OPLOG_ENTRY_NOT_FOUND);
+    uint64_t latest = 99;
+    ASSERT_EQ(writer_->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 0u);
+    EXPECT_EQ(writer_->WriteOpLog(MakeEntry(2), false),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(metrics.get_oplog_async_queue_size(), 0);
+}
+
 TEST_F(RedisOpLogDoctorTest, CommitFailureReportsReasonAndClearsOnRecovery) {
     // Entries can persist, but committing the latest watermark is denied.
     RedisReplyPtr reply((redisReply*)redisCommand(
