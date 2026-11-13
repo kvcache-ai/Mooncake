@@ -789,6 +789,36 @@ class RedisOpLogDoctorTest : public RedisOpLogStoreTest {
     std::unique_ptr<RedisOpLogStore> writer_;
 };
 
+TEST_F(RedisOpLogDoctorTest, CommitFailureReportsReasonAndClearsOnRecovery) {
+    // Entries can persist, but committing the latest watermark is denied.
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        admin_.get(), "ACL SETUSER %s resetkeys ~mooncake:%s:oplog:entry:*",
+        user_.c_str(), cluster_id_.c_str()));
+    ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] {
+        return status_.SerializeDoctorJson().find("OPLOG_COMMIT_FAILED") !=
+               std::string::npos;
+    }));
+    const auto report = status_.GetDoctorReport();
+    const auto failure = std::find_if(
+        report.issues.begin(), report.issues.end(),
+        [](const auto& issue) { return issue.code == "OPLOG_COMMIT_FAILED"; });
+    ASSERT_NE(failure, report.issues.end());
+    EXPECT_NE(failure->message.find("target=1"), std::string::npos);
+    EXPECT_NE(failure->message.find("NOPERM"), std::string::npos);
+
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(WaitUntil([&] {
+        uint64_t committed = 0;
+        return writer_->GetLocalCommittedSequenceId(committed) ==
+                   ErrorCode::OK &&
+               committed == 1;
+    }));
+    EXPECT_EQ(status_.SerializeDoctorJson().find("OPLOG_COMMIT_FAILED"),
+              std::string::npos);
+}
+
 TEST_F(RedisOpLogDoctorTest, TracksFailuresUntilEachEntryRecovers) {
     const auto retries =
         HAMetricManager::instance().get_oplog_write_retries_total();

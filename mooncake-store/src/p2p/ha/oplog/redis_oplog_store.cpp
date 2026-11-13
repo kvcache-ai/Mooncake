@@ -757,11 +757,12 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         (redisReply*)redisCommand(ctx, "SET %b %b", latest_key_.data(),
                                   latest_key_.size(), seq.data(), seq.size()));
     if (!IsRedisOkStatus(reply.get())) {
+        const auto error = RedisUtil::FormatCommandError(ctx, reply.get());
         HAStatusManager::instance().SetDoctorIssue(
-            "OPLOG_COMMIT_FAILED", "target=" + std::to_string(target));
+            "OPLOG_COMMIT_FAILED",
+            "target=" + std::to_string(target) + ": " + error);
         LOG(ERROR) << "RedisOpLogStore::AdvanceCommittedLatest: SET failed"
-                   << ", target=" << target << ", error="
-                   << RedisUtil::FormatCommandError(ctx, reply.get());
+                   << ", target=" << target << ", error=" << error;
         return ErrorCode::INTERNAL_ERROR;
     }
     HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
