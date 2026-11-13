@@ -61,25 +61,6 @@ if (USE_CUDA)
       "CUDA IBGDA DMA-BUF DevX UMEM support disabled: the installed mlx5 headers or libmlx5 do not provide MLX5DV_UMEM_MASK_DMABUF, mlx5dv_devx_umem_in::dmabuf_fd, and mlx5dv_devx_umem_reg_ex. Update rdma-core/libmlx5 to enable DMA-BUF control memory; Device API will use GPU-VA and host-mapped fallback.")
   endif()
 endif()
-if (USE_ASCEND)
-  include(../mooncake-common/FindMpi.cmake)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
-  set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
-
-  include_directories(/usr/local/include
-                      /usr/include
-                      ${ASCEND_INCLUDE_DIR}
-                      ${ASCEND_INCLUDE_DIR}/hccl
-                      ${ASCEND_INCLUDE_DIR}/experiment
-                      ${ASCEND_INCLUDE_DIR}/experiment/hccl
-                      ${ASCEND_INCLUDE_DIR}/experiment/slog/toolchain
-                      ${ASCEND_INCLUDE_DIR}/experiment/metadef/common/util/error_manager
-                      ${ASCEND_INCLUDE_DIR}/experiment/runtime
-                      ${ASCEND_INCLUDE_DIR}/experiment/msprof
-                      ${MPI_INCLUDE_DIR}
-                      /usr/local/Ascend/ascend-toolkit/latest/tools/hccl_test/common/src/
-                      )
-endif()
 
 if (USE_ASCEND_HETEROGENEOUS)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
@@ -95,6 +76,13 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   include_directories(src/common/adaptive_congestion_control)
 endif()
 add_subdirectory(include)
+
+# The shared Ascend allocator/affinity library is used by the classic Ascend
+# Direct transport, the Store and TENT, so build it before the engine.
+if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
+  add_subdirectory(allocator)
+endif()
+
 add_subdirectory(src)
 
 if (BUILD_UNIT_TESTS)

@@ -58,6 +58,7 @@ RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
     auto client = std::make_shared<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
 
+    co_await coro_io::post([] {}, &client->get_executor());
     auto ec = co_await client->connect(addr);
     if (ec) {
         LOG(ERROR) << "RpcClient: connect failed to " << addr << ": "
@@ -77,8 +78,35 @@ RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
 }
 
 void RpcClient::spawn(async_simple::coro::Lazy<void> task) {
+    auto state = state_;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->shutdown.load(std::memory_order_acquire)) return;
+        ++state->pending_tasks;
+    }
+    auto complete = [state](auto&&) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        --state->pending_tasks;
+        state->drained.notify_all();
+    };
     auto executor = coro_io::get_global_executor();
-    std::move(task).via(executor).start([](auto&&) {});
+    std::move(task).via(executor).start(std::move(complete));
+}
+
+void RpcClient::shutdown() {
+    decltype(state_->clients) clients;
+    {
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        state_->shutdown.store(true, std::memory_order_release);
+        state_->drained.wait(lock,
+                             [this] { return state_->pending_tasks == 0; });
+        clients.swap(state_->clients);
+    }
+    for (auto& [addr, client] : clients) {
+        // Close on the socket executor and wait for that close to execute.
+        async_simple::coro::syncAwait(coro_io::post(
+            [client] { client->close(); }, &client->get_executor()));
+    }
 }
 
 std::unique_ptr<coro_rpc::coro_rpc_client> RpcClient::createSyncClient() {
@@ -100,6 +128,7 @@ bool RpcClient::tryReconnect(const std::string& addr) {
     // they complete - no use-after-free.
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->shutdown.load(std::memory_order_acquire)) return false;
         state_->clients.erase(addr);
     }
 
@@ -110,7 +139,8 @@ bool RpcClient::tryReconnect(const std::string& addr) {
     auto client = std::make_shared<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
 
-    auto ec = async_simple::coro::syncAwait(client->connect(addr));
+    auto ec = async_simple::coro::syncAwait(
+        client->connect(addr).via(&client->get_executor()));
     if (ec) {
         LOG(ERROR) << "RpcClient: reconnect failed to " << addr << ": "
                    << ec.message();
@@ -118,6 +148,7 @@ bool RpcClient::tryReconnect(const std::string& addr) {
     }
 
     std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->shutdown.load(std::memory_order_acquire)) return false;
     state_->clients[addr] = client;
     return true;
 }

@@ -32,7 +32,7 @@ __device__ __forceinline__ void drainCollectiveTransfers(
     for (const auto& peer : remote_peers) {
         transfer_peers[peer_index++] = peer.global_rank;
     }
-    drainTransfers(handle, transfer_peers, remote_peers.size());
+    handle.drain(transfer_peers, remote_peers.size());
 }
 
 // Publish to all required peers before waiting, avoiding a startup cycle.
@@ -91,9 +91,11 @@ prepareCollectiveInvocation(Plan* plan,
                             cooperative_groups::thread_block block,
                             Prepare prepare) {
     PG_ASSERT(plan && collective.control_mailbox);
-    if (block.thread_rank() == 0)
+    if (block.thread_rank() == 0) {
+        collective.transfer_handle->pauseIfRequested();
         applyPendingControlUpdate(
             &collective.control_mailbox->control_update_slot);
+    }
     block.sync();
     PG_ASSERT(plan->status == DevicePlanStatus::Ready);
     return prepare();
@@ -143,12 +145,14 @@ static __device__ __noinline__ void recoverCollectiveFailure(
     const CollectiveRuntimeBindings& collective, RemotePeerList remote_peers,
     InGroupRank failed_rank, uint64_t failed_hint_address) {
     drainCollectiveTransfers(*collective.transfer_handle, remote_peers);
-    collective.control_mailbox->recovery
-        .submit(CollectiveFailureReport{
+    auto recovery =
+        collective.control_mailbox->recovery.submit(CollectiveFailureReport{
             .failed_rank = failed_rank,
             .failed_hint_address = failed_hint_address,
-        })
-        .wait();
+        });
+    // This CTA no longer uses DTS while waiting for recovery. Acknowledge pause
+    // requests here so DTS can switch route resources before the kernel exits.
+    while (!recovery.poll()) collective.transfer_handle->pauseIfRequested();
     applyPinnedControlUpdate(&collective.control_mailbox->control_update_slot);
 }
 

@@ -147,6 +147,10 @@ class IOUringTransport : public Transport {
         return io_uring_submit(ring);
     }
 
+    // Staging copies are synchronous. Keeping this behind a narrow seam lets
+    // tests inject device-copy failures while real io_uring handles file I/O.
+    virtual Status copyMemory(void *dst, void *src, size_t length);
+
     IOUringStagingPool *stagingPool() const { return staging_pool_.get(); }
 
    private:

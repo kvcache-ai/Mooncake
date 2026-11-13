@@ -190,6 +190,12 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
     return impl_->getTransferStatus(batch_id, overall_status);
 }
 
+Status TransferEngine::waitTransfer(BatchID batch_id,
+                                    std::vector<TransferStatus>* status_list,
+                                    uint64_t timeout_ms) {
+    return impl_->waitTransfer(batch_id, status_list, timeout_ms);
+}
+
 Status TransferEngine::progressBatch(BatchID batch_id,
                                      TransferStatus& overall_status) {
     return impl_->progressBatch(batch_id, overall_status);

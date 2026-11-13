@@ -9,6 +9,7 @@
 #include <glog/logging.h>
 
 #include "device_comm/device_utils/d2h_request_slot.h"
+#include "device_comm/device_utils/h2d_request_slot.h"
 #include "device_comm/device_collective/algorithms/ring/ring_all_reduce.h"
 #include "device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.h"
 #include "device_comm/device_collective/device_control_update.h"
@@ -16,6 +17,7 @@
 #include "device_comm/device_collective/protocols/simple/simple_resources.h"
 #include "device_comm/device_collective/protocols/ll/ll_resources.h"
 #include "device_comm/device_collective/strong_stream.h"
+#include "gpu_runtime.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -35,20 +37,6 @@ namespace {
 
 // Simple (3), LL bindings (1), two Plans, and the recovery mirror.
 static_assert(kMaxDeviceControlUpdateOperations >= 7);
-
-PGResult<uint64_t> timeoutTicks(int device_index, size_t timeout_us) {
-    if (timeout_us == 0) return uint64_t{0};
-    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
-    int clock_rate_khz_value = 0;
-    PG_TRY_CUDA(cudaDeviceGetAttribute(&clock_rate_khz_value,
-                                       cudaDevAttrClockRate, device_index));
-    const uint64_t clock_rate_khz = static_cast<uint64_t>(clock_rate_khz_value);
-    if (clock_rate_khz == 0) return uint64_t{0};
-    if (timeout_us > std::numeric_limits<uint64_t>::max() / clock_rate_khz) {
-        return uint64_t{std::numeric_limits<uint64_t>::max()};
-    }
-    return uint64_t{std::max<uint64_t>(1, timeout_us * clock_rate_khz / 1000)};
-}
 
 bool rangesOverlap(const void* left, const void* right, size_t size) {
     if (size == 0 || left == right) return false;
@@ -106,7 +94,7 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
                     "device collective group capacity is too large");
 
     PG_TRY(auto timeout_ticks,
-           timeoutTicks(device_index, collective_timeout_us));
+           gpuTimeoutTicks(device_index, collective_timeout_us));
     const uint64_t view_epoch_signal_bytes =
         static_cast<uint64_t>(max_group_size) * sizeof(uint64_t);
     PG_TRY(auto view_epoch_signals,
@@ -160,7 +148,7 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
     PG_TRY(runtime->ring_all_reduce_,
            RingAllReduceAlgorithm::create(device_index, collective, workspace,
                                           *runtime->simple_));
-    const auto* p2p = transfer_service.p2pRoute();
+    const auto* p2p = transfer_service.findRoute<P2pRoute>();
     if (max_group_size > 1 && p2p && !p2p->nativeAtomicPeerUuids().empty()) {
         PG_TRY(runtime->ll_, LLResources::create(transfer_service, self_rank,
                                                  max_group_size));
@@ -461,8 +449,8 @@ PGResult<void> DeviceCollectiveRuntime::publishControlState(
                                                       configuration.one_shot));
     }
     *configuration_ = configuration;
-    publishControlUpdate(control_mailbox_->control_update_slot,
-                         builder.controlUpdate(), pinned);
+    control_mailbox_->control_update_slot.publish(builder.controlUpdate(),
+                                                  pinned);
     return {};
 }
 

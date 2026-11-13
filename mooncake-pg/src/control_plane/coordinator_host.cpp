@@ -267,6 +267,14 @@ void CoordinatorHost::postViewUpdateAck(GroupId group_id, GlobalRank rank,
     });
 }
 
+void CoordinatorHost::postTransferEndpointUpdateAck(
+    TransferEndpointUpdateAck ack) {
+    executor_.post([this, ack = std::move(ack)] {
+        auto result = state_machine_.handleTransferEndpointUpdateAck(ack);
+        runEffects(result.effects);
+    });
+}
+
 void CoordinatorHost::runEffects(
     const std::vector<CoordinatorEffect>& effects) {
     for (const auto& effect : effects) {
@@ -282,6 +290,9 @@ void CoordinatorHost::runEffects(
                     }
                 },
                 [this](const PushViewUpdate& e) { pushViewUpdate(e); },
+                [this](const PushTransferEndpointUpdate& e) {
+                    pushTransferEndpointUpdate(e);
+                },
                 [this](const ReplyProposal& e) {
                     auto it = pending_proposal_resps_.find(e.propose_id);
                     if (it != pending_proposal_resps_.end()) {
@@ -335,6 +346,25 @@ void CoordinatorHost::pushViewUpdate(const PushViewUpdate& effect) {
                 if (!result.has_value()) return;
                 auto ack = std::move(result).value();
                 postViewUpdateAck(group_id, rank, ack.epoch, ack.applied);
+            });
+    }
+}
+
+void CoordinatorHost::pushTransferEndpointUpdate(
+    const PushTransferEndpointUpdate& effect) {
+    const auto& push = effect.push;
+    for (auto rank : push.snapshot.participants) {
+        rpc_client_->callAsync<&AgentRpcService::onTransferEndpointUpdate>(
+            state_machine_.getAgentAddr(rank), push,
+            [this, rank, rank_epoch = push.snapshot.rank_epochs[rank],
+             version = push.snapshot.version](
+                PGResult<TransferEndpointUpdateAck> result) {
+                if (!result.has_value()) return;
+                auto ack = std::move(result).value();
+                if (ack.rank != rank || ack.rank_epoch != rank_epoch ||
+                    ack.version != version)
+                    return;
+                postTransferEndpointUpdateAck(std::move(ack));
             });
     }
 }

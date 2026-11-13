@@ -248,6 +248,33 @@ class TiledCOOPayloadRange:
 
 
 @dataclass(frozen=True)
+class TiledCOODenseFragment:
+    """One dense source-row range and its target-local copy geometry."""
+
+    source_byte_offset: int
+    source_byte_count: int
+    row_count: int
+    source_row_elements: int
+    target_fragment_id: str
+    target_row_offset: int
+    target_column_offset: int
+    source_column_offset: int
+    column_count: int
+
+
+@dataclass(frozen=True)
+class _TiledCOODenseGeometry:
+    source_row_offset: int
+    row_count: int
+    source_row_elements: int
+    target_fragment_id: str
+    target_row_offset: int
+    target_column_offset: int
+    source_column_offset: int
+    column_count: int
+
+
+@dataclass(frozen=True)
 class BoundTiledCOOReadPlan:
     """Fresh integer columns in read_plan.tile_runs order, including empty runs.
 
@@ -276,11 +303,76 @@ class TiledCOOReadPlan:
     offset_ranges: tuple[TiledCOOIndexRange, ...]
     offset_gather_indices: tuple[int, ...]
     offset_buffer_elements: int
+    record_numels: tuple[int, ...]
+    _dense_geometry: tuple[tuple[_TiledCOODenseGeometry, ...], ...]
     _offset_positions: tuple[tuple[int, int], ...]
 
     @property
     def empty(self) -> bool:
         return not self.tile_runs
+
+    def bind_dense(
+        self, records: Sequence[int] | None, itemsize: int
+    ) -> tuple[TiledCOODenseFragment, ...]:
+        """Bind packed dense records to cached source/target intersections.
+
+        ``None`` selects all records in layout order. An explicit sequence uses
+        the publisher's packing order, including records not owned by this
+        target, so byte offsets remain valid without target-specific packing.
+        """
+        if type(itemsize) is not int or itemsize <= 0:
+            raise ValueError("dense itemsize must be a positive integer")
+        selected = range(len(self.record_numels)) if records is None else records
+        fragments: list[TiledCOODenseFragment] = []
+        base = 0
+        for record_index in selected:
+            if type(record_index) is not int or not 0 <= record_index < len(
+                self.record_numels
+            ):
+                raise ValueError("dense record index is outside the source directory")
+            for geometry in self._dense_geometry[record_index]:
+                fragments.append(
+                    TiledCOODenseFragment(
+                        source_byte_offset=(base + geometry.source_row_offset)
+                        * itemsize,
+                        source_byte_count=geometry.row_count
+                        * geometry.source_row_elements
+                        * itemsize,
+                        row_count=geometry.row_count,
+                        source_row_elements=geometry.source_row_elements,
+                        target_fragment_id=geometry.target_fragment_id,
+                        target_row_offset=geometry.target_row_offset,
+                        target_column_offset=geometry.target_column_offset,
+                        source_column_offset=geometry.source_column_offset,
+                        column_count=geometry.column_count,
+                    )
+                )
+            base += self.record_numels[record_index]
+        fragments.sort(
+            key=lambda fragment: (
+                fragment.target_fragment_id,
+                fragment.source_byte_offset,
+            )
+        )
+        merged: list[TiledCOODenseFragment] = []
+        for fragment in fragments:
+            if merged and _dense_fragments_are_adjacent(merged[-1], fragment):
+                previous = merged[-1]
+                merged[-1] = TiledCOODenseFragment(
+                    source_byte_offset=previous.source_byte_offset,
+                    source_byte_count=previous.source_byte_count
+                    + fragment.source_byte_count,
+                    row_count=previous.row_count + fragment.row_count,
+                    source_row_elements=previous.source_row_elements,
+                    target_fragment_id=previous.target_fragment_id,
+                    target_row_offset=previous.target_row_offset,
+                    target_column_offset=previous.target_column_offset,
+                    source_column_offset=previous.source_column_offset,
+                    column_count=previous.column_count,
+                )
+            else:
+                merged.append(fragment)
+        return tuple(merged)
 
     def bind_offsets(self, values: Sequence[int]) -> BoundTiledCOOReadPlan:
         if len(values) != len(self.offset_indices):
@@ -340,6 +432,22 @@ class TiledCOOReadPlan:
         )
 
 
+def _dense_fragments_are_adjacent(
+    previous: TiledCOODenseFragment,
+    current: TiledCOODenseFragment,
+) -> bool:
+    return (
+        previous.target_fragment_id == current.target_fragment_id
+        and previous.source_row_elements == current.source_row_elements
+        and previous.target_column_offset == current.target_column_offset
+        and previous.source_column_offset == current.source_column_offset
+        and previous.column_count == current.column_count
+        and previous.source_byte_offset + previous.source_byte_count
+        == current.source_byte_offset
+        and previous.target_row_offset + previous.row_count == current.target_row_offset
+    )
+
+
 def _coalesced_index_ranges(indices: tuple[int, ...]) -> tuple[TiledCOOIndexRange, ...]:
     if not indices:
         return ()
@@ -395,9 +503,14 @@ def plan_tiled_coo_read(
 
     tile_rows, tile_columns = layout.tile_shape
     raw_runs: list[tuple[TiledCOORecord, PlacementFragment, int, int]] = []
+    dense_geometry: list[list[_TiledCOODenseGeometry]] = [
+        [] for _record in layout.records
+    ]
     targets_by_tensor: dict[str, list[PlacementFragment]] = {}
     for target in normalized_targets:
         targets_by_tensor.setdefault(target.tensor_id, []).append(target)
+    for tensor_targets in targets_by_tensor.values():
+        tensor_targets.sort(key=lambda target: target.placement_fragment_id)
     for record in layout.records:
         for target in targets_by_tensor.get(record.tensor_id, ()):
             intersection = box_intersection(
@@ -409,6 +522,20 @@ def plan_tiled_coo_read(
             if intersection is None:
                 continue
             lo, hi = intersection
+            source_row_elements = record.local_shape[1]
+            dense_geometry[record.record_index].append(
+                _TiledCOODenseGeometry(
+                    source_row_offset=(lo[0] - record.global_offset[0])
+                    * source_row_elements,
+                    row_count=hi[0] - lo[0],
+                    source_row_elements=source_row_elements,
+                    target_fragment_id=target.placement_fragment_id,
+                    target_row_offset=lo[0] - target.global_offset[0],
+                    target_column_offset=lo[1] - target.global_offset[1],
+                    source_column_offset=lo[1] - record.global_offset[1],
+                    column_count=hi[1] - lo[1],
+                )
+            )
             first_row = lo[0] // tile_rows - record.tile_origin[0]
             last_row = (hi[0] + tile_rows - 1) // tile_rows - record.tile_origin[0]
             first_column = lo[1] // tile_columns - record.tile_origin[1]
@@ -477,6 +604,10 @@ def plan_tiled_coo_read(
         offset_ranges,
         _index_gather_indices(offset_indices, offset_ranges),
         sum(item.count for item in offset_ranges),
+        tuple(
+            record.local_shape[0] * record.local_shape[1] for record in layout.records
+        ),
+        tuple(tuple(items) for items in dense_geometry),
         tuple((run.first_offset_position, run.last_offset_position) for run in runs),
     )
 
@@ -484,6 +615,7 @@ def plan_tiled_coo_read(
 __all__ = [
     "DEFAULT_TILE_SHAPE",
     "BoundTiledCOOReadPlan",
+    "TiledCOODenseFragment",
     "TiledCOOIndexRange",
     "TiledCOOLayout",
     "TiledCOOPayloadRange",

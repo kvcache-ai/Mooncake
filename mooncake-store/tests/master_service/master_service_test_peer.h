@@ -433,11 +433,6 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
-    }
-
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {

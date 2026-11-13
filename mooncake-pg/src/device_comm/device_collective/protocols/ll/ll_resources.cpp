@@ -41,7 +41,7 @@ PGResult<std::unique_ptr<LLResources>> LLResources::create(
     auto resources = std::unique_ptr<LLResources>(new LLResources(
         std::move(signals), self_rank, max_group_size,
         transfer_service.deviceHandle(), transfer_service.deviceIndex()));
-    if (const auto* p2p = transfer_service.p2pRoute()) {
+    if (const auto* p2p = transfer_service.findRoute<P2pRoute>()) {
         resources->endpoint_.device_uuid = p2p->deviceUuid();
         resources->endpoint_.native_atomic_peer_uuids =
             p2p->nativeAtomicPeerUuids();

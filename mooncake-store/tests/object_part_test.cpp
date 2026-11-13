@@ -145,6 +145,19 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
     EXPECT_TRUE(part.replicas().empty());
 }
 
+// The first replica lives in the part itself, so the common one-replica part
+// needs no allocation of its own.
+TEST(ObjectPartTest, OneReplicaStaysInsideThePart) {
+    ObjectPart part(kObjectLength, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+    ASSERT_EQ(part.replicas().size(), 1u);
+
+    const auto replica =
+        reinterpret_cast<std::uintptr_t>(part.replicas().data());
+    const auto part_begin = reinterpret_cast<std::uintptr_t>(&part);
+    EXPECT_GE(replica, part_begin);
+    EXPECT_LT(replica, part_begin + sizeof(ObjectPart));
+}
+
 TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
@@ -161,6 +174,19 @@ TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     EXPECT_EQ(metadata->GetAllReplicas().data(), part.replicas().data());
     EXPECT_EQ(metadata->GetAllReplicas().size(), part.replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
+}
+
+// The first part lives in the envelope itself, so the common one-part object
+// needs no separate part array.
+TEST(EnvelopePartTest, TheFirstPartStaysInsideTheEnvelope) {
+    auto metadata = MakeEnvelope(kObjectLength,
+                                 MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+
+    const auto part = reinterpret_cast<std::uintptr_t>(&metadata->GetPart(0));
+    const auto envelope_begin =
+        reinterpret_cast<std::uintptr_t>(metadata.get());
+    EXPECT_GE(part, envelope_begin);
+    EXPECT_LT(part, envelope_begin + sizeof(ObjectMetadata));
 }
 
 TEST(EnvelopePartTest, VisitsAndErasesThroughTheEnvelope) {

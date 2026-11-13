@@ -794,9 +794,11 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
@@ -941,9 +943,11 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
 
     // Export segments from OpLogApplier's registry (Patch B)
@@ -1038,6 +1042,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        capture.object_storage = metadata_store_->SnapshotObjectReplicas();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }

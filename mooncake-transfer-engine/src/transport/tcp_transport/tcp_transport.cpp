@@ -46,6 +46,12 @@
 
 #include "cuda_alike.h"
 
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_UBSHMEM)
+#define MOONCAKE_TCP_ASCEND
+#include <acl/acl.h>
+#endif
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 
@@ -74,7 +80,7 @@ std::atomic<size_t> staging_device_query_count{0};
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(MOONCAKE_TCP_ASCEND)
 void recordStagingBufferAllocationForTest() noexcept {
     staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
 }

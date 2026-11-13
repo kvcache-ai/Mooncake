@@ -3,19 +3,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
-#include <span>
 #include <string_view>
 #include <vector>
 
+#include <transport/device/device_transport.h>
+
 #include "device_comm/device_transfer/routes/route_provider.h"
-#include "gpu_runtime.h"
 
 namespace mooncake {
-
-namespace device {
-class P2pTransport;
-}
 
 struct P2pRouteOptions {
     bool enabled = true;
@@ -26,10 +23,8 @@ class P2pRoute : public RouteProvider {
     static constexpr std::string_view kRouteKey = "p2p";
     static constexpr uint32_t kEndpointVersion = 1;
 
-    P2pRoute(device::P2pTransport& transport, void* local_region,
-             int device_index, GlobalRank self_rank, uint32_t max_world_size);
-
-    [[nodiscard]] PGResult<void> initialize();
+    [[nodiscard]] static PGResult<std::unique_ptr<P2pRoute>> create(
+        int device_index, GlobalRank self_rank, uint32_t max_world_size);
 
     [[nodiscard]] const DeviceUUID& deviceUuid() const noexcept {
         return device_uuid_;
@@ -39,28 +34,41 @@ class P2pRoute : public RouteProvider {
         return native_atomic_peer_uuids_;
     }
 
-    [[nodiscard]] std::string_view routeKey() const noexcept override;
-    [[nodiscard]] uint32_t routeVersion() const noexcept override;
     PGResult<void> registerRegion(DeviceRegionKind kind, void* addr,
                                   size_t size) override;
     PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
                                     size_t size) override;
     [[nodiscard]] std::optional<RouteEndpoint> localEndpoint() override;
-    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> resolveRoutes(
-        std::span<const std::optional<DeviceTransferEndpoint>> endpoints)
+    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
+                                    uint64_t reclaim_before_version) override;
+    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> updateRoutes()
         override;
+    PGResult<void> shutdown() override;
 
    private:
-    [[nodiscard]] std::vector<int32_t> localHandle() const;
+    P2pRoute(int device_index, GlobalRank self_rank, uint32_t max_world_size);
 
-    device::P2pTransport& transport_;
-    void* local_region_ = nullptr;
+    struct PeerMapping {
+        std::vector<int32_t> handle;
+        std::shared_ptr<device::P2pMapping> mapping;
+    };
+
+    struct State {
+        uint64_t installation_version = 0;
+        std::vector<PeerMapping> peers;
+        std::vector<DeviceTransferRoute> routes;
+    };
+
+    void* local_ptr_ = nullptr;
+    size_t local_size_ = 0;
+    std::vector<int32_t> local_handle_;
+    std::unique_ptr<State> current_;
+    std::unique_ptr<State> standby_;
     int device_index_ = -1;
     GlobalRank self_rank_ = kInvalidGlobalRank;
     uint32_t max_world_size_ = 0;
     DeviceUUID device_uuid_{};
     std::vector<DeviceUUID> native_atomic_peer_uuids_;
-    std::optional<GpuStream> snapshot_stream_;
 };
 
 }  // namespace mooncake

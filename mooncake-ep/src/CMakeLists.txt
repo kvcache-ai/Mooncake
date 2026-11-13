@@ -15,7 +15,8 @@ if(USE_XPU)
   endif()
   pybind11_add_module(
     _ep MODULE ep_py.cpp xpu/mooncake_ep_xpu_buffer.cpp xpu/xpu_ipc.cpp
-    xpu/xpu_ep_kernels.cpp)
+    xpu/xpu_ep_kernels.cpp xpu/mooncake_ep_xpu_elastic_buffer.cpp
+    xpu/xpu_ep_elastic_kernels.cpp)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_XPU=1)
   set(_ep_xpu_sycl_flags -fsycl)
   if(MOONCAKE_EP_XPU_AOT_DEVICES)
@@ -45,6 +46,16 @@ if(USE_XPU)
                                ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_compile_options(xpu_ep_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
   target_link_options(xpu_ep_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
+  # The same for the ElasticBuffer (not built by default).
+  add_executable(
+    xpu_ep_elastic_hybrid_test EXCLUDE_FROM_ALL
+    ../tests/xpu_ep_elastic_hybrid_test.cpp xpu/xpu_ep_elastic_kernels.cpp)
+  target_include_directories(
+    xpu_ep_elastic_hybrid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/xpu
+                                       ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_options(xpu_ep_elastic_hybrid_test
+                         PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_options(xpu_ep_elastic_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
 
   # The verbs path to ranks on other nodes needs an rdma-core with
   # ibv_reg_dmabuf_mr. Without it _ep reaches only ranks on its node. The
@@ -222,6 +233,10 @@ if(USE_CUDA)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
   endif()
 elseif(USE_MUSA)
+  # Define this before pybind11_add_module(_ep). GCC LTO with the mcc-built
+  # object below leaves C++ constructor calls at address 0, which crashes _ep
+  # on import.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
   if(DEFINED ENV{MUSA_HOME} AND NOT "$ENV{MUSA_HOME}" STREQUAL "")
     set(_ep_musa_compiler_hint "$ENV{MUSA_HOME}/bin")
@@ -359,4 +374,7 @@ elseif(USE_MACA)
     set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
   endif()
   target_link_libraries(_ep PRIVATE ${MACA_RUNTIME_LIBS})
+elseif(USE_ENFLAME)
+  set_target_properties(_ep PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_libraries(_ep PRIVATE topsrt efrt rt)
 endif()

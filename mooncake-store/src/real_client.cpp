@@ -13,8 +13,10 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -1235,7 +1237,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
+            kWildcardLocation, client_->SupportsGatherRead(), true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
                        << toString(result.error());
@@ -1372,7 +1374,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && use_hugepage_;
+            (protocol == "rdma" || protocol == "efa") && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(
@@ -1423,8 +1425,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * segment_numa_nodes.size());
+                // Base pages are THP-advised: keep every region and the tail
+                // on 2MB boundaries, so no huge page straddles two bindings.
+                const size_t region_align = use_hugepage_ ? page_sz : SZ_2MB;
+                mapped_size = align_up(
+                    segment_size, region_align * segment_numa_nodes.size());
                 ptr = allocate_buffer_numa_segments(
                     mapped_size, segment_numa_nodes, page_sz);
                 seg_location =
@@ -1451,9 +1456,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifndef USE_VRAM_SEGMENT
             } else if (protocol == "efa") {
                 // EFA host segments must be THP backed and must not pile up
-                // on one NUMA node; see allocate_buffer_thp_interleaved().
+                // on one NUMA node; see allocate_buffer_thp().
                 mapped_size = align_up(segment_size, SZ_2MB);
-                ptr = allocate_buffer_thp_interleaved(mapped_size);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInterleaveIfDefault);
+                use_mmap_segment = true;
+            } else if (protocol == "rdma") {
+                // At most one usable NIC NUMA node: THP backed like the
+                // NUMA-segmented path, under the task's own NUMA policy.
+                mapped_size = align_up(segment_size, SZ_2MB);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInheritTask);
                 use_mmap_segment = true;
 #endif
             } else {
@@ -1507,7 +1520,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
             } else if (use_mmap_segment) {
-                // NUMA-segmented, hugepage or EFA THP: track as mmap
+                // NUMA-segmented, hugepage or EFA/RDMA THP: track as mmap
                 // allocation for munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
@@ -3275,6 +3288,16 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Reject a second local buffer before mapping or registering its memory.
+    // The exclusive lock also keeps this check valid through installation.
+    if (is_local_buffer && context_it != shm_contexts_.end() &&
+        context_it->second.client_buffer_allocator) {
+        LOG(ERROR) << "A local buffer is already mapped for this "
+                      "client shared memory.";
+        close(fd);
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
 #ifdef USE_ASCEND_DIRECT
     auto context_result = set_context_if_needed(protocol, physical_device_id,
                                                 "POSIX shm registration");
@@ -3349,12 +3372,6 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 
     if (is_local_buffer) {
-        if (context.client_buffer_allocator) {
-            LOG(ERROR) << "A local buffer is already mapped for this "
-                          "client shared memory.";
-            munmap(shm_buffer, shm_size);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
         context.client_buffer_allocator =
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
@@ -4776,8 +4793,11 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
-    auto result = client_->RegisterLocalMemory(buffer, registration_size,
-                                               kWildcardLocation, false, true);
+    // Gather reads are owner-initiated WRITEs. Publish Store output buffers
+    // on supported classic transports; TE's registration defaults stay intact.
+    auto result = client_->RegisterLocalMemory(
+        buffer, registration_size, kWildcardLocation,
+        client_->SupportsGatherRead(), true);
     if (!result) {
         return result;
     }
@@ -4850,6 +4870,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         }
         LOG(WARNING) << "TE reports buffer " << buffer
                      << " as already unregistered; retrying the NoF cleanup";
+    }
+    // TENT may successfully unregister an unknown address. Without a Store
+    // record there is no pending NoF cleanup to retry.
+    if (rec_it == registered_buffer_sizes_.end()) {
+        return tl::unexpected(ErrorCode::NOT_REGISTERED);
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
@@ -4930,6 +4955,23 @@ bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
     return region.has_value() && size <= region->size - region->offset;
 }
 
+bool RealClient::can_use_direct_dfs_read(
+    const Replica::Descriptor &replica,
+    const std::vector<void *> &buffers) const {
+    if (!client_ || !client_->CanReadDfsReplicaIntoHostMemory(replica)) {
+        return false;
+    }
+    // Each destination becomes one iovec, and preadv() rejects more than
+    // IOV_MAX of them; the contiguous staging buffer has no such limit.
+    if (buffers.size() > static_cast<size_t>(IOV_MAX)) return false;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (void *buffer : buffers) {
+        if (runtime_accelerator.FindDeviceForPointer(buffer)) return false;
+    }
+    return true;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache,
@@ -5002,6 +5044,24 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 if (!checksum_result) {
                     return tl::unexpected(checksum_result.error());
                 }
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(
+                replica, {static_cast<char *>(buffer) + dst_offset})) {
+            // DFS into host memory: the adapter reads into the destination.
+            std::vector<mooncake::Slice> slices;
+            allocateSlices(slices, replica,
+                           static_cast<char *>(buffer) + dst_offset);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
+            auto get_result = client_->Get(key, filtered_qr, slices);
+            if (!get_result) {
+                LOG(ERROR) << "DFS Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
             }
             return static_cast<int64_t>(total_size);
         }
@@ -5149,22 +5209,32 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
         const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
-        auto result = partial_disk_read(
-            [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
-                auto read_results = client_->BatchReadFileReplicaRanges(
-                    {key}, {replica}, {Slice{tmp_buf, size}}, {src_offset});
-                if (read_results.size() != 1) {
-                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                if (!read_results[0]) {
-                    LOG(ERROR)
-                        << replica_type << " range read failed for key: " << key
-                        << " with error: " << toString(read_results[0].error());
-                    return tl::unexpected(read_results[0].error());
-                }
-                return {};
-            },
-            size);
+        auto read_window =
+            [&](void *read_buf) -> tl::expected<void, ErrorCode> {
+            auto read_results = client_->BatchReadFileReplicaRanges(
+                {key}, {replica}, {Slice{read_buf, size}}, {src_offset});
+            if (read_results.size() != 1) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (!read_results[0]) {
+                LOG(ERROR) << replica_type
+                           << " range read failed for key: " << key
+                           << " with error: "
+                           << toString(read_results[0].error());
+                return tl::unexpected(read_results[0].error());
+            }
+            return {};
+        };
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        tl::expected<int64_t, ErrorCode> result;
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(replica, {dst})) {
+            auto read_result = read_window(dst);
+            if (!read_result) return tl::unexpected(read_result.error());
+            result = static_cast<int64_t>(size);
+        } else {
+            result = partial_disk_read(read_window, size);
+        }
         if (!result) return result;
         // Same contract as Client::Get: the window may finish transferring
         // after the QueryResult lease deadline. Reject after the successful
@@ -5315,6 +5385,16 @@ RealClient::get_into_ranges_internal(
     };
     std::unordered_map<std::string, ScatterLease> scatter_leases;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
+    std::vector<std::string> gather_endpoints;
+    auto append_memory_transfer =
+        [&](TransferEngine::ScatterTransferRange transfer,
+            const Replica::Descriptor &replica) {
+            gather_endpoints.push_back(
+                buffer_capacities || client_->CanUseLocalMemcpy(replica)
+                    ? ""
+                    : transfer.remote_segment);
+            memory_transfers.push_back(std::move(transfer));
+        };
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
             continue;
@@ -5461,13 +5541,15 @@ RealClient::get_into_ranges_internal(
                 };
                 if (!StoreHcaAffinityEnabled() ||
                     metadata.query_result.replicas.size() == 1) {
-                    memory_transfers.push_back(std::move(transfer));
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica);
                     continue;
                 }
                 auto candidates = FilterQueryResult(metadata.query_result,
                                                     metadata.replica, false);
                 if (candidates.replicas.size() == 1) {
-                    memory_transfers.push_back(std::move(transfer));
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica);
                     continue;
                 }
                 Replica::Descriptor selected;
@@ -5504,7 +5586,7 @@ RealClient::get_into_ranges_internal(
                             size_t, const Status &status) {
                             complete(k, status);
                         };
-                    memory_transfers.push_back(std::move(fragment));
+                    append_memory_transfer(std::move(fragment), selected);
                 }
                 continue;
             }
@@ -5559,6 +5641,79 @@ RealClient::get_into_ranges_internal(
 
     // Planning may consume most of a short lease; renew before submission.
     if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
+    // Choose only compatible contiguous-output groups. Both ordinary and
+    // snapshot reads share this planner and preserve their lease semantics.
+    auto plans =
+        client_->SupportsGatherRead()
+            ? store::PlanGatherReads(memory_transfers, gather_endpoints)
+            : std::vector<store::GatherReadPlan>{};
+    std::vector<std::pair<size_t, store::GatherReadOperation>> gathered;
+    if (!plans.empty()) {
+        // Discovery, pool contention and session negotiation can all block.
+        // Keep renewing every source lease, including earlier submissions,
+        // while one worker prepares and submits the plans.
+        auto submitting = std::async(std::launch::async, [&] {
+            for (size_t i = 0; i < plans.size(); ++i) {
+                const auto &plan = plans[i];
+                auto operation = client_->SubmitGatherRead(
+                    plan.endpoint, plan.ranges, plan.destination, plan.bytes);
+                if (operation) gathered.emplace_back(i, std::move(*operation));
+            }
+        });
+        if (allow_query_refresh) {
+            while (true) {
+                const auto delay = next_refresh_delay();
+                if (delay == std::chrono::nanoseconds::max() ||
+                    submitting.wait_for(delay) == std::future_status::ready)
+                    break;
+                refresh_leases();
+            }
+        }
+        submitting.get();
+    }
+    std::vector<bool> handled(memory_transfers.size(), false);
+    for (auto &[index, operation] : gathered) {
+        store::GatherReadResult result;
+        do {
+            auto delay = allow_query_refresh ? next_refresh_delay()
+                                             : std::chrono::nanoseconds::max();
+            result =
+                delay == std::chrono::nanoseconds::max()
+                    ? operation.wait()
+                    : operation.waitFor(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              delay));
+            if (result.completion == store::GatherReadCompletion::Pending)
+                refresh_leases();
+        } while (result.completion == store::GatherReadCompletion::Pending);
+        // Rejection guarantees no writes: unsupported/busy owners safely use
+        // scatter. A submitted, drained failure must not silently retry.
+        if (result.rejected()) continue;
+        for (size_t i : plans[index].transfers) {
+            handled[i] = true;
+            const auto &transfer = memory_transfers[i];
+            const auto failure = Status::Socket(result.error);
+            for (size_t k = 0; k < transfer.lengths.size(); ++k) {
+                const auto offset =
+                    reinterpret_cast<uintptr_t>(transfer.local_buffer) +
+                    transfer.local_offsets[k] -
+                    reinterpret_cast<uintptr_t>(plans[index].destination);
+                transfer.on_fragment_complete(
+                    k, result.completedRange(offset, transfer.lengths[k])
+                           ? Status::OK()
+                           : failure);
+            }
+        }
+    }
+    size_t retained = 0;
+    for (size_t i = 0; i < memory_transfers.size(); ++i)
+        if (!handled[i]) {
+            if (retained != i)
+                memory_transfers[retained] = std::move(memory_transfers[i]);
+            ++retained;
+        }
+    memory_transfers.resize(retained);
+    if (memory_transfers.empty()) return results;
     auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -6845,9 +7000,11 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+        if (replica.is_disk_replica() ||
+            (replica.is_dfs_replica() &&
+             !can_use_direct_dfs_read(replica, {buffers[i]}))) {
+            // DISK replicas, and DFS replicas that cannot be read directly
+            // into the destination, use a contiguous temp buffer, then scatter.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6858,7 +7015,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer.
+        // MEMORY / NOF: RDMA directly to user buffer. DFS into host memory:
+        // the fs adapter reads directly to user buffer.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -8627,8 +8785,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // MEMORY / NOF: RDMA directly to the user buffers.
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            (replica.is_dfs_replica() &&
+             can_use_direct_dfs_read(replica, buffers))) {
+            // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
+            // memory: the fs adapter reads directly to the user buffers.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }

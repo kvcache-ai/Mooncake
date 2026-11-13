@@ -11,6 +11,7 @@
 #include "replica.h"
 #include "types.h"
 #include "weight_metadata_store.h"
+#include "storage/distributed/object_replica_state.h"
 
 namespace mooncake {
 
@@ -92,9 +93,10 @@ struct StandbySnapshot {
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
     struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
+    struct_pack::compatible<ObjectReplicaSnapshot, 2> object_storage;
 
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
-             weight_metadata);
+             weight_metadata, object_storage);
 };
 
 /**
@@ -170,6 +172,12 @@ class StandbySegmentRegistry {
 class MetadataStore {
    public:
     virtual ~MetadataStore() = default;
+
+    virtual bool ApplyObjectReplicaMutation(
+        const std::string& tenant_id, const std::string& key,
+        const ObjectReplicaMutation& mutation) {
+        return false;
+    }
 
     // NEW: tenant-aware methods (primary API)
     virtual bool PutMetadata(const std::string& tenant_id,

@@ -66,15 +66,28 @@ struct DeviceCollectiveWorkspaceEndpoint {
     bool operator==(const DeviceCollectiveWorkspaceEndpoint&) const = default;
 };
 
-// Process-level bootstrap metadata for the device transfer service.
-// A peer publishes one immutable value for each rank epoch.
+// Process-level metadata for the device transfer service.
 struct DeviceTransferEndpoint {
     uint64_t region_address = 0;
     uint64_t region_size = 0;
 
     std::vector<RouteEndpoint> routes;
+    // Orders publications within a rank epoch. Publishing alone does not
+    // request an installation or invalidate installed resources.
+    uint64_t version = 0;
 
     bool operator==(const DeviceTransferEndpoint&) const = default;
+};
+
+// Process-level endpoints selected by the Coordinator for one installation.
+// endpoints and rank_epochs are indexed by GlobalRank.
+struct DeviceTransferSnapshot {
+    std::vector<std::optional<DeviceTransferEndpoint>> endpoints;
+    std::vector<uint64_t> rank_epochs;
+    std::vector<GlobalRank> participants;
+    uint64_t version = 0;
+
+    bool operator==(const DeviceTransferSnapshot&) const = default;
 };
 
 // Communicator-local signals interpreted by Simple primitives. Payload uses

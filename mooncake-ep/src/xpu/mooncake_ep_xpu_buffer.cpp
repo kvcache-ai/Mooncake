@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 #include "xpu_ep_common.h"
@@ -50,6 +51,23 @@ sycl::queue* asQueue(uint64_t stream_ptr) {
     return reinterpret_cast<sycl::queue*>(stream_ptr);
 }
 
+// Checked in the initializer list, before the stream: bad arguments raise
+// ValueError (std::invalid_argument) with the same messages as CUDA.
+int validate_rank(int rank, int num_ranks) {
+    if (num_ranks <= 0 || num_ranks > kMaxRanks || rank < 0 ||
+        rank >= num_ranks) {
+        throw std::invalid_argument("invalid EP rank or world size");
+    }
+    return rank;
+}
+
+int64_t validate_buffer_size(int64_t num_ep_buffer_bytes) {
+    if (num_ep_buffer_bytes <= 0) {
+        throw std::invalid_argument("EP buffer size must be positive");
+    }
+    return num_ep_buffer_bytes;
+}
+
 }  // namespace
 
 XpuEventHandle::XpuEventHandle(uint64_t stream_ptr) {
@@ -63,14 +81,11 @@ void XpuEventHandle::current_stream_wait(uint64_t stream_ptr) const {
 MooncakeEpXpuBuffer::MooncakeEpXpuBuffer(int rank, int num_ranks,
                                          int64_t num_ep_buffer_bytes,
                                          bool disable_p2p, uint64_t stream_ptr)
-    : rank_(rank),
+    : rank_(validate_rank(rank, num_ranks)),
       num_ranks_(num_ranks),
-      num_ep_buffer_bytes_(num_ep_buffer_bytes),
+      num_ep_buffer_bytes_(validate_buffer_size(num_ep_buffer_bytes)),
       p2p_enabled_(!disable_p2p),
       queue_(*asQueue(stream_ptr)) {
-    XPU_EP_CHECK(num_ep_buffer_bytes > 0, "EP buffer size must be positive");
-    XPU_EP_CHECK(num_ranks > 0 && num_ranks <= kMaxRanks,
-                 "too many ranks for the XPU EP buffer");
     XPU_EP_CHECK(queue_.is_in_order(), "the torch.xpu stream must be in-order");
     ipc_ = std::make_unique<XpuIpcBuffer>(
         queue_, static_cast<size_t>(num_ep_buffer_bytes), rank, num_ranks);

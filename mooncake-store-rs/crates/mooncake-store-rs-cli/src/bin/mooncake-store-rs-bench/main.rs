@@ -1,3 +1,4 @@
+mod aligned_buffer;
 mod bench;
 mod cli;
 mod datagen;

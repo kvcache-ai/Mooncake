@@ -37,6 +37,15 @@ ReplicateConfig OneMemoryReplica() {
 
 }  // namespace
 
+TEST_F(MasterServiceTest, AccessorNamesTheKeyAndTenantItHolds) {
+    MasterService service;
+    const TenantId tenant("tenant-a");
+    Accessor accessor(&service, Identity{tenant, "accessor_names_key"},
+                      Accessor::CreateKey{});
+    EXPECT_EQ("accessor_names_key", accessor.GetKey());
+    EXPECT_EQ(tenant, accessor.GetTenantId());
+}
+
 TEST_F(MasterServiceTest, ObjectRefReachesOnlyItsOwnPublication) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);

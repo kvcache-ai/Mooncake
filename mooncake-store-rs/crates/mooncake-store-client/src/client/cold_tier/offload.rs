@@ -4,7 +4,7 @@ use super::super::{
     ColdTierOffloadManager, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
     ColdTierOffloadRunGuard, ColdTierPendingOffloadPolicy, FreeSchedulerState, ObjectKey,
     ObjectRoute, OperationTracker, PendingOffloadCasContext, PendingOffloadCasOutcome,
-    PendingOffloadEntry, PendingOffloadKey, PendingOffloadMaterialization,
+    PendingOffloadEntry, PendingOffloadKey, PendingOffloadMaterialization, PendingOffloadPayload,
     PendingOffloadPrepareOutcome, PendingOffloadQueue, PendingOffloadQueueSnapshot,
     PendingOffloadReadyRoute, PersistentStorageBackend, Result, RouteCasRequest, RouteState,
     RouteVersion, StorageOwnerState, StoreError, DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS,
@@ -12,15 +12,21 @@ use super::super::{
 };
 use super::{
     backend_remove_cold_payload, backend_remove_pending_source, backend_store_cold_payload_batch,
-    backend_store_pending_source, local_hot_replica_checksum, materialized_cold_backing,
+    backend_store_pending_source, materialized_cold_backing, payload_checksum,
     pending_persistent_backing, persistent_backing_contains_target, persistent_backing_targets,
-    read_local_hot_replica_payload, same_cold_payload,
+    pin_local_hot_replica_payload, read_local_hot_replica_payload, same_cold_payload,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod waves;
+
+use waves::{materialize_claimed_pending_offload_waves, retry_admission_deferred};
+
+const PENDING_OFFLOAD_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(in super::super) fn enqueue_pending_offload(
     storage_owner: &StorageOwnerState,
@@ -60,7 +66,12 @@ fn managed_nof_payload_writer(route: &ObjectRoute) -> Option<&super::super::Clie
 }
 
 fn can_materialize_pending_offload(route: &ObjectRoute) -> bool {
-    route.state == RouteState::Active
+    let all_existing_backings_are_pending = route.cold_backing.as_ref().is_none_or(|backing| {
+        backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+    }) && route.nof_backing.as_ref().is_none_or(
+        |backing| backing.state == mooncake_store_core::ColdBackingState::PendingOffload,
+    );
+    (route.state == RouteState::Active && all_existing_backings_are_pending)
         || (route.state == RouteState::Deleting
             && route.nof_backing.as_ref().is_some_and(|backing| {
                 backing.state == mooncake_store_core::ColdBackingState::PendingOffload
@@ -115,7 +126,9 @@ fn publish_initial_write_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(checksum) = checksum_for_cold_backing(storage_owner, route, replica)? else {
+    let Some((checksum, _source_pin)) =
+        pinned_checksum_for_cold_backing(storage_owner, route, replica)?
+    else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -226,7 +239,9 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(checksum) = checksum_for_cold_backing(storage_owner, route, replica)? else {
+    let Some((checksum, _source_pin)) =
+        pinned_checksum_for_cold_backing(storage_owner, route, replica)?
+    else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -267,21 +282,18 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
     }
 }
 
-fn checksum_for_cold_backing(
+fn pinned_checksum_for_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
     replica: &mooncake_store_core::ReplicaRoute,
-) -> Result<Option<u64>> {
-    if let Some(checksum) = replica.checksum {
-        return Ok(Some(checksum));
-    }
-    match local_hot_replica_checksum(
-        &storage_owner.allocator,
-        &storage_owner.state,
-        route,
-        replica,
-    ) {
-        Ok(checksum) => Ok(Some(checksum)),
+) -> Result<Option<(u64, PendingOffloadPayload)>> {
+    match pin_local_hot_replica_payload(&storage_owner.allocator, &storage_owner.state, replica) {
+        Ok(payload) => {
+            let checksum = replica
+                .checksum
+                .unwrap_or_else(|| payload_checksum(payload.as_slice()));
+            Ok(Some((checksum, payload)))
+        }
         Err(error) => {
             tracing::warn!(
                 runtime = %storage_owner.runtime,
@@ -351,46 +363,33 @@ pub(in super::super) fn materialize_pending_offloads_bounded(
     result
 }
 
+pub(in super::super) fn materialize_pending_offload_routes_bounded(
+    storage_owner: &StorageOwnerState,
+    routes: &[ObjectRoute],
+) -> Result<usize> {
+    if super::cold_tier_disabled() || routes.is_empty() {
+        return Ok(0);
+    }
+    let entries = routes
+        .iter()
+        .filter(|route| pending_persistent_backing(route).is_some())
+        .filter_map(|route| {
+            storage_owner
+                .pending_offloads
+                .claim(&route.key, route.version)
+        })
+        .collect::<Vec<_>>();
+    let result = materialize_claimed_pending_offload_waves(storage_owner, entries);
+    storage_owner.record_cold_tier_observability_snapshots();
+    result
+}
+
 fn ensure_pending_offload_work_available(storage_owner: &StorageOwnerState) -> Result<()> {
     if !storage_owner.pending_offloads.is_empty() {
         return Ok(());
     }
     rebuild_pending_offload_queue(storage_owner)?;
     Ok(())
-}
-
-fn materialize_ready_pending_offload_groups(
-    storage_owner: &StorageOwnerState,
-    pending: &mut [PendingOffloadMaterialization],
-) -> Result<usize> {
-    pending.sort_by(|left, right| {
-        left.cold_backing
-            .cold_tier_id
-            .cmp(&right.cold_backing.cold_tier_id)
-    });
-    let mut round_materialized = 0usize;
-    let mut first_error = None;
-    let mut start = 0usize;
-    while start < pending.len() {
-        let cold_tier_id = pending[start].cold_backing.cold_tier_id.clone();
-        let mut end = start + 1;
-        while end < pending.len() && pending[end].cold_backing.cold_tier_id == cold_tier_id {
-            end += 1;
-        }
-        round_materialized = round_materialized.saturating_add(
-            storage_owner.materialize_prepared_pending_offload_batch(
-                &pending[start..end],
-                &mut first_error,
-            )?,
-        );
-        start = end;
-    }
-    if round_materialized == 0 {
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-    }
-    Ok(round_materialized)
 }
 
 fn drain_pending_offload_round(
@@ -405,17 +404,8 @@ fn drain_pending_offload_round(
         if entries.is_empty() {
             return Ok(0);
         }
-        let prepare_tracker = OperationTracker::new("cold_offload_prepare_batch");
-        let pending = storage_owner.prepare_pending_offload_entries(entries);
-        prepare_tracker.finish(
-            &pending,
-            pending
-                .as_ref()
-                .map(|pending| pending.len())
-                .unwrap_or_default() as u64,
-        );
-        let mut pending = pending?;
-        if pending.is_empty() {
+        let materialized = materialize_claimed_pending_offload_waves(storage_owner, entries)?;
+        if materialized == 0 {
             let snapshot = storage_owner
                 .pending_offloads
                 .observability_snapshot(Instant::now());
@@ -425,7 +415,7 @@ fn drain_pending_offload_round(
             }
             return Ok(0);
         }
-        return materialize_ready_pending_offload_groups(storage_owner, &mut pending);
+        return Ok(materialized);
     }
 }
 
@@ -447,29 +437,65 @@ pub(in super::super) fn prepare_pending_offload_entries(
     storage_owner: &StorageOwnerState,
     entries: Vec<PendingOffloadEntry>,
 ) -> Result<Vec<PendingOffloadMaterialization>> {
+    let prepared = prepare_pending_offload_entries_partitioned(storage_owner, entries)?;
+    retry_admission_deferred(storage_owner, prepared.admission_deferred);
+    Ok(prepared.pending)
+}
+
+struct PendingOffloadPreparationBatch {
+    pending: Vec<PendingOffloadMaterialization>,
+    admission_deferred: Vec<(PendingOffloadEntry, Duration)>,
+}
+
+fn prepare_pending_offload_entries_partitioned(
+    storage_owner: &StorageOwnerState,
+    entries: Vec<PendingOffloadEntry>,
+) -> Result<PendingOffloadPreparationBatch> {
     if super::cold_tier_disabled() {
         for entry in entries {
             storage_owner.pending_offloads.retry(entry);
         }
-        return Ok(Vec::new());
+        return Ok(PendingOffloadPreparationBatch {
+            pending: Vec::new(),
+            admission_deferred: Vec::new(),
+        });
     }
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PendingOffloadPreparationBatch {
+            pending: Vec::new(),
+            admission_deferred: Vec::new(),
+        });
     }
-    let routes = storage_owner.route_ops.load_routes(
+    let routes = match storage_owner.route_ops.load_routes(
         &entries
             .iter()
             .map(|entry| entry.key.route_key.clone())
             .collect::<Vec<_>>(),
-    )?;
+    ) {
+        Ok(routes) => routes,
+        Err(error) => {
+            for entry in entries {
+                storage_owner.pending_offloads.retry(entry);
+            }
+            return Err(error);
+        }
+    };
     let devices = if storage_owner.cold_tier_devices.has_any_local_backend() {
         let devices = match storage_owner.cold_tier_devices.devices.lock().snapshot() {
             Some(devices) => devices,
-            None => refresh_cold_tier_device_cache(
+            None => match refresh_cold_tier_device_cache(
                 storage_owner.metadata.as_ref(),
                 &storage_owner.cold_tier_devices.devices,
                 "cold_tier_device_snapshot_offload_prepare",
-            )?,
+            ) {
+                Ok(devices) => devices,
+                Err(error) => {
+                    for entry in entries {
+                        storage_owner.pending_offloads.retry(entry);
+                    }
+                    return Err(error);
+                }
+            },
         };
         devices
             .into_iter()
@@ -479,10 +505,25 @@ pub(in super::super) fn prepare_pending_offload_entries(
         BTreeMap::new()
     };
     let mut prepared = Vec::new();
+    let mut admission_deferred = Vec::new();
+    let mut blocked_devices = BTreeSet::new();
+    let mut unknown_device_blocked = false;
     for index in 0..entries.len() {
         let entry = entries[index].clone();
         let key = entry.key.clone();
         let route = routes.get(index).cloned().unwrap_or(None);
+        let admission_device = route
+            .as_ref()
+            .and_then(pending_persistent_backing)
+            .map(|backing| cold_tier_device_id(&backing).to_owned());
+        if unknown_device_blocked
+            || admission_device
+                .as_ref()
+                .is_some_and(|device| blocked_devices.contains(device))
+        {
+            admission_deferred.push((entry, PENDING_OFFLOAD_ADMISSION_RETRY_DELAY));
+            continue;
+        }
         match prepare_pending_offload_entry(storage_owner, entry.clone(), route.clone(), &devices) {
             Ok(PendingOffloadPrepareOutcome::Ready(materialization)) => {
                 prepared.push(*materialization)
@@ -493,7 +534,12 @@ pub(in super::super) fn prepare_pending_offload_entries(
             }
             Ok(PendingOffloadPrepareOutcome::RetryAfter(entry, delay)) => {
                 registry::record_cold_tier_operation("offload", "retry", "admission");
-                storage_owner.pending_offloads.retry_after(entry, delay);
+                if let Some(device) = admission_device {
+                    blocked_devices.insert(device);
+                } else {
+                    unknown_device_blocked = true;
+                }
+                admission_deferred.push((entry, delay));
             }
             Ok(PendingOffloadPrepareOutcome::Refreshed(entry)) => {
                 registry::record_cold_tier_operation("offload", "refreshed", "stale");
@@ -512,6 +558,7 @@ pub(in super::super) fn prepare_pending_offload_entries(
                         .pending_offloads
                         .retry(materialization.entry.clone());
                 }
+                retry_admission_deferred(storage_owner, admission_deferred);
                 for remaining in &entries[index + 1..] {
                     storage_owner.pending_offloads.retry(remaining.clone());
                 }
@@ -519,7 +566,10 @@ pub(in super::super) fn prepare_pending_offload_entries(
             }
         }
     }
-    Ok(prepared)
+    Ok(PendingOffloadPreparationBatch {
+        pending: prepared,
+        admission_deferred,
+    })
 }
 
 pub(in super::super) fn prepare_pending_offload_entry(
@@ -549,10 +599,6 @@ pub(in super::super) fn prepare_pending_offload_entry(
             length_bytes: Some(replica.length),
         });
     if !can_materialize_pending_offload(&route) {
-        if let Some(refreshed_entry) = refreshed_pending_entry.clone() {
-            storage_owner.sync_route(&route);
-            return Ok(PendingOffloadPrepareOutcome::Refreshed(refreshed_entry));
-        }
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
@@ -582,7 +628,9 @@ pub(in super::super) fn prepare_pending_offload_entry(
     let route = if route.nof_backing.as_ref().is_some_and(|backing| {
         backing.state == mooncake_store_core::ColdBackingState::PendingOffload
     }) {
-        let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
+        let Some((checksum, _source_pin)) =
+            pinned_checksum_for_cold_backing(storage_owner, &route, &replica)?
+        else {
             return Ok(PendingOffloadPrepareOutcome::Retry(entry));
         };
         let Some(pending) = storage_owner
@@ -599,7 +647,9 @@ pub(in super::super) fn prepare_pending_offload_entry(
     let (cold_backing, transient_nof, route) = match pending_persistent_backing(&route) {
         Some(backing) => (backing, false, route.clone()),
         None => {
-            let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
+            let Some((checksum, _source_pin)) =
+                pinned_checksum_for_cold_backing(storage_owner, &route, &replica)?
+            else {
                 storage_owner.sync_route(&route);
                 return Ok(PendingOffloadPrepareOutcome::Skipped);
             };
@@ -672,7 +722,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
             );
             return Ok(PendingOffloadPrepareOutcome::RetryAfter(
                 entry,
-                Duration::from_millis(100),
+                PENDING_OFFLOAD_ADMISSION_RETRY_DELAY,
             ));
         }
     };
@@ -1660,17 +1710,6 @@ impl ColdTierOffloadManager {
         self.queue.lock().retry_after(entry, delay);
     }
 
-    pub(in super::super) fn requeue_for_debug_evict_all(
-        &self,
-        route_key: ObjectKey,
-        route_version: RouteVersion,
-        length_bytes: Option<u64>,
-    ) -> bool {
-        self.queue
-            .lock()
-            .requeue_for_debug_evict_all(route_key, route_version, length_bytes)
-    }
-
     pub(in super::super) fn discard_for_debug_evict_all(&self, route_key: &ObjectKey) {
         self.queue.lock().discard_for_debug_evict_all(route_key);
     }
@@ -1944,30 +1983,6 @@ impl PendingOffloadQueue {
         } else if self.keys.insert(entry.key.clone()) {
             self.entries.push_back(entry);
         }
-    }
-
-    pub(in super::super) fn requeue_for_debug_evict_all(
-        &mut self,
-        route_key: ObjectKey,
-        route_version: RouteVersion,
-        length_bytes: Option<u64>,
-    ) -> bool {
-        let key = PendingOffloadKey { route_key };
-        let removed_in_flight = self.in_flight.remove(&key);
-        if self.keys.contains(&key) {
-            return removed_in_flight;
-        }
-        let now = Instant::now();
-        self.keys.insert(key.clone());
-        self.entries.push_front(PendingOffloadEntry {
-            key,
-            route_version,
-            attempts: 0,
-            not_before: now,
-            enqueued_at: now,
-            length_bytes,
-        });
-        true
     }
 
     pub(in super::super) fn discard_for_debug_evict_all(&mut self, route_key: &ObjectKey) {

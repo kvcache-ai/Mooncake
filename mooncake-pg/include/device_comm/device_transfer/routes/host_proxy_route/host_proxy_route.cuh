@@ -107,7 +107,8 @@ HostProxyTransferTicket::waitLeader() const {
 }
 
 __device__ __forceinline__ void drainHostProxyTransfers(
-    const DeviceHostProxyContext& context, uint64_t timeout_ticks) {
+    const DeviceTransferHandle& handle) {
+    const auto& context = handle.route_context.host_proxy;
     if (!context.command_slots) return;
 
     // Producers have stopped. The worker publishes completion after finishing
@@ -115,7 +116,7 @@ __device__ __forceinline__ void drainHostProxyTransfers(
     const uint64_t start_ticks = clock64();
     for (uint32_t lane = 0; lane < kTransferLaneCount; ++lane) {
         const auto& slot = context.command_slots[lane];
-        if (!slot.waitUntilIdle(start_ticks, timeout_ticks)) {
+        if (!slot.waitUntilIdle(start_ticks, handle.drain_timeout_ticks)) {
             printf("[PG] Host-proxy drain timed out at lane %u; continuing\n",
                    lane);
             return;

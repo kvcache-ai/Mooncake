@@ -10,12 +10,17 @@ from ..identity import KVCacheModelDomain
 from ..types import (
     KVCacheComponent,
     KVCacheDescriptor,
+    descriptor_identity,
     require_integer,
     require_manifest_items,
     require_nonempty_string,
     require_sha256,
 )
-from ._utils import KVCacheLogicalShard, validate_logical_coverage
+from ._utils import (
+    KVCacheLogicalShard,
+    validate_logical_coverage,
+    validate_store_descriptor,
+)
 from ._utils import canonical_digest as _canonical_digest
 
 
@@ -93,6 +98,7 @@ class KVCacheStoreLayout:
     def __post_init__(self) -> None:
         if not isinstance(self.descriptor, KVCacheDescriptor):
             raise ValueError("descriptor must be a KVCacheDescriptor")  # noqa: TRY004
+        validate_store_descriptor(self.descriptor)
         if not isinstance(self.object_format, KVCacheStoreFormat):
             raise ValueError(  # noqa: TRY004
                 "object_format must be a KVCacheStoreFormat"
@@ -146,7 +152,7 @@ class KVCacheStoreLayout:
                 shard.head_count,
                 self.token_count,
             )
-            for component_index, component in enumerate(KVCacheComponent):
+            for component_index, component in enumerate(d.components):
                 dim = (
                     d.key_head_dim
                     if component is KVCacheComponent.KEY
@@ -193,7 +199,9 @@ class KVCacheStoreLayout:
 
     @cached_property
     def digest(self) -> str:
-        return _canonical_digest(asdict(self))
+        content = asdict(self)
+        content["descriptor"] = descriptor_identity(self.descriptor)
+        return _canonical_digest(content)
 
     @property
     def layout_id(self) -> str:
@@ -246,7 +254,9 @@ class KVCacheStoreManifest:
 
     @cached_property
     def digest(self) -> str:
-        return _canonical_digest(asdict(self))
+        content = asdict(self)
+        content["layout"]["descriptor"] = descriptor_identity(self.layout.descriptor)
+        return _canonical_digest(content)
 
 
 def _layout_digest(layout_id: str) -> str:

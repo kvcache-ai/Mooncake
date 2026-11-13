@@ -8,6 +8,7 @@
 #include "common_types.h"
 #include "pg_assert.h"
 #include "device_comm/device_utils/d2h_request_slot_types.h"
+#include "device_comm/device_utils/h2d_request_slot_types.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
@@ -157,34 +158,6 @@ struct alignas(16) ControlUpdateOp {
     Payload payload = {};
 };
 
-// Idle: no update is pending; the host may acquire the slot for writing.
-// Writing: the host publisher exclusively owns the slot while copying an
-// already constructed update; device code must not read or execute it.
-// Published: a complete update is visible. The next collective may claim it,
-// or the host may replace it to coalesce another update.
-// Pinned: recovery has reserved the published update for the last channel CTA
-// of the current failed invocation; ordinary collectives and host publishers
-// must leave it untouched.
-// Claimed: a device CTA exclusively owns and executes the update, then returns
-// the slot to Idle.
-//
-// Replaceable host publication:
-//   Idle      -> Writing -> Published
-//   Published -> Writing -> Published (coalescing)
-// Direct recovery publication:
-//   Idle/Published -> Writing -> Pinned
-// Normal collective startup:
-//   Published -> Claimed -> Idle
-// Failed collective resume:
-//   Pinned -> Claimed -> Idle
-enum class ControlUpdateState : uint32_t {
-    Idle = 0,
-    Writing = 1,
-    Published = 2,
-    Pinned = 3,
-    Claimed = 4,
-};
-
 // One complete, idempotent update for device-resident control-plane state.
 // The host constructs it locally before briefly acquiring the mapped slot for
 // publication.
@@ -193,16 +166,6 @@ struct alignas(16) ControlUpdate {
     uint32_t payload_size = 0;
     ControlUpdateOp operations[kMaxDeviceControlUpdateOperations] = {};
     alignas(16) uint8_t payload[kDeviceControlUpdatePayloadBytes] = {};
-};
-
-// Mapped single-slot state for a ControlUpdate. The host owns the slot
-// only during the short Writing publication step, and a collective kernel
-// owns it while Claimed. Pinned protects a failure-resume update until the last
-// channel CTA can apply it. A newer complete update may replace Published,
-// which coalesces existing GroupView updates.
-struct alignas(64) ControlUpdateSlot {
-    uint32_t state = static_cast<uint32_t>(ControlUpdateState::Idle);
-    ControlUpdate update;
 };
 
 struct CollectiveFailureReport {
@@ -214,18 +177,23 @@ struct CollectiveFailureReport {
 // control-update slot carries ordinary Plan updates as well as the pinned
 // update used by failure recovery.
 //
-// The device publishes a new failure generation only after every active
-// channel CTA has stopped touching the old Plan and algorithm buffers. Recovery
-// pins a control update and then acknowledges the matching failure generation.
+// The device submits a failure report only after every active channel CTA has
+// stopped touching the old Plan and algorithm buffers. The host pins a control
+// update before replying to the matching recovery request.
 // The last channel CTA applies the pinned update before it leaves the failed
 // collective.
 struct alignas(64) ControlMailbox {
     using RecoverySlot = D2HRequestSlot<CollectiveFailureReport>;
-    // The host replies only after pinning the corresponding recovery update.
+    using ControlUpdateSlot = H2DRequestSlot<ControlUpdate>;
+
+    // D2H: the device reports failure; the host replies after pinning the
+    // corresponding recovery update.
     RecoverySlot recovery;
 
-    // Valid for the last channel CTA only while its state is Pinned and
-    // ready_generation has caught up with failure_generation.
+    // H2D: the host publishes updates; the device replies after applying them.
+    // Ordinary updates coalesce until collective startup consumes them. Pinned
+    // recovery updates must remain available for the last channel CTA after
+    // the recovery reply.
     ControlUpdateSlot control_update_slot;
 };
 

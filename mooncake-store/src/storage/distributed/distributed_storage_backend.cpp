@@ -185,6 +185,11 @@ DistributedStorageBackend::~DistributedStorageBackend() {
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
+bool DistributedStorageBackend::SupportsArbitraryHostReadBuffers() const {
+    return !UsesObjectStorage() && fs_adapter_ &&
+           fs_adapter_->SupportsArbitraryHostReadBuffers();
+}
+
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (initialized_) {
         LOG(WARNING) << "DistributedStorageBackend is already initialized";

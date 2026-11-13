@@ -3,17 +3,16 @@
 
 #include <cstdint>
 
-#include <cuda/atomic>
-
 #include "pg_assert.h"
 #include "device_comm/device_collective/device_collective_types.cuh"
+#include "device_comm/device_utils/h2d_request_slot.cuh"
 
 namespace mooncake {
 namespace detail {
 
 __device__ __forceinline__ void executeClaimedControlUpdate(
-    ControlUpdateSlot* slot) {
-    const auto& update = slot->update;
+    const ControlMailbox::ControlUpdateSlot::ReceivedRequest& received) {
+    const auto& update = *received.request;
     const uint32_t operation_count = update.operation_count;
     const uint32_t payload_size = update.payload_size;
     PG_ASSERT(operation_count <= kMaxDeviceControlUpdateOperations);
@@ -69,69 +68,31 @@ __device__ __forceinline__ void executeClaimedControlUpdate(
         __threadfence_system();
     }
 
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> state(slot->state);
-    state.store(static_cast<uint32_t>(ControlUpdateState::Idle),
-                cuda::memory_order_release);
+    received.handle.reply({});
 }
 
 }  // namespace detail
 
-// Called by the elected first resident CTA before any CTA reads algorithm
-// state. Publication constructs the batch before taking Writing, so a device
-// that loses the state CAS can safely wait for it and then claim the newly
-// published complete update.
+// Called by the startup thread before any CTA reads algorithm state.
 __device__ __forceinline__ void applyPendingControlUpdate(
-    ControlUpdateSlot* slot) {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> state(slot->state);
-    while (true) {
-        uint32_t observed = state.load(cuda::memory_order_acquire);
-        const auto observed_state = static_cast<ControlUpdateState>(observed);
-        switch (observed_state) {
-            case ControlUpdateState::Idle:
-                return;
-            case ControlUpdateState::Writing:
-                continue;
-            case ControlUpdateState::Published:
-                if (!state.compare_exchange_strong(
-                        observed,
-                        static_cast<uint32_t>(ControlUpdateState::Claimed),
-                        cuda::memory_order_acquire,
-                        cuda::memory_order_relaxed)) {
-                    continue;
-                }
-                detail::executeClaimedControlUpdate(slot);
-                return;
-            case ControlUpdateState::Pinned:
-            case ControlUpdateState::Claimed:
-                // StrongStream excludes another collective invocation, and a
-                // failed invocation consumes Pinned before its successor
-                // starts.
-                PG_UNREACHABLE();
-                return;
-            default:
-                PG_UNREACHABLE();
-                return;
-        }
-    }
+    ControlMailbox::ControlUpdateSlot* slot) {
+    ControlMailbox::ControlUpdateSlot::ReceivedRequest received;
+    if (!slot->tryReceive(received)) return;
+    PG_ASSERT(!received.pinned);
+    detail::executeClaimedControlUpdate(received);
 }
 
-// Called only after the recovery worker acknowledges a failure. The update was
-// pinned before that acknowledgement, so no ordinary collective may consume
-// or replace it.
+// Called only after recovery is acknowledged. The host pins the update before
+// replying, so a pinned request must be available.
 __device__ __forceinline__ void applyPinnedControlUpdate(
-    ControlUpdateSlot* slot) {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> state(slot->state);
-    uint32_t observed = static_cast<uint32_t>(ControlUpdateState::Pinned);
-    if (!state.compare_exchange_strong(
-            observed, static_cast<uint32_t>(ControlUpdateState::Claimed),
-            cuda::memory_order_acquire, cuda::memory_order_relaxed)) {
-        // The worker acknowledges recovery only after the host pins this
-        // update. Host writers cannot replace Pinned, and StrongStream excludes
-        // another device claimant, so this CAS must succeed.
+    ControlMailbox::ControlUpdateSlot* slot) {
+    ControlMailbox::ControlUpdateSlot::ReceivedRequest received;
+    if (!slot->tryReceive(received)) {
         PG_UNREACHABLE();
         return;
     }
-    detail::executeClaimedControlUpdate(slot);
+    PG_ASSERT(received.pinned);
+    detail::executeClaimedControlUpdate(received);
 }
 
 }  // namespace mooncake
