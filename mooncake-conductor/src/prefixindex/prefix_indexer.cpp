@@ -3,6 +3,8 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -166,7 +168,9 @@ void TouchOrder(ContextState& state, ProjectedPrefix prefix) {
     state.order_pos.emplace(prefix, state.write_order.begin());
 }
 
-// Evict oldest entries in batches until the target occupancy is reached. The
+// Evict oldest entries in batches until the target occupancy is reached. A
+// queried entry moves to the front once instead: engines do not re-announce
+// reused blocks by default, so a shared prefix would otherwise go first. The
 // caller holds the state write lock.
 void EvictIfOverCapacity(ContextState& state) {
     if (state.max_blocks == 0 || state.blocks.size() <= state.max_blocks) {
@@ -176,6 +180,14 @@ void EvictIfOverCapacity(ContextState& state) {
         static_cast<size_t>(state.max_blocks * kEvictTargetRatio);
     while (state.blocks.size() > target && !state.write_order.empty()) {
         const ProjectedPrefix oldest = state.write_order.back();
+        auto block = state.blocks.find(oldest);
+        if (block != state.blocks.end() &&
+            block->second.queried.exchange(false, std::memory_order_relaxed)) {
+            state.write_order.splice(state.write_order.begin(),
+                                     state.write_order,
+                                     std::prev(state.write_order.end()));
+            continue;
+        }
         state.write_order.pop_back();
         state.order_pos.erase(oldest);
         state.blocks.erase(oldest);
@@ -644,10 +656,16 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         std::shared_lock probe_lock(state->mutex);
         while (probe_depth < chunk_end) {
             const HashBlock* hashed = chain->At(probe_depth, &chain_error);
-            if (hashed == nullptr ||
-                !state->blocks.contains(hashed->projected)) {
+            auto block = hashed == nullptr
+                             ? state->blocks.end()
+                             : state->blocks.find(hashed->projected);
+            if (block == state->blocks.end()) {
                 probe_stalled = true;
                 break;
+            }
+            // Load first so a prefix shared by many queries stays read-only.
+            if (!block->second.queried.load(std::memory_order_relaxed)) {
+                block->second.queried.store(true, std::memory_order_relaxed);
             }
             ++probe_depth;
         }

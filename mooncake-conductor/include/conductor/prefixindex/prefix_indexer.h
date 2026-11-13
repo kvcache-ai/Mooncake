@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -33,6 +34,8 @@ struct BlockPresence {
     std::map<EngineOwner, uint32_t> cpu_local_refs;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
+    // Set by Query when it matches this block, cleared by capacity eviction.
+    mutable std::atomic<bool> queried{false};
 
     bool Empty() const {
         return device_owners.empty() && cpu_local_owners.empty() &&
