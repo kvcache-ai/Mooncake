@@ -531,7 +531,9 @@ echo "Installing required build packages"
 # rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
 # abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
 # the Python toolchain does.
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "${SKIP_WHEEL_BUILD_DEPS:-0}" = "1" ]; then
+    echo "Using preinstalled wheel build packages"
+elif [ "$NPU_BUILD" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
         echo "Error: $PYTHON_CMD not found for NPU wheel build"
@@ -641,7 +643,7 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ] || [ "${WHEEL_BUILD_NO_ISOLATION:-0}" = "1" ]; then
     python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
     AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
 else

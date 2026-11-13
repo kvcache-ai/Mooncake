@@ -200,6 +200,7 @@ jobs:
             $SUDO apt-get update -y || true
           fi
           $SUDO bash -x dependencies.sh -y
+          export PATH="/usr/local/go/bin:$PATH"
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir -p build && cd build
           # Ninja is required: limit_jobs.cmake caps parallelism through Ninja

@@ -98,6 +98,7 @@ fi
 # Parse command line arguments
 SKIP_CONFIRM=false
 INSTALL_SPDK=false
+SKIP_SUBMODULES=false
 for arg in "$@"; do
     case $arg in
         -y|--yes)
@@ -106,12 +107,16 @@ for arg in "$@"; do
         --with-spdk)
             INSTALL_SPDK=true
             ;;
+        --skip-submodules)
+            SKIP_SUBMODULES=true
+            ;;
         -h|--help)
             echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
             echo -e "Usage: ./dependencies.sh [OPTIONS]"
             echo -e "\nOptions:"
             echo -e "  -y, --yes       Skip confirmation and install all dependencies"
             echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+            echo -e "  --skip-submodules  Install dependencies without initializing Git submodules"
             echo -e "  -h, --help      Show this help message and exit"
             exit 0
             ;;
@@ -123,7 +128,9 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - Git submodules (pybind11)"
+if [ "$SKIP_SUBMODULES" = false ]; then
+    echo -e "  - Git submodules (pybind11)"
+fi
 echo -e "  - Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  - SPDK (for NVMe-oF support)"
@@ -322,8 +329,11 @@ print_success "System packages installed successfully"
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
 
-# Check if .gitmodules exists
-if [ -f "${REPO_ROOT}/.gitmodules" ]; then
+# Docker installs dependencies before copying the source and initializes
+# submodules afterwards. Other callers initialize submodules here by default.
+if [ "$SKIP_SUBMODULES" = true ]; then
+    echo -e "${YELLOW}Skipping Git submodule initialization (--skip-submodules).${NC}"
+elif [ -f "${REPO_ROOT}/.gitmodules" ]; then
     echo "Enter repository root: ${REPO_ROOT}"
     cd "${REPO_ROOT}"
     check_success "Failed to change to repository root directory"
@@ -516,7 +526,9 @@ print_section "Installation Complete"
 echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
-echo -e "  ${GREEN}✓${NC} Git submodules"
+if [ "$SKIP_SUBMODULES" = false ]; then
+    echo -e "  ${GREEN}✓${NC} Git submodules"
+fi
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
