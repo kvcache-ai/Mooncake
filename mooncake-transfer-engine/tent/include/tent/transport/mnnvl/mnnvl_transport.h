@@ -104,6 +104,9 @@ class MnnvlTransport : public Transport {
     bool tracksLocalBuffer(const BufferDesc &desc) const override;
 
     virtual const char *getName() const { return "mnnvl"; }
+    bool supportsGlobalAddressing() const override { return true; }
+    Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
+    Status unmapRemoteMemory(SegmentID peer, void *address) override;
 
     bool strictFabricEgm() const {
         return installed_ && egm_enabled_ && egm_strict_ &&
@@ -128,6 +131,9 @@ class MnnvlTransport : public Transport {
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
 
+    Status mapVmmMemory(uint64_t &address, size_t size, SegmentID peer,
+                        bool fixed_address);
+
     static Status ensureCudaContext();
 
     Status getLocalAllocationRange(uint64_t address, size_t length,
@@ -151,12 +157,13 @@ class MnnvlTransport : public Transport {
         // Handle the mapping was imported from; a peer that re-registers the
         // same address publishes a different one.
         std::string mnnvl_handle;
+        std::shared_ptr<CudaSharedMemory> memory;
     };
 
-    Status importRemoteBuffer(const BufferDesc &buffer,
-                              OpenedMnnvlEntry &entry);
+    Status importRemoteBuffer(const BufferDesc &buffer, OpenedMnnvlEntry &entry,
+                              bool fixed_address = false);
 
-    static void releaseImportedEntry(const OpenedMnnvlEntry &entry);
+    static Status releaseImportedEntry(const OpenedMnnvlEntry &entry);
 
     using HashMap =
         std::unordered_map<SegmentID,
@@ -192,6 +199,9 @@ class MnnvlTransport : public Transport {
     std::unordered_map<void *, LocalAllocation> allocate_set_;
     std::vector<LocalAllocation> failed_allocations_;
     static Status releaseLocalAllocation(LocalAllocation &allocation);
+    // Explicit uninstall requires callers to release GVA allocations first.
+    std::unordered_map<void *, std::unique_ptr<CudaSharedMemory>>
+        gva_allocations_;
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;

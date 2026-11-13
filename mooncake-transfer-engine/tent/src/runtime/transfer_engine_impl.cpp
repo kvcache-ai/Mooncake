@@ -916,8 +916,9 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
-    if (options.type < 0 || options.type >= kSupportedTransportTypes)
-        return Status::InvalidArgument("Invalid memory transport" LOC_MARK);
+    if (options.type <= UNSPEC || options.type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid memory transport type" LOC_MARK);
     auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
@@ -948,10 +949,17 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
         if (it->addr == addr) {
             if (it->options.global_address) {
                 auto segment = metadata_->segmentManager().getLocal();
-                if (segment && segment->findBuffer(
-                                   reinterpret_cast<uint64_t>(addr), it->size))
-                    return Status::InvalidArgument(
-                        "Unregister GVA memory before freeing it" LOC_MARK);
+                if (segment) {
+                    const auto base = reinterpret_cast<uint64_t>(addr);
+                    for (const auto& buffer :
+                         std::get<MemorySegmentDesc>(segment->detail).buffers) {
+                        if (buffer.addr < base + it->size &&
+                            base < buffer.addr + buffer.length)
+                            return Status::InvalidArgument(
+                                "Unregister GVA memory before freeing "
+                                "it" LOC_MARK);
+                    }
+                }
             }
             auto status = it->transport->freeLocalMemory(addr, it->size);
             if (!status.ok()) {
