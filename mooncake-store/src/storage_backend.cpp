@@ -2341,8 +2341,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     continue;
                 }
                 const auto& meta = *metadata;
+                // A .meta cut at a record boundary still parses: it keeps
+                // every key but only the first per-object records.
                 if (meta.data_size == 0 || meta.meta_size == 0 ||
-                    meta.metadatas.empty() || meta.keys.empty()) {
+                    meta.metadatas.empty() || meta.keys.empty() ||
+                    meta.keys.size() != meta.metadatas.size()) {
                     LOG(ERROR) << "Metadata validation failed for bucket: "
                                << bucket_id_str << " on disk " << disk_path
                                << ", will delete the bucket's data and "

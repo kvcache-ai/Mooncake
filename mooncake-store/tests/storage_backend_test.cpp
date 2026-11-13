@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ylt/struct_pb.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
@@ -800,6 +801,108 @@ TEST_F(StorageBackendTest, MissingBucketDataFileCleanup) {
         });
     ASSERT_TRUE(scan_result.has_value());
     EXPECT_TRUE(recovered_keys.empty());
+}
+
+// A .meta file reaches the disk in whole blocks, so after a crash it can end
+// at a block boundary. When that boundary is also a record boundary, what is
+// left is still a well-formed protobuf message: it keeps every key but only
+// the first per-object records. Init() must drop such a bucket instead of
+// indexing keys that have no record.
+TEST_F(StorageBackendTest, TruncatedBucketMetadataCleanup) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    // The common page and filesystem block size.
+    constexpr size_t kBlockSize = 4096;
+    // 160 keys of 23 bytes with a 12-byte value give a .meta of 5437 bytes
+    // whose first block ends right after the 11th record.
+    constexpr int kKeyCount = 160;
+    std::vector<std::string> truncated_keys;
+    for (int i = 0; i < kKeyCount; ++i) {
+        const auto index = std::to_string(i);
+        truncated_keys.push_back("truncated_meta_key_" +
+                                 std::string(4 - index.size(), '0') + index);
+    }
+    const std::string intact_key = "intact_meta_key";
+    std::string value = "restart_data";
+
+    int64_t truncated_bucket_id = 0;
+    int64_t intact_bucket_id = 0;
+    {
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+
+        const auto offload = [&](const std::vector<std::string>& keys) {
+            std::unordered_map<std::string, std::vector<Slice>> batch;
+            for (const auto& key : keys) {
+                batch.emplace(
+                    key, std::vector<Slice>{Slice{value.data(), value.size()}});
+            }
+            return storage_backend.BatchOffload(
+                batch, [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                });
+        };
+
+        auto truncated_result = offload(truncated_keys);
+        ASSERT_TRUE(truncated_result.has_value());
+        truncated_bucket_id = truncated_result.value();
+
+        auto intact_result = offload({intact_key});
+        ASSERT_TRUE(intact_result.has_value());
+        intact_bucket_id = intact_result.value();
+    }
+
+    const auto bucket_path =
+        fs::path(data_path) / (std::to_string(truncated_bucket_id) + ".bucket");
+    const auto metadata_path =
+        fs::path(data_path) / (std::to_string(truncated_bucket_id) + ".meta");
+
+    std::string encoded;
+    {
+        std::ifstream metadata_file(metadata_path, std::ios::binary);
+        ASSERT_TRUE(metadata_file.is_open());
+        encoded.assign(std::istreambuf_iterator<char>(metadata_file),
+                       std::istreambuf_iterator<char>());
+    }
+    ASSERT_GT(encoded.size(), kBlockSize);
+
+    // The first block alone must be the case under test: it parses, and it
+    // has every key but only some of the records.
+    BucketMetadata first_block{};
+    ASSERT_NO_THROW(
+        struct_pb::from_pb(first_block, encoded.substr(0, kBlockSize)));
+    ASSERT_EQ(first_block.keys.size(), truncated_keys.size());
+    ASSERT_FALSE(first_block.metadatas.empty());
+    ASSERT_LT(first_block.metadatas.size(), truncated_keys.size());
+
+    // Keep only the first block, as if the rest had never been written.
+    fs::resize_file(metadata_path, kBlockSize);
+
+    BucketStorageBackend restarted_backend(config, bucket_config);
+    ASSERT_TRUE(restarted_backend.Init());
+    EXPECT_FALSE(fs::exists(metadata_path));
+    EXPECT_FALSE(fs::exists(bucket_path));
+
+    for (const auto& key : truncated_keys) {
+        auto exists = restarted_backend.IsExist(key);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value()) << key;
+    }
+
+    // The bucket next to it is recovered as usual.
+    EXPECT_TRUE(fs::exists(fs::path(data_path) /
+                           (std::to_string(intact_bucket_id) + ".meta")));
+    EXPECT_EQ(CountDataFiles(data_path), 2);
+    std::string loaded(value.size(), '\0');
+    std::unordered_map<std::string, Slice> slices = {
+        {intact_key, Slice{loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(restarted_backend.BatchLoad(slices));
+    EXPECT_EQ(std::string(static_cast<char*>(slices.at(intact_key).ptr),
+                          slices.at(intact_key).size),
+              value);
 }
 
 class BucketRecoveryOwnershipTest : public StorageBackendTest {
