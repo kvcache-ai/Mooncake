@@ -31,6 +31,9 @@ class NoFRegisterClient {
                                    const std::string &traddr, size_t trsvcid,
                                    const std::string &master_server_addr);
 
+    [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
+    get_all_nof_segments(const std::string &master_server_addr);
+
    private:
     MasterClient master_client_;
 };

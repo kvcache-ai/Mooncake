@@ -2442,7 +2442,35 @@ PYBIND11_MODULE(_store, m) {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_unregister_by_endpoint(
                      nqn, nsid, traddr, trsvcid, master_server_addr);
-             });
+             })
+        .def(
+            "get_all_nof_segments",
+            [](MooncakeDistributedNoFRegisterPyWrapper &,
+               const std::string &master_server_addr) -> py::tuple {
+                NoFRegisterClient client;
+                auto result = client.get_all_nof_segments(master_server_addr);
+                if (!result.has_value()) {
+                    LOG(ERROR) << "GetAllNoFSegments failed for master: "
+                               << master_server_addr
+                               << ", error: " << toInt(result.error());
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                py::list segments;
+                for (const auto &segment : result.value()) {
+                    py::dict info;
+                    info["id"] = UuidToString(segment.id);
+                    info["name"] = segment.name;
+                    info["base"] = segment.base;
+                    info["size"] = segment.size;
+                    info["te_endpoint"] = segment.te_endpoint;
+                    segments.append(info);
+                }
+                return py::make_tuple(segments, 0);
+            },
+            py::arg("master_server_addr"),
+            "List all mounted NoF segments.\n\n"
+            "Returns (segments, 0) on success or (None, error_code) on "
+            "failure.");
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
