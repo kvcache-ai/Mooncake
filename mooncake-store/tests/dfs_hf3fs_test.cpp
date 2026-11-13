@@ -108,10 +108,13 @@ class Hf3fsAdapterTest : public ::testing::Test {
 
 class RecordingHf3fsAdapter : public Hf3fsAdapter {
    public:
-    tl::expected<int, ErrorCode> OpenExistingFile(
-        const std::string& path) override {
-        auto fd = Hf3fsAdapter::OpenExistingFile(path);
-        if (fd) peak_open = std::max(peak_open, ++open_now);
+    tl::expected<int, ErrorCode> OpenExistingFile(const std::string& path,
+                                                  bool write) override {
+        auto fd = Hf3fsAdapter::OpenExistingFile(path, write);
+        if (fd) {
+            peak_open = std::max(peak_open, ++open_now);
+            ++(write ? writable_opens : read_only_opens);
+        }
         return fd;
     }
 
@@ -137,6 +140,8 @@ class RecordingHf3fsAdapter : public Hf3fsAdapter {
     std::vector<size_t> read_batches;
     int open_now = 0;
     int peak_open = 0;
+    int writable_opens = 0;
+    int read_only_opens = 0;
 };
 
 }  // namespace
@@ -266,6 +271,8 @@ TEST_F(Hf3fsAdapterTest, BucketBatchSharesHandlesAcrossBoundedSubmissions) {
     EXPECT_EQ(recorded->write_batches, (std::vector<size_t>{2 * kMaxOpen, 2}));
     EXPECT_EQ(recorded->peak_open, static_cast<int>(kMaxOpen));
     EXPECT_EQ(recorded->open_now, 0);
+    EXPECT_EQ(recorded->writable_opens, static_cast<int>(kBuckets));
+    EXPECT_EQ(recorded->read_only_opens, 0);
 
     std::vector<std::string> outputs(kObjects, std::string(kObjectSize, '\0'));
     std::vector<DfsReadRequest> reads;
@@ -281,6 +288,9 @@ TEST_F(Hf3fsAdapterTest, BucketBatchSharesHandlesAcrossBoundedSubmissions) {
     EXPECT_EQ(recorded->read_batches, (std::vector<size_t>{2 * kMaxOpen, 2}));
     EXPECT_EQ(recorded->peak_open, static_cast<int>(kMaxOpen));
     EXPECT_EQ(recorded->open_now, 0);
+    // Reads go through read-only USRBIO handles.
+    EXPECT_EQ(recorded->writable_opens, static_cast<int>(kBuckets));
+    EXPECT_EQ(recorded->read_only_opens, static_cast<int>(kBuckets));
 }
 
 TEST_F(Hf3fsAdapterTest, ShardAllocatorPacksMegabytePayloads) {
