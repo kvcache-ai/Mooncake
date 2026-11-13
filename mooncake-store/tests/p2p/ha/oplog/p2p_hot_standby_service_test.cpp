@@ -502,7 +502,7 @@ TEST_F(P2PHotStandbyServiceTest, SyncStatusDistinguishesUnknownLatestFromZero) {
     EXPECT_FALSE(standby.GetSyncStatus().primary_seq_id_known);
 }
 
-TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
+TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POpLog) {
     P2PMasterService master(MakeMasterConfig());
     const UUID client_id{1, 1};
     const UUID segment_id{2, 2};
@@ -842,7 +842,7 @@ TEST_F(P2PHotStandbyServiceTest, PrimarySnapshotSourceServesCurrentMetadata) {
 }
 
 TEST_F(P2PHotStandbyServiceTest,
-       StartsFromDemotedPrimaryMetadataAndCatchesUpFromOplog) {
+       StartsFromDemotedPrimaryMetadataAndCatchesUpFromOpLog) {
     P2PMasterService primary(MakeMasterConfig());
     const UUID client_id{25, 25};
     const UUID segment_id{26, 26};
@@ -929,7 +929,7 @@ TEST_F(P2PHotStandbyServiceTest,
 }
 
 TEST_F(P2PHotStandbyServiceTest,
-       LocalCommittedHandoffRejectsUncommittedWithdrawLikeOplog) {
+       LocalCommittedHandoffRejectsUncommittedWithdrawLikeOpLog) {
     P2PMasterService primary(MakeMasterConfig());
     const UUID client_id{111, 111};
     const UUID segment_id{112, 112};

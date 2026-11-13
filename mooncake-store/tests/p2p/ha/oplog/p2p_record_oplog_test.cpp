@@ -23,7 +23,7 @@
 #include "mock_oplog_store.h"
 
 namespace mooncake {
-class P2PRecordOplogTestPeer {
+class P2PRecordOpLogTestPeer {
    public:
     static void RunMonitor(P2PClientManager& manager) {
         manager.ClientMonitorFunc();
@@ -88,7 +88,7 @@ class FailingOpLogStore : public OpLogStore {
     }
 };
 
-class P2PRecordOplogTest : public ::testing::Test {
+class P2PRecordOpLogTest : public ::testing::Test {
    protected:
     void SetUp() override {
         test_dir_ =
@@ -207,7 +207,7 @@ class P2PRecordOplogTest : public ::testing::Test {
     std::filesystem::path test_dir_;
 };
 
-TEST_F(P2PRecordOplogTest, CrashRecordsUnregisterAndCleansStandbyReplicas) {
+TEST_F(P2PRecordOpLogTest, CrashRecordsUnregisterAndCleansStandbyReplicas) {
     auto config = MakeConfig();
     config.client_lifecycle.live_ttl_seconds = 0;
     config.client_lifecycle.crashed_ttl_seconds = 1;
@@ -237,7 +237,7 @@ TEST_F(P2PRecordOplogTest, CrashRecordsUnregisterAndCleansStandbyReplicas) {
               standby_metadata.clients.end());
     EXPECT_EQ(standby_metadata.clients.at(client_id).segments.size(), 2u);
 
-    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    P2PRecordOpLogTestPeer::RunMonitor(service.GetClientManager());
     auto client = service.GetClientManager().GetClient(client_id);
     ASSERT_NE(client, nullptr);
     EXPECT_EQ(client->get_health_state().status,
@@ -246,7 +246,7 @@ TEST_F(P2PRecordOplogTest, CrashRecordsUnregisterAndCleansStandbyReplicas) {
     EXPECT_EQ(service.GetKeyCount(), 2u);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    P2PRecordOpLogTestPeer::RunMonitor(service.GetClientManager());
     EXPECT_EQ(service.GetClientManager().GetClient(client_id), nullptr);
     EXPECT_EQ(service.GetKeyCount(), 0u);
     ASSERT_EQ(manager->GetLastSequenceId(), 5u);
@@ -274,11 +274,11 @@ TEST_F(P2PRecordOplogTest, CrashRecordsUnregisterAndCleansStandbyReplicas) {
     EXPECT_TRUE(exported.clients.empty());
     EXPECT_TRUE(exported.routes.empty());
 
-    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    P2PRecordOpLogTestPeer::RunMonitor(service.GetClientManager());
     EXPECT_EQ(manager->GetLastSequenceId(), 5u);
 }
 
-TEST_F(P2PRecordOplogTest, CrashEnqueueFailureStillCleansLocallyWithoutRetry) {
+TEST_F(P2PRecordOpLogTest, CrashEnqueueFailureStillCleansLocallyWithoutRetry) {
     auto config = MakeConfig();
     config.client_lifecycle.live_ttl_seconds = 0;
     config.client_lifecycle.crashed_ttl_seconds = 0;
@@ -293,18 +293,18 @@ TEST_F(P2PRecordOplogTest, CrashEnqueueFailureStillCleansLocallyWithoutRetry) {
 
     auto failing_store = std::make_shared<FailingOpLogStore>();
     service.GetOpLogManager()->SetOpLogStore(failing_store);
-    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    P2PRecordOpLogTestPeer::RunMonitor(service.GetClientManager());
 
     EXPECT_EQ(service.GetClientManager().GetClient(client_id), nullptr);
     EXPECT_EQ(service.GetKeyCount(), 0u);
     EXPECT_EQ(failing_store->write_attempts, 1u);
     EXPECT_FALSE(failing_store->last_sync);
 
-    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    P2PRecordOpLogTestPeer::RunMonitor(service.GetClientManager());
     EXPECT_EQ(failing_store->write_attempts, 1u);
 }
 
-TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
+TEST_F(P2PRecordOpLogTest, RegisterClientRecordsOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{1, 1};
     const UUID segment_id{2, 2};
@@ -329,7 +329,7 @@ TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
     EXPECT_EQ(payload.segments[0].name, segment.name);
 }
 
-TEST_F(P2PRecordOplogTest, DuplicateRegisterClientRecordsSegmentOplog) {
+TEST_F(P2PRecordOpLogTest, DuplicateRegisterClientRecordsSegmentOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{1, 1};
     const UUID segment_id{2, 2};
@@ -356,7 +356,7 @@ TEST_F(P2PRecordOplogTest, DuplicateRegisterClientRecordsSegmentOplog) {
     EXPECT_EQ(payload.segment.id, req.segments.front().id);
 }
 
-TEST_F(P2PRecordOplogTest, DuplicateRegisterClientRetriesFailedSegmentOplog) {
+TEST_F(P2PRecordOpLogTest, DuplicateRegisterClientRetriesFailedSegmentOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{1, 1};
     RegisterClient(service, client_id, MakeSegment({2, 2}));
@@ -390,7 +390,7 @@ TEST_F(P2PRecordOplogTest, DuplicateRegisterClientRetriesFailedSegmentOplog) {
     EXPECT_EQ(payload.segment.id, req.segments.front().id);
 }
 
-TEST_F(P2PRecordOplogTest, RegisterClientRejectsMissingEndpoint) {
+TEST_F(P2PRecordOpLogTest, RegisterClientRejectsMissingEndpoint) {
     P2PMasterService service(MakeConfig());
     const UUID segment_id{2, 2};
 
@@ -415,7 +415,7 @@ TEST_F(P2PRecordOplogTest, RegisterClientRejectsMissingEndpoint) {
     EXPECT_EQ(manager->GetLastSequenceId(), 0);
 }
 
-TEST_F(P2PRecordOplogTest, MountAndUnmountSegmentRecordOplog) {
+TEST_F(P2PRecordOpLogTest, MountAndUnmountSegmentRecordOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{3, 3};
     const UUID initial_segment_id{4, 4};
@@ -450,7 +450,7 @@ TEST_F(P2PRecordOplogTest, MountAndUnmountSegmentRecordOplog) {
     EXPECT_EQ(unmount_payload.segment_id, extra_segment_id);
 }
 
-TEST_F(P2PRecordOplogTest, UnregisterClientRecordsOplog) {
+TEST_F(P2PRecordOpLogTest, UnregisterClientRecordsOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{6, 6};
     const UUID segment_id{7, 7};
@@ -471,7 +471,7 @@ TEST_F(P2PRecordOplogTest, UnregisterClientRecordsOplog) {
     EXPECT_EQ(payload.client_id, client_id);
 }
 
-TEST_F(P2PRecordOplogTest, AddReplicaRecordsOplog) {
+TEST_F(P2PRecordOpLogTest, AddReplicaRecordsOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{8, 8};
     const UUID segment_id{9, 9};
@@ -495,7 +495,7 @@ TEST_F(P2PRecordOplogTest, AddReplicaRecordsOplog) {
     EXPECT_EQ(payload.size, 1234);
 }
 
-TEST_F(P2PRecordOplogTest, RemoveReplicaRecordsOplog) {
+TEST_F(P2PRecordOpLogTest, RemoveReplicaRecordsOpLog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{10, 10};
     const UUID segment_id{11, 11};
@@ -519,7 +519,7 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaRecordsOplog) {
     EXPECT_EQ(payload.segment_id, segment_id);
 }
 
-TEST_F(P2PRecordOplogTest, BatchSyncRoutesRecordsSuccessfulOps) {
+TEST_F(P2PRecordOpLogTest, BatchSyncRoutesRecordsSuccessfulOps) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{12, 12};
     const UUID segment_id{13, 13};
@@ -560,7 +560,7 @@ TEST_F(P2PRecordOplogTest, BatchSyncRoutesRecordsSuccessfulOps) {
     EXPECT_TRUE(has_entry(OpType_PUBLISH_ROUTE, "new-key"));
 }
 
-TEST_F(P2PRecordOplogTest,
+TEST_F(P2PRecordOpLogTest,
        BatchSyncRoutesPreservesMutationPolicyWhenPersistenceFails) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{20, 20};
@@ -596,8 +596,8 @@ TEST_F(P2PRecordOplogTest,
     EXPECT_EQ(retained->size(), 1);
 }
 
-TEST_F(P2PRecordOplogTest,
-       RegisterClientReturnsErrorWhenOplogPersistenceFails) {
+TEST_F(P2PRecordOpLogTest,
+       RegisterClientReturnsErrorWhenOpLogPersistenceFails) {
     P2PMasterService service(MakeConfig());
     InjectFailingOpLogStore(service);
 
@@ -617,7 +617,7 @@ TEST_F(P2PRecordOplogTest,
     EXPECT_NE(service.GetClientManager().GetClient(req.client_id), nullptr);
 }
 
-TEST_F(P2PRecordOplogTest, AddReplicaSucceedsWhenOplogPersistenceFails) {
+TEST_F(P2PRecordOpLogTest, AddReplicaSucceedsWhenOpLogPersistenceFails) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{32, 32};
     const UUID segment_id{33, 33};
@@ -638,7 +638,7 @@ TEST_F(P2PRecordOplogTest, AddReplicaSucceedsWhenOplogPersistenceFails) {
     ASSERT_EQ(1u, replicas.value().size());
 }
 
-TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
+TEST_F(P2PRecordOpLogTest, RemoveReplicaDoesNotApplyWhenOpLogPersistenceFails) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{34, 34};
     const UUID segment_id{35, 35};
@@ -661,7 +661,7 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
     EXPECT_EQ(replicas.value()[0].client_id, client_id);
 }
 
-TEST_F(P2PRecordOplogTest, EnabledOplogFailsFastWhenStoreInitFails) {
+TEST_F(P2PRecordOpLogTest, EnabledOpLogFailsFastWhenStoreInitFails) {
     std::filesystem::create_directories(test_dir_);
     const auto invalid_root = test_dir_ / "not-a-directory";
     std::ofstream(invalid_root) << "file";
@@ -673,7 +673,7 @@ TEST_F(P2PRecordOplogTest, EnabledOplogFailsFastWhenStoreInitFails) {
     EXPECT_THROW(P2PMasterService service(config), std::runtime_error);
 }
 
-TEST_F(P2PRecordOplogTest, DisabledOplogDoesNotCreateManager) {
+TEST_F(P2PRecordOpLogTest, DisabledOpLogDoesNotCreateManager) {
     P2PMasterService service(MakeConfig(/*enable_oplog=*/false));
     const UUID client_id{14, 14};
     const UUID segment_id{15, 15};

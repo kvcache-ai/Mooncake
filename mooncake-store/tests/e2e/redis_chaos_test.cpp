@@ -1340,7 +1340,7 @@ TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {
     EXPECT_GT(next_version, version);
 }
 
-TEST_F(RedisChaosTest, DemotedPrimaryCatchesUpFromOplogWithoutSnapshot) {
+TEST_F(RedisChaosTest, DemotedPrimaryCatchesUpFromOpLogWithoutSnapshot) {
     int leader_index = -1;
     ViewVersionId version = 0;
     ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));

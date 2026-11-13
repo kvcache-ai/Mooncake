@@ -20,7 +20,7 @@
 
 namespace mooncake {
 
-class P2PRecordOplogTestPeer;
+class P2PRecordOpLogTestPeer;
 
 /**
  * @brief Manages P2P clients' lifecycle and heartbeat state.
@@ -83,7 +83,7 @@ class P2PClientManager final {
     void SetClientCrashedCallback(ClientCrashedCallback cb);
 
    private:
-    friend class P2PRecordOplogTestPeer;
+    friend class P2PRecordOpLogTestPeer;
 
     static constexpr uint64_t kClientMonitorSleepMs = 1000;
 

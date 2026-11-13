@@ -470,7 +470,7 @@ TEST_F(HAStatusTest, DoctorDeduplicatesReadinessWithoutHidingElectionErrors) {
     EXPECT_EQ(report.issues[0].severity, "error");
 }
 
-TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
+TEST_F(HAStatusTest, StatusExposesClearOpLogAndMasterViewAliases) {
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
