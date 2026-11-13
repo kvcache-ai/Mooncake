@@ -337,6 +337,7 @@ struct NvmeKvExecutorEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_VALUE_BLOCK_UNIT_BYTES);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS);
 };
 
 struct S3ClientEnvironmentVariables {

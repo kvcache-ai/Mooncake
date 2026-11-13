@@ -133,4 +133,11 @@ NvmeKvExecutorResult CreateNvmeKvIoctlExecutor(std::string device_path,
                                                uint32_t queue_depth,
                                                uint32_t runtime_transfer_limit);
 
+#if defined(USE_NOF) && defined(MOONCAKE_HAVE_SPDK_NVME_KV)
+NvmeKvExecutorResult CreateNvmeKvSpdkExecutor(std::string transport_id,
+                                              uint32_t nsid,
+                                              uint32_t queue_depth,
+                                              uint32_t runtime_transfer_limit);
+#endif
+
 }  // namespace mooncake

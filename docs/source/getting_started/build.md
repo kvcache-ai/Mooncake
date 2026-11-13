@@ -194,11 +194,11 @@ sudo make install
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
 `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
 
-Registering client buffers for NoF over RDMA requires SPDK 22.05 or newer
-(`spdk_mem_register`). The build probes for it automatically and continues
-with older SPDK versions, but then logs a CMake warning, and pure-NoF writes
-over RDMA from unregistered user buffers fail at runtime with
-"No translation" errors.
+The dependency script installs SPDK 26.05, which is required for the typed
+NVMe KV API. Registering client buffers for NoF over RDMA requires SPDK 22.05
+or newer (`spdk_mem_register`). The build probes both capabilities: older
+installations can still build block NoF support, but the NVMe KV SPDK executor
+is disabled when the typed KV API is absent.
 
 (build-with-store-rs)=
 ### Build with Store-RS
