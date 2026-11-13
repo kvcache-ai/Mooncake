@@ -3092,6 +3092,66 @@ TEST_F(RealClientTest, ErrDuplicatePutSameKey) {
         << "Retrieved data should match original data from the first put";
 }
 
+TEST_F(RealClientTest, BatchPutFromDuplicateKeysPreservesFirstSource) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t kSlotSize = 8192;
+    std::vector<char> memory(5 * kSlotSize);
+    ASSERT_EQ(py_client_->register_buffer(memory.data(), memory.size()), 0);
+    auto unregister = [this](void* ptr) {
+        EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+    };
+    std::unique_ptr<void, decltype(unregister)> registration(memory.data(),
+                                                             unregister);
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < 4; ++i) {
+        auto* source = memory.data() + i * kSlotSize;
+        std::fill_n(source, kSlotSize, static_cast<char>(0x11 * (i + 1)));
+        buffers.push_back(source);
+    }
+    auto* destination = memory.data() + 4 * kSlotSize;
+    const std::vector<std::pair<size_t, size_t>> size_cases{
+        {4096, 4096}, {4096, 8192}, {8192, 4096}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    for (size_t i = 0; i < size_cases.size(); ++i) {
+        SCOPED_TRACE(i);
+        const std::string prefix = "batch_put_duplicate_" + std::to_string(i);
+        const std::vector<std::string> keys{prefix, prefix + "_unique_a",
+                                            prefix, prefix + "_unique_b"};
+        const std::vector<size_t> sizes{size_cases[i].first, 2048,
+                                        size_cases[i].second, 1024};
+        ASSERT_EQ(py_client_->batch_put_from(keys, buffers, sizes, config),
+                  std::vector<int>(keys.size(), 0));
+
+        // The first occurrence creates the object; later duplicates are
+        // idempotent skips. Every unique key must retain its own source too.
+        for (size_t index : {0u, 1u, 3u}) {
+            SCOPED_TRACE(index);
+            EXPECT_EQ(py_client_->getSize(keys[index]),
+                      static_cast<int64_t>(sizes[index]));
+            std::fill_n(destination, kSlotSize, static_cast<char>(0x7f));
+            EXPECT_EQ(py_client_->get_into(keys[index], destination, kSlotSize),
+                      static_cast<int64_t>(sizes[index]));
+            EXPECT_EQ(std::memcmp(destination, buffers[index], sizes[index]),
+                      0);
+        }
+
+        // Once published, repeated puts with other sources must preserve the
+        // original object rather than overwrite it.
+        ASSERT_EQ(py_client_->batch_put_from({prefix, prefix},
+                                             {buffers[2], buffers[1]},
+                                             {sizes[2], sizes[1]}, config),
+                  std::vector<int>({0, 0}));
+        EXPECT_EQ(py_client_->getSize(prefix), static_cast<int64_t>(sizes[0]));
+        std::fill_n(destination, kSlotSize, static_cast<char>(0x7f));
+        EXPECT_EQ(py_client_->get_into(prefix, destination, kSlotSize),
+                  static_cast<int64_t>(sizes[0]));
+        EXPECT_EQ(std::memcmp(destination, buffers[0], sizes[0]), 0);
+    }
+}
+
 // Buffer registration edge cases
 TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
