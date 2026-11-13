@@ -699,6 +699,59 @@ TEST_F(RedisOpLogStoreTest, StopWritingAbortsSyncWaitAndRejectsNewWrites) {
     EXPECT_EQ(0, HAMetricManager::instance().get_oplog_async_queue_size());
 }
 
+TEST_F(RedisOpLogStoreTest, NonblockingStopDoesNotWaitForLatestReply) {
+    auto writer = CreateWriter();
+    DelayedLatestReply delay;
+    auto entered = delay.entered.get_future();
+    std::promise<void> cleanup_started;
+    auto cleanup_entered = cleanup_started.get_future();
+    std::future<ErrorCode> pending;
+    std::future<void> stop;
+    std::future<void> cleanup;
+    {
+        // Release before joining workers or destroying futures, even on ASSERT.
+        struct ReleaseReply {
+            DelayedLatestReply& delay;
+            RedisOpLogStore& writer;
+            ~ReleaseReply() {
+                delayed_latest_reply.store(nullptr);
+                delay.release.set_value();
+                writer.StopWriting();
+            }
+        } release{delay, *writer};
+        delayed_latest_reply.store(&delay);
+        pending = std::async(std::launch::async, [&] {
+            return writer->WriteOpLog(MakeEntry(1), true);
+        });
+        ASSERT_EQ(entered.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        stop = std::async(std::launch::async,
+                          [&] { writer->RequestStopWriting(); });
+        EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+        cleanup = std::async(std::launch::async, [&] {
+            cleanup_started.set_value();
+            writer->StopWriting();
+        });
+        ASSERT_EQ(cleanup_entered.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+                  std::future_status::timeout);
+    }
+    stop.get();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    cleanup.get();
+    // The latest command already in flight may succeed despite cancellation.
+    const auto result = pending.get();
+    EXPECT_TRUE(result == ErrorCode::OK || result == ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), true),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), false),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(HAMetricManager::instance().get_oplog_async_queue_size(), 0);
+}
+
 TEST_F(RedisOpLogStoreTest, DrainWritingReturnsAfterLeaseLossStopRequest) {
     auto writer = CreateWriter();
     // seq=2 cannot commit while seq=1 is missing, so the writer keeps it
