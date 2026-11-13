@@ -441,6 +441,14 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordDeadlineInfeasible(TCP);
     metrics.recordBatchQuarantined();
     metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
+    metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::User,
+                                 TentMetrics::AdmissionEvent::Admitted);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User, 1,
+                                  1024);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User, -1,
+                                  -1024);
+    metrics.recordAdmissionWait(TentMetrics::AdmissionOwnerKind::User, 14.0);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -450,7 +458,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 34>
+    const std::array<std::pair<std::string_view, std::string_view>, 39>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -467,9 +475,13 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_task_failures_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
+            {"tent_transport_selection_events_total", "counter"},
+            {"tent_admission_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_logical_requests_inflight", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
+            {"tent_admission_queue_owners", "gauge"},
+            {"tent_admission_queue_bytes", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
             {"tent_read_size_bytes", "histogram"},
@@ -479,6 +491,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_dispatch_us", "histogram"},
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_admission_wait_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -546,6 +559,136 @@ TEST_F(MetricsRecordingTest,
             before.series("tent_metrics_serialization_failures_total{format=\""
                           "prometheus\"}"),
         1);
+}
+
+TEST_F(MetricsRecordingTest, SelectionSignalsUseBoundedDecisionLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::FallbackSelected,
+                                 TCP);
+    metrics.recordSelectionEvent(
+        TentMetrics::SelectionEvent::CandidateUnavailable, SHM);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Exhausted);
+
+    auto after = MetricsSnapshot(metrics);
+    for (const auto& [event, transport] :
+         std::array<std::pair<std::string_view, std::string_view>, 4>{{
+             {"selected", "rdma"},
+             {"fallback_selected", "tcp"},
+             {"candidate_unavailable", "shm"},
+             {"exhausted", "unspec"},
+         }}) {
+        const std::string series =
+            "tent_transport_selection_events_total{event=\"" +
+            std::string(event) + "\",transport=\"" + std::string(transport) +
+            "\"}";
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
+    }
+}
+
+TEST_F(MetricsRecordingTest, AdmissionSignalsTrackDecisionsQueueAndWait) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::Staging,
+                                 TentMetrics::AdmissionEvent::Admitted, 2);
+    metrics.recordAdmissionEvent(
+        TentMetrics::AdmissionOwnerKind::User,
+        TentMetrics::AdmissionEvent::RejectedOwnerCapacity);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::Staging, 2,
+                                  4096);
+    metrics.recordAdmissionWait(TentMetrics::AdmissionOwnerKind::Staging, 27.0);
+
+    auto active = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        active.series("tent_admission_events_total{owner_kind=\"staging\","
+                      "event=\"admitted\"}") -
+            before.series("tent_admission_events_total{owner_kind=\"staging\","
+                          "event=\"admitted\"}"),
+        2);
+    EXPECT_EQ(
+        active.series("tent_admission_events_total{owner_kind=\"user\","
+                      "event=\"rejected_owner_capacity\"}") -
+            before.series("tent_admission_events_total{owner_kind=\"user\","
+                          "event=\"rejected_owner_capacity\"}"),
+        1);
+    EXPECT_EQ(
+        active.series("tent_admission_queue_owners{owner_kind=\"staging\"}") -
+            before.series(
+                "tent_admission_queue_owners{owner_kind=\"staging\"}"),
+        2);
+    EXPECT_EQ(
+        active.series("tent_admission_queue_bytes{owner_kind=\"staging\"}") -
+            before.series("tent_admission_queue_bytes{owner_kind=\"staging\"}"),
+        4096);
+    EXPECT_EQ(active.histogramCount("tent_admission_wait_us") -
+                  before.histogramCount("tent_admission_wait_us"),
+              1);
+
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::Staging, -2,
+                                  -4096);
+    auto released = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        released.series("tent_admission_queue_owners{owner_kind=\"staging\"}"),
+        before.series("tent_admission_queue_owners{owner_kind=\"staging\"}"));
+    EXPECT_EQ(
+        released.series("tent_admission_queue_bytes{owner_kind=\"staging\"}"),
+        before.series("tent_admission_queue_bytes{owner_kind=\"staging\"}"));
+}
+
+TEST_F(MetricsRecordingTest, AdmissionQueueRecordsOwnedStateTransitions) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    LocalTransferAdmissionQueue queue({1, 128, 0, 0});
+
+    auto makeSubmit = [](uint64_t token) {
+        QueueSubmit submit;
+        submit.batch_token = token;
+        submit.batch_slots_left = 1;
+        QueueOwnerInput owner;
+        owner.owner_task_id = 0;
+        owner.request.length = 32;
+        owner.kind = QueueOwnerKind::User;
+        submit.owners.push_back(owner);
+        return submit;
+    };
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_TRUE(queue.tryAdmit(makeSubmit(1), ids).ok());
+    ASSERT_EQ(ids.size(), 1u);
+    auto admitted = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        admitted.series("tent_admission_queue_owners{owner_kind=\"user\"}") -
+            before.series("tent_admission_queue_owners{owner_kind=\"user\"}"),
+        1);
+    EXPECT_EQ(
+        admitted.series("tent_admission_queue_bytes{owner_kind=\"user\"}") -
+            before.series("tent_admission_queue_bytes{owner_kind=\"user\"}"),
+        32);
+
+    std::vector<QueueOwnerId> rejected_ids;
+    EXPECT_TRUE(
+        queue.tryAdmit(makeSubmit(2), rejected_ids).IsTooManyRequests());
+    auto rejected = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        rejected.series("tent_admission_events_total{owner_kind=\"user\","
+                        "event=\"rejected_owner_capacity\"}") -
+            before.series("tent_admission_events_total{owner_kind=\"user\","
+                          "event=\"rejected_owner_capacity\"}"),
+        1);
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, ids);
+    ASSERT_TRUE(queue.complete(ids.front(), COMPLETED).ok());
+    auto completed = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        completed.series("tent_admission_queue_owners{owner_kind=\"user\"}"),
+        before.series("tent_admission_queue_owners{owner_kind=\"user\"}"));
+    EXPECT_EQ(
+        completed.series("tent_admission_queue_bytes{owner_kind=\"user\"}"),
+        before.series("tent_admission_queue_bytes{owner_kind=\"user\"}"));
 }
 
 // ---------------------------------------------------------------------------

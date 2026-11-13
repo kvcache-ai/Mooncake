@@ -265,11 +265,15 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_logical_request_outcomes_total` | Counter | `operation`, `outcome` | Terminal outcome of each counted logical request |
 | `tent_transport_attempt_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal outcome of each counted physical transport attempt |
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
+| `tent_transport_selection_events_total` | Counter | `event`, `transport` | Transport policy, candidate, hint, fallback, refresh, and exhaustion decisions |
+| `tent_admission_events_total` | Counter | `owner_kind`, `event` | Runtime admission, rejection, dispatch, deadline-drop, and cancellation decisions |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_logical_requests_inflight` | Gauge | `operation` | Counted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
+| `tent_admission_queue_owners` | Gauge | `owner_kind` | Owners currently accounted by runtime admission control |
+| `tent_admission_queue_bytes` | Gauge | `owner_kind` | Bytes currently accounted by runtime admission control |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -279,6 +283,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_admission_wait_us` | Histogram | `owner_kind` | Runtime admission wait before dispatch |
 
 ### Metrics pipeline self-observability
 
@@ -319,6 +324,7 @@ visible when runtime transfer recording is disabled.
   request that starts while disabled emits neither side of the pair.
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
 - `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
+- Admission owner and byte gauges stay paired across runtime metric enable/disable transitions. They are charged only after admission succeeds and released on completion, queued cancellation, or deadline drop.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
@@ -346,6 +352,8 @@ values are accepted.
 | `operation` | `read`, `write` | Attempt operation |
 | `outcome` | `success`, `failed`, `timeout`, `canceled` | Bounded terminal outcome |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
+| `owner_kind` | `user`, `staging`, `all` | Runtime admission owner class; `all` represents a mixed-owner capacity decision |
+| `event` | selection: `selected`, `fallback_selected`, `candidate_unavailable`, `policy_miss`, `candidate_empty`, `hint_rejected`, `hint_unavailable`, `exhausted`, `metadata_refresh`; admission: `admitted`, `rejected_batch_capacity`, `rejected_owner_capacity`, `rejected_byte_capacity`, `rejected_user_owner_capacity`, `rejected_user_byte_capacity`, `rejected_dispatch_window`, `dispatched`, `deadline_dropped`, `canceled` | Family-specific bounded decision or lifecycle event |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -360,10 +368,12 @@ Transport label values come from the shared `transportTypeName()` mapping.
 few pairs ever occur), each attempt metric has at most 19x2 = 38
 transport/operation combinations, logical outcomes have at most 2x4 = 8,
 attempt outcomes have at most 19x2x4 = 152, task failures have at most 19x4 =
-76, and each serialization family has exactly two series. Build identity
-labels are constant for the life of the process; a served
-`tent_metrics_build_info` series itself confirms that metrics were compiled
-in. Total series across all metrics is bounded by these closed sets.
+76, selection decisions have at most 19x9 = 171, admission decisions have at
+most 3x10 = 30, and each admission gauge or histogram has three series. Each
+serialization family has exactly two series. Build identity labels are constant
+for the life of the process; a served `tent_metrics_build_info` series itself
+confirms that metrics were compiled in. Total series across all metrics is
+bounded by these closed sets.
 
 ### Per-rail load (`getNicLoadStats`)
 
