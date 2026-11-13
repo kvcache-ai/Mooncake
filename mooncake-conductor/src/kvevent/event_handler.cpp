@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -79,6 +80,40 @@ std::optional<prefixindex::StorageTier> SglangLocalTier(
         return prefixindex::StorageTier::kDisk;
     }
     return std::nullopt;
+}
+
+// Count processed engine events separately from their block references.
+// Ignored media and empty removals are not successful index applications.
+template <typename Variant>
+void RecordEngineEvent(EventMetrics& metrics, const Variant& value,
+                       const std::string& error, bool replay) {
+    std::visit(
+        [&](const auto& event) {
+            using Event = std::decay_t<decltype(event)>;
+            constexpr bool stored =
+                std::is_same_v<Event, zmq::VllmStoredEvent> ||
+                std::is_same_v<Event, zmq::SglangStoredEvent>;
+            constexpr bool removed =
+                std::is_same_v<Event, zmq::VllmRemovedEvent> ||
+                std::is_same_v<Event, zmq::SglangRemovedEvent>;
+            auto type = stored    ? EventMetrics::kStored
+                        : removed ? EventMetrics::kRemoved
+                                  : EventMetrics::kCleared;
+            auto result = error.empty() ? EventMetrics::kApplied
+                                        : EventMetrics::kRejected;
+            uint64_t blocks = 0;
+            if constexpr (stored || removed) {
+                blocks = event.block_hashes.size();
+                bool ignored = blocks == 0;
+                if constexpr (std::is_same_v<Event, zmq::VllmStoredEvent> ||
+                              std::is_same_v<Event, zmq::VllmRemovedEvent>) {
+                    ignored = ignored || !VllmTier(event.medium).has_value();
+                }
+                if (error.empty() && ignored) result = EventMetrics::kIgnored;
+            }
+            metrics.Record(type, result, replay, blocks);
+        },
+        value);
 }
 
 std::string OriginalMedium(const std::optional<std::string>& medium) {
@@ -376,9 +411,12 @@ std::string KVEventHandler::HandleVllmBatch(
         return "batch data_parallel_rank conflicts with trusted registration";
     }
 
+    metrics_.RecordBatch(metadata.sequence, metadata.from_replay);
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
         if (!decoded.ok()) {
+            metrics_.Record(EventMetrics::kUnknown, EventMetrics::kRejected,
+                            metadata.from_replay);
             LOG(WARNING) << "Rejected vLLM event endpoint=" << service_.endpoint
                          << " publisher_kind="
                          << common::PublisherKindName(metadata.publisher_kind)
@@ -403,6 +441,8 @@ std::string KVEventHandler::HandleVllmBatch(
                 }
             },
             *decoded.event);
+        RecordEngineEvent(metrics_, *decoded.event, error,
+                          metadata.from_replay);
         if (!error.empty()) {
             LOG(WARNING) << "Rejected vLLM event endpoint=" << service_.endpoint
                          << " publisher_kind="
@@ -423,9 +463,12 @@ std::string KVEventHandler::HandleSglangBatch(
         *batch.data_parallel_rank != service_.dp_rank) {
         return "batch data_parallel_rank conflicts with trusted registration";
     }
+    metrics_.RecordBatch(metadata.sequence, metadata.from_replay);
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
         if (!decoded.ok()) {
+            metrics_.Record(EventMetrics::kUnknown, EventMetrics::kRejected,
+                            metadata.from_replay);
             LOG(WARNING) << "Rejected SGLang event endpoint="
                          << service_.endpoint << " event_index=" << index
                          << " error=" << decoded.error;
@@ -444,6 +487,8 @@ std::string KVEventHandler::HandleSglangBatch(
                 }
             },
             *decoded.event);
+        RecordEngineEvent(metrics_, *decoded.event, error,
+                          metadata.from_replay);
         if (!error.empty()) {
             LOG(WARNING) << "Rejected SGLang event endpoint="
                          << service_.endpoint << " event_index=" << index

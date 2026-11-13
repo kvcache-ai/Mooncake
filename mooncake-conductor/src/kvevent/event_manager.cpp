@@ -26,8 +26,8 @@ using coro_http::coro_http_request;
 using coro_http::coro_http_response;
 using coro_http::status_type;
 
-// Every endpoint speaks msgpack only: request bodies, success responses, and
-// error envelopes are all msgpack maps. There is no JSON wire path.
+// Control endpoints use MessagePack for requests and response envelopes.
+// The /metrics endpoint uses Prometheus text instead.
 constexpr const char* kApplicationMsgpack = "application/msgpack";
 
 using MsgpackPacker = msgpack::packer<msgpack::sbuffer>;
@@ -1009,10 +1009,126 @@ std::pair<bool, std::string> EventManager::UnsubscribeFromService(
     return {true, ""};
 }
 
+std::string EventManager::RenderMetrics() {
+    struct Source {
+        common::ServiceConfig config;
+        std::shared_ptr<KVEventHandler> handler;
+        std::shared_ptr<zmq::ZMQClient> client;
+    };
+    std::vector<Source> sources;
+    {
+        std::shared_lock lock(mu_);
+        for (const auto& [key, config] : active_configs_) {
+            const auto handler = handlers_.find(key);
+            const auto client = subscribers_.find(key);
+            if (handler != handlers_.end() && client != subscribers_.end()) {
+                sources.push_back({config, handler->second, client->second});
+            }
+        }
+    }
+    // No manager lock is held while taking a subscriber/metrics lock.
+    struct Family {
+        const char* name;
+        const char* help;
+        const char* type;
+    };
+    static constexpr Family families[] = {
+        {"mooncake_conductor_metrics_info",
+         "Conductor event metrics schema version.", "gauge"},
+        {"mooncake_conductor_events_total",
+         "Engine event handling attempts, including redeliveries.", "counter"},
+        {"mooncake_conductor_event_block_references_total",
+         "Block references in applied event attempts, not distinct resident "
+         "blocks.",
+         "counter"},
+        {"mooncake_conductor_last_applied_event_timestamp_seconds",
+         "Unix receive time of the last applied engine event; absent before "
+         "the first application.",
+         "gauge"},
+        {"mooncake_conductor_event_batch_redeliveries_total",
+         "Engine batches delivered with a non-increasing transport sequence, "
+         "including retries.",
+         "counter"},
+        {"mooncake_conductor_source_stale",
+         "Whether an unrecoverable event source was invalidated (1) or remains "
+         "usable (0).",
+         "gauge"},
+        {"mooncake_conductor_events_supported",
+         "Whether engine event counters are supported for this publisher kind.",
+         "gauge"},
+        {"mooncake_conductor_batch_failures_total",
+         "Malformed transport frames, invalid envelopes, or failed batch "
+         "dispatches.",
+         "counter"},
+        {"mooncake_conductor_sequence_gaps_total",
+         "Gaps observed in the live transport sequence.", "counter"},
+        {"mooncake_conductor_sequence_missing_messages_total",
+         "Messages missing from live sequence gaps, including messages later "
+         "recovered by replay.",
+         "counter"},
+        {"mooncake_conductor_replay_requests_total",
+         "Replay attempts by terminal result, including failed retries.",
+         "counter"},
+    };
+    std::map<std::string, std::string> samples;
+    samples["mooncake_conductor_metrics_info"] =
+        "mooncake_conductor_metrics_info{schema=\"2\"} 1\n";
+    for (const auto& source : sources) {
+        const auto& cfg = source.config;
+        const auto quote = EventMetrics::Quote;
+        const std::string labels =
+            "tenant_id=" + quote(cfg.tenant_id) +
+            ",cache_domain=" + quote(cfg.model_name) +
+            ",instance_id=" + quote(cfg.instance_id) +
+            ",dp_rank=" + quote(std::to_string(cfg.dp_rank)) +
+            ",publisher_kind=" +
+            quote(common::PublisherKindName(cfg.publisher_kind));
+        const bool supported =
+            cfg.publisher_kind == common::PublisherKind::kVllm ||
+            cfg.publisher_kind == common::PublisherKind::kSglang;
+        auto sample = [&](const std::string& name, uint64_t value,
+                          const std::string& extra = "") {
+            samples[name] += name + "{" + labels + extra + "} " +
+                             std::to_string(value) + "\n";
+        };
+        sample("mooncake_conductor_events_supported", supported);
+        if (supported) {
+            for (const auto& [name, values] :
+                 source.handler->RenderMetricFamilies(labels)) {
+                samples[name] += values;
+            }
+        }
+        sample("mooncake_conductor_source_stale", source.client->IsStale());
+        sample("mooncake_conductor_batch_failures_total",
+               source.client->GetBatchFailures());
+        sample("mooncake_conductor_sequence_gaps_total",
+               source.client->GetGapCount());
+        sample("mooncake_conductor_sequence_missing_messages_total",
+               source.client->GetDroppedEvents());
+        sample("mooncake_conductor_replay_requests_total",
+               source.client->GetReplaySuccesses(), ",result=\"success\"");
+        sample("mooncake_conductor_replay_requests_total",
+               source.client->GetReplayFailures(), ",result=\"failed\"");
+    }
+    std::string out;
+    for (const auto& family : families) {
+        out += std::string("# HELP ") + family.name + " " + family.help + "\n";
+        out += std::string("# TYPE ") + family.name + " " + family.type + "\n";
+        out += samples[family.name];
+    }
+    return out;
+}
+
 void EventManager::RegisterHttpHandlers() {
     using coro_http::GET;
     using coro_http::POST;
     auto* server = http_server_.get();
+    server->set_http_handler<GET>(
+        "/metrics", [this](coro_http_request&, coro_http_response& resp) {
+            resp.add_header("Content-Type",
+                            "text/plain; version=0.0.4; charset=utf-8");
+            resp.set_status_and_content(status_type::ok, RenderMetrics());
+        });
 
     // ---- /query ---------------------------------------------------------
     // msgpack-only protocol (JSON support was dropped during development:
