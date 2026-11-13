@@ -55,10 +55,14 @@ DEFINE_int32(redis_master_view_ttl_sec, 4,
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "Redis heartbeat interval for Redis master failover test");
 
-constexpr int kMasterPortBase = 51051;
 constexpr int kMasterNum = 3;
-constexpr int kClientPortBase = 52051;
-constexpr int kSnapshotPortBase = 53051;
+// Keep listeners below Linux's default ephemeral port range (32768-60999).
+// Outgoing connections must not claim a standby's RPC port before promotion.
+constexpr int kMasterPortBase = 21051;
+constexpr int kClientPortBase = 22051;
+constexpr int kSnapshotPortBase = 23051;
+constexpr int kMetricsPortBase = 24051;
+constexpr int kHeartbeatPortBase = 25051;
 
 namespace mooncake {
 namespace testing {
@@ -667,8 +671,8 @@ class RedisGracefulShutdownTest : public RedisChaosTest {
     }
 
     void ConfigureMasters(MasterRunnerConfig& config) override {
-        config.metrics_port_base = 54051;
-        config.heartbeat_rpc_port_base = 55051;
+        config.metrics_port_base = kMetricsPortBase;
+        config.heartbeat_rpc_port_base = kHeartbeatPortBase;
     }
 
     bool WaitForSnapshotReadiness(int index, const std::string& role,
@@ -681,9 +685,9 @@ class RedisGracefulShutdownTest : public RedisChaosTest {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             coro_http::coro_http_client client;
-            auto response =
-                client.get("http://127.0.0.1:" + std::to_string(54051 + index) +
-                           "/ha/status");
+            auto response = client.get(
+                "http://127.0.0.1:" + std::to_string(kMetricsPortBase + index) +
+                "/ha/status");
             if (response.status == 200) {
                 HAStatusSnapshot status;
                 struct_json::from_json(status, response.resp_body);
@@ -782,8 +786,8 @@ TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
     WaitForLeaderServiceReady();
     ASSERT_TRUE(TcpPortAccepting("127.0.0.1:" +
                                  std::to_string(kMasterPortBase + leader)));
-    ASSERT_TRUE(
-        TcpPortAccepting("127.0.0.1:" + std::to_string(55051 + leader)));
+    ASSERT_TRUE(TcpPortAccepting("127.0.0.1:" +
+                                 std::to_string(kHeartbeatPortBase + leader)));
     const auto instance_id = RegistryInstance(leader);
     ASSERT_FALSE(instance_id.empty());
 
@@ -793,8 +797,8 @@ TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
     ExpectRegistryRemoved(instance_id);
     EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
                                   std::to_string(kMasterPortBase + leader)));
-    EXPECT_FALSE(
-        TcpPortAccepting("127.0.0.1:" + std::to_string(55051 + leader)));
+    EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kHeartbeatPortBase + leader)));
     EXPECT_TRUE(
         WaitForMasterLog(leader, "released=1", std::chrono::seconds(1)));
     EXPECT_TRUE(WaitForMasterLog(leader, "HA shutdown completed",
@@ -809,7 +813,7 @@ TEST_F(RedisGracefulShutdownTest,
     WaitForLeaderServiceReady();
     const auto client_id = generate_uuid();
     P2PMasterClient client(client_id);
-    client.SetHeartbeatRpcPort(55051 + leader);
+    client.SetHeartbeatRpcPort(kHeartbeatPortBase + leader);
     ASSERT_EQ(
         client.Connect("127.0.0.1:" + std::to_string(kMasterPortBase + leader)),
         ErrorCode::OK);
@@ -851,7 +855,8 @@ TEST_F(RedisGracefulShutdownTest,
                     .has_value());
     coro_http::coro_http_client http;
     auto response = http.get(
-        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/status");
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+        "/ha/status");
     ASSERT_EQ(response.status, 200);
     HAStatusSnapshot status;
     struct_json::from_json(status, response.resp_body);
@@ -866,7 +871,7 @@ TEST_F(RedisGracefulShutdownTest,
     ViewVersionId next_version = 0;
     ASSERT_TRUE(WaitForNewLeader(leader, version, next_leader, next_version));
     WaitForLeaderServiceReady();
-    client.SetHeartbeatRpcPort(55051 + next_leader);
+    client.SetHeartbeatRpcPort(kHeartbeatPortBase + next_leader);
     ASSERT_EQ(client.Connect("127.0.0.1:" +
                              std::to_string(kMasterPortBase + next_leader)),
               ErrorCode::OK);
@@ -900,10 +905,10 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownReleasesLeaseBeforeTTL) {
     ASSERT_GT(ttl->integer, 5000) << "Lease expiry must not satisfy this test";
 
     coro_http::coro_http_client client;
-    auto response =
-        client.post("http://127.0.0.1:" + std::to_string(54051 + leader) +
-                        "/ha/stepdown?cooldown_sec=0",
-                    "", coro_http::req_content_type::octet_stream);
+    auto response = client.post(
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+            "/ha/stepdown?cooldown_sec=0",
+        "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ASSERT_NE(response.resp_body.find("\"success\":true"),
               std::string_view::npos);
@@ -942,7 +947,7 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
     const auto log_offset = MasterLogEndOffset(leader);
     const auto start = std::chrono::steady_clock::now();
     const std::string url =
-        "http://127.0.0.1:" + std::to_string(54051 + leader);
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader);
     coro_http::coro_http_client client;
     auto response =
         client.post(url + "/ha/stepdown?cooldown_sec=5&drain_timeout_ms=1234",
@@ -983,7 +988,8 @@ TEST_F(RedisGracefulShutdownTest, StepdownCooldownDoesNotBlockShutdown) {
     const auto log_offset = MasterLogEndOffset(leader);
     coro_http::coro_http_client client;
     auto response = client.post(
-        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/stepdown",
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+            "/ha/stepdown",
         "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ASSERT_NE(response.resp_body.find("\"cooldown_sec\":30"),
@@ -1018,10 +1024,10 @@ TEST_F(RedisSnapshotDisabledTest, ReadinessStaysFalseAcrossStepdown) {
     }
     const auto start = std::chrono::steady_clock::now();
     coro_http::coro_http_client client;
-    auto response =
-        client.post("http://127.0.0.1:" + std::to_string(54051 + leader) +
-                        "/ha/stepdown?cooldown_sec=30",
-                    "", coro_http::req_content_type::octet_stream);
+    auto response = client.post(
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+            "/ha/stepdown?cooldown_sec=30",
+        "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ExpectPromptSuccessor(leader, version, start);
     ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", false,
@@ -1125,7 +1131,8 @@ class RedisOpLogStopTest : public RedisGracefulShutdownTest {
 
     bool WaitForStoppedWriter(int index) {
         const auto url =
-            "http://127.0.0.1:" + std::to_string(54051 + index) + "/metrics";
+            "http://127.0.0.1:" + std::to_string(kMetricsPortBase + index) +
+            "/metrics";
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(15);
         while (std::chrono::steady_clock::now() < deadline) {
