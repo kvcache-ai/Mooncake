@@ -76,6 +76,13 @@ MasterRuntimeState MapStandbyRuntimeState(
     return MasterRuntimeState::kStandby;
 }
 
+// A warm standby polls the OpLog once a second. A production-like replay wrote
+// about 1270 entries/s, so a warm standby's normal lag can exceed 1000 and must
+// not count as far behind. A cold replacement is millions behind. 10000 is
+// about 8 s of that write rate. The value is a judgment call, not a measured
+// promotion boundary.
+constexpr uint64_t kFarBehindLagEntries = 10000;
+
 class NoopStandbyController final : public StandbyController {
    public:
     ErrorCode StartStandby(const std::optional<MasterView>&) override {
@@ -402,6 +409,22 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                                       observed_leader, capabilities_);
     }
 
+    bool IsFarBehind() const override {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!capabilities_.has_oplog_following) {
+                return false;
+            }
+            // An OpLog-following master whose standby is not running (never
+            // started, or its reader failed) holds no replicated state.
+            if (!standby_running_) {
+                return true;
+            }
+        }
+        return IsStandbyFarBehind(standby_service_->GetSyncStatus(),
+                                  kFarBehindLagEntries);
+    }
+
     ErrorCode RestorePromotionBaseline(PromotionContext context) override {
         if (!context.metadata_store) {
             return ErrorCode::OK;
@@ -466,6 +489,31 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 };
 
 }  // namespace
+
+// Whether a standby is too far behind the OpLog to win an election usefully.
+// Before the first successful poll the lag is unknown, so the standby counts
+// as behind; a fresh cluster with no OpLog completes that poll at once.
+bool IsStandbyFarBehind(const StandbySyncStatus& status,
+                        uint64_t max_lag_entries) {
+    switch (status.state) {
+        case StandbyState::CONNECTING:
+        case StandbyState::SYNCING:
+        case StandbyState::RECOVERING:
+        case StandbyState::RECONNECTING:
+        case StandbyState::FAILED:
+            return true;
+        case StandbyState::WATCHING:
+            // A rebootstrap keeps the state at WATCHING and only sets
+            // is_recovering, so check it here.
+            return status.is_recovering || !status.polled_once ||
+                   status.lag_entries > max_lag_entries;
+        case StandbyState::STOPPED:
+        case StandbyState::PROMOTING:
+        case StandbyState::PROMOTED:
+            return false;
+    }
+    return false;
+}
 
 std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,

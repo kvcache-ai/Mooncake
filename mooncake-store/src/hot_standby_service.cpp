@@ -298,6 +298,9 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
     }
 
+    // Withdraw "polled" before the state turns WATCHING, so no reader sees
+    // WATCHING with a flag left over from an earlier run.
+    polled_once_.store(false, std::memory_order_release);
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
     replication_loop_running_.store(true, std::memory_order_release);
     replication_thread_ =
@@ -436,6 +439,10 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     StandbySyncStatus status;
 
     // Callbacks can query status while mutex_ is held or state is swapped.
+    // Load polled_once first: the writer stores the sequence numbers before it
+    // releases the flag, so a reader that sees the flag set must read the
+    // sequence numbers after it to see that poll's values.
+    status.polled_once = polled_once_.load(std::memory_order_acquire);
     status.applied_seq_id = applied_seq_id_.load();
     status.is_recovering = recovering_.load(std::memory_order_acquire);
 
@@ -1071,6 +1078,9 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     HAMetricManager::SnapshotOperationTimer metric_timer(
         HAMetricManager::SnapshotOperation::Rebootstrap);
     recovering_.store(true, std::memory_order_release);
+    // The restored cursor sets applied == primary, so the lag reads 0 until
+    // the next poll. Withdraw "polled" so that window counts as unknown.
+    polled_once_.store(false, std::memory_order_release);
     CancelSnapshotCapture();
     {
         std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
@@ -1265,6 +1275,13 @@ void HotStandbyService::ReplicationLoop() {
                 oplog_applier_->GetExpectedSequenceId();
             if (expected_after > 0) {
                 applied_seq_id_.store(expected_after - 1);
+            }
+            if (result.error == ErrorCode::OK) {
+                // Publish "polled" only after primary_seq_id_ and
+                // applied_seq_id_ hold the poll's result: a reader that sees
+                // the flag must also see a lag computed from this poll, not
+                // the zero lag of the local baseline.
+                polled_once_.store(true, std::memory_order_release);
             }
             if (result.error != ErrorCode::OK) {
                 last_error_.store(result.error, std::memory_order_release);

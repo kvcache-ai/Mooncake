@@ -65,6 +65,9 @@ struct StandbySyncStatus {
     bool is_syncing{false};
     bool is_connected{false};
     bool is_recovering{false};
+    // False until the first OpLog poll since Start() has succeeded. Until
+    // then primary_seq_id (and so lag_entries) is only the local baseline.
+    bool polled_once{false};
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
     ErrorCode last_error{ErrorCode::OK};
@@ -303,6 +306,7 @@ class HotStandbyService {
     std::atomic<uint64_t> primary_seq_id_{0};
     std::atomic<ErrorCode> last_error_{ErrorCode::OK};
     std::atomic<bool> recovering_{false};
+    std::atomic<bool> polled_once_{false};
 
     // State machine for managing service lifecycle
     StandbyStateMachine state_machine_;
