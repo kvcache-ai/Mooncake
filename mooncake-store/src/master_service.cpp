@@ -11538,7 +11538,8 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
+                       replica.is_dfs_replica() ||
+                       replica.is_object_storage_replica()) {
                 has_disk = true;
             }
         });
@@ -11578,7 +11579,8 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
                 has_cpu = true;
             } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
+                       replica.is_dfs_replica() ||
+                       replica.is_object_storage_replica()) {
                 has_disk = true;
             }
         });

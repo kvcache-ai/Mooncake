@@ -37,6 +37,27 @@ TEST(KvEventPublisherTest, DisabledPublisherIsNoop) {
     EXPECT_EQ(stats.dropped_events, 0u);
 }
 
+TEST(KvEventPublisherTest, ObjectReplicaMediaTracksVisibilityAndRemoval) {
+    for (auto status : {ReplicaStatus::PROCESSING, ReplicaStatus::COMPLETE,
+                        ReplicaStatus::REMOVED}) {
+        SCOPED_TRACE(static_cast<int>(status));
+        std::vector<Replica> replicas;
+        replicas.emplace_back(
+            ObjectStorageDescriptor{"object", 1024,
+                                    ObjectStorageWriteMode::SYNC, "namespace"},
+            status);
+        ObjectMetadata metadata(generate_uuid(),
+                                std::chrono::system_clock::now(), 1024,
+                                std::move(replicas));
+        EXPECT_EQ(test::MasterServiceTestPeer::KvMediaForMetadata(metadata),
+                  status == ReplicaStatus::COMPLETE
+                      ? std::vector<std::string>{"disk"}
+                      : std::vector<std::string>{});
+        EXPECT_EQ(test::MasterServiceTestPeer::KvMediaForRemoval(metadata),
+                  (std::vector<std::string>{"disk"}));
+    }
+}
+
 #if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
 
 namespace {
@@ -535,6 +556,82 @@ TEST(KvEventPublisherTest, MemoryEvictionRetractsLastReplica) {
         ExpectObjectEvent(FirstEvent(payload), "removed", key);
         EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
                   "cpu");
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    }
+}
+
+TEST(KvEventPublisherTest, ObjectCommitAndMemoryEvictionKeepDiskAdvertised) {
+    for (bool keep_memory : {false, true}) {
+        SCOPED_TRACE(keep_memory);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "object-event-test";
+        config.default_kv_lease_ttl = 0;
+        MasterService service(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "object_event_segment";
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client = generate_uuid();
+        ASSERT_TRUE(service.MountSegment(segment, client));
+        const std::string key = "object_event_key";
+        const auto tenant = TenantId::Default();
+        ASSERT_TRUE(
+            service.PutStart(client, key, tenant, 1024, ReplicateConfig{}));
+        // Isolate event accounting from the object upload protocol, which is
+        // covered with real MinIO by object_storage_e2e.py.
+        using Accessor = test::MasterServiceTestPeer::MetadataAccessorRW;
+        {
+            Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+            ASSERT_TRUE(accessor.IsPublished());
+            if (!keep_memory) {
+                auto removed = accessor.Get().PopReplicas();
+            }
+            std::vector<Replica> replicas;
+            replicas.emplace_back(
+                ObjectStorageDescriptor{"event-object", 1024,
+                                        ObjectStorageWriteMode::SYNC,
+                                        "event-namespace"},
+                ReplicaStatus::PROCESSING);
+            accessor.Get().AddReplicas(std::move(replicas));
+        }
+        ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::ALL));
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), keep_memory ? 2u : 1u);
+        const auto& stored = EventAt(payload, keep_memory ? 1 : 0);
+        ExpectObjectEvent(stored, "stored", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(stored, "medium")), "disk");
+
+        if (keep_memory) {
+            test::MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0,
+                                                                         1.0);
+            ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+            ASSERT_EQ(EventCount(payload), 1u);
+            ExpectObjectEvent(FirstEvent(payload), "removed", key);
+            EXPECT_EQ(
+                MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                "cpu");
+            auto remaining = service.GetReplicaListForAdmin(key, tenant);
+            ASSERT_TRUE(remaining);
+            ASSERT_EQ(remaining->replicas.size(), 1u);
+            EXPECT_TRUE(
+                remaining->replicas.front().is_object_storage_replica());
+            EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        }
+        ASSERT_TRUE(service.Remove(key, tenant, true));
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "removed", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                  "disk");
         EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
     }
 }
