@@ -1365,5 +1365,48 @@ TEST_F(WeightGroupLifecycleTest,
     }
 }
 
+TEST_F(WeightGroupLifecycleTest, BatchedColdEvictionRespectsByteBudget) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.enable_offload = true;
+    config.weight_migration_max_members_per_round = 3;
+    config.weight_migration_max_bytes_per_round = 2048;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    ASSERT_TRUE(service.MountLocalDiskSegment(context.client_id, true));
+    const std::vector<PayloadSpec> payloads{{"batch-a", 1024, "a"},
+                                            {"batch-b", 1024, "b"},
+                                            {"batch-c", 1024, "c"},
+                                            {"batch-d", 1024, "d"},
+                                            {"batch-e", 1024, "e"}};
+    const auto ready =
+        PublishReadyWithPayloads(service, context.client_id, payloads);
+    for (const auto& payload : payloads) {
+        AddLocalDiskReplica(service, context.client_id, payload.key,
+                            payload.size, "test_segment");
+    }
+    ASSERT_TRUE(service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::COLD,
+    }));
+    for (const size_t expected_remaining : {3u, 1u, 0u}) {
+        ASSERT_TRUE(
+            service.ReconcileWeightRevision({.identity = ready.identity}));
+        const auto members = GetWeightGroupResidencyForTest(
+            service, ready.identity, ready.manifest.payload_group_id);
+        size_t remaining = 0;
+        for (const auto& member : members) {
+            if (member.data_type == ObjectDataType::METADATA) {
+                EXPECT_TRUE(member.has_memory);
+            } else {
+                EXPECT_TRUE(member.has_cold);
+                remaining += member.has_memory;
+            }
+        }
+        EXPECT_EQ(expected_remaining, remaining);
+    }
+}
+
 }  // namespace
 }  // namespace mooncake::test
