@@ -1314,6 +1314,13 @@ TEST_F(P2PMasterHttpEndpointsTest, MetricsEndpointsExposeRedisHAHealthMetrics) {
     ha_metrics.set_oplog_consecutive_write_failures(1);
     ha_metrics.set_oplog_snapshot_ready_standby_count(2);
     ha_metrics.inc_election_renew_failures();
+    const auto pipeline_failures_before =
+        ha_metrics.get_oplog_redis_pipeline_batch_failures_total();
+    const auto pipeline_retries_before =
+        ha_metrics.get_oplog_redis_pipeline_batch_retries_total();
+    ha_metrics.observe_oplog_redis_pipeline_batch_size(64);
+    ha_metrics.inc_oplog_redis_pipeline_batch_failures();
+    ha_metrics.inc_oplog_redis_pipeline_batch_retries();
 
     auto metrics_response = HttpGet(http_base_url_ + "/metrics");
     ASSERT_EQ(metrics_response.status, 200)
@@ -1324,10 +1331,19 @@ TEST_F(P2PMasterHttpEndpointsTest, MetricsEndpointsExposeRedisHAHealthMetrics) {
              "ha_oplog_consecutive_write_failures",
              "ha_oplog_snapshot_ready_standby_count",
              "ha_election_renew_failures_total",
+             "ha_oplog_redis_pipeline_batch_size_bucket",
+             "ha_oplog_redis_pipeline_batch_failures_total",
+             "ha_oplog_redis_pipeline_batch_retries_total",
          }) {
         EXPECT_NE(metrics_response.resp_body.find(name), std::string::npos)
             << name;
     }
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body,
+                               "ha_oplog_redis_pipeline_batch_failures_total"),
+              pipeline_failures_before + 1);
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body,
+                               "ha_oplog_redis_pipeline_batch_retries_total"),
+              pipeline_retries_before + 1);
 
     auto summary_response = HttpGet(http_base_url_ + "/metrics/summary");
     ASSERT_EQ(summary_response.status, 200)
