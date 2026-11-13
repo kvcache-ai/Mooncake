@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mooncake import mooncake_config as _cfg_mod
 from mooncake.mooncake_config import (
@@ -79,6 +80,32 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.tenant_id, "default")
         self.assertEqual(config.enable_client_http_server, False)
         self.assertEqual(config.client_http_port, 9300)
+
+    def test_load_iec_sizes_from_file(self):
+        self.write_config(
+            {
+                **self.valid_config,
+                "global_segment_size": "256MiB",
+                "local_buffer_size": "1.5 GiB",
+            }
+        )
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertEqual(config.global_segment_size, 256 * 1024**2)
+        self.assertEqual(config.local_buffer_size, 1536 * 1024**2)
+
+    def test_load_iec_sizes_from_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MOONCAKE_MASTER": "localhost:8081",
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "8GiB",
+                "MOONCAKE_LOCAL_BUFFER_SIZE": "512mIb",
+            },
+            clear=True,
+        ):
+            config = MooncakeConfig.load_from_env()
+        self.assertEqual(config.global_segment_size, 8 * 1024**3)
+        self.assertEqual(config.local_buffer_size, 512 * 1024**2)
 
     def test_load_tenant_id_from_file(self):
         """Test loading tenant_id from configuration file"""
@@ -348,6 +375,27 @@ class TestParseSegmentSize(unittest.TestCase):
         self.assertEqual(_parse_segment_size("1tb"), 1024**4)
         self.assertEqual(_parse_segment_size("1TB"), 1024**4)
         self.assertEqual(_parse_segment_size("1t"), 1024**4)
+
+    def test_iec_suffixes(self):
+        cases = [
+            ("1KiB", 1024),
+            ("512MiB", 512 * 1024**2),
+            ("8GiB", 8 * 1024**3),
+            ("2TiB", 2 * 1024**4),
+            ("1.5 GiB", 1536 * 1024**2),
+            ("8mIb", 8 * 1024**2),
+            ("0KiB", 0),
+            ("\t16 MiB \n", 16 * 1024**2),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_segment_size(raw), expected)
+
+    def test_malformed_iec_sizes_raise(self):
+        for raw in ("MiB", "1Ki", "1MiBB", "1GiBS", "1PiB", "nanGiB", "infMiB"):
+            with self.subTest(raw=raw):
+                with self.assertRaises((ValueError, OverflowError)):
+                    _parse_segment_size(raw)
 
     def test_b_suffix(self):
         self.assertEqual(_parse_segment_size("4096b"), 4096)

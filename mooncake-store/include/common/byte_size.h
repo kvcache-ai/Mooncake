@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
@@ -60,13 +61,6 @@ namespace mooncake {
     } catch (const std::exception&) {
         return std::nullopt;
     }
-    if (value < 0) {
-        return std::nullopt;
-    }
-    if (unit_offset >= value_string.length()) {
-        return static_cast<uint64_t>(value);
-    }
-
     std::string unit = value_string.substr(unit_offset);
     unit.erase(0, unit.find_first_not_of(" \t\r\n"));
     std::transform(unit.begin(), unit.end(), unit.begin(),
@@ -76,22 +70,25 @@ namespace mooncake {
     constexpr double kMiB = kKiB * 1024.0;
     constexpr double kGiB = kMiB * 1024.0;
     constexpr double kTiB = kGiB * 1024.0;
-    if (unit == "KB" || unit == "K") {
-        return static_cast<uint64_t>(value * kKiB);
+    double multiplier = 1.0;
+    if (unit == "KB" || unit == "K" || unit == "KIB") {
+        multiplier = kKiB;
+    } else if (unit == "MB" || unit == "M" || unit == "MIB") {
+        multiplier = kMiB;
+    } else if (unit == "GB" || unit == "G" || unit == "GIB") {
+        multiplier = kGiB;
+    } else if (unit == "TB" || unit == "T" || unit == "TIB") {
+        multiplier = kTiB;
+    } else if (unit != "B" && !unit.empty()) {
+        return std::nullopt;
     }
-    if (unit == "MB" || unit == "M") {
-        return static_cast<uint64_t>(value * kMiB);
+    // UINT64_MAX can round up as a double, so use an exclusive limit.
+    const double limit =
+        std::ldexp(1.0, std::numeric_limits<uint64_t>::digits) / multiplier;
+    if (!(value >= 0 && value < limit)) {
+        return std::nullopt;
     }
-    if (unit == "GB" || unit == "G") {
-        return static_cast<uint64_t>(value * kGiB);
-    }
-    if (unit == "TB" || unit == "T") {
-        return static_cast<uint64_t>(value * kTiB);
-    }
-    if (unit == "B" || unit.empty()) {
-        return static_cast<uint64_t>(value);
-    }
-    return std::nullopt;
+    return static_cast<uint64_t>(value * multiplier);
 }
 
 [[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
