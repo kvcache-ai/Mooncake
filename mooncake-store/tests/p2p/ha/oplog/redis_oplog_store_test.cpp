@@ -38,6 +38,12 @@
 namespace mooncake {
 namespace {
 
+struct DelayedLatestReply {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::future<void> released{release.get_future()};
+};
+std::atomic<DelayedLatestReply*> delayed_latest_reply{nullptr};
 std::atomic<bool> fail_one_latest_write{false};
 std::atomic<size_t> max_pipelined_sets{0};
 std::atomic<bool> fail_one_pipelined_reply{false};
@@ -89,19 +95,27 @@ extern "C" void* __wrap_redisCommand(redisContext* ctx, const char* format,
     va_start(args, format);
     va_list copy;
     va_copy(copy, args);
+    DelayedLatestReply* delay = nullptr;
     if (std::strcmp(format, "SET %b %b") == 0) {
         const auto* key = va_arg(copy, const char*);
         const auto length = va_arg(copy, size_t);
-        if (std::string_view(key, length).ends_with(":latest") &&
-            fail_one_latest_write.exchange(false)) {
-            va_end(copy);
-            va_end(args);
-            return nullptr;
+        if (std::string_view(key, length).ends_with(":latest")) {
+            if (fail_one_latest_write.exchange(false)) {
+                va_end(copy);
+                va_end(args);
+                return nullptr;
+            }
+            delay = delayed_latest_reply.exchange(nullptr);
         }
     }
     va_end(copy);
     void* return_value = redisvCommand(ctx, format, args);
     va_end(args);
+    if (delay) {
+        // The worker still holds its queue lock until this reply is returned.
+        delay->entered.set_value();
+        delay->released.wait();
+    }
     return return_value;
 }
 
@@ -779,44 +793,6 @@ TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
     EXPECT_EQ(1u, latest);
 }
 
-TEST_F(RedisOpLogStoreTest, LatestStallOnlyTimesBusyPendingWork) {
-    auto& status = HAStatusManager::instance();
-    status.Reset();
-    status.Configure(true, cluster_id_, "test-primary", 1);
-    status.SetLeader("test-primary", 1);
-    status.SetRoleState("primary", "RUNNING");
-    auto has_stall_issue = [&] {
-        return status.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=
-               std::string::npos;
-    };
-    auto writer = CreateWriter();
-    // Seq=3 is persisted but cannot commit latest without seq=1 and seq=2.
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
-    const auto stall_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (!has_stall_issue() &&
-           std::chrono::steady_clock::now() < stall_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_TRUE(has_stall_issue());
-
-    // Additional work does not restart the timer.
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
-    EXPECT_TRUE(has_stall_issue());
-
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
-    uint64_t latest = 0;
-    ASSERT_EQ(writer->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
-    EXPECT_EQ(latest, 3u);
-    EXPECT_FALSE(has_stall_issue());
-
-    // Rewriting an already committed entry cannot arm a new timer.
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), true), ErrorCode::OK);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    EXPECT_FALSE(has_stall_issue());
-    status.Reset();
-}
-
 TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
     for (size_t batch_size : {size_t{0}, kMaxRedisOpLogWriteBatchSize + 1}) {
         auto writer = OpLogStoreFactory::Create(
@@ -920,6 +896,11 @@ class RedisOpLogDoctorTest : public RedisOpLogStoreTest {
                                  std::to_string(count)) != std::string::npos;
     }
 
+    bool HasLatestStall() {
+        return status_.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=
+               std::string::npos;
+    }
+
     HAStatusManager& status_{HAStatusManager::instance()};
     std::unique_ptr<redisContext, decltype(&redisFree)> admin_{nullptr,
                                                                &redisFree};
@@ -955,6 +936,94 @@ TEST_F(RedisOpLogDoctorTest, CommitFailureReportsReasonAndClearsOnRecovery) {
     }));
     EXPECT_EQ(status_.SerializeDoctorJson().find("OPLOG_COMMIT_FAILED"),
               std::string::npos);
+}
+
+TEST_F(RedisOpLogDoctorTest, LatestStallSurvivesRetriesAndNewEntries) {
+    // The fixture's ACL keeps seq=1 failing, so new work cannot advance latest.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] { return HasLatestStall(); }));
+    const auto retries =
+        HAMetricManager::instance().get_oplog_write_retries_total();
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
+    OpLogEntry entry;
+    ASSERT_TRUE(WaitUntil([&] {
+        return writer_->ReadOpLog(3, entry) == ErrorCode::OK &&
+               HAMetricManager::instance().get_oplog_write_retries_total() >
+                   retries;
+    }));
+    EXPECT_TRUE(HasFailureCount(1));
+    EXPECT_TRUE(HasLatestStall());
+    uint64_t latest = 0;
+    ASSERT_EQ(writer_->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 0u);
+
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(WaitUntil([&] {
+        return writer_->GetLocalCommittedSequenceId(latest) == ErrorCode::OK &&
+               latest == 1;
+    }));
+    EXPECT_FALSE(HasLatestStall());  // Progress resets the timer, not new work.
+    ASSERT_TRUE(WaitUntil([&] { return HasLatestStall(); }));
+    EXPECT_TRUE(HasFailureCount(0));  // Seq=3 still waits for missing seq=2.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    EXPECT_FALSE(HasLatestStall());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());  // No timer after all pending work drains.
+}
+
+TEST_F(RedisOpLogDoctorTest, CommittedRewritesDoNotStartLatestStallTimer) {
+    ASSERT_EQ(writer_->UpdateLatestSequenceId(1), ErrorCode::OK);
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] { return HasFailureCount(1); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());  // Even a failed rewrite needs no advance.
+
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), false), ErrorCode::OK);
+    EXPECT_FALSE(HasLatestStall());
+    ASSERT_TRUE(WaitUntil([&] { return HasLatestStall(); }));
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(writer_->DrainWriting(3000).drained);
+    EXPECT_FALSE(HasLatestStall());
+    // Preserve the old test's coverage of successful committed rewrites too.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());
+}
+
+TEST_F(RedisOpLogDoctorTest, LatestStallIsReadableWhileRedisReplyIsBlocked) {
+    ASSERT_TRUE(AllowEntries("*"));
+    DelayedLatestReply delay;
+    auto entered = delay.entered.get_future();
+    std::future<std::string> diagnosis;
+    std::future<void> stop;
+    {
+        // Release before joining workers or destroying futures, even on ASSERT.
+        struct ReleaseReply {
+            DelayedLatestReply& delay;
+            RedisOpLogStore& writer;
+            ~ReleaseReply() {
+                delayed_latest_reply.store(nullptr);
+                delay.release.set_value();
+                writer.StopWriting();
+            }
+        } cleanup{delay, *writer_};
+        delayed_latest_reply.store(&delay);
+        ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+        ASSERT_EQ(entered.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        diagnosis = std::async(std::launch::async,
+                               [&] { return status_.SerializeDoctorJson(); });
+        EXPECT_EQ(diagnosis.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+        stop = std::async(std::launch::async,
+                          [&] { writer_->RequestStopWriting(); });
+        EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+    }
+    stop.get();
+    EXPECT_NE(diagnosis.get().find("OPLOG_LATEST_STALLED"), std::string::npos);
+    EXPECT_FALSE(HasLatestStall());
 }
 
 TEST_F(RedisOpLogDoctorTest, TracksFailuresUntilEachEntryRecovers) {
@@ -1011,6 +1080,16 @@ TEST_F(RedisOpLogDoctorTest, DroppingLastFailedEntryClearsIssue) {
         return HAMetricManager::instance().get_oplog_async_queue_size() == 0;
     }));
     EXPECT_TRUE(HasFailureCount(0));
+    uint64_t latest = 0;
+    ASSERT_EQ(writer_->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 0u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());  // A dropped-only tail is idle.
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    ASSERT_EQ(writer_->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 2u);  // Later progress can bridge the allowed hole.
+    EXPECT_FALSE(HasLatestStall());
 }
 
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
