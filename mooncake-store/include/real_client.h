@@ -1441,7 +1441,7 @@ class RealClient : public PyClient {
         const std::string &object_key, ErrorCode error,
         std::vector<int> &results);
 
-    tl::expected<void, ErrorCode> Setup(const ClientConfig &config);
+    tl::expected<void, ErrorCode> Setup(ClientConfig config);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;

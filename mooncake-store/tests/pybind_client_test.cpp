@@ -135,7 +135,7 @@ TEST(ClientConfigTest, EmbeddedMasterDefaultsPreserveExplicitValues) {
     parsed->ResolveOverrides(true, false, 9300);
     EXPECT_TRUE(parsed->enable_embedded_master);
     EXPECT_EQ(parsed->metadata_server, "P2PHANDSHAKE");
-    EXPECT_EQ(parsed->master_server_addr, "");
+    EXPECT_EQ(parsed->master_server_addr, DEFAULT_MASTER_SERVER_ADDR);
     EXPECT_TRUE(parsed->Validate().has_value());
 
     auto explicit_values = ParseClientConfig(
@@ -148,6 +148,15 @@ TEST(ClientConfigTest, EmbeddedMasterDefaultsPreserveExplicitValues) {
     EXPECT_TRUE(explicit_values->enable_embedded_master);
     EXPECT_EQ(explicit_values->metadata_server, "http://metadata/metadata");
     EXPECT_EQ(explicit_values->master_server_addr, "master:50051");
+
+    auto empty_master =
+        ParseClientConfig({{CONFIG_KEY_LOCAL_HOSTNAME, "localhost"},
+                           {CONFIG_KEY_MASTER_SERVER_ADDR, ""}});
+    ASSERT_TRUE(empty_master.has_value());
+    empty_master->ResolveOverrides(false, false, 9300);
+    EXPECT_EQ(empty_master->master_server_addr, "");
+    empty_master->ResolveOverrides(true, false, 9300);
+    EXPECT_EQ(empty_master->master_server_addr, "");
 }
 
 TEST(ClientConfigTest, HttpFlagsPreserveEnableAndPortPrecedence) {

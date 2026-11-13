@@ -26,7 +26,7 @@ struct ClientConfig {
     size_t local_buffer_size = DEFAULT_LOCAL_BUFFER_SIZE;
     std::string protocol = DEFAULT_PROTOCOL;
     std::string rdma_devices;
-    std::optional<std::string> master_server_addr = DEFAULT_MASTER_SERVER_ADDR;
+    std::string master_server_addr = DEFAULT_MASTER_SERVER_ADDR;
     std::shared_ptr<TransferEngine> transfer_engine;
     std::string ipc_socket_path;
     int local_rpc_port = 50052;
@@ -48,11 +48,6 @@ struct ClientConfig {
                           bool http_server_from_flags,
                           int http_port_from_flags) {
         enable_embedded_master |= embedded_master_from_environment;
-        if (!master_server_addr) {
-            master_server_addr = enable_embedded_master
-                                     ? std::string()
-                                     : std::string(DEFAULT_MASTER_SERVER_ADDR);
-        }
         if (metadata_server.empty() && enable_embedded_master &&
             !transfer_engine) {
             metadata_server = "P2PHANDSHAKE";
@@ -167,10 +162,8 @@ inline tl::expected<ClientConfig, ErrorCode> ParseClientConfig(
     config.metadata_server = Get(input, CONFIG_KEY_METADATA_SERVER);
     config.protocol = Get(input, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     config.rdma_devices = Get(input, CONFIG_KEY_RDMA_DEVICES);
-    const auto master = input.find(CONFIG_KEY_MASTER_SERVER_ADDR);
-    config.master_server_addr = master == input.end()
-                                    ? std::nullopt
-                                    : std::make_optional(master->second);
+    config.master_server_addr =
+        Get(input, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
     config.ipc_socket_path = Get(input, CONFIG_KEY_IPC_SOCKET_PATH);
     config.start_offload_rpc_server = true;
     config.ssd_offload_path = Get(input, "ssd_offload_path");

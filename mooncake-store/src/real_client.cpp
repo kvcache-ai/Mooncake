@@ -1043,7 +1043,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     });
 }
 
-tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
+tl::expected<void, ErrorCode> RealClient::Setup(ClientConfig config) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
@@ -1078,7 +1078,6 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
-    ClientConfig config = input;
     const bool embedded_master_from_environment =
         !config.enable_embedded_master &&
         Environ::Process().GetTypedOr(
@@ -1099,23 +1098,6 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     const auto valid = config.Validate();
     if (!valid) return tl::unexpected(valid.error());
 
-    const auto &egm_config = config.egm;
-    const auto &local_hostname = config.local_hostname;
-    const auto &metadata_server = config.metadata_server;
-    auto global_segment_size = config.global_segment_size;
-    const auto local_buffer_size = config.local_buffer_size;
-    const auto &protocol = config.protocol;
-    const auto &rdma_devices = config.rdma_devices;
-    const auto &master_server_addr = *config.master_server_addr;
-    const auto &transfer_engine = config.transfer_engine;
-    const auto &ipc_socket_path = config.ipc_socket_path;
-    const auto local_rpc_port = config.local_rpc_port;
-    const auto enable_ssd_offload = config.enable_ssd_offload;
-    const auto start_offload_rpc_server = config.start_offload_rpc_server;
-    const auto &tenant_id = config.tenant_id;
-    const auto enable_client_http_server = config.enable_client_http_server;
-    const auto client_http_port = config.client_http_port;
-    const auto enable_embedded_master = config.enable_embedded_master;
     enable_ssd_prefetch_ = config.enable_ssd_prefetch;
     ssd_prefetch_cooldown_sec_ = config.ssd_prefetch_cooldown_sec;
     ssd_prefetch_dedup_ttl_sec_ = config.ssd_prefetch_dedup_ttl_sec;
@@ -1123,11 +1105,11 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
 
-    this->protocol = protocol;
-    this->ipc_socket_path_ = ipc_socket_path;
+    this->protocol = config.protocol;
+    this->ipc_socket_path_ = config.ipc_socket_path;
 #ifdef USE_ASCEND_DIRECT
-    if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
-        auto ascend_setup = setup_ascend_internal(local_buffer_size);
+    if (config.protocol == "ascend" && globalConfig().ascend_agent_mode) {
+        auto ascend_setup = setup_ascend_internal(config.local_buffer_size);
         if (!ascend_setup) return ascend_setup;
         if (!ContextManager::getInstance().setCurrentContext(0)) {
             LOG(ERROR) << "Failed to set current context for device " << 0;
@@ -1142,14 +1124,14 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     nof_runtime_ = nof_factory ? nof_factory() : CreateNofRuntime();
 
     std::optional<std::string> device_name =
-        ((rdma_devices.empty() || rdma_devices == "auto-discovery")
+        ((config.rdma_devices.empty() ||
+          config.rdma_devices == "auto-discovery")
              ? std::nullopt
-             : std::make_optional(rdma_devices));
+             : std::make_optional(config.rdma_devices));
 
-    std::string resolved_master_server_addr = master_server_addr;
-    std::string resolved_metadata_server = metadata_server;
-    if (enable_embedded_master) {
-        auto started = StartEmbeddedMaster(enable_ssd_offload);
+    std::string resolved_master_server_addr = config.master_server_addr;
+    if (config.enable_embedded_master) {
+        auto started = StartEmbeddedMaster(config.enable_ssd_offload);
         if (!started) {
             return tl::unexpected(started.error());
         }
@@ -1157,18 +1139,19 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     }
 
     // Check if hostname already contains a port
-    const std::string &hostname = local_hostname;
-    bool user_specified_port = hasExplicitPort(hostname);
+    bool user_specified_port = hasExplicitPort(config.local_hostname);
 
     if (user_specified_port) {
         // User specified port, no retry needed
-        this->local_hostname = local_hostname;
-        this->local_rpc_addr = buildHostNameWithPort(
-            getHostNameWithoutPort(hostname), local_rpc_port);
+        this->local_hostname = config.local_hostname;
+        this->local_rpc_addr =
+            buildHostNameWithPort(getHostNameWithoutPort(config.local_hostname),
+                                  config.local_rpc_port);
         auto client_opt = mooncake::Client::Create(
-            this->local_hostname, resolved_metadata_server, protocol,
-            device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+            this->local_hostname, config.metadata_server, config.protocol,
+            device_name, resolved_master_server_addr, config.transfer_engine,
+            {{"client_mode", "real"}}, config.tenant_id,
+            nof_runtime_.initiator);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1193,13 +1176,15 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                 continue;
             }
 
-            this->local_hostname = buildHostNameWithPort(hostname, port);
-            this->local_rpc_addr =
-                buildHostNameWithPort(hostname, local_rpc_port);
+            this->local_hostname =
+                buildHostNameWithPort(config.local_hostname, port);
+            this->local_rpc_addr = buildHostNameWithPort(config.local_hostname,
+                                                         config.local_rpc_port);
             auto client_opt = mooncake::Client::Create(
-                this->local_hostname, resolved_metadata_server, protocol,
-                device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+                this->local_hostname, config.metadata_server, config.protocol,
+                device_name, resolved_master_server_addr,
+                config.transfer_engine, {{"client_mode", "real"}},
+                config.tenant_id, nof_runtime_.initiator);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1224,7 +1209,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
         }
     }
 
-    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
+    if (config.egm.enabled && !client_->HasClassicTransport("nvlink")) {
         LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
                       "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1246,7 +1231,8 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     // (protocol-specific allocation -> VRAM -> aligned_alloc).
     try {
         client_buffer_allocator_ = ClientBufferAllocator::create(
-            local_buffer_size, this->protocol, use_hugepage_for_client_buffer,
+            config.local_buffer_size, this->protocol,
+            use_hugepage_for_client_buffer,
             nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
     } catch (const std::bad_alloc &) {
         // The NoF DMA allocator yields nullptr when the SPDK env is
@@ -1257,11 +1243,11 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                       "hugepage/SPDK environment)";
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (local_buffer_size > 0 && protocol != "cxl") {
-        LOG(INFO) << "Registering local memory: " << local_buffer_size
+    if (config.local_buffer_size > 0 && config.protocol != "cxl") {
+        LOG(INFO) << "Registering local memory: " << config.local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), local_buffer_size,
+            client_buffer_allocator_->getBase(), config.local_buffer_size,
             kWildcardLocation, client_->SupportsGatherRead(), true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
@@ -1272,7 +1258,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_ = WritableBufferRegion{
                 .base = client_buffer_allocator_->getBase(),
-                .size = local_buffer_size,
+                .size = config.local_buffer_size,
                 .offset = 0,
             };
         }
@@ -1283,13 +1269,14 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     // If global_segment_size is 0, skip mount segment. Transports with a
     // registration limit split it into balanced chunks; other transports use
     // one segment.
-    if (protocol == "cxl") {
+    if (config.protocol == "cxl") {
         const size_t cxl_dev_size = *config.cxl_device_size;
 
         void *ptr = client_->GetBaseAddr();
         LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
                   << ptr;
-        auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
+        auto mount_result =
+            client_->MountSegment(ptr, cxl_dev_size, config.protocol);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
@@ -1297,16 +1284,17 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
         }
 
     } else {
-        uint64_t total_glbseg_size = global_segment_size;  // For logging
+        size_t remaining_segment_size = config.global_segment_size;
+        uint64_t total_glbseg_size = remaining_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
 
-        auto split_limit = GetTransportRegistrationLimit(protocol);
+        auto split_limit = GetTransportRegistrationLimit(config.protocol);
         size_t alignment = facebook::cachelib::Slab::kSize;
         std::vector<int> egm_numa_nodes;
         std::vector<size_t> egm_node_sizes;
         size_t egm_node_index = 0;
-        if (egm_config.enabled) {
-            if (egm_config.auto_numa_nodes) {
+        if (config.egm.enabled) {
+            if (config.egm.auto_numa_nodes) {
                 auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
                     egm_numa_nodes);
                 if (!status.ok()) {
@@ -1314,7 +1302,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
                 }
             } else {
-                egm_numa_nodes = egm_config.numa_nodes;
+                egm_numa_nodes = config.egm.numa_nodes;
             }
             std::vector<size_t> granularities;
             for (int node : egm_numa_nodes) {
@@ -1330,27 +1318,28 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                 granularities.push_back(granularity);
             }
             auto capacity = CalculateEgmStorePoolCapacity(
-                global_segment_size, granularities, alignment,
+                remaining_segment_size, granularities, alignment,
                 static_cast<size_t>(globalConfig().max_mr_size));
             if (!capacity) return tl::unexpected(capacity.error());
             alignment = capacity->alignment;
             split_limit = capacity->max_chunk_size;
             egm_node_sizes = std::move(capacity->node_sizes);
-            global_segment_size = (global_segment_size / alignment) * alignment;
+            remaining_segment_size =
+                (remaining_segment_size / alignment) * alignment;
             LOG(INFO) << "EGM Store capacity: requested=" << total_glbseg_size
-                      << " effective=" << global_segment_size
+                      << " effective=" << remaining_segment_size
                       << " alignment=" << alignment;
-            total_glbseg_size = global_segment_size;
+            total_glbseg_size = remaining_segment_size;
         }
 #ifdef USE_ASCEND_DIRECT
-        if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
-            const size_t cap = AgentModeStoreChunkCap(global_segment_size);
+        if (config.protocol == "ascend" && globalConfig().ascend_agent_mode) {
+            const size_t cap = AgentModeStoreChunkCap(remaining_segment_size);
             if (cap > 0) {
                 if (!split_limit.has_value() || cap < *split_limit) {
                     split_limit = cap;
                 }
                 LOG(INFO) << "Agent mode splits the store segment of "
-                          << global_segment_size << " bytes across "
+                          << remaining_segment_size << " bytes across "
                           << ContextManager::getInstance().getDeviceCount()
                           << " devices, at most " << cap
                           << " bytes on each device";
@@ -1364,7 +1353,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
         const bool partition_numa =
             ReplicaSelectionConfig::FromEnvironment().hca_numa_segments_enabled;
         std::vector<int> seg_numa_nodes;
-        if (protocol == "rdma") {
+        if (config.protocol == "rdma") {
             // Only the NIC nodes this process may allocate from: binding a
             // region to a node outside its cpuset fails setup with EINVAL.
             seg_numa_nodes =
@@ -1385,7 +1374,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
 
         if (partition_numa && !seg_numa_nodes.empty()) {
             const auto numa_limit = align_up(
-                DivideRoundUp(global_segment_size, seg_numa_nodes.size()),
+                DivideRoundUp(remaining_segment_size, seg_numa_nodes.size()),
                 alignment);
             if (!split_limit || numa_limit < *split_limit) {
                 split_limit = numa_limit;
@@ -1394,19 +1383,20 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
         size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
-            (protocol == "rdma" || protocol == "efa") && use_hugepage_;
+            (config.protocol == "rdma" || config.protocol == "efa") &&
+            use_hugepage_;
 
-        while (global_segment_size > 0) {
+        while (remaining_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(
-                egm_config.enabled ? egm_node_sizes[egm_node_index]
-                                   : global_segment_size,
+                config.egm.enabled ? egm_node_sizes[egm_node_index]
+                                   : remaining_segment_size,
                 split_limit, alignment);
             if (segment_size == 0) {
                 LOG(ERROR) << "Registration limit is smaller than segment "
                               "alignment";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            global_segment_size -= segment_size;
+            remaining_segment_size -= segment_size;
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
@@ -1415,7 +1405,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
             std::vector<int> segment_numa_nodes;
 
-            if (egm_config.enabled) {
+            if (config.egm.enabled) {
                 auto status = NvlinkHostNumaAllocation::Create(
                     egm_numa_nodes[egm_node_index], segment_size, alignment,
                     egm_owner);
@@ -1457,12 +1447,13 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                         ? "cpu:" + std::to_string(segment_numa_nodes[0])
                         : buildSegmentsLocation(page_sz, segment_numa_nodes);
 #ifdef USE_ASCEND_DIRECT
-            } else if (protocol == "ascend" || protocol == "ubshmem") {
+            } else if (config.protocol == "ascend" ||
+                       config.protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
                     segment_size, this->protocol, use_hugepage_,
                     parallel_hugetlb_population, &mapped_size);
 #elif defined(USE_MEMFABRIC)
-            } else if (protocol == "ascend") {
+            } else if (config.protocol == "ascend") {
                 ptr = AllocateMemFabricStoreSegment(
                     segment_size, this->protocol, use_hugepage_,
                     parallel_hugetlb_population, &mapped_size);
@@ -1474,14 +1465,14 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
 #ifndef USE_VRAM_SEGMENT
-            } else if (protocol == "efa") {
+            } else if (config.protocol == "efa") {
                 // EFA host segments must be THP backed and must not pile up
                 // on one NUMA node; see allocate_buffer_thp().
                 mapped_size = align_up(segment_size, SZ_2MB);
                 ptr = allocate_buffer_thp(mapped_size,
                                           ThpNumaPolicy::kInterleaveIfDefault);
                 use_mmap_segment = true;
-            } else if (protocol == "rdma") {
+            } else if (config.protocol == "rdma") {
                 // At most one usable NIC NUMA node: THP backed like the
                 // NUMA-segmented path, under the task's own NUMA policy.
                 mapped_size = align_up(segment_size, SZ_2MB);
@@ -1499,13 +1490,13 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             const size_t mount_size =
-                egm_config.enabled || !split_limit.has_value() ? mapped_size
+                config.egm.enabled || !split_limit.has_value() ? mapped_size
                                                                : segment_size;
             current_glbseg_size += mount_size;
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (egm_config.enabled) {
+            if (config.egm.enabled) {
                 egm_segment_ptrs_.emplace_back(std::move(egm_owner));
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
@@ -1566,8 +1557,8 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
 
             auto pinned_region =
                 TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
-            auto mount_result =
-                client_->MountSegment(ptr, mount_size, protocol, seg_location);
+            auto mount_result = client_->MountSegment(
+                ptr, mount_size, config.protocol, seg_location);
             if (!mount_result.has_value()) {
                 if (!ReleasePinnedRegionForFree(pinned_region,
                                                 "Store setup segment")) {
@@ -1581,7 +1572,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                 setup_segment_pinned_regions_.push_back(
                     std::move(pinned_region));
             }
-            if (egm_config.enabled) {
+            if (config.egm.enabled) {
                 egm_node_sizes[egm_node_index] -= segment_size;
                 if (egm_node_sizes[egm_node_index] == 0) ++egm_node_index;
             }
@@ -1590,7 +1581,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
             LOG(INFO) << "Global segment size is 0, skip mounting segment";
         }
 #ifdef USE_ASCEND_DIRECT
-        if (protocol == "ascend" && globalConfig().ascend_agent_mode &&
+        if (config.protocol == "ascend" && globalConfig().ascend_agent_mode &&
             !RestoreAgentModeDeviceZero()) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -1605,7 +1596,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
-    if (enable_ssd_offload && start_offload_rpc_server) {
+    if (config.enable_ssd_offload && config.start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
         offload_rpc_server_ =
@@ -1647,7 +1638,7 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
             return init_result;
         }
     }
-    if (enable_ssd_offload) {
+    if (config.enable_ssd_offload) {
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.
@@ -1656,8 +1647,8 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
         // hits the scoped index and would report every healthy file gone.
         std::weak_ptr<FileStorage> weak_storage = file_storage_;
         client_->SetLocalDiskProbe(
-            [weak_storage,
-             tenant_id](const std::string &key) -> std::optional<bool> {
+            [weak_storage, tenant_id = config.tenant_id](
+                const std::string &key) -> std::optional<bool> {
                 auto storage = weak_storage.lock();
                 if (!storage) {
                     return std::nullopt;
@@ -1686,10 +1677,10 @@ tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
                   << CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC << "="
                   << ssd_prefetch_dedup_ttl_sec_ << "s";
     }
-    if (enable_client_http_server) {
-        if (start_http_server(client_http_port) != 0) {
+    if (config.enable_client_http_server) {
+        if (start_http_server(config.client_http_port) != 0) {
             LOG(WARNING) << "Failed to start client HTTP server on port "
-                         << client_http_port
+                         << config.client_http_port
                          << "; continuing without HTTP endpoints";
         }
     }
@@ -1717,15 +1708,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
     auto parsed = ParseClientConfig(config);
     if (!parsed) return tl::unexpected(parsed.error());
+    const bool cleanup_egm_on_failure = parsed->egm.enabled;
     try {
-        auto result = Setup(*parsed);
-        if (!result && parsed->egm.enabled) {
+        auto result = Setup(std::move(*parsed));
+        if (!result && cleanup_egm_on_failure) {
             (void)tearDownAll_internal();
         }
         return result;
     } catch (...) {
         // EGM setup can own registrations even when initialization fails.
-        if (parsed->egm.enabled) (void)tearDownAll_internal();
+        if (cleanup_egm_on_failure) (void)tearDownAll_internal();
         throw;
     }
 }
