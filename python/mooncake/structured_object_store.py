@@ -3928,13 +3928,14 @@ class _StructuredObjectLayer:
         if step != 1:
             raise ValueError("structured tensor slicing currently requires step=1")
         row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
+        selected_rows = max(0, end - start)
         data_offset = metadata_bytes + start * row_width
-        data_length = (end - start) * row_width
+        data_length = selected_rows * row_width
         metadata = self._bundle_store.read_payload_range(
             payload_spec, 0, metadata_bytes
         )
         sliced_metadata = _slice_tensor_metadata(
-            metadata, (end - start, *shape[1:]), data_length
+            metadata, (selected_rows, *shape[1:]), data_length
         )
         if destination is not None:
             if not isinstance(

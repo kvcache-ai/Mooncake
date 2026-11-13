@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import struct
 import threading
 import time
 from types import MappingProxyType
@@ -2347,6 +2348,79 @@ def test_structured_object_torch_tensor_slice_uses_range_reads() -> None:
 
     assert torch.equal(result.objects["tensor"], tensor[3:9])
     assert store.get_into_ranges_calls >= 2
+
+
+@pytest.mark.parametrize("shape", [(6,), (6, 2)])
+@pytest.mark.parametrize("start,end", [(3, 1), (20, 1), (-1, -4), (3, 3), (1, 3)])
+def test_structured_tensor_slice_raw_destination(shape, start, end) -> None:
+    """Empty forward slices must write zero rows and zero payload bytes."""
+    _store, transfer = make_transfer(NoTensorFastPathStore())
+    values = np.arange(np.prod(shape), dtype=np.int64).reshape(shape)
+    # TensorMetadata's full wire layout from integration_utils.h: a 40-byte
+    # header, two 8-dimension shapes, axis count/reserved and four LayoutAxes.
+    # No native codec is needed for the caller-owned raw destination path.
+    metadata = bytearray(304)
+    struct.pack_into(
+        "=IHHiiIIQQ",
+        metadata,
+        0,
+        0x4D4F4F4E,
+        1,
+        len(metadata),
+        8,
+        len(shape),
+        0,
+        0,
+        len(metadata),
+        values.nbytes,
+    )
+    dimensions = (*shape, *([-1] * (8 - len(shape))))
+    struct.pack_into("=16q", metadata, 40, *dimensions, *dimensions)
+    ref = transfer.put_bundle(
+        meta=b"", buffers={"tensor": bytes(metadata) + values.tobytes()}
+    )
+    payload_spec = dict(ref.manifest["buffers"]["tensor"], metadata_bytes=len(metadata))
+    output = ctypes.create_string_buffer(len(metadata) + values.nbytes)
+    destination = raw_destination(ctypes.addressof(output), len(output), output)
+
+    result = transfer._structured_store._read_sliced_torch_tensor_member(
+        "tensor",
+        payload_spec,
+        {"shape": list(shape), "element_size": values.itemsize},
+        sos.StructuredMemberSlice(axis=0, start=start, end=end),
+        destination,
+    )
+
+    expected = values[start:end]
+    assert result is destination
+    assert struct.unpack_from("=Q", output.raw, 32)[0] == expected.nbytes
+    assert struct.unpack_from(f"={len(shape)}q", output.raw, 40) == expected.shape
+    assert struct.unpack_from(f"={len(shape)}q", output.raw, 104) == expected.shape
+    assert (
+        output.raw[len(metadata) : len(metadata) + expected.nbytes]
+        == expected.tobytes()
+    )
+
+
+@pytest.mark.parametrize("start,end", [(3, 1), (20, 1), (-1, -4)])
+def test_structured_object_torch_tensor_empty_forward_slice(start, end) -> None:
+    torch = pytest.importorskip("torch")
+    mooncake_store = pytest.importorskip("mooncake._store")
+    if not hasattr(mooncake_store, "_serialize_tensor") or not hasattr(
+        mooncake_store, "_deserialize_tensor"
+    ):
+        pytest.skip("built mooncake.store lacks tensor serialization helpers")
+    _store, transfer = make_transfer(NoTensorFastPathStore())
+    tensor = torch.arange(6, dtype=torch.int64)
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"tensor": tensor})
+    )
+
+    result = transfer.materialize(
+        transfer.read_spec(ref).slice_member("tensor", axis=0, start=start, end=end)
+    )
+
+    assert torch.equal(result.objects["tensor"], tensor[start:end])
 
 
 def test_structured_object_direct_torch_tensor_slice_uses_real_store_ranges() -> None:
