@@ -1578,8 +1578,8 @@ void BindP2PMethods(StoreBinding& store) {
                uint64_t metric_report_interval_seconds = 60,
                uint16_t heartbeat_rpc_port = 0, bool start_local_only = false,
                size_t te_async_poll_worker_num = 32,
-               size_t business_coro_worker_num = 32) {
-                auto real_client = self.init_real_client();
+               size_t business_coro_worker_num = 32,
+               int32_t heartbeat_rpc_timeout_ms = 1000) {
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
@@ -1604,8 +1604,9 @@ void BindP2PMethods(StoreBinding& store) {
                     enable_metric_collection, metric_report_interval_seconds,
                     DEFAULT_CLUSTER_ID, "", 0, 4, 1, "", heartbeat_rpc_port,
                     te_async_poll_worker_num, start_local_only,
-                    business_coro_worker_num);
+                    business_coro_worker_num, heartbeat_rpc_timeout_ms);
 
+                auto real_client = self.init_real_client();
                 auto ret = real_client->setup(config);
                 return ret;
             },
@@ -1633,6 +1634,7 @@ void BindP2PMethods(StoreBinding& store) {
             py::arg("start_local_only") = false,
             py::arg("te_async_poll_worker_num") = 32,
             py::arg("business_coro_worker_num") = 32,
+            py::arg("heartbeat_rpc_timeout_ms") = 1000,
             "Setup the store in P2P architecture. start_local_only skips "
             "Master "
             "connection and heartbeat until an explicit POST /register.")
@@ -1689,7 +1691,9 @@ void BindP2PMethods(StoreBinding& store) {
             "  async_route_queue_size: Async route queue size (default 0).\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  heartbeat_rpc_port: Dedicated heartbeat RPC port on the master "
-            "(0 uses the main RPC port, default 0).");
+            "(0 uses the main RPC port, default 0).\n"
+            "  heartbeat_rpc_timeout_ms: Client heartbeat connection/request "
+            "timeout in milliseconds (positive, default 1000).");
 }
 
 #else

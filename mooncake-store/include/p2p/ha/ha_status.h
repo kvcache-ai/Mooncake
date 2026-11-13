@@ -155,12 +155,13 @@ class HAStatusManager {
     void ClearLastErrorIfPrefix(std::string prefix);
     void RecordRegistryHeartbeat(ErrorCode result, std::string error);
     // Event-driven flag set from the P2P election readiness wait loop and
-    // Redis election callback when the standby oplog lag exceeds the readiness
-    // gate, cleared once the standby catches up or stops trying to win
-    // election. The doctor report formats the message at query time from the
-    // stored decision values and the current snapshot.
-    void SetElectionReadinessBlocked(bool blocked, uint64_t lag_entries = 0,
-                                     uint64_t max_lag_entries = 0);
+    // Redis election callback when latest is unknown or lag exceeds the gate.
+    // Capture the same sample used for the decision, independently of status
+    // updates from background replication. Clear when ready or election ends.
+    void SetElectionReadinessBlocked(
+        bool blocked, uint64_t applied_sequence_id = 0,
+        std::optional<uint64_t> latest_sequence_id = std::nullopt,
+        uint64_t max_lag_entries = 0);
 
     HAStatusSnapshot Snapshot() const;
     std::string SerializeJson() const;
@@ -249,9 +250,12 @@ class HAStatusManager {
         std::optional<std::chrono::steady_clock::time_point> last_success_at;
         int64_t last_success_ms{0};
     } oplog_poll_;
-    bool election_readiness_blocked_{false};
-    uint64_t election_readiness_blocked_lag_{0};
-    uint64_t election_readiness_blocked_max_{0};
+    struct ElectionReadiness {
+        bool blocked{false};
+        uint64_t applied_sequence_id{0};
+        std::optional<uint64_t> latest_sequence_id;
+        uint64_t max_lag_entries{0};
+    } election_readiness_;
 };
 
 }  // namespace mooncake

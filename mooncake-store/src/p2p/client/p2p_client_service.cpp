@@ -436,6 +436,13 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         LOG(ERROR) << "Cannot initialize an active or stopped P2P service";
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
+    const auto heartbeat_config_result =
+        master_client_.SetHeartbeatRpcTimeoutMs(
+            config.heartbeat_rpc_timeout_ms);
+    if (heartbeat_config_result != ErrorCode::OK) {
+        // SetHeartbeatRpcTimeoutMs already logs the configuration error.
+        return heartbeat_config_result;
+    }
     transfer_direction_mode_ = config.transfer_direction_mode;
     master_client_.SetHeartbeatRpcPort(config.heartbeat_rpc_port);
     // Reuse this entry when a LOCAL_ONLY service rejoins the cluster.

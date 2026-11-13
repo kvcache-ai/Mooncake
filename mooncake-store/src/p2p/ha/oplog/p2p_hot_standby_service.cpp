@@ -32,29 +32,38 @@ P2PSnapshotSourceSelection SelectP2PSnapshotSources(
                    (!self_snapshot_endpoint.empty() &&
                     master.snapshot_endpoint == self_snapshot_endpoint);
         };
-    auto eligible_source = [&is_self, trimmed_sequence_id](
-                               const RedisMasterRegistryEntry& master) {
-        return !is_self(master) &&
-               master.applied_sequence_id >= trimmed_sequence_id &&
-               !master.snapshot_endpoint.empty();
-    };
-
     P2PSnapshotSourceSelection selection;
+    selection.alive_count = masters.size();
+    std::vector<std::string> primary_endpoints;
     for (const auto& master : masters) {
-        if (eligible_source(master) && master.role == "standby" &&
-            master.snapshot_ready) {
-            selection.endpoints.push_back(master.snapshot_endpoint);
+        if (is_self(master)) {
+            ++selection.excluded_self_count;
+        } else if (master.snapshot_endpoint.empty()) {
+            ++selection.excluded_unavailable_count;
+        } else if (master.applied_sequence_id < trimmed_sequence_id) {
+            ++selection.excluded_stale_count;
+        } else if (master.role == "standby") {
+            if (master.snapshot_ready) {
+                selection.endpoints.push_back(master.snapshot_endpoint);
+                ++selection.qualified_standby_count;
+            } else {
+                ++selection.excluded_unavailable_count;
+            }
+        } else if (master.role == "primary") {
+            primary_endpoints.push_back(master.snapshot_endpoint);
+        } else {
+            ++selection.excluded_role_count;
         }
     }
-    if (!selection.endpoints.empty()) {
-        return selection;
+    if (selection.endpoints.empty()) {
+        selection.primary_fallback_count = primary_endpoints.size();
+        selection.endpoints = std::move(primary_endpoints);
+        selection.used_primary_fallback = !selection.endpoints.empty();
+    } else {
+        selection.excluded_primary_not_used_count = primary_endpoints.size();
     }
-    for (const auto& master : masters) {
-        if (eligible_source(master) && master.role == "primary") {
-            selection.endpoints.push_back(master.snapshot_endpoint);
-        }
-    }
-    selection.used_primary_fallback = !selection.endpoints.empty();
+    selection.excluded_count =
+        selection.alive_count - selection.endpoints.size();
     return selection;
 }
 #endif
@@ -147,7 +156,7 @@ ErrorCode P2PHotStandbyService::Start(
                 (probe_store->GetTrimmedSequenceId(
                      current_trimmed_sequence_id) != ErrorCode::OK ||
                  baseline_sequence_id < current_trimmed_sequence_id)) {
-                LOG(WARNING)
+                LOG_EVERY_N(WARNING, 50)
                     << "P2PHotStandbyService: snapshot baseline is "
                        "behind current trim horizon"
                     << ", baseline_sequence_id=" << baseline_sequence_id
@@ -169,13 +178,15 @@ ErrorCode P2PHotStandbyService::Start(
             if (bootstrap_required) {
                 LOG(ERROR) << "P2PHotStandbyService: required snapshot "
                               "bootstrap failed"
+                           << ", error=" << toString(bootstrap_err)
                            << ", baseline_sequence_id=" << baseline_sequence_id
                            << ", trimmed_sequence_id=" << trimmed_sequence_id;
                 state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
                 return bootstrap_err;
             }
-            LOG(WARNING) << "P2PHotStandbyService: optional peer bootstrap "
-                            "failed; falling back to OpLog replay";
+            // BootstrapFromSnapshotSources records the aggregate failure.
+            VLOG(1) << "P2PHotStandbyService: optional peer bootstrap "
+                       "failed; falling back to OpLog replay";
         } else {
             snapshot_bootstrap_succeeded = true;
         }
@@ -278,8 +289,9 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
             ? std::shared_ptr<OpLogStore>(std::move(prepared_reader_store))
             : CreateReaderStore();
     if (!watcher_oplog_store_) {
-        LOG(ERROR) << "P2PHotStandbyService: failed to create reader store"
-                   << ", cluster_id=" << config_.cluster_id;
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to create reader store"
+            << ", cluster_id=" << config_.cluster_id;
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -287,7 +299,7 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     oplog_change_notifier_ = watcher_oplog_store_->CreateChangeNotifier(
         config_.cluster_id, config_.oplog_poll_batch_size);
     if (!oplog_change_notifier_) {
-        LOG(ERROR)
+        LOG_EVERY_N(WARNING, 50)
             << "P2PHotStandbyService: failed to create OpLogChangeNotifier"
             << ", cluster_id=" << config_.cluster_id;
         return ErrorCode::INTERNAL_ERROR;
@@ -309,7 +321,8 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
         }
     }
 
-    LOG(ERROR) << "P2PHotStandbyService: failed to start OpLogReplicator";
+    LOG_EVERY_N(WARNING, 50)
+        << "P2PHotStandbyService: failed to start OpLogReplicator";
     return ErrorCode::INTERNAL_ERROR;
 }
 
@@ -580,6 +593,12 @@ bool P2PHotStandbyService::IsReadyForSnapshot() const {
            applied_sequence_id >= trimmed_sequence_id;
 }
 
+bool P2PHotStandbyService::CanServeSnapshot() const {
+    return snapshot_server_running_.load(std::memory_order_acquire) &&
+           IsReadyForSnapshot() &&
+           snapshot_server_running_.load(std::memory_order_acquire);
+}
+
 uint64_t P2PHotStandbyService::GetLatestAppliedSequenceId() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return GetLocalLastAppliedSequenceIdLocked();
@@ -624,6 +643,11 @@ ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
         static thread_local std::mt19937 generator(std::random_device{}());
         std::shuffle(endpoints.begin(), endpoints.end(), generator);
     }
+    // Bound normal log volume even for a large configured source list. Full
+    // per-source diagnostics remain available at verbosity 2.
+    constexpr size_t kMaxReportedSourceErrors = 8;
+    std::string source_errors;
+    size_t reported_errors = 0;
     for (const auto& endpoint : endpoints) {
         uint64_t source_sequence_id = 0;
         auto err = client.Bootstrap(endpoint, config_.cluster_id,
@@ -643,15 +667,28 @@ ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
                       << ", baseline_sequence_id=" << baseline_sequence_id;
             return ErrorCode::OK;
         }
-        VLOG(1) << "P2PHotStandbyService: snapshot source failed"
+        if (reported_errors < kMaxReportedSourceErrors) {
+            if (!source_errors.empty()) {
+                source_errors += "; ";
+            }
+            source_errors += endpoint + ": " + toString(err);
+            ++reported_errors;
+        }
+        VLOG(2) << "P2PHotStandbyService: snapshot source failed"
                 << ", source=" << endpoint << ", error=" << toString(err);
     }
     if (endpoints.empty()) {
-        VLOG(1) << "P2PHotStandbyService: no snapshot source available";
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: no snapshot source available"
+            << ", cluster_id=" << config_.cluster_id;
+    } else {
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: all snapshot sources failed"
+            << ", cluster_id=" << config_.cluster_id
+            << ", source_count=" << endpoints.size() << ", errors=["
+            << source_errors << "]"
+            << ", omitted_errors=" << endpoints.size() - reported_errors;
     }
-    LOG(ERROR) << "P2PHotStandbyService: all snapshot sources failed"
-               << ", cluster_id=" << config_.cluster_id
-               << ", source_count=" << endpoints.size();
     HAMetricManager::instance().inc_p2p_snapshot_bootstrap_failures();
     return ErrorCode::INTERNAL_ERROR;
 }
@@ -662,39 +699,41 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
     uint64_t baseline_sequence_id = 0;
     auto err = BootstrapFromSnapshotSources(baseline_sequence_id);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "P2PHotStandbyService: snapshot resync bootstrap failed"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", error=" << toString(err);
+        // The lower layer logs all failed sources together. Resync is retried
+        // by RecoveryLoop; only terminal startup failure is an ERROR.
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return err;
     }
 
     auto trim_store = CreateReaderStore();
     if (!trim_store) {
-        LOG(ERROR) << "P2PHotStandbyService: failed to create reader store "
-                      "while validating snapshot resync trim horizon"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", baseline_sequence_id=" << baseline_sequence_id;
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to create reader store "
+               "while validating snapshot resync trim horizon"
+            << ", cluster_id=" << config_.cluster_id
+            << ", baseline_sequence_id=" << baseline_sequence_id;
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::OPLOG_TRIMMED;
     }
     uint64_t trimmed_sequence_id = 0;
     err = trim_store->GetTrimmedSequenceId(trimmed_sequence_id);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "P2PHotStandbyService: failed to read trim horizon "
-                      "after snapshot resync"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", baseline_sequence_id=" << baseline_sequence_id
-                   << ", error=" << toString(err);
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to read trim horizon "
+               "after snapshot resync"
+            << ", cluster_id=" << config_.cluster_id
+            << ", baseline_sequence_id=" << baseline_sequence_id
+            << ", error=" << toString(err);
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::OPLOG_TRIMMED;
     }
     if (baseline_sequence_id < trimmed_sequence_id) {
-        LOG(ERROR) << "P2PHotStandbyService: snapshot resync baseline is "
-                      "behind trim horizon"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", baseline_sequence_id=" << baseline_sequence_id
-                   << ", trimmed_sequence_id=" << trimmed_sequence_id;
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: snapshot resync baseline is "
+               "behind trim horizon"
+            << ", cluster_id=" << config_.cluster_id
+            << ", baseline_sequence_id=" << baseline_sequence_id
+            << ", trimmed_sequence_id=" << trimmed_sequence_id;
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::OPLOG_TRIMMED;
     }
@@ -711,11 +750,12 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
     uint64_t catch_up_target = baseline_sequence_id;
     err = GetLatestOpLogSequenceId(catch_up_target);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "P2PHotStandbyService: failed to get snapshot resync "
-                      "catch-up target"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", baseline_sequence_id=" << baseline_sequence_id
-                   << ", error=" << toString(err);
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to get snapshot resync "
+               "catch-up target"
+            << ", cluster_id=" << config_.cluster_id
+            << ", baseline_sequence_id=" << baseline_sequence_id
+            << ", error=" << toString(err);
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return err;
     }
@@ -723,21 +763,23 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
         static_cast<int64_t>(catch_up_target));
     err = StartOplogFollowingLocked(baseline_sequence_id);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "P2PHotStandbyService: failed to restart OpLog "
-                      "following after snapshot resync"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", baseline_sequence_id=" << baseline_sequence_id
-                   << ", catch_up_target=" << catch_up_target
-                   << ", error=" << toString(err);
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to restart OpLog "
+               "following after snapshot resync"
+            << ", cluster_id=" << config_.cluster_id
+            << ", baseline_sequence_id=" << baseline_sequence_id
+            << ", catch_up_target=" << catch_up_target
+            << ", error=" << toString(err);
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return err;
     }
     if (!WaitForAppliedSequenceLocked(catch_up_target)) {
-        LOG(ERROR) << "P2PHotStandbyService: snapshot resync catch-up timed out"
-                   << ", cluster_id=" << config_.cluster_id
-                   << ", catch_up_target=" << catch_up_target
-                   << ", applied_sequence_id="
-                   << GetLocalLastAppliedSequenceIdLocked();
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: snapshot resync catch-up timed out"
+            << ", cluster_id=" << config_.cluster_id
+            << ", catch_up_target=" << catch_up_target
+            << ", applied_sequence_id="
+            << GetLocalLastAppliedSequenceIdLocked();
         ResetOplogFollowingLocked();
         HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::INTERNAL_ERROR;
@@ -754,9 +796,10 @@ ErrorCode P2PHotStandbyService::GetLatestOpLogSequenceId(
     uint64_t& sequence_id) const {
     auto store = CreateReaderStore();
     if (!store) {
-        LOG(ERROR) << "P2PHotStandbyService: failed to create OpLog reader "
-                      "store when fetching latest sequence id"
-                   << ", cluster_id=" << config_.cluster_id;
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to create OpLog reader "
+               "store when fetching latest sequence id"
+            << ", cluster_id=" << config_.cluster_id;
         return ErrorCode::INTERNAL_ERROR;
     }
     return store->GetLatestSequenceId(sequence_id);
@@ -799,10 +842,12 @@ ErrorCode P2PHotStandbyService::StartSnapshotServer() {
                    << ", port=" << config_.snapshot_service_port;
         return ErrorCode::INTERNAL_ERROR;
     }
+    snapshot_server_running_.store(true, std::memory_order_release);
     return ErrorCode::OK;
 }
 
 void P2PHotStandbyService::StopSnapshotServer() {
+    snapshot_server_running_.store(false, std::memory_order_release);
     if (snapshot_server_) {
         snapshot_server_->stop();
     }
@@ -818,10 +863,16 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
     }
     auto store = CreateReaderStore();
     uint64_t trimmed_sequence_id = 0;
-    if (!store ||
-        store->GetTrimmedSequenceId(trimmed_sequence_id) != ErrorCode::OK) {
-        LOG(WARNING) << "P2PHotStandbyService: failed to read trim horizon "
-                        "while discovering snapshot sources";
+    const auto trim_error =
+        store ? store->GetTrimmedSequenceId(trimmed_sequence_id)
+              : ErrorCode::INTERNAL_ERROR;
+    if (trim_error != ErrorCode::OK) {
+        LOG_EVERY_N(WARNING, 50)
+            << "P2PHotStandbyService: failed to read trim horizon "
+               "while discovering snapshot sources"
+            << ", cluster_id=" << config_.cluster_id
+            << ", has_store=" << (store != nullptr)
+            << ", error=" << toString(trim_error);
         return endpoints;
     }
     RedisMasterRegistry registry(config_.cluster_id, config_.redis_endpoint,
@@ -831,9 +882,9 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
     auto err = registry.DiscoverAlive(
         std::chrono::seconds(config_.master_registry_ttl_sec), masters);
     if (err != ErrorCode::OK) {
-        LOG(WARNING) << "P2PHotStandbyService: snapshot source discovery "
-                        "failed"
-                     << ", error=" << toString(err);
+        VLOG(1) << "P2PHotStandbyService: snapshot source discovery "
+                   "failed"
+                << ", error=" << toString(err);
         endpoints.clear();
         return endpoints;
     }
@@ -842,12 +893,24 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
         config_.local_master_endpoint, config_.local_snapshot_endpoint,
         trimmed_sequence_id);
     endpoints = std::move(selection.endpoints);
-    if (selection.used_primary_fallback) {
-        LOG(INFO) << "P2PHotStandbyService: using primary snapshot fallback"
-                  << ", cluster_id=" << config_.cluster_id
-                  << ", source_count=" << endpoints.size()
-                  << ", trimmed_sequence_id=" << trimmed_sequence_id;
-    }
+    LOG_EVERY_N(INFO, 50) << "P2PHotStandbyService: snapshot source discovery"
+                          << ", cluster_id=" << config_.cluster_id
+                          << ", selected=" << endpoints.size()
+                          << ", used_primary_fallback="
+                          << selection.used_primary_fallback;
+    VLOG(1) << "P2PHotStandbyService: snapshot source filtering"
+            << ", cluster_id=" << config_.cluster_id
+            << ", alive=" << selection.alive_count
+            << ", qualified_standby=" << selection.qualified_standby_count
+            << ", primary_fallback=" << selection.primary_fallback_count
+            << ", excluded=" << selection.excluded_count
+            << ", excluded_self=" << selection.excluded_self_count
+            << ", excluded_unavailable=" << selection.excluded_unavailable_count
+            << ", excluded_stale=" << selection.excluded_stale_count
+            << ", excluded_primary_not_used="
+            << selection.excluded_primary_not_used_count
+            << ", excluded_role=" << selection.excluded_role_count
+            << ", trimmed_sequence_id=" << trimmed_sequence_id;
 #endif
     return endpoints;
 }
@@ -956,7 +1019,7 @@ void P2PHotStandbyService::RecoveryLoop() {
                                 state_machine_.ProcessEvent(
                                     StandbyEvent::WATCH_BROKEN);
                             }
-                            LOG(ERROR)
+                            LOG_EVERY_N(WARNING, 50)
                                 << "P2PHotStandbyService: snapshot resync "
                                    "reader is not healthy"
                                 << ", state="
@@ -981,7 +1044,7 @@ void P2PHotStandbyService::RecoveryLoop() {
                                 state_machine_.ProcessEvent(
                                     StandbyEvent::WATCH_BROKEN);
                             }
-                            LOG(ERROR)
+                            LOG_EVERY_N(WARNING, 50)
                                 << "P2PHotStandbyService: recovered OpLog "
                                    "reader is not healthy"
                                 << ", state="
@@ -1027,13 +1090,16 @@ void P2PHotStandbyService::RecoveryLoop() {
                 HAMetricManager::instance()
                     .inc_oplog_reader_reconnect_failures();
             }
-            LOG(WARNING) << "P2PHotStandbyService: "
-                         << (attempted_snapshot_resync
-                                 ? "snapshot resync"
-                                 : "OpLog reader reconnect")
-                         << " failed, retrying"
-                         << ", resume_sequence_id=" << resume_sequence_id
-                         << ", retry_in_ms=" << backoff_ms;
+            // Snapshot resync already reports a bounded, contextual failure.
+            // Keep this loop's generic retry message for reader reconnection.
+            if (!attempted_snapshot_resync) {
+                LOG_EVERY_N(WARNING, 50)
+                    << "P2PHotStandbyService: OpLog reader reconnect failed, "
+                       "retrying"
+                    << ", error=" << toString(err)
+                    << ", resume_sequence_id=" << resume_sequence_id
+                    << ", retry_in_ms=" << backoff_ms;
+            }
             recovery_cv_.wait_for(recovery_lock,
                                   std::chrono::milliseconds(backoff_ms),
                                   [this] { return recovery_stopping_.load(); });

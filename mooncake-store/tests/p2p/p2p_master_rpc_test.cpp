@@ -547,6 +547,76 @@ class GatedRpcHandler {
     std::atomic<bool> exited_{false};
 };
 
+TEST_F(P2PMasterRpcTest, StartupCancellationDoesNotPublishRunningOrFailure) {
+    for (const bool dedicated_heartbeat : {false, true}) {
+        SCOPED_TRACE(dedicated_heartbeat);
+        P2PMasterConfig config;
+        config.rpc.address = "127.0.0.1";
+        config.rpc.port = 0;
+        config.rpc.thread_num = 1;
+        config.metrics.enable_reporting = false;
+        config.metrics.http_port = 0;
+        if (dedicated_heartbeat) {
+            const int port = getFreeTcpPort();
+            ASSERT_GT(port, 0);
+            config.rpc.heartbeat_port = port;
+        }
+        P2PMaster master(config);
+        P2PMasterRpcService service(config);
+        coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
+        // A lease loss or shutdown can stop the fresh server before startup.
+        server.stop();
+        bool running = false;
+        std::string startup_error = "previous error";
+        EXPECT_EQ(master.RunActiveRpcServers(
+                      server, service, [&] { running = true; }, {}, {}, {},
+                      &startup_error),
+                  0);
+        EXPECT_FALSE(running);
+        EXPECT_TRUE(startup_error.empty());
+        if (dedicated_heartbeat) {
+            asio::io_context io;
+            asio::ip::tcp::socket probe(io);
+            asio::error_code error;
+            probe.connect({asio::ip::make_address("127.0.0.1"),
+                           static_cast<uint16_t>(config.rpc.heartbeat_port)},
+                          error);
+            EXPECT_EQ(error, asio::error::connection_refused);
+        }
+    }
+}
+
+TEST_F(P2PMasterRpcTest, RpcStartupFailureDoesNotPublishRunning) {
+    for (const bool dedicated_heartbeat : {false, true}) {
+        SCOPED_TRACE(dedicated_heartbeat);
+        asio::io_context io;
+        asio::ip::tcp::acceptor occupied(
+            io, {asio::ip::make_address("127.0.0.1"), 0});
+        P2PMasterConfig config;
+        config.rpc.address = "127.0.0.1";
+        config.rpc.port =
+            dedicated_heartbeat ? 0 : occupied.local_endpoint().port();
+        config.rpc.heartbeat_port =
+            dedicated_heartbeat ? occupied.local_endpoint().port() : 0;
+        config.rpc.thread_num = 1;
+        config.metrics.enable_reporting = false;
+        config.metrics.http_port = 0;
+        P2PMaster master(config);
+        P2PMasterRpcService service(config);
+        coro_rpc::coro_rpc_server server(1, config.rpc.port, "127.0.0.1");
+        bool running = false;
+        std::string startup_error;
+        EXPECT_EQ(master.RunActiveRpcServers(
+                      server, service, [&] { running = true; }, {}, {}, {},
+                      &startup_error),
+                  -1);
+        EXPECT_FALSE(running);
+        EXPECT_NE(startup_error.find(dedicated_heartbeat ? "heartbeat RPC"
+                                                         : "P2P master RPC"),
+                  std::string::npos);
+    }
+}
+
 class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
    public:
     static void SetUpTestSuite() {

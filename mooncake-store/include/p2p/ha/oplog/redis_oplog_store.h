@@ -3,6 +3,7 @@
 #ifdef STORE_USE_REDIS
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -155,6 +156,10 @@ class RedisOpLogStore : public OpLogStore {
     std::set<uint64_t> dropped_sequences_ GUARDED_BY(async_mutex_);
     uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
     size_t failed_write_count_ GUARDED_BY(async_mutex_) = 0;
+    // Per-writer sampling, serialized by the existing queue lock.
+    std::chrono::steady_clock::time_point next_queue_warning_at_
+        GUARDED_BY(async_mutex_){};
+    uint64_t queue_overflows_since_last_log_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
     std::atomic<int64_t> consecutive_write_failures_{0};
     std::vector<std::thread> async_workers_;

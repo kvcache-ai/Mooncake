@@ -222,7 +222,13 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
     if (!BeginBlockingOperation()) {
         return;
     }
-    ScopeGuard operation([this] { EndBlockingOperation(); });
+    ScopeGuard operation([this] {
+        // Cancellation can leave a rejected readiness attempt pending. Clear
+        // only waiting diagnostics; preserve actual election failure details.
+        HAStatusManager::instance().SetDoctorIssue("ELECTION_NOT_READY");
+        HAStatusManager::instance().SetElectionReadinessBlocked(false);
+        EndBlockingOperation();
+    });
     const auto election_start = std::chrono::steady_clock::now();
     while (!cancel_election_) {
         if (should_elect_ && !should_elect_()) {

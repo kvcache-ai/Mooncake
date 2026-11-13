@@ -1,8 +1,10 @@
 #pragma once
 
+#include <charconv>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <json/json.h>
 #include "client_config_builder.h"
 #include "p2p/common/p2p_types.h"
@@ -18,6 +20,8 @@ struct P2PClientConfig : RealClientConfigBase {
     // Dedicated master heartbeat port; must match --heartbeat_rpc_port.
     // Zero sends heartbeats to the main RPC port.
     uint16_t heartbeat_rpc_port = 0;
+    // Client connection/request timeout for heartbeat RPCs; must be positive.
+    int32_t heartbeat_rpc_timeout_ms = 1000;
 
     // Port for HTTP server.
     // Only used when enable_http_server is true.
@@ -149,7 +153,13 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
         const std::string& redis_username = "", uint16_t heartbeat_rpc_port = 0,
         size_t te_async_poll_worker_num = 32, bool start_local_only = false,
-        size_t business_coro_worker_num = 32) {
+        size_t business_coro_worker_num = 32,
+        int32_t heartbeat_rpc_timeout_ms = 1000) {
+        if (heartbeat_rpc_timeout_ms <= 0) {
+            LOG(ERROR) << "heartbeat_rpc_timeout_ms must be greater than 0";
+            throw std::invalid_argument(
+                "heartbeat_rpc_timeout_ms must be greater than 0");
+        }
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -224,6 +234,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
 
         config.heartbeat_rpc_port = heartbeat_rpc_port;
+        config.heartbeat_rpc_timeout_ms = heartbeat_rpc_timeout_ms;
         return config;
     }
 
@@ -297,6 +308,18 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         uint16_t heartbeat_rpc_port = static_cast<uint16_t>(
             get_config_size(config, DictP2P::kHeartbeatRpcPort,
                             DictP2P::kDefaultHeartbeatRpcPort));
+        int32_t heartbeat_rpc_timeout_ms = 1000;
+        if (auto it = config.find(DictP2P::kHeartbeatRpcTimeoutMs);
+            it != config.end()) {
+            const auto& value = it->second;
+            const auto [end, error] =
+                std::from_chars(value.data(), value.data() + value.size(),
+                                heartbeat_rpc_timeout_ms);
+            if (error != std::errc{} || end != value.data() + value.size()) {
+                LOG(ERROR) << "Invalid heartbeat_rpc_timeout_ms: " << value;
+                throw std::invalid_argument("Invalid heartbeat_rpc_timeout_ms");
+            }
+        }
 
         return build_p2p_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
@@ -312,7 +335,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             redis_config.heartbeat_interval_sec, redis_config.username,
             heartbeat_rpc_port, te_async_poll_worker_num,
             get_config_bool(config, DictP2P::kStartLocalOnly, false),
-            business_coro_worker_num);
+            business_coro_worker_num, heartbeat_rpc_timeout_ms);
     }
 
    private:
@@ -376,6 +399,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         static constexpr const char* kEnableMetricCollection =
             "enable_metric_collection";
         static constexpr const char* kHeartbeatRpcPort = "heartbeat_rpc_port";
+        static constexpr const char* kHeartbeatRpcTimeoutMs =
+            "heartbeat_rpc_timeout_ms";
         static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 60;
         static constexpr bool kDefaultEnableMetricCollection = true;
         static constexpr uint16_t kDefaultHeartbeatRpcPort = 0;

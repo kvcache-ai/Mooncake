@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <string_view>
 #include <vector>
 #include <string>
@@ -22,6 +26,7 @@
 #include "p2p/ha/oplog/oplog_replicator.h"
 #include "p2p/ha/oplog/p2p_oplog_applier.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
@@ -33,13 +38,56 @@
 namespace mooncake {
 namespace {
 
+struct DelayedLatestReply {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::future<void> released{release.get_future()};
+};
+std::atomic<DelayedLatestReply*> delayed_latest_reply{nullptr};
 std::atomic<bool> fail_one_latest_write{false};
 std::atomic<size_t> max_pipelined_sets{0};
 std::atomic<bool> fail_one_pipelined_reply{false};
 std::atomic<bool> fail_one_pipelined_status{false};
+std::atomic<bool> trace_pipeline_sets{false};
+std::atomic<bool> hold_initial_pipeline{false};
+std::atomic<bool> hold_failed_retry{false};
+std::atomic<bool> failed_retry_blocked{false};
+std::mutex pipeline_trace_mutex;
+std::map<std::string, size_t> pipeline_set_attempts;
+std::vector<std::string> failed_pipeline_keys;
+std::string failed_retry_key;
 thread_local size_t appended_sets = 0;
+thread_local std::vector<std::string> appended_set_keys;
+thread_local std::vector<std::string> pipeline_set_keys;
 thread_local size_t pipeline_replies_total = 0;
 thread_local size_t pipeline_replies_remaining = 0;
+
+void ResetPipelineTrace() {
+    std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+    pipeline_set_attempts.clear();
+    failed_pipeline_keys.clear();
+    failed_retry_key.clear();
+    failed_retry_blocked.store(false);
+    hold_initial_pipeline.store(true);
+    hold_failed_retry.store(true);
+    trace_pipeline_sets.store(true);
+}
+
+void StopPipelineTrace() {
+    hold_initial_pipeline.store(false);
+    hold_failed_retry.store(false);
+    trace_pipeline_sets.store(false);
+    fail_one_pipelined_reply.store(false);
+    fail_one_pipelined_status.store(false);
+}
+
+void WaitForPipelineRelease(const std::atomic<bool>& hold) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (hold.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 
 extern "C" void* __wrap_redisCommand(redisContext* ctx, const char* format,
                                      ...) {
@@ -47,19 +95,27 @@ extern "C" void* __wrap_redisCommand(redisContext* ctx, const char* format,
     va_start(args, format);
     va_list copy;
     va_copy(copy, args);
+    DelayedLatestReply* delay = nullptr;
     if (std::strcmp(format, "SET %b %b") == 0) {
         const auto* key = va_arg(copy, const char*);
         const auto length = va_arg(copy, size_t);
-        if (std::string_view(key, length).ends_with(":latest") &&
-            fail_one_latest_write.exchange(false)) {
-            va_end(copy);
-            va_end(args);
-            return nullptr;
+        if (std::string_view(key, length).ends_with(":latest")) {
+            if (fail_one_latest_write.exchange(false)) {
+                va_end(copy);
+                va_end(args);
+                return nullptr;
+            }
+            delay = delayed_latest_reply.exchange(nullptr);
         }
     }
     va_end(copy);
     void* return_value = redisvCommand(ctx, format, args);
     va_end(args);
+    if (delay) {
+        // The worker still holds its queue lock until this reply is returned.
+        delay->entered.set_value();
+        delay->released.wait();
+    }
     return return_value;
 }
 
@@ -67,6 +123,28 @@ extern "C" int __wrap_redisAppendCommand(redisContext* ctx, const char* format,
                                          ...) {
     va_list args;
     va_start(args, format);
+    std::string key;
+    const bool tracing = trace_pipeline_sets.load();
+    if (tracing && std::strcmp(format, "SET %b %b") == 0) {
+        va_list copy;
+        va_copy(copy, args);
+        const auto* data = va_arg(copy, const char*);
+        const auto length = va_arg(copy, size_t);
+        key.assign(data, length);
+        va_end(copy);
+        // Queue the full workload before allowing workers to finish batches.
+        WaitForPipelineRelease(hold_initial_pipeline);
+        bool block_retry = false;
+        {
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            block_retry = key == failed_retry_key &&
+                          pipeline_set_attempts.count(key) != 0;
+        }
+        if (block_retry && hold_failed_retry.load()) {
+            failed_retry_blocked.store(true);
+            WaitForPipelineRelease(hold_failed_retry);
+        }
+    }
     const int result = redisvAppendCommand(ctx, format, args);
     va_end(args);
     if (result == REDIS_OK && std::strcmp(format, "SET %b %b") == 0) {
@@ -74,6 +152,11 @@ extern "C" int __wrap_redisAppendCommand(redisContext* ctx, const char* format,
         size_t previous = max_pipelined_sets.load();
         while (count > previous &&
                !max_pipelined_sets.compare_exchange_weak(previous, count)) {
+        }
+        if (tracing) {
+            appended_set_keys.push_back(key);
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            ++pipeline_set_attempts[key];
         }
     }
     return result;
@@ -85,6 +168,10 @@ extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
         pipeline_replies_total = appended_sets;
         pipeline_replies_remaining = appended_sets;
         appended_sets = 0;
+        if (trace_pipeline_sets.load()) {
+            pipeline_set_keys = std::move(appended_set_keys);
+            appended_set_keys.clear();
+        }
     }
     const int result = __real_redisGetReply(ctx, reply);
     if (result == REDIS_OK && pipeline_replies_remaining > 0) {
@@ -93,6 +180,11 @@ extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
         --pipeline_replies_remaining;
         if (pipeline_replies_total > 1 && reply_number == 2 &&
             fail_one_pipelined_reply.exchange(false)) {
+            if (trace_pipeline_sets.load()) {
+                std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+                failed_pipeline_keys = pipeline_set_keys;
+                failed_retry_key = pipeline_set_keys.front();
+            }
             freeReplyObject(*reply);
             *reply = nullptr;
             ctx->err = REDIS_ERR_IO;
@@ -100,6 +192,12 @@ extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
         }
         if (pipeline_replies_total > 1 && reply_number == 2 &&
             fail_one_pipelined_status.exchange(false)) {
+            if (trace_pipeline_sets.load()) {
+                std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+                failed_pipeline_keys = pipeline_set_keys;
+                failed_retry_key = pipeline_set_keys[1];
+            }
+            // The SET reached Redis, but the worker cannot accept this reply.
             auto* status = static_cast<redisReply*>(*reply);
             if (status->type == REDIS_REPLY_STATUS && status->len >= 2) {
                 std::memcpy(status->str, "NO", 2);
@@ -282,6 +380,85 @@ class RedisOpLogStoreTest : public ::testing::Test {
         return entry;
     }
 
+    void CheckPipelineFaultRecovery(bool reply_read_failure) {
+        auto writer = CreateWriter();
+        ResetPipelineTrace();
+        // Declared after writer: release hooks before its destructor joins.
+        struct TraceCleanup {
+            ~TraceCleanup() { StopPipelineTrace(); }
+        } cleanup;
+        max_pipelined_sets.store(0);
+        fail_one_pipelined_reply.store(reply_read_failure);
+        fail_one_pipelined_status.store(!reply_read_failure);
+        auto& metrics = HAMetricManager::instance();
+        const auto failures_before =
+            metrics.get_oplog_redis_pipeline_batch_failures_total();
+        const auto retries_before =
+            metrics.get_oplog_redis_pipeline_batch_retries_total();
+
+        // With the initial appends held, four workers cannot drain these
+        // entries one at a time; at least one batch must contain multiple SETs.
+        for (uint64_t seq = 1; seq <= 40; ++seq) {
+            ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
+        }
+        hold_initial_pipeline.store(false);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!failed_retry_blocked.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(failed_retry_blocked.load());
+        std::string retry_key;
+        {
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            retry_key = failed_retry_key;
+        }
+        ASSERT_FALSE(retry_key.empty());
+        const auto failed_sequence =
+            std::stoull(retry_key.substr(retry_key.rfind(':') + 1));
+        uint64_t latest = 0;
+        ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+        EXPECT_LT(latest, failed_sequence);
+        ASSERT_EQ(ErrorCode::OK, writer->GetLocalCommittedSequenceId(latest));
+        EXPECT_LT(latest, failed_sequence);
+
+        hold_failed_retry.store(false);
+        ASSERT_TRUE(writer->DrainWriting(5000).drained);
+        // Join before inspecting attempts or disabling tracing.
+        writer->StopWriting();
+        EXPECT_GT(max_pipelined_sets.load(), 1u);
+        EXPECT_FALSE(fail_one_pipelined_reply.load());
+        EXPECT_FALSE(fail_one_pipelined_status.load());
+        EXPECT_GT(metrics.get_oplog_redis_pipeline_batch_failures_total(),
+                  failures_before);
+        EXPECT_GT(metrics.get_oplog_redis_pipeline_batch_retries_total(),
+                  retries_before);
+
+        std::vector<std::string> failed_keys;
+        std::map<std::string, size_t> attempts;
+        {
+            std::lock_guard<std::mutex> lock(pipeline_trace_mutex);
+            failed_keys = failed_pipeline_keys;
+            attempts = pipeline_set_attempts;
+        }
+        ASSERT_GT(failed_keys.size(), 1u);
+        for (const auto& key : failed_keys) {
+            EXPECT_EQ(reply_read_failure || key == retry_key ? 2u : 1u,
+                      attempts[key])
+                << key;
+        }
+
+        auto reader = CreateReader();
+        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
+        EXPECT_EQ(40u, latest);
+        for (uint64_t seq = 1; seq <= 40; ++seq) {
+            OpLogEntry entry;
+            ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(seq, entry)) << seq;
+            EXPECT_EQ("payload_" + std::to_string(seq), entry.payload);
+        }
+    }
+
     std::string redis_endpoint_;
     std::string redis_username_;
     std::string redis_password_;
@@ -313,18 +490,50 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
     EXPECT_EQ(2u, latest);
 }
 
-TEST_F(RedisOpLogStoreTest, PrimaryLatestSequenceUpdatesAppliedMetric) {
-    auto writer = CreateWriter();
+TEST_F(RedisOpLogStoreTest, LatestReadsPreserveLocalAppliedMetric) {
+    struct StatusResetGuard {
+        ~StatusResetGuard() { HAStatusManager::instance().Reset(); }
+    } reset_guard;
+    auto& status = HAStatusManager::instance();
+    auto& metrics = HAMetricManager::instance();
+    status.Reset();
+    status.Configure(true, cluster_id_, "local");
+    status.SetRoleState("primary", "RUNNING");
+
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
-    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(2));
-    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+    ASSERT_EQ(manager.SetInitialSequenceId(2), ErrorCode::OK);
+    // Leave an allocated entry unpersisted so the two watermarks differ
+    // deterministically, without racing an asynchronous Redis writer.
+    const auto pending =
+        manager.AllocateEntry(OpType::PUT_END, "pending", "payload");
+    ASSERT_EQ(pending.sequence_id, 3u);
+    const auto persisted = manager.ReadLatestOpLogSequenceId();
+    ASSERT_TRUE(persisted.has_value());
+    ASSERT_EQ(*persisted, 2u);
+    status.SetOpLogProgress(manager.GetLastSequenceId(), *persisted);
+    EXPECT_EQ(status.Snapshot().applied_sequence_id, 3u);
+    EXPECT_EQ(status.Snapshot().latest_sequence_id, 2u);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
 
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
     EXPECT_EQ(2u, latest);
-    EXPECT_EQ(static_cast<int64_t>(latest),
-              HAMetricManager::instance().get_oplog_applied_sequence_id());
+    EXPECT_EQ(metrics.get_oplog_last_sequence_id(), 2);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
+    auto reader = CreateReader();
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 2u);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
+
+    ASSERT_EQ(manager.PersistEntry(pending, /*sync=*/true), ErrorCode::OK);
+    ASSERT_EQ(writer->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 3u);
+    EXPECT_EQ(metrics.get_oplog_last_sequence_id(), 3);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
 }
 
 TEST_F(RedisOpLogStoreTest, OpLogKeysDoNotUseRedisHashTags) {
@@ -490,6 +699,59 @@ TEST_F(RedisOpLogStoreTest, StopWritingAbortsSyncWaitAndRejectsNewWrites) {
     EXPECT_EQ(0, HAMetricManager::instance().get_oplog_async_queue_size());
 }
 
+TEST_F(RedisOpLogStoreTest, NonblockingStopDoesNotWaitForLatestReply) {
+    auto writer = CreateWriter();
+    DelayedLatestReply delay;
+    auto entered = delay.entered.get_future();
+    std::promise<void> cleanup_started;
+    auto cleanup_entered = cleanup_started.get_future();
+    std::future<ErrorCode> pending;
+    std::future<void> stop;
+    std::future<void> cleanup;
+    {
+        // Release before joining workers or destroying futures, even on ASSERT.
+        struct ReleaseReply {
+            DelayedLatestReply& delay;
+            RedisOpLogStore& writer;
+            ~ReleaseReply() {
+                delayed_latest_reply.store(nullptr);
+                delay.release.set_value();
+                writer.StopWriting();
+            }
+        } release{delay, *writer};
+        delayed_latest_reply.store(&delay);
+        pending = std::async(std::launch::async, [&] {
+            return writer->WriteOpLog(MakeEntry(1), true);
+        });
+        ASSERT_EQ(entered.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        stop = std::async(std::launch::async,
+                          [&] { writer->RequestStopWriting(); });
+        EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+        cleanup = std::async(std::launch::async, [&] {
+            cleanup_started.set_value();
+            writer->StopWriting();
+        });
+        ASSERT_EQ(cleanup_entered.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+                  std::future_status::timeout);
+    }
+    stop.get();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    cleanup.get();
+    // The latest command already in flight may succeed despite cancellation.
+    const auto result = pending.get();
+    EXPECT_TRUE(result == ErrorCode::OK || result == ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), true),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), false),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(HAMetricManager::instance().get_oplog_async_queue_size(), 0);
+}
+
 TEST_F(RedisOpLogStoreTest, DrainWritingReturnsAfterLeaseLossStopRequest) {
     auto writer = CreateWriter();
     // seq=2 cannot commit while seq=1 is missing, so the writer keeps it
@@ -565,37 +827,73 @@ TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
     }
 }
 
-TEST_F(RedisOpLogStoreTest, PipelineRetriesAndCommitsEveryEntry) {
-    max_pipelined_sets.store(0);
-    fail_one_pipelined_reply.store(true);
-    fail_one_pipelined_status.store(true);
+TEST_F(RedisOpLogStoreTest, StopWritingWhileEntriesAreBeingPersisted) {
     auto writer = CreateWriter();
-
-    // Queue entries beyond the gap so workers can pipeline batches before
-    // seq=1 allows latest to advance.
-    for (uint64_t seq = 2; seq <= 40; ++seq) {
-        ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
+    const auto first = MakeEntry(1);
+    ASSERT_EQ(writer->WriteOpLog(first, true), ErrorCode::OK);
+    std::promise<void> producer_ready;
+    auto ready = producer_ready.get_future();
+    std::future<ErrorCode> producer;
+    {
+        // Stop on every exit before the producer future is joined/destroyed.
+        struct StopWriter {
+            RedisOpLogStore& writer;
+            ~StopWriter() { writer.StopWriting(); }
+        } cleanup{*writer};
+        producer = std::async(std::launch::async, [&] {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            // Missing seq=2 keeps the committed prefix at 1 while writes run.
+            for (uint64_t seq = 3; std::chrono::steady_clock::now() < deadline;
+                 ++seq) {
+                const auto result = writer->WriteOpLog(MakeEntry(seq), false);
+                if (result != ErrorCode::OK) return result;
+                if (seq == 102) producer_ready.set_value();
+                // Stay below queue capacity until stop rejects a write.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // Reaching the safety deadline must fail the rejection assertion.
+            return ErrorCode::OK;
+        });
+        ASSERT_EQ(ready.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        OpLogEntry persisted;
+        for (int i = 0; i < 200; ++i) {
+            if (writer->ReadOpLog(3, persisted) == ErrorCode::OK) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_EQ(persisted.sequence_id, 3u);
+        EXPECT_EQ(producer.wait_for(std::chrono::milliseconds(0)),
+                  std::future_status::timeout);
+        writer->RequestStopWriting();
+        ASSERT_EQ(producer.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        EXPECT_EQ(producer.get(), ErrorCode::INTERNAL_ERROR);
     }
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
-    EXPECT_GT(max_pipelined_sets.load(), 1u);
-    EXPECT_FALSE(fail_one_pipelined_reply.load());
-    EXPECT_FALSE(fail_one_pipelined_status.load());
-
-    auto reader = CreateReader();
+    const auto pattern = "mooncake:" + cluster_id_ + ":oplog:entry:*";
+    const auto count = ScanKeys(pattern).size();
+    EXPECT_GT(count, 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(ScanKeys(pattern).size(), count);
     uint64_t latest = 0;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    do {
-        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
-        if (latest == 40u) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    } while (std::chrono::steady_clock::now() < deadline);
-    EXPECT_EQ(40u, latest);
-    for (uint64_t seq = 1; seq <= 40; ++seq) {
-        OpLogEntry entry;
-        ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(seq, entry)) << seq;
-        EXPECT_EQ("payload_" + std::to_string(seq), entry.payload);
-    }
+    ASSERT_EQ(writer->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 1u);
+    OpLogEntry stored;
+    ASSERT_EQ(writer->ReadOpLog(1, stored), ErrorCode::OK);
+    EXPECT_EQ(stored.payload, first.payload);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), true),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(writer->WriteOpLog(MakeEntry(2), false),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(HAMetricManager::instance().get_oplog_async_queue_size(), 0);
+}
+
+TEST_F(RedisOpLogStoreTest, PipelineReplyReadFailureRetriesWholeBatch) {
+    CheckPipelineFaultRecovery(/*reply_read_failure=*/true);
+}
+
+TEST_F(RedisOpLogStoreTest, PipelineNonOkReplyRetriesOnlyFailedEntry) {
+    CheckPipelineFaultRecovery(/*reply_read_failure=*/false);
 }
 
 TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
@@ -607,44 +905,6 @@ TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
     EXPECT_EQ(1u, latest);
-}
-
-TEST_F(RedisOpLogStoreTest, LatestStallOnlyTimesBusyPendingWork) {
-    auto& status = HAStatusManager::instance();
-    status.Reset();
-    status.Configure(true, cluster_id_, "test-primary", 1);
-    status.SetLeader("test-primary", 1);
-    status.SetRoleState("primary", "RUNNING");
-    auto has_stall_issue = [&] {
-        return status.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=
-               std::string::npos;
-    };
-    auto writer = CreateWriter();
-    // Seq=3 is persisted but cannot commit latest without seq=1 and seq=2.
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
-    const auto stall_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (!has_stall_issue() &&
-           std::chrono::steady_clock::now() < stall_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_TRUE(has_stall_issue());
-
-    // Additional work does not restart the timer.
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
-    EXPECT_TRUE(has_stall_issue());
-
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
-    uint64_t latest = 0;
-    ASSERT_EQ(writer->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
-    EXPECT_EQ(latest, 3u);
-    EXPECT_FALSE(has_stall_issue());
-
-    // Rewriting an already committed entry cannot arm a new timer.
-    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), true), ErrorCode::OK);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    EXPECT_FALSE(has_stall_issue());
-    status.Reset();
 }
 
 TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
@@ -660,30 +920,33 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
 }
 
 TEST_F(RedisOpLogStoreTest, ConfiguredBatchSizeAboveDefaultIsUsed) {
+    auto writer = OpLogStoreFactory::Create(
+        OpLogStoreType::REDIS, cluster_id_, OpLogStoreRole::WRITER,
+        redis_endpoint_, /*poll_interval_ms=*/10, redis_password_,
+        redis_username_, /*db_index=*/0,
+        /*async_queue_max_entries=*/100000, /*overflow_mode=*/"reject",
+        /*best_effort_max_retries=*/3, /*async_write_batch_size=*/128);
+    ASSERT_NE(nullptr, writer);
+    ResetPipelineTrace();
+    // Release held appends before writer destruction, including ASSERT exits.
+    struct TraceCleanup {
+        ~TraceCleanup() { StopPipelineTrace(); }
+    } cleanup;
     max_pipelined_sets.store(0);
-    RedisOpLogStore store(cluster_id_, redis_endpoint_, /*enable_write=*/true,
-                          /*poll_interval_ms=*/10, redis_password_,
-                          redis_username_, /*db_index=*/0,
-                          /*async_queue_max_entries=*/100000,
-                          OpLogAsyncQueueOverflowMode::REJECT,
-                          /*best_effort_max_retries=*/3,
-                          /*async_write_batch_size=*/128);
-    ASSERT_EQ(ErrorCode::OK, store.Init());
 
+    // Hold each worker's first append until enough entries are queued to
+    // require a batch larger than the default, regardless of scheduling.
     for (uint64_t seq = 2; seq <= 1000; ++seq) {
-        ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(seq), false));
+        ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
     }
-    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(1), true));
+    hold_initial_pipeline.store(false);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_TRUE(writer->DrainWriting(10000).drained);
+    writer->StopWriting();
 
     auto reader = CreateReader();
     uint64_t latest = 0;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    do {
-        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
-        if (latest == 1000u) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
     EXPECT_EQ(1000u, latest);
     EXPECT_GT(max_pipelined_sets.load(), 64u);
     EXPECT_LE(max_pipelined_sets.load(), 128u);
@@ -750,12 +1013,175 @@ class RedisOpLogDoctorTest : public RedisOpLogStoreTest {
                                  std::to_string(count)) != std::string::npos;
     }
 
+    bool HasLatestStall() {
+        return status_.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=
+               std::string::npos;
+    }
+
     HAStatusManager& status_{HAStatusManager::instance()};
     std::unique_ptr<redisContext, decltype(&redisFree)> admin_{nullptr,
                                                                &redisFree};
     std::string user_;
     std::unique_ptr<RedisOpLogStore> writer_;
 };
+
+TEST_F(RedisOpLogDoctorTest, StopWritingPreventsRetryAfterRedisRecovers) {
+    auto& metrics = HAMetricManager::instance();
+    const auto retries = metrics.get_oplog_write_retries_total();
+    std::future<ErrorCode> pending;
+    {
+        // Also cancel the synchronous write before future destruction on
+        // ASSERT.
+        struct StopWriter {
+            RedisOpLogStore& writer;
+            ~StopWriter() { writer.StopWriting(); }
+        } cleanup{*writer_};
+        pending = std::async(std::launch::async, [&] {
+            return writer_->WriteOpLog(MakeEntry(1), true);
+        });
+        // The fixture denies seq=1. Observe a failed retry, not only admission.
+        ASSERT_TRUE(WaitUntil([&] {
+            return metrics.get_oplog_write_retries_total() >= retries + 2;
+        }));
+        EXPECT_TRUE(HasFailureCount(1));
+        writer_->RequestStopWriting();
+        ASSERT_EQ(pending.wait_for(std::chrono::seconds(1)),
+                  std::future_status::ready);
+        EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    }
+    // Restore access only after joining: an in-flight SET may otherwise
+    // succeed.
+    const auto stopped_retries = metrics.get_oplog_write_retries_total();
+    ASSERT_TRUE(AllowEntries("*"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(metrics.get_oplog_write_retries_total(), stopped_retries);
+    OpLogEntry stored;
+    EXPECT_EQ(writer_->ReadOpLog(1, stored), ErrorCode::OPLOG_ENTRY_NOT_FOUND);
+    uint64_t latest = 99;
+    ASSERT_EQ(writer_->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 0u);
+    EXPECT_EQ(writer_->WriteOpLog(MakeEntry(2), false),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(metrics.get_oplog_async_queue_size(), 0);
+}
+
+TEST_F(RedisOpLogDoctorTest, CommitFailureReportsReasonAndClearsOnRecovery) {
+    // Entries can persist, but committing the latest watermark is denied.
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        admin_.get(), "ACL SETUSER %s resetkeys ~mooncake:%s:oplog:entry:*",
+        user_.c_str(), cluster_id_.c_str()));
+    ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] {
+        return status_.SerializeDoctorJson().find("OPLOG_COMMIT_FAILED") !=
+               std::string::npos;
+    }));
+    const auto report = status_.GetDoctorReport();
+    const auto failure = std::find_if(
+        report.issues.begin(), report.issues.end(),
+        [](const auto& issue) { return issue.code == "OPLOG_COMMIT_FAILED"; });
+    ASSERT_NE(failure, report.issues.end());
+    EXPECT_NE(failure->message.find("target=1"), std::string::npos);
+    EXPECT_NE(failure->message.find("NOPERM"), std::string::npos);
+
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(WaitUntil([&] {
+        uint64_t committed = 0;
+        return writer_->GetLocalCommittedSequenceId(committed) ==
+                   ErrorCode::OK &&
+               committed == 1;
+    }));
+    EXPECT_EQ(status_.SerializeDoctorJson().find("OPLOG_COMMIT_FAILED"),
+              std::string::npos);
+}
+
+TEST_F(RedisOpLogDoctorTest, LatestStallSurvivesRetriesAndNewEntries) {
+    // The fixture's ACL keeps seq=1 failing, so new work cannot advance latest.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] { return HasLatestStall(); }));
+    const auto retries =
+        HAMetricManager::instance().get_oplog_write_retries_total();
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
+    OpLogEntry entry;
+    ASSERT_TRUE(WaitUntil([&] {
+        return writer_->ReadOpLog(3, entry) == ErrorCode::OK &&
+               HAMetricManager::instance().get_oplog_write_retries_total() >
+                   retries;
+    }));
+    EXPECT_TRUE(HasFailureCount(1));
+    EXPECT_TRUE(HasLatestStall());
+    uint64_t latest = 0;
+    ASSERT_EQ(writer_->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 0u);
+
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(WaitUntil([&] {
+        return writer_->GetLocalCommittedSequenceId(latest) == ErrorCode::OK &&
+               latest == 1;
+    }));
+    EXPECT_FALSE(HasLatestStall());  // Progress resets the timer, not new work.
+    ASSERT_TRUE(WaitUntil([&] { return HasLatestStall(); }));
+    EXPECT_TRUE(HasFailureCount(0));  // Seq=3 still waits for missing seq=2.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    EXPECT_FALSE(HasLatestStall());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());  // No timer after all pending work drains.
+}
+
+TEST_F(RedisOpLogDoctorTest, CommittedRewritesDoNotStartLatestStallTimer) {
+    ASSERT_EQ(writer_->UpdateLatestSequenceId(1), ErrorCode::OK);
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] { return HasFailureCount(1); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());  // Even a failed rewrite needs no advance.
+
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), false), ErrorCode::OK);
+    EXPECT_FALSE(HasLatestStall());
+    ASSERT_TRUE(WaitUntil([&] { return HasLatestStall(); }));
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(writer_->DrainWriting(3000).drained);
+    EXPECT_FALSE(HasLatestStall());
+    // Preserve the old test's coverage of successful committed rewrites too.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());
+}
+
+TEST_F(RedisOpLogDoctorTest, LatestStallIsReadableWhileRedisReplyIsBlocked) {
+    ASSERT_TRUE(AllowEntries("*"));
+    DelayedLatestReply delay;
+    auto entered = delay.entered.get_future();
+    std::future<std::string> diagnosis;
+    std::future<void> stop;
+    {
+        // Release before joining workers or destroying futures, even on ASSERT.
+        struct ReleaseReply {
+            DelayedLatestReply& delay;
+            RedisOpLogStore& writer;
+            ~ReleaseReply() {
+                delayed_latest_reply.store(nullptr);
+                delay.release.set_value();
+                writer.StopWriting();
+            }
+        } cleanup{delay, *writer_};
+        delayed_latest_reply.store(&delay);
+        ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+        ASSERT_EQ(entered.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        diagnosis = std::async(std::launch::async,
+                               [&] { return status_.SerializeDoctorJson(); });
+        EXPECT_EQ(diagnosis.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+        stop = std::async(std::launch::async,
+                          [&] { writer_->RequestStopWriting(); });
+        EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+    }
+    stop.get();
+    EXPECT_NE(diagnosis.get().find("OPLOG_LATEST_STALLED"), std::string::npos);
+    EXPECT_FALSE(HasLatestStall());
+}
 
 TEST_F(RedisOpLogDoctorTest, TracksFailuresUntilEachEntryRecovers) {
     const auto retries =
@@ -811,6 +1237,16 @@ TEST_F(RedisOpLogDoctorTest, DroppingLastFailedEntryClearsIssue) {
         return HAMetricManager::instance().get_oplog_async_queue_size() == 0;
     }));
     EXPECT_TRUE(HasFailureCount(0));
+    uint64_t latest = 0;
+    ASSERT_EQ(writer_->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 0u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(HasLatestStall());  // A dropped-only tail is idle.
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    ASSERT_EQ(writer_->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 2u);  // Later progress can bridge the allowed hole.
+    EXPECT_FALSE(HasLatestStall());
 }
 
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
@@ -1223,7 +1659,28 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidDatabaseIndex) {
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store.Init());
 }
 
-TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
+class RedisPromotionTest : public RedisOpLogStoreTest {
+   protected:
+    void SetUp() override {
+        RedisOpLogStoreTest::SetUp();
+        if (IsSkipped()) return;
+        auto& status = HAStatusManager::instance();
+        status.Reset();
+        status.Configure(true, cluster_id_, "test-primary");
+        status.SetRoleState("primary", "STARTING");
+    }
+
+    void TearDown() override {
+        RedisOpLogStoreTest::TearDown();
+        HAStatusManager::instance().Reset();
+    }
+};
+
+class RedisPromotionSequenceTest
+    : public RedisPromotionTest,
+      public ::testing::WithParamInterface<uint64_t> {};
+
+TEST_P(RedisPromotionSequenceTest, NewWritesPreserveUnappliedCommittedEntries) {
     {
         auto old_writer = CreateWriter();
         for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
@@ -1242,9 +1699,28 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     config.oplog.data_dir = "127.0.0.1:notaport";
 
     P2PMasterService promoted(config);
-    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 0),
+    // Empty metadata isolates sequence initialization from metadata replay.
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, GetParam()),
               ErrorCode::OK);
+    ASSERT_NE(promoted.GetOpLogManager(), nullptr);
     EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 3);
+    const auto expect_diagnosis = [&] {
+        const auto report = HAStatusManager::instance().GetDoctorReport();
+        const auto issue = std::find_if(
+            report.issues.begin(), report.issues.end(), [](const auto& item) {
+                return item.code == "PROMOTION_CATCHUP_INCOMPLETE";
+            });
+        if (GetParam() < 3) {
+            ASSERT_NE(issue, report.issues.end());
+            EXPECT_NE(issue->message.find("oplog_applied_sequence_id=" +
+                                          std::to_string(GetParam()) +
+                                          ", oplog_latest_sequence_id=3"),
+                      std::string::npos);
+        } else {
+            EXPECT_EQ(issue, report.issues.end());
+        }
+    };
+    expect_diagnosis();
 
     auto sequence = promoted.GetOpLogManager()->AppendAndPersist(
         OpType::PUT_END, "new-primary", "new-payload", true);
@@ -1255,6 +1731,8 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     uint64_t latest = 0;
     ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
     EXPECT_EQ(latest, 4);
+    // New writes must not clear or rewrite the original promotion event.
+    expect_diagnosis();
     for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
         OpLogEntry entry;
         ASSERT_EQ(reader->ReadOpLog(sequence_id, entry), ErrorCode::OK);
@@ -1265,6 +1743,151 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     ASSERT_EQ(reader->ReadOpLog(4, new_entry), ErrorCode::OK);
     EXPECT_EQ(new_entry.object_key, "new-primary");
     EXPECT_EQ(new_entry.payload, "new-payload");
+}
+
+INSTANTIATE_TEST_SUITE_P(RestoredProgress, RedisPromotionSequenceTest,
+                         ::testing::Values(0, 1, 3));
+
+TEST_F(RedisPromotionTest, BatchLimitPromotionPreservesTailAndReportsCatchup) {
+    // Keep background delivery paused so the real Promote() loop does all
+    // replay. The counting reader still executes the real Redis scans.
+    class PausedNotifier : public OpLogChangeNotifier {
+       public:
+        ErrorCode Start(uint64_t, EntryCallback, ErrorCallback,
+                        MaintenanceCallback = {}) override {
+            return ErrorCode::OK;
+        }
+        void Stop() override {}
+        bool IsHealthy() const override { return true; }
+    };
+    class CountingReader : public RedisOpLogStore {
+       public:
+        CountingReader(const P2PHotStandbyConfig& config,
+                       std::atomic<size_t>& batch_reads)
+            : RedisOpLogStore(config.cluster_id, config.redis_endpoint, false,
+                              10, config.redis_password, config.redis_username),
+              batch_reads_(batch_reads) {}
+        std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
+            const std::string&, size_t = 1000) override {
+            return std::make_unique<PausedNotifier>();
+        }
+        ErrorCode ReadOpLogSinceWithProgress(
+            uint64_t start, size_t limit, std::vector<OpLogEntry>& entries,
+            OpLogReadProgress& progress) override {
+            EXPECT_EQ(start, batch_reads_.fetch_add(1) * 1000);
+            EXPECT_EQ(limit, 1000u);
+            return RedisOpLogStore::ReadOpLogSinceWithProgress(
+                start, limit, entries, progress);
+        }
+
+       private:
+        std::atomic<size_t>& batch_reads_;
+    };
+
+    P2PHotStandbyConfig standby_config;
+    standby_config.cluster_id = cluster_id_;
+    standby_config.oplog_store_type = OpLogStoreType::REDIS;
+    standby_config.redis_endpoint = redis_endpoint_;
+    standby_config.redis_username = redis_username_;
+    standby_config.redis_password = redis_password_;
+    // Promotion's fixed scan limit must not use the background poll setting.
+    standby_config.oplog_poll_batch_size = 5000;
+    std::atomic<size_t> batch_reads{0};
+    P2PHotStandbyService standby(standby_config, [&] {
+        auto reader =
+            std::make_unique<CountingReader>(standby_config, batch_reads);
+        EXPECT_EQ(reader->Init(), ErrorCode::OK);
+        return reader;
+    });
+    auto& status = HAStatusManager::instance();
+    status.SetRoleState("standby", "WATCHING");
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+
+    constexpr uint64_t kCaughtUp = 100 * 1000;
+    constexpr uint64_t kLatest = kCaughtUp + 1;
+    const UUID first_client{1, 1};
+    const UUID tail_client{2, 2};
+    const auto make_registration = [&](uint64_t sequence, UUID client) {
+        auto entry = MakeEntry(sequence, "", OpType_REGISTER_CLIENT);
+        entry.payload = SerializeP2PPayload(
+            RegisterClientPayload{client, "127.0.0.1", 50051, {}});
+        entry.checksum = static_cast<uint32_t>(
+            XXH32(entry.payload.data(), entry.payload.size(), 0));
+        return entry;
+    };
+    const auto first = make_registration(1, first_client);
+    const auto tail = make_registration(kLatest, tail_client);
+    {
+        auto writer = CreateWriter();
+        ASSERT_EQ(writer->WriteOpLog(first, true), ErrorCode::OK);
+        // Sparse committed IDs exercise 100 real scan batches without
+        // constructing 100,000 unrelated metadata records.
+        ASSERT_EQ(writer->UpdateLatestSequenceId(kCaughtUp), ErrorCode::OK);
+        ASSERT_EQ(writer->WriteOpLog(tail, true), ErrorCode::OK);
+    }
+    ASSERT_EQ(standby.GetLatestAppliedSequenceId(), 0u);
+    EXPECT_EQ(batch_reads.load(), 0u);
+    EXPECT_EQ(status.SerializeDoctorJson().find("PROMOTION_CATCHUP_INCOMPLETE"),
+              std::string::npos);
+
+    ASSERT_EQ(standby.Promote(), ErrorCode::OK);
+    EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
+    EXPECT_EQ(batch_reads.load(), 100u);
+    const auto applied = standby.GetLatestAppliedSequenceId();
+    ASSERT_EQ(applied, kCaughtUp);
+    const auto metadata = standby.ExportMetadata();
+    ASSERT_EQ(metadata.clients.size(), 1u);
+    EXPECT_EQ(metadata.clients.count(first_client), 1u);
+    EXPECT_EQ(metadata.clients.count(tail_client), 0u);
+
+    P2PMasterConfig master_config;
+    master_config.oplog.enabled = true;
+    master_config.oplog.store_type = "redis";
+    master_config.cluster_id = cluster_id_;
+    master_config.redis.endpoint = redis_endpoint_;
+    master_config.redis.username = redis_username_;
+    master_config.redis.password = redis_password_;
+    status.SetRoleState("primary", "STARTING");
+    P2PMasterService promoted(master_config);
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(metadata, applied),
+              ErrorCode::OK);
+    status.SetLeader("test-primary", 1);
+    status.SetRoleState("primary", "RUNNING");
+    const auto expect_diagnosis = [&] {
+        const auto report = status.GetDoctorReport();
+        EXPECT_EQ(report.health, "degraded");
+        const auto issue = std::find_if(
+            report.issues.begin(), report.issues.end(), [](const auto& item) {
+                return item.code == "PROMOTION_CATCHUP_INCOMPLETE";
+            });
+        ASSERT_NE(issue, report.issues.end());
+        EXPECT_NE(issue->message.find("oplog_applied_sequence_id=100000, "
+                                      "oplog_latest_sequence_id=100001"),
+                  std::string::npos);
+    };
+    expect_diagnosis();
+
+    P2PRegisterClientRequest request;
+    request.client_id = UUID{3, 3};
+    request.ip_address = "127.0.0.1";
+    request.rpc_port = 50051;
+    ASSERT_TRUE(promoted.RegisterClient(request).has_value());
+    ASSERT_NE(promoted.GetOpLogManager(), nullptr);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), kLatest + 1);
+    ASSERT_TRUE(promoted.GetOpLogManager()->DrainWriting(5000).drained);
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, kLatest + 1);
+    for (const auto& original :
+         {first, tail, make_registration(kLatest + 1, request.client_id)}) {
+        OpLogEntry stored;
+        ASSERT_EQ(reader->ReadOpLog(original.sequence_id, stored),
+                  ErrorCode::OK);
+        EXPECT_EQ(stored.op_type, original.op_type);
+        EXPECT_EQ(stored.payload, original.payload);
+    }
+    expect_diagnosis();
 }
 
 TEST_F(RedisOpLogStoreTest, PromotionWriterStartSkipsSnapshotCoveredGap) {

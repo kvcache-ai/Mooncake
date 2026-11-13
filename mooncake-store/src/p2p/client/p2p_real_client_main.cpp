@@ -33,6 +33,16 @@ DEFINE_uint32(
     "heartbeats are sent to <master host>:heartbeat_rpc_port instead of "
     "the main RPC port so heavy metadata RPCs cannot head-of-line-block "
     "them. Must match the master's --heartbeat_rpc_port. 0 = disabled.");
+DEFINE_int32(heartbeat_rpc_timeout_ms, 1000,
+             "Client heartbeat RPC connection/request timeout in milliseconds; "
+             "must be greater than 0.");
+DEFINE_validator(heartbeat_rpc_timeout_ms, [](const char* name, int32_t value) {
+    if (value <= 0) {
+        LOG(ERROR) << name << " must be greater than 0";
+        return false;
+    }
+    return true;
+});
 DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_string(tiered_backend_config, "conf/tiered_backend.json",
               "Tiered backend config: accepts a JSON string or a path to a "
@@ -135,7 +145,8 @@ int main(int argc, char* argv[]) {
         FLAGS_redis_username, static_cast<uint16_t>(FLAGS_heartbeat_rpc_port),
         static_cast<size_t>(FLAGS_te_async_poll_worker_num),
         FLAGS_p2p_start_local_only,
-        static_cast<size_t>(FLAGS_business_coro_worker_num));
+        static_cast<size_t>(FLAGS_business_coro_worker_num),
+        FLAGS_heartbeat_rpc_timeout_ms);
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
