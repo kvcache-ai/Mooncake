@@ -123,9 +123,16 @@ Master 和客户端从各自环境读取凭据；配置 RPC 不传凭据。Maste
 客户端需要对应的读写权限。每个集群使用独立 bucket/prefix；外部写入或删除本
 命名空间内的对象不属于本协议支持的并发修改。
 
+`object_storage_region` 默认空，启用对象副本时必须显式配置。它参与请求签名，
+需要与目标服务的区域匹配，不会根据 endpoint 猜测，也不会用客户端环境变量补齐。
+上例针对使用 `us-east-1` 的 MinIO 测试部署；阿里云 OSS 应填写实际区域 ID，
+例如 `cn-hangzhou`。未启用对象副本时不要求填写。
+已有持久记录的部署应显式填写此前使用的 region；修改默认值不会迁移已有对象目标。
+
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `enable_object_storage` | `false` | 启用同步对象副本 |
+| `object_storage_region` | 空，启用时必填 | 与目标服务匹配的签名区域 |
 | `object_storage_max_object_bytes` | 256 MiB | 单对象上限 |
 | `object_storage_max_staging_bytes` | 1 GiB | 每客户端对象暂存预算 |
 | `object_storage_max_pending_records` | 10000 | 未提交上传和退役对象的新增授权阈值，不限制有效对象数量 |

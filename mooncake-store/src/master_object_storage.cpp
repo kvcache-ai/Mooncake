@@ -34,7 +34,8 @@ void MasterService::InitObjectStorage(const MasterServiceConfig& config) {
         !ordered_oplog_writer_ || view_version_ == 0 || enable_dfs_ ||
         !root_fs_dir_.empty()) {
         throw std::invalid_argument(
-            "Object replicas require fenced HA ordered-log recovery with DFS "
+            "Object replicas require a valid target including an explicit "
+            "object_storage_region, fenced HA ordered-log recovery with DFS "
             "and legacy shared-file replicas disabled");
     }
     auto adapter = CreateObjectReplicaAdapter(object_storage_config_);

@@ -390,7 +390,9 @@ DEFINE_string(object_storage_provider, "s3",
               "Object service provider: s3 or oss");
 DEFINE_string(object_storage_endpoint, "", "Object service endpoint");
 DEFINE_string(object_storage_bucket, "", "Object service bucket");
-DEFINE_string(object_storage_region, "us-east-1", "Object service region");
+DEFINE_string(object_storage_region, "",
+              "Object service signing region; required when object replicas "
+              "are enabled");
 DEFINE_string(object_storage_prefix, "", "Immutable object namespace prefix");
 DEFINE_bool(object_storage_path_style, false, "Use path-style object requests");
 DEFINE_uint64(
@@ -1610,6 +1612,12 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    if (master_config.object_storage.enabled &&
+        master_config.object_storage.target.region.empty()) {
+        LOG(ERROR) << "object_storage_region must be explicitly set when "
+                      "enable_object_storage=true";
+        return 1;
+    }
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());

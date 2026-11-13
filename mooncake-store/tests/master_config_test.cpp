@@ -5,6 +5,24 @@
 namespace mooncake::test {
 namespace {
 
+TEST(ObjectStorageConfigTest, RegionIsRequiredOnlyWhenEnabled) {
+    ObjectStorageConfig config;
+    EXPECT_TRUE(config.target.region.empty());
+    EXPECT_TRUE(config.Validate());
+    config.enabled = true;
+    config.target.endpoint = "https://objects.example.com";
+    config.target.bucket = "bucket";
+    config.target.prefix = "cluster";
+    for (const char* provider : {"s3", "oss"}) {
+        SCOPED_TRACE(provider);
+        config.target.provider = provider;
+        config.target.region.clear();
+        EXPECT_FALSE(config.Validate());
+        config.target.region = "cn-hangzhou";
+        EXPECT_TRUE(config.Validate());
+    }
+}
+
 TEST(ClientLivenessConfigTest, UsesIndependentDefaultsWhenNothingIsSet) {
     const auto resolved = ResolveClientLivenessConfig({}, {});
 
