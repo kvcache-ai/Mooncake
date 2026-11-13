@@ -146,6 +146,11 @@ TEST_F(OpLogApplierTest, PendingNoopDrainsAfterPreviousEntry) {
 }
 
 TEST_F(OpLogApplierTest, ConfiguredPendingCapacity) {
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, cluster_id_, "local");
+    status.SetRoleState("standby", "WATCHING");
+
     P2POpLogApplier applier(metadata_store_.get(), cluster_id_, nullptr,
                             /*max_pending_entries=*/2);
     EXPECT_FALSE(applier.ApplyOpLogEntry(MakeEntry(
@@ -154,11 +159,17 @@ TEST_F(OpLogApplierTest, ConfiguredPendingCapacity) {
         3, OpType_WITHDRAW_ROUTE, "key3", MakeWithdrawPayload("key3"))));
     EXPECT_FALSE(applier.ApplyOpLogEntry(MakeEntry(
         4, OpType_WITHDRAW_ROUTE, "key4", MakeWithdrawPayload("key4"))));
+    const auto doctor = status.SerializeDoctorJson();
+    EXPECT_NE(doctor.find("OPLOG_PENDING_REJECTED"), std::string::npos);
+    EXPECT_NE(doctor.find("first_rejected_sequence_id=4,"), std::string::npos);
+    EXPECT_NE(doctor.find("capacity=2,"), std::string::npos);
+
     EXPECT_TRUE(applier.ApplyOpLogEntry(MakeEntry(
         1, OpType_WITHDRAW_ROUTE, "key1", MakeWithdrawPayload("key1"))));
 
     // Sequence 4 was rejected after the two-entry pending buffer filled.
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    status.Reset();
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
