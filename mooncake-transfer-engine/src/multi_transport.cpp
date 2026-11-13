@@ -158,6 +158,15 @@ Status MultiTransport::tryFreeBatchID(
     bool busy = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
+        // TCP keeps outstanding_slice_completions alive across the full
+        // terminal-action unwind (including after mark* returns). Refuse the
+        // is_finished fast path while that counter is nonzero.
+        if (__atomic_load_n(&task.outstanding_slice_completions,
+                            __ATOMIC_ACQUIRE) != 0) {
+            return Status::BatchBusy(
+                "BatchID cannot be freed until slice completion callbacks are "
+                "quiescent");
+        }
         if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) {
             // Event-driven completion can finish a task without a poll
             // (e.g. mooncake-store waits on completion_cv, then frees the
@@ -174,10 +183,10 @@ Status MultiTransport::tryFreeBatchID(
         if (!query_status.ok()) {
             return query_status;
         }
-        // A terminal transfer status only means the task published completion;
-        // the completion callback may still be unwinding while holding raw
-        // BatchDesc access. Keep the batch alive until the explicit quiescence
-        // counter reaches zero below.
+        // A terminal transfer status only means the task published completion.
+        // Keep the batch alive until outstanding_slice_completions (above)
+        // and active_completion_callbacks (CompletionCallbackPin, below) are
+        // both quiescent.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
             busy = true;
