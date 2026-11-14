@@ -32,6 +32,7 @@
 #include <vector>
 #include <ylt/struct_json/json_reader.h>
 
+#include "common.h"
 #include "transfer_engine.h"
 #include "topology.h"
 #include "transfer_task.h"
@@ -96,7 +97,13 @@ int GetCurrentNumaSocketId() {
     if (cpu < 0) {
         return 0;
     }
-    int node = numa_node_of_cpu(cpu);
+    // numa_node_of_cpu() fills libnuma's per-node cpumask cache on first use;
+    // see numaNodeCpuCacheMutex().
+    int node;
+    {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        node = numa_node_of_cpu(cpu);
+    }
     return node < 0 ? 0 : node;
 #else
     // libnuma is Linux-only; default to socket 0 elsewhere.
