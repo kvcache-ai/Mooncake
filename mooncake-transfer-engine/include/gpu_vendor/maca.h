@@ -25,6 +25,7 @@ const static std::string GPU_PREFIX = "maca:";
 #define cuMemGetAddressRange mcMemGetAddressRange
 #define cuMemGetAllocationGranularity mcMemGetAllocationGranularity
 #define cuMemGetHandleForAddressRange mcMemGetHandleForAddressRange
+#define cuMemGetHandleForAddressRangeExt mcMemGetHandleForAddressRangeExt
 #define cuMemImportFromShareableHandle mcMemImportFromShareableHandle
 #define cuMemMap mcMemMap
 #define cuMemRelease mcMemRelease
@@ -57,6 +58,7 @@ const static std::string GPU_PREFIX = "maca:";
 
 #define CU_MEMORYTYPE_HOST mcMemoryTypeHost
 #define CU_MEMORYTYPE_DEVICE mcMemoryTypeDevice
+#define CU_MEMORYTYPE_UNIFIED mcMemoryTypeUnified
 #define CU_POINTER_ATTRIBUTE_MEMORY_TYPE mcPointerAttributeMemoryType
 #define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL mcPointerAttributeDevice
 #define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR mcPointerAttributeRangeStartAddr
@@ -64,6 +66,14 @@ const static std::string GPU_PREFIX = "maca:";
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD mcMemHandleTypePosixFileDescriptor
 #define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED \
     mcDeviceAttributeHandleTypePosixFileDescriptorSupported
+
+// MACA 3.8.2 exports this extension but omits it from its public headers.
+// Newer SDKs declare the same signature, where this is a legal redeclaration.
+extern "C" mcError_t mcMemGetHandleForAddressRangeExt(void *handle, void *dptr,
+                                                      size_t size,
+                                                      int handle_type,
+                                                      unsigned long long flags,
+                                                      uint64_t *offset);
 
 static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
     if (err_str) {
