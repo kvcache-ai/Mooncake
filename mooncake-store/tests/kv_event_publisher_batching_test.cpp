@@ -240,6 +240,56 @@ TEST(KvEventPublisherBatchingTest, ShutdownInterruptsRemovalDeadline) {
     EXPECT_LT(Clock::now() - before, std::chrono::seconds(1));
 }
 
+TEST(KvEventPublisherBatchingTest, ConfiguredTimeoutIsHonouredOverDefault) {
+    // The window is configuration, not a constant: a value far above the
+    // default must be the one the worker actually waits on.
+    const auto config = Config(400000);  // 400ms, far above the 100us default
+    KvEventPublisher publisher(config);
+    Subscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
+    const auto start = Clock::now();
+    publisher.PublishRemoved("paced", "cpu");
+    const auto batch = subscriber.Receive();
+    const auto elapsed = Clock::now() - start;
+    ASSERT_TRUE(batch);
+    ASSERT_EQ(batch->events.size(), 1u);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(300));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+}
+
+TEST(KvEventPublisherBatchingTest,
+     OverflowDuringCoalescingStillLeavesSequenceGap) {
+    // The subscriber guide promises every queue-overflow drop reserves its
+    // sequence number. Delaying removals must not make that loss silent.
+    auto config = Config(1000000);  // 1s window keeps the worker parked
+    config.queue_capacity = 16;
+    auto publisher = std::make_unique<KvEventPublisher>(config);
+    Subscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
+
+    // Baseline batch so the subscriber has a sequence number to compare
+    // against.
+    publisher->PublishCleared();
+    const auto baseline = subscriber.Receive();
+    ASSERT_TRUE(baseline);
+    ASSERT_EQ(baseline->sequence, 1u);
+
+    publisher->PublishRemoved("seed", "cpu");
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    for (int i = 0; i < 200; ++i) {
+        publisher->PublishRemoved("k" + std::to_string(i), "cpu");
+    }
+    publisher->PublishCleared();
+
+    // The control event ends the coalescing window, so one further batch
+    // carries the surviving removals and the reserved sequence gap.
+    const auto next = subscriber.Receive();
+    ASSERT_TRUE(next);
+    const auto stats = publisher->GetStats();
+    ASSERT_GT(stats.dropped_events, 0u);
+    EXPECT_EQ(next->sequence - baseline->sequence - 1, stats.dropped_events);
+}
+
 }  // namespace
 }  // namespace mooncake
 

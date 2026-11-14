@@ -762,6 +762,7 @@ master publisher <mooncake-store-master-publisher>` reference.
 | `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
 | `--kv_events_emit_object_key` | `true` | Emit the raw Mooncake `object_key`. Setting this to `false` suppresses `stored` and `removed` entirely, since those events then carry no object identity; `cleared` is unaffected |
 | `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full and reserves its sequence number so the loss stays visible. Set to `0` for an unbounded queue |
+| `--kv_events_removal_batch_timeout_us` | `100` | Coalesce `removed` events for at most this many microseconds, or until 64 events are queued, so a full-pool eviction publishes fewer, larger batches. `stored` and `cleared` events and shutdown flush without waiting, and mutation order is preserved. Set to `0` to publish each removal immediately |
 
 One master publisher serves one fixed model and parallel context, so the
 remaining flags below are emitted verbatim in every event envelope. Empty

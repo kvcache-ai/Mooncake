@@ -30,6 +30,7 @@ master flags are:
 - `kv_events_emit_object_key`
 - `kv_events_emit_legacy_compat`
 - `kv_events_queue_capacity`
+- `kv_events_removal_batch_timeout_us`
 
 The feature is compiled only when `ENABLE_KV_EVENTS=ON`; public client APIs
 remain available and become no-ops for event metadata in builds without ZMQ.

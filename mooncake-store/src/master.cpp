@@ -329,6 +329,10 @@ DEFINE_bool(kv_events_emit_object_key, true,
 DEFINE_uint32(kv_events_queue_capacity, 65536,
               "Maximum pending KV events; oldest events are dropped when "
               "the queue is full (0 = unbounded)");
+DEFINE_uint32(kv_events_removal_batch_timeout_us, 100,
+              "Coalesce KV removal events for at most this many microseconds "
+              "before publishing; stored/cleared events and shutdown flush "
+              "without waiting (0 = no coalescing delay)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_int64(ha_leader_lease_ttl_sec,
@@ -679,6 +683,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("kv_events_queue_capacity",
                              &master_config.kv_events_queue_capacity,
                              FLAGS_kv_events_queue_capacity);
+    default_config.GetUInt32("kv_events_removal_batch_timeout_us",
+                             &master_config.kv_events_removal_batch_timeout_us,
+                             FLAGS_kv_events_removal_batch_timeout_us);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -1081,6 +1088,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.kv_events_queue_capacity = FLAGS_kv_events_queue_capacity;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_removal_batch_timeout_us",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_removal_batch_timeout_us =
+            FLAGS_kv_events_removal_batch_timeout_us;
     }
     // Clamp promotion_admission_threshold into the sketch counter's
     // representable range. The CountMinSketch uses 8-bit saturating

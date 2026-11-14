@@ -320,4 +320,43 @@ TEST(MasterServiceConfigTest,
     EXPECT_EQ(from_supervisor.http_port, UINT16_MAX);
 }
 
+TEST(MasterServiceConfigTest, KvRemovalBatchTimeoutDefaultsTo100Microseconds) {
+    MasterConfig master_config{};
+    EXPECT_EQ(100u, master_config.kv_events_removal_batch_timeout_us);
+
+    MasterServiceConfig service_config{};
+    EXPECT_EQ(100u, service_config.kv_events_removal_batch_timeout_us);
+}
+
+TEST(MasterServiceConfigTest,
+     KvRemovalBatchTimeoutPropagatesThroughConfiguration) {
+    MasterConfig master_config{};
+    master_config.kv_events_removal_batch_timeout_us = 2500;
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(2500u, supervisor_config.kv_events_removal_batch_timeout_us);
+
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    EXPECT_EQ(2500u, wrapped_config.kv_events_removal_batch_timeout_us);
+
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(2500u, service_config.kv_events_removal_batch_timeout_us);
+
+    EXPECT_EQ(2500u, WrappedMasterServiceConfig(master_config, 1)
+                         .kv_events_removal_batch_timeout_us);
+}
+
+TEST(MasterServiceConfigTest, KvRemovalBatchTimeoutZeroSurvivesPropagation) {
+    // Zero disables the coalescing delay, so it must not be replaced by the
+    // default anywhere along the configuration chain.
+    MasterConfig master_config{};
+    master_config.kv_events_removal_batch_timeout_us = 0;
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+
+    EXPECT_EQ(0u, service_config.kv_events_removal_batch_timeout_us);
+}
+
 }  // namespace mooncake::test

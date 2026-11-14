@@ -11389,6 +11389,8 @@ KvEventConfig MasterService::BuildKvEventConfig(
     kv_config.emit_legacy_compat_fields = config.kv_events_emit_legacy_compat;
     kv_config.emit_object_key = config.kv_events_emit_object_key;
     kv_config.queue_capacity = config.kv_events_queue_capacity;
+    kv_config.removal_batch_timeout_us =
+        config.kv_events_removal_batch_timeout_us;
     return kv_config;
 }
 
