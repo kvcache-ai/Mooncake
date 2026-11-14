@@ -5,15 +5,19 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <unordered_set>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "allocator.h"
 #include "client_metric.h"
@@ -26,6 +30,52 @@
 #include "utils/common.h"
 
 namespace mooncake {
+
+// Simulate registration backpressure after the master accepts one key.
+// Successful registrations still use the real master implementation.
+class RecoveryRpcService {
+   public:
+    RecoveryRpcService(std::shared_ptr<WrappedMasterService> master,
+                       ErrorCode error)
+        : master_(std::move(master)), error_(error) {}
+
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas) {
+        std::lock_guard lock(mutex_);
+        attempts_.push_back(std::chrono::steady_clock::now());
+        batches_.push_back(tasks);
+        if (attempts_.size() <= 2) {
+            if (attempts_.size() == 1 && !tasks.empty()) {
+                auto partial = master_->NotifyOffloadSuccess(
+                    client_id, {tasks.front()}, {metadatas.front()});
+                if (!partial) return partial;
+            }
+            attempts_cv_.notify_all();
+            return tl::make_unexpected(error_);
+        }
+        return master_->NotifyOffloadSuccess(client_id, tasks, metadatas);
+    }
+
+    bool WaitForAttempt() {
+        std::unique_lock lock(mutex_);
+        return attempts_cv_.wait_for(lock, std::chrono::seconds(2),
+                                     [this] { return !attempts_.empty(); });
+    }
+
+    auto Snapshot() {
+        std::lock_guard lock(mutex_);
+        return std::pair{attempts_, batches_};
+    }
+
+   private:
+    std::shared_ptr<WrappedMasterService> master_;
+    ErrorCode error_;
+    std::mutex mutex_;
+    std::condition_variable attempts_cv_;
+    std::vector<std::chrono::steady_clock::time_point> attempts_;
+    std::vector<std::vector<OffloadTaskItem>> batches_;
+};
 
 void SetEnv(const std::string& key, const std::string& value) {
     setenv(key.c_str(), value.c_str(), 1);
@@ -123,6 +173,148 @@ class FailingReadBackend : public BucketStorageBackend {
 
 class FileStorageTest : public ::testing::Test {
    protected:
+    enum class RecoveryPath { Startup, Rescan, Drain, Shutdown };
+
+    void RunRecoveryRegistrationRetry(ErrorCode error, RecoveryPath path,
+                                      bool retryable) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        auto service = master.service();
+        RecoveryRpcService recovery(service, error);
+        const auto port = getFreeTcpPort();
+        coro_rpc::coro_rpc_server server(2, port, "127.0.0.1");
+        server.register_handler<&WrappedMasterService::ServiceReady,
+                                &WrappedMasterService::Ping,
+                                &WrappedMasterService::GetStorageConfig,
+                                &WrappedMasterService::GetFsdir,
+                                &WrappedMasterService::ReMountSegment,
+                                &WrappedMasterService::MountLocalDiskSegment,
+                                &WrappedMasterService::UnmountLocalDiskSegment,
+                                &WrappedMasterService::ReportSsdCapacity,
+                                &WrappedMasterService::OffloadObjectHeartbeat,
+                                &WrappedMasterService::PromotionObjectHeartbeat,
+                                &WrappedMasterService::PollRemoveAll,
+                                &WrappedMasterService::FetchTasks,
+                                &WrappedMasterService::GetReplicaList>(
+            service.get());
+        server.register_handler<&store::GatherReadDirectory::Publish,
+                                &store::GatherReadDirectory::Resolve>(
+            &service->gather_directory);
+        server.register_handler<&RecoveryRpcService::NotifyOffloadSuccess>(
+            &recovery,
+            coro_rpc::func_id<&WrappedMasterService::NotifyOffloadSuccess>());
+        auto started = server.async_start();
+        ASSERT_FALSE(started.hasResult());
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created =
+            Client::Create(endpoint, master.metadata_url(), "tcp", std::nullopt,
+                           "127.0.0.1:" + std::to_string(port));
+        ASSERT_TRUE(created);
+        auto client = *created;
+
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/recovery_retry";
+        config.local_buffer_size = 1024 * 1024;
+        config.scanmeta_iterator_keys_limit = 2;
+        config.heartbeat_interval_seconds = 1;
+        config.client_buffer_gc_interval_seconds = 1;
+        const bool cancel =
+            path == RecoveryPath::Drain || path == RecoveryPath::Shutdown;
+        if (cancel) {
+            config.metadata_recovery_retry_initial_ms = 5000;
+            config.metadata_recovery_retry_max_ms = 5000;
+        }
+        fs::create_directories(config.storage_filepath);
+        BucketBackendConfig buckets;
+        buckets.bucket_keys_limit = 2;
+        const std::vector<std::string> keys{"recover-a", "recover-b",
+                                            "recover-c", "recover-d"};
+        std::string value(128, 'r');
+        // Populate and close the real SSD backend before starting the owner.
+        // Nothing is advertised to the master until the recovery scan runs.
+        {
+            BucketStorageBackend disk(config, buckets);
+            ASSERT_TRUE(disk.Init());
+            for (size_t i = 0; i < keys.size(); i += 2) {
+                std::unordered_map<std::string, std::vector<Slice>> batch;
+                for (size_t j = i; j < i + 2; ++j) {
+                    batch.emplace(
+                        TenantId::Default().MakeScopedKey(keys[j]),
+                        std::vector<Slice>{{value.data(), value.size()}});
+                }
+                ASSERT_TRUE(disk.BatchOffload(batch, nullptr));
+            }
+        }
+        // Keep the promise alive until FileStorage has joined its owned rescan.
+        std::promise<tl::expected<void, ErrorCode>> completed;
+        auto storage = std::make_unique<FileStorage>(config, client, endpoint);
+        storage->storage_backend_ =
+            std::make_shared<BucketStorageBackend>(config, buckets);
+        if (path != RecoveryPath::Startup) {
+            ASSERT_TRUE(storage->storage_backend_->Init());
+            ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        }
+        if (cancel) {
+            auto outcome = completed.get_future();
+            auto* owner = storage.get();
+            storage->rescan_future_ =
+                std::async(std::launch::async, [&completed, owner] {
+                    completed.set_value(owner->ReRegisterOffloadedObjects());
+                });
+            ASSERT_TRUE(recovery.WaitForAttempt());
+            // Let the fast local RPC complete before interrupting a 2.5-5s
+            // wait.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const auto stopped_at = std::chrono::steady_clock::now();
+            if (path == RecoveryPath::Shutdown) {
+                storage.reset();
+            } else {
+                ASSERT_TRUE(storage->DrainLocalDiskSegment(0));
+            }
+            ASSERT_EQ(outcome.wait_for(std::chrono::seconds(1)),
+                      std::future_status::ready);
+            auto result = outcome.get();
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+            EXPECT_LT(std::chrono::steady_clock::now() - stopped_at,
+                      std::chrono::seconds(1));
+            EXPECT_EQ(recovery.Snapshot().first.size(), 1u);
+            return;
+        }
+        auto result = path == RecoveryPath::Startup
+                          ? storage->Init()
+                          : storage->ReRegisterOffloadedObjects();
+        const auto [attempts, batches] = recovery.Snapshot();
+        if (!retryable) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), error);
+            EXPECT_EQ(attempts.size(), 1u);
+            return;
+        }
+        // A transient error must retry this batch rather than abandon the scan.
+        ASSERT_TRUE(result) << "SSD registration must retry transient failures";
+        ASSERT_EQ(attempts.size(), 4u);
+        // Retries must back off and resend the same batch, including its
+        // already accepted prefix. Only then may the second batch advance.
+        EXPECT_GE(attempts[1] - attempts[0], std::chrono::milliseconds(50));
+        EXPECT_GE(attempts[2] - attempts[1], std::chrono::milliseconds(100));
+        EXPECT_EQ(batches[1], batches[0]);
+        EXPECT_EQ(batches[2], batches[0]);
+        for (const auto& key : keys) {
+            auto registered = client->Query(key);
+            ASSERT_TRUE(registered);
+            EXPECT_EQ(registered->replicas.size(), 1u);
+            auto exists =
+                storage->Exists(TenantId::Default().MakeScopedKey(key));
+            ASSERT_TRUE(exists);
+            EXPECT_TRUE(*exists);
+        }
+    }
+
     std::string data_path;
 
     static uintmax_t StoredFileBytes(const std::string& path) {
@@ -2671,6 +2863,40 @@ TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
         client.value()->OffloadObjectHeartbeat(true, offload_items);
     ASSERT_FALSE(heartbeat_rpc.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+}
+
+class FileStorageRecoveryRetryTest
+    : public FileStorageTest,
+      public ::testing::WithParamInterface<ErrorCode> {};
+
+TEST_P(FileStorageRecoveryRetryTest,
+       StartupRetriesTransientRegistrationErrors) {
+    RunRecoveryRegistrationRetry(GetParam(), RecoveryPath::Startup, true);
+}
+
+TEST_P(FileStorageRecoveryRetryTest, RescanRetriesTransientRegistrationErrors) {
+    RunRecoveryRegistrationRetry(GetParam(), RecoveryPath::Rescan, true);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    TransientErrors, FileStorageRecoveryRetryTest,
+    ::testing::Values(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                      ErrorCode::RPC_FAIL, ErrorCode::RPC_TIMEOUT,
+                      ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+
+TEST_F(FileStorageTest, RecoveryDoesNotRetryInvalidMetadata) {
+    RunRecoveryRegistrationRetry(ErrorCode::INVALID_PARAMS,
+                                 RecoveryPath::Startup, false);
+}
+
+TEST_F(FileStorageTest, RecoveryBackoffStopsOnDrain) {
+    RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                 RecoveryPath::Drain, true);
+}
+
+TEST_F(FileStorageTest, RecoveryBackoffStopsOnShutdown) {
+    RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                 RecoveryPath::Shutdown, true);
 }
 
 }  // namespace mooncake

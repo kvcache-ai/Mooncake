@@ -19,6 +19,7 @@
 #include "client_metric.h"
 #include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
+#include "random.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
@@ -165,6 +166,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
 FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
+    recovery_stopping_.store(true);
     heartbeat_running_ = false;
     WakeHeartbeat();
     if (heartbeat_thread_.joinable()) {
@@ -251,8 +253,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
             auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
+            auto add_object_result = NotifyRecoveredObjects(tasks, metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -1114,6 +1115,7 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
     {
         MutexLocker locker(&offloading_mutex_);
         draining_.store(true);
+        WakeHeartbeat();
 
         // On failure the latch stays and the heartbeat retries the unmount.
         auto result = client_->UnmountLocalDiskSegment();
@@ -1771,6 +1773,44 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     return false;
 }
 
+tl::expected<void, ErrorCode> FileStorage::NotifyRecoveredObjects(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    uint64_t delay_ms = config_.metadata_recovery_retry_initial_ms;
+    const auto stopping = [this] {
+        return recovery_stopping_.load() || draining_.load() ||
+               disk_fenced_.load();
+    };
+    while (true) {
+        if (stopping()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+        if (result) return result;
+        const auto error = result.error();
+        if (error != ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+            error != ErrorCode::RPC_FAIL && error != ErrorCode::RPC_TIMEOUT &&
+            error != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            return result;
+        }
+        // The master may have accepted a prefix before rejecting the batch.
+        // Retry the same batch; do not advance or restart the metadata scan.
+        const auto wait_ms =
+            randomUniform(std::max(uint64_t{1}, delay_ms / 2), delay_ms);
+        LOG(WARNING) << "SSD recovery registration failed: " << error
+                     << ", retrying " << tasks.size() << " keys in " << wait_ms
+                     << "ms";
+        // Drain, disk fencing and shutdown already signal this wakeup.
+        std::unique_lock lock(heartbeat_wake_mutex_);
+        if (heartbeat_wake_cv_.wait_for(
+                lock, std::chrono::milliseconds(wait_ms), stopping)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        delay_ms = std::min(delay_ms * 2,
+                            uint64_t{config_.metadata_recovery_retry_max_ms});
+    }
+}
+
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
               << "offloaded objects with master";
@@ -1807,7 +1847,7 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 }
                 auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                    NotifyRecoveredObjects(tasks, metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)

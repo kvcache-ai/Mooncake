@@ -109,6 +109,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.scanmeta_iterator_keys_limit = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT,
         legacy_scanmeta_iterator_keys_limit);
+    config.metadata_recovery_retry_max_ms = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_METADATA_RECOVERY_RETRY_MAX_MS,
+        config.metadata_recovery_retry_max_ms);
 
     config.total_keys_limit = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT, config.total_keys_limit);
@@ -230,6 +233,12 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
+    if (metadata_recovery_retry_initial_ms == 0 ||
+        metadata_recovery_retry_max_ms < metadata_recovery_retry_initial_ms) {
+        LOG(ERROR) << "Metadata recovery retry delays must satisfy "
+                      "0 < initial_ms <= max_ms";
+        return false;
+    }
     // storage_filepath may be a comma-separated multi-disk list. ValidatePath
     // stats a single path and would reject the raw list string (stat of
     // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed
