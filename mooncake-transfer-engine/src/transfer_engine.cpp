@@ -733,8 +733,9 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         config->set("transports/memfabric/store_te_init",
                     globalConfig().ascend_store_te_init);
 #endif
-        impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
-        if (!impl_tent_->available()) return ERR_CONTEXT;
+        auto engine = std::make_shared<mooncake::tent::TransferEngine>(config);
+        if (!engine->available()) return ERR_CONTEXT;
+        impl_tent_ = std::move(engine);
         metadata_conn_string_ = metadata_conn_string;
         return 0;
     }
@@ -798,7 +799,7 @@ std::string TransferEngine::getLocalIpAndPort() {
 
 int TransferEngine::getRpcPort() {
     if (use_tent_) {
-        return impl_tent_->getRpcServerPort();
+        return impl_tent_ ? impl_tent_->getRpcServerPort() : 0;
     } else
         return impl_->getRpcPort();
 }

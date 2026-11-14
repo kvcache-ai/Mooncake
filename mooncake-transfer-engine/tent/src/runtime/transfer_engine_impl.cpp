@@ -472,14 +472,27 @@ Status TransferEngineImpl::construct() {
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
-    CHECK_STATUS(metadata_->start(port_, ipv6_, rpc_server_threads));
+    auto status = metadata_->start(port_, ipv6_, rpc_server_threads);
+    if (!status.ok()) {
+        metadata_.reset();
+        port_ = 0;
+        return status;
+    }
 
     if (metadata_type == "p2p")
         local_segment_name_ = buildIpAddrWithPort(hostname_, port_, ipv6_);
     else if (local_segment_name_.empty())
         local_segment_name_ = randomSegmentName();
 
-    CHECK_STATUS(setupLocalSegment());
+    status = setupLocalSegment();
+    if (!status.ok()) {
+        // Initial publication failed. Stop RPC workers before returning an
+        // unavailable engine, and do not delete a descriptor we never owned.
+        local_segment_tracker_.reset();
+        metadata_.reset();
+        port_ = 0;
+        return status;
+    }
 
     // Initialize transport selector
     transport_selector_ = std::make_unique<TransportSelector>(conf_);

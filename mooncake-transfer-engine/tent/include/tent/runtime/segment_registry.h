@@ -55,6 +55,8 @@ class CentralSegmentRegistry : public SegmentRegistry {
 
     virtual ~CentralSegmentRegistry() {}
 
+    bool available() const { return plugin_ != nullptr; }
+
    public:
     virtual Status getSegmentDesc(SegmentDescRef &desc,
                                   const std::string &segment_name);

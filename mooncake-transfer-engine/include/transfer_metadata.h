@@ -234,14 +234,15 @@ class TransferMetadata {
     };
 
    public:
+    // Throws std::invalid_argument if the storage backend is unsupported or
+    // disabled in this build. P2PHANDSHAKE does not require a storage backend.
     TransferMetadata(const std::string &conn_string);
 
     ~TransferMetadata();
 
    protected:
     // Test-only seam: inject a storage plugin directly, bypassing the
-    // conn-string plugin factory (which LOG(FATAL)s without a real
-    // etcd/redis/http backend) and the P2P handshake daemon. Derived
+    // conn-string plugin factory and the P2P handshake daemon. Derived
     // hardware-free unit tests substitute an in-memory
     // MetadataStoragePlugin to exercise syncSegmentCache without RDMA/CUDA.
     explicit TransferMetadata(

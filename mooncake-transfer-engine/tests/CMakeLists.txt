@@ -624,6 +624,10 @@ if(USE_SUNRISE)
 endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
+if(USE_TENT)
+  target_compile_definitions(transfer_metadata_test PRIVATE USE_TENT)
+endif()
+
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)

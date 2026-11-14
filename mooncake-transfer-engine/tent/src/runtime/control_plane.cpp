@@ -458,7 +458,10 @@ ControlService::ControlService(const std::string& type,
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
         auto agent = std::make_unique<CentralSegmentRegistry>(type, servers);
+        const bool available = agent->available();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
+        // Reject an unavailable registry before creating the RPC service.
+        if (!available) return;
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();
     rpc_server_->registerFunction(
@@ -602,6 +605,9 @@ void ControlService::finishNotifyCallback() {
 }
 
 Status ControlService::start(uint16_t& port, bool ipv6_, size_t threads) {
+    if (!rpc_server_)
+        return Status::MetadataError(
+            "Central metadata store not started" LOC_MARK);
     return rpc_server_->start(port, ipv6_, threads);
 }
 
