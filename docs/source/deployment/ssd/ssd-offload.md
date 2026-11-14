@@ -140,12 +140,15 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
+| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_ALLOC_WAIT_MS` | `5000` | How long a staging-arena allocation waits for space when the arena is exhausted before the read fails with `BUFFER_OVERFLOW`; `0` restores fail-fast behavior |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
 
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
+
+Size `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` against the per-read staging footprint: field measurements with a 70B-class model at TP4 show the default 1.25 GiB arena holding about one read batch at a time, so concurrent SSD readers serialize behind `MOONCAKE_OFFLOAD_CLIENT_BUFFER_ALLOC_WAIT_MS` until earlier reads release space. Raise the arena when parallel reads matter.
 
 The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`. The arena is selected when the current process owns the SSD replica and the restore destination is GPU memory, and is also used as request-scoped staging for DFS ranged-session reads into device memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote and CPU-destination reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal client buffer arena; if the quota cannot be pinned at startup, the optimization remains disabled. io_uring disables the pinned restore arena. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
 
