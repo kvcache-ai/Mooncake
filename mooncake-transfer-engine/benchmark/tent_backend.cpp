@@ -457,7 +457,11 @@ void TENTBenchRunner::pinThread(int thread_id) {
         return;
     }
 #endif
-    uint64_t addr = getLocalBufferBase(thread_id, 0, 0);
+    // The layout is validated before the run, so a missing region only means
+    // there is nothing to pin this worker to.
+    const auto base = getLocalBufferBase(thread_id, 0);
+    if (!base) return;
+    const uint64_t addr = *base;
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
     if (result.empty()) return;
     LocationParser location(result[0].location);

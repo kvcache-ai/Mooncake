@@ -82,6 +82,16 @@ if(BUILD_UNIT_TESTS)
     add_test(NAME tebench_tent_config_test COMMAND tebench_tent_config_test)
 
     add_executable(
+      tebench_tent_layout_test tests/tent_layout_test.cpp tent_backend.cpp
+                               bench_runner.cpp split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_layout_test PRIVATE transfer_engine tent_link_group gtest
+                                       gtest_main)
+    target_include_directories(tebench_tent_layout_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_layout_test COMMAND tebench_tent_layout_test)
+
+    add_executable(
       tebench_tent_teardown_test tests/tent_teardown_test.cpp tent_backend.cpp
                                  bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
