@@ -512,9 +512,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     bool terminal_reported_ = false;
     OnTerminal on_terminal_;
 
-    void initiate(void* buffer, uint64_t dest_addr, size_t size,
-                  TransferRequest::OpCode opcode) {
-        local_buffer_ = (char*)buffer;
+    // A coalesced transfer is one wire request whose body maps, in order, onto
+    // several local buffers. Empty for an ordinary single-buffer request.
+    std::vector<std::pair<char*, size_t>> segments_;
+    size_t segment_index_ = 0;
+    // Body offset at which the current local buffer starts.
+    uint64_t segment_begin_ = 0;
+
+    void setLocalBuffer(char* buffer) {
+        local_buffer_ = buffer;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
@@ -523,6 +529,42 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #ifdef MOONCAKE_TCP_ASCEND
         ascend_device_ = getAscendDeviceId(local_buffer_);
 #endif
+    }
+
+    // Next local address the body reads into or writes from.
+    char* cursor() const {
+        return local_buffer_ + (total_transferred_bytes_ - segment_begin_);
+    }
+
+    // Bytes left in the current local buffer. Steps to the next buffer of a
+    // coalesced transfer once the current one is full, so this returns 0 only
+    // when the whole body is done.
+    size_t localRemaining(uint64_t size) {
+        if (segments_.empty()) return size - total_transferred_bytes_;
+        size_t left = segment_begin_ + segments_[segment_index_].second -
+                      total_transferred_bytes_;
+        if (left == 0 && segment_index_ + 1 < segments_.size()) {
+            segment_begin_ = total_transferred_bytes_;
+            setLocalBuffer(segments_[++segment_index_].first);
+            left = segments_[segment_index_].second;
+        }
+        return left;
+    }
+
+    // `segments` must be non-empty and hold no zero-length entry.
+    void initiateCoalesced(std::vector<std::pair<char*, size_t>> segments,
+                           uint64_t dest_addr, TransferRequest::OpCode opcode) {
+        size_t total = 0;
+        for (const auto& segment : segments) total += segment.second;
+        segments_ = std::move(segments);
+        segment_index_ = 0;
+        segment_begin_ = 0;
+        initiate(segments_[0].first, dest_addr, total, opcode);
+    }
+
+    void initiate(void* buffer, uint64_t dest_addr, size_t size,
+                  TransferRequest::OpCode opcode) {
+        setLocalBuffer((char*)buffer);
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode | (v2_ ? kOpcodeV2Flag : 0);
@@ -831,14 +873,13 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         uint64_t size = le64toh(header_.size);
         char* addr = local_buffer_;
 
-        size_t buffer_size =
-            std::min(getChunkSize(), size - total_transferred_bytes_);
+        size_t buffer_size = std::min(getChunkSize(), localRemaining(size));
         if (buffer_size == 0) {
             finalize(TransferStatusEnum::COMPLETED, true);
             return;
         }
 
-        char* dram_buffer = addr + total_transferred_bytes_;
+        char* dram_buffer = cursor();
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
@@ -888,13 +929,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
-                    cudaError_t cuda_status =
-                        copyTcpCudaMemory(addr + total_transferred_bytes_,
-                                          dram_buffer, transferred_bytes);
+                    cudaError_t cuda_status = copyTcpCudaMemory(
+                        cursor(), dram_buffer, transferred_bytes);
 #else
                     cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+                        cudaMemcpy(cursor(), dram_buffer, transferred_bytes,
+                                   cudaMemcpyDefault);
 #endif
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
@@ -909,9 +949,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #ifdef MOONCAKE_TCP_ASCEND
                 if (ascend_device_ >= 0) {
                     auto status = copyTcpAscendMemory(
-                        addr + total_transferred_bytes_, dram_buffer,
-                        transferred_bytes, ascend_device_,
-                        ACL_MEMCPY_HOST_TO_DEVICE);
+                        cursor(), dram_buffer, transferred_bytes,
+                        ascend_device_, ACL_MEMCPY_HOST_TO_DEVICE);
                     if (status != ACL_SUCCESS) {
                         LOG(ERROR) << "TCP Ascend H2D copy failed: " << status;
                         finalize(TransferStatusEnum::FAILED, false);
@@ -929,8 +968,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         uint64_t size = le64toh(header_.size);
         char* addr = local_buffer_;
 
-        size_t buffer_size =
-            std::min(getChunkSize(), size - total_transferred_bytes_);
+        size_t buffer_size = std::min(getChunkSize(), localRemaining(size));
         if (buffer_size == 0) {
             if (v2_) {
                 if (write_abort_requested_) {
@@ -957,7 +995,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             return;
         }
 
-        char* dram_buffer = addr + total_transferred_bytes_;
+        char* dram_buffer = cursor();
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
@@ -966,12 +1004,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
-            cudaError_t cuda_status = copyTcpCudaMemory(
-                dram_buffer, addr + total_transferred_bytes_, buffer_size);
-#else
             cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+                copyTcpCudaMemory(dram_buffer, cursor(), buffer_size);
+#else
+            cudaError_t cuda_status = cudaMemcpy(
+                dram_buffer, cursor(), buffer_size, cudaMemcpyDefault);
 #endif
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
@@ -986,9 +1023,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #ifdef MOONCAKE_TCP_ASCEND
         if (ascend_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
-            auto status = copyTcpAscendMemory(
-                dram_buffer, addr + total_transferred_bytes_, buffer_size,
-                ascend_device_, ACL_MEMCPY_DEVICE_TO_HOST);
+            auto status =
+                copyTcpAscendMemory(dram_buffer, cursor(), buffer_size,
+                                    ascend_device_, ACL_MEMCPY_DEVICE_TO_HOST);
             if (status != ACL_SUCCESS) {
                 LOG(ERROR) << "TCP Ascend D2H copy failed: " << status;
                 abortWrite();
