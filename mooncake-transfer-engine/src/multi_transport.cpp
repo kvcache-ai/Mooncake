@@ -290,12 +290,17 @@ void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
 }
 
 void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
+    bool wake = false;
     {
         std::lock_guard<std::mutex> lock(completion_mu_);
         auto& batch = Transport::toBatchDesc(batch_id);
         if (batch.terminal_suppressed) return;
+        // Drain reads the fd and then takes the queue. A non-empty queue
+        // already holds that wake, so later records skip the write.
+        wake = ready_.empty();
         ready_.push_back(BatchCompletion{batch_id, status});
     }
+    if (!wake) return;
     // Local completion only. Peer notify stays on getBatchTransferStatus;
     // do not sendNotify from the CQ / completion path (RFC #5164).
     // enableBatchCompletionNotification already rejected a missing fd, so

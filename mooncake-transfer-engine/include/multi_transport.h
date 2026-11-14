@@ -196,7 +196,8 @@ class MultiTransport {
     std::thread deferred_cleanup_thread_;
 
     // completion_mu_ guards ready_ and BatchDesc::terminal_suppressed.
-    // The eventfd write stays outside the lock and is not retried.
+    // The eventfd is written only when ready_ goes from empty to non-empty.
+    // The write stays outside the lock and is not retried.
     std::mutex completion_mu_;
     std::vector<BatchCompletion> ready_;
     int completion_fd_ = -1;
