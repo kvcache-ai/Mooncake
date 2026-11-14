@@ -292,7 +292,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
     verify_multi_buffer_batch_ops(&target_a, &reader, value_size)?;
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
-    verify_request_replication_policy(&target_a, &target_b, &reader, value_size)?;
+    verify_request_replication_policy(&target_a, &target_b, &reader, &planner, value_size)?;
     verify_delete_reclaim_parity(&reclaim_writer, value_size)?;
     verify_embedded_route_directory_offloads_metadata(
         metadata.as_ref(),
@@ -300,14 +300,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &reader,
         value_size,
     )?;
-    verify_routed_scale_out(&router, &reader, value_size)?;
-    verify_multi_replica_route_publish(&router_replica, &reader, value_size)?;
+    verify_routed_scale_out(&router, &reader, &planner, value_size)?;
+    verify_multi_replica_route_publish(&router_replica, &reader, &planner, value_size)?;
     verify_dynamic_expand_and_soft_shrink(&elastic_target, &elastic_router, &reader, value_size)?;
     verify_hot_upgrade(
         &mut target_a,
         &mut target_upgrade,
         &router_replica,
         &reader,
+        &planner,
         value_size,
     )?;
     target_c.register_local_memory()?;
@@ -1002,12 +1003,36 @@ fn verify_overwrite_reclaims_capacity(
     Ok(())
 }
 
+fn wait_for_placement_candidate_count(
+    planner: &PlacementPlanner,
+    observer: &StoreClient,
+    key: &str,
+    minimum: usize,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let candidates = planner.ranked_candidates(observer, &ObjectRef::new(key))?;
+        if candidates.len() >= minimum {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(StoreError::InvalidState(format!(
+                "placement membership did not converge for {key}: candidates={} need={minimum}",
+                candidates.len()
+            )));
+        }
+        sleep(Duration::from_millis(10));
+    }
+}
+
 fn verify_request_replication_policy(
     writer: &StoreClient,
     preferred_target: &StoreClient,
     reader: &StoreClient,
+    planner: &PlacementPlanner,
     value_size: usize,
 ) -> Result<()> {
+    wait_for_placement_candidate_count(planner, writer, "policy-single-key", 2)?;
     let single_value = payload("policy-single", value_size);
     let single_route = writer.put_with_policy(
         "policy-single-key",
@@ -1361,8 +1386,10 @@ fn verify_embedded_route_directory_offloads_metadata(
 fn verify_routed_scale_out(
     router: &StoreClient,
     reader: &StoreClient,
+    planner: &PlacementPlanner,
     value_size: usize,
 ) -> Result<()> {
+    wait_for_placement_candidate_count(planner, router, "scale-auto-readiness", 2)?;
     let items = build_items("tenant-a", "scale-auto", 32, value_size);
     let puts = items
         .iter()
@@ -1403,8 +1430,10 @@ fn verify_routed_scale_out(
 fn verify_multi_replica_route_publish(
     router: &StoreClient,
     reader: &StoreClient,
+    planner: &PlacementPlanner,
     value_size: usize,
 ) -> Result<()> {
+    wait_for_placement_candidate_count(planner, router, "replicated-route-readiness", 2)?;
     let items = build_items("tenant-a", "replicated", 8, value_size);
     let puts = items
         .iter()
@@ -1447,6 +1476,7 @@ fn verify_hot_upgrade(
     writer_upgrade: &mut StoreClient,
     routed_writer: &StoreClient,
     reader: &StoreClient,
+    planner: &PlacementPlanner,
     value_size: usize,
 ) -> Result<()> {
     writer_a.enter_draining()?;
@@ -1458,6 +1488,29 @@ fn verify_hot_upgrade(
         Some(now_ms() + 5_000),
     )?;
     writer_upgrade.activate()?;
+
+    // Lifecycle publication is synchronous, but placement uses a membership
+    // snapshot refreshed in the background. Wait for the routing client to
+    // observe the handoff before testing its two-replica write.
+    let membership_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let candidates =
+            planner.ranked_candidates(routed_writer, &ObjectRef::new("upgrade-routed-key"))?;
+        if candidates.len() >= 2
+            && candidates.contains(writer_upgrade.runtime_id())
+            && !candidates.contains(writer_a.runtime_id())
+        {
+            break;
+        }
+        if Instant::now() >= membership_deadline {
+            return Err(StoreError::InvalidState(format!(
+                "hot-upgrade placement did not converge: old={} successor={} candidates={candidates:?}",
+                writer_a.runtime_id(),
+                writer_upgrade.runtime_id(),
+            )));
+        }
+        sleep(Duration::from_millis(10));
+    }
 
     let preserved = payload("upgrade-preserved", value_size);
     let promoted = payload("upgrade-promoted", value_size);

@@ -7523,6 +7523,156 @@ fn routed_put_skips_owner_with_full_publication_ledger() {
 }
 
 #[test]
+fn single_object_put_paths_retry_after_reservation_membership_refresh() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("single-put-refresh-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("single-put-refresh-b-segment"));
+    let successor_transport =
+        Arc::new(store_a_transport.peer("single-put-refresh-successor-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("single-put-refresh-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-successor")
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(successor_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("successor build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    successor
+        .register_local_memory()
+        .expect("successor memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &successor, &writer]);
+
+    store_a.enter_draining().expect("old owner should drain");
+    let stale_membership = writer
+        .live_clients_snapshot(true)
+        .expect("pre-activation membership should refresh");
+    assert!(stale_membership.iter().any(|lease| {
+        lease.runtime == *store_a.runtime_id() && lease.state == ClientLifecycleState::Draining
+    }));
+    assert!(stale_membership.iter().any(|lease| {
+        lease.runtime == *successor.runtime_id() && lease.state == ClientLifecycleState::Standby
+    }));
+    successor.activate().expect("successor should activate");
+    writer
+        .live_client_cache
+        .lock()
+        .store(stale_membership.clone());
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .prefer_local(false);
+    let value = b"single-put-refresh-payload";
+    let route = writer
+        .put_with_policy("single-put-refresh-key", value, &policy)
+        .expect("single put should refresh stale membership and retry");
+    assert_eq!(route.replicas.len(), 2);
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *successor.runtime_id()));
+    assert_eq!(writer.get("single-put-refresh-key").unwrap(), value);
+
+    // Exercise the same reserve retry through the registered-buffer entry point.
+    writer
+        .live_client_cache
+        .lock()
+        .store(stale_membership.clone());
+    let registered_value = b"registered-put-refresh-payload".to_vec();
+    writer
+        .register_buffer(
+            registered_value.as_ptr() as *mut c_void,
+            registered_value.len(),
+        )
+        .expect("registered source should register");
+    let registered_route = writer
+        .put_from_with_policy(
+            "registered-put-refresh-key",
+            registered_value.as_ptr().cast(),
+            registered_value.len(),
+            &policy,
+        )
+        .expect("registered-buffer put should refresh stale membership and retry");
+    assert_eq!(registered_route.replicas.len(), 2);
+    assert!(registered_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *successor.runtime_id()));
+    assert_eq!(
+        writer.get("registered-put-refresh-key").unwrap(),
+        registered_value
+    );
+
+    // Different per-item policies intentionally select batch_put's single-object fallback.
+    writer.live_client_cache.lock().store(stale_membership);
+    let batch_value = b"fallback-batch-replica-two";
+    let single_value = b"fallback-batch-replica-one";
+    let routes = writer
+        .batch_put(&[
+            PutRequest::new("fallback-batch-two", batch_value).replication(policy),
+            PutRequest::new("fallback-batch-one", single_value).replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false),
+            ),
+        ])
+        .expect("single-object batch fallback should handle stale membership");
+    assert_eq!(routes[0].replicas.len(), 2);
+    assert!(routes[0]
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *successor.runtime_id()));
+    assert_eq!(routes[1].replicas.len(), 1);
+    assert_eq!(writer.get("fallback-batch-two").unwrap(), batch_value);
+    assert_eq!(writer.get("fallback-batch-one").unwrap(), single_value);
+}
+
+#[test]
 fn routed_batch_put_from_replans_after_membership_refresh_and_uses_new_runtime() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("batch-put-replan-a-segment"));
@@ -18056,6 +18206,126 @@ fn drain_migration_updates_object_route_without_refreshing_draining_authority() 
         "object route facade must stop advertising the evacuated replica"
     );
     assert_eq!(writer.get(key).expect("migrated value should read"), value);
+}
+
+#[test]
+fn stale_membership_does_not_prune_active_replicas_on_single_or_batch_read() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("stale-read-prune-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("stale-read-prune-b-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("stale-read-prune-reader-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("stale-read-prune-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-a")
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &reader]);
+    let stale_membership = reader
+        .live_clients_snapshot(true)
+        .expect("standby membership should refresh");
+    assert!(stale_membership.iter().any(|lease| {
+        lease.runtime == *store_a.runtime_id() && lease.state == ClientLifecycleState::Standby
+    }));
+    store_a.activate().expect("store-a should activate");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .live_client_cache
+        .lock()
+        .store(stale_membership.clone());
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .prefer_local(false)
+        .preferred_storage_owners([
+            store_a.runtime_id().storage_key(),
+            store_b.runtime_id().storage_key(),
+        ]);
+    let single_value = b"stale-read-single-payload";
+    let single_route = writer
+        .put_with_policy("stale-read-single-key", single_value, &policy)
+        .expect("two-replica seed put should succeed");
+    assert_eq!(single_route.replicas[0].owner, *store_a.runtime_id());
+    assert_eq!(single_route.replicas.len(), 2);
+
+    assert_eq!(reader.get("stale-read-single-key").unwrap(), single_value);
+    let after_single = writer
+        .query_route("stale-read-single-key")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_single.replicas.len(),
+        2,
+        "single get must retain both active replicas"
+    );
+
+    // Restore the pre-activation snapshot so batch read exercises the same stale window.
+    reader.live_client_cache.lock().store(stale_membership);
+    let batch_value = b"stale-read-batch-payload";
+    writer
+        .put_with_policy("stale-read-batch-key", batch_value, &policy)
+        .expect("second two-replica seed put should succeed");
+    let batch_result = reader
+        .batch_get(&[ObjectRef::new("stale-read-batch-key")])
+        .expect("batch get should read through the active backup");
+    assert_eq!(batch_result, vec![batch_value.to_vec()]);
+    let after_batch = writer.query_route("stale-read-batch-key").unwrap().unwrap();
+    assert_eq!(
+        after_batch.replicas.len(),
+        2,
+        "batch get must retain both active replicas"
+    );
 }
 
 #[test]
