@@ -32,5 +32,14 @@ class LogObserver final : public EvictionObserver {
     const long offload_cap_;
 };
 
+// The age at eviction of every object that released memory, into the
+// master_evicted_key_age_seconds histogram. Only fitted to runs whose
+// reclaimer releases for real (not through the OpLog, where the release the
+// effect records is still pending its durable entry).
+class AgeObserver final : public EvictionObserver {
+   public:
+    void OnApplied(const ObjectView& view, const Effect& effect) override;
+};
+
 }  // namespace eviction
 }  // namespace mooncake

@@ -71,7 +71,7 @@ using namespace mooncake;
 namespace {
 std::function<GidRefreshResult()> gid_probe;
 std::function<int(ibv_port_state *)> port_state_probe;
-}
+}  // namespace
 
 // Wrap the device probe, leaving the actual WorkerPool recovery path intact.
 extern "C" GidRefreshResult
