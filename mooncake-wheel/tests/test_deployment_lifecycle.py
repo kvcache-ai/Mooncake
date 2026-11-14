@@ -326,14 +326,19 @@ class TestDeploymentLifecycle(unittest.TestCase):
         for field in ("short_ok", "single_ok", "shape_ok"):
             self.assertTrue(response[field], field)
 
-    def wait_roundtrip(self, worker):
+    def wait_roundtrip(self, worker, *, expect_local_pool=True):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             response = worker.call("roundtrip")
             if (response["writes"] == [0, 0] and
                     response["reads"] == response["sizes"] and
-                    response["single_write"] == 0):
-                self.assert_roundtrip(response)
+                    (not expect_local_pool or response["single_write"] == 0)):
+                if expect_local_pool:
+                    self.assert_roundtrip(response)
+                else:
+                    self.assert_buffer_io(response)
+                    # Explicit SHM must not create the ordinary put/get pool.
+                    self.assertLess(response["single_write"], 0)
                 return
             time.sleep(0.1)
         self.fail(f"Dummy did not complete readiness/reconnect data checks; log: {worker.log}")
@@ -447,10 +452,8 @@ class TestDeploymentLifecycle(unittest.TestCase):
                 self.fail(f"Zero-buffer Dummy did not reconnect; log: {worker.log}")
             time.sleep(0.1)
         self.assertTrue(worker.call("allocate").get("ready"))
-        response = worker.call("roundtrip")
-        self.assert_buffer_io(response)
-        # Explicit SHM registration must not create the ordinary put/get pool.
-        self.assertLess(response["single_write"], 0)
+        # RPC reconnection can precede eviction of the killed Real's segments.
+        self.wait_roundtrip(worker, expect_local_pool=False)
         self.assertEqual(worker.call("close")["closed"], 0)
         self.assertEqual(worker.process.wait(timeout=10), 0)
 
