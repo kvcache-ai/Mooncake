@@ -840,6 +840,24 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
+    // Quiesce in-flight batches that still reference this buffer before
+    // transport deregister. Mid-flight ibv_dereg_mr causes LOC_PROT storms
+    // that latch sticky "Device is not active" (#5481).
+    if (multi_transports_) {
+        Status st = multi_transports_->waitMemoryIdle(addr, /*length=*/0,
+                                                      /*timeout_ms=*/5000);
+        if (st.IsBatchBusy()) {
+            LOG(ERROR) << "unregisterLocalMemory: buffer still in flight, "
+                          "refusing deregister addr="
+                       << addr;
+            return ERR_BATCH_BUSY;
+        }
+        if (!st.ok()) {
+            LOG(WARNING) << "unregisterLocalMemory waitMemoryIdle: "
+                         << st.ToString();
+        }
+    }
+
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
@@ -1056,6 +1074,18 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    if (multi_transports_) {
+        for (auto* addr : addr_list) {
+            Status st = multi_transports_->waitMemoryIdle(addr, /*length=*/0,
+                                                          /*timeout_ms=*/5000);
+            if (st.IsBatchBusy()) {
+                LOG(ERROR) << "unregisterLocalMemoryBatch: buffer still in "
+                              "flight, refusing deregister addr="
+                           << addr;
+                return ERR_BATCH_BUSY;
+            }
+        }
+    }
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);

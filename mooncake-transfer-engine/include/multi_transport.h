@@ -21,6 +21,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "transport/transport.h"
 #include "task_congestion_status.h"
@@ -105,6 +106,13 @@ class MultiTransport {
 
     std::vector<Transport *> listTransports();
 
+    // Block until no live/deferred batch still references [addr,
+    // addr+length). Used by unregisterLocalMemory so ibv_dereg_mr
+    // cannot race outstanding RDMA WRs (local protection → sticky
+    // Device-not-active). length==0 matches exact source pointer.
+    // Returns BatchBusy if timeout_ms elapses while still busy.
+    Status waitMemoryIdle(void *addr, size_t length, int64_t timeout_ms);
+
     void *getBaseAddr();
 
    private:
@@ -148,6 +156,12 @@ class MultiTransport {
 
     void deferredCleanupLoop();
 
+    void trackLiveBatch(BatchID batch_id);
+    void untrackLiveBatch(BatchID batch_id);
+    bool memoryReferencedByBatch(BatchID batch_id, void *addr,
+                                 size_t length) const;
+    bool memoryBusyLocked(void *addr, size_t length) const;
+
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
                               Transport *&transport,
@@ -162,6 +176,10 @@ class MultiTransport {
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
     std::mutex deferred_cleanup_mutex_;
+    // Always-on live batch index for unregister quiesce (#5481).
+    // Distinct from optional CONFIG_USE_BATCH_DESC_SET ownership map.
+    mutable std::mutex live_batches_mutex_;
+    std::unordered_set<BatchID> live_batches_;
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>
         deferred_cleanup_batches_;
