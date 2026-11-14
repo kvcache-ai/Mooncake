@@ -51,30 +51,33 @@ void DmabufExport::close() {
     if (::close(owned_fd) != 0) PLOG(WARNING) << "Failed to close dma-buf fd";
 }
 
+std::unique_ptr<Platform> Platform::create(std::shared_ptr<Config> conf) {
+    const auto init_conf = conf ? conf : std::make_shared<Config>();
+#ifdef USE_CUDA
+    return std::make_unique<CudaPlatform>(init_conf);
+#elif defined(USE_HIP)
+    return std::make_unique<RocmPlatform>(init_conf);
+#elif defined(USE_SUNRISE)
+    return std::make_unique<SunrisePlatform>(init_conf);
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
+    return std::make_unique<AscendPlatform>(init_conf);
+#elif defined(USE_TPU)
+    return std::make_unique<TpuPlatform>(init_conf);
+#elif defined(USE_MLU)
+    return std::make_unique<MluPlatform>(init_conf);
+#elif defined(USE_XPU)
+    return std::make_unique<XpuPlatform>(init_conf);
+#else
+    return std::make_unique<CpuPlatform>(init_conf);
+#endif
+}
+
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     static std::shared_ptr<Platform> g_instance;
     static std::once_flag flag;
-    std::call_once(flag, [conf = std::move(conf)]() {
-        const auto init_conf = conf ? conf : std::make_shared<Config>();
-#ifdef USE_CUDA
-        g_instance = std::make_shared<CudaPlatform>(init_conf);
-#elif defined(USE_HIP)
-        g_instance = std::make_shared<RocmPlatform>(init_conf);
-#elif defined(USE_SUNRISE)
-        g_instance = std::make_shared<SunrisePlatform>(init_conf);
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
-    defined(USE_MEMFABRIC)
-        g_instance = std::make_shared<AscendPlatform>(init_conf);
-#elif defined(USE_TPU)
-        g_instance = std::make_shared<TpuPlatform>(init_conf);
-#elif defined(USE_MLU)
-            g_instance = std::make_shared<MluPlatform>(init_conf);
-#elif defined(USE_XPU)
-            g_instance = std::make_shared<XpuPlatform>(init_conf);
-#else
-        g_instance = std::make_shared<CpuPlatform>(init_conf);
-#endif
-    });
+    std::call_once(flag,
+                   [conf = std::move(conf)]() { g_instance = create(conf); });
     return *g_instance;
 }
 
