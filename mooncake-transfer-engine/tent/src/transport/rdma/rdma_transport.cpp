@@ -272,12 +272,16 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
-    // Intel XPU and Cambricon MLU export device buffers as dma-bufs. Buffers
+    // Intel XPU, Cambricon MLU, and modern NVIDIA CUDA drivers (when
+    // nvidia_peermem is absent) export device buffers as dma-bufs. Buffers
     // that fail export or registration are not offered on RDMA and get staged.
     const auto platform_type = Platform::getLoader().type();
-    if (platform_type == "xpu" || platform_type == "mlu") {
+    if (platform_type == "xpu" || platform_type == "mlu" ||
+        platform_type == "cuda") {
         auto& loader = IbvLoader::Instance();
-        return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
+        if (loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr) {
+            return true;
+        }
     }
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
@@ -757,9 +761,11 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
-    // Warm-up is a plain ibv_reg_mr; dma-buf device memory has no host pages.
+    // Warm-up is a plain ibv_reg_mr; device memory has no host pages.
     const auto memory_type = Platform::getLoader().getMemoryType(addr);
-    if (memory_type == MTYPE_XPU || memory_type == MTYPE_MLU) return false;
+    if (memory_type == MTYPE_XPU || memory_type == MTYPE_MLU ||
+        memory_type == MTYPE_CUDA)
+        return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;
