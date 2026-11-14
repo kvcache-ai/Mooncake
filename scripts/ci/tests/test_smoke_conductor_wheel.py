@@ -121,6 +121,83 @@ class ConductorWheelGateTest(unittest.TestCase):
             "/preserved/server/lib",
         )
 
+    def test_declared_external_runtime_reaches_client(self):
+        runtime = "/opt/intel/oneapi/compiler/lib"
+        seen = []
+
+        def run(command, **kwargs):
+            if "env" in kwargs:
+                seen.append((command, dict(kwargs["env"])))
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.dict(
+            os.environ,
+            {
+                "LD_LIBRARY_PATH": "/build/lib",
+                "CONDUCTOR_CLIENT_LD_LIBRARY_PATH": runtime,
+            },
+        ):
+            with patch.object(SMOKE.subprocess, "run", side_effect=run):
+                self.invoke("--server", self.server)
+        client_calls = [
+            env
+            for command, env in seen
+            if "pip" in command
+            or "pytest" in command
+            or any("import mooncake.conductor" in arg for arg in command)
+        ]
+        self.assertTrue(client_calls)
+        for env in client_calls:
+            self.assertEqual(env["LD_LIBRARY_PATH"], runtime)
+
+
+class IntelRuntimeLibraryPathTest(unittest.TestCase):
+    """XPU wheels exclude the Intel runtime, so the smoke client must find it."""
+
+    def resolve(self, ldd_output):
+        script_path = Path(SMOKE.__file__).parent / "build_wheel.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_dir = Path(temporary)
+            ldd = binary_dir / "ldd"
+            ldd.write_text(f"#!/bin/sh\ncat <<'EOF'\n{ldd_output}EOF\n")
+            ldd.chmod(0o755)
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f"source {shlex.quote(str(script_path))}\n"
+                    "intel_runtime_library_path /build/_conductor.so",
+                ],
+                env=dict(os.environ, PATH=f"{binary_dir}:{os.environ['PATH']}"),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        return result.stdout.strip()
+
+    def test_only_intel_runtime_directories_are_exposed(self):
+        oneapi = "/opt/intel/oneapi/compiler/2026.1/lib"
+        output = (
+            "\tlinux-vdso.so.1 (0x0000)\n"
+            "\tlibasio.so => /build/mooncake-common/libasio.so (0x0000)\n"
+            f"\tlibsycl.so.9 => {oneapi}/libsycl.so.9 (0x0000)\n"
+            f"\tlibsvml.so => {oneapi}/libsvml.so (0x0000)\n"
+            f"\tlibimf.so => {oneapi}/libimf.so (0x0000)\n"
+            "\tlibirng.so => /opt/intel/oneapi/umf/lib/libirng.so (0x0000)\n"
+            f"\tlibintlc.so.5 => {oneapi}/libintlc.so.5 (0x0000)\n"
+            "\tlibze_loader.so.1 => /lib/x86_64-linux-gnu/libze_loader.so.1 (0x0000)\n"
+            "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x0000)\n"
+        )
+        self.assertEqual(self.resolve(output), f"{oneapi}:/opt/intel/oneapi/umf/lib")
+
+    def test_unresolved_or_unrelated_libraries_expose_nothing(self):
+        output = (
+            "\tlibasio.so => /build/mooncake-common/libasio.so (0x0000)\n"
+            "\tlibsvml.so => not found\n"
+            "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x0000)\n"
+        )
+        self.assertEqual(self.resolve(output), "")
+
 
 class ConductorServerPreservationTest(unittest.TestCase):
     def test_server_survives_build_cleanup_and_is_removed_on_exit(self):

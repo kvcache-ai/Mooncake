@@ -27,7 +27,20 @@ cleanup_build_directory() {
     fi
 }
 
-# Sourcing exposes the cleanup function without starting a wheel build.
+# XPU wheels leave the SYCL and Intel compiler runtimes to the user's PyTorch
+# XPU environment (see the auditwheel excludes below). Print the directories
+# $1 resolves them from, so the wheel smoke client can load them without
+# inheriting build-tree library paths.
+intel_runtime_library_path() {
+    ldd "$1" | awk '
+        $2 == "=>" && $3 ~ "^/" && $1 ~ "^lib(sycl|svml|imf|irng|intlc)[.]so" {
+            dir = $3; sub("/[^/]*$", "", dir)
+            if (!seen[dir]++) dirs = dirs (dirs ? ":" : "") dir
+        }
+        END { if (dirs) print dirs }'
+}
+
+# Sourcing exposes the helpers above without starting a wheel build.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
     return 0
 fi
@@ -191,6 +204,7 @@ fi
 if compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
     echo "Copying _conductor.so..."
     cp ${BUILD_DIR}/mooncake-integration/_conductor.*.so mooncake-wheel/mooncake/
+    CONDUCTOR_CLIENT_LD_LIBRARY_PATH=$(intel_runtime_library_path ${BUILD_DIR}/mooncake-integration/_conductor.*.so)
 else
     echo "Error: required _conductor extension disappeared during staging" >&2
     exit 1
@@ -945,6 +959,7 @@ WHEEL_OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 cd ..
 
 # Validate the final repaired artifact, not the build tree.
+CONDUCTOR_CLIENT_LD_LIBRARY_PATH="${CONDUCTOR_CLIENT_LD_LIBRARY_PATH}" \
 CONDUCTOR_SERVER_LD_LIBRARY_PATH="${CONDUCTOR_SMOKE_DIR}:${LD_LIBRARY_PATH}" \
     python${PYTHON_VERSION} scripts/smoke_conductor_wheel.py "${WHEEL_OUTPUT_DIR}"/*.whl \
     --server "${CONDUCTOR_SMOKE_DIR}/mooncake_conductor"

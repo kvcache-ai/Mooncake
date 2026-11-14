@@ -54,6 +54,12 @@ def main():
                 check=True,
             )
             subprocess.run([python, "-I", "-c", "pass"], env=env, check=True)
+        # Some wheels leave a runtime to the user's environment (XPU: the
+        # SYCL/Intel compiler runtime). Expose only those directories, never
+        # the inherited build-time search path.
+        client_library_path = os.environ.get("CONDUCTOR_CLIENT_LD_LIBRARY_PATH")
+        if client_library_path:
+            env["LD_LIBRARY_PATH"] = client_library_path
         subprocess.run(
             [
                 python,
