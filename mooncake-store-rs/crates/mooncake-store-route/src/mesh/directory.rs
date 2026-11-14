@@ -901,9 +901,7 @@ impl EmbeddedWrhRouteDirectory {
             let Some(authority) = authorities.get(rank).cloned() else {
                 continue;
             };
-            if resolved[index].is_some()
-                && (repairs.is_none() || !self.authority_is_local(&authority))
-            {
+            if resolved[index].is_some() && repairs.is_none() {
                 continue;
             }
             groups
@@ -1747,6 +1745,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             }
         }
 
+        // Raw presence ignores delete-marker versions; validate hits with canonical reads.
+        let positives = resolved
+            .iter()
+            .enumerate()
+            .filter(|(_, present)| **present)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let positive_keys = positives
+            .iter()
+            .map(|&index| keys[index].clone())
+            .collect::<Vec<_>>();
+        let validated = self.get_object_routes(observer, &positive_keys)?;
+        for (index, route) in positives.into_iter().zip(validated) {
+            resolved[index] = route.is_some();
+        }
         Ok(resolved)
     }
 
@@ -2292,6 +2305,7 @@ mod owner_page_contract_tests {
 
     struct RecordingConfirmationClient {
         routes: BTreeMap<String, Option<ObjectRoute>>,
+        delete_versions: BTreeMap<String, Option<RouteVersion>>,
         queried_authorities: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2310,7 +2324,11 @@ mod owner_page_contract_tests {
                 .map(|_| {
                     Ok(RouteAuthorityRecord {
                         route: route.clone(),
-                        delete_version: None,
+                        delete_version: self
+                            .delete_versions
+                            .get(&authority.0)
+                            .cloned()
+                            .unwrap_or(None),
                     })
                 })
                 .collect())
@@ -2320,10 +2338,16 @@ mod owner_page_contract_tests {
             &self,
             _lease: &ClientLease,
             _namespace: &str,
-            _authority: &ClientStableId,
-            _keys: &[ObjectKey],
+            authority: &ClientStableId,
+            keys: &[ObjectKey],
         ) -> Result<Vec<Result<bool>>> {
-            Err(StoreError::Unsupported("unused test operation".to_string()))
+            let present = self
+                .routes
+                .get(&authority.0)
+                .cloned()
+                .unwrap_or(None)
+                .is_some();
+            Ok(keys.iter().map(|_| Ok(present)).collect())
         }
 
         fn batch_compare_and_swap_routes(
@@ -2341,9 +2365,9 @@ mod owner_page_contract_tests {
             _lease: &ClientLease,
             _namespace: &str,
             _authority: &ClientStableId,
-            _requests: &[RouteCasRequest],
+            requests: &[RouteCasRequest],
         ) -> Result<Vec<Result<()>>> {
-            Err(StoreError::Unsupported("unused test operation".to_string()))
+            Ok(requests.iter().map(|_| Ok(())).collect())
         }
 
         fn list_routes_by_replica_owner_page(
@@ -2806,6 +2830,7 @@ mod owner_page_contract_tests {
             &observer,
             Arc::new(RecordingConfirmationClient {
                 routes,
+                delete_versions: BTreeMap::new(),
                 queried_authorities: queried_authorities.clone(),
             }),
             Arc::new(RetainedMembership { current, retained }),
@@ -3084,6 +3109,70 @@ mod owner_page_contract_tests {
         assert_eq!(live.version, RouteVersion(6));
         assert_eq!(live.replicas[0].allocation_id, Some(8));
         unregister_local_authority(&directory.namespace, &peer.runtime.stable_id);
+    }
+
+    #[test]
+    fn contains_reads_merge_remote_delete_marker_versions() {
+        for (live_version, expected) in [(2, false), (6, true)] {
+            let observer = test_lease(&format!("contains-remote-observer-{live_version}"));
+            let candidates = vec![
+                test_lease(&format!("contains-remote-a-{live_version}")),
+                test_lease(&format!("contains-remote-b-{live_version}")),
+            ];
+            let key = ObjectKey::new(format!("contains-remote-key-{live_version}"));
+            let metadata = Arc::new(InMemoryMetadataBackend::new());
+            let namespace = metadata.route_namespace();
+            let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+            let mut live = test_route(&key.0, &observer.runtime);
+            live.version = RouteVersion(live_version);
+            let (live_rank, marker_rank) = if expected { (1, 0) } else { (0, 1) };
+            let routes = BTreeMap::from([
+                (ranked[live_rank].runtime.stable_id.0.clone(), Some(live)),
+                (ranked[marker_rank].runtime.stable_id.0.clone(), None),
+            ]);
+            let delete_versions = BTreeMap::from([
+                (ranked[live_rank].runtime.stable_id.0.clone(), None),
+                (
+                    ranked[marker_rank].runtime.stable_id.0.clone(),
+                    Some(RouteVersion(5)),
+                ),
+            ]);
+            let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+            let directory = EmbeddedWrhRouteDirectory::new(
+                2,
+                metadata,
+                &observer,
+                Arc::new(RecordingConfirmationClient {
+                    routes,
+                    delete_versions,
+                    queried_authorities: queried_authorities.clone(),
+                }),
+                Arc::new(TestMembership {
+                    leases: candidates.clone(),
+                }),
+            );
+
+            assert_eq!(
+                directory.contains_object_route(&observer, &key).unwrap(),
+                expected
+            );
+            assert_eq!(
+                queried_authorities
+                    .lock()
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                ranked
+                    .iter()
+                    .map(|lease| lease.runtime.stable_id.0.clone())
+                    .collect::<BTreeSet<_>>()
+            );
+            let route = directory.get_object_route(&observer, &key).unwrap();
+            assert_eq!(
+                route.as_ref().map(|route| route.version),
+                expected.then_some(RouteVersion(live_version))
+            );
+        }
     }
 
     #[test]
