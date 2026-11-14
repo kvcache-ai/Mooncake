@@ -619,26 +619,32 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
+        coordinated_fallback = False
         ibgda_ready = True
-        if self.device_type != "xpu" and is_update:
+        if self.device_type != "xpu":
             ibgda_ready_tensor = torch.tensor(
-                [int(not self.runtime.ibgda_disabled())],
+                [
+                    int(not self._use_fallback and not self.runtime.ibgda_disabled()),
+                    int(self.runtime.ibgda_disabled()),
+                ],
                 dtype=torch.int32,
                 device=device,
             )
             dist.all_reduce(ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group)
-            ibgda_ready = bool(ibgda_ready_tensor.item())
-            if ibgda_ready:
+            ibgda_ready = bool(ibgda_ready_tensor[0].item())
+            p2p_only = bool(ibgda_ready_tensor[1].item())
+            if ibgda_ready and is_update:
                 self.runtime.update_local_qpns()
-                ibgda_ready_tensor.fill_(int(not self.runtime.ibgda_disabled()))
+                ibgda_ready_tensor[0] = int(not self.runtime.ibgda_disabled())
                 dist.all_reduce(
                     ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group
                 )
-                ibgda_ready = bool(ibgda_ready_tensor.item())
+                ibgda_ready = bool(ibgda_ready_tensor[0].item())
             if not ibgda_ready:
-                # A failed update on any rank invalidates the IBGDA exchange
+                # A setup failure on any rank invalidates the IBGDA exchange
                 # for the whole group. Keep every rank on the same path.
                 self._use_fallback = True
+                coordinated_fallback = not p2p_only
         # XPU has no IBGDA: peers on the node are reached over Level Zero IPC,
         # others over the proxy's RDMA writes (_connect_xpu_rdma).
         if (
@@ -728,6 +734,15 @@ class Buffer:
                 interface_ids,
                 active_ranks_mask,
             )
+            ibgda_connected = torch.tensor(
+                [int(not self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device=device,
+            )
+            dist.all_reduce(ibgda_connected, op=dist.ReduceOp.MIN, group=self.group)
+            if not bool(ibgda_connected.item()):
+                self._use_fallback = True
+                coordinated_fallback = True
 
         if self.group_size == 1:
             # No peer can import this IPC handle in single-rank EP.  Skipping
@@ -771,6 +786,7 @@ class Buffer:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
+        use_fast_path = use_fast_path and not coordinated_fallback
         # Each rank maps its peers on its own, so one may reach them all while
         # another cannot. Take the fast path only if every rank can; a rank in
         # native kernels would wait forever on one that runs fallback collectives.

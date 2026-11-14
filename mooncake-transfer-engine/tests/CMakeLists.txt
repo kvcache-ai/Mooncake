@@ -89,6 +89,14 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# Hardware-free coverage for IBGDA CUDA operation failure propagation.
+add_executable(ibgda_cuda_error_test ${WORKSPACE}/ibgda_cuda_error_test.cpp)
+target_include_directories(
+  ibgda_cuda_error_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/device)
+target_link_libraries(ibgda_cuda_error_test PUBLIC gtest gtest_main)
+add_test(NAME ibgda_cuda_error_test COMMAND ibgda_cuda_error_test)
+
 # The timeout decision is stateful but independent of RDMA hardware; keep its
 # timing behavior covered by a deterministic unit test.
 add_executable(cq_timeout_diagnostic_test
