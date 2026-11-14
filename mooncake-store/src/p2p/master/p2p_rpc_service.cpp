@@ -18,6 +18,8 @@
 #include "common/scoped_vlog_timer.h"
 #include "version.h"
 
+#include "common.h"
+
 namespace mooncake {
 
 namespace {
@@ -59,12 +61,13 @@ std::string GetMasterMetricsSummary() {
 P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
                                          ViewVersionId view_version)
     : master_service_(config, view_version),
-      http_server_(4, static_cast<uint16_t>(config.metrics.http_port)),
+      http_server_(4, static_cast<uint16_t>(config.metrics.http_port),
+                   config.metrics.host),
       metric_report_running_(config.metrics.enable_reporting),
       heartbeat_rpc_port_(config.rpc.heartbeat_port) {
     HAStatusManager::instance().Configure(
         config.ha.enabled, config.cluster_id,
-        config.rpc.address + ":" + std::to_string(config.rpc.port),
+        buildHostNameWithPort(config.rpc.address, config.rpc.port),
         config.oplog.latest_stall_timeout_sec,
         config.oplog.catchup_stall_timeout_sec);
     P2PMasterMetricManager::instance().set_component_info(

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ylt/util/tl/expected.hpp>
+
 #include "client_config_builder.h"
 
 namespace mooncake {
@@ -17,7 +19,8 @@ struct CentralizedClientConfig : RealClientConfigBase {
 
 class CentralizedClientConfigBuilder : private ClientConfigBuilder {
    public:
-    static CentralizedClientConfig build_centralized_real_client(
+    static tl::expected<CentralizedClientConfig, ErrorCode>
+    build_centralized_real_client(
         const std::string& local_hostname,
         const std::string& metadata_connstring,
         const std::string& protocol = "tcp",
@@ -28,36 +31,64 @@ class CentralizedClientConfigBuilder : private ClientConfigBuilder {
         const std::string& ipc_socket_path = "", bool enable_offload = false,
         const std::map<std::string, std::string>& labels = {},
         uint16_t client_rpc_port = 0) {
+        if (local_hostname.empty()) {
+            LOG(ERROR) << "local_hostname is empty";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
             ipc_socket_path, labels);
+        if (config.rdma_devices && (config.rdma_devices->empty() ||
+                                    *config.rdma_devices == "auto-discovery")) {
+            config.rdma_devices = std::nullopt;
+        }
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         config.client_rpc_port = client_rpc_port;
         return config;
     }
 
-    static CentralizedClientConfig build_centralized_real_client(
+    static tl::expected<CentralizedClientConfig, ErrorCode>
+    build_centralized_real_client(
         const std::unordered_map<std::string, std::string>& config) {
+        auto local_hostname =
+            get_config_str(config, DictCommon::kLocalHostname);
+        auto metadata_server =
+            get_config_str(config, DictCommon::kMetadataServer);
+        auto global_size =
+            get_config_size(config, DictCentralized::kGlobalSegmentSize,
+                            DictCentralized::kDefaultGlobalSegmentSize);
+        auto local_size = get_config_size(config, DictCommon::kLocalBufferSize,
+                                          DictCommon::kDefaultLocalBufferSize);
+        if (!global_size || !local_size) {
+            LOG(ERROR) << "Failed to parse centralized buffer sizes";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
         auto devices = get_config_str(config, DictCommon::kRdmaDevices);
-        auto client_port = get_config_port(config, "client_rpc_port");
-        return build_centralized_real_client(
-            get_config_str(config, DictCommon::kLocalHostname),
-            get_config_str(config, DictCommon::kMetadataServer),
+        auto client_port =
+            get_config_integer<uint16_t>(config, "client_rpc_port", 0);
+        if (!client_port) {
+            LOG(ERROR) << "Failed to parse centralized client_rpc_port";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto result = build_centralized_real_client(
+            local_hostname, metadata_server,
             get_config_str(config, DictCommon::kProtocol,
                            DictCommon::kDefaultProtocol),
             devices.empty() ? std::nullopt
                             : std::optional<std::string>(devices),
             get_config_str(config, DictCommon::kMasterServerAddr,
                            DictCommon::kDefaultMasterServerAddr),
-            get_config_size(config, DictCentralized::kGlobalSegmentSize,
-                            DictCentralized::kDefaultGlobalSegmentSize),
-            get_config_size(config, DictCommon::kLocalBufferSize,
-                            DictCommon::kDefaultLocalBufferSize),
-            nullptr, get_config_str(config, DictCommon::kIpcSocketPath),
-            get_config_bool(config, "enable_offload", false), {}, client_port);
+            *global_size, *local_size, nullptr,
+            get_config_str(config, DictCommon::kIpcSocketPath),
+            get_config_bool(config, "enable_offload", false), {}, *client_port);
+        if (!result) {
+            LOG(ERROR) << "Centralized dict configuration is invalid: "
+                       << result.error();
+        }
+        return result;
     }
 
    private:
@@ -67,28 +98,6 @@ class CentralizedClientConfigBuilder : private ClientConfigBuilder {
         // Defaults
         static constexpr size_t kDefaultGlobalSegmentSize = 1024 * 1024 * 16;
     };
-
-    static uint16_t get_config_port(
-        const std::unordered_map<std::string, std::string>& config,
-        const std::string& key) {
-        auto it = config.find(key);
-        if (it == config.end()) {
-            return 0;
-        }
-        const auto& value = it->second;
-        try {
-            size_t parsed = 0;
-            auto port = std::stoul(value, &parsed);
-            if (value.empty() || value.front() == '-' ||
-                parsed != value.size() || port > UINT16_MAX) {
-                throw std::invalid_argument("out of range or malformed port");
-            }
-            return static_cast<uint16_t>(port);
-        } catch (const std::exception& error) {
-            LOG(ERROR) << "Invalid " << key << ": " << error.what();
-            throw std::invalid_argument("Invalid " + key);
-        }
-    }
 };
 
 }  // namespace mooncake

@@ -4,6 +4,8 @@
 #include "common/scoped_vlog_timer.h"
 #include "version.h"
 
+#include "common.h"
+
 #include <chrono>
 #include <gflags/gflags.h>
 
@@ -172,12 +174,9 @@ ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
             client_accessor_.SetClientPool(client_pool);
             client_addr_param_ = master_addr;
             if (heartbeat_rpc_port_ > 0) {
-                auto colon = master_addr.rfind(':');
-                std::string host = (colon == std::string::npos)
-                                       ? master_addr
-                                       : master_addr.substr(0, colon);
+                const auto host = getHostNameWithoutPort(master_addr);
                 heartbeat_accessor_.SetClientPool(heartbeat_client_pools_->at(
-                    host + ":" + std::to_string(heartbeat_rpc_port_)));
+                    buildHostNameWithPort(host, heartbeat_rpc_port_)));
             } else {
                 heartbeat_accessor_.SetClientPool(
                     heartbeat_client_pools_->at(master_addr));

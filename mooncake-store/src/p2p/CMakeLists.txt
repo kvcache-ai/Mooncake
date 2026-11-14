@@ -37,6 +37,7 @@ set(MOONCAKE_STORE_P2P_MASTER_SOURCES
 
 set(MOONCAKE_STORE_P2P_CLIENT_SOURCES
     master/p2p_master_client.cpp
+    client/p2p_client_config_builder.cpp
     client/p2p_client_service.cpp
     client/p2p_real_client.cpp
     client/p2p_client_metric.cpp

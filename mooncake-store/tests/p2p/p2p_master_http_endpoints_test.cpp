@@ -13,6 +13,10 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1347,7 +1351,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
 // Reproduces the real standby lifecycle: the supervisor-level status server
 // runs while the active (primary-only) HTTP surface is absent.
 TEST_F(P2PMasterHttpEndpointsTest, StatusServerServesStandbyDiagnostics) {
-    P2PStatusHttpServer status_server(/*port=*/0);
+    P2PStatusHttpServer status_server(/*port=*/0, "127.0.0.1");
     status_server.Start();
     const uint16_t status_port = status_server.port();
     ASSERT_NE(status_port, 0);
@@ -1379,7 +1383,31 @@ TEST_F(P2PMasterHttpEndpointsTest, StatusServerServesStandbyDiagnostics) {
     auto summary = HttpGet(status_base_url + "/metrics/summary");
     ASSERT_EQ(summary.status, 200);
 
+    // Binding to one loopback address must leave the same port available
+    // on a different address. A wildcard listener would fail this probe.
+    const auto expect_scoped_binding = [status_port] {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(fd, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(0x7f000002);
+        address.sin_port = htons(status_port);
+        const int result =
+            bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        EXPECT_EQ(close(fd), 0);
+        EXPECT_EQ(result, 0);
+    };
+    ASSERT_NO_FATAL_FAILURE(expect_scoped_binding());
+
     status_server.Stop();
+    P2PMasterConfig active_config;
+    active_config.metrics.enable_reporting = false;
+    active_config.metrics.http_port = status_port;
+    active_config.metrics.host = "127.0.0.1";
+    P2PMasterRpcService active(active_config);
+    active.init();
+    ASSERT_EQ(HttpGet(status_base_url + "/health").status, 200);
+    ASSERT_NO_FATAL_FAILURE(expect_scoped_binding());
 }
 
 }  // namespace testing

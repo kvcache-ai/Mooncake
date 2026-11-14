@@ -1,9 +1,10 @@
 # P2P Store builds and tests; common checks run in ci.yml.
-# TODO(UPG-003.1/UPG-004.1): Adopt shared wheel workflows and toolchains,
-# preserving the P2P selector and artifact names.
-# Follow the shared-wheel deferral in ci.yml: F01-T118 / UPG1-F22-B02,
-# workflow integration in UPG1-F22-B04, and UPG2-F01-public-build providers.
-# Reuse U's common build steps and retain only the required P2P differences.
+# TODO-REF(F02-T004, receiver=UPG1-F22-B04): Migrate shared wheel workflows
+# and legacy Docker jobs during B04 implementation, before B04 acceptance.
+# Keep architecture-specific artifacts; validate replacement image coverage
+# before removing old jobs/Buildx. Package profiles remain F01-T118/B02 and
+# public providers remain F01-T113/UPG2.
+# Source: UPG1-F02-B05 block 3 audit; clarified by Codex on 2026-11-12.
 name: 'Build & Test P2P (Linux)'
 
 on:
@@ -257,7 +258,7 @@ jobs:
     - name: Start metadata server
       run: |
         source test_env/bin/activate
-        mooncake_http_metadata_server --port 8080 &
+        mooncake_http_metadata_server --host 127.0.0.1 --port 8080 &
       shell: bash
 
     - name: Prepare P2P test configurations
@@ -524,10 +525,10 @@ jobs:
         name: mooncake-wheel-ubuntu-p2p-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
-  # TODO: During UPG1-F22-B04 (CI/nightly migration), move this legacy Docker
-  # check to U's nightly flow. Remove this job and its Buildx setup after the
-  # replacement validates P2P image builds. Keep Buildx setup wherever the
-  # replacement still uses docker buildx build.
+  # TODO-REF(F02-T004, receiver=UPG1-F22-B04): During B04 implementation,
+  # replace this P2P Docker job only after nightly image coverage passes.
+  # Keep Buildx where the replacement uses it; close before B04 acceptance.
+  # Source: UPG1-F02-B05 block 3 audit; clarified by Codex on 2026-11-12.
   build-docker-p2p:
     name: Build Docker Image (P2P)
     if: >-

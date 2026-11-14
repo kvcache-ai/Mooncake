@@ -257,11 +257,13 @@ class HAIntegrationTest : public ::testing::Test {
     }
 
     static P2PClientConfig LifecycleConfig(uint16_t rpc_port = 0) {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            "localhost:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
-            "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", rpc_port);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                "localhost:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
+                "tcp", std::nullopt, master_address_,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                /*local_buffer_size=*/0, nullptr, "", rpc_port)
+                .value();
         config.local_transfer_mode = LocalTransferMode::MEMCPY;
         config.async_sender_thread_count = 0;
         config.enable_http_server = false;
@@ -276,17 +278,19 @@ class HAIntegrationTest : public ::testing::Test {
         uint32_t rpc_port = 0, size_t async_sender_thread_count = 1) {
         const uint16_t http_port = static_cast<uint16_t>(getFreeTcpPort());
 
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_addr,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", rpc_port,
-            /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
-            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/60 * 1000,
-            /*local_transfer_mode=*/"memcpy",
-            /*local_io_worker_num=*/32, http_port,
-            /*enable_http_server=*/true,
-            /*labels=*/{}, async_sender_thread_count);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_addr,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                /*local_buffer_size=*/0, nullptr, "", rpc_port,
+                /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
+                /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
+                /*route_cache_ttl_ms=*/60 * 1000,
+                /*local_transfer_mode=*/"memcpy",
+                /*local_io_worker_num=*/32, http_port,
+                /*enable_http_server=*/true,
+                /*labels=*/{}, async_sender_thread_count)
+                .value();
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,
@@ -661,6 +665,7 @@ TEST_F(HAIntegrationTest, LocalOnlyStartupNeverContactsMaster) {
     ASSERT_TRUE(created.has_value());
     auto client = *created;
     EXPECT_EQ(client->GetHealthStatus(), "LOCAL_ONLY");
+    EXPECT_EQ(client->GetServiceStatus(), DummyClientStatus::HEALTH);
     EXPECT_EQ(client->master_view_, nullptr);
     EXPECT_EQ(client->master_client_.client_accessor_.GetClientPool(), nullptr);
     EXPECT_TRUE(client->heartbeat_thread_.joinable());
@@ -2040,6 +2045,7 @@ TEST_F(HAIntegrationTest, DegradedModeLocalOps) {
     ASSERT_TRUE(put_b.has_value());
 
     ForceDegraded(client1_);
+    EXPECT_EQ(client1_->GetServiceStatus(), DummyClientStatus::HEALTH);
 
     // Degraded Put falls back to PutLocal
     auto put_c = PutData(client1_, "a2_client1_degraded_put", "degraded_data");

@@ -10,6 +10,9 @@
 #include <string>
 #include <unordered_map>
 #include <glog/logging.h>
+#include "bool_parser.h"
+#include "common/byte_size.h"
+#include "integer_parser.h"
 #include "common.h"
 #include "common_types.h"
 
@@ -108,57 +111,39 @@ class ClientConfigBuilder {
         return (it != config.end()) ? it->second : default_value;
     }
 
-    static size_t get_config_size(
+    // Byte capacities only; counts, ports and durations use get_config_integer.
+    static std::optional<size_t> get_config_size(
         const std::unordered_map<std::string, std::string>& config,
         const std::string& key, size_t default_value) {
         auto it = config.find(key);
         if (it == config.end()) {
             return default_value;
         }
-        const std::string& value = it->second;
-        // Check for negative numbers (stoull incorrectly parses "-1" as large
-        // val)
-        if (!value.empty() && value[0] == '-') {
-            LOG(WARNING) << "Invalid negative value for config key '" << key
-                         << "': " << value
-                         << ", using default: " << default_value;
-            return default_value;
+        auto parsed = try_string_to_byte_size(it->second);
+        if (!parsed) {
+            LOG(ERROR) << "Invalid size value for config key '" << key
+                       << "': " << it->second;
+            return std::nullopt;
         }
-        try {
-            return std::stoull(value);
-        } catch (const std::invalid_argument&) {
-            LOG(WARNING) << "Invalid non-numeric value for config key '" << key
-                         << "': " << value
-                         << ", using default: " << default_value;
-            return default_value;
-        } catch (const std::out_of_range&) {
-            LOG(WARNING) << "Value out of range for config key '" << key
-                         << "': " << value
-                         << ", using default: " << default_value;
-            return default_value;
-        }
+        return static_cast<size_t>(*parsed);
     }
 
-    static int get_config_int(
+    template <typename Integer>
+    static std::optional<Integer> get_config_integer(
         const std::unordered_map<std::string, std::string>& config,
-        const std::string& key, int default_value) {
+        const std::string& key, Integer default_value) {
         auto it = config.find(key);
         if (it == config.end()) {
             return default_value;
         }
-        try {
-            return std::stoi(it->second);
-        } catch (const std::invalid_argument&) {
-            LOG(WARNING) << "Invalid non-numeric value for config key '" << key
-                         << "': " << it->second
-                         << ", using default: " << default_value;
-            return default_value;
-        } catch (const std::out_of_range&) {
-            LOG(WARNING) << "Value out of range for config key '" << key
-                         << "': " << it->second
-                         << ", using default: " << default_value;
-            return default_value;
+        auto parsed = TryParseInteger<Integer>(
+            it->second,
+            {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (!parsed) {
+            LOG(ERROR) << "Invalid integer value for config key '" << key
+                       << "': " << it->second;
         }
+        return parsed;
     }
 
     static bool get_config_bool(
@@ -168,16 +153,9 @@ class ClientConfigBuilder {
         if (it == config.end()) {
             return default_value;
         }
-        std::string value = it->second;
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (value == "1" || value == "true" || value == "yes" ||
-            value == "on" || value == "enable") {
-            return true;
-        }
-        if (value == "0" || value == "false" || value == "no" ||
-            value == "off" || value == "disable") {
-            return false;
+        const auto parsed = TryParseBool(it->second);
+        if (parsed) {
+            return *parsed;
         }
         LOG(WARNING) << "Invalid boolean value for config key '" << key
                      << "': " << it->second

@@ -260,4 +260,17 @@ TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
     EXPECT_EQ(first_call, second_call);
 }
 
+TEST(HostPortHelpers, ExtractsHostWithoutPort) {
+    EXPECT_EQ(getHostNameWithoutPort("8.8.8.8:4321"), "8.8.8.8");
+    EXPECT_EQ(getHostNameWithoutPort("example.com:4321"), "example.com");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]:4321"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("2001:db8::1"), "2001:db8::1");
+}
+
+TEST(HostPortHelpers, BuildsBracketedIpv6Endpoint) {
+    EXPECT_EQ(buildHostNameWithPort("2001:db8::1", 4321), "[2001:db8::1]:4321");
+    EXPECT_EQ(buildHostNameWithPort("8.8.8.8", 4321), "8.8.8.8:4321");
+}
+
 }  // namespace

@@ -9,10 +9,14 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "common/network.h"
+#include "config/metrics_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
+#include "master_admin_service.h"
+#include "config/rpc_protocol_config.h"
 #include "types.h"
 
 #include "master_config.h"
@@ -29,6 +33,10 @@ DEFINE_int32(
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
+DEFINE_string(metrics_host,
+              std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
+              "Address for the HTTP metrics/admin server to listen on. "
+              "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects");
 DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
@@ -51,6 +59,9 @@ DEFINE_int32(
     "Port for RPC server to listen on (0 = use port, preferred over port)");
 DEFINE_string(rpc_address, "0.0.0.0",
               "Address for RPC server to bind to, required in HA mode");
+DEFINE_string(rpc_interface, "",
+              "Network interface name for RPC server address resolution. "
+              "When set, its IPv4 address overrides rpc_address");
 DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
@@ -90,6 +101,13 @@ DEFINE_int32(http_metadata_server_port, 8080,
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
 
+DEFINE_bool(
+    enable_metadata_cleanup_on_timeout, false,
+    "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
+    "when client heartbeat times out. Works in two modes: (1) co-located "
+    "(enable_http_metadata_server=true) via in-process removal, or "
+    "(2) separately-deployed metadata server via async HTTP DELETE.");
+
 DEFINE_uint64(put_start_discard_timeout_sec,
               mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
               "Timeout for discarding uncompleted PutStart operations");
@@ -119,6 +137,55 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+namespace {
+
+mooncake::MetricsBootstrapCommandLineOverrides
+GetMetricsBootstrapCommandLineOverrides() {
+    mooncake::MetricsBootstrapCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
+        !info.is_default) {
+        command_line.enabled = FLAGS_enable_metric_reporting;
+    }
+    if (google::GetCommandLineFlagInfo("metrics_port", &info) &&
+        !info.is_default) {
+        command_line.port = static_cast<uint32_t>(FLAGS_metrics_port);
+    }
+    if (google::GetCommandLineFlagInfo("metrics_host", &info) &&
+        !info.is_default) {
+        command_line.host = FLAGS_metrics_host;
+    }
+    return command_line;
+}
+
+void ResolveRpcAddressFromInterfaceOrDie(
+    mooncake::MasterConfig& master_config) {
+    if (master_config.rpc_interface.empty()) {
+        return;
+    }
+
+    if (!master_config.rpc_address.empty() &&
+        master_config.rpc_address != "0.0.0.0") {
+        LOG(WARNING) << "rpc_interface is set. Overriding rpc_address="
+                     << master_config.rpc_address;
+    }
+
+    auto resolved_address =
+        mooncake::GetInterfaceIPv4Address(master_config.rpc_interface);
+    if (!resolved_address) {
+        LOG(FATAL) << "Failed to resolve rpc_interface="
+                   << master_config.rpc_interface << ": "
+                   << resolved_address.error();
+    }
+
+    master_config.rpc_address = resolved_address.value();
+    LOG(INFO) << "Resolved rpc_interface=" << master_config.rpc_interface
+              << " to rpc_address=" << master_config.rpc_address;
+}
+
+}  // namespace
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -128,17 +195,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,
                              FLAGS_cxl_size);
-    default_config.GetBool("enable_metric_reporting",
-                           &master_config.enable_metric_reporting,
-                           FLAGS_enable_metric_reporting);
-    default_config.GetUInt32("metrics_port", &master_config.metrics_port,
-                             FLAGS_metrics_port);
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
                              FLAGS_rpc_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
                              FLAGS_rpc_address);
+    default_config.GetString("rpc_interface", &master_config.rpc_interface,
+                             FLAGS_rpc_interface);
     default_config.GetInt32("rpc_conn_timeout_seconds",
                             &master_config.rpc_conn_timeout_seconds,
                             FLAGS_rpc_conn_timeout_seconds);
@@ -188,6 +252,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetBool("enable_metadata_cleanup_on_timeout",
+                           &master_config.enable_metadata_cleanup_on_timeout,
+                           FLAGS_enable_metadata_cleanup_on_timeout);
     default_config.GetUInt64("put_start_discard_timeout_sec",
                              &master_config.put_start_discard_timeout_sec,
                              FLAGS_put_start_discard_timeout_sec);
@@ -283,6 +350,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.rpc_address = FLAGS_rpc_address;
     }
+    if ((google::GetCommandLineFlagInfo("rpc_interface", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.rpc_interface = FLAGS_rpc_interface;
+    }
     if ((google::GetCommandLineFlagInfo("rpc_conn_timeout_seconds", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -292,16 +364,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
-    }
-    if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_metric_reporting = FLAGS_enable_metric_reporting;
-    }
-    if ((google::GetCommandLineFlagInfo("metrics_port", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.metrics_port = FLAGS_metrics_port;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -389,6 +451,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_metadata_cleanup_on_timeout",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_metadata_cleanup_on_timeout =
+            FLAGS_enable_metadata_cleanup_on_timeout;
     }
     if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
                                         &info) &&
@@ -480,8 +549,8 @@ int main(int argc, char* argv[]) {
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
+    mooncake::DefaultConfig default_config;
     if (!conf_path.empty()) {
-        mooncake::DefaultConfig default_config;
         default_config.SetPath(conf_path);
         try {
             default_config.Load();
@@ -492,6 +561,16 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
+            conf_path.empty() ? nullptr : &default_config,
+            GetMetricsBootstrapCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to resolve master metrics configuration: "
+                   << error.what();
+        return 1;
+    }
+    ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
         LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
@@ -509,61 +588,85 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
-        protocol = "rdma";
+    const auto rpc_protocol_config =
+        mooncake::RpcProtocolConfig::FromEnvironment();
+#ifdef YLT_ENABLE_IBV
+    const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
+#else
+    const std::string protocol = "tcp";
+    if (rpc_protocol_config.use_rdma) {
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
     }
-    LOG(INFO)
-        << "Master service started on port " << master_config.rpc_port
-        << ", max_threads=" << master_config.rpc_thread_num
-        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
-        << ", metrics_port=" << master_config.metrics_port
-        << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
-        << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
-        << ", allow_evict_soft_pinned_objects="
-        << master_config.allow_evict_soft_pinned_objects
-        << ", eviction_ratio=" << master_config.eviction_ratio
-        << ", eviction_high_watermark_ratio="
-        << master_config.eviction_high_watermark_ratio
-        << ", enable_ha=" << master_config.enable_ha
-        << ", enable_offload=" << master_config.enable_offload
-        << ", etcd_endpoints=" << master_config.etcd_endpoints
-        << ", client_ttl=" << master_config.client_live_ttl_sec
-        << ", rpc_thread_num=" << master_config.rpc_thread_num
-        << ", rpc_port=" << master_config.rpc_port
-        << ", rpc_address=" << master_config.rpc_address
-        << ", rpc_conn_timeout_seconds="
-        << master_config.rpc_conn_timeout_seconds
-        << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
-        << ", rpc protocol=" << protocol
-        << ", cluster_id=" << master_config.cluster_id
-        << ", root_fs_dir=" << master_config.root_fs_dir
-        << ", global_file_segment_size="
-        << master_config.global_file_segment_size
-        << ", memory_allocator=" << master_config.memory_allocator
-        << ", enable_http_metadata_server="
-        << master_config.enable_http_metadata_server
-        << ", http_metadata_server_port="
-        << master_config.http_metadata_server_port
-        << ", http_metadata_server_host="
-        << master_config.http_metadata_server_host
-        << ", put_start_discard_timeout_sec="
-        << master_config.put_start_discard_timeout_sec
-        << ", put_start_release_timeout_sec="
-        << master_config.put_start_release_timeout_sec
-        << ", max_total_finished_tasks="
-        << master_config.max_total_finished_tasks
-        << ", max_total_pending_tasks=" << master_config.max_total_pending_tasks
-        << ", max_total_processing_tasks="
-        << master_config.max_total_processing_tasks
-        << ", pending_task_timeout_sec="
-        << master_config.pending_task_timeout_sec
-        << ", processing_task_timeout_sec="
-        << master_config.processing_task_timeout_sec
-        << ", enable_cxl=" << master_config.enable_cxl
-        << ", cxl_path=" << master_config.cxl_path
-        << ", cxl_size=" << master_config.cxl_size;
+#endif
+
+    LOG(INFO) << "Master service started on port " << master_config.rpc_port
+              << ", max_threads=" << master_config.rpc_thread_num
+              << ", enable_metric_reporting=" << master_config.metrics.enabled
+              << ", metrics_port=" << master_config.metrics.port
+              << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
+              << ", default_kv_soft_pin_ttl="
+              << master_config.default_kv_soft_pin_ttl
+              << ", allow_evict_soft_pinned_objects="
+              << master_config.allow_evict_soft_pinned_objects
+              << ", eviction_ratio=" << master_config.eviction_ratio
+              << ", eviction_high_watermark_ratio="
+              << master_config.eviction_high_watermark_ratio
+              << ", enable_ha=" << master_config.enable_ha
+              << ", enable_offload=" << master_config.enable_offload
+              << ", etcd_endpoints=" << master_config.etcd_endpoints
+              << ", client_ttl=" << master_config.client_live_ttl_sec
+              << ", rpc_thread_num=" << master_config.rpc_thread_num
+              << ", rpc_port=" << master_config.rpc_port
+              << ", rpc_address=" << master_config.rpc_address
+              << ", rpc_conn_timeout_seconds="
+              << master_config.rpc_conn_timeout_seconds
+              << ", rpc_enable_tcp_no_delay="
+              << master_config.rpc_enable_tcp_no_delay
+              << ", rpc protocol=" << protocol
+              << ", cluster_id=" << master_config.cluster_id
+              << ", root_fs_dir=" << master_config.root_fs_dir
+              << ", global_file_segment_size="
+              << master_config.global_file_segment_size
+              << ", memory_allocator=" << master_config.memory_allocator
+              << ", enable_http_metadata_server="
+              << master_config.enable_http_metadata_server
+              << ", http_metadata_server_port="
+              << master_config.http_metadata_server_port
+              << ", http_metadata_server_host="
+              << master_config.http_metadata_server_host
+              << ", put_start_discard_timeout_sec="
+              << master_config.put_start_discard_timeout_sec
+              << ", put_start_release_timeout_sec="
+              << master_config.put_start_release_timeout_sec
+              << ", max_total_finished_tasks="
+              << master_config.max_total_finished_tasks
+              << ", max_total_pending_tasks="
+              << master_config.max_total_pending_tasks
+              << ", max_total_processing_tasks="
+              << master_config.max_total_processing_tasks
+              << ", pending_task_timeout_sec="
+              << master_config.pending_task_timeout_sec
+              << ", processing_task_timeout_sec="
+              << master_config.processing_task_timeout_sec
+              << ", enable_cxl=" << master_config.enable_cxl
+              << ", cxl_path=" << master_config.cxl_path
+              << ", cxl_size=" << master_config.cxl_size;
+
+    // TODO(F02-T012, replace-in=UPG1-F14-S24):
+    // Fixed U: d01447808d10af78011e9203d53796a15a032a03.
+    // Source: UPG1-F02-B05; owner: UPG1-F14-S24.
+    // Stage: UPG1 / F14-S24 / asynchronous offboarding implementation;
+    // Due: before S24 acceptance. Replace this explicit unavailable guard
+    // with fixed U ResolveMetadataServerForCleanup, Wrapped cleanup wiring,
+    // MasterService cleanupHttpMetadata and the stopped/joined queue owner.
+    // HA fencing/stop: F12-S50 and F13-S25 implementation, before each task's
+    // acceptance. Close after identity/re-registration/late-DELETE checks,
+    // review and receiving commits; do not silently accept this option.
+    if (master_config.enable_metadata_cleanup_on_timeout) {
+        LOG(ERROR)
+            << "Metadata cleanup on timeout is not available in this build";
+        return 1;
+    }
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
@@ -593,14 +696,37 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (rpc_protocol_config.use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
+        auto wrapped_master_service =
+            std::make_shared<mooncake::WrappedMasterService>(
+                mooncake::WrappedMasterServiceConfig(master_config, version));
+        mooncake::MasterAdminServer admin_server(
+            static_cast<uint16_t>(master_config.metrics.port),
+            master_config.metrics.enabled, master_config.metrics.host);
+        if (!admin_server.Start()) {
+            LOG(ERROR) << "Failed to start master admin server";
+            return 1;
+        }
+        admin_server.SetRuntimeState(
+            mooncake::ha::MasterRuntimeState::kServing);
+        admin_server.SetServiceDelegate(wrapped_master_service);
+        admin_server.SetServiceAvailable(true);
 
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        // TODO-REF(F02-T015, receiver=UPG1-F13-S56):
+        // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).
+        // Stage: UPG1 / F13-S56 / restore admission implementation;
+        // Due: before S56 acceptance. Replace this legacy registration with
+        // U MarkReadyForServing/ActivateServing and the real restore owner.
+        // F14-I07 supplies U RpcWorkerPool before I07 acceptance. Close with
+        // lifecycle/owner verification, review and receiving commits.
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
         return server.start();
     }
 }

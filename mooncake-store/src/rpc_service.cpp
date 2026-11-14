@@ -24,16 +24,29 @@
 
 namespace mooncake {
 
-const uint64_t kMetricReportIntervalSeconds = 10;
-
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config)
     : master_service_(MasterServiceConfig(config)),
-      http_server_(4, config.http_port),
-      metric_report_running_(config.enable_metric_reporting) {
-    init_http_server();
+      metric_report_running_(false) {
+    // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+    // Source: UPG1-F02-B09; owner: UPG1-F12-S50.
+    // Stage: UPG1 / F12-S50 / centralized HA implementation.
+    // Due: before S50 acceptance. Delete the remaining HA-only Wrapped HTTP
+    // owner and use fixed U supervisor-owned MasterAdminServer. Non-HA already
+    // owns its independent admin. Close after U lifecycle/review/receipt proof.
+    if (config.enable_ha) {
+        http_server_ = std::make_unique<coro_http::coro_http_server>(
+            4, config.http_port, config.http_host);
+        init_http_server();
+        metric_report_running_ = config.enable_metric_reporting;
+    }
 
-    if (config.enable_metric_reporting) {
+    // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+    // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+    // Remove this started-state guard and the old Wrapped metric thread.
+    // Use fixed U MasterAdminServer::Start metric-thread ownership.
+    // Due: before F12-S50 implementation acceptance; final TODO closure.
+    if (http_server_started_ && config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
                 std::string metrics_summary =
@@ -51,13 +64,15 @@ WrappedMasterService::~WrappedMasterService() {
     if (metric_report_thread_.joinable()) {
         metric_report_thread_.join();
     }
-    http_server_.stop();
+    if (http_server_) {
+        http_server_->stop();
+    }
 }
 
 void WrappedMasterService::init_http_server() {
     using namespace coro_http;
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/metrics", [](coro_http_request& req, coro_http_response& resp) {
             std::string metrics =
                 MasterMetricManager::instance().serialize_metrics();
@@ -65,7 +80,7 @@ void WrappedMasterService::init_http_server() {
             resp.set_status_and_content(status_type::ok, std::move(metrics));
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/metrics/summary",
         [](coro_http_request& req, coro_http_response& resp) {
             std::string summary =
@@ -74,7 +89,7 @@ void WrappedMasterService::init_http_server() {
             resp.set_status_and_content(status_type::ok, std::move(summary));
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/query_key", [&](coro_http_request& req, coro_http_response& resp) {
             auto key = req.get_query_value("key");
             auto get_result = GetReplicaList(std::string(key));
@@ -101,7 +116,7 @@ void WrappedMasterService::init_http_server() {
             }
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/get_all_keys", [&](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
 
@@ -120,7 +135,7 @@ void WrappedMasterService::init_http_server() {
             }
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/get_all_segments",
         [&](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
@@ -139,7 +154,7 @@ void WrappedMasterService::init_http_server() {
             }
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/query_segment",
         [&](coro_http_request& req, coro_http_response& resp) {
             auto segment = req.get_query_value("segment");
@@ -163,13 +178,13 @@ void WrappedMasterService::init_http_server() {
             }
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");
         });
 
-    http_server_.set_http_handler<GET>(
+    http_server_->set_http_handler<GET>(
         "/batch_query_keys",
         [&](coro_http_request& req, coro_http_response& resp) {
             auto keys_view = req.get_query_value("keys");
@@ -247,14 +262,14 @@ void WrappedMasterService::init_http_server() {
             resp.set_status_and_content(status_type::ok, std::move(ss));
         });
 
-    auto ec = http_server_.async_start();
+    auto ec = http_server_->async_start();
     if (ec.hasResult()) {
         LOG(ERROR) << "Failed to start HTTP metrics server on port "
-                   << http_server_.port() << ": " << ec.value().message();
+                   << http_server_->port() << ": " << ec.value().message();
         return;
     }
     http_server_started_ = true;
-    LOG(INFO) << "HTTP metrics server started on port " << http_server_.port();
+    LOG(INFO) << "HTTP metrics server started on port " << http_server_->port();
 }
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>

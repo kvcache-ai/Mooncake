@@ -14,6 +14,7 @@
 #include <limits>
 #include <string>
 
+#include "common/network.h"
 #include "default_config.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 
@@ -21,9 +22,15 @@ DEFINE_string(config_path, "", "P2P master config file path");
 DEFINE_bool(enable_metric_reporting, true,
             "Enable periodic P2P master metric reporting");
 DEFINE_uint32(metrics_port, 9003, "P2P master HTTP metrics port");
+DEFINE_string(metrics_host, "0.0.0.0",
+              "Address for the HTTP metrics/admin server to listen on. "
+              "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_uint32(rpc_thread_num, 4, "P2P master RPC server threads");
 DEFINE_uint32(rpc_port, 50051, "P2P master RPC server port");
 DEFINE_string(rpc_address, "0.0.0.0", "P2P master RPC bind address");
+DEFINE_string(rpc_interface, "",
+              "Network interface name for RPC server address resolution. "
+              "When set, its IPv4 address overrides rpc_address");
 DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "RPC connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
@@ -116,10 +123,13 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
                    config.metrics.enable_reporting);
     source.GetUInt32("metrics_port", &config.metrics.http_port,
                      config.metrics.http_port);
+    source.GetString("metrics_host", &config.metrics.host, config.metrics.host);
     source.GetUInt32("rpc_port", &config.rpc.port, config.rpc.port);
     source.GetUInt32("rpc_thread_num", &config.rpc.thread_num,
                      config.rpc.thread_num);
     source.GetString("rpc_address", &config.rpc.address, config.rpc.address);
+    source.GetString("rpc_interface", &config.rpc.interface,
+                     config.rpc.interface);
     source.GetInt32("rpc_conn_timeout_seconds",
                     &config.rpc.connection_timeout_seconds,
                     config.rpc.connection_timeout_seconds);
@@ -224,9 +234,11 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
 
     APPLY_OVERRIDE(enable_metric_reporting, config.metrics.enable_reporting);
     APPLY_OVERRIDE(metrics_port, config.metrics.http_port);
+    APPLY_OVERRIDE(metrics_host, config.metrics.host);
     APPLY_OVERRIDE(rpc_port, config.rpc.port);
     APPLY_OVERRIDE(rpc_thread_num, config.rpc.thread_num);
     APPLY_OVERRIDE(rpc_address, config.rpc.address);
+    APPLY_OVERRIDE(rpc_interface, config.rpc.interface);
     APPLY_OVERRIDE(rpc_conn_timeout_seconds,
                    config.rpc.connection_timeout_seconds);
     APPLY_OVERRIDE(rpc_enable_tcp_no_delay, config.rpc.enable_tcp_no_delay);
@@ -305,6 +317,10 @@ void NormalizeRedisEndpoint(std::string& endpoint) {
 
 tl::expected<void, std::string> ValidateAndNormalize(
     P2PMasterConfig& config, const std::string& election_backend) {
+    if (config.metrics.http_port > std::numeric_limits<uint16_t>::max()) {
+        return tl::make_unexpected(
+            "metrics_port must be in the range 0..65535");
+    }
     NormalizeRedisEndpoint(config.redis.endpoint);
 
     if (config.client_lifecycle.crashed_ttl_seconds == -1) {
@@ -414,14 +430,30 @@ static tl::expected<P2PMasterConfig, std::string> LoadP2PMasterConfig() {
         source.SetPath(FLAGS_config_path);
         try {
             source.Load();
+            LoadConfigFile(source, config, election_backend);
         } catch (const std::exception& error) {
             return tl::make_unexpected("failed to load P2P master config: " +
                                        std::string(error.what()));
         }
-        LoadConfigFile(source, config, election_backend);
     }
 
     ApplyCommandLineOverrides(config, election_backend);
+    if (!config.rpc.interface.empty()) {
+        if (!config.rpc.address.empty() && config.rpc.address != "0.0.0.0") {
+            LOG(WARNING) << "rpc_interface is set. Overriding rpc_address="
+                         << config.rpc.address;
+        }
+        auto address = GetInterfaceIPv4Address(config.rpc.interface);
+        if (!address) {
+            return tl::make_unexpected(
+                "Failed to resolve rpc_interface=" + config.rpc.interface +
+                ": " + address.error());
+        }
+        config.rpc.address = address.value();
+        LOG(INFO) << "Resolved rpc_interface="
+                  << config.rpc.interface << " to rpc_address="
+                  << config.rpc.address;
+    }
     auto validated = ValidateAndNormalize(config, election_backend);
     if (!validated) {
         return tl::make_unexpected(validated.error());

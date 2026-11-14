@@ -23,11 +23,13 @@ class RuntimeConfigTest : public ::testing::Test {
    protected:
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port, uint16_t http_port) {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            0, nullptr, "", rpc_port, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000,
-            "te", 32, http_port, true);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                0, nullptr, "", rpc_port, 2, 1024, 300 * 1024 * 1024,
+                5 * 60 * 1000, "te", 32, http_port, true)
+                .value();
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,

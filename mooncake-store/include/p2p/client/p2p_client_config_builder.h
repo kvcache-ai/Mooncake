@@ -1,9 +1,9 @@
 #pragma once
 
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <json/json.h>
+#include <ylt/util/tl/expected.hpp>
 #include "client_config_builder.h"
 #include "p2p/common/p2p_types.h"
 
@@ -118,7 +118,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
     static constexpr const char* kDefaultTieredBackendConfigPath =
         "conf/tiered_backend.json";
 
-    static P2PClientConfig build_p2p_real_client(
+    static tl::expected<P2PClientConfig, ErrorCode> build_p2p_real_client(
         const std::string& local_hostname,
         const std::string& metadata_connstring,
         const std::string& protocol = "tcp",
@@ -159,21 +159,14 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         config.enable_http_server = enable_http_server;
         config.enable_metric_collection = enable_metric_collection;
         config.metric_report_interval_seconds = metric_report_interval_seconds;
-        std::string rc_source = runtime_config;
-        if (runtime_config.empty()) {
-            const char* env = std::getenv("MC_RUNTIME_CONFIG");
-            if (env && *env) {
-                rc_source = env;
-            }
-        }
+        const std::string rc_source =
+            ResolveRuntimeConfigSource(runtime_config);
         if (!rc_source.empty()) {
             config.runtime_config_json = LoadJsonConfig(rc_source);
             if (config.runtime_config_json.isNull() ||
                 !config.runtime_config_json.isObject()) {
                 LOG(ERROR) << "P2P runtime configuration must be a JSON object";
-                throw std::runtime_error(
-                    "Invalid runtime configuration provided via runtime_config "
-                    "or MC_RUNTIME_CONFIG");
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
         fill_redis_discovery_config(config, redis_cluster_id, redis_password,
@@ -185,8 +178,13 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         config.lock_shard_count = lock_shard_count;
         config.route_cache_max_memory_bytes = route_cache_max_memory_bytes;
         config.route_cache_ttl_ms = route_cache_ttl_ms;
-        config.local_transfer_mode =
+        auto parsed_local_mode =
             parse_p2p_local_transfer_mode(local_transfer_mode);
+        if (!parsed_local_mode) {
+            LOG(ERROR) << "Failed to parse P2P local_transfer_mode";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        config.local_transfer_mode = *parsed_local_mode;
         config.local_io_worker_num = local_io_worker_num;
         config.te_async_poll_worker_num = te_async_poll_worker_num;
         config.business_coro_worker_num = business_coro_worker_num;
@@ -197,13 +195,10 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
 
         Json::Value tiered_config = LoadJsonConfig(tiered_backend_config_json);
 
-        if (tiered_config.isNull() || !tiered_config.isMember("tiers") ||
+        if (!tiered_config.isObject() || !tiered_config.isMember("tiers") ||
             tiered_config["tiers"].empty()) {
             LOG(ERROR) << "P2P tiered backend configuration requires tiers";
-            throw std::runtime_error(
-                "Tiered backend configuration is missing or invalid. Please "
-                "provide a valid JSON string or a path to a JSON config file "
-                "via tiered_backend_config_json parameter.");
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         config.tiered_backend_config = tiered_config;
 
@@ -220,14 +215,19 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             config.p2p_key_lease_scan_interval_ms =
                 p2p_key_lease_scan_interval_ms;
         }
-        config.transfer_direction_mode =
+        auto parsed_direction =
             parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
+        if (!parsed_direction) {
+            LOG(ERROR) << "Failed to parse p2p_transfer_direction_mode";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        config.transfer_direction_mode = *parsed_direction;
 
         config.heartbeat_rpc_port = heartbeat_rpc_port;
         return config;
     }
 
-    static P2PClientConfig build_p2p_real_client(
+    static tl::expected<P2PClientConfig, ErrorCode> build_p2p_real_client(
         const std::unordered_map<std::string, std::string>& config) {
         std::string local_hostname =
             get_config_str(config, DictCommon::kLocalHostname);
@@ -247,75 +247,107 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         std::string tiered_backend_config =
             get_config_str(config, DictP2P::kTieredBackendConfig,
                            kDefaultTieredBackendConfigPath);
-        size_t local_buffer_size =
+        auto local_buffer_size =
             get_config_size(config, DictCommon::kLocalBufferSize,
                             DictCommon::kDefaultLocalBufferSize);
         std::string ipc_socket_path =
             get_config_str(config, DictCommon::kIpcSocketPath);
-        uint16_t client_rpc_port = static_cast<uint16_t>(get_config_size(
-            config, DictP2P::kClientRpcPort, DictP2P::kDefaultClientRpcPort));
-        uint32_t rpc_thread_num = static_cast<uint32_t>(get_config_size(
-            config, DictP2P::kRpcThreadNum, DictP2P::kDefaultRpcThreadNum));
-        size_t lock_shard_count = get_config_size(
+        auto client_rpc_port = get_config_integer<uint16_t>(
+            config, DictP2P::kClientRpcPort, DictP2P::kDefaultClientRpcPort);
+        auto rpc_thread_num = get_config_integer<uint32_t>(
+            config, DictP2P::kRpcThreadNum, DictP2P::kDefaultRpcThreadNum);
+        auto lock_shard_count = get_config_integer<size_t>(
             config, DictP2P::kLockShardCount, DictP2P::kDefaultLockShardCount);
-        size_t route_cache_max_memory =
+        auto route_cache_max_memory =
             get_config_size(config, DictP2P::kRouteCacheMaxMemoryBytes,
                             DictP2P::kDefaultRouteCacheMaxMemoryBytes);
-        uint64_t route_cache_ttl_ms =
-            get_config_size(config, DictP2P::kRouteCacheTtlMs,
-                            DictP2P::kDefaultRouteCacheTtlMs);
+        auto route_cache_ttl_ms =
+            get_config_integer<uint64_t>(config, DictP2P::kRouteCacheTtlMs,
+                                         DictP2P::kDefaultRouteCacheTtlMs);
         std::string local_transfer_mode =
             get_config_str(config, DictP2P::kLocalTransferMode,
                            DictP2P::kDefaultLocalTransferMode);
-        size_t local_io_worker_num =
-            get_config_size(config, DictP2P::kLocalIoWorkerNum,
-                            DictP2P::kDefaultLocalIoWorkerNum);
-        size_t te_async_poll_worker_num =
-            get_config_size(config, DictP2P::kTeAsyncPollWorkerNum,
-                            DictP2P::kDefaultTeAsyncPollWorkerNum);
-        size_t business_coro_worker_num =
-            get_config_size(config, DictP2P::kBusinessCoroWorkerNum,
-                            DictP2P::kDefaultBusinessCoroWorkerNum);
-        size_t async_sender_thread_count =
-            get_config_size(config, DictP2P::kAsyncSenderThreadCount,
-                            DictP2P::kDefaultAsyncSenderThreadCount);
-        size_t async_max_batch_size =
-            get_config_size(config, DictP2P::kAsyncMaxBatchSize,
-                            DictP2P::kDefaultAsyncMaxBatchSize);
-        size_t async_route_queue_size =
-            get_config_size(config, DictP2P::kAsyncRouteQueueSize,
-                            DictP2P::kDefaultAsyncRouteQueueSize);
+        auto local_io_worker_num =
+            get_config_integer<size_t>(config, DictP2P::kLocalIoWorkerNum,
+                                       DictP2P::kDefaultLocalIoWorkerNum);
+        auto te_async_poll_worker_num =
+            get_config_integer<size_t>(config, DictP2P::kTeAsyncPollWorkerNum,
+                                       DictP2P::kDefaultTeAsyncPollWorkerNum);
+        auto business_coro_worker_num =
+            get_config_integer<size_t>(config, DictP2P::kBusinessCoroWorkerNum,
+                                       DictP2P::kDefaultBusinessCoroWorkerNum);
+        auto async_sender_thread_count =
+            get_config_integer<size_t>(config, DictP2P::kAsyncSenderThreadCount,
+                                       DictP2P::kDefaultAsyncSenderThreadCount);
+        auto async_max_batch_size =
+            get_config_integer<size_t>(config, DictP2P::kAsyncMaxBatchSize,
+                                       DictP2P::kDefaultAsyncMaxBatchSize);
+        auto async_route_queue_size =
+            get_config_integer<size_t>(config, DictP2P::kAsyncRouteQueueSize,
+                                       DictP2P::kDefaultAsyncRouteQueueSize);
         std::string runtime_config =
             get_config_str(config, DictP2P::kRuntimeConfig);
         bool enable_metric_collection =
             get_config_bool(config, DictP2P::kEnableMetricCollection,
                             DictP2P::kDefaultEnableMetricCollection);
-        uint64_t metric_report_interval_seconds =
-            get_config_size(config, DictP2P::kMetricReportIntervalSeconds,
-                            DictP2P::kDefaultMetricReportIntervalSeconds);
-        RedisDiscoveryConfig redis_config = get_redis_discovery_config(config);
-        uint16_t heartbeat_rpc_port = static_cast<uint16_t>(
-            get_config_size(config, DictP2P::kHeartbeatRpcPort,
-                            DictP2P::kDefaultHeartbeatRpcPort));
+        auto metric_report_interval_seconds = get_config_integer<uint64_t>(
+            config, DictP2P::kMetricReportIntervalSeconds,
+            DictP2P::kDefaultMetricReportIntervalSeconds);
+        auto redis_config = get_redis_discovery_config(config);
+        auto heartbeat_rpc_port =
+            get_config_integer<uint16_t>(config, DictP2P::kHeartbeatRpcPort,
+                                         DictP2P::kDefaultHeartbeatRpcPort);
+        auto http_port =
+            get_config_integer<uint16_t>(config, "http_port", 9003);
+        bool enable_http_server =
+            get_config_bool(config, "enable_http_server", true);
+        auto key_lease_duration_ms = get_config_integer<uint32_t>(
+            config, "p2p_key_lease_duration_ms", 0);
+        auto key_lease_scan_interval_ms = get_config_integer<uint32_t>(
+            config, "p2p_key_lease_scan_interval_ms", 0);
+        auto transfer_direction_mode =
+            get_config_str(config, "p2p_transfer_direction_mode", "reverse");
 
-        return build_p2p_real_client(
+        if (!local_buffer_size || !client_rpc_port || !rpc_thread_num ||
+            !lock_shard_count || !route_cache_max_memory ||
+            !route_cache_ttl_ms || !local_io_worker_num ||
+            !te_async_poll_worker_num || !business_coro_worker_num ||
+            !async_sender_thread_count || !async_max_batch_size ||
+            !async_route_queue_size || !metric_report_interval_seconds ||
+            !heartbeat_rpc_port || !http_port || !key_lease_duration_ms ||
+            !key_lease_scan_interval_ms || !redis_config) {
+            LOG(ERROR) << "Failed to parse P2P numeric configuration";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        auto result = build_p2p_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
-            master_server_addr, tiered_backend_config, local_buffer_size,
-            nullptr, ipc_socket_path, client_rpc_port, rpc_thread_num,
-            lock_shard_count, route_cache_max_memory, route_cache_ttl_ms,
-            local_transfer_mode, local_io_worker_num, 9003, true, {},
-            async_sender_thread_count, async_max_batch_size,
-            async_route_queue_size, 0, 0, "reverse", runtime_config,
-            enable_metric_collection, metric_report_interval_seconds,
-            redis_config.cluster_id, redis_config.password,
-            redis_config.db_index, redis_config.master_view_ttl_sec,
-            redis_config.heartbeat_interval_sec, redis_config.username,
-            heartbeat_rpc_port, te_async_poll_worker_num,
+            master_server_addr, tiered_backend_config, *local_buffer_size,
+            nullptr, ipc_socket_path, *client_rpc_port, *rpc_thread_num,
+            *lock_shard_count, *route_cache_max_memory, *route_cache_ttl_ms,
+            local_transfer_mode, *local_io_worker_num, *http_port,
+            enable_http_server, {}, *async_sender_thread_count,
+            *async_max_batch_size, *async_route_queue_size,
+            *key_lease_duration_ms, *key_lease_scan_interval_ms,
+            transfer_direction_mode, runtime_config, enable_metric_collection,
+            *metric_report_interval_seconds, redis_config->cluster_id,
+            redis_config->password, redis_config->db_index,
+            redis_config->master_view_ttl_sec,
+            redis_config->heartbeat_interval_sec, redis_config->username,
+            *heartbeat_rpc_port, *te_async_poll_worker_num,
             get_config_bool(config, DictP2P::kStartLocalOnly, false),
-            business_coro_worker_num);
+            *business_coro_worker_num);
+        if (!result) {
+            LOG(ERROR) << "P2P dict configuration is invalid: "
+                       << result.error();
+        }
+        return result;
     }
 
    private:
+    static std::string ResolveRuntimeConfigSource(
+        const std::string& runtime_config);
+
     struct RedisDiscoveryConfig {
         std::string cluster_id = DEFAULT_CLUSTER_ID;
         std::string username;
@@ -381,21 +413,30 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         static constexpr uint16_t kDefaultHeartbeatRpcPort = 0;
     };
 
-    static RedisDiscoveryConfig get_redis_discovery_config(
+    static tl::expected<RedisDiscoveryConfig, ErrorCode>
+    get_redis_discovery_config(
         const std::unordered_map<std::string, std::string>& config) {
         RedisDiscoveryConfig redis_config;
         redis_config.cluster_id = get_config_str(
             config, DictP2P::kRedisClusterId, DEFAULT_CLUSTER_ID);
         redis_config.username = get_config_str(config, DictP2P::kRedisUsername);
         redis_config.password = get_config_str(config, DictP2P::kRedisPassword);
-        redis_config.db_index =
-            get_config_int(config, DictP2P::kRedisDbIndex, 0);
-        redis_config.master_view_ttl_sec =
-            get_config_int(config, DictP2P::kRedisMasterViewTtlSec,
-                           redis_config.master_view_ttl_sec);
-        redis_config.heartbeat_interval_sec =
-            get_config_int(config, DictP2P::kRedisHeartbeatIntervalSec,
-                           redis_config.heartbeat_interval_sec);
+        auto db_index = get_config_integer<int>(config, DictP2P::kRedisDbIndex,
+                                                redis_config.db_index);
+        auto view_ttl =
+            get_config_integer<int>(config, DictP2P::kRedisMasterViewTtlSec,
+                                    redis_config.master_view_ttl_sec);
+        auto heartbeat_interval =
+            get_config_integer<int>(config, DictP2P::kRedisHeartbeatIntervalSec,
+                                    redis_config.heartbeat_interval_sec);
+        if (!db_index || !view_ttl || !heartbeat_interval) {
+            LOG(ERROR)
+                << "Failed to parse Redis discovery integer configuration";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        redis_config.db_index = *db_index;
+        redis_config.master_view_ttl_sec = *view_ttl;
+        redis_config.heartbeat_interval_sec = *heartbeat_interval;
         return redis_config;
     }
 
@@ -455,7 +496,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         return config;
     }
 
-    static LocalTransferMode parse_p2p_local_transfer_mode(std::string mode) {
+    static std::optional<LocalTransferMode> parse_p2p_local_transfer_mode(
+        std::string mode) {
         std::transform(
             mode.begin(), mode.end(), mode.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -465,12 +507,13 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         if (mode == "te") {
             return LocalTransferMode::TE;
         }
-        throw std::runtime_error(
-            "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");
+        LOG(ERROR) << "Invalid p2p local transfer mode: " << mode
+                   << ". Expected 'memcpy' or 'te'.";
+        return std::nullopt;
     }
 
-    static TransferDirectionMode parse_p2p_transfer_direction_mode(
-        std::string mode) {
+    static std::optional<TransferDirectionMode>
+    parse_p2p_transfer_direction_mode(std::string mode) {
         std::transform(
             mode.begin(), mode.end(), mode.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -480,9 +523,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         if (mode == "forward") {
             return TransferDirectionMode::FORWARD;
         }
-        throw std::runtime_error(
-            "Invalid p2p transfer direction mode. Expected 'reverse' or "
-            "'forward'.");
+        LOG(ERROR) << "Invalid p2p transfer direction mode: " << mode;
+        return std::nullopt;
     }
 };
 

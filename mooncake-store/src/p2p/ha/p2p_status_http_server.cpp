@@ -67,7 +67,7 @@ void P2PStatusHttpServer::Start() {
     }
 
     server_ = std::make_unique<coro_http::coro_http_server>(
-        /*thread_num=*/1, port_);
+        /*thread_num=*/1, port_, host_);
     RegisterStatusHttpHandlers(*server_);
     // Component info is process scoped. Initialize it before the supervisor
     // HTTP server becomes reachable so standby /metrics scrapes are complete.

@@ -274,7 +274,10 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertEqual(await self.store.async_get_batch(keys), [b"", b""])
         self.assertEqual(await self.store.async_remove_all(), 0)
 
-    # TODO: Enable P2P coverage once global remove_by_regex is implemented.
+    # TODO(F02-T009, replace-in=UPG1-F06-S02): receiver=UPG1-F06-S02 must decide
+    # global regex-removal support during S02 analysis. Restore this test with
+    # the approved provider before S02 acceptance, or record explicit rejection
+    # and its negative coverage. Source: F02-B05 audit, Codex, 2026-11-12.
     @unittest.skipIf(IS_P2P, "P2P global remove_by_regex is not implemented yet")
     async def test_05_remove_by_regex(self):
         """Test remove_by_regex."""

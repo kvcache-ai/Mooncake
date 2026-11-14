@@ -234,6 +234,8 @@ class P2PClientService final {
 
     std::string GetHealthStatus() const;
 
+    DummyClientStatus GetServiceStatus() const;
+
     // Access service-owned client state.
     uint16_t GetHttpPort() const { return http_port_; }
     uint16_t GetRpcPort() const { return client_rpc_port_; }

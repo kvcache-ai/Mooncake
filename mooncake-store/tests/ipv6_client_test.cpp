@@ -101,7 +101,8 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
             FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(client_->setup(setup_config), 0)
         << "Client setup should succeed with IPv6 address";
 
@@ -169,7 +170,8 @@ TEST_F(IPv6ClientTest, BasicPutGetOverLinkLocalIPv6) {
             server_address, "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(client_->setup(setup_config), 0)
         << "Client setup should succeed with link-local IPv6 address";
 
@@ -224,7 +226,8 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
             FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(client_->setup(setup_config), 0);
 
     // Prepare batch data

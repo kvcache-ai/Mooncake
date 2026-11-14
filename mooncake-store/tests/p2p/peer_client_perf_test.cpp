@@ -44,8 +44,10 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
 }
 
 // Compare sync/async RPC overhead on failure paths; TE is uninitialized.
-// TODO(P2P-011): Add successful native Client benchmarks with byte/content
-// checks and error counts for baseline comparison.
+// TODO(F02-T007, replace-in=UPG3): receiver=UPG3; review this benchmark in
+// UPG3.1 and add real native successful paths before UPG3.3 measurement.
+// Require byte/content checks and error counts under the fixed UPG3 protocol.
+// Source: F02-B05 audit, Codex, 2026-11-12; replaces legacy P2P-011.
 class PeerClientPerfTest : public ::testing::Test {
    protected:
     void SetUp() override {

@@ -40,6 +40,9 @@ STORE_PACKAGE_DIR=$(python -c 'import mooncake; from pathlib import Path; print(
 python mooncake-wheel/setup.py --check-store-artifacts "$STORE_PACKAGE_DIR" \
     --with-store ON --expected-architecture "${EXPECTED_STORE_ARCH:-centralized}"
 
+# Source: UPG1-F01-3.2; clarified by F02-B05/Codex on 2026-11-12.
+# Due: public modules during UPG2 merge review; structured consumers during
+# their assigned F15 implementation review, before each task is accepted.
 # TODO: Follow F01-T113 (owner/replace-in=UPG2-F01-public-build) for U's
 # Reshard package checks, and F01-T114 (owner/replace-in=UPG1-F15) for
 # structured/fast-copy checks. Add their U import/test calls together with
@@ -48,24 +51,35 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cd test_env
+# Source: UPG1-F01-3.2; clarified by F02-B05/Codex on 2026-11-12.
+# Due: UPG2-F01-public-build implementation/merge review, before UPG2 acceptance.
 # TODO: Follow F01-T113 (owner/replace-in=UPG2-F01-public-build) to restore
 # U's unpinned Torch install with its EP/PG CMake/JIT providers. The current
 # legacy wheel builds extensions for explicit Torch versions.
-pip install torch==2.10.0 numpy
+pip install torch==2.10.0 numpy pytest
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
 
+echo "Running CLI module tests..."
+python -m pytest -q tests/test_cli_modules.py
+
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
 mooncake_master --version
+python -I -m mooncake.cli --version
 echo "Success: mooncake_master entry point found"
 
 # Check if the mooncake_client entry point is installed and executable
 which mooncake_client || { echo "ERROR: mooncake_client entry point not found!"; exit 1; }
+python -I -m mooncake.cli_client --version
 echo "Success: mooncake_client entry point found"
+
+echo "Verifying Store REST console entry point..."
+mc_store_rest_server --help >/dev/null
+echo "Success: Store REST entry point found"
 
 echo "Verifying transfer_engine_bench entry point..."
 # Check if the transfer_engine_bench entry point is installed and executable

@@ -53,16 +53,18 @@ class P2PRegisterConcurrencyTest : public ::testing::Test {
         // and releasing free ports first races with concurrent test servers.
         const std::string host_name = "localhost:0";
 
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", /*client_rpc_port=*/0,
-            /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
-            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/60 * 1000,
-            /*local_transfer_mode=*/"te",
-            /*local_io_worker_num=*/32, /*http_port=*/0,
-            /*enable_http_server=*/true);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                /*local_buffer_size=*/0, nullptr, "", /*client_rpc_port=*/0,
+                /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
+                /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
+                /*route_cache_ttl_ms=*/60 * 1000,
+                /*local_transfer_mode=*/"te",
+                /*local_io_worker_num=*/32, /*http_port=*/0,
+                /*enable_http_server=*/true)
+                .value();
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,

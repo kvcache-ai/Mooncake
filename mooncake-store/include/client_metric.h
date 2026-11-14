@@ -1,6 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <iomanip>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -22,6 +28,33 @@ const std::vector<double> kLatencyBucket = {
     // safeguards for long tails
     50000, 100000, 200000, 500000, 1000000};
 
+inline std::string format_metric_rate(double value, const char* suffix) {
+    const double KB = 1024.0;
+    const double MB = KB * 1024.0;
+    const double GB = MB * 1024.0;
+    const double TB = GB * 1024.0;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    if (value >= TB) {
+        oss << value / TB << " T" << suffix;
+    } else if (value >= GB) {
+        oss << value / GB << " G" << suffix;
+    } else if (value >= MB) {
+        oss << value / MB << " M" << suffix;
+    } else if (value >= KB) {
+        oss << value / KB << " K" << suffix;
+    } else {
+        oss << value << " " << suffix;
+    }
+    return oss.str();
+}
+
+inline std::string format_metric_bandwidth(uint64_t total_bytes,
+                                           double elapsed_seconds) {
+    return format_metric_rate(total_bytes / elapsed_seconds, "B/s");
+}
+
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})
         : total_read_bytes("mooncake_transfer_read_bytes", "Total bytes read",
@@ -37,7 +70,8 @@ struct TransferMetric {
           get_latency_us("mooncake_transfer_get_latency",
                          "Get transfer latency (us)", kLatencyBucket, labels),
           put_latency_us("mooncake_transfer_put_latency",
-                         "Put transfer latency (us)", kLatencyBucket, labels) {}
+                         "Put transfer latency (us)", kLatencyBucket, labels),
+          start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t total_read_bytes;
     ylt::metric::counter_t total_write_bytes;
@@ -55,7 +89,7 @@ struct TransferMetric {
         put_latency_us.serialize(str);
     }
 
-    std::string summary_metrics() {
+    std::string summary_metrics(bool include_bandwidth = true) {
         std::stringstream ss;
         ss << "=== Transfer Metrics Summary ===\n";
 
@@ -64,6 +98,14 @@ struct TransferMetric {
         auto write_bytes = total_write_bytes.value();
         ss << "Total Read: " << byte_size_to_string(read_bytes) << "\n";
         ss << "Total Write: " << byte_size_to_string(write_bytes) << "\n";
+        if (include_bandwidth) {
+            ss << "Average Read Throughput: "
+               << format_metric_bandwidth(read_bytes, elapsed_seconds())
+               << "\n";
+            ss << "Average Write Throughput: "
+               << format_metric_bandwidth(write_bytes, elapsed_seconds())
+               << "\n";
+        }
 
         // Latency summaries
         ss << "\n=== Latency Summary (microseconds) ===\n";
@@ -78,6 +120,14 @@ struct TransferMetric {
     }
 
    private:
+    std::chrono::steady_clock::time_point start_time_;
+
+    double elapsed_seconds() const {
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time_);
+        return std::max(elapsed.count(), 1e-9);
+    }
+
     std::string format_latency_summary(ylt::metric::histogram_t& hist) {
         // Access the internal sum and bucket counts
         auto sum_ptr =
@@ -250,6 +300,14 @@ struct MasterClientMetric {
     }
 };
 
+struct ClientMetricConfig {
+    bool enabled = true;
+    std::chrono::milliseconds reporting_interval{0};
+    bool bandwidth_reporting_enabled = true;
+
+    static ClientMetricConfig FromEnvironment();
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
@@ -266,7 +324,8 @@ struct ClientMetric {
      *   (default: 0, 0 = collect but don't report)
      */
     static std::unique_ptr<ClientMetric> Create(
-        std::map<std::string, std::string> labels = {});
+        const std::map<std::string, std::string>& labels = {},
+        bool master_rpc_metrics_enabled = true);
 
     void serialize(std::string& str);
     std::string summary_metrics();
@@ -274,16 +333,29 @@ struct ClientMetric {
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
     explicit ClientMetric(uint64_t interval_seconds = 0,
-                          std::map<std::string, std::string> labels = {});
+                          const std::map<std::string, std::string>& labels = {},
+                          bool bandwidth_reporting_enabled = true,
+                          bool master_rpc_metrics_enabled = true);
     ~ClientMetric();
 
    private:
+    struct TransferSnapshot {
+        uint64_t read_bytes;
+        uint64_t write_bytes;
+        std::chrono::steady_clock::time_point timestamp;
+    };
+
     // Metrics reporting thread management
     std::jthread metrics_reporting_thread_;
     std::atomic<bool> should_stop_metrics_thread_{false};
     uint64_t metrics_interval_seconds_{0};
+    bool bandwidth_reporting_enabled_{true};
+    bool master_rpc_metrics_enabled_{true};
+    std::mutex snapshot_mutex_;
+    std::optional<TransferSnapshot> last_report_snapshot_;
 
     void StartMetricsReportingThread();
     void StopMetricsReportingThread();
+    std::string BuildBandwidthReport();
 };
 };  // namespace mooncake

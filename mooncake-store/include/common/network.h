@@ -47,6 +47,9 @@ class AutoPortBinder {
 // HTTP utility: simple GET, returns body on 200, otherwise error code
 tl::expected<std::string, int> httpGet(const std::string& url);
 
+tl::expected<std::string, std::string> GetInterfaceIPv4Address(
+    const std::string& interface_name);
+
 // Network utility: obtain an available TCP port on loopback by binding to 0
 int getFreeTcpPort();
 

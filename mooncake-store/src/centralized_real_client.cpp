@@ -34,6 +34,28 @@ void RealClient::register_dummy_rpc_handlers() {
 
 tl::expected<std::shared_ptr<ClientServiceImpl>, ErrorCode>
 RealClient::CreateService(const ClientConfig& config) {
+    constexpr uint64_t kMinSegmentSize = 1024;
+    constexpr uint64_t kMaxSegmentSize = 1024ULL * 1024 * 1024 * 1024;
+    if (config.metadata_connstring.empty() && !config.transfer_engine) {
+        LOG(ERROR) << "metadata_server is required without an external "
+                      "transfer engine";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.global_segment_size != 0 &&
+        config.global_segment_size < kMinSegmentSize) {
+        LOG(ERROR) << "Invalid global_segment_size: "
+                   << config.global_segment_size << ", must be 0 or at least "
+                   << kMinSegmentSize;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if ((config.local_buffer_size != 0 &&
+         config.local_buffer_size < kMinSegmentSize) ||
+        config.local_buffer_size > kMaxSegmentSize) {
+        LOG(ERROR) << "Invalid local_buffer_size: " << config.local_buffer_size
+                   << ", must be 0 or between " << kMinSegmentSize << " and "
+                   << kMaxSegmentSize;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (config.master_server_entry.rfind("redis://", 0) == 0) {
         LOG(ERROR) << "Centralized setup does not support Redis discovery";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -69,7 +91,16 @@ tl::expected<void, ErrorCode> RealClient::initAll_internal(
         device_name.empty() ? std::nullopt
                             : std::optional<std::string>(device_name),
         "127.0.0.1:50051", mount_segment_size, buffer_allocator_size);
-    return setup_internal(config);
+    if (!config) {
+        LOG(ERROR) << "Failed to build centralized client config: "
+                   << config.error();
+        return tl::unexpected(config.error());
+    }
+    auto result = setup_internal(*config);
+    if (!result) {
+        LOG(ERROR) << "Centralized initAll setup failed: " << result.error();
+    }
+    return result;
 }
 
 DeploymentMode RealClient::deployment_mode() const {

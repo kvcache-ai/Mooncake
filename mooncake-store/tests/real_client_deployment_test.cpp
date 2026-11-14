@@ -18,6 +18,8 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "config.h"
 #include "dummy_client.h"
@@ -109,6 +111,19 @@ struct ClientOwner {
     }
 };
 
+// Synthetic entries exercise heartbeat counts without registering memory.
+void AddShmContext(RealClient& rc, const UUID& id, size_t mapped_count = 0) {
+    SharedMutexLocker lock(&RealClientTestHelper::ShmMutex(rc));
+    auto context = std::make_shared<RealClientTestHelper::ShmContext>();
+    context->mapped_shms_.resize(mapped_count);
+    RealClientTestHelper::ShmContexts(rc)[id] = std::move(context);
+}
+
+void EraseShmContext(RealClient& rc, const UUID& id) {
+    SharedMutexLocker lock(&RealClientTestHelper::ShmMutex(rc));
+    RealClientTestHelper::ShmContexts(rc).erase(id);
+}
+
 // Pause a real native batch read at its Master RPC, after native admission.
 // The rest of the endpoint delegates to the existing in-process Master.
 class PausedReadMaster {
@@ -121,7 +136,7 @@ class PausedReadMaster {
     using Service = WrappedMasterService;
     using ReadRequest = const std::vector<std::string>&;
     using ReadResponse =
-        std::vector<tl::expected<GetReplicaListResponse, ErrorCode> >;
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>;
 #endif
 
     explicit PausedReadMaster(Service& service)
@@ -376,7 +391,7 @@ void CheckIpcRecovery(Config config, const WriteConfig& write_config) {
             peer.fd, file.fd(), request, sizeof(request) / 2, response));
         EXPECT_NE(response, 0);
         ASSERT_NO_FATAL_FAILURE(
-            rpc.ExpectStatus(id, DummyClientStatus::DISCONNECTION, 0));
+            rpc.ExpectStatus(id, DummyClientStatus::HEALTH, 0));
     }
     {
         Socket peer(ConnectIpc(config.ipc_socket_path));
@@ -388,7 +403,7 @@ void CheckIpcRecovery(Config config, const WriteConfig& write_config) {
                                                  sizeof(invalid), response));
         EXPECT_NE(response, 0);
         ASSERT_NO_FATAL_FAILURE(
-            rpc.ExpectStatus(id, DummyClientStatus::DISCONNECTION, 0));
+            rpc.ExpectStatus(id, DummyClientStatus::HEALTH, 0));
     }
     Socket peer(ConnectIpc(config.ipc_socket_path));
     ASSERT_GE(peer.fd, 0);
@@ -419,8 +434,7 @@ void CheckIpcRecovery(Config config, const WriteConfig& write_config) {
     auto unmapped = rpc.Unmap(id);
     ASSERT_TRUE(unmapped) << unmapped.error().msg;
     ASSERT_TRUE(*unmapped);
-    ASSERT_NO_FATAL_FAILURE(
-        rpc.ExpectStatus(id, DummyClientStatus::DISCONNECTION, 0));
+    ASSERT_NO_FATAL_FAILURE(rpc.ExpectStatus(id, DummyClientStatus::HEALTH, 0));
 }
 
 template <typename Config>
@@ -493,8 +507,8 @@ void CheckUnmapWaitsForContext(Config config, const WriteConfig& write_config,
                           << (*ping).error();
             break;
         }
-        if ((*ping)->status == DummyClientStatus::DISCONNECTION) {
-            EXPECT_EQ((*ping)->mapped_shm_count, 0);
+        if ((*ping)->mapped_shm_count == 0) {
+            EXPECT_EQ((*ping)->status, DummyClientStatus::HEALTH);
             detached = true;
             break;
         }
@@ -517,7 +531,7 @@ void CheckUnmapWaitsForContext(Config config, const WriteConfig& write_config,
     EXPECT_EQ(std::string(static_cast<char*>(file.data), value.size()), value);
     EXPECT_TRUE(RealClientTestHelper::ShmMappingsEmpty(*context));
     ASSERT_NO_FATAL_FAILURE(
-        observer.ExpectStatus(id, DummyClientStatus::DISCONNECTION, 0));
+        observer.ExpectStatus(id, DummyClientStatus::HEALTH, 0));
     // Once detached, a new read must fail without modifying shared memory.
     std::memset(file.data, 0x5a, SharedFile::kSize);
     auto response_late =
@@ -555,11 +569,13 @@ class RealClientDeploymentTest : public ::testing::Test {
 
     auto DeploymentConfig() {
 #if defined(MOONCAKE_STORE_CLIENT_P2P)
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
-            master_.master_address(),
-            R"({"tiers":[{"type":"DRAM","capacity":67108864,"priority":100}]})",
-            4 * 1024 * 1024, nullptr, "", 0);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
+                master_.master_address(),
+                R"({"tiers":[{"type":"DRAM","capacity":67108864,"priority":100}]})",
+                4 * 1024 * 1024, nullptr, "", 0)
+                .value();
         config.enable_http_server = false;
         config.enable_metric_collection = false;
         config.async_sender_thread_count = 0;
@@ -567,8 +583,9 @@ class RealClientDeploymentTest : public ::testing::Test {
         return config;
 #else
         return CentralizedClientConfigBuilder::build_centralized_real_client(
-            "127.0.0.1:0", "P2PHANDSHAKE", "tcp", std::nullopt,
-            master_.master_address(), 16 * 1024 * 1024, 4 * 1024 * 1024);
+                   "127.0.0.1:0", "P2PHANDSHAKE", "tcp", std::nullopt,
+                   master_.master_address(), 16 * 1024 * 1024, 4 * 1024 * 1024)
+            .value();
 #endif
     }
 
@@ -586,6 +603,141 @@ class RealClientDeploymentTest : public ::testing::Test {
     InProcMaster master_;
 #endif
 };
+
+// Availability stays healthy while only this Dummy's mapping count changes.
+TEST_F(RealClientDeploymentTest, PingTracksShmMappingChanges) {
+    ClientOwner owner;
+    ASSERT_EQ(owner.client->setup(DeploymentConfig()), 0);
+    auto& rc = *owner.client;
+    const UUID id{5, 6};
+    const auto expect_count = [&](uint64_t count) {
+        auto ping = rc.ping(id);
+        ASSERT_TRUE(ping);
+        EXPECT_EQ(ping->status, DummyClientStatus::HEALTH);
+        EXPECT_EQ(ping->mapped_shm_count, count);
+    };
+
+    expect_count(0);  // No context before the first registration.
+    AddShmContext(rc, id);
+    expect_count(0);  // An empty context is also valid.
+    AddShmContext(rc, id, 2);
+    expect_count(2);
+    EraseShmContext(rc, id);
+    expect_count(0);
+    AddShmContext(rc, id, 1);
+    expect_count(1);
+}
+
+// Mapped and unmapped clients are reported independently.
+TEST_F(RealClientDeploymentTest, PingCountsArePerClient) {
+    ClientOwner owner;
+    ASSERT_EQ(owner.client->setup(DeploymentConfig()), 0);
+    auto& rc = *owner.client;
+    UUID mapped{1, 2};
+    UUID absent{3, 4};
+
+    AddShmContext(rc, mapped, 1);
+    EXPECT_EQ(rc.ping(mapped).value().mapped_shm_count, 1u);
+    EXPECT_EQ(rc.ping(absent).value().mapped_shm_count, 0u);
+}
+
+// ping() must finish while another reader holds the shared map lock.
+// Release the reader before checking or collecting the async result,
+// including when the wait times out.
+TEST_F(RealClientDeploymentTest, PingNotBlockedByConcurrentReader) {
+    ClientOwner owner;
+    ASSERT_EQ(owner.client->setup(DeploymentConfig()), 0);
+    auto& rc = *owner.client;
+    UUID id{7, 8};
+
+    // Keep the future outside the lock scope so unwinding unlocks first.
+    std::future<tl::expected<DummyHeartbeatResponse, ErrorCode>> pending;
+    std::future_status status;
+    {
+        SharedMutexLocker reader(&RealClientTestHelper::ShmMutex(rc),
+                                 shared_lock);
+        pending = std::async(std::launch::async, [&] { return rc.ping(id); });
+        status = pending.wait_for(std::chrono::seconds(5));
+    }
+
+    EXPECT_EQ(status, std::future_status::ready);
+    auto result = pending.get();
+    EXPECT_TRUE(result.has_value());
+}
+
+// Concurrent map/ping smoke test; TSan checks races on the executed paths.
+// Each thread owns its UUID, so its expected mapping count is deterministic.
+TEST_F(RealClientDeploymentTest, PingConcurrentWithMapMutation) {
+    ClientOwner owner;
+    ASSERT_EQ(owner.client->setup(DeploymentConfig()), 0);
+    auto& rc = *owner.client;
+    constexpr int kThreads = 8;
+    constexpr int kIters = 2000;
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&rc, t] {
+            UUID id{static_cast<uint64_t>(t), 0};
+            for (int i = 0; i < kIters; ++i) {
+                if (i & 1) {
+                    AddShmContext(rc, id, 1);
+                } else {
+                    EraseShmContext(rc, id);
+                }
+                auto r = rc.ping(id);
+                ASSERT_TRUE(r.has_value());
+                EXPECT_EQ(r->status, DummyClientStatus::HEALTH);
+                EXPECT_EQ(r->mapped_shm_count, (i & 1) ? 1u : 0u);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    SUCCEED();
+}
+
+#if !defined(MOONCAKE_STORE_CLIENT_P2P)
+TEST(RealClientSetupTest, InvalidBusinessConfigRejectsSetup) {
+    const std::pair<uint64_t, uint64_t> invalid_sizes[] = {
+        {1023, 0}, {0, 1023}, {0, (1ULL << 40) + 1}};
+    for (const auto& [global_size, local_size] : invalid_sizes) {
+        auto config =
+            CentralizedClientConfigBuilder::build_centralized_real_client(
+                {{"local_hostname", "127.0.0.1"},
+                 {"metadata_server", "P2PHANDSHAKE"},
+                 {"global_segment_size", std::to_string(global_size)},
+                 {"local_buffer_size", std::to_string(local_size)}});
+        ASSERT_TRUE(config);
+        auto client = RealClient::create();
+        EXPECT_EQ(client->setup(*config), toInt(ErrorCode::INVALID_PARAMS));
+        EXPECT_EQ(RealClientTestHelper::NativeClient(*client), nullptr);
+    }
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
+        "127.0.0.1", "");
+    ASSERT_TRUE(config);
+    auto client = RealClient::create();
+    EXPECT_EQ(client->setup(*config), toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(RealClientTestHelper::NativeClient(*client), nullptr);
+}
+
+TEST_F(RealClientDeploymentTest, MasterLossChangesHealthWithoutLosingMappings) {
+    ClientOwner owner;
+    ASSERT_EQ(owner.client->setup(DeploymentConfig()), 0);
+    const UUID id{19, 20};
+    AddShmContext(*owner.client, id, 1);
+    master_.Stop();
+    auto native = RealClientTestHelper::NativeClient(*owner.client);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (native->GetServiceStatus() != DummyClientStatus::DISCONNECTION &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    auto ping = owner.client->ping(id);
+    ASSERT_TRUE(ping);
+    EXPECT_EQ(ping->status, DummyClientStatus::DISCONNECTION);
+    EXPECT_EQ(ping->mapped_shm_count, 1u);
+}
+#endif
 
 TEST_F(RealClientDeploymentTest,
        InvalidShmRegistrationClosesFdAndLeavesNoContext) {
@@ -613,7 +765,7 @@ TEST_F(RealClientDeploymentTest,
     ExpectFdConsumed(passed_fd, original);
     auto ping = client->ping({1, 2});
     ASSERT_TRUE(ping);
-    EXPECT_EQ(ping->status, DummyClientStatus::DISCONNECTION);
+    EXPECT_EQ(ping->status, DummyClientStatus::HEALTH);
     EXPECT_EQ(ping->mapped_shm_count, 0);
     EXPECT_EQ(client->tearDownAll(), 0);
 }
@@ -657,6 +809,10 @@ TEST_F(RealClientDeploymentTest, DeploymentModeIsIndependentOfReadiness) {
     auto readiness = owner.client->service_ready_internal();
     ASSERT_FALSE(readiness);
     EXPECT_EQ(readiness.error(), ErrorCode::INTERNAL_ERROR);
+    const auto dummy_id = generate_uuid();
+    auto ping = owner.client->ping(dummy_id);
+    ASSERT_FALSE(ping);
+    EXPECT_EQ(ping.error(), ErrorCode::INTERNAL_ERROR);
 
     ASSERT_EQ(owner.client->setup(DeploymentConfig()), 0);
     EXPECT_EQ(owner.client->deployment_mode(), expected_mode);
@@ -664,6 +820,10 @@ TEST_F(RealClientDeploymentTest, DeploymentModeIsIndependentOfReadiness) {
     readiness = owner.client->service_ready_internal();
     ASSERT_TRUE(readiness);
     EXPECT_EQ(readiness.value(), expected_mode);
+    ping = owner.client->ping(dummy_id);
+    ASSERT_TRUE(ping);
+    EXPECT_EQ(ping->status, DummyClientStatus::HEALTH);
+    EXPECT_EQ(ping->mapped_shm_count, 0u);
 
     EXPECT_EQ(owner.client->tearDownAll(), 0);
     EXPECT_EQ(owner.client->deployment_mode(), expected_mode);
@@ -671,6 +831,9 @@ TEST_F(RealClientDeploymentTest, DeploymentModeIsIndependentOfReadiness) {
     readiness = owner.client->service_ready_internal();
     ASSERT_FALSE(readiness);
     EXPECT_EQ(readiness.error(), ErrorCode::SHUTTING_DOWN);
+    ping = owner.client->ping(dummy_id);
+    ASSERT_FALSE(ping);
+    EXPECT_EQ(ping.error(), ErrorCode::SHUTTING_DOWN);
     // Repeated close after completion is covered here.
     EXPECT_EQ(owner.client->tearDownAll(), 0);
 }
@@ -1086,6 +1249,10 @@ TEST_F(RealClientDeploymentTest, CloseWaitsForRegisteredShmPublication) {
         config.transfer_engine = transport.GetTransferEngine();
         config.local_hostname = transport.GetLocalEndpoint();
     }
+#if !defined(MOONCAKE_STORE_CLIENT_P2P)
+    // The supplied engine already owns its metadata connection.
+    config.metadata_connstring.clear();
+#endif
     const auto id = generate_uuid();
     config.ipc_socket_path = "ipc_publish_" + std::to_string(getpid()) + "_" +
                              std::to_string(id.first);
@@ -1225,8 +1392,7 @@ TEST_F(RealClientDeploymentTest, RpcBindFailureClosesClient) {
     EXPECT_TRUE(recovered.client->is_initialized());
     ShmRpcPeer rpc;
     ASSERT_TRUE(rpc.Connect(rpc_port));
-    ASSERT_NO_FATAL_FAILURE(
-        rpc.ExpectStatus(id, DummyClientStatus::DISCONNECTION, 0));
+    ASSERT_NO_FATAL_FAILURE(rpc.ExpectStatus(id, DummyClientStatus::HEALTH, 0));
     {
         Socket peer(ConnectIpc(config.ipc_socket_path));
         EXPECT_GE(peer.fd, 0);

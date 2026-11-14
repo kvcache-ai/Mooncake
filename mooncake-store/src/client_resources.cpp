@@ -11,6 +11,7 @@
 #include <thread>
 #include <utility>
 
+#include "client_auto_port_config.h"
 #include "client_buffer.h"
 #include "common/network.h"
 #include "config.h"
@@ -203,8 +204,10 @@ ErrorCode ClientResources::InitTransferEngine(
     // Never report success without a successful initialization attempt.
     ErrorCode err = ErrorCode::INTERNAL_ERROR;
 
-    const int kMaxRetries =
-        is_auto_port ? GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20) : 1;
+    const auto auto_port_config = is_auto_port
+                                      ? ClientAutoPortConfig::FromEnvironment()
+                                      : ClientAutoPortConfig{};
+    const int kMaxRetries = is_auto_port ? auto_port_config.max_retries : 1;
 
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
         if (attempt > 0) {
@@ -219,7 +222,8 @@ ErrorCode ClientResources::InitTransferEngine(
             }
             te_port_ = static_cast<uint16_t>(new_port);
         } else if (is_auto_port) {
-            port_binder_ = std::make_unique<AutoPortBinder>();
+            port_binder_ = std::make_unique<AutoPortBinder>(
+                auto_port_config.min_port, auto_port_config.max_port);
             int new_port = port_binder_->getPort();
             if (new_port < 0) {
                 LOG(ERROR) << "Failed to bind available port"

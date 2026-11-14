@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/functional/hash.hpp>
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <mutex>
@@ -89,6 +90,8 @@ class Client {
 
     // Reject new core business calls and drain admitted calls/background work.
     void Stop();
+
+    DummyClientStatus GetServiceStatus() const;
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -618,6 +621,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_success_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 };
 

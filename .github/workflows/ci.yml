@@ -1,9 +1,9 @@
-# TODO(UPG-003.1/UPG-004.1): Adopt shared wheel workflows and toolchains;
-# retain the separate P2P workflow.
-# Follow F01-T118 (owner/replace-in=UPG1-F22-B02) for U's wheel profiles
-# and toolchains, with workflow integration under UPG1-F22-B04. U's manylinux
-# builder requires the dependency installer/providers deferred to
-# UPG2-F01-public-build; the current installer only supports apt.
+# TODO(F02-T004, replace-in=UPG1-F22-B04): Migrate shared wheel workflows
+# and legacy Docker jobs during B04 implementation, before B04 acceptance.
+# Keep architecture-specific artifacts; validate replacement image coverage
+# before removing old jobs/Buildx. Package profiles remain F01-T118/B02 and
+# public providers remain F01-T113/UPG2.
+# Source: UPG1-F02-B05 block 3 audit; clarified by Codex on 2026-11-12.
 name: 'Build & Test (Linux)'
 
 on:
@@ -93,7 +93,11 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        # TODO(UPG-001.1): Enable STORE_USE_REDIS with centralized Redis support.
+        # TODO(F02-T005, replace-in=UPG1-F22-B04): Enable Redis CI only after
+        # receiver=UPG1-F12-S50 delivers the approved native Redis provider.
+        # receiver=UPG1-F22-B04 wires/verifies ON/OFF during CI implementation,
+        # before B04 acceptance. Analysis in S50 decides supported architectures.
+        # Source: F02-B05 audit, Codex, 2026-11-12; replaces legacy UPG-001.1.
         cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DPARALLEL_LINK_JOBS=2 -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
 
@@ -432,7 +436,8 @@ jobs:
       run: |
         mkdir build
         cd build
-        # TODO(UPG-001.1): Enable STORE_USE_REDIS with centralized Redis support.
+        # TODO-REF(F02-T005, receiver=UPG1-F22-B04): Wire Redis after the
+        # S50 provider is received; verify this wheel job before B04 acceptance.
         cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
@@ -507,10 +512,10 @@ jobs:
         name: mooncake-wheel-ubuntu-centralized-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
-  # TODO: During UPG1-F22-B04 (CI/nightly migration), move this legacy Docker
-  # check to U's nightly flow. Remove this job and its Buildx setup after the
-  # replacement validates centralized image builds. Keep Buildx setup wherever
-  # the replacement still uses docker buildx build.
+  # TODO-REF(F02-T004, receiver=UPG1-F22-B04): During B04 implementation,
+  # replace this centralized Docker job only after nightly image coverage passes.
+  # Keep Buildx where the replacement uses it; close before B04 acceptance.
+  # Source: UPG1-F02-B05 block 3 audit; clarified by Codex on 2026-11-12.
   build-docker:
     name: Build Docker Image
     if: >-
