@@ -1890,6 +1890,31 @@ TEST_F(StorageBackendTest,
               std::string(64 * 1024, '4'));
 }
 
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxBatchPinSurvivesRemoveAll) {
+    ZeroCopyDaxFixture f(data_path);
+    OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+    ASSERT_TRUE(backend.Init());
+
+    const std::string old_value(64 * 1024, 'o');
+    OffloadOne(backend, "k", old_value);
+    auto pinned = backend.BatchPin({"k"}, {64 * 1024});
+    ASSERT_TRUE(pinned.has_value());
+
+    // RemoveAll forgets the key but must not hand the pinned extent out
+    // again, and must give the unpinned space back: three fills of ~40% of
+    // the arena only fit if each RemoveAll freed the previous one.
+    for (char round : {'1', '2', '3'}) {
+        backend.RemoveAll();
+        EXPECT_FALSE(backend.IsExist("k").value());
+        for (int i = 0; i < 24; ++i) {
+            OffloadOne(backend, "fill" + std::to_string(i),
+                       std::string(64 * 1024, round));
+        }
+        EXPECT_EQ(PinnedValue(*pinned, 0, old_value.size()), old_value);
+    }
+}
+
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinCap) {
     ZeroCopyDaxFixture f(data_path);
     f.config.local_buffer_size = 100 * 1024;
@@ -1923,6 +1948,34 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinRecovered) {
     auto pinned = restarted.BatchPin({"k"}, {16 * 1024});
     ASSERT_TRUE(pinned.has_value());
     EXPECT_EQ(PinnedValue(*pinned, 0, v.size()), v);
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxPinnedRemoveAllSurvivesCrash) {
+    ZeroCopyDaxFixture f(data_path);
+    f.dax_cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string v2(16 * 1024, '2');
+    {
+        OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+        ASSERT_TRUE(backend.Init());
+        OffloadOne(backend, "k", std::string(16 * 1024, 'r'));
+        auto pinned = backend.BatchPin({"k"}, {16 * 1024});
+        ASSERT_TRUE(pinned.has_value());
+        backend.RemoveAll();
+        // kStrict checkpoints this batch while the removed record's extent
+        // is still pinned, so the checkpoint lists it as used.
+        OffloadOne(backend, "k2", v2);
+        // Crash: no final checkpoint. The pin goes first because it holds
+        // the mapping, and with it the device lock the restart needs.
+        pinned->owner.reset();
+        backend.SetSkipFinalCheckpointForTest();
+    }
+    // The removed record's bytes are still in the arena and its extent is
+    // in the checkpoint; only its invalidated header keeps it from returning.
+    OffsetAllocatorStorageBackend restarted(f.config, f.dax_cfg);
+    ASSERT_TRUE(restarted.Init());
+    EXPECT_FALSE(restarted.IsExist("k").value());
+    EXPECT_EQ(LoadOne(restarted, "k2", v2.size()), v2);
 }
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxZeroCopyLocation) {

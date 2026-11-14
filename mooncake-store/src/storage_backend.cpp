@@ -6560,8 +6560,10 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // Rebinding the shared_ptr drops our ref; any in-flight
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
-    // A DAX arena keeps its mapping: the allocator rebuild below already
-    // makes every old record unreachable, and there is nothing to truncate.
+    // A DAX arena keeps its mapping and its allocator: clearing the shard
+    // maps above already freed every extent except those pinned by in-flight
+    // zero-copy reads, which a rebuilt allocator would hand out again under
+    // the reader.
     if (!data_file_path_.empty() && cfg_.dax_device_path.empty()) {
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
 #ifdef USE_URING
@@ -6585,7 +6587,7 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
                          << data_file_path_;
         }
     }
-    if (capacity_ > 0) {
+    if (capacity_ > 0 && cfg_.dax_device_path.empty()) {
         allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
     }
     // Have the next checkpoint record the emptied allocator, so a restart
