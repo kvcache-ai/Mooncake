@@ -7,11 +7,14 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 
 #if defined(__x86_64__)
 #include <cpuid.h>
@@ -125,6 +128,21 @@ tl::expected<std::shared_ptr<DaxFile>, ErrorCode> DaxFile::Open(
                        << " bytes: " << strerror(errno);
             ::close(fd);
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+    }
+    // Device-DAX mmap does not check the length against the device: mapping
+    // past its end succeeds and raises SIGBUS on first touch.
+    if (S_ISCHR(st.st_mode)) {
+        uint64_t dev_size = 0;  // stays 0 (check skipped) without sysfs size
+        std::ifstream("/sys/dev/char/" + std::to_string(major(st.st_rdev)) +
+                      ":" + std::to_string(minor(st.st_rdev)) + "/size") >>
+            dev_size;
+        if (dev_size != 0 && size > dev_size) {
+            LOG(ERROR) << "DaxFile: arena of " << size << " bytes exceeds "
+                       << path << " (" << dev_size << " bytes); lower "
+                       << "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES";
+            ::close(fd);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
 

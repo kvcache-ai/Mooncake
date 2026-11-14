@@ -324,6 +324,7 @@ Set `MOONCAKE_OFFSET_DAX_DEVICE_PATH` to place the arena on byte-addressable mem
 Notes:
 
 - The process needs read/write permission on the device node, and the device must already exist; no `ndctl`/`daxctl` provisioning is performed.
+- `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` must not exceed the device size (`daxctl list`, or `size` under `/sys/bus/dax/devices/<dev>/`). The 2 TB default is larger than many devices, and the backend refuses to start on a device-DAX node smaller than the limit.
 - Each DAX arena belongs to one live client. The backend takes an exclusive `flock` on the device, so a second client pointed at the same device fails to start instead of overwriting the first one's records.
 - `MOONCAKE_OFFLOAD_USE_URING` is ignored for the DAX arena.
 - Device memory outlives the process, so `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed` restores the arena after a restart. Without `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE`, sync uses `msync`, which does not flush CPU caches to persistent media; treat the arena as volatile across power loss unless the platform has eADR. CXL memory expanders are volatile regardless, so their contents are lost on a host reboot or power loss.
