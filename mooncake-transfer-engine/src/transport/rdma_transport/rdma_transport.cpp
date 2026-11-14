@@ -82,6 +82,33 @@ static std::string resolveBufferLocation(
     return location;
 }
 
+std::string RdmaTransport::destinationLocalHca(SegmentDesc *peer,
+                                               TransferRequest::OpCode opcode,
+                                               uint64_t offset, size_t length) {
+    if (!globalConfig().enable_dest_local_rail ||
+        !globalConfig().enable_dest_device_affinity ||
+        opcode != TransferRequest::WRITE || !peer || length == 0)
+        return {};
+    // The first and last bytes may sit in different MRs of one GPU (a receiver
+    // splits large allocations by MC_MAX_MR_SIZE), so resolve each on its own.
+    auto locate = [peer](uint64_t addr, std::string &location) {
+        int buffer_id = -1, device_id = -1;
+        if (selectDevice(peer, addr, 1, buffer_id, device_id)) return false;
+        location = resolveBufferLocation(peer->buffers[buffer_id], addr);
+        return true;
+    };
+    std::string location, last_location;
+    if (!locate(offset, location) ||
+        !locate(offset + length - 1, last_location))
+        return {};
+    // Ambiguous multi-GPU spans keep ordinary selection.
+    if (location != last_location) return {};
+    const int pinned = peer->topology.pinnedDevice(location);
+    const auto &hcas = peer->topology.getHcaList();
+    if (pinned < 0 || static_cast<size_t>(pinned) >= hcas.size()) return {};
+    return hcas[pinned];
+}
+
 // The last-hit shortcut and the index lookup both assume the MR covering an
 // address is unique; only then do they answer what a first-match scan would.
 // Descriptors with overlapping MRs, or whose index is out of sync with
@@ -1417,29 +1444,47 @@ Status RdmaTransport::submitTransferTask(
         // local RNIC. The advisory hint affects initial submission only;
         // submit-level retries keep the existing topology policy.
         auto request_buffer_id = -1, request_device_id = -1;
-        const std::string_view request_hint =
-            request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                          : std::string_view{};
+        std::string destination_hint;
+        std::string_view request_hint;
+        if (request.advise_retry_cnt == 0) {
+            request_hint = nic_hint_name(request.nic_hint);
+            if (request_hint.empty()) {
+                destination_hint = destinationLocalHca(
+                    target_segment_desc.get(), request.opcode,
+                    request.target_offset, request.length);
+                request_hint = destination_hint;
+            }
+        }
         const int local_hint_device_id =
             request_hint.empty() &&
                     last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
-        if (local_device_cache.select(
-                local_segment_desc, (uint64_t)request.source, request.length,
-                request_buffer_id, request_device_id, [&] {
-                    return selectDevice(
-                        local_segment_desc.get(), (uint64_t)request.source,
-                        request.length, request_hint, request_buffer_id,
-                        request_device_id, 0, last_local_buffer_id,
-                        local_hint_device_id);
-                })) {
+        auto select_request_device = [&] {
+            return selectDevice(local_segment_desc.get(),
+                                (uint64_t)request.source, request.length,
+                                request_hint, request_buffer_id,
+                                request_device_id, 0, last_local_buffer_id,
+                                local_hint_device_id);
+        };
+        // The cache assumes a fixed hint; the destination hint follows each
+        // request's target GPU, so those requests select uncached.
+        if (destination_hint.empty()
+                ? local_device_cache.select(
+                      local_segment_desc, (uint64_t)request.source,
+                      request.length, request_buffer_id, request_device_id,
+                      select_request_device)
+                : select_request_device()) {
             request_buffer_id = -1;
             request_device_id = -1;
         } else {
             last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
+            // A destination-hinted NIC follows the target GPU, not the source
+            // buffer, so unhinted requests must not reuse it.
+            if (destination_hint.empty()) {
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+            }
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -1491,9 +1536,17 @@ Status RdmaTransport::submitTransferTask(
                 // registered-memory boundaries even though each slice is
                 // valid. Honor the hint for the initial per-slice attempt too,
                 // then drop it so retries can fail over to another RNIC.
-                const std::string_view slice_hint =
-                    retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                   : std::string_view{};
+                std::string slice_destination_hint;
+                std::string_view slice_hint;
+                if (retry_cnt == 0) {
+                    slice_hint = nic_hint_name(request.nic_hint);
+                    if (slice_hint.empty()) {
+                        slice_destination_hint = destinationLocalHca(
+                            target_segment_desc.get(), request.opcode,
+                            slice->rdma.dest_addr, slice->length);
+                        slice_hint = slice_destination_hint;
+                    }
+                }
                 const int slice_hint_device_id =
                     slice_hint.empty() &&
                             last_local_device_buffer_id == last_local_buffer_id
@@ -1519,8 +1572,10 @@ Status RdmaTransport::submitTransferTask(
                        context_list_.size());
                 found_device = true;
                 last_local_buffer_id = buffer_id;
-                last_local_device_id = device_id;
-                last_local_device_buffer_id = buffer_id;
+                if (slice_destination_hint.empty()) {
+                    last_local_device_id = device_id;
+                    last_local_device_buffer_id = buffer_id;
+                }
                 break;
             }
             if (!found_device) {
