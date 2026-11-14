@@ -60,6 +60,10 @@ inline size_t align_up(size_t size, size_t alignment) {
 
 void populate_hugetlb_mapping(void* ptr, size_t total_size);
 
+// Fault in a fresh writable mapping with parallel writes, one per page.
+void populate_mmap_mapping(void* ptr, size_t total_size, size_t page_size,
+                           size_t thread_count = 0);
+
 void populate_hugetlb_numa_mapping(void* ptr, size_t total_size,
                                    const std::vector<int>& numa_nodes);
 
