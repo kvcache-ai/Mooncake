@@ -457,6 +457,42 @@ static inline bool CheckSubTaskPool(std::stack<NofSubTask*>& sub_task_pool,
     return true;
 }
 
+// TryRecoverSegment never blocks on the target, but each failed attempt can
+// queue a controller reset, so pace attempts while the target is down.
+constexpr int kNofRecoverIntervalMs = 1000;
+
+// Heal a segment whose io qpair failed, e.g. because the NoF target went away.
+// The initiator caches one qpair per namespace, so without this the worker
+// would keep submitting to the failed qpair and never recover once the target
+// is back. Must be called on the worker that owns the qpair, holding the
+// segment's io lock.
+static void MaybeRecoverNofSegment(
+    NVMeoFInitiator* initiator, NofSegmentHandle* seg_handle,
+    std::map<NofSegmentHandle*, std::chrono::steady_clock::time_point>&
+        next_recover_at,
+    int work_idx) {
+    if (!initiator->IsSegmentFailed(seg_handle)) {
+        next_recover_at.erase(seg_handle);
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto it = next_recover_at.find(seg_handle);
+    if (it != next_recover_at.end() && now < it->second) {
+        return;
+    }
+
+    if (initiator->TryRecoverSegment(seg_handle)) {
+        LOG(INFO) << "work " << work_idx << ", seg " << seg_handle
+                  << " recovered";
+        next_recover_at.erase(seg_handle);
+        return;
+    }
+
+    next_recover_at[seg_handle] =
+        now + std::chrono::milliseconds(kNofRecoverIntervalMs);
+}
+
 void NofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "NofWorkerPool worker thread started";
@@ -465,6 +501,8 @@ void NofWorkerPool::workerThread(int work_idx) {
     // ownership.
     auto total_outstanding_io = std::make_shared<std::atomic<int64_t>>(0);
     std::map<NofSegmentHandle*, std::unique_ptr<NofQos>> seg_to_qos;
+    std::map<NofSegmentHandle*, std::chrono::steady_clock::time_point>
+        seg_next_recover_at;
     std::stack<NofSubTask*> sub_task_pool;
     std::vector<NofSubTask*> sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
@@ -551,6 +589,17 @@ void NofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (nof_qos->Empty()) {
+                continue;
+            }
+            // Skip, rather than wait for, a segment whose controller is being
+            // reset, so other segments on this worker keep moving.
+            auto io_lock = initiator_->TryLockSegmentIo(seg_handle);
+            if (!io_lock.owns_lock()) {
+                continue;
+            }
+            MaybeRecoverNofSegment(initiator_.get(), seg_handle,
+                                   seg_next_recover_at, work_idx);
             // block_size comes from the QoS cache; the hot loop no longer
             // queries the initiator.
             const uint32_t block_size = nof_qos->block_size;
@@ -633,6 +682,10 @@ void NofWorkerPool::workerThread(int work_idx) {
 
         if (total_outstanding_io->load(std::memory_order_acquire) > 0) {
             for (auto& it : seg_to_qos) {
+                auto io_lock = initiator_->TryLockSegmentIo(it.first);
+                if (!io_lock.owns_lock()) {
+                    continue;
+                }
                 int64_t ret = initiator_->PollCompletion(it.first, 0);
                 if (ret < 0) {
                     LOG(ERROR) << "poll completion error: ret " << ret;
