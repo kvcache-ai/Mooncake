@@ -258,6 +258,7 @@ killall mooncake_master || true
 killall mooncake_client || true
 mooncake_master \
     --default_kv_lease_ttl=500 \
+    --http_metadata_server_host=127.0.0.1 \
     --enable_http_metadata_server="$ENABLE_EMBEDDED_METADATA_SERVER" &
 MASTER_PID=$!
 sleep 1

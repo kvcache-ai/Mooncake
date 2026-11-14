@@ -74,11 +74,15 @@ tl::expected<std::string, int> httpGet(const std::string &url) {
     return tl::unexpected(res.status);
 }
 
-tl::expected<void, std::string> httpDelete(const std::string &url,
-                                           std::chrono::milliseconds timeout) {
+tl::expected<void, std::string> httpDelete(
+    const std::string &url, std::chrono::milliseconds timeout,
+    const std::unordered_map<std::string, std::string> &headers) {
     coro_http::coro_http_client client;
     client.set_conn_timeout(timeout);
     client.set_req_timeout(timeout);
+    for (const auto &[name, value] : headers) {
+        client.add_header(name, value);
+    }
     auto res = async_simple::coro::syncAwait(
         client.async_delete(url, "", coro_http::req_content_type::none));
     if (res.net_err) {
