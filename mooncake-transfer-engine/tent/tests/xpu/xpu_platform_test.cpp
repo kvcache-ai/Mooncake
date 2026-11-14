@@ -485,6 +485,64 @@ TEST_F(XpuPlatformTest, CopyRejectsRangePastAllocationEnd) {
     EXPECT_TRUE(platform_->free(dev, kSize).ok());
 }
 
+// submitCopies enqueues a batch and reports per copy: host<->host is not
+// device memory, a range past the allocation end fails, the rest land once
+// the fence is done -- across devices too when there are two.
+TEST_F(XpuPlatformTest, SubmitCopiesReportsAndCompletesEachCopy) {
+    EXPECT_EQ(XpuPlatform::copyStatus(nullptr),
+              XpuPlatform::CopyStatus::kCompleted);
+    const size_t kSize = 64 * 1024;
+    MemoryOptions opts;
+    opts.location = "xpu:0";
+    void *a = nullptr;
+    void *b = nullptr;
+    ASSERT_TRUE(platform_->allocate(&a, kSize, opts).ok());
+    opts.location = device_count_ >= 2 ? "xpu:1" : "xpu:0";
+    ASSERT_TRUE(platform_->allocate(&b, kSize, opts).ok());
+    auto *da = static_cast<uint8_t *>(a);
+    auto *db = static_cast<uint8_t *>(b);
+    std::vector<uint8_t> seed(kSize), out(kSize, 0), x(16, 1), y(16, 2);
+    for (size_t i = 0; i < kSize; ++i) seed[i] = static_cast<uint8_t>(i % 199);
+    ASSERT_TRUE(platform_->copy(da, seed.data(), kSize).ok());
+
+    // Copies of one batch may run on different queues, unordered against
+    // each other, so these are independent.
+    const size_t half = kSize / 2;
+    std::vector<XpuPlatform::CopyRequest> copies = {
+        {db + half, da, half},           // D2D (cross-device with two XPUs)
+        {db, da + half, half},           // D2D, other half
+        {out.data(), da, kSize},         // D2H
+        {x.data(), y.data(), x.size()},  // host<->host
+        {out.data(), da + 1024, kSize},  // past the end of `a`
+    };
+    std::vector<XpuPlatform::CopyResult> results;
+    XpuPlatform::CopyFence fence;
+    platform_->submitCopies(copies, results, fence);
+    ASSERT_EQ(results.size(), copies.size());
+    using R = XpuPlatform::CopyResult;
+    EXPECT_EQ(results[0], R::kSubmitted);
+    EXPECT_EQ(results[1], R::kSubmitted);
+    EXPECT_EQ(results[2], R::kSubmitted);
+    EXPECT_EQ(results[3], R::kNotDevice);
+    EXPECT_EQ(results[4], R::kFailed);
+    ASSERT_NE(fence, nullptr);
+    using S = XpuPlatform::CopyStatus;
+    while (XpuPlatform::copyStatus(fence) == S::kPending)
+        std::this_thread::yield();
+    EXPECT_EQ(XpuPlatform::copyStatus(fence), S::kCompleted);
+    fence.reset();
+    EXPECT_EQ(x[0], 1);
+    EXPECT_EQ(0, std::memcmp(out.data(), seed.data(), kSize));
+
+    std::vector<uint8_t> readback(kSize, 0);
+    ASSERT_TRUE(platform_->copy(readback.data(), db, kSize).ok());
+    EXPECT_EQ(0, std::memcmp(readback.data(), seed.data() + half, half));
+    EXPECT_EQ(0, std::memcmp(readback.data() + half, seed.data(), half));
+
+    EXPECT_TRUE(platform_->free(a, kSize).ok());
+    EXPECT_TRUE(platform_->free(b, kSize).ok());
+}
+
 // Cross-process sharing primitives, exercised within one process: exportIpc
 // describes the allocation (Level Zero IPC handle, base, size), importIpc
 // maps that handle as device memory the given local device can address, and

@@ -46,11 +46,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -459,22 +461,141 @@ class XpuSyclBackend {
                 direct->memcpy(dst, src, len).wait();
                 return 0;
             }
-            std::vector<uint8_t> bounce(std::min(len, kBounceChunk));
-            for (size_t off = 0; off < len; off += bounce.size()) {
-                const size_t n = std::min(bounce.size(), len - off);
-                src_q
-                    ->memcpy(bounce.data(),
-                             static_cast<const uint8_t *>(src) + off, n)
-                    .wait();
-                dst_q
-                    ->memcpy(static_cast<uint8_t *>(dst) + off, bounce.data(),
-                             n)
-                    .wait();
-            }
+            bounce(*src_q, *dst_q, dst, src, len);
             return 0;
         } catch (const sycl::exception &) {
             return 1;
         }
+    }
+
+    // One copy of a submitCopies() batch.
+    struct CopyOp {
+        void *dst;
+        const void *src;
+        size_t len;
+    };
+    enum CopyOpResult {
+        kCopySubmitted = 0,
+        // Neither side is USM device memory; nothing was enqueued.
+        kCopyNotDevice = 1,
+        // A range runs past the end of its allocation, or the runtime
+        // refused the copy.
+        kCopyFailed = 2,
+    };
+
+    // Completion of a submitCopies() batch: the last event of every queue it
+    // enqueued on. The queues are in-order, so each of those events completes
+    // only after every earlier copy on its queue. Destroying a fence waits for
+    // it, so the memory its copies touch may be released once it is gone.
+    // A fence whose wait threw is done but failed(): the copies are over, yet
+    // their result is not known to be written.
+    class CopyFence {
+       public:
+        ~CopyFence() { wait(); }
+
+        bool done() {
+            if (done_.load(std::memory_order_acquire)) return true;
+            try {
+                for (auto &event : events_) {
+                    if (event.get_info<
+                            sycl::info::event::command_execution_status>() !=
+                        sycl::info::event_command_status::complete)
+                        return false;
+                }
+            } catch (const sycl::exception &) {
+                wait();  // Cannot query the status; the copies still end.
+            }
+            done_.store(true, std::memory_order_release);
+            return true;
+        }
+
+        // Meaningful once done().
+        bool failed() const { return failed_.load(std::memory_order_acquire); }
+
+        void wait() noexcept {
+            if (done_.load(std::memory_order_acquire)) return;
+            for (auto &event : events_) {
+                try {
+                    event.wait();
+                } catch (const sycl::exception &) {
+                    failed_.store(true, std::memory_order_release);
+                }
+            }
+            done_.store(true, std::memory_order_release);
+        }
+
+       private:
+        friend class XpuSyclBackend;
+        std::vector<sycl::event> events_;
+        std::atomic<bool> done_{false};
+        std::atomic<bool> failed_{false};
+    };
+
+    // Enqueue the `n` copies of `ops` without waiting for them. Both sides of
+    // every copy are classified under one lock acquisition, and each copy is
+    // enqueued on the queue copy()/copyD2D() would use: the device side's for
+    // VRAM<->host, the source device's (or, with only the reverse peer access,
+    // the destination's) for VRAM<->VRAM. Pairs of devices without peer
+    // access are bounced through host memory before this returns, as in
+    // copyD2D. results[i] receives the CopyOpResult of copy i. Returns the
+    // fence of the enqueued copies, or null when none is pending.
+    std::shared_ptr<CopyFence> submitCopies(const CopyOp *ops, size_t n,
+                                            int *results) {
+        struct Plan {
+            int queue = -1;                  // direct copy on this queue
+            int src_dev = -1, dst_dev = -1;  // host bounce otherwise
+        };
+        std::vector<Plan> plans(n);
+        std::vector<sycl::queue> queues;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!initialized_) {
+                std::fill(results, results + n, kCopyFailed);
+                return nullptr;
+            }
+            queues = queues_;
+            for (size_t i = 0; i < n; ++i) {
+                const int src = resolveLocked(ops[i].src, ops[i].len);
+                const int dst = resolveLocked(ops[i].dst, ops[i].len);
+                auto &plan = plans[i];
+                results[i] = kCopySubmitted;
+                if (src == kPastEnd || dst == kPastEnd)
+                    results[i] = kCopyFailed;
+                else if (src < 0 && dst < 0)
+                    results[i] = kCopyNotDevice;
+                else if (src < 0)
+                    plan.queue = dst;
+                else if (dst < 0 || src == dst || peerLocked(src, dst))
+                    plan.queue = src;
+                else if (peerLocked(dst, src))
+                    plan.queue = dst;
+                else {
+                    plan.src_dev = src;
+                    plan.dst_dev = dst;
+                }
+            }
+        }
+        std::vector<std::optional<sycl::event>> last(queues.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (results[i] != kCopySubmitted) continue;
+            const auto &plan = plans[i];
+            try {
+                if (plan.queue >= 0)
+                    last[plan.queue] = queues[plan.queue].memcpy(
+                        ops[i].dst, ops[i].src, ops[i].len);
+                else
+                    bounce(queues[plan.src_dev], queues[plan.dst_dev],
+                           ops[i].dst, ops[i].src, ops[i].len);
+            } catch (const sycl::exception &) {
+                results[i] = kCopyFailed;
+            }
+        }
+        auto fence = std::make_shared<CopyFence>();
+        for (auto &event : last) {
+            if (event) fence->events_.push_back(std::move(*event));
+        }
+        if (fence->events_.empty()) return nullptr;
+        return fence;
     }
 
     // True when device `from` may directly access USM device memory that
@@ -883,17 +1004,35 @@ class XpuSyclBackend {
         return -1;
     }
 
-    // Device ordinal owning the device range [dev, dev+len), or -1 when it is
-    // not device memory or (for our own allocations) runs past the end.
+    // Device ordinal owning the device range [dev, dev+len); -1 when it is
+    // not device memory, kPastEnd when (for our own allocations and imports)
+    // it runs past the end of its allocation.
+    static constexpr int kPastEnd = -2;
     int resolveLocked(const void *dev, size_t len) const {
         if (auto a = findLocked(dev)) {
             const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
             if (!xpu_detail::validateDmabufRange(start - a->base, len, a->size)
                      .ok())
-                return -1;
+                return kPastEnd;
             return a->device;
         }
         return classifyLocked(dev);
+    }
+
+    // Copy between two devices without peer access, in kBounceChunk pieces
+    // through a host buffer. Throws sycl::exception on failure.
+    static void bounce(sycl::queue &src_q, sycl::queue &dst_q, void *dst,
+                       const void *src, size_t len) {
+        std::vector<uint8_t> buffer(std::min(len, kBounceChunk));
+        for (size_t off = 0; off < len; off += buffer.size()) {
+            const size_t n = std::min(buffer.size(), len - off);
+            src_q
+                .memcpy(buffer.data(), static_cast<const uint8_t *>(src) + off,
+                        n)
+                .wait();
+            dst_q.memcpy(static_cast<uint8_t *>(dst) + off, buffer.data(), n)
+                .wait();
+        }
     }
 
     bool peerLocked(int from, int to) const {

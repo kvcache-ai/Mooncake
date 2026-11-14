@@ -20,6 +20,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "tent/common/config.h"
 #include "tent/platform/cpu.h"
@@ -77,6 +79,32 @@ class XpuPlatform : public CpuPlatform {
     // VRAM<->VRAM (same device, PCIe P2P, or host bounce) when both are;
     // otherwise the inherited host memcpy.
     Status copy(void *dst, void *src, size_t length) override;
+
+    // Asynchronous form of copy() for XPU memory, used by XpuTransport.
+    // submitCopies enqueues every copy of `copies` without waiting for it, so
+    // a batch costs one submission per copy rather than one blocking round
+    // trip. results[i] tells whether copy i was enqueued (kSubmitted), was
+    // rejected because neither side is XPU memory (kNotDevice), or failed (a
+    // range runs past the end of its allocation, or the runtime refused it).
+    // Copies between two XPUs without peer access are bounced through host
+    // memory before submitCopies returns. `fence` completes once every
+    // enqueued copy has (see copyStatus) and is null when none is pending.
+    // Releasing the last reference to a fence waits for its copies, so the
+    // memory they touch may be released once the fence is gone.
+    struct CopyRequest {
+        void *dst;
+        void *src;
+        size_t length;
+    };
+    enum class CopyResult : uint8_t { kSubmitted, kNotDevice, kFailed };
+    using CopyFence = std::shared_ptr<void>;
+    void submitCopies(const std::vector<CopyRequest> &copies,
+                      std::vector<CopyResult> &results, CopyFence &fence);
+    // State of the copies behind `fence` (a null fence has completed).
+    // kFailed: they are over, but waiting for them failed, so their data is
+    // not known to have landed.
+    enum class CopyStatus : uint8_t { kPending, kCompleted, kFailed };
+    static CopyStatus copyStatus(const CopyFence &fence);
 
     MemoryType getMemoryType(void *addr) override;
 
