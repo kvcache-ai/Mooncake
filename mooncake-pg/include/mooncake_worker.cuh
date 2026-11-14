@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <future>
 #include <utility>
@@ -26,6 +27,70 @@
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
+
+// Sync regions of a buffer half. Peers address them by offset, so their layout
+// is part of what ranks agree on.
+//
+// A run flag. It carries the sender's read counts (see
+// TransferGroupMeta::halfReads) as they were when the flag was posted, one word
+// per half. A word holds the count in its low 32 bits and the sender's tag (see
+// syncFlagTag) in its high 32 bits. The flag word is the word of the flag's own
+// half, and a nonzero tag there marks the flag as set.
+//
+// A reader reads each word with one aligned 8-byte load and trusts a count
+// only next to the tag of the process it expects. The words of one flag may
+// land in either order, but each word must land whole, as an aligned 8-byte
+// store does on the transports in use. A count that a reader sees late is
+// lower, which only costs a READ, and the count of a word left by an earlier
+// process has another tag. Arrival takes any nonzero tag, as the base took any
+// set flag.
+struct alignas(16) SyncFlag {
+    uint64_t words[2];
+};
+static_assert(sizeof(SyncFlag) == 16, "a flag is two 8-byte words");
+// The bytes of a flag that are sent. tests/transfer_fault_preload.cpp
+// recognizes flag writes by this length.
+static constexpr size_t kSyncFlagBytes = sizeof(SyncFlag);
+
+// The tag a rank puts into its flag words. It is never zero, and it differs
+// between the rank epochs of a slot's processes.
+inline uint32_t syncFlagTag(uint64_t rank_epoch) {
+    return static_cast<uint32_t>(rank_epoch) << 1 | 1u;
+}
+
+inline uint64_t syncFlagWord(uint32_t tag, uint32_t count) {
+    return static_cast<uint64_t>(tag) << 32 | count;
+}
+
+inline uint32_t syncFlagWordTag(uint64_t word) {
+    return static_cast<uint32_t>(word >> 32);
+}
+
+inline uint32_t syncFlagWordCount(uint64_t word) {
+    return static_cast<uint32_t>(word);
+}
+
+// What a rank receives for a half.
+struct HalfRecvSync {
+    // Two sets of flags, used by the half's consecutive runs in turn (see
+    // TransferGroupMeta::bufferHalfRuns). A set has one flag per sending rank.
+    SyncFlag flags[2][kMaxNumRanks];
+    // Where the host worker reads a peer's counts into, one pair per peer.
+    uint32_t readCountsIn[kMaxNumRanks][2];
+};
+// The region is allocated as an int32_t array.
+static_assert(alignof(HalfRecvSync) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+
+// What a rank sends from for a half.
+struct HalfSendSync {
+    // The flag of a run, one per flag set.
+    SyncFlag flags[2];
+    // This rank's read counts for both halves. Only half 0's copy is used:
+    // peers read it at send_sync[0].
+    uint32_t halfReads[2];
+};
+// A CPU communicator allocates the region as an int32_t array.
+static_assert(alignof(HalfSendSync) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
 
 class MooncakeCommunicator;
 
@@ -95,6 +160,33 @@ struct TransferGroupMeta {
     // two sets of sync flags and a run uses the set of its count's parity. The
     // counts restart only when a rank is admitted (see applyGroupState).
     std::atomic<uint32_t> bufferHalfRuns[2]{};
+    // Reads of each buffer half so far. A run is read when its copy-out is
+    // done, and whoever issues the copy-out counts it right behind it: a kernel
+    // on the same stream for a GPU collective, the host worker for a CPU one.
+    // The counts live in registered memory (see HalfSendSync), so a peer can
+    // read them. A run flag says that a rank's data landed, not that the
+    // receiver read it. So before a rank stores into a peer's half again, that
+    // peer's count for the half must have passed the count that its flag of the
+    // half's last run carried. halfReadsDevice is the device's view of the
+    // counts.
+    uint32_t* halfReads = nullptr;
+    uint32_t* halfReadsDevice = nullptr;
+    // What the host worker knows about a peer's reads. Only the worker uses it.
+    // The knowledge belongs to one process: the worker forgets it when a new
+    // process takes the peer's slot, which has a new rank epoch and counts
+    // from zero. A peer that stays, or rejoins in place, keeps counting.
+    struct PeerReads {
+        // The rank epoch of the process this entry describes.
+        uint64_t rankEpoch;
+        // The peer's latest counts that this rank has seen.
+        uint32_t known[2];
+        bool knownValid[2];
+        // The count the peer must reach before this rank stores into its half
+        // again: one more than its flag of the half's last run carried.
+        uint32_t needed[2];
+        bool awaited[2];
+    };
+    PeerReads peerReads[kMaxNumRanks]{};
 
     GroupId group_id;
     std::atomic<uint64_t> epoch{0};
