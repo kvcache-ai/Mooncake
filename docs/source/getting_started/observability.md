@@ -323,3 +323,51 @@ This is a sampled control-plane response. `OK` does not prove that every
 segment is mounted, that transfer metadata or SSD recovery is complete, or
 that data RPCs and RDMA transfers are healthy. The existing `/health` check
 can remain healthy when a successful Ping returns `NEED_REMOUNT`.
+
+## Unified Grafana Dashboard
+
+The repository provisions `monitoring/grafana/dashboards/mooncake-core.json` as **Mooncake Core | TE, Store & Master**. It complements the existing Master-only `mooncake.json`; it does not replace or modify that dashboard. See the [monitoring quickstart](https://github.com/kvcache-ai/Mooncake/tree/main/monitoring) for container startup and scrape-target examples.
+
+The dashboard targets Prometheus-compatible metrics from three independent sources:
+
+| Source | Required telemetry | Dashboard coverage |
+|--------|--------------------|--------------------|
+| Classic Transfer Engine | `MC_TE_METRIC=1` and an explicit `MC_TE_METRIC_HTTP_PORT` | Terminal task outcomes, completed throughput, and completion-observation latency |
+| Store client | Client HTTP server and client metric collection enabled | Heartbeat observations and operation-attributed counts, logical bytes, and latency |
+| Master | Admin HTTP `/metrics` endpoint | Batch request and item outcomes, eviction, capacity, clients, and keys |
+
+Use the datasource, `job`, `instance`, and `op_name` variables to select targets. The Store operation variable includes both read and write operation names. Different jobs and instances remain separate in detailed time series. TE ratios and pooled latency aggregate only the selected targets, while scrape target state, heartbeat status and age, and Master gauges remain visible per instance rather than being averaged or summed.
+
+### TE Measurement Boundaries
+
+The TE panels use the `mooncake_te_{read,write}_*` family. `MC_TE_METRIC` is disabled by default and is not supported with TENT. Setting `MC_TE_METRIC_HTTP_PORT` opts in to a separate unauthenticated HTTP exporter. Bind it to loopback for a same-namespace scraper or to a private interface reachable only from a trusted monitoring network. Its default host is `0.0.0.0` when a port is configured, so an external scrape setup also needs an explicit bind-address and firewall decision.
+
+The panel queries preserve the engine's accounting contract:
+
+- `requests_total` is a terminal-observation counter, not a submission counter.
+- `failures_total` includes `FAILED` and `CANCELED`; `timeouts_total` is displayed separately.
+- `bytes_total` and `latency_us` include completed transfers only. A timeout is not rewritten as a success when a late completion arrives.
+- Latency measures submission to the first terminal observation and therefore includes polling delay. Histogram microseconds are converted to milliseconds in Grafana.
+- The non-success ratio is `(failures + timeouts) / terminal observations`, clamped at zero for transient arithmetic around counter resets. With no terminal observations, the denominator filter produces **No data**, not zero percent.
+
+The dashboard does not infer TENT telemetry from these TE series. Missing optional telemetry produces missing panels or series rather than synthetic zero values.
+
+### Store and Master Boundaries
+
+Store `mooncake_transfer_*_operation_*` series remain grouped by `job`, `instance`, and `op_name`. Their counts and logical payload bytes describe Store client operations, not TE terminal tasks, and they do not form a unified success ratio. Store client-operation latency is also a separate measurement from TE submission-to-terminal latency.
+
+Master batch panels keep request outcomes and item outcomes on separate axes. Fully successful requests exclude failed and partially successful requests. Successful items are total items minus failed items. `BatchPutStart` additionally exposes `OBJECT_ALREADY_EXISTS` as a labeled subset of failed items, not as an independent success category.
+
+Eviction operations, evicted keys, and evicted logical bytes are rates of their respective counters. Evicted logical bytes are not a promise of an equal allocator RSS reduction in the same interval. Capacity utilization filters out zero or missing total capacity, and available capacity is clamped at zero for transient inconsistent samples.
+
+No panel uses request IDs, object keys, segment IDs, peer addresses, or raw pointers as labels. All rate panels use Grafana's `$__rate_interval` so the query window follows panel resolution and scrape configuration.
+
+### Dashboard Contract Test
+
+Run the structural checks from the repository root after changing the dashboard:
+
+```bash
+python3 monitoring/tests/test_core_dashboard.py
+```
+
+The test checks section and panel identity, unique IDs, non-overlapping grid layout, scoped queries, operation-name preservation, histogram unit conversion, non-success denominator behavior, and exclusion of nonexistent Master successful-byte counters. These static checks complement, rather than replace, executing the queries against the deployed Prometheus version and importing the dashboard into Grafana.
