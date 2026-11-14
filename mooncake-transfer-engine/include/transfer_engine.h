@@ -167,6 +167,9 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Enable before registering memory or starting concurrent callers.
+    int enableSharedMemoryRegistration();
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,

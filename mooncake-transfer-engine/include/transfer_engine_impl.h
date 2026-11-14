@@ -133,6 +133,8 @@ class TransferEngineImpl {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    int enableSharedMemoryRegistration();
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
@@ -447,9 +449,22 @@ class TransferEngineImpl {
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        size_t users = 0;
+        bool releasing = false;
     };
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+
+    int registerSharedMemory(const std::vector<BufferEntry>& buffers,
+                             const std::string& location);
+    int unregisterSharedMemory(const std::vector<void*>& addresses);
+    int registerLocalMemoryBatchImpl(const std::vector<BufferEntry>& buffers,
+                                     const std::string& location);
+    int unregisterLocalMemoryBatchImpl(const std::vector<void*>& addresses);
+
+    bool shared_memory_registration_ = false;
+    std::mutex shared_registration_mutex_;
+    std::map<uintptr_t, size_t> shared_memory_users_;
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 
