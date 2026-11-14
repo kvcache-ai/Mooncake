@@ -1,18 +1,29 @@
 #include "registered_pinned_memory.h"
 
 #include <string>
+#include <utility>
 
 #include <glog/logging.h>
 
 #if defined(USE_CUDA)
 #include <cuda_runtime_api.h>
+#elif defined(USE_XPU)
+#include "device/accelerator_registry.h"
 #endif
 
 namespace mooncake {
 namespace {
 
+#if defined(USE_CUDA)
+constexpr const char* kPinApi = "cudaHostRegister";
+#elif defined(USE_XPU)
+constexpr const char* kPinApi = "XPU prepare_for_device_copy";
+#else
+constexpr const char* kPinApi = "host memory registration";
+#endif
+
 void LogPinSkip(const std::string& owner, const char* reason, size_t size) {
-    LOG(WARNING) << "Skip cudaHostRegister for " << owner << ": " << reason
+    LOG(WARNING) << "Skip " << kPinApi << " for " << owner << ": " << reason
                  << ", size=" << size;
 }
 
@@ -40,11 +51,42 @@ RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithCuda(
     return RegisteredPinnedMemoryManager::UnregisterResult::kError;
 }
 
+#elif defined(USE_XPU)
+// Store segments are plain host allocations; Level Zero treats them as
+// pageable and stages every device copy through driver buffers. Importing them
+// once lets local memcpy transfers DMA directly.
+bool RegisterPinnedRegionWithXpu(void* addr, size_t size,
+                                 std::string* error_message) {
+    const auto* xpu = device::GetAcceleratorRegistry().GetDevice(
+        device::AcceleratorVendor::kIntel);
+    if (!xpu) {
+        if (error_message) *error_message = "no XPU accelerator registered";
+        return false;
+    }
+    std::string message;
+    const bool ok = xpu->RegisterHostMemory(addr, size, message);
+    if (!ok && error_message) *error_message = std::move(message);
+    return ok;
+}
+
+RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithXpu(
+    void* addr, std::string* error_message) {
+    const auto* xpu = device::GetAcceleratorRegistry().GetDevice(
+        device::AcceleratorVendor::kIntel);
+    std::string message = "no XPU accelerator registered";
+    if (xpu && xpu->UnregisterHostMemory(addr, message)) {
+        return RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
+    }
+    if (error_message) *error_message = std::move(message);
+    return RegisteredPinnedMemoryManager::UnregisterResult::kError;
+}
 #endif
 
 RegisteredPinnedMemoryManager::PinOps DefaultPinOps() {
 #if defined(USE_CUDA)
     return {RegisterPinnedRegionWithCuda, UnregisterPinnedRegionWithCuda};
+#elif defined(USE_XPU)
+    return {RegisterPinnedRegionWithXpu, UnregisterPinnedRegionWithXpu};
 #else
     return {};
 #endif
@@ -75,8 +117,8 @@ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
     RegisteredPinnedMemoryConfig config, PinOps pin_ops)
     : limit_bytes_(config.max_bytes), pin_ops_(pin_ops) {
-#if defined(USE_CUDA)
-    LOG(INFO) << "Store segment pinned memory is "
+#if defined(USE_CUDA) || defined(USE_XPU)
+    LOG(INFO) << "Store segment pinned memory (" << kPinApi << ") is "
               << (limit_bytes_ != 0 ? "enabled" : "disabled")
               << ", max_bytes=" << limit_bytes_;
 #else
@@ -122,7 +164,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         }
 
         if (size > limit_bytes_ || pinned_bytes_ > limit_bytes_ - size) {
-            LOG(WARNING) << "Skip cudaHostRegister for " << owner
+            LOG(WARNING) << "Skip " << kPinApi << " for " << owner
                          << ": quota exceeded, requested=" << size
                          << ", pinned=" << pinned_bytes_
                          << ", limit=" << limit_bytes_;
@@ -146,8 +188,8 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
             std::lock_guard<std::mutex> lock(mutex_);
             remove_inactive_region_locked(addr, size);
         }
-        LOG(WARNING) << "cudaHostRegister failed for " << owner
-                     << ", size=" << size << ", error=" << error_message
+        LOG(WARNING) << kPinApi << " failed for " << owner << ", size=" << size
+                     << ", error=" << error_message
                      << ". Continue with pageable host memory.";
         return nullptr;
     }
@@ -164,7 +206,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         }
     }
 
-    LOG(INFO) << "cudaHostRegister succeeded for " << owner << ", size=" << size
+    LOG(INFO) << kPinApi << " succeeded for " << owner << ", size=" << size
               << ", pinned=" << pinned_bytes << ", limit=" << limit_bytes_;
     return region;
 }

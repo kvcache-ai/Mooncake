@@ -153,6 +153,41 @@ class XpuRuntime {
         }
     }
 
+    // Import existing host memory (e.g. a Store segment) into the shared
+    // context, so copies between it and any device DMA it directly instead
+    // of staging pageable memory.
+    bool RegisterHost(void* addr, size_t size, std::string& error_message) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!context_) {
+            error_message = "no XPU context";
+            return false;
+        }
+        try {
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(addr, size,
+                                                                     *context_);
+            return true;
+        } catch (const sycl::exception& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool UnregisterHost(void* addr, std::string& error_message) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!context_) {
+            error_message = "no XPU context";
+            return false;
+        }
+        try {
+            sycl::ext::oneapi::experimental::release_from_device_copy(
+                addr, *context_);
+            return true;
+        } catch (const sycl::exception& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     // Pinned host memory in the shared context, usable by every queue.
     void* AllocHost(size_t size) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -223,6 +258,21 @@ class XpuAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
               CopyDirection /*direction*/) const override {
         // queue::memcpy resolves the direction from the USM pointer types.
         return XpuRuntime::Instance().Copy(dst, src, size, g_current_device);
+    }
+
+    bool RegisterHostMemory(void* addr, size_t size,
+                            std::string& error_message) const override {
+        auto& runtime = XpuRuntime::Instance();
+        if (!runtime.Init()) {
+            error_message = "no usable XPU device";
+            return false;
+        }
+        return runtime.RegisterHost(addr, size, error_message);
+    }
+
+    bool UnregisterHostMemory(void* addr,
+                              std::string& error_message) const override {
+        return XpuRuntime::Instance().UnregisterHost(addr, error_message);
     }
 
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
