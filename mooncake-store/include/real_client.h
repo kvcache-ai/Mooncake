@@ -47,6 +47,7 @@ struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
+class GpuStaging;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -772,6 +773,21 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_alloc_in_same_node);
 
+    // MC_NVLINK_COALESCE: multi-buffer gets and puts through a device staging
+    // buffer, one transfer per key. nullopt when nothing was staged and the
+    // caller's own path should run.
+    std::optional<std::vector<tl::expected<void, ErrorCode>>>
+    coalesce_nvlink_get(
+        const std::vector<std::string> &keys,
+        const std::vector<QueryResult> &queries,
+        const std::unordered_map<std::string, std::vector<Slice>> &slices,
+        bool group_by_target);
+    std::optional<std::vector<tl::expected<void, ErrorCode>>>
+    coalesce_nvlink_put(const std::vector<std::string> &keys,
+                        const std::vector<std::vector<void *>> &all_buffers,
+                        const std::vector<std::vector<size_t>> &all_sizes,
+                        const ReplicateConfig &config);
+
     // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
     // fires one promotion attempt for those keys (best-effort, non-blocking,
     // one dedup lookup + one pool enqueue; no RPC on the caller's thread).
@@ -1306,6 +1322,10 @@ class RealClient : public PyClient {
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
     // calls retry the cleanup and keep reporting the failure until it heals.
     std::atomic<bool> nof_buffer_cleanup_failed_{false};
+
+    // MC_NVLINK_COALESCE staging, one per direction; nullptr when off.
+    std::unique_ptr<GpuStaging> nvlink_get_staging_;
+    std::unique_ptr<GpuStaging> nvlink_put_staging_;
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};

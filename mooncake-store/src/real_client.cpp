@@ -37,6 +37,7 @@
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "batch_read_fanout.h"
+#include "gpu_staging.h"
 #include "common.h"
 #include "config.h"
 #include "config/distributed_storage_config.h"
@@ -1205,6 +1206,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    nvlink_get_staging_ = GpuStaging::Create(client_);
+    if (nvlink_get_staging_) nvlink_put_staging_ = GpuStaging::Create(client_);
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
@@ -1964,6 +1968,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_http_server();
 
     ErrorCode cleanup_error = ErrorCode::OK;
+    nvlink_get_staging_.reset();
+    nvlink_put_staging_.reset();
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
             // Callers must quiesce in-flight requests before close. FileStorage
@@ -8604,9 +8610,104 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config, bool stage_nonlocal) {
+    if (nvlink_put_staging_ && !stage_nonlocal) {
+        auto coalesced =
+            coalesce_nvlink_put(keys, all_buffers, all_sizes, config);
+        if (coalesced) return std::move(*coalesced);
+    }
     return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
                                       config, client_buffer_allocator_,
                                       stage_nonlocal, &Client::BatchPut);
+}
+
+namespace {
+
+GpuStaging::ResolveRegion StagingRegions(const RealClient &client) {
+    return [&client](void *ptr) -> std::optional<GpuStagingRegion> {
+        auto region = client.resolve_writable_buffer_region(ptr);
+        if (!region) return std::nullopt;
+        return GpuStagingRegion{region->base, region->size};
+    };
+}
+
+}  // namespace
+
+std::optional<std::vector<tl::expected<void, ErrorCode>>>
+RealClient::coalesce_nvlink_get(
+    const std::vector<std::string> &keys,
+    const std::vector<QueryResult> &queries,
+    const std::unordered_map<std::string, std::vector<Slice>> &slices,
+    bool group_by_target) {
+    std::vector<std::vector<Slice>> parts;
+    std::vector<size_t> object_bytes;
+    parts.reserve(keys.size());
+    object_bytes.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        parts.push_back(slices.at(keys[i]));
+        // One NVLink memory replica: the object is one contiguous buffer, so
+        // one copy moves all of it.
+        const auto &replicas = queries[i].replicas;
+        const bool nvlink = replicas.size() == 1 &&
+                            replicas.front().is_memory_replica() &&
+                            replicas.front()
+                                    .get_memory_descriptor()
+                                    .buffer_descriptor.protocol_ == "nvlink";
+        object_bytes.push_back(nvlink ? calculate_total_size(replicas.front())
+                                      : 0);
+    }
+    return nvlink_get_staging_->Read(
+        parts, object_bytes, StagingRegions(*this),
+        [&](const std::vector<size_t> &indices,
+            const std::vector<std::vector<Slice>> &targets) {
+            std::vector<std::string> batch_keys;
+            std::vector<QueryResult> batch_queries;
+            std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+            for (size_t n = 0; n < indices.size(); ++n) {
+                batch_keys.push_back(keys[indices[n]]);
+                batch_queries.push_back(queries[indices[n]]);
+                batch_slices.emplace(keys[indices[n]], targets[n]);
+            }
+            return client_->BatchGet(batch_keys, batch_queries, batch_slices,
+                                     group_by_target);
+        });
+}
+
+std::optional<std::vector<tl::expected<void, ErrorCode>>>
+RealClient::coalesce_nvlink_put(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config) {
+    if (client_->GetProtocol() != "nvlink" ||
+        !config.HasValidKeyHints(keys.size()) ||
+        !config.ValidSessionIds(keys.size()))
+        return std::nullopt;
+    // Staged keys are written in batches; a repeated key would land in
+    // different calls than on the per-part path.
+    if (std::unordered_set<std::string>(keys.begin(), keys.end()).size() !=
+        keys.size())
+        return std::nullopt;
+    auto parts = BuildNestedSlicesFromBuffers(keys, all_buffers, all_sizes);
+    if (!parts) return std::nullopt;
+    return nvlink_put_staging_->Write(
+        *parts, StagingRegions(*this),
+        [&](const std::vector<size_t> &indices,
+            const std::vector<std::vector<Slice>> &sources) {
+            std::vector<std::string> batch_keys;
+            std::vector<std::vector<void *>> buffers(indices.size());
+            std::vector<std::vector<size_t>> sizes(indices.size());
+            for (size_t n = 0; n < indices.size(); ++n) {
+                batch_keys.push_back(keys[indices[n]]);
+                for (const auto &slice : sources[n]) {
+                    buffers[n].push_back(slice.ptr);
+                    sizes[n].push_back(slice.size);
+                }
+            }
+            return BatchWriteFromMultiBuffers(
+                client_, batch_keys, buffers, sizes,
+                config.ForKeySubset(indices), client_buffer_allocator_,
+                /*stage_nonlocal=*/false, &Client::BatchPut);
+        });
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
@@ -8860,8 +8961,15 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results = client_->BatchGet(
-            batch_keys, batch_query_results, batch_slices, group_by_target);
+        std::optional<std::vector<tl::expected<void, ErrorCode>>> coalesced;
+        if (nvlink_get_staging_) {
+            coalesced = coalesce_nvlink_get(batch_keys, batch_query_results,
+                                            batch_slices, group_by_target);
+        }
+        auto batch_get_results =
+            coalesced ? std::move(*coalesced)
+                      : client_->BatchGet(batch_keys, batch_query_results,
+                                          batch_slices, group_by_target);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];

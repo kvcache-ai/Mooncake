@@ -135,6 +135,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    gpu_staging.cpp
     config/registered_pinned_memory_config.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
@@ -566,6 +567,17 @@ string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 # so SDK presence must not enable CUDA support by itself.
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
+  # Same defaults as engram: CUDA may already be enabled in a sibling
+  # directory.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+      set(CMAKE_CUDA_ARCHITECTURES 80 90 103)
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 80 90)
+    endif()
+  endif()
+  enable_language(CUDA)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES gpu_staging_kernel.cu)
 elseif(USE_HIP)
   find_package(hip REQUIRED)
 endif()
