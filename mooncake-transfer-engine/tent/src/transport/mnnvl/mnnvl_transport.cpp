@@ -263,6 +263,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     }
 
     if (!conf) conf = std::make_shared<Config>();
+    CHECK_STATUS(parseMnnvlConfig(*conf, options_));
     if (!supportFabricMem()) {
         return Status::InvalidArgument(
             "CUDA Fabric handle type not supported " LOC_MARK);
@@ -293,7 +294,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     else
         handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     host_register_ = conf_->get("transports/nvlink/host_register", true);
-    egm_enabled_ = conf_->get("transports/mnnvl/egm", false);
+    egm_enabled_ = options_.egm_enabled;
     if (egm_enabled_) {
         // Host buffers allocated through allocateLocalMemory() (or any
         // HOST_NUMA VMM allocation registered by the caller) are exported
@@ -313,6 +314,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
               << " handle_type="
               << (handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC ? "fabric"
                                                             : "posix_fd")
+              << " require_fabric=" << options_.require_fabric
               << " egm=" << egm_enabled_ << " copy_api=" << copy_api
               << " cuda_runtime=" << CUDART_VERSION;
     return Status::OK();
@@ -677,17 +679,39 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                    isEgmAllocation(handle, handle_type_);
         if (result == CUDA_SUCCESS && !egm) cuMemRelease(handle);
         if (!egm) {
+            if (options_.require_fabric && egm_enabled_) {
+                TentMetrics::instance().recordMnnvlEvent(
+                    TentMetrics::MnnvlEvent::StrictFailure);
+                return Status::InvalidArgument(
+                    "Strict MNNVL requires an exportable EGM allocation");
+            }
             // Plain host memory: usable as the local side of a transfer
             // (dram_to_gpu) but not addressable by peers.
             return pin_host();
         }
     } else if (result != CUDA_SUCCESS) {
+        if (options_.require_fabric) {
+            TentMetrics::instance().recordMnnvlEvent(
+                TentMetrics::MnnvlEvent::StrictFailure);
+            return Status::InvalidArgument(
+                "Strict MNNVL requires fabric-exportable GPU memory; use "
+                "local-only registration for local endpoints");
+        }
         LOG(INFO) << "Memory region " << (void *)desc.addr
                   << "  will not be registered for MNNVL transport.";
         return Status::OK();
     }
 
     RetainedAllocation retained{handle};
+    CUmemAllocationProp prop = {};
+    CHECK_CU(cuMemGetAllocationPropertiesFromHandle(&prop, handle));
+    if (options_.require_fabric &&
+        !(prop.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC)) {
+        TentMetrics::instance().recordMnnvlEvent(
+            TentMetrics::MnnvlEvent::StrictFailure);
+        return Status::InvalidArgument(
+            "Strict MNNVL allocation has no FABRIC handle type");
+    }
     void *real_addr = nullptr;
     size_t real_size = 0;
     // cuMemGetAddressRange need not support VMM mappings. Allocations created
@@ -708,6 +732,9 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                  : cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
                                         (CUdeviceptr)desc.addr);
     if (result != CUDA_SUCCESS) {
+        if (options_.require_fabric)
+            return Status::InternalError(
+                "Strict MNNVL cannot determine export allocation extent");
         const uint64_t granularity = 2 * 1024 * 1024;
         if (desc.length > UINT64_MAX - (granularity - 1))
             return Status::InvalidArgument("MNNVL export extent overflow");
@@ -738,6 +765,9 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     }
     // retained releases the allocation reference on every return path.
     if (result != CUDA_SUCCESS) {
+        if (options_.require_fabric)
+            TentMetrics::instance().recordMnnvlEvent(
+                TentMetrics::MnnvlEvent::StrictFailure);
         return Status::InternalError(
             std::string("cuMemExportToShareableHandle: cuResult ") +
             std::to_string(result) + LOC_MARK);
@@ -811,6 +841,12 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     void *ptr = nullptr;
     auto result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
+        if (options_.require_fabric) {
+            TentMetrics::instance().recordMnnvlEvent(
+                TentMetrics::MnnvlEvent::StrictFailure);
+            return Status::InternalError("Strict MNNVL cuMemCreate failed: " +
+                                         std::to_string(result));
+        }
         TentMetrics::instance().recordMnnvlEvent(
             TentMetrics::MnnvlEvent::FabricFallback);
         LOG(WARNING) << "Fallback to "
@@ -1010,6 +1046,12 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (!buffer || buffer->mnnvl_handle.empty())
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
+            if (options_.require_fabric &&
+                (buffer->permission == kLocalReadWrite ||
+                 std::find(buffer->transports.begin(), buffer->transports.end(),
+                           MNNVL) == buffer->transports.end()))
+                return Status::InvalidArgument(
+                    "Peer buffer has no accessible MNNVL fabric export");
             return Status::OK();
         }));
 
