@@ -461,6 +461,19 @@ Status MultiTransport::mp_submitTransfer(
     }
 
     if (entries.empty()) return Status::OK();
+
+    // Resolve every route before adding tasks so a rejected request leaves the
+    // batch available for a corrected submission.
+    std::vector<Transport*> transports;
+    transports.reserve(entries.size());
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        auto status = mp_selectTransport(request, transport, proto);
+        if (!status.ok()) return status;
+        assert(transport);
+        transports.push_back(transport);
+    }
+
     // Explicit-protocol dispatch retains transport-specific polling.
     batch_desc.counter_eligible = false;
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
@@ -471,12 +484,10 @@ Status MultiTransport::mp_submitTransfer(
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = mp_selectTransport(request, transport, proto);
-        if (!status.ok()) return status;
-        assert(transport);
-        auto& task = batch_desc.task_list[task_id];
+    for (size_t i = 0; i < entries.size(); ++i) {
+        auto& request = entries[i];
+        auto* transport = transports[i];
+        auto& task = batch_desc.task_list[task_id + i];
         task.batch_id = batch_id;
         task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
@@ -487,7 +498,6 @@ Status MultiTransport::mp_submitTransfer(
         if (transport->supportsBatchCompletionCounter())
             Transport::Slice::unsealTaskSubmission(&task);
         recordTaskStart(task, request);
-        ++task_id;
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
