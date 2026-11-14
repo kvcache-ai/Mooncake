@@ -5738,6 +5738,596 @@ TEST_F(StorageBackendTest, BucketBackendReportsUringReadErrno) {
 
 #endif
 
+//-----------------------------------------------------------------------------
+// OffsetAllocatorStorageBackend read path
+//-----------------------------------------------------------------------------
+
+namespace {
+
+using OffsetRecordHeader = OffsetAllocatorStorageBackend::RecordHeader;
+
+// A read buffer with the room FileStorage::AllocateBatch guarantees a backend
+// for an O_DIRECT read and no more: it starts on a 4 KiB boundary and holds
+// the value rounded up to 4 KiB plus one page. A backend may read whole pages
+// into it and move Slice::ptr to where the value starts. The page after it
+// cannot be accessed, so a read that goes past the room fails.
+class OffsetReadBuffer {
+   public:
+    explicit OffsetReadBuffer(size_t size)
+        : size_(size), room_((size + kPage - 1) / kPage * kPage + kPage) {
+        void* mem = mmap(nullptr, room_ + kPage, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) throw std::bad_alloc();
+        data_ = static_cast<char*>(mem);
+        std::memset(data_, 0x5a, room_);
+        if (mprotect(data_ + room_, kPage, PROT_NONE) != 0) {
+            munmap(data_, room_ + kPage);
+            throw std::bad_alloc();
+        }
+    }
+    OffsetReadBuffer(OffsetReadBuffer&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)),
+          size_(other.size_),
+          room_(other.room_) {}
+    OffsetReadBuffer(const OffsetReadBuffer&) = delete;
+    OffsetReadBuffer& operator=(const OffsetReadBuffer&) = delete;
+    ~OffsetReadBuffer() {
+        if (data_ != nullptr) munmap(data_, room_ + kPage);
+    }
+
+    Slice slice() const { return Slice{data_, size_}; }
+
+   private:
+    static constexpr size_t kPage = 4096;
+    char* data_ = nullptr;
+    size_t size_;
+    size_t room_;
+};
+
+// Value bytes that depend on the key and on the position, including the page
+// the position is in, so bytes of another record, or of the right record
+// read at a shifted position, do not compare equal.
+std::string OffsetReadPathValue(size_t key_index, size_t size) {
+    std::string value(size, '\0');
+    for (size_t i = 0; i < size; ++i) {
+        value[i] =
+            static_cast<char>((i * 31 + (i >> 12) + key_index * 131) & 0xff);
+    }
+    return value;
+}
+
+struct OffsetReadPathRecord {
+    std::string key;
+    std::string value;
+    int64_t offset = -1;  // where the record starts in kv_cache.data
+};
+
+FileStorageConfig MakeOffsetReadPathConfig(const std::string& data_path,
+                                           bool use_uring) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 16 * 1024 * 1024;
+    config.total_keys_limit = 1000;
+    config.use_uring = use_uring;
+    return config;
+}
+
+// Offloads the records one batch each, in order, so the file offsets they get
+// do not depend on map iteration order, and notes each offset.
+void OffloadInOrder(OffsetAllocatorStorageBackend& backend,
+                    std::vector<OffsetReadPathRecord>& records) {
+    for (auto& record : records) {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(record.key,
+                      std::vector<Slice>{
+                          Slice{record.value.data(), record.value.size()}});
+        auto stored = backend.BatchOffload(
+            batch, [&record](const std::vector<std::string>&,
+                             std::vector<StorageObjectMetadata>& metadatas) {
+                record.offset = metadatas.front().offset;
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(stored.has_value()) << stored.error();
+        ASSERT_EQ(stored.value(), 1);
+    }
+}
+
+bool SliceHolds(const Slice& slice, std::string_view expected) {
+    return slice.size == expected.size() &&
+           std::string_view(static_cast<const char*>(slice.ptr), slice.size) ==
+               expected;
+}
+
+// Values of several sizes read back in one batch.
+void OffsetReadPathMixedSizes(const std::string& data_path, bool use_uring) {
+    OffsetAllocatorStorageBackend backend(
+        MakeOffsetReadPathConfig(data_path, use_uring));
+    ASSERT_TRUE(backend.Init());
+
+    // 1000, 1500 and 777 are the value sizes of the persistence tests above,
+    // 56960 is the KV page size reported in issue #5272 and 131072 is the
+    // default of storage_backend_bench.  The small records get extents whose
+    // size is not a multiple of 4 KiB, so the records after them do not
+    // start on a page boundary.
+    constexpr size_t kSizes[] = {1000, 131072, 1500, 56960, 777};
+    constexpr size_t kKeyCount = 40;  // more than one io_uring group of 32
+    std::vector<OffsetReadPathRecord> records(kKeyCount);
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        records[i].key = "read_path_key_" + std::to_string(i);
+        records[i].value =
+            OffsetReadPathValue(i, kSizes[i % std::size(kSizes)]);
+    }
+    ASSERT_NO_FATAL_FAILURE(OffloadInOrder(backend, records));
+    ASSERT_TRUE(std::ranges::any_of(records, [](const auto& record) {
+        return record.offset % 4096 != 0;
+    })) << "no record starts off the page grid";
+
+    std::vector<OffsetReadBuffer> buffers;
+    buffers.reserve(kKeyCount);
+    std::unordered_map<std::string, Slice> load;
+    for (const auto& record : records) {
+        buffers.emplace_back(record.value.size());
+        load.emplace(record.key, buffers.back().slice());
+    }
+    auto loaded = backend.BatchLoad(load);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    for (const auto& record : records) {
+        EXPECT_TRUE(SliceHolds(load.at(record.key), record.value))
+            << "key=" << record.key << " offset=" << record.offset
+            << " size=" << record.value.size();
+    }
+}
+
+// Keys long enough that the header and key do not fit in the page the
+// record starts in.
+void OffsetReadPathLongKeys(const std::string& data_path, bool use_uring) {
+    OffsetAllocatorStorageBackend backend(
+        MakeOffsetReadPathConfig(data_path, use_uring));
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<OffsetReadPathRecord> records(4);
+    // Moves the records after it off the page grid.
+    records[0].key = "short_key";
+    records[0].value = OffsetReadPathValue(0, 1500);
+    // Header and key take 3024 bytes, less than a page, but the record does
+    // not start on a page boundary: the key ends in the page the value
+    // starts in.
+    records[1].key = std::string(3000, 'k');
+    records[1].value = OffsetReadPathValue(1, 56960);
+    // Header and key take more than a page, so the value starts 8 KiB into
+    // the record.
+    records[2].key = std::string(5000, 'm');
+    records[2].value = OffsetReadPathValue(2, 1000);
+    // Header and key fill a page exactly: no padding before the value.
+    records[3].key = std::string(
+        OffsetRecordHeader::kValueAlignment - OffsetRecordHeader::SIZE, 'n');
+    records[3].value = OffsetReadPathValue(3, 131072);
+    ASSERT_NO_FATAL_FAILURE(OffloadInOrder(backend, records));
+
+    const auto& crossing = records[1];
+    ASSERT_GT(
+        crossing.offset % 4096 + OffsetRecordHeader::SIZE + crossing.key.size(),
+        OffsetRecordHeader::ValueOffsetInRecord(crossing.key.size()))
+        << "the key does not cross into the page of the value, offset="
+        << crossing.offset;
+
+    std::vector<OffsetReadBuffer> buffers;
+    buffers.reserve(records.size());
+    std::unordered_map<std::string, Slice> load;
+    for (const auto& record : records) {
+        buffers.emplace_back(record.value.size());
+        load.emplace(record.key, buffers.back().slice());
+    }
+    auto loaded = backend.BatchLoad(load);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    for (const auto& record : records) {
+        EXPECT_TRUE(SliceHolds(load.at(record.key), record.value))
+            << "key size=" << record.key.size() << " offset=" << record.offset;
+    }
+
+    // A window that starts past the page the key ends in.
+    constexpr uint64_t kOffset = 8000;
+    constexpr size_t kLength = 100;
+    OffsetReadBuffer window(kLength);
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.emplace(crossing.key, StorageValueSpan{kOffset, crossing.value.size(),
+                                                 window.slice()});
+    auto span_loaded = backend.BatchLoadSpans(spans);
+    ASSERT_TRUE(span_loaded.has_value()) << span_loaded.error();
+    EXPECT_TRUE(
+        SliceHolds(spans.at(crossing.key).slice,
+                   std::string_view(crossing.value).substr(kOffset, kLength)));
+}
+
+// Windows of a value, several keys in one batch.
+void OffsetReadPathSpans(const std::string& data_path, bool use_uring) {
+    OffsetAllocatorStorageBackend backend(
+        MakeOffsetReadPathConfig(data_path, use_uring));
+    ASSERT_TRUE(backend.Init());
+
+    struct Window {
+        uint64_t offset;
+        size_t length;
+    };
+    constexpr size_t kValueSize = 131072;
+    // {1000, 144} is the window of the bucket span test above.  The others
+    // start at the value's first byte, on a page boundary inside it, and
+    // run to its last byte; the last one is empty.
+    constexpr Window kWindows[] = {{0, 100},
+                                   {1000, 144},
+                                   {4096, 8192},
+                                   {70000, kValueSize - 70000},
+                                   {kValueSize, 0}};
+
+    std::vector<OffsetReadPathRecord> records(1 + std::size(kWindows));
+    // Moves the records after it off the page grid.
+    records[0].key = "short_key";
+    records[0].value = OffsetReadPathValue(0, 1500);
+    for (size_t i = 1; i < records.size(); ++i) {
+        records[i].key = "span_key_" + std::to_string(i);
+        records[i].value = OffsetReadPathValue(i, kValueSize);
+    }
+    ASSERT_NO_FATAL_FAILURE(OffloadInOrder(backend, records));
+
+    std::vector<OffsetReadBuffer> buffers;
+    buffers.reserve(std::size(kWindows));
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    for (size_t i = 0; i < std::size(kWindows); ++i) {
+        buffers.emplace_back(kWindows[i].length);
+        spans.emplace(records[i + 1].key,
+                      StorageValueSpan{kWindows[i].offset, kValueSize,
+                                       buffers.back().slice()});
+    }
+    auto loaded = backend.BatchLoadSpans(spans);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    for (size_t i = 0; i < std::size(kWindows); ++i) {
+        const auto& record = records[i + 1];
+        EXPECT_TRUE(
+            SliceHolds(spans.at(record.key).slice,
+                       std::string_view(record.value)
+                           .substr(kWindows[i].offset, kWindows[i].length)))
+            << "window offset=" << kWindows[i].offset
+            << " length=" << kWindows[i].length;
+    }
+
+    OffsetReadBuffer past_end(8);
+    std::unordered_map<std::string, StorageValueSpan> overflow;
+    overflow.emplace(
+        records[1].key,
+        StorageValueSpan{kValueSize - 4, kValueSize, past_end.slice()});
+    auto rejected = backend.BatchLoadSpans(overflow);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+}
+
+// A record whose key on disk is not the key the index has for it is not
+// returned.
+void OffsetReadPathRejectsOtherKey(const std::string& data_path,
+                                   bool use_uring) {
+    OffsetAllocatorStorageBackend backend(
+        MakeOffsetReadPathConfig(data_path, use_uring));
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<OffsetReadPathRecord> records(1);
+    records[0].key = "expected_key";
+    records[0].value = OffsetReadPathValue(0, 56960);
+    ASSERT_NO_FATAL_FAILURE(OffloadInOrder(backend, records));
+
+    {
+        const std::string data_file =
+            (fs::path(data_path) / "kv_cache.data").string();
+        int fd = open(data_file.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0);
+        const char other = 'E';  // the key on disk becomes "Expected_key"
+        const ssize_t written =
+            pwrite(fd, &other, 1, records[0].offset + OffsetRecordHeader::SIZE);
+        const int synced = fsync(fd);
+        close(fd);
+        ASSERT_EQ(written, 1);
+        ASSERT_EQ(synced, 0);
+    }
+
+    OffsetReadBuffer buffer(records[0].value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace(records[0].key, buffer.slice());
+    auto loaded = backend.BatchLoad(load);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error(), ErrorCode::FILE_READ_FAIL);
+}
+
+// The windows of a value of `size` bytes that start at its first byte, next
+// to it, on either side of the first page boundary inside it and at its
+// last byte, each one byte long, one page long and running to the end.
+std::vector<std::pair<uint64_t, size_t>> OffsetReadPathWindows(size_t size) {
+    constexpr size_t kPage = OffsetRecordHeader::kValueAlignment;
+    std::vector<std::pair<uint64_t, size_t>> windows;
+    for (const uint64_t start : {uint64_t{0}, uint64_t{1}, uint64_t{kPage - 1},
+                                 uint64_t{kPage}, uint64_t{size - 1}}) {
+        if (start >= size) continue;
+        for (const size_t wanted : {size_t{1}, kPage, size}) {
+            const std::pair<uint64_t, size_t> window{
+                start, std::min<size_t>(wanted, size - start)};
+            if (std::ranges::find(windows, window) == windows.end()) {
+                windows.push_back(window);
+            }
+        }
+    }
+    return windows;
+}
+
+// Every pairing of a key length and a value size around the page boundaries,
+// read whole and through every window of OffsetReadPathWindows.
+void OffsetReadPathBoundaries(const std::string& data_path, bool use_uring) {
+    OffsetAllocatorStorageBackend backend(
+        MakeOffsetReadPathConfig(data_path, use_uring));
+    ASSERT_TRUE(backend.Init());
+
+    constexpr size_t kPage = OffsetRecordHeader::kValueAlignment;
+    // Header and key together end one byte before a page boundary, on it and
+    // one byte past it, for the first and for the second page of a record.
+    constexpr size_t kOnePage = kPage - OffsetRecordHeader::SIZE;
+    constexpr size_t kTwoPages = 2 * kPage - OffsetRecordHeader::SIZE;
+    constexpr size_t kKeyLengths[] = {
+        1, 20, kOnePage - 1, kOnePage, kOnePage + 1, kTwoPages, kTwoPages + 1};
+    constexpr size_t kValueSizes[] = {1,         kPage - 1, kPage,
+                                      kPage + 1, 2 * kPage, 12345};
+    std::vector<OffsetReadPathRecord> records;
+    for (const size_t key_length : kKeyLengths) {
+        for (size_t v = 0; v < std::size(kValueSizes); ++v) {
+            const size_t index = records.size();
+            OffsetReadPathRecord record;
+            if (key_length == 1) {
+                record.key = std::string(1, static_cast<char>('A' + v));
+            } else {
+                record.key = "k" + std::to_string(index) + "_";
+                record.key.resize(key_length,
+                                  static_cast<char>('a' + index % 26));
+            }
+            record.value = OffsetReadPathValue(index, kValueSizes[v]);
+            records.push_back(std::move(record));
+        }
+    }
+    ASSERT_NO_FATAL_FAILURE(OffloadInOrder(backend, records));
+
+    // The sizes differ, so the records start at several places in a page.
+    std::map<int64_t, int> page_shifts;
+    for (const auto& record : records) ++page_shifts[record.offset % kPage];
+    ASSERT_GE(page_shifts.size(), 4u);
+    ASSERT_TRUE(page_shifts.contains(0));
+
+    {
+        std::vector<OffsetReadBuffer> buffers;
+        buffers.reserve(records.size());
+        std::unordered_map<std::string, Slice> load;
+        for (const auto& record : records) {
+            buffers.emplace_back(record.value.size());
+            load.emplace(record.key, buffers.back().slice());
+        }
+        auto loaded = backend.BatchLoad(load);
+        ASSERT_TRUE(loaded.has_value()) << loaded.error();
+        for (const auto& record : records) {
+            EXPECT_TRUE(SliceHolds(load.at(record.key), record.value))
+                << "key size=" << record.key.size()
+                << " value size=" << record.value.size()
+                << " offset=" << record.offset;
+        }
+    }
+
+    // One window per record in a call; a record with fewer windows than
+    // the call number repeats one of its own.
+    size_t calls = 0;
+    for (const auto& record : records) {
+        calls =
+            std::max(calls, OffsetReadPathWindows(record.value.size()).size());
+    }
+    for (size_t call = 0; call < calls; ++call) {
+        std::vector<OffsetReadBuffer> buffers;
+        buffers.reserve(records.size());
+        std::vector<std::pair<uint64_t, size_t>> wanted;
+        std::unordered_map<std::string, StorageValueSpan> spans;
+        for (const auto& record : records) {
+            const auto windows = OffsetReadPathWindows(record.value.size());
+            wanted.push_back(windows[call % windows.size()]);
+            buffers.emplace_back(wanted.back().second);
+            spans.emplace(record.key, StorageValueSpan{wanted.back().first,
+                                                       record.value.size(),
+                                                       buffers.back().slice()});
+        }
+        auto loaded = backend.BatchLoadSpans(spans);
+        ASSERT_TRUE(loaded.has_value()) << loaded.error() << " call=" << call;
+        for (size_t i = 0; i < records.size(); ++i) {
+            const auto& record = records[i];
+            EXPECT_TRUE(
+                SliceHolds(spans.at(record.key).slice,
+                           std::string_view(record.value)
+                               .substr(wanted[i].first, wanted[i].second)))
+                << "key size=" << record.key.size()
+                << " value size=" << record.value.size()
+                << " offset=" << record.offset << " window=" << wanted[i].first
+                << "+" << wanted[i].second;
+        }
+    }
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_MixedSizes) {
+    OffsetReadPathMixedSizes(data_path, /*use_uring=*/false);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_LongKeys) {
+    OffsetReadPathLongKeys(data_path, /*use_uring=*/false);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_Spans) {
+    OffsetReadPathSpans(data_path, /*use_uring=*/false);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_RejectsOtherKey) {
+    OffsetReadPathRejectsOtherKey(data_path, /*use_uring=*/false);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_Boundaries) {
+    OffsetReadPathBoundaries(data_path, /*use_uring=*/false);
+}
+
+#ifdef USE_URING
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_MixedSizes_Uring) {
+    OffsetReadPathMixedSizes(data_path, /*use_uring=*/true);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_LongKeys_Uring) {
+    OffsetReadPathLongKeys(data_path, /*use_uring=*/true);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_Spans_Uring) {
+    OffsetReadPathSpans(data_path, /*use_uring=*/true);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_RejectsOtherKey_Uring) {
+    OffsetReadPathRejectsOtherKey(data_path, /*use_uring=*/true);
+}
+
+// A buffer that does not start on a page boundary promises no spare room:
+// exactly the value is written to it, and its pointer stays where it was.
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_UnalignedBuffer_Uring) {
+    OffsetAllocatorStorageBackend backend(
+        MakeOffsetReadPathConfig(data_path, /*use_uring=*/true));
+    ASSERT_TRUE(backend.Init());
+
+    constexpr size_t kSizes[] = {1500, 56960, 131072};
+    std::vector<OffsetReadPathRecord> records(std::size(kSizes));
+    for (size_t i = 0; i < records.size(); ++i) {
+        records[i].key = "unaligned_key_" + std::to_string(i);
+        records[i].value = OffsetReadPathValue(i, kSizes[i]);
+    }
+    ASSERT_NO_FATAL_FAILURE(OffloadInOrder(backend, records));
+
+    constexpr char kGuard = 0x5a;
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::unordered_map<std::string, Slice> load;
+    for (const auto& record : records) {
+        // One byte in front puts the value off the page grid, one byte
+        // behind shows a write past its end.
+        buffers.push_back(std::make_unique<char[]>(record.value.size() + 2));
+        std::memset(buffers.back().get(), kGuard, record.value.size() + 2);
+        load.emplace(record.key,
+                     Slice{buffers.back().get() + 1, record.value.size()});
+    }
+    auto loaded = backend.BatchLoad(load);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    for (size_t i = 0; i < records.size(); ++i) {
+        const Slice& slice = load.at(records[i].key);
+        EXPECT_EQ(slice.ptr, buffers[i].get() + 1);
+        EXPECT_TRUE(SliceHolds(slice, records[i].value))
+            << "size=" << kSizes[i];
+        EXPECT_EQ(buffers[i][0], kGuard);
+        EXPECT_EQ(buffers[i][records[i].value.size() + 1], kGuard);
+    }
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_Boundaries_Uring) {
+    OffsetReadPathBoundaries(data_path, /*use_uring=*/true);
+}
+
+// Readers on the O_DIRECT path while the writer evicts keys and hands their
+// extents to new ones: a read returns the bytes of its keys or fails because
+// a key is gone, and never returns the bytes of another record.
+TEST_F(StorageBackendTest, OffsetAllocatorReadPath_ConcurrentEviction_Uring) {
+    auto config = MakeOffsetReadPathConfig(data_path, /*use_uring=*/true);
+    config.total_size_limit = 512 * 1024;  // room for some forty records
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    OffsetAllocatorStorageBackend backend(config, backend_cfg);
+    ASSERT_TRUE(backend.Init());
+
+    // Sizes whose extents are not multiples of 4 KiB, so records start all
+    // over the page and both the one-read and the two-read form are used.
+    constexpr size_t kSizes[] = {1500, 5000, 11000};
+    constexpr size_t kKeys = 2000;
+    constexpr size_t kBatch = 6;
+    const auto key_of = [](size_t i) { return "ckey_" + std::to_string(i); };
+    const auto value_of = [&](size_t i) {
+        return OffsetReadPathValue(i, kSizes[i % std::size(kSizes)]);
+    };
+    const auto write = [&](size_t i) {
+        std::string value = value_of(i);
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key_of(i),
+                      std::vector<Slice>{Slice{value.data(), value.size()}});
+        return backend.BatchOffload(batch, NoopCompleteHandler(),
+                                    AcceptAllEvictionHandler());
+    };
+
+    std::atomic<size_t> written{0};
+    for (size_t i = 0; i < 2 * kBatch; ++i) {
+        ASSERT_TRUE(write(i).has_value());
+        written.store(i + 1);
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> hits{0};
+    std::atomic<size_t> gone{0};
+    std::atomic<size_t> wrong_bytes{0};
+    std::atomic<size_t> other_errors{0};
+    const auto reader = [&](size_t lag) {
+        while (!stop.load()) {
+            // `lag` batches behind the newest key: the newest are there,
+            // older ones are being evicted.
+            const size_t newest = written.load();
+            if (newest < (lag + 1) * kBatch) continue;
+            const size_t first = newest - (lag + 1) * kBatch;
+            std::vector<OffsetReadBuffer> buffers;
+            buffers.reserve(kBatch);
+            std::vector<std::string> values;
+            std::unordered_map<std::string, Slice> load;
+            for (size_t i = first; i < first + kBatch; ++i) {
+                values.push_back(value_of(i));
+                buffers.emplace_back(values.back().size());
+                load.emplace(key_of(i), buffers.back().slice());
+            }
+            auto loaded = backend.BatchLoad(load);
+            if (!loaded) {
+                (loaded.error() == ErrorCode::OBJECT_NOT_FOUND ? gone
+                                                               : other_errors)
+                    .fetch_add(1);
+                continue;
+            }
+            hits.fetch_add(1);
+            for (size_t i = 0; i < kBatch; ++i) {
+                if (!SliceHolds(load.at(key_of(first + i)), values[i])) {
+                    wrong_bytes.fetch_add(1);
+                }
+            }
+        }
+    };
+    std::vector<std::thread> readers;
+    for (const size_t lag : {size_t{0}, size_t{0}, size_t{3}, size_t{6}}) {
+        readers.emplace_back(reader, lag);
+    }
+
+    size_t failed_writes = 0;
+    for (size_t i = written.load(); i < kKeys && failed_writes == 0; ++i) {
+        if (!write(i).has_value()) ++failed_writes;
+        written.store(i + 1);
+        // Write a key that is still there again: its old extent is freed
+        // as soon as no reader holds it.
+        if (i % 7 == 0 && !write(i - 1).has_value()) ++failed_writes;
+    }
+    stop.store(true);
+    for (auto& thread : readers) thread.join();
+
+    EXPECT_EQ(failed_writes, 0u);
+    EXPECT_EQ(wrong_bytes.load(), 0u);
+    EXPECT_EQ(other_errors.load(), 0u);
+    EXPECT_GT(hits.load(), 0u);
+    EXPECT_GT(gone.load(), 0u) << "no read met an evicted key";
+}
+
+#endif
+
 TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
