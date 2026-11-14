@@ -139,9 +139,11 @@ mc_nccl_gin_sharing_mode(NcclGinResourceSharing mode) {
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
 using NcclStrongVaSignalAdd = ncclGin_StrongVASignalAdd;
+using NcclWeakVaSignalAdd = ncclGin_WeakVASignalAdd;
 #else
 // NCCL 2.30.4 exposes only the legacy spelling, whose semantics are strong.
 using NcclStrongVaSignalAdd = ncclGin_VASignalAdd;
+using NcclWeakVaSignalAdd = ncclGin_VASignalAdd;
 #endif
 
 }  // namespace detail
@@ -216,6 +218,24 @@ class NcclGinHandle {
                  opt_flags);
     }
 
+    // Both contexts must belong to the same communicator. Source pointers are
+    // relative to src_ctx; destination pointers are relative to this
+    // handle's window.
+    template <NcclGinTeam Team, typename RemoteAction = ncclGin_None>
+    __device__ __forceinline__ void put(
+        int dst_rank, const NcclDeviceContext& src_ctx, const void* send_ptr,
+        void* recv_ptr, size_t nbytes, RemoteAction remote_action = {},
+        uint32_t opt_flags = ncclGinOptFlagsDefault) const {
+        const auto src_window =
+            detail::NcclDeviceContextAccess::window(src_ctx);
+        const auto src_offset =
+            detail::mc_nccl_pointer_offset(src_ctx, send_ptr);
+        gin_.put(team<Team>(), dst_rank, window_, pointerOffset(recv_ptr),
+                 src_window, src_offset, nbytes, remote_action, ncclGin_None{},
+                 ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+                 cuda::thread_scope_device, opt_flags);
+    }
+
     template <NcclGinTeam Team, typename T>
     __device__ __forceinline__ void putValue(
         int dst_rank, T* recv_ptr, T value,
@@ -230,6 +250,21 @@ class NcclGinHandle {
                       value, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
                       cuda::thread_scope_thread, cuda::thread_scope_device,
                       opt_flags);
+    }
+
+    // Build a weak VA Add action for an aligned uint64_t in this handle's
+    // registration.
+    __device__ __forceinline__ detail::NcclWeakVaSignalAdd makeWeakVaSignalAdd(
+        const uint64_t* signal_ptr, uint64_t value) const {
+        return {window_, pointerOffset(signal_ptr), value};
+    }
+
+    template <NcclGinTeam Team>
+    __device__ __forceinline__ void signalAddWeak(int dst_rank,
+                                                  uint64_t* signal_ptr,
+                                                  uint64_t value) const {
+        gin_.signal(team<Team>(), dst_rank,
+                    makeWeakVaSignalAdd(signal_ptr, value), ncclCoopThread{});
     }
 
     template <NcclGinTeam Team>
@@ -254,6 +289,22 @@ class NcclGinHandle {
     __device__ __forceinline__ void flushWarp() const {
         gin_.flush(ncclCoopWarp{});
     }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 2)
+    // Local completion for one peer on this context. Zero means no timeout.
+    template <NcclGinTeam Team>
+    __device__ __forceinline__ ncclResult_t
+    flushPeer(int dst_rank, uint64_t timeout_cycles = 0) const {
+        ncclGinRequest_t request;
+        gin_.flushAsync(team<Team>(), dst_rank, &request, ncclCoopThread{});
+        if (timeout_cycles == 0) {
+            gin_.wait(request, ncclCoopThread{});
+            return ncclSuccess;
+        }
+        return gin_.wait(request, ncclCoopThread{}, ncclGin_None{},
+                         cuda::memory_order_acquire, timeout_cycles);
+    }
+#endif
 
     __device__ __forceinline__ void flushContextWarp(int context) const {
         ncclGin(comm_, context, NCCL_GIN_RESOURCE_SHARING_CTA)
