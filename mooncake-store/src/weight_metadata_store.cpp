@@ -1461,6 +1461,7 @@ WeightMetadataStore::PrepareReconcile(const WeightRevisionIdentity& identity,
 
 bool WeightMetadataStore::IsManagedGroup(
     const std::string& payload_group_id) const {
+    if (payload_group_id.empty()) return false;
     std::lock_guard lock(mutex_);
     return group_index_.contains(payload_group_id);
 }

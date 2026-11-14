@@ -13,6 +13,10 @@
 
 namespace mooncake {
 
+namespace test {
+struct WeightMetadataStoreTestPeer;
+}
+
 inline constexpr uint32_t kWeightMetadataSchemaVersion = 3;
 
 struct WeightResidencyObservation {
@@ -68,6 +72,8 @@ tl::expected<void, WeightManagementError> ValidateWeightMetadataSnapshot(
     const WeightMetadataSnapshot& snapshot);
 
 class WeightMetadataStore {
+    friend struct test::WeightMetadataStoreTestPeer;
+
    public:
     template <typename T>
     using Result = tl::expected<T, WeightManagementError>;

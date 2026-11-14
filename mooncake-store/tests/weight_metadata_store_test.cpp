@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <future>
 #include <limits>
 #include <thread>
 #include <vector>
@@ -9,6 +10,15 @@
 #include "tenant_id.h"
 
 namespace mooncake {
+namespace test {
+
+struct WeightMetadataStoreTestPeer {
+    static std::unique_lock<std::mutex> Lock(WeightMetadataStore& store) {
+        return std::unique_lock<std::mutex>(store.mutex_);
+    }
+};
+
+}  // namespace test
 namespace {
 
 WeightRevisionIdentity Identity(std::string revision = "step-100",
@@ -1252,6 +1262,30 @@ TEST(WeightMetadataStoreTest, DeletedTombstoneRetryRequiresGenerationFence) {
         500);
     ASSERT_FALSE(stale.has_value());
     EXPECT_EQ(WeightManagementError::STALE_GENERATION, stale.error());
+}
+
+TEST(WeightMetadataStoreTest, EmptyGroupDoesNotContendWithStoreMutex) {
+    WeightMetadataStore metadata_store;
+    auto importing = PublishBegin(metadata_store, BeginRequest());
+    auto lock = test::WeightMetadataStoreTestPeer::Lock(metadata_store);
+
+    std::promise<void> finished_promise;
+    auto finished = finished_promise.get_future();
+    std::atomic<bool> managed{true};
+    std::thread query([&] {
+        managed = metadata_store.IsManagedGroup("");
+        finished_promise.set_value();
+    });
+    const bool returned_without_lock =
+        finished.wait_for(std::chrono::milliseconds(100)) ==
+        std::future_status::ready;
+    lock.unlock();
+    query.join();
+
+    EXPECT_TRUE(returned_without_lock);
+    EXPECT_FALSE(managed.load());
+    EXPECT_TRUE(
+        metadata_store.IsManagedGroup(importing.manifest.payload_group_id));
 }
 
 TEST(WeightMetadataStoreTest, OnlyOneConcurrentCasCandidatePublishes) {
