@@ -210,7 +210,7 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 
 <h2 id="ecosystem-integrations">🌐 Ecosystem Integrations</h2>
 
-Mooncake connects inference engines, cache middleware, RL systems, and deployment tools. The directory below links to upstream guides and implementations for each integration, checked on Oct 15, 2026.
+Mooncake connects inference engines, cache middleware, RL systems, and deployment tools. The directory below links to upstream guides and implementations for each integration.
 
 <details>
 <summary>Integration directory</summary>
@@ -243,10 +243,10 @@ Mooncake connects inference engines, cache middleware, RL systems, and deploymen
 | TorchSpec | Store | Hidden-state exchange between inference and draft-model training | [Training architecture](https://github.com/torchspec-project/TorchSpec) |
 | Speculators | Store | Hidden-state exchange for distributed online draft-model training | [Hidden-state connectors](https://github.com/vllm-project/speculators/tree/main/hs_connectors) |
 | vLLM-Omni | TE, Store | Data exchange between multimodal pipeline stages | [Omni connectors](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/distributed/omni_connectors/connectors) |
+| SGLang-Omni | TE | Cross-stage tensor and blob transfer between thinker, talker, codec, and vocoder stages | [SGLang-Omni](https://github.com/sgl-project/sglang-omni) |
 | LightX2V | TE | Encoder/transformer disaggregation for video generation | [Transfer backend](https://github.com/ModelTC/LightX2V/blob/main/lightx2v/disagg/mooncake.py) |
 | slime | TE via SGLang | PD-disaggregated rollout serving | [RL serving architecture](https://github.com/THUDM/slime/blob/main/docs/en/advanced/rl-systems.md) |
-
-The Dynamo entry describes SGLang HiCache shared-cache routing. Its separate [KVBM G4 Store adapter proposal](https://github.com/ai-dynamo/dynamo/pull/9786) is still unmerged. NeMo RL's GDR path changes client-side tensor transfers; queued objects remain in Mooncake-managed host memory.
+| ATOM | TE, Store | Shared KV cache pooling and efficient KV transfer | [Integration blog](https://kvcache.ai/blog/atom-meets-mooncake/) |
 
 </details>
 
