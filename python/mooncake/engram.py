@@ -12,6 +12,8 @@ import json
 import mmap
 import operator
 import os
+import struct
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -19,6 +21,25 @@ from pathlib import Path
 import numpy as np
 
 __all__ = ["EngramStore"]
+
+_F_PREALLOCATE = 42
+_F_ALLOCATEALL = 0x00000004
+_F_PEOFPOSMODE = 0x00000003
+
+
+def _preallocate(file, size):
+    if hasattr(os, "posix_fallocate"):
+        os.posix_fallocate(file.fileno(), 0, size)
+        return
+    if sys.platform != "darwin":
+        raise RuntimeError("Engram local tables require file preallocation support")
+
+    # Python's macOS bindings do not expose F_PREALLOCATE or fstore_t. These
+    # values and the 64-bit field layout come from XNU's sys/fcntl.h.
+    # F_ALLOCATEALL retains posix_fallocate's all-or-error disk-space guarantee.
+    request = struct.pack("IIqqq", _F_ALLOCATEALL, _F_PEOFPOSMODE, 0, size, 0)
+    fcntl.fcntl(file.fileno(), _F_PREALLOCATE, request)
+    file.truncate(size)
 
 
 class EngramStore:
@@ -119,7 +140,7 @@ class EngramStore:
                 try:
                     with open(temporary / "rows", "w+b") as f:
                         if rows.nbytes:
-                            os.posix_fallocate(f.fileno(), 0, rows.nbytes)
+                            _preallocate(f, rows.nbytes)
                             with mmap.mmap(f.fileno(), rows.nbytes) as target:
                                 target[:] = memoryview(rows).cast("B")
                     (temporary / "layout.json").write_text(json.dumps(spec))
@@ -139,7 +160,7 @@ class EngramStore:
         # The descriptor has no directory entry. The mmap owns its pages even
         # after the descriptor closes; SIGKILL cannot leave a named large file.
         with tempfile.TemporaryFile(dir=self._root) as f:
-            os.posix_fallocate(f.fileno(), 0, rows.nbytes)
+            _preallocate(f, rows.nbytes)
             mapping = mmap.mmap(f.fileno(), rows.nbytes)
         try:
             mapping[:] = memoryview(rows).cast("B")
