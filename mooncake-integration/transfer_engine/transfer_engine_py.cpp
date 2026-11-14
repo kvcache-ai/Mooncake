@@ -862,6 +862,41 @@ BatchArrays batchArraysFromPages(const pybind11::buffer& src_pages,
     return arrays;
 }
 
+// True once every task is COMPLETED or FAILED, i.e. no sibling of a failed
+// task still touches caller buffers; false if deadline_ns passes first.
+bool waitBatchQuiescent(TransferEngine& engine, batch_id_t batch_id,
+                        size_t task_count, int64_t deadline_ns) {
+    for (size_t task_id = 0; task_id < task_count;) {
+        TransferStatus status;
+        Status s = engine.getTransferStatus(batch_id, task_id, status);
+        if (s.ok() && (status.s == TransferStatusEnum::COMPLETED ||
+                       status.s == TransferStatusEnum::FAILED)) {
+            ++task_id;
+            continue;
+        }
+        if (getCurrentTimeInNano() > deadline_ns) return false;
+    }
+    return true;
+}
+
+// Returns -1 if the failed batch is quiescent, else COMPLETION_UNKNOWN (-2).
+int releaseFailedSyncBatch(TransferEngine& engine, batch_id_t batch_id,
+                           size_t task_count, int64_t deadline_ns) {
+    // TENT task states do not imply physical quiescence yet (#4816).
+    if (engine.isUsingTent()) {
+        engine.freeBatchID(batch_id);
+        return -1;
+    }
+    const bool quiescent =
+        waitBatchQuiescent(engine, batch_id, task_count, deadline_ns);
+    engine.freeBatchID(batch_id);
+    if (quiescent) return -1;
+    LOG(ERROR) << "Sync transfer still in flight at its deadline; caller "
+                  "buffers must stay alive";
+    return static_cast<int>(
+        ScatterTransferCompletionStatus::COMPLETION_UNKNOWN);
+}
+
 }  // namespace
 
 int TransferEnginePy::batchTransferSyncWritePages(
@@ -990,6 +1025,8 @@ int TransferEnginePy::transferSync(const char* target_hostname,
     const int max_retry =
         engine_->numContexts() + 1;  // Iter all possible local contexts
     auto start_ts = getCurrentTimeInNano();
+    const int64_t deadline =
+        start_ts + transfer_timeout_nsec_ + length;  // 1GiB per second
     const int nic_hint_id = resolveNicHint(nic_hint);
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
@@ -1034,40 +1071,30 @@ int TransferEnginePy::transferSync(const char* target_hostname,
             return -1;
         }
 
-        bool completed = false;
-        bool release_scheduled = false;
         TransferStatus status;
-        while (!completed) {
+        while (true) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
-                engine_->freeBatchID(batch_id);
-                release_scheduled = true;
-                completed = true;
+                break;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
-                engine_->freeBatchID(batch_id);
-                release_scheduled = true;
-                completed = true;
+                break;
             }
-            if (completed) break;
             auto current_ts = getCurrentTimeInNano();
-            const int64_t timeout =
-                transfer_timeout_nsec_ + length;  // 1GiB per second
-            if (current_ts - start_ts > timeout) {
+            if (current_ts > deadline) {
                 LOG(INFO) << "Sync data transfer timeout after "
                           << current_ts - start_ts << "ns, local buffer "
                           << (void*)buffer << " remote buffer "
                           << (void*)peer_buffer_address << " length " << length;
-                if (!release_scheduled) {
-                    engine_->freeBatchID(batch_id);
-                }
-                return -1;
+                return releaseFailedSyncBatch(*engine_, batch_id, 1, deadline);
             }
         }
+        int ret = releaseFailedSyncBatch(*engine_, batch_id, 1, deadline);
+        if (ret != -1) return ret;
     }
     return -1;
 }
@@ -1104,6 +1131,8 @@ int TransferEnginePy::batchTransferSync(
     const int max_retry = engine_->numContexts() + 1;
     auto start_ts = getCurrentTimeInNano();
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
+    const int64_t deadline =
+        start_ts + transfer_timeout_nsec_ + total_length;  // 1GiB per second
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
     std::vector<TransferRequest> entries;
@@ -1162,10 +1191,8 @@ int TransferEnginePy::batchTransferSync(
             return -1;
         }
 
-        bool completed = false;
-        bool release_scheduled = false;
         TransferStatus status;
-        while (!completed) {
+        while (true) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -1176,27 +1203,22 @@ int TransferEnginePy::batchTransferSync(
                            << target_hostname << " (batch of " << batch_size
                            << " requests, " << total_length
                            << " bytes) on retry " << retry << "/" << max_retry;
-                engine_->freeBatchID(batch_id);
-                completed = true;
+                break;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
-                engine_->freeBatchID(batch_id);
-                release_scheduled = true;
-                completed = true;
+                break;
             }
-            if (completed) break;
             auto current_ts = getCurrentTimeInNano();
-            const int64_t timeout =
-                transfer_timeout_nsec_ + total_length;  // 1GiB per second
-            if (current_ts - start_ts > timeout) {
+            if (current_ts > deadline) {
                 LOG(INFO) << "Sync batch data transfer timeout after "
                           << current_ts - start_ts << "ns";
-                if (!release_scheduled) {
-                    engine_->freeBatchID(batch_id);
-                }
-                return -1;
+                return releaseFailedSyncBatch(*engine_, batch_id, batch_size,
+                                              deadline);
             }
         }
+        int ret =
+            releaseFailedSyncBatch(*engine_, batch_id, batch_size, deadline);
+        if (ret != -1) return ret;
     }
     LOG(ERROR) << "batchTransferSync: all " << max_retry
                << " retries exhausted for " << target_hostname << " (batch of "
