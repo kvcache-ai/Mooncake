@@ -28,6 +28,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-wheel-xpu:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-e2e-ci'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci_xpu.yml
+    with:
+      checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}
+
+  xpu-integration-test:
+    needs: build-wheel-xpu
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/integration-test-xpu.yml
+    with:
+      checkout_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}
+      source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
+      artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
+      artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+      artifact_attempt: ${{ needs.build-wheel-xpu.outputs.artifact_attempt }}
+
   ascend-test:
     if: >
       github.event_name == 'workflow_dispatch' ||
@@ -93,6 +116,8 @@ jobs:
       - integration-test
       - rocm-integration-test
       - integration-test-tent
+      - build-wheel-xpu
+      - xpu-integration-test
     runs-on: ubuntu-latest
     steps:
       - name: Check E2E results

@@ -1,15 +1,22 @@
-"""Host-only regression checks for XPU CI gates and packaging."""
+"""CPU-only regressions for XPU packaging and hardware CI orchestration."""
 
+import hashlib
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from importlib import metadata
+import xml.etree.ElementTree as ET
+import zipfile
 
 import yaml
 
@@ -26,6 +33,10 @@ def load_script(name, path):
 
 
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci_xpu.yml").read_text())
+E2E_WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/e2e-ci.yml").read_text())
+INTEGRATION = yaml.safe_load(
+    (ROOT / ".github/workflows/integration-test-xpu.yml").read_text()
+)
 
 
 def workflow_step(name):
@@ -36,72 +47,73 @@ def workflow_step(name):
     )["run"]
 
 
+def hardware_step(name):
+    return next(
+        step
+        for step in INTEGRATION["jobs"]["core"]["steps"]
+        if step.get("name") == name
+    )["run"]
+
+
 ROCM = load_script("verify_rocm_wheel", "scripts/e2e/python/verify_rocm_wheel.py")
 with patch.dict(sys.modules, {"verify_rocm_wheel": ROCM}):
-    VERIFY = load_script("verify_xpu_wheel", "scripts/e2e/python/verify_xpu_wheel.py")
+    VERIFY = load_script("verify_xpu_ci", "scripts/e2e/python/verify_xpu_ci.py")
 
 
 class HostReportTest(unittest.TestCase):
-    def test_requires_nonempty_completed_non_skipped_cases(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reports = Path(directory) / "xpu-ci-output/reports"
-            reports.mkdir(parents=True)
-            code = (
-                workflow_step("Run host-side unit tests")
-                .split("python - <<'PY'\n", 1)[1]
-                .rsplit("\nPY", 1)[0]
-            )
-            passed = '<testcase status="run" result="completed"/>'
-            for body, count, valid in (
-                (passed, 1, True),
-                (passed, 20, True),
-                ("", 1, False),
-                ('<testcase status="notrun" result="suppressed"/>', 1, False),
-                (
-                    '<testcase status="run" result="skipped"><skipped/></testcase>',
-                    1,
-                    False,
+    def test_workflow_uses_xpu_report_validation(self):
+        script = workflow_step("Run host-side unit tests")
+        self.assertIn("python scripts/e2e/python/verify_xpu_ci.py reports", script)
+        self.assertNotIn("--allow-skipped", script)
+        for name in ("config", "ep", "crc32c"):
+            self.assertIn(f"xpu-ci-output/reports/{name}.xml", script)
+
+    def test_reports_command(self):
+        completed = (
+            '<testcase classname="Host" name="Pass" status="run" result="completed"/>'
+        )
+        for case, success in (
+            (completed, True),
+            ("", False),
+            ('<testcase classname="Host" name="MissingStatus"/>', False),
+            (completed.replace("/>", "><failure/></testcase>"), False),
+            (completed.replace("/>", "><error/></testcase>"), False),
+            (completed.replace("/>", "><skipped/></testcase>"), False),
+            (completed.replace('result="completed"', 'result="skipped"'), False),
+            (
+                completed.replace(
+                    'status="run" result="completed"',
+                    'status="notrun" result="suppressed"',
                 ),
-                (
-                    '<testcase status="run" result="completed"><failure/></testcase>',
-                    1,
-                    False,
-                ),
-                (
-                    '<testcase status="run" result="completed"><error/></testcase>',
-                    1,
-                    False,
-                ),
-                (
-                    passed
-                    + '<testcase status="run" result="skipped"><skipped/></testcase>',
-                    1,
-                    False,
-                ),
-            ):
-                with self.subTest(body=body, count=count):
-                    for name in ("config", "ep", "crc32c"):
-                        (reports / f"{name}.xml").write_text(
-                            f"<testsuites><testsuite>{body * count}</testsuite></testsuites>"
-                        )
-                    result = subprocess.run(
-                        [sys.executable, "-c", code],
-                        cwd=directory,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(result.returncode == 0, valid, result.stderr)
-            (reports / "ep.xml").unlink()
-            self.assertNotEqual(
-                subprocess.run(
-                    [sys.executable, "-c", code],
-                    cwd=directory,
+                False,
+            ),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                valid = Path(directory) / "valid.xml"
+                report = Path(directory) / "report.xml"
+                valid.write_text(
+                    f"<testsuites><testsuite>{completed}</testsuite></testsuites>"
+                )
+                report.write_text(
+                    f"<testsuites><testsuite>{case}</testsuite></testsuites>"
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(VERIFY.__file__)),
+                        "reports",
+                        str(valid),
+                        str(report),
+                    ],
                     capture_output=True,
-                    timeout=10,
-                ).returncode,
-                0,
-            )
+                    text=True,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_reports_command_requires_reports(self):
+        with patch.object(sys, "argv", [VERIFY.__file__, "reports"]):
+            with self.assertRaisesRegex(RuntimeError, "at least one test report"):
+                VERIFY.cli()
 
 
 class BuildDirectoryTest(unittest.TestCase):
@@ -301,6 +313,227 @@ class WorkflowTest(unittest.TestCase):
             [step.get("name") for step in job["steps"]].index("Check out source"),
         )
 
+    def test_hosted_wheelhouse_is_hashed_inside_the_native_bundle(self):
+        script = workflow_step("Package Python dependencies for hardware")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "xpu-ci-output"
+            payload.mkdir()
+            wheel = payload / "fixture.whl"
+            wheel.write_bytes(b"wheel")
+            python = root / "python"
+            python.write_text("""#!/bin/bash
+set -eu
+[ "$*" = "-m pip download --only-binary=:all: --dest xpu-ci-output/python-deps xpu-ci-output/fixture.whl" ]
+cp xpu-ci-output/fixture.whl xpu-ci-output/python-deps/
+echo dependency > xpu-ci-output/python-deps/dependency.whl
+""")
+            python.chmod(0o755)
+            result = subprocess.run(
+                ["bash", "-ec", script],
+                cwd=root,
+                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [path.name for path in (payload / "python-deps").iterdir()],
+                ["dependency.whl"],
+            )
+        self.assertIn(
+            'cp -R xpu-ci-output/python-deps "$out/"',
+            workflow_step("Package native tests"),
+        )
+
+    def test_unified_trigger_and_matching_artifact_handoff(self):
+        jobs = E2E_WORKFLOW["jobs"]
+        event = E2E_WORKFLOW.get("on", E2E_WORKFLOW.get(True))
+        self.assertEqual(event["pull_request_target"]["types"], ["labeled"])
+        self.assertNotIn("synchronize", event["pull_request_target"]["types"])
+        self.assertNotIn("xpu-authorize", jobs)
+        self.assertIn("run-e2e-ci", jobs["build-wheel-xpu"]["if"])
+        self.assertIn("workflow_dispatch", jobs["build-wheel-xpu"]["if"])
+        self.assertTrue(E2E_WORKFLOW["concurrency"]["cancel-in-progress"])
+        self.assertFalse((ROOT / ".github/workflows/xpu-core.yml").exists())
+        self.assertNotIn("needs", jobs["build-wheel-xpu"])
+        self.assertEqual(
+            jobs["build-wheel-xpu"]["with"]["checkout_ref"],
+            "${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}",
+        )
+        self.assertEqual(
+            jobs["xpu-integration-test"]["needs"],
+            "build-wheel-xpu",
+        )
+        self.assertEqual(
+            jobs["xpu-integration-test"]["with"]["checkout_sha"],
+            "${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}",
+        )
+        for name in (
+            "artifact_id",
+            "artifact_digest",
+            "artifact_attempt",
+            "source_sha",
+        ):
+            self.assertEqual(
+                jobs["xpu-integration-test"]["with"][name],
+                "${{ needs.build-wheel-xpu.outputs." + name + " }}",
+            )
+        build_event = WORKFLOW.get("on", WORKFLOW.get(True))
+        self.assertEqual(
+            build_event["workflow_call"]["outputs"]["artifact_attempt"]["value"],
+            "${{ jobs.build-wheel-xpu.outputs.artifact_attempt }}",
+        )
+        self.assertEqual(
+            WORKFLOW["jobs"]["build-wheel-xpu"]["outputs"]["artifact_attempt"],
+            "${{ steps.source.outputs.attempt }}",
+        )
+        self.assertIn(
+            'echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"',
+            workflow_step("Record selected source"),
+        )
+        hardware_event = INTEGRATION.get("on", INTEGRATION.get(True))
+        self.assertEqual(
+            hardware_event["workflow_call"]["inputs"]["artifact_attempt"],
+            {"type": "string", "required": True},
+        )
+        download = next(
+            step
+            for step in INTEGRATION["jobs"]["core"]["steps"]
+            if step.get("name") == "Download exact build artifact"
+        )
+        self.assertEqual(
+            download["env"]["XPU_BUILD_ATTEMPT"], "${{ inputs.artifact_attempt }}"
+        )
+        self.assertEqual(
+            set(jobs["e2e-gate"]["needs"]),
+            {
+                "ascend-test",
+                "build-wheel-rocm",
+                "integration-test",
+                "rocm-integration-test",
+                "integration-test-tent",
+                "build-wheel-xpu",
+                "xpu-integration-test",
+            },
+        )
+        self.assertIn("always()", jobs["e2e-gate"]["if"])
+        self.assertNotIn("permissions", jobs["e2e-gate"])
+        self.assertNotIn("continue-on-error", jobs["e2e-gate"]["steps"][0])
+        self.assertEqual(jobs["cleanup-label"]["needs"], ["e2e-gate"])
+        integration = yaml.safe_load(
+            (ROOT / ".github/workflows/integration-test-xpu.yml").read_text()
+        )
+        job = integration["jobs"]["core"]
+        self.assertEqual(job["runs-on"], "xpu")
+        build = yaml.safe_load((ROOT / ".github/workflows/ci_xpu.yml").read_text())
+        self.assertEqual(
+            job["env"]["XPU_IMAGE"], build["jobs"]["build-wheel-xpu"]["container"]
+        )
+        self.assertIn("github.workflow_sha", job["steps"][0]["with"]["ref"])
+        self.assertTrue(
+            all(
+                not step.get("with", {}).get("persist-credentials", False)
+                for step in job["steps"]
+            )
+        )
+
+    def test_shared_gate_still_checks_other_platforms(self):
+        steps = E2E_WORKFLOW["jobs"]["e2e-gate"]["steps"]
+        self.assertEqual(len(steps), 1)
+        step = next(step for step in steps if step["name"] == "Check E2E results")
+        script = re.sub(r"\$\{\{.*?\}\}", "fixture", step["run"])
+        for status in ("success", "failure", "cancelled", "skipped"):
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    ["bash", "-ec", script],
+                    env={
+                        **os.environ,
+                        "NEEDS_JSON": json.dumps(
+                            {
+                                "rocm-integration-test": {"result": status},
+                                "xpu-integration-test": {"result": "success"},
+                            }
+                        ),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    result.returncode == 0,
+                    status in ("success", "skipped"),
+                    result.stderr,
+                )
+
+
+class CommandLineTest(unittest.TestCase):
+    def test_run_library_path_excludes_empty_components(self):
+        for previous in (None, "", "/existing/lib", "/first::/second:"):
+            with (
+                self.subTest(previous=previous),
+                tempfile.TemporaryDirectory() as directory,
+                patch.dict(os.environ),
+                patch.object(VERIFY, "verify_hashes"),
+                patch.object(VERIFY, "extract_native") as extract,
+                patch.object(VERIFY, "command"),
+            ):
+                root = Path(directory)
+                (root / "test.whl").touch()
+                extract.return_value = root / "native"
+                if previous is None:
+                    os.environ.pop("LD_LIBRARY_PATH", None)
+                else:
+                    os.environ["LD_LIBRARY_PATH"] = previous
+                VERIFY.run(root, root / "source", root / "output")
+                expected = [str(root / "native/lib"), str(Path(sys.prefix) / "lib")]
+                expected.extend(path for path in (previous or "").split(":") if path)
+                self.assertEqual(os.environ["LD_LIBRARY_PATH"].split(":"), expected)
+
+    def test_no_arguments_preserve_host_only_wheel_checks(self):
+        with (
+            patch.object(sys, "argv", ["verify_xpu_ci.py"]),
+            patch.object(VERIFY, "main") as verify,
+        ):
+            VERIFY.cli()
+            verify.assert_called_once_with()
+
+    def test_hardware_subcommands_and_unknown_command(self):
+        for arguments, callback, expected in (
+            (
+                ["unpack", "dir", "sha", "42", "digest"],
+                "unpack",
+                [Path("dir"), "sha", "42", "digest"],
+            ),
+            (
+                ["run", "bundle", "source", "output"],
+                "run",
+                [Path("bundle"), Path("source"), Path("output")],
+            ),
+            (
+                ["suite", "native", "source", "output"],
+                "suite",
+                [Path("native"), Path("source"), Path("output")],
+            ),
+            (
+                ["store", "source", "report"],
+                "store_test",
+                [Path("source"), Path("report")],
+            ),
+            (["seccomp", "profile"], "prepare_seccomp", [Path("profile")]),
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(sys, "argv", ["verify_xpu_ci.py", *arguments]),
+                patch.object(VERIFY, callback) as command,
+            ):
+                VERIFY.cli()
+                command.assert_called_once_with(*expected)
+        with patch.object(sys, "argv", ["verify_xpu_ci.py", "unknown"]):
+            with self.assertRaisesRegex(RuntimeError, "Unknown XPU verification"):
+                VERIFY.cli()
+
 
 class InstalledWheelTest(unittest.TestCase):
     def setUp(self):
@@ -413,6 +646,8 @@ class NativeBundleTest(unittest.TestCase):
         self.out.parent.mkdir()
         (self.out.parent / "provenance.txt").write_text("source_sha=test\n")
         (self.out.parent / "fixture.whl").write_bytes(b"wheel artifact")
+        (self.out.parent / "python-deps").mkdir()
+        (self.out.parent / "python-deps" / "fixture-dep.whl").write_bytes(b"dependency")
         self.build.mkdir()
         (self.build / "CMakeCache.txt").write_text("USE_XPU:BOOL=ON\n")
         self.library = self.root / "libfixture.so"
@@ -496,6 +731,817 @@ class NativeBundleTest(unittest.TestCase):
         result = self.package()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Empty GoogleTest inventory", result.stderr)
+
+
+def write_sums(root, excluded=()):
+    (root / "SHA256SUMS").write_text(
+        "".join(
+            f"{VERIFY.digest(path)}  ./{path.relative_to(root)}\n"
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and path.name not in (*excluded, "SHA256SUMS")
+        )
+    )
+
+
+class ArtifactTest(unittest.TestCase):
+    def test_exact_artifact_identity_digest_sha_and_complete_manifest(self):
+        sha = "a" * 40
+        image = "intel/pytorch@sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provenance = f"source_sha={sha}\nimage={image}\nci_run=123/2\n"
+            wheel = "mooncake_transfer_engine_xpu-0.0.0-cp312-cp312-linux_x86_64.whl"
+            payload = {wheel: b"wheel", "native-tests.tar.gz": b"native"}
+            sums = "".join(
+                f"{hashlib.sha256(data).hexdigest()}  ./{name}\n"
+                for name, data in payload.items()
+            )
+            payload.update(
+                {"provenance.txt": provenance.encode(), "SHA256SUMS": sums.encode()}
+            )
+            with zipfile.ZipFile(root / "artifact.zip", "w") as archive:
+                for name, data in payload.items():
+                    archive.writestr(name, data)
+            checksum = VERIFY.digest(root / "artifact.zip")
+            original = {
+                "id": 42,
+                "name": f"mooncake-xpu-ci-py312-{sha}-123-2",
+                "expired": False,
+                "workflow_run": {"id": 123},
+                "digest": f"sha256:{checksum}",
+            }
+            environment = {
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "3",
+                "XPU_BUILD_ATTEMPT": "2",
+                "XPU_IMAGE": image,
+            }
+            for change in (
+                {"id": 43},
+                {"name": "latest"},
+                {"expired": True},
+                {"workflow_run": {"id": 122}},
+                {"digest": "sha256:" + "0" * 64},
+            ):
+                with self.subTest(change=change), patch.dict(os.environ, environment):
+                    (root / "artifact.json").write_text(
+                        json.dumps({**original, **change})
+                    )
+                    with self.assertRaises(RuntimeError):
+                        VERIFY.unpack(root, sha, "42", checksum)
+            (root / "artifact.json").write_text(json.dumps(original))
+            with patch.dict(os.environ, environment):
+                for attempt in ("", "0", "-1", "2/3", "3"):
+                    with self.subTest(attempt=attempt), patch.dict(
+                        os.environ, {"XPU_BUILD_ATTEMPT": attempt}
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            VERIFY.unpack(root, sha, "42", checksum)
+                with self.assertRaises(RuntimeError):
+                    VERIFY.unpack(root, sha, "42", "0" * 64)
+                VERIFY.unpack(root, sha, "42", checksum)
+            bundle = root / "bundle"
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_provenance(bundle, "c" * 40, image, "123/2")
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_provenance(bundle, sha, image + "changed", "123/2")
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_provenance(bundle, sha, image, "123/3")
+            (bundle / wheel).write_bytes(b"corrupted")
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_hashes(bundle, {"provenance.txt"})
+
+    def test_zip_rejects_traversal_and_duplicate_entries(self):
+        for names in (
+            ["../escape", "a", "b", "c"],
+            ["/escape", "a", "b", "c"],
+            ["nested/file", "a", "b", "c"],
+        ):
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with zipfile.ZipFile(root / "artifact.zip", "w") as archive:
+                    for name in names:
+                        archive.writestr(name, b"data")
+                checksum = VERIFY.digest(root / "artifact.zip")
+                (root / "artifact.json").write_text(
+                    json.dumps(
+                        {
+                            "id": 1,
+                            "name": f"mooncake-xpu-ci-py312-{'a' * 40}-1-1",
+                            "expired": False,
+                            "workflow_run": {"id": 1},
+                            "digest": f"sha256:{checksum}",
+                        }
+                    )
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "GITHUB_RUN_ID": "1",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "XPU_BUILD_ATTEMPT": "1",
+                    },
+                ):
+                    with self.assertRaises(RuntimeError):
+                        VERIFY.unpack(root, "a" * 40, "1", checksum)
+
+    def test_hash_inventory_rejects_unhashed_missing_duplicate_and_unsafe_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "a").write_bytes(b"a")
+            write_sums(root)
+            valid = (root / "SHA256SUMS").read_text()
+            VERIFY.verify_hashes(root)
+            for content in (
+                "",
+                valid * 2,
+                valid.replace("./a", "../a"),
+                valid + "invalid\n",
+            ):
+                with self.subTest(content=content):
+                    (root / "SHA256SUMS").write_text(content)
+                    with self.assertRaises(RuntimeError):
+                        VERIFY.verify_hashes(root)
+            (root / "SHA256SUMS").write_text(valid)
+            (root / "unhashed").write_text("extra")
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_hashes(root)
+
+    def test_native_tar_roundtrip_and_rejection_of_links_and_traversal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            native = root / "native-tests"
+            native.mkdir()
+            (native / "provenance.txt").write_text("source provenance")
+            (native / "test").write_bytes(b"executable")
+            (native / "test").chmod(0o755)
+            write_sums(native)
+            (root / "provenance.txt").write_bytes(
+                (native / "provenance.txt").read_bytes()
+            )
+            with tarfile.open(root / "native-tests.tar.gz", "w:gz") as archive:
+                archive.add(native, arcname="native-tests")
+            output = root / "valid"
+            output.mkdir()
+            extracted = VERIFY.extract_native(root, output)
+            self.assertEqual((extracted / "test").stat().st_mode & 0o777, 0o755)
+            for index, (name, kind) in enumerate(
+                (
+                    ("../escape", tarfile.REGTYPE),
+                    ("native-tests/link", tarfile.SYMTYPE),
+                    ("native-tests/link", tarfile.LNKTYPE),
+                    ("native-tests/device", tarfile.CHRTYPE),
+                )
+            ):
+                with self.subTest(name=name, kind=kind):
+                    entry = tarfile.TarInfo(name)
+                    entry.type = kind
+                    with tarfile.open(root / "native-tests.tar.gz", "w:gz") as archive:
+                        archive.addfile(entry, io.BytesIO())
+                    output = root / str(index)
+                    output.mkdir()
+                    with self.assertRaises(RuntimeError):
+                        VERIFY.extract_native(root, output)
+
+
+class ReportTest(unittest.TestCase):
+    def test_suite_requires_store_report_and_ep_completion_before_success(self):
+        import importlib.metadata
+
+        def write_report(path, identities):
+            root = ET.Element("testsuites")
+            suite = ET.SubElement(root, "testsuite")
+            for identity in identities:
+                classname, name = identity.split(".", 1)
+                ET.SubElement(
+                    suite,
+                    "testcase",
+                    classname=classname,
+                    name=name,
+                    status="run",
+                    result="completed",
+                )
+            ET.ElementTree(root).write(path)
+
+        def inventory_text(identities):
+            return "".join(
+                f"{identity.split('.', 1)[0]}.\n  {identity.split('.', 1)[1]}\n"
+                for identity in sorted(identities)
+            )
+
+        for store_report, ep_complete, valid in (
+            (True, True, True),
+            (False, True, False),
+            (True, False, False),
+        ):
+            with self.subTest(store_report=store_report, ep_complete=ep_complete):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for name, (inventory, _) in VERIFY.SUITES.items():
+                        (root / f"{name}.list").write_text(inventory_text(inventory))
+
+                    def run_command(args, log, timeout=600):
+                        if log.name == "wheel.log":
+                            self.assertEqual(args, [sys.executable, VERIFY.__file__])
+                            self.assertTrue(Path(args[1]).is_file())
+                        if "--gtest_list_tests" in args:
+                            return inventory_text(VERIFY.SUITES[Path(args[0]).name][0])
+                        for argument in args:
+                            if argument.startswith("--gtest_output=xml:"):
+                                write_report(
+                                    Path(argument.split("xml:", 1)[1]),
+                                    VERIFY.SUITES[Path(args[0]).name][1],
+                                )
+                        if len(args) > 2 and args[2] == "store" and store_report:
+                            write_report(
+                                Path(args[4]), {"StorePython.test_xpu_local_copy_paths"}
+                            )
+                        if "test_mooncake_ep_xpu.py" in args[1]:
+                            if not ep_complete:
+                                return ""
+                            return "".join(
+                                f"round {i}: tokens=0 ok\n" for i in range(8)
+                            ) + (
+                                "PASSED: 8 rounds + 2 empty-rank rounds + 4 two-batch rounds"
+                                " + duplicate experts + reused src_info + rejected handle"
+                                " + cross-stream + fallback agreement"
+                                " on 2 ranks (hidden=1024, experts=8, topk=2)\n"
+                            )
+                        return ""
+
+                    with (
+                        patch.object(VERIFY, "preflight"),
+                        patch.object(VERIFY, "command", side_effect=run_command),
+                        patch.object(
+                            VERIFY, "validate_report", wraps=VERIFY.validate_report
+                        ) as validate,
+                        patch.object(VERIFY.socket, "create_connection"),
+                        patch.object(VERIFY.subprocess, "Popen") as process,
+                        patch.object(
+                            importlib.metadata, "distribution"
+                        ) as distribution,
+                        patch.dict(os.environ, {"XPU_SOURCE_SHA": "a" * 40}),
+                    ):
+                        distribution.return_value.locate_file.return_value = root
+                        process.return_value.__enter__.return_value.poll.return_value = None
+                        if valid:
+                            VERIFY.suite(root, ROOT, root)
+                            self.assertTrue(validate.called)
+                            for call in validate.call_args_list:
+                                self.assertTrue(call.kwargs["require_gtest_status"])
+                                self.assertTrue(call.args[1])
+                            result = json.loads((root / "result.json").read_text())
+                            self.assertEqual(result["cpp_cases"], 151)
+                            self.assertEqual(result["ep_rounds"], 8)
+                        else:
+                            with self.assertRaises((RuntimeError, FileNotFoundError)):
+                                VERIFY.suite(root, ROOT, root)
+                            self.assertFalse((root / "result.json").exists())
+
+    def test_inventory_parser(self):
+        self.assertEqual(
+            VERIFY.parse_inventory(
+                "noise\nModes/Suite.\n  Case/0  # GetParam() = false\n  Case/1\n"
+            ),
+            {"Modes/Suite.Case/0", "Modes/Suite.Case/1"},
+        )
+        for text in ("", "noise\n", "  Case\n", "Suite.\n  Case\n  Case\n"):
+            with self.subTest(text=text), self.assertRaises(RuntimeError):
+                VERIFY.parse_inventory(text)
+
+    def test_required_inventory_matches_cpp_sources(self):
+        tent = ROOT / "mooncake-transfer-engine/tent/tests/xpu"
+        for filename, names in (
+            ("xpu_platform_test.cpp", VERIFY.PLATFORM),
+            ("xpu_transport_test.cpp", VERIFY.TRANSPORT),
+            ("xpu_engine_test.cpp", VERIFY.ENGINE | VERIFY.RDMA),
+            ("xpu_ipc_process_test.cpp", VERIFY.IPC),
+        ):
+            declared = set(
+                re.findall(
+                    r"TEST_[FP]\(\s*(\w+),\s*(\w+)\s*\)", (tent / filename).read_text()
+                )
+            )
+            selected = {
+                (
+                    identity.split(".")[0].split("/")[-1],
+                    identity.split(".")[1].split("/")[0],
+                )
+                for identity in names
+            }
+            self.assertEqual(selected, declared, filename)
+        self.assertEqual(len(VERIFY.ENGINE), 124)
+        self.assertEqual(len(VERIFY.INAPPLICABLE), 10)
+        self.assertEqual(
+            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 151
+        )
+        selected_engine = VERIFY.SUITES["tent_xpu_engine_test"][1]
+        self.assertFalse(selected_engine & VERIFY.RDMA)
+        self.assertFalse(selected_engine & VERIFY.INAPPLICABLE.keys())
+
+    def test_command_exit_and_timeout_propagate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "command.log"
+            diagnostics = io.StringIO()
+            with (
+                patch.object(VERIFY.sys, "stderr", diagnostics),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                VERIFY.command(["bash", "-c", "echo failed; exit 2"], log)
+            self.assertIn("failed", log.read_text())
+            self.assertIn(str(log), diagnostics.getvalue())
+            self.assertIn("failed", diagnostics.getvalue())
+            diagnostics = io.StringIO()
+            with (
+                patch.object(VERIFY.sys, "stderr", diagnostics),
+                self.assertRaises(subprocess.TimeoutExpired),
+            ):
+                VERIFY.command(["sleep", "2"], log, timeout=0.01)
+            self.assertIn(str(log), diagnostics.getvalue())
+
+    def test_command_failure_diagnostics_are_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "command.log"
+            diagnostics = io.StringIO()
+            with (
+                patch.object(VERIFY.sys, "stderr", diagnostics),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                VERIFY.command(["bash", "-c", "seq 1 100; exit 2"], log)
+            lines = diagnostics.getvalue().splitlines()
+            self.assertEqual(len(lines), 41)
+            self.assertEqual(lines[1:], [str(i) for i in range(61, 101)])
+
+    def test_device_preflight_rejects_missing_wrong_and_unexecuted_devices(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            for count, name, total, valid in (
+                (0, "Intel Arc Pro B60", 2080, False),
+                (1, "Intel Arc Pro B60", 2080, False),
+                (2, "CPU fallback", 2080, False),
+                (2, "Intel Arc Pro B60", 0, False),
+                (2, "Intel Arc Pro B60", 2080, True),
+            ):
+                tensor = unittest.mock.MagicMock()
+                tensor.__add__.return_value.sum.return_value.cpu.return_value = total
+                torch = SimpleNamespace(
+                    __version__="2.13.0+xpu",
+                    xpu=SimpleNamespace(
+                        is_available=lambda: count > 0,
+                        device_count=lambda: count,
+                        get_device_properties=lambda index: SimpleNamespace(
+                            name=name, total_memory=24 << 30
+                        ),
+                        synchronize=lambda index: None,
+                    ),
+                    arange=lambda *args, **kwargs: tensor,
+                )
+                read_text = Path.read_text
+
+                def runtime_text(path, *args, **kwargs):
+                    if str(path) == "/proc/self/status":
+                        return "CapEff:\t00000000\n"
+                    if str(path) == "/proc/sys/kernel/yama/ptrace_scope":
+                        return "1"
+                    return read_text(path, *args, **kwargs)
+
+                with (
+                    self.subTest(count=count, name=name, total=total),
+                    patch.dict("sys.modules", {"torch": torch}),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "ONEAPI_DEVICE_SELECTOR": "level_zero:gpu",
+                            "ZE_AFFINITY_MASK": "0,1",
+                            "XPU_IMAGE": "image",
+                            "XPU_SOURCE_SHA": "a" * 40,
+                        },
+                    ),
+                    patch.object(Path, "read_text", runtime_text),
+                ):
+                    if valid:
+                        VERIFY.preflight(output)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            VERIFY.preflight(output)
+
+
+class ShellLifecycleTest(unittest.TestCase):
+    def test_inline_hardware_shell_syntax_and_removed_launchers(self):
+        for step in INTEGRATION["jobs"]["core"]["steps"]:
+            if "run" in step:
+                with self.subTest(step=step["name"]):
+                    result = subprocess.run(
+                        ["bash", "-n"],
+                        input=step["run"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("run_xpu_core.sh", "xpu_core.py"):
+            self.assertFalse((ROOT / "scripts/ci" / name).exists())
+        self.assertIn(
+            "scripts/e2e/python/verify_xpu_ci.py unpack",
+            hardware_step("Download exact build artifact"),
+        )
+
+    def prepare_run(self, root):
+        output = root / "github-output"
+        subprocess.run(
+            ["bash", "-ec", hardware_step("Allocate run directory")],
+            env={
+                **os.environ,
+                "RUNNER_TEMP": str(root),
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return Path(output.read_text().strip().removeprefix("directory="))
+
+    def test_network_isolation_sets_store_and_ep_loopback_interfaces(self):
+        script = hardware_step("Execute isolated two-B60 core")
+        start = script.index("container_id=$(docker create")
+        stop = script.index("timeout --signal=TERM", start)
+        docker_command = script[start:stop]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docker = root / "docker"
+            docker.write_text("""#!/bin/bash
+set -eu
+printf '%s\\n' "$@" > "$DOCKER_ARGUMENTS"
+echo container-id
+""")
+            docker.chmod(0o755)
+            arguments = root / "arguments"
+            result = subprocess.run(
+                ["bash", "-ec", "device_args=()\n" + docker_command],
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "DOCKER_ARGUMENTS": str(arguments),
+                    "GITHUB_RUN_ID": "123",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "XPU_IMAGE": "image",
+                    "ZE_AFFINITY_MASK": "4,5",
+                    "CHECKOUT_SHA": "a" * 40,
+                    "run_directory": str(root),
+                    "source_directory": str(ROOT),
+                    "control_directory": str(ROOT / "scripts"),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = arguments.read_text().splitlines()
+            self.assertEqual(args[args.index("--network") + 1], "none")
+            for variable in (
+                "MOONCAKE_LOCAL_HOSTNAME=127.0.0.1",
+                "CCL_KVS_IFACE=lo",
+                "GLOO_SOCKET_IFNAME=lo",
+                "LOCAL_HOSTNAME=127.0.0.1",
+                "MASTER_SERVER=127.0.0.1:50051",
+                "ZE_AFFINITY_MASK=4,5",
+            ):
+                self.assertIn(variable, args)
+                self.assertEqual(args[args.index(variable) - 1], "--env")
+            self.assertNotIn("--privileged", args)
+            self.assertIn(
+                "python3 /control/e2e/python/verify_xpu_ci.py run /bundle /source /output",
+                "\n".join(args),
+            )
+
+    def test_fixed_runner_masks_need_no_lock_or_profile_variables(self):
+        script = hardware_step("Execute isolated two-B60 core")
+        start = script.index(': "${ZE_AFFINITY_MASK:')
+        stop = script.index("# Preserve host GPU ordinals")
+        for mask, valid in (
+            ("0,1", True),
+            ("2,3", True),
+            ("4,5", True),
+            ("6,7", True),
+            ("0,0", False),
+            ("00,0", False),
+            ("0", False),
+            ("0.0,0.1", False),
+            ("", False),
+        ):
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "XPU_LOCK_DIRECTORY",
+                    "XPU_SECCOMP_PROFILE",
+                    "XPU_RENDER_DEVICES",
+                }
+            }
+            environment.update(
+                {
+                    "ZE_AFFINITY_MASK": mask,
+                    "XPU_IMAGE": "image@sha256:" + "a" * 64,
+                    "CHECKOUT_SHA": "b" * 40,
+                }
+            )
+            with self.subTest(mask=mask):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-ec",
+                        'fail() { echo "$*" >&2; exit 1; }\n' + script[start:stop],
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+        self.assertNotIn("XPU_LOCK_DIRECTORY", script)
+        self.assertNotIn("XPU_SECCOMP_PROFILE", script)
+        self.assertNotIn("XPU_RENDER_DEVICES", script)
+        self.assertNotIn("flock", script)
+        self.assertIn("devices=(/dev/dri/renderD*)", script)
+        self.assertIn('--env "ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK"', script)
+        self.assertIn(
+            '--security-opt "seccomp=$run_directory/output/seccomp.json"', script
+        )
+
+    def test_cleanup_recheck_propagates_docker_query_failure(self):
+        for query_status in (0, 2):
+            with self.subTest(
+                query_status=query_status
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_directory = self.prepare_run(root)
+                docker = root / "docker"
+                docker.write_text("""#!/bin/bash
+set -eu
+case "$1" in
+  ps) exit "$QUERY_STATUS" ;;
+  info) exit 0 ;;
+  *) exit 99 ;;
+esac
+""")
+                docker.chmod(0o755)
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-ec",
+                        hardware_step("Recheck current-run container cleanup"),
+                    ],
+                    env={
+                        **os.environ,
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "QUERY_STATUS": str(query_status),
+                        "RUN_DIRECTORY": str(run_directory),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, query_status, result.stderr)
+                self.assertEqual(
+                    (run_directory / "output/cleanup-recheck.json").exists(),
+                    query_status == 0,
+                )
+
+    def test_owned_container_cleanup_and_failures_propagate(self):
+        script = hardware_step("Execute isolated two-B60 core")
+        cleanup = (
+            'source "$RUN_DIRECTORY/cleanup.sh"\n'
+            + script[
+                script.index("container_id=\n") : script.index(
+                    'docker pull "$XPU_IMAGE"'
+                )
+            ]
+        )
+        for suite_status, cleanup_failure, expected in (
+            (0, "no", 0),
+            (2, "no", 2),
+            (0, "yes", 1),
+        ):
+            with self.subTest(
+                suite_status=suite_status, cleanup_failure=cleanup_failure
+            ):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    run_directory = self.prepare_run(root)
+                    (run_directory / "output").mkdir()
+                    docker = root / "docker"
+                    docker.write_text("""#!/bin/bash
+set -eu
+echo "$*" >> "$RUN_DIRECTORY/docker.commands"
+case "$1" in
+  info) echo daemon-ready ;;
+  stop) echo owned-container ;;
+  inspect)
+    [ ! -e "$RUN_DIRECTORY/removed" ] || exit 1
+    if [ "${2:-}" = --format ]; then echo false; else echo '{}'; fi ;;
+  rm)
+    [ "$CLEANUP_FAILURE" = no ] || exit 1
+    touch "$RUN_DIRECTORY/removed" ;;
+  *) exit 99 ;;
+esac
+""")
+                    docker.chmod(0o755)
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            "-ec",
+                            f"{cleanup}\ncontainer_id=owned-container\nexit {suite_status}",
+                        ],
+                        env={
+                            **os.environ,
+                            "PATH": f"{root}:{os.environ['PATH']}",
+                            "run_directory": str(run_directory),
+                            "RUN_DIRECTORY": str(run_directory),
+                            "CLEANUP_FAILURE": cleanup_failure,
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode, expected, result.stdout + result.stderr
+                    )
+                    commands = (run_directory / "docker.commands").read_text()
+                    self.assertIn("stop --time 10 owned-container", commands)
+                    self.assertIn("rm owned-container", commands)
+                    self.assertNotIn("prune", commands)
+                    report = json.loads(
+                        (run_directory / "output/cleanup.json").read_text()
+                    )
+                    self.assertEqual(
+                        report["cleanup_status"] == 0, cleanup_failure == "no"
+                    )
+
+    def test_cleanup_recheck_removes_only_current_run_container(self):
+        for container_id, valid in (("a" * 64, True), ("invalid-id", False)):
+            with self.subTest(
+                container_id=container_id
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_directory = self.prepare_run(root)
+                docker = root / "docker"
+                docker.write_text("""#!/bin/bash
+set -eu
+echo "$*" >> "$RUN_DIRECTORY/docker.commands"
+case "$1" in
+  ps) echo "$OWNED_CONTAINER" ;;
+  info|stop) exit 0 ;;
+  inspect)
+    [ ! -e "$RUN_DIRECTORY/removed" ] || exit 1
+    if [ "${2:-}" = --format ]; then echo false; else echo '{}'; fi ;;
+  rm) touch "$RUN_DIRECTORY/removed" ;;
+  *) exit 99 ;;
+esac
+""")
+                docker.chmod(0o755)
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-ec",
+                        hardware_step("Recheck current-run container cleanup"),
+                    ],
+                    env={
+                        **os.environ,
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                        "RUN_DIRECTORY": str(run_directory),
+                        "OWNED_CONTAINER": container_id,
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+                commands = (run_directory / "docker.commands").read_text()
+                self.assertIn("--filter label=mooncake.xpu.run=123-1", commands)
+                self.assertEqual((run_directory / "removed").exists(), valid)
+                self.assertEqual(
+                    (run_directory / "output/cleanup-recheck.json").exists(), valid
+                )
+                if valid:
+                    self.assertIn(f"rm {container_id}", commands)
+                else:
+                    self.assertNotIn("stop ", commands)
+                    self.assertNotIn("rm ", commands)
+                self.assertNotIn("prune", commands)
+
+    def test_host_preflight_rejects_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "output").mkdir()
+            fake_id = root / "id"
+            fake_id.write_text("#!/bin/sh\necho 0\n")
+            fake_id.chmod(0o755)
+            script = hardware_step("Execute isolated two-B60 core")
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-ec",
+                    script[script.index("exec >") :],
+                ],
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "run_directory": str(root),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not run as root", result.stdout + result.stderr)
+
+
+class SeccompTest(unittest.TestCase):
+    def test_only_required_syscalls_are_unconditionally_allowed(self):
+        original = {
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "defaultErrnoRet": 1,
+            "archMap": [{"architecture": "SCMP_ARCH_X86_64", "subArchitectures": []}],
+            "syscalls": [
+                {"names": ["read", "write", "pidfd_open"], "action": "SCMP_ACT_ALLOW"},
+                {
+                    "names": ["pidfd_getfd", "ptrace"],
+                    "action": "SCMP_ACT_ALLOW",
+                    "includes": {"caps": ["CAP_SYS_PTRACE"]},
+                },
+                {
+                    "names": ["io_uring_setup"],
+                    "action": "SCMP_ACT_ERRNO",
+                    "errnoRet": 1,
+                },
+                {
+                    "names": ["mount"],
+                    "action": "SCMP_ACT_ALLOW",
+                    "includes": {"caps": ["CAP_SYS_ADMIN"]},
+                },
+            ],
+        }
+        content = json.dumps(original).encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "seccomp.json"
+            with (
+                patch.object(VERIFY.urllib.request, "urlopen") as download,
+                patch.object(
+                    VERIFY, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
+                ),
+            ):
+                download.return_value.__enter__.return_value.read.return_value = content
+                VERIFY.prepare_seccomp(output)
+                download.assert_called_once_with(VERIFY.SECCOMP_URL, timeout=30)
+            actual = json.loads(output.read_text())
+            self.assertEqual(actual["defaultAction"], original["defaultAction"])
+            self.assertEqual(actual["archMap"], original["archMap"])
+            self.assertEqual(
+                actual["syscalls"][-1],
+                {
+                    "names": sorted(VERIFY.XPU_SYSCALLS),
+                    "action": "SCMP_ACT_ALLOW",
+                },
+            )
+            remaining = []
+            for rule in original["syscalls"]:
+                names = [
+                    name for name in rule["names"] if name not in VERIFY.XPU_SYSCALLS
+                ]
+                if names:
+                    remaining.append({**rule, "names": names})
+            self.assertEqual(actual["syscalls"][:-1], remaining)
+
+    def test_download_checksum_and_default_action_failures_abort(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "seccomp.json"
+            with patch.object(
+                VERIFY.urllib.request, "urlopen", side_effect=OSError("download failed")
+            ):
+                with self.assertRaisesRegex(OSError, "download failed"):
+                    VERIFY.prepare_seccomp(output)
+            with patch.object(VERIFY.urllib.request, "urlopen") as download:
+                download.return_value.__enter__.return_value.read.return_value = (
+                    b"corrupted"
+                )
+                with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                    VERIFY.prepare_seccomp(output)
+                content = b'{"defaultAction":"SCMP_ACT_ALLOW"}'
+                download.return_value.__enter__.return_value.read.return_value = content
+                with patch.object(
+                    VERIFY, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "deny-by-default"):
+                        VERIFY.prepare_seccomp(output)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

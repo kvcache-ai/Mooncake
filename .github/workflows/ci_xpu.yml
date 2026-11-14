@@ -18,6 +18,8 @@ on:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_digest }}
+      artifact_attempt:
+        value: ${{ jobs.build-wheel-xpu.outputs.artifact_attempt }}
   workflow_dispatch:
 
 permissions:
@@ -36,6 +38,7 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
       artifact_id: ${{ steps.artifact.outputs.artifact-id }}
       artifact_digest: ${{ steps.artifact.outputs.artifact-digest }}
+      artifact_attempt: ${{ steps.source.outputs.attempt }}
     env:
       XPU_BUILD: "1"
       PYTHON_VERSION: "3.12"
@@ -64,6 +67,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Install toolchain and dependencies
         run: |
@@ -132,18 +136,10 @@ jobs:
             --gtest_output=xml:xpu-ci-output/reports/ep.xml
           "$BUILD_DIR/mooncake-store/tests/crc32c_test" \
             --gtest_output=xml:xpu-ci-output/reports/crc32c.xml
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
-          for name in ("config", "ep", "crc32c"):
-              cases = ET.parse(f"xpu-ci-output/reports/{name}.xml").findall(".//testcase")
-              if not cases:
-                  raise RuntimeError(f"{name}: no tests executed")
-              for case in cases:
-                  if (case.get("status"), case.get("result")) != ("run", "completed") or any(
-                      case.find(tag) is not None for tag in ("failure", "error", "skipped")
-                  ):
-                      raise RuntimeError(f"{name}: test did not pass: {case.attrib}")
-          PY
+          python scripts/e2e/python/verify_xpu_ci.py reports \
+            xpu-ci-output/reports/config.xml \
+            xpu-ci-output/reports/ep.xml \
+            xpu-ci-output/reports/crc32c.xml
 
       - name: Apply wheel version override
         if: inputs.version_override != ''
@@ -174,7 +170,17 @@ jobs:
           "$smoke_venv/bin/python" -m pip install xpu-ci-output/*.whl
           # Do not expose build libraries or the source package to the check.
           cd "$RUNNER_TEMP"
-          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_wheel.py"
+          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_ci.py"
+
+      - name: Package Python dependencies for hardware
+        run: |
+          set -euo pipefail
+          out=xpu-ci-output/python-deps
+          mkdir -p "$out"
+          for wheel in xpu-ci-output/*.whl; do
+            python -m pip download --only-binary=:all: --dest "$out" "$wheel"
+            rm "$out/$(basename "$wheel")"
+          done
 
       - name: Package native tests
         run: |
@@ -184,6 +190,7 @@ jobs:
           export LD_LIBRARY_PATH="$library_dirs:${LD_LIBRARY_PATH:-}"
           out=xpu-ci-output/native-tests
           mkdir -p "$out/lib"
+          cp -R xpu-ci-output/python-deps "$out/"
           cp xpu-ci-output/provenance.txt "$out/"
           for binary in \
             "$BUILD_DIR"/mooncake-transfer-engine/tent/tests/tent_xpu_{platform,transport,engine,ipc_process}_test \
