@@ -18,7 +18,8 @@ std::string ReadPrimaryOrAlias(const EnvironmentVariable<std::string>& primary,
 
 }  // namespace
 
-tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment() {
+tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment(
+    const ObjectReplicaTarget* target) {
     using Variables = OssAdapterEnvironmentVariables;
     OssAdapterConfig config;
 
@@ -51,6 +52,13 @@ tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment() {
         std::clamp(Environ::ReadOr(Variables::MOONCAKE_OSS_UPLOAD_BUFFER_SIZE,
                                    config.upload_buffer_size),
                    16 * 1024, 2 * 1024 * 1024);
+
+    if (target) {
+        config.endpoint = target->endpoint;
+        config.bucket = target->bucket;
+        config.region = target->region;
+        config.path_style = target->path_style;
+    }
 
     while (!config.endpoint.empty() && config.endpoint.back() == '/') {
         config.endpoint.pop_back();

@@ -65,4 +65,62 @@ TEST(BackgroundWorkerTest, ScheduleIsIgnoredWhileStopped) {
     EXPECT_EQ(callback_count, 0);
 }
 
+TEST(BackgroundWorkerTest, EarlierScheduleInterruptsTimedWait) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t callbacks = 0;
+    BackgroundWorker worker([&] {
+        std::lock_guard lock(mutex);
+        ++callbacks;
+        cv.notify_all();
+    });
+    worker.Start();
+    worker.ScheduleAt(BackgroundWorker::Clock::now() + std::chrono::hours(1));
+    worker.Schedule();
+    {
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return callbacks == 1; }));
+    }
+    worker.Stop();
+    EXPECT_EQ(callbacks, 1);
+}
+
+TEST(BackgroundWorkerTest, CallbackCanScheduleItsNextDeadline) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t callbacks = 0;
+    auto next = BackgroundWorker::Clock::time_point::max();
+    auto observed = BackgroundWorker::Clock::time_point::min();
+    BackgroundWorker worker([&] {
+        std::lock_guard lock(mutex);
+        if (++callbacks == 1) {
+            next =
+                BackgroundWorker::Clock::now() + std::chrono::milliseconds(1);
+            worker.ScheduleAt(next);
+        } else {
+            observed = BackgroundWorker::Clock::now();
+            cv.notify_all();
+        }
+    });
+    worker.Start();
+    worker.Schedule();
+    {
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return callbacks == 2; }));
+    }
+    worker.Stop();
+    EXPECT_GE(observed, next);
+}
+
+TEST(BackgroundWorkerTest, StopCancelsFutureWakeup) {
+    bool called = false;
+    BackgroundWorker worker([&] { called = true; });
+    worker.Start();
+    worker.ScheduleAt(BackgroundWorker::Clock::now() + std::chrono::hours(1));
+    worker.Stop();
+    EXPECT_FALSE(called);
+}
+
 }  // namespace mooncake::test

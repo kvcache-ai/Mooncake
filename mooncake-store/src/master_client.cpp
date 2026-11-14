@@ -31,6 +31,19 @@ struct RpcNameTraits<&store::GatherReadDirectory::Resolve> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetObjectStorageConfig> {
+    static constexpr const char* value = "GetObjectStorageConfig";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::FinishObjectStorageUpload> {
+    static constexpr const char* value = "FinishObjectStorageUpload";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RevokeObjectStorageWrite> {
+    static constexpr const char* value = "RevokeObjectStorageWrite";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
     static constexpr const char* value = "ExistKey";
 };
@@ -783,6 +796,22 @@ MasterClient::BatchGetReplicaListReadOnly(
                                                  object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+tl::expected<ObjectStorageConfig, ErrorCode>
+MasterClient::GetObjectStorageConfig() {
+    return invoke_rpc<&WrappedMasterService::GetObjectStorageConfig,
+                      ObjectStorageConfig>();
+}
+tl::expected<void, ErrorCode> MasterClient::FinishObjectStorageUpload(
+    const std::string& name, ObjectUploadOutcome outcome) {
+    return invoke_rpc<&WrappedMasterService::FinishObjectStorageUpload, void>(
+        client_id_, name, outcome, tenant_id_.value());
+}
+tl::expected<void, ErrorCode> MasterClient::RevokeObjectStorageWrite(
+    const std::string& key, const ObjectWriteAttempt& attempt) {
+    return invoke_rpc<&WrappedMasterService::RevokeObjectStorageWrite, void>(
+        client_id_, key, attempt, tenant_id_.value());
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>

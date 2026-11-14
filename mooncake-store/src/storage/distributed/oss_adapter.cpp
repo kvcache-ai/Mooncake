@@ -308,7 +308,8 @@ OssObjectStorageAdapter::OssObjectStorageAdapter(std::string key_prefix)
 }
 
 tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
-    auto config = OssAdapterConfig::FromEnvironment();
+    auto config =
+        OssAdapterConfig::FromEnvironment(target_ ? &*target_ : nullptr);
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }

@@ -72,9 +72,9 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 }
 
 // Decides whether PutStart may proceed with the replicas that were
-// actually allocated. Three deliberately different policies apply:
+// actually allocated. The following allocation policies apply:
 //
-//  - Memory-only (nof_replica_num == 0): best-effort. Fewer than
+//  - Memory-only: best-effort. Fewer than
 //    config.replica_num replicas (but at least one) still succeed, even
 //    though DetermineReplicaWriteMode() classifies such configs as
 //    RELIABLE_MULTI_REPLICA. The shortfall is surfaced via a WARNING log
@@ -82,9 +82,10 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 //    master_put_start_partial_allocations_total metric.
 //  - FLEXIBLE_DUAL_REPLICA (1 memory + 1 NoF): allocating either side
 //    alone is sufficient.
-//  - Any other config with nof_replica_num > 0: strict. Both replica
-//    types must match the requested counts exactly, otherwise PutStart
-//    fails with NO_AVAILABLE_HANDLE.
+//  - Object storage or any other config with nof_replica_num > 0: strict.
+//    Memory and NoF counts must match exactly, including zero. Object
+//    authorization follows allocation; it does not require a memory replica.
+//    A count mismatch fails with NO_AVAILABLE_HANDLE.
 //
 // The "reliable" guarantee of RELIABLE_MULTI_REPLICA is enforced at the
 // transfer stage (all allocated replicas must complete or the put is
@@ -92,7 +93,8 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+    if (config.os_replica_num == 0 && config.nof_replica_num == 0 &&
+        config.dfs_replica_num == 0) {
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -488,6 +490,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
               ClearInvalidHandles();
           }
       }),
+      object_storage_worker_([this] { MaintainObjectStorage(); }),
       kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
@@ -752,12 +755,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
+    InitObjectStorage(config);
+
     // This worker is part of the Client lifecycle protocol. Start it before
     // any raw std::thread so a startup failure can unwind the constructor
     // normally instead of encountering joinable thread destructors.
     client_offboarding_worker_.Start();
     VLOG(1) << "action=start_client_offboarding_worker";
     if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
+    if (object_uploads_) object_storage_worker_.Start();
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -973,6 +979,7 @@ MasterService::~MasterService() {
     }
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
+    object_storage_worker_.Stop();
     kvcs_capacity_refresh_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -3524,6 +3531,16 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     local_disk_desc.transport_endpoint, desc.status,
                     RecordRestoreKnownOwner(ctx.new_known_owner_records,
                                             local_disk_desc.client_id)));
+            } else if (desc.is_object_storage_replica()) {
+                const auto& object = desc.get_object_storage_descriptor();
+                if (!object_uploads_ ||
+                    object.object_size != standby_meta.size ||
+                    object.namespace_id !=
+                        object_storage_config_.NamespaceId() ||
+                    desc.status != ReplicaStatus::COMPLETE) {
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                replicas.push_back(Replica(desc.id, object, desc.status));
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
                 if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
@@ -3607,6 +3624,9 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
+        if (standby_meta.object_storage_write_attempt.has_value())
+            metadata.object_storage_write_attempt =
+                standby_meta.object_storage_write_attempt.value();
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -3754,10 +3774,13 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     auto result = RestoreFromStandbyStateCore(
         legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
         chunk_object_count, expected_max_replica_id, legacy_weight_metadata);
+    if (result && metadata_store)
+        result = RestoreObjectStorage(metadata_store->SnapshotObjectReplicas());
 
     lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
                                               : RestoreLifecycleState::kFailed,
                            std::memory_order_release);
+    if (result && object_uploads_) object_storage_worker_.Schedule();
     LOG(INFO) << "Restore lifecycle -> "
               << RestoreLifecycleStateToString(lifecycle_state_.load());
     return result;
@@ -4109,6 +4132,16 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         local_disk_desc.object_size,
                         local_disk_desc.transport_endpoint, desc.status,
                         record_for_known_owner(local_disk_desc.client_id)));
+                } else if (desc.is_object_storage_replica()) {
+                    const auto& object = desc.get_object_storage_descriptor();
+                    if (!object_uploads_ ||
+                        object.object_size != standby_meta.size ||
+                        object.namespace_id !=
+                            object_storage_config_.NamespaceId() ||
+                        desc.status != ReplicaStatus::COMPLETE) {
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    replicas.push_back(Replica(desc.id, object, desc.status));
                 } else if (desc.is_dfs_replica()) {
                     const auto& dfs_desc = desc.get_dfs_descriptor();
                     if (!use_kvcs_ ||
@@ -4627,6 +4660,11 @@ auto MasterService::BatchReplicaClear(
         }
     }
 
+    shared_lock.unlock();
+    if (object_uploads_) {
+        auto durable = AwaitObjectMutations();
+        if (!durable) return tl::make_unexpected(durable.error());
+    }
     return cleared_keys;
 }
 
@@ -5144,6 +5182,11 @@ auto MasterService::InsertMetadata(
     const TenantId& tenant_id = accessor.GetTenantId();
     const auto deadline_to_index = committed_soft_pin_timeout;
 
+    if (config.os_replica_num) {
+        auto authorized = AuthorizeObjectStorage(client_id, tenant_id, key,
+                                                 value_length, replicas);
+        if (!authorized) return tl::make_unexpected(authorized.error());
+    }
     std::vector<Replica::Descriptor> replica_list;
     std::unordered_set<ReplicaID> eligible_replica_ids;
     replica_list.reserve(replicas.size());
@@ -5189,7 +5232,27 @@ auto MasterService::InsertMetadata(
                                         *deadline_to_index);
     }
     accessor.GetState().is_processing = true;
-
+    if (object_uploads_) {
+        auto previous =
+            object_uploads_->FirstObjectUploadForKey(tenant_id.value(), key);
+        if (config.os_replica_num || previous) {
+            auto object =
+                std::find_if(replica_list.begin(), replica_list.end(),
+                             [](const auto& replica) {
+                                 return replica.is_object_storage_replica();
+                             });
+            const ObjectWriteAttempt attempt =
+                object != replica_list.end()
+                    ? ObjectWriteAttempt{object->id,
+                                         object->get_object_storage_descriptor()
+                                             .object_key}
+                    : ObjectWriteAttempt{replica_list.front().id,
+                                         UuidToString(generate_uuid())};
+            accessor.Get().object_storage_write_attempt = attempt;
+            for (auto& descriptor : replica_list)
+                descriptor.object_write_attempt = attempt;
+        }
+    }
     return replica_list;
 }
 
@@ -5229,13 +5292,20 @@ auto MasterService::PrepareWriteStart(
     uint64_t slice_length, const ReplicateConfig& config,
     std::string_view action) -> tl::expected<WriteStartPlan, ErrorCode> {
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
-         config.dfs_replica_num == 0) ||
+         config.dfs_replica_num == 0 && config.os_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
                    << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", os_replica_num=" << config.os_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.os_replica_num > 1 ||
+        (config.os_replica_num &&
+         (!object_uploads_ || config.dfs_replica_num ||
+          slice_length > object_storage_config_.max_object_bytes))) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 1) {
@@ -5325,6 +5395,10 @@ auto MasterService::PrepareWriteStart(
 auto MasterService::CleanupStaleBeforeWrite(const char* why,
                                             MetadataAccessorRW& accessor)
     -> tl::expected<void, ErrorCode> {
+    if (accessor.IsPublished() &&
+        accessor.GetState().object_storage_commit_pending)
+        return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+
     if (!accessor.IsPublished()) {
         return {};
     }
@@ -5378,10 +5452,10 @@ auto MasterService::AdmitWithDfsRecovery(const ReplicateConfig& config,
     return result;
 }
 
-auto MasterService::PutStart(const UUID& client_id, const std::string& key,
-                             const TenantId& tenant_id,
-                             const uint64_t slice_length,
-                             const ReplicateConfig& config)
+auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
+                                 const TenantId& tenant_id,
+                                 const uint64_t slice_length,
+                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
@@ -5418,6 +5492,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
         if (accessor.IsPublished()) {
             auto& metadata = accessor.Get();
+            if (config.os_replica_num &&
+                !metadata.HasReplica([](const Replica& replica) {
+                    return replica.is_object_storage_replica() &&
+                           replica.is_completed();
+                }) &&
+                (metadata.HasReplica(&Replica::fn_is_completed) ||
+                 metadata.put_start_time + put_start_discard_timeout_sec_ >=
+                     now)) {
+                return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            }
             if (metadata.HasReplica(&Replica::fn_is_completed) ||
                 metadata.put_start_time + put_start_discard_timeout_sec_ >=
                     now) {
@@ -5463,8 +5547,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
-auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+auto MasterService::PutEndImpl(const UUID& client_id,
+                               const ObjectMeta& object_meta,
+                               const TenantId& tenant_id,
+                               ReplicaType replica_type, bool persist,
+                               WeightStoreManager::ImportWriteGuard* admission)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -5488,7 +5575,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                     !replica.has_invalid_mem_handle()) ||
                    (replica.is_nof_replica() &&
                     !replica.has_invalid_nof_handle()) ||
-                   replica.is_dfs_replica();
+                   replica.is_dfs_replica() ||
+                   replica.is_object_storage_replica();
         }
         if (replica_type == ReplicaType::MEMORY) {
             return replica.is_memory_replica() &&
@@ -5527,10 +5615,13 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     // Do not take the group lock while holding the object shard. The guard
     // arbitrates timeout admission without holding a lock across durability.
-    auto import_write = weight_manager_.TrackImportWrite(object_id.tenant_id,
-                                                         metadata.group_id);
-    if (!import_write) {
-        return tl::make_unexpected(import_write.error());
+    std::optional<WeightStoreManager::ImportWriteGuard> local_admission;
+    if (!admission) {
+        auto tracked = weight_manager_.TrackImportWrite(object_id.tenant_id,
+                                                        metadata.group_id);
+        if (!tracked) return tl::make_unexpected(tracked.error());
+        local_admission.emplace(std::move(*tracked));
+        admission = &*local_admission;
     }
 
     if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
@@ -5591,7 +5682,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
     }
 
-    if (replica_type != ReplicaType::DFS && enable_offload_ &&
+    if (!metadata.HasReplica(&Replica::fn_is_object_storage_replica) &&
+        replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
@@ -5630,7 +5722,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
     PublishKvStored(key, metadata, object_id.tenant_id);
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    if (persist && enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
         auto result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key, payload);
@@ -5639,8 +5731,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                          << ", err=" << static_cast<int>(result.error());
         }
     }
+    accessor.GetState().object_storage_commit_pending = false;
     if (advanced_primary_write) {
-        import_write->Accept();
+        admission->Accept();
     }
     return {};
 }
@@ -5790,6 +5883,10 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto& metadata = accessor.Get();
+    if (metadata.object_storage_write_attempt ||
+        metadata.HasReplica(&Replica::fn_is_object_storage_replica))
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
@@ -5938,10 +6035,11 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 //
 // Note: during Case B the key is temporarily unreadable (all replicas are
 // PROCESSING).  Readers will get REPLICA_IS_NOT_READY until UpsertEnd.
-auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
-                                const TenantId& tenant_id,
-                                const uint64_t slice_length,
-                                const ReplicateConfig& config)
+auto MasterService::UpsertStartImpl(const UUID& client_id,
+                                    const std::string& key,
+                                    const TenantId& tenant_id,
+                                    const uint64_t slice_length,
+                                    const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
@@ -6046,6 +6144,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // buffers, so every completed Client-owned target must still
                 // be serving before any queue or metadata state is changed.
                 if (metadata.TotalLength() == slice_length &&
+                    !metadata.HasReplica(
+                        &Replica::fn_is_object_storage_replica) &&
                     metadata.HasReplica([](const Replica& replica) {
                         if (!replica.is_completed() ||
                             (!replica.is_memory_replica() &&
@@ -6178,20 +6278,29 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_read_lease = !metadata.IsLeaseExpired(now);
                 if (has_read_lease &&
                     metadata.HasReplica([](const Replica& replica) {
-                        return !replica.is_memory_replica();
+                        return !replica.is_memory_replica() &&
+                               !replica.is_object_storage_replica();
                     })) {
                     // File-backed reads can resolve storage by key, so they
                     // cannot retain an old version across replacement.
                     return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
                 }
 
-                const bool has_bucket_dfs_replica =
-                    bucket_allocator_ != nullptr &&
-                    metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                const bool requires_fresh_object_replicas =
+                    config.os_replica_num ||
+                    metadata.HasReplica(
+                        &Replica::fn_is_object_storage_replica) ||
+                    (object_uploads_ &&
+                     object_uploads_->FirstObjectUploadForKey(
+                         object_id.tenant_id.value(), key));
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
-                    !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
+                    !requires_fresh_object_replicas &&
+                    !(bucket_allocator_ != nullptr &&
+                      metadata.HasReplica(&Replica::fn_is_dfs_replica)) &&
+                    !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    metadata.object_storage_write_attempt.reset();
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
@@ -6259,7 +6368,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // old metadata so an allocation failure leaves the old object
                 // readable instead of turning it into OBJECT_NOT_FOUND.
                 std::optional<std::vector<Replica>> replacement_replicas;
-                if (has_read_lease) {
+                // Bucket DFS indexes reservations by key and must release the
+                // old reservation before allocating its replacement below.
+                if (has_read_lease || requires_fresh_object_replicas) {
                     auto grown = accessor.Grow(SaturatingMultiply(
                         slice_length, allocation_config.replica_num));
                     if (!grown) {
@@ -6273,6 +6384,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     }
                     replacement_replicas.emplace(
                         std::move(allocation_result.value()));
+                    if (config.os_replica_num) {
+                        auto authorized = AuthorizeObjectStorage(
+                            client_id, object_id.tenant_id, key, slice_length,
+                            *replacement_replicas);
+                        if (!authorized)
+                            return tl::make_unexpected(authorized.error());
+                    }
                 }
 
                 // A query granted before this write lock can retain its
@@ -7350,9 +7468,9 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
     return RemoveObject(key, tenant_id, force, false);
 }
 
-auto MasterService::RemoveObject(const std::string& key,
-                                 const TenantId& tenant_id, bool force,
-                                 bool allow_managed_weight)
+auto MasterService::RemoveObjectImpl(const std::string& key,
+                                     const TenantId& tenant_id, bool force,
+                                     bool allow_managed_weight)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -7519,6 +7637,11 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
             << ", removed_count=" << result.removed_count;
+    shared_lock.unlock();
+    if (object_uploads_) {
+        auto durable = AwaitObjectMutations();
+        if (!durable) return tl::make_unexpected(durable.error());
+    }
     return result.removed_count;
 }
 
@@ -7579,6 +7702,8 @@ long MasterService::RemoveAll(bool force) {
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
+    shared_lock.unlock();
+    if (object_uploads_ && !AwaitObjectMutations()) return -1;
     return removed_count;
 }
 
@@ -7609,6 +7734,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             << ", tenant_id=" << normalized_tenant.value()
             << ", removed_count=" << result.removed_count
             << ", total_freed_size=" << result.freed_bytes;
+    shared_lock.unlock();
+    if (object_uploads_ && !AwaitObjectMutations()) return -1;
     return result.removed_count;
 }
 
@@ -7690,6 +7817,13 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         results[original_idx] = {};  // Success
     }
 
+    snapshot_lock.unlock();
+    if (object_uploads_) {
+        auto durable = AwaitObjectMutations();
+        if (!durable)
+            for (auto& result : results)
+                if (result) result = tl::make_unexpected(durable.error());
+    }
     return results;
 }
 
@@ -9727,6 +9861,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             continue;
         }
 
+        if (accessor.GetState().object_storage_commit_pending) continue;
         auto& metadata = accessor.Get();
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
@@ -11413,7 +11548,8 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
+                       replica.is_dfs_replica() ||
+                       replica.is_object_storage_replica()) {
                 has_disk = true;
             }
         });
@@ -11453,7 +11589,8 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
                 has_cpu = true;
             } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
+                       replica.is_dfs_replica() ||
+                       replica.is_object_storage_replica()) {
                 has_disk = true;
             }
         });
@@ -11756,6 +11893,9 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
     payload.residency_affinity_id = metadata.residency_affinity_id;
+    if (metadata.object_storage_write_attempt)
+        payload.object_storage_write_attempt =
+            *metadata.object_storage_write_attempt;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
@@ -11850,8 +11990,8 @@ MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
     entry.tenant_id = resolved_tenant.value();
     entry.object_key = key;
     entry.payload = payload;
-    auto pending = ordered_oplog_writer_->Commit(std::move(reservation.value()),
-                                                 std::move(entry), nullptr);
+    auto pending = CommitObjectAware(std::move(reservation.value()),
+                                     std::move(entry), nullptr);
     if (!pending) {
         return tl::unexpected(pending.error());
     }
@@ -11939,8 +12079,8 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
     entry.tenant_id = resolved_tenant.value();
     entry.object_key = key;
     entry.payload = payload;
-    auto pending = ordered_oplog_writer_->Commit(std::move(reservation), entry,
-                                                 std::move(callback));
+    auto pending =
+        CommitObjectAware(std::move(reservation), entry, std::move(callback));
     if (!pending) {
         return tl::unexpected(pending.error());
     }

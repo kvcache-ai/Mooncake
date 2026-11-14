@@ -1,3 +1,4 @@
+#include "metadata_wire_compat.h"
 #include "ha/snapshot/batch_oplog/codec.h"
 
 #include <limits>
@@ -61,7 +62,16 @@ DecodeBatchOpLogSnapshotObjectChunk(const std::vector<uint8_t>& encoded,
     auto decoded =
         Decode<BatchOpLogSnapshotObjectChunk>(encoded, "snapshot object chunk");
     if (!decoded) {
-        return decoded;
+        auto legacy = Decode<metadata_wire_v2::Chunk>(
+            encoded, "legacy snapshot object chunk");
+        if (!legacy) return decoded;
+        BatchOpLogSnapshotObjectChunk converted;
+        converted.chunk_index = legacy->chunk_index;
+        for (const auto& entry : legacy->objects)
+            converted.objects.push_back(
+                {entry.tenant_id, entry.key,
+                 metadata_wire_v2::Convert(entry.metadata)});
+        decoded = std::move(converted);
     }
     if (decoded->chunk_index != expected_chunk_index) {
         return tl::make_unexpected("Snapshot object chunk index mismatch");

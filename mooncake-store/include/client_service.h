@@ -34,6 +34,7 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
+class ObjectStorageBackend;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -956,6 +957,9 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const std::string& key, const ObjectWriteAttempt& attempt);
+
     // What the dangling-replica probe established for one key. The Put path
     // retries only on kEvicted; the batch-get path also retries on kPresent,
     // because a batch read dies wholesale and a healthy key swept in by a
@@ -1040,6 +1044,21 @@ class Client {
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
         TransferIntent intent = TransferIntent::kUnspecified);
+    ErrorCode InitObjectStorage();
+    ErrorCode WriteObjectStorageReplica(const Replica::Descriptor&,
+                                        const std::vector<Slice>&);
+    ErrorCode ReadObjectStorageReplica(const Replica::Descriptor&,
+                                       const std::vector<Slice>&, uint64_t);
+    void SubmitObjectStorageWrites(std::vector<PutOperation>&);
+    void PollObjectStorage();
+    void ReportObjectStorageUpload(const std::string&, ObjectUploadOutcome);
+    void AcknowledgeObjectStorageWrite(const std::vector<Replica::Descriptor>&);
+    std::shared_ptr<ObjectStorageBackend> object_storage_backend_;
+    std::string object_storage_namespace_;
+    std::mutex object_storage_completions_mutex_;
+    std::unordered_map<std::string, ObjectUploadOutcome>
+        object_storage_completions_;
+
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,

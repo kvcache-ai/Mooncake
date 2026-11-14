@@ -41,7 +41,8 @@ bool NeedsPathStyle(std::string_view host) {
 
 }  // namespace
 
-tl::expected<S3AdapterConfig, ErrorCode> S3AdapterConfig::FromEnvironment() {
+tl::expected<S3AdapterConfig, ErrorCode> S3AdapterConfig::FromEnvironment(
+    const ObjectReplicaTarget* target) {
     using Variables = S3AdapterEnvironmentVariables;
     S3AdapterConfig config;
 
@@ -51,7 +52,9 @@ tl::expected<S3AdapterConfig, ErrorCode> S3AdapterConfig::FromEnvironment() {
 
     // Region: MOONCAKE_S3_REGION, then AWS_REGION, then AWS_DEFAULT_REGION
     // (the order the AWS CLI and SDKs use), then us-east-1.
-    if (auto region = Environ::Read(Variables::MOONCAKE_S3_REGION)) {
+    if (target) {
+        config.region = target->region;
+    } else if (auto region = Environ::Read(Variables::MOONCAKE_S3_REGION)) {
         config.region = *region;
     } else if (auto aws_region = Environ::Read(Variables::AWS_REGION)) {
         config.region = *aws_region;
@@ -106,6 +109,13 @@ tl::expected<S3AdapterConfig, ErrorCode> S3AdapterConfig::FromEnvironment() {
         std::clamp(Environ::ReadOr(Variables::MOONCAKE_S3_UPLOAD_BUFFER_SIZE,
                                    config.upload_buffer_size),
                    16 * 1024, 2 * 1024 * 1024);
+
+    if (target) {
+        config.endpoint = target->endpoint;
+        config.bucket = target->bucket;
+        config.region = target->region;
+        config.path_style = target->path_style;
+    }
 
     while (!config.endpoint.empty() && config.endpoint.back() == '/') {
         config.endpoint.pop_back();

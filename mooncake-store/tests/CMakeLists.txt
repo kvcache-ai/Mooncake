@@ -648,3 +648,9 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+# Manual end-to-end protocol driver; orchestrated by object_storage_e2e.py.
+add_executable(object_storage_protocol_client
+               object_storage_protocol_client.cpp)
+target_link_libraries(object_storage_protocol_client PRIVATE mooncake_store
+                                                             glog::glog)

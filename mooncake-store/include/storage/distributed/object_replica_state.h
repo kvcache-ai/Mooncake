@@ -6,21 +6,9 @@
 #include <vector>
 
 #include "replica.h"
+#include "config/object_storage_config.h"
 
 namespace mooncake {
-
-// Non-secret identity of the storage namespace. Credentials stay process-local.
-struct ObjectReplicaTarget {
-    std::string provider;
-    std::string endpoint;
-    std::string bucket;
-    std::string region;
-    std::string prefix;
-    bool path_style{false};
-    YLT_REFL(ObjectReplicaTarget, provider, endpoint, bucket, region, prefix,
-             path_style);
-    bool operator==(const ObjectReplicaTarget&) const = default;
-};
 
 // Object addressing only; this review unit does not add a Store replica type.
 struct ObjectStorageLocation {

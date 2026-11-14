@@ -100,16 +100,34 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
             return false;
         }
     }
-    // Logical metadata keeps its existing codec and ownership. The integration
-    // must validate its exact object descriptor before submitting this entry.
-    if (!mutation.metadata_payload.empty() &&
-        std::none_of(mutation.records.begin(), mutation.records.end(),
-                     [&](const auto& record) {
-                         return record.phase == ObjectUploadPhase::UPLOADED &&
-                                record.writer == payload.client_id &&
-                                record.object.object_size == payload.size;
-                     })) {
-        return false;
+    if (!mutation.metadata_payload.empty()) {
+        for (const auto& record : mutation.records) {
+            if (record.phase == ObjectUploadPhase::AUTHORIZED ||
+                (record.phase == ObjectUploadPhase::UPLOADED &&
+                 (record.writer != payload.client_id ||
+                  record.object.object_size != payload.size)))
+                return false;
+        }
+    }
+    // Every object descriptor must be backed by this exact immutable attempt.
+    // A removal/replacement may legitimately leave only non-object replicas.
+    for (const auto& replica : payload.replicas) {
+        if (!replica.is_object_storage_replica()) continue;
+        const auto& object = replica.get_object_storage_descriptor();
+        const auto candidate = std::find_if(
+            mutation.records.begin(), mutation.records.end(),
+            [&](const auto& record) {
+                return record.replica_id == replica.id &&
+                       record.object.object_key == object.object_key;
+            });
+        if (candidate == mutation.records.end() ||
+            candidate->phase != ObjectUploadPhase::UPLOADED ||
+            !candidate->upload_finished ||
+            candidate->writer != payload.client_id ||
+            candidate->object.object_size != payload.size ||
+            object.object_size != payload.size ||
+            replica.status != ReplicaStatus::COMPLETE)
+            return false;
     }
     for (const auto& name : mutation.forget) {
         const auto old = object_uploads_.find(name);
@@ -123,10 +141,29 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
     object_storage_target_ = mutation.target;
     for (const auto& record : mutation.records) {
         object_uploads_[record.object.object_key] = record;
+        object_upload_keys_[{record.tenant_id, record.key}].insert(
+            record.object.object_key);
+        const auto identity = std::make_pair(record.tenant_id, record.key);
+        if (record.phase == ObjectUploadPhase::RETIRED) {
+            retired_object_upload_names_.insert(record.object.object_key);
+            auto active = active_object_upload_keys_.find(identity);
+            if (active != active_object_upload_keys_.end()) {
+                active->second.erase(record.object.object_key);
+                if (active->second.empty())
+                    active_object_upload_keys_.erase(active);
+            }
+        } else
+            active_object_upload_keys_[identity].insert(
+                record.object.object_key);
         object_upload_names_[record.replica_id] = record.object.object_key;
     }
     for (const auto& name : mutation.forget) {
-        object_upload_names_.erase(object_uploads_.at(name).replica_id);
+        const auto& record = object_uploads_.at(name);
+        auto key_it = object_upload_keys_.find({record.tenant_id, record.key});
+        key_it->second.erase(name);
+        if (key_it->second.empty()) object_upload_keys_.erase(key_it);
+        object_upload_names_.erase(record.replica_id);
+        retired_object_upload_names_.erase(name);
         object_uploads_.erase(name);
     }
     if (mutation.remove_value) {
@@ -157,9 +194,74 @@ bool StandbyMetadataStore::RestoreObjectReplicas(
     }
     std::lock_guard lock(mutex_);
     object_storage_target_ = snapshot.target;
+    object_upload_keys_.clear();
+    active_object_upload_keys_.clear();
+    retired_object_upload_names_.clear();
+    for (const auto& [name, record] : records) {
+        object_upload_keys_[{record.tenant_id, record.key}].insert(name);
+        if (record.phase == ObjectUploadPhase::RETIRED)
+            retired_object_upload_names_.insert(name);
+        else
+            active_object_upload_keys_[{record.tenant_id, record.key}].insert(
+                name);
+    }
     object_uploads_ = std::move(records);
     object_upload_names_ = std::move(ids);
     return true;
+}
+
+std::optional<ObjectUploadRecord> StandbyMetadataStore::FindObjectUpload(
+    const std::string& name) const {
+    std::lock_guard lock(mutex_);
+    auto it = object_uploads_.find(name);
+    if (it == object_uploads_.end()) return std::nullopt;
+    return it->second;
+}
+std::vector<ObjectUploadRecord> StandbyMetadataStore::ObjectUploadChunk(
+    const std::string& after, size_t count) const {
+    std::lock_guard lock(mutex_);
+    std::vector<ObjectUploadRecord> records;
+    auto it = after.empty() ? object_uploads_.begin()
+                            : object_uploads_.upper_bound(after);
+    while (it != object_uploads_.end() && records.size() < count) {
+        records.push_back(it->second);
+        ++it;
+    }
+    return records;
+}
+std::optional<ObjectUploadRecord> StandbyMetadataStore::FirstObjectUploadForKey(
+    const std::string& tenant, const std::string& key) const {
+    std::lock_guard lock(mutex_);
+    auto it = object_upload_keys_.find({NormalizeTenantId(tenant), key});
+    if (it == object_upload_keys_.end()) return std::nullopt;
+    return object_uploads_.at(*it->second.begin());
+}
+std::vector<ObjectUploadRecord> StandbyMetadataStore::ActiveObjectUploadsForKey(
+    const std::string& tenant, const std::string& key) const {
+    std::lock_guard lock(mutex_);
+    std::vector<ObjectUploadRecord> records;
+    auto it = active_object_upload_keys_.find({NormalizeTenantId(tenant), key});
+    if (it != active_object_upload_keys_.end())
+        for (const auto& name : it->second)
+            records.push_back(object_uploads_.at(name));
+    return records;
+}
+std::vector<ObjectUploadRecord> StandbyMetadataStore::RetiredObjectUploadChunk(
+    const std::string& after, size_t count) const {
+    std::lock_guard lock(mutex_);
+    std::vector<ObjectUploadRecord> records;
+    auto it = after.empty() ? retired_object_upload_names_.begin()
+                            : retired_object_upload_names_.upper_bound(after);
+    while (it != retired_object_upload_names_.end() && records.size() < count) {
+        records.push_back(object_uploads_.at(*it));
+        ++it;
+    }
+    return records;
+}
+
+size_t StandbyMetadataStore::ObjectUploadCount() const {
+    std::lock_guard lock(mutex_);
+    return object_uploads_.size();
 }
 
 bool StandbyMetadataStore::HasObjectReplicaState() const {
@@ -254,6 +356,9 @@ void StandbyMetadataStore::Clear() {
     store_.clear();
     object_storage_target_.reset();
     object_uploads_.clear();
+    object_upload_keys_.clear();
+    active_object_upload_keys_.clear();
+    retired_object_upload_names_.clear();
     object_upload_names_.clear();
     weight_metadata_.clear();
     weight_metadata_tombstones_.clear();

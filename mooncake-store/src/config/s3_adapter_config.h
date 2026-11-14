@@ -5,6 +5,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
+#include "config/object_storage_config.h"
 
 namespace mooncake {
 
@@ -21,7 +22,8 @@ struct S3AdapterConfig {
     int receive_buffer_size = 1024 * 1024;
     int upload_buffer_size = 1024 * 1024;
 
-    static tl::expected<S3AdapterConfig, ErrorCode> FromEnvironment();
+    static tl::expected<S3AdapterConfig, ErrorCode> FromEnvironment(
+        const ObjectReplicaTarget* target = nullptr);
 };
 
 }  // namespace mooncake

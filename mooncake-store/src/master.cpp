@@ -385,6 +385,32 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
 
+DEFINE_bool(enable_object_storage, false, "Enable synchronous object replicas");
+DEFINE_string(object_storage_provider, "s3",
+              "Object service provider: s3 or oss");
+DEFINE_string(object_storage_endpoint, "", "Object service endpoint");
+DEFINE_string(object_storage_bucket, "", "Object service bucket");
+DEFINE_string(object_storage_region, "",
+              "Object service signing region; required when object replicas "
+              "are enabled");
+DEFINE_string(object_storage_prefix, "", "Immutable object namespace prefix");
+DEFINE_bool(object_storage_path_style, false, "Use path-style object requests");
+DEFINE_uint64(
+    object_storage_max_pending_records, 10000,
+    "Admission threshold for uncommitted uploads and retired objects; "
+    "committed referenced objects do not count");
+DEFINE_uint64(object_storage_max_object_bytes, 268435456,
+              "Maximum object size");
+DEFINE_uint64(object_storage_max_staging_bytes, 1073741824,
+              "Maximum object staging bytes per client");
+DEFINE_uint64(object_storage_maintenance_batch_size, 32,
+              "Maximum pending records per worker callback; due backlog "
+              "continues in the next callback without an interval wait");
+DEFINE_uint64(
+    object_storage_cleanup_interval_ms, 10000,
+    "Retry/recheck interval for failed deletions, unknown uploads and "
+    "unfinished writes; not a delay between healthy cleanup batches");
+
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
             "Enable HA metadata replication through batch-record OpLog");
@@ -694,6 +720,43 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                             FLAGS_etcd_max_send_message_bytes);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
+    default_config.GetBool("enable_object_storage",
+                           &master_config.object_storage.enabled,
+                           FLAGS_enable_object_storage);
+    default_config.GetString("object_storage_provider",
+                             &master_config.object_storage.target.provider,
+                             FLAGS_object_storage_provider);
+    default_config.GetString("object_storage_endpoint",
+                             &master_config.object_storage.target.endpoint,
+                             FLAGS_object_storage_endpoint);
+    default_config.GetString("object_storage_bucket",
+                             &master_config.object_storage.target.bucket,
+                             FLAGS_object_storage_bucket);
+    default_config.GetString("object_storage_region",
+                             &master_config.object_storage.target.region,
+                             FLAGS_object_storage_region);
+    default_config.GetString("object_storage_prefix",
+                             &master_config.object_storage.target.prefix,
+                             FLAGS_object_storage_prefix);
+    default_config.GetBool("object_storage_path_style",
+                           &master_config.object_storage.target.path_style,
+                           FLAGS_object_storage_path_style);
+    default_config.GetUInt64("object_storage_max_pending_records",
+                             &master_config.object_storage.max_pending_records,
+                             FLAGS_object_storage_max_pending_records);
+    default_config.GetUInt64("object_storage_max_object_bytes",
+                             &master_config.object_storage.max_object_bytes,
+                             FLAGS_object_storage_max_object_bytes);
+    default_config.GetUInt64("object_storage_max_staging_bytes",
+                             &master_config.object_storage.max_staging_bytes,
+                             FLAGS_object_storage_max_staging_bytes);
+    default_config.GetUInt64(
+        "object_storage_maintenance_batch_size",
+        &master_config.object_storage.maintenance_batch_size,
+        FLAGS_object_storage_maintenance_batch_size);
+    default_config.GetUInt64("object_storage_cleanup_interval_ms",
+                             &master_config.object_storage.cleanup_interval_ms,
+                             FLAGS_object_storage_cleanup_interval_ms);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
                            FLAGS_enable_oplog);
     default_config.GetBool(
@@ -1174,6 +1237,70 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
     }
+    if ((google::GetCommandLineFlagInfo("enable_object_storage", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.enabled = FLAGS_enable_object_storage;
+    if ((google::GetCommandLineFlagInfo("object_storage_provider", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.target.provider =
+            FLAGS_object_storage_provider;
+    if ((google::GetCommandLineFlagInfo("object_storage_endpoint", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.target.endpoint =
+            FLAGS_object_storage_endpoint;
+    if ((google::GetCommandLineFlagInfo("object_storage_bucket", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.target.bucket =
+            FLAGS_object_storage_bucket;
+    if ((google::GetCommandLineFlagInfo("object_storage_region", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.target.region =
+            FLAGS_object_storage_region;
+    if ((google::GetCommandLineFlagInfo("object_storage_prefix", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.target.prefix =
+            FLAGS_object_storage_prefix;
+    if ((google::GetCommandLineFlagInfo("object_storage_path_style", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.target.path_style =
+            FLAGS_object_storage_path_style;
+    if ((google::GetCommandLineFlagInfo("object_storage_max_pending_records",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.max_pending_records =
+            FLAGS_object_storage_max_pending_records;
+    if ((google::GetCommandLineFlagInfo("object_storage_max_object_bytes",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.max_object_bytes =
+            FLAGS_object_storage_max_object_bytes;
+    if ((google::GetCommandLineFlagInfo("object_storage_max_staging_bytes",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.max_staging_bytes =
+            FLAGS_object_storage_max_staging_bytes;
+    if ((google::GetCommandLineFlagInfo("object_storage_maintenance_batch_size",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.maintenance_batch_size =
+            FLAGS_object_storage_maintenance_batch_size;
+    if ((google::GetCommandLineFlagInfo("object_storage_cleanup_interval_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.cleanup_interval_ms =
+            FLAGS_object_storage_cleanup_interval_ms;
     if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1486,6 +1613,12 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    if (master_config.object_storage.enabled &&
+        master_config.object_storage.target.region.empty()) {
+        LOG(ERROR) << "object_storage_region must be explicitly set when "
+                      "enable_object_storage=true";
+        return 1;
+    }
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
