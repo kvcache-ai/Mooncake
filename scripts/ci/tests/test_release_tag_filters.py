@@ -14,6 +14,7 @@ WORKFLOWS = REPOSITORY / ".github" / "workflows"
 STABLE_RELEASE_WORKFLOWS = (
     "release.yaml",
     "release-cuda13.yaml",
+    "release-memfabric.yaml",
     "release-musa.yaml",
     "release-non-cuda.yaml",
     "release-npu.yaml",
@@ -81,6 +82,7 @@ VERSION_CHECK_SOURCES = {
     "release.yaml": "_build-wheel.yaml",
     "release-cuda13.yaml": "_build-wheel.yaml",
     "release-non-cuda.yaml": "_build-wheel.yaml",
+    "release-memfabric.yaml": "release-memfabric.yaml",
     "release-musa.yaml": "release-musa.yaml",
     "release-npu.yaml": "release-npu.yaml",
     "release-rocm.yaml": "release-rocm.yaml",
