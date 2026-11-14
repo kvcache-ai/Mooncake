@@ -937,7 +937,8 @@ if(TARGET tent_xport_fabric)
     UnregisteredTargetIsRejected
     PeerLossFails
     QueuedOpFailsWhileCreditIsHeld
-    OverdueOpHoldsTaskAndBuffer)
+    OverdueOpHoldsTaskAndBuffer
+    OverdueOpUnregisterRetryStillWaits)
     add_test(NAME tent_fabric_transport_${case}
              COMMAND tent_fabric_transport_test
                      --gtest_filter=FabricTransportTest.${case})
