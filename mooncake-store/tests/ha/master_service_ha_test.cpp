@@ -3026,6 +3026,59 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
               metric_before + 1024);
 }
 
+TEST_F(MasterServiceHATest, PruningWorkerStopBeforeStartRemainsLatched) {
+    const std::string cluster_id = "test_pruner_stop_before_start";
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build();
+    MasterService service(service_config);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    service.RequestStopBatchOpLogPruningWorker();
+
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+              service.StartBatchOpLogPruningWorker(10, 50));
+}
+
+TEST_F(MasterServiceHATest, PruningWorkerStartRacesStopRequestSafely) {
+    const std::string cluster_id = "test_pruner_start_stop_race";
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build();
+    MasterService service(service_config);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    std::promise<void> start_calls;
+    const auto start_calls_future = start_calls.get_future().share();
+    auto start = std::async(std::launch::async, [&] {
+        start_calls_future.wait();
+        return service.StartBatchOpLogPruningWorker(10, 50);
+    });
+    auto stop = std::async(std::launch::async, [&] {
+        start_calls_future.wait();
+        service.RequestStopBatchOpLogPruningWorker();
+    });
+    start_calls.set_value();
+
+    const ErrorCode start_result = start.get();
+    stop.get();
+    EXPECT_TRUE(start_result == ErrorCode::OK ||
+                start_result == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    service.StopBatchOpLogPruningWorker();
+}
+
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
     const std::string cluster_id = "test_restore_repair_no_writer";
     auto service_config = MasterServiceConfig::builder()

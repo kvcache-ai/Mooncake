@@ -74,6 +74,7 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
+class BatchOpLogPruningWorker;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -159,6 +160,10 @@ class MasterService {
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
+    ErrorCode StartBatchOpLogPruningWorker(uint64_t chunk_batch_count,
+                                           uint64_t max_batches_per_second);
+    void RequestStopBatchOpLogPruningWorker();
+    void StopBatchOpLogPruningWorker();
     void StopBatchOpLogWriter();
 
     /**
@@ -2311,6 +2316,12 @@ class MasterService {
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
+    std::unique_ptr<BatchOpLogPruningWorker> batch_oplog_pruning_worker_;
+    // Serializes the pruning worker's pointer publication with asynchronous
+    // stop requests. The stop latch belongs to this service instance and is
+    // intentionally not cleared by a later worker Start().
+    std::mutex batch_oplog_pruning_mutex_;
+    bool batch_oplog_pruning_stop_requested_{false};
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     // OpLog publishing helpers

@@ -285,7 +285,7 @@ All names in the table have the `ha_snapshot_` prefix:
 | `catch_up_target_batch`, `catch_up_target_sequence` | Durable cursor observed when capture was released; zero after local apply reaches it. |
 | `applied_batch`, `latest_batch`, `fallback_batch` | Local applied cursor and last observed pointer cursors; compare with the catch-up target and durable batch. |
 | `durable_batch`, `compaction_floor`, `candidate_floor` | Last observed durable batch, reader-visible retention floor, and latest pruning candidate. The floor updates immediately after its CAS, before batch deletion. |
-| `uncompacted_batches` | `max(durable_batch - compaction_floor, 0)`: the logical retained suffix, not a physical etcd key count or database size. Failed deletion can retain additional keys below the floor. |
+| `uncompacted_batches` | `max(durable_batch - compaction_floor, 0)`: the logical retained suffix, not a physical etcd key count or database size. Asynchronous deletion can leave additional keys below the floor. |
 | `floor_advances_total`, `lease_lost_total` | Successful floor advances and acquired maintenance leases observed lost before release. A failed publish CAS alone does not prove lease loss. |
 | `gc_orphan_prefixes`, `gc_deleted_prefixes` | Unprotected attempt prefixes found by the last completed GC listing, and how many that sweep deleted. A failure before listing leaves the previous observation. |
 | `operations_total{operation}`, `errors_total{operation}`, `duration_us_total{operation}` | Completed calls, failed calls (including exceptions), and total elapsed microseconds. Operations are `schedule`, `upload`, `bootstrap`, `replay`, `publish`, `gc`, `prune`, and `rebootstrap`. Scheduling decisions past the interval/lifecycle gates and no-op pruning calls are included in completed calls; inspect skip reasons and floor advances for its effect. |
@@ -309,6 +309,22 @@ have independent error counters: a GC failure does not turn a committed publicat
 into a failure. Pointer observations may lag changes made by another standby until
 the next scheduler/bootstrap read.
 
+The snapshot `prune` operation covers snapshot validation and floor publication.
+Physical deletion runs asynchronously on the leader and reports these metrics,
+all with the `mooncake_ha_batch_oplog_pruner_` prefix:
+
+| Metric suffix | Meaning |
+| --- | --- |
+| `active` | Whether the pruning worker is active. Check errors and floor lag to assess progress. |
+| `cursor_batch_id` | Recovered or successfully deleted-through batch ID. |
+| `floor_lag_batch_ids` | `max(observed_floor - cursor_batch_id, 0)`: pending batch ID positions through the last observed floor, not a physical key count. |
+| `chunks_deleted_total` | Successful bounded delete requests, including requests covering already absent keys. |
+| `batch_ids_advanced_total` | Batch ID positions advanced through successful deletion, including already absent keys. |
+| `errors_total` | Failed floor reads, cursor recovery, or deletion attempts. |
+
+Pruner counters reset whenever the worker starts, including when the same master
+becomes leader again. Values remain exposed after the worker stops.
+
 ---
 
 ### Batch OpLog Capacity Operations
@@ -331,9 +347,14 @@ is an example; choose retention for all watch/revision consumers and keep member
 configuration consistent. Monitor each member's `dbSize`, `dbSizeInUse`, quota
 utilization and free disk space. Increasing quota does not replace cleanup.
 
-For Mooncake alerts, use `ha_snapshot_active=1` and the metrics described above.
-Snapshot storage outages stall new baselines and pruning; GC failures retain
-orphan artifacts. These failures retain recovery data safely but grow storage
+For snapshot alerts, use `ha_snapshot_active=1` and the metrics described above.
+Snapshot storage outages stall new baselines and floor advancement; the leader
+can continue deleting through an already published floor. GC failures retain
+orphan artifacts. Deletion failures or a pruning rate below the rate at which
+batch IDs become eligible for deletion grow the backlog below the floor. Monitor
+`mooncake_ha_batch_oplog_pruner_floor_lag_batch_ids` on the leader while
+`mooncake_ha_batch_oplog_pruner_active=1` and tune the pruning limits for measured
+backend capacity. These delays retain recovery data safely but grow storage
 until availability is at risk. The logical retained suffix does not include
 undeleted keys below the floor. Never lower the floor or manually delete batch
 keys/pointers to clear a capacity alarm.
@@ -451,9 +472,12 @@ HA leadership and metadata replication are configured separately:
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
 - `--etcd_max_send_message_bytes`: Outgoing gRPC message limit for the HA store etcd client, in bytes. Defaults to `2097152` (2 MiB) and must be positive. For a server configured with `--max-request-bytes=16777216`, use `--etcd_max_send_message_bytes=16777216` and keep serialized batches below that request budget. The setting is applied before the first connection and reused by reset and keepalive clients; it does not change the server limit, receive limit, Transfer Engine client, or snapshot client. The YAML/JSON configuration key is also `etcd_max_send_message_bytes`; an explicitly supplied CLI flag overrides it.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
-- With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
+- With `enable_oplog_snapshot=true`, each successful publication also attempts to advance a monotonic `compaction_floor` under the same maintenance lease. This requires two independently validated snapshots and sets the floor to the fallback snapshot's batch ID. The first snapshot does not publish a floor. GC or floor-publication failures keep the published snapshot successful.
+- The leader runs a separate background worker that deletes batches through the published floor in bounded, paced chunks. It recovers its cursor from the oldest remaining batch on startup, polls for floor changes every 10 seconds while idle, and retries backend errors without waiting for another snapshot publication. Physical deletion does not hold the snapshot maintenance lease. Leadership loss requests worker shutdown; the next leader resumes cleanup.
 - Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
 - `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
+- `--oplog_prune_chunk_batch_count`: Maximum batch ID positions covered by one delete request. Defaults to `10`; must be greater than zero when `enable_oplog_snapshot=true`.
+- `--oplog_prune_max_batches_per_second`: Average pruning rate limit in batch ID positions per second. Defaults to `50`; must be greater than zero when `enable_oplog_snapshot=true`. This limits ID advancement rather than deleted bytes.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
@@ -466,6 +490,8 @@ ha_backend_type: "etcd"
 enable_oplog: true
 enable_oplog_snapshot: true
 snapshot_chunk_object_count: 1000000
+oplog_prune_chunk_batch_count: 10
+oplog_prune_max_batches_per_second: 50
 snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
 ```
@@ -889,6 +915,8 @@ mooncake_master \
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
+| `--oplog_prune_chunk_batch_count` | `10` | Maximum batch ID positions per delete request; must be positive when batch snapshots are enabled |
+| `--oplog_prune_max_batches_per_second` | `50` | Average pruning rate limit in batch ID positions per second; must be positive when batch snapshots are enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
@@ -900,6 +928,8 @@ mooncake_master \
 | `--enable_oplog` | `false` | Enable the primary batch OpLog writer and standby reader |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch snapshot chunk |
+| `--oplog_prune_chunk_batch_count` | `10` | Maximum batch ID positions per delete request; must be positive |
+| `--oplog_prune_max_batches_per_second` | `50` | Average pruning rate limit in batch ID positions per second; must be positive |
 | `--snapshot_interval_seconds` | `600` (10 min) | Interval between standby batch snapshots |
 | `--snapshot_object_store_type` | required | Object store: `local` or `s3` |
 

@@ -43,6 +43,7 @@
 #include "ha/ha_types.h"
 #include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/batch_oplog_pruning_worker.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
 #include "common/zstd_util.h"
@@ -953,6 +954,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 }
 
 MasterService::~MasterService() {
+    StopBatchOpLogPruningWorker();
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
@@ -1034,6 +1036,44 @@ void MasterService::SetBatchOpLogTerminalCallback(
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->SetTerminalCallback(std::move(callback));
     }
+}
+
+ErrorCode MasterService::StartBatchOpLogPruningWorker(
+    uint64_t chunk_batch_count, uint64_t max_batches_per_second) {
+    std::lock_guard lock(batch_oplog_pruning_mutex_);
+    if (batch_oplog_pruning_stop_requested_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (chunk_batch_count == 0 || max_batches_per_second == 0 ||
+        !batch_oplog_storage_) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (!batch_oplog_pruning_worker_) {
+        batch_oplog_pruning_worker_ = std::make_unique<BatchOpLogPruningWorker>(
+            *batch_oplog_storage_, chunk_batch_count, max_batches_per_second);
+    }
+    return batch_oplog_pruning_worker_->Start();
+}
+
+void MasterService::RequestStopBatchOpLogPruningWorker() {
+    std::lock_guard lock(batch_oplog_pruning_mutex_);
+    batch_oplog_pruning_stop_requested_ = true;
+    if (batch_oplog_pruning_worker_) {
+        batch_oplog_pruning_worker_->RequestStop();
+    }
+}
+
+void MasterService::StopBatchOpLogPruningWorker() {
+    std::unique_ptr<BatchOpLogPruningWorker> worker;
+    {
+        std::lock_guard lock(batch_oplog_pruning_mutex_);
+        batch_oplog_pruning_stop_requested_ = true;
+        if (batch_oplog_pruning_worker_) {
+            batch_oplog_pruning_worker_->RequestStop();
+            worker = std::move(batch_oplog_pruning_worker_);
+        }
+    }
+    if (worker) worker->Stop();
 }
 
 void MasterService::StopBatchOpLogWriter() {

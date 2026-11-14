@@ -11,9 +11,8 @@ class HaKvBackend;
 class SnapshotObjectStore;
 class SnapshotMaintenanceLease;
 
-// Runs only after snapshot publication, under the same maintenance lease.
-// The reader-visible floor always precedes batch deletion. Errors retain data
-// and must not change the outcome of the already successful publication.
+// Validates snapshots and publishes the reader-visible safe deletion floor
+// under the maintenance lease. Physical deletion is handled asynchronously.
 class BatchOpLogPruningCoordinator {
    public:
     BatchOpLogPruningCoordinator(HaKvBackend& backend,
