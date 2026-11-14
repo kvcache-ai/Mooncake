@@ -590,6 +590,20 @@ class Transport {
         }
     };
 
+    // One heap node per published event batch. The queue owns it, so
+    // freeing the BatchDesc does not unlink the queue.
+    struct CompletionRecord {
+        std::atomic<CompletionRecord *> next{nullptr};
+        BatchID batch_id = 0;
+        TransferStatus status{};
+        // freeBatchID sets this after the record is published. Drain
+        // drops the id and does not touch the BatchDesc.
+        std::atomic<bool> skip{false};
+        // One ref for the queue, one for the batch. free releases the
+        // batch ref; pop releases the queue ref.
+        std::atomic<uint32_t> refs{2};
+    };
+
     struct BatchDesc {
         BatchID id;
         size_t batch_size;
@@ -631,10 +645,16 @@ class Transport {
                                           TransferStatus status);
         TerminalNotifyFn terminal_notify = nullptr;
         void *terminal_notify_ctx = nullptr;
-        // Touched only under MultiTransport's completion lock. True after
-        // freeBatchID commits to invalidating the handle so a late publish
-        // is dropped. One meaning only: discarded / freed.
-        bool terminal_suppressed = false;
+
+        // Event-batch publish state. The queue node is not stored here.
+        // Suppressed means freeBatchID won before publish, so the callback
+        // must not enqueue. After publish, free only sets the node's skip
+        // flag; drain reads that flag and does not need this object.
+        static constexpr uint32_t kCompletionIdle = 0;
+        static constexpr uint32_t kCompletionQueued = 1;
+        static constexpr uint32_t kCompletionSuppressed = 2;
+        std::atomic<uint32_t> completion_queue_state{kCompletionIdle};
+        std::atomic<CompletionRecord *> completion_record{nullptr};
 
         // Event-batch completion latch (RFC #5164 v1). Separate from
         // finished_task_count, which EDC and the status path still use.

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #ifdef __linux__
 #include <poll.h>
@@ -861,6 +862,190 @@ TEST_F(BatchCounterWait, ConcurrentFinishAndDrain) {
     EXPECT_EQ(drained[0].status.transferred_bytes, 17u);
     ASSERT_TRUE(multi.freeBatchID(b).ok());
     forget(batches, b);
+#endif
+}
+
+// Several completion threads publish while one thread drains. The old
+// completion lock made that handoff atomic; the queue must still deliver
+// each id once.
+TEST_F(BatchCounterWait, ConcurrentPublishersAndOneDrain) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    constexpr int kProducers = 4;
+    constexpr int kPerProducer = 400;
+    constexpr int kBatches = kProducers * kPerProducer;
+    const size_t task_base = rdma->tasks.size();
+    std::vector<Transport::BatchID> ids;
+    ids.reserve(kBatches);
+    for (int i = 0; i < kBatches; ++i) {
+        auto id = batch(1);
+        ASSERT_TRUE(enable(id).ok());
+        ASSERT_TRUE(submit(id, {1}).ok());
+        ids.push_back(id);
+    }
+
+    std::atomic<bool> go{false};
+    std::vector<BatchCompletion> drained;
+    std::mutex drained_mu;
+    std::vector<std::thread> producers;
+    for (int producer = 0; producer < kProducers; ++producer) {
+        producers.emplace_back([&, producer] {
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int i = producer; i < kBatches; i += kProducers) {
+                rdma->finish(task_base + static_cast<size_t>(i));
+            }
+        });
+    }
+    std::thread drainer([&] {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::vector<BatchCompletion> got;
+            if (!multi.drainCompletions(got).ok()) continue;
+            if (got.empty()) {
+                std::lock_guard<std::mutex> lock(drained_mu);
+                if (static_cast<int>(drained.size()) >= kBatches) return;
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(drained_mu);
+            drained.insert(drained.end(), got.begin(), got.end());
+            if (static_cast<int>(drained.size()) >= kBatches) return;
+        }
+    });
+    go.store(true, std::memory_order_release);
+    for (auto& producer : producers) producer.join();
+    drainer.join();
+    std::vector<BatchCompletion> tail;
+    ASSERT_TRUE(multi.drainCompletions(tail).ok());
+    drained.insert(drained.end(), tail.begin(), tail.end());
+
+    std::unordered_set<Transport::BatchID> seen;
+    for (const auto& item : drained) {
+        EXPECT_TRUE(seen.insert(item.batch_id).second);
+        EXPECT_EQ(item.status.s, Transport::COMPLETED);
+        EXPECT_EQ(item.status.transferred_bytes, 17u);
+    }
+    EXPECT_EQ(seen.size(), ids.size());
+    for (auto id : ids) {
+        EXPECT_EQ(seen.count(id), 1u);
+        ASSERT_TRUE(multi.freeBatchID(id).ok());
+        forget(batches, id);
+    }
+#endif
+}
+
+// freeBatchID and the completion callback race on the idle-to-queued
+// state. Whichever wins, a drain that starts after both have finished
+// must not report the id.
+TEST_F(BatchCounterWait, FreeRacesPublishAndIsAbsentFromLaterDrain) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    constexpr int kIters = 200;
+    for (int iter = 0; iter < kIters; ++iter) {
+        auto id = batch(1);
+        ASSERT_TRUE(enable(id).ok());
+        ASSERT_TRUE(submit(id, {1}).ok());
+        const size_t task_index = rdma->tasks.size() - 1;
+        std::atomic<bool> go{false};
+        Status freed = Status::InvalidArgument("free did not run");
+        std::thread publisher([&] {
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            rdma->finish(task_index);
+        });
+        std::thread freer([&] {
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (;;) {
+                freed = multi.freeBatchID(id);
+                if (freed.ok() || freed.IsBatchCleanupDeferred() ||
+                    !freed.IsBatchBusy()) {
+                    return;
+                }
+            }
+        });
+        go.store(true, std::memory_order_release);
+        publisher.join();
+        freer.join();
+        ASSERT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred())
+            << freed.ToString();
+        forget(batches, id);
+        std::vector<BatchCompletion> done;
+        ASSERT_TRUE(multi.drainCompletions(done).ok());
+        for (const auto& item : done) {
+            EXPECT_NE(item.batch_id, id);
+        }
+    }
+#endif
+}
+
+// Records are already queued. Drain and free run together, so one side
+// sets the skip flag while the other pops the node.
+TEST_F(BatchCounterWait, DrainRacesFreeAfterPublish) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    constexpr int kBatches = 500;
+    const size_t task_base = rdma->tasks.size();
+    std::vector<Transport::BatchID> ids;
+    ids.reserve(kBatches);
+    for (int i = 0; i < kBatches; ++i) {
+        auto id = batch(1);
+        ASSERT_TRUE(enable(id).ok());
+        ASSERT_TRUE(submit(id, {1}).ok());
+        ids.push_back(id);
+    }
+    for (int i = 0; i < kBatches; ++i) {
+        rdma->finish(task_base + static_cast<size_t>(i));
+    }
+
+    std::atomic<bool> go{false};
+    std::vector<BatchCompletion> drained;
+    std::thread drainer([&] {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < 200; ++i) {
+            std::vector<BatchCompletion> got;
+            if (!multi.drainCompletions(got).ok()) continue;
+            drained.insert(drained.end(), got.begin(), got.end());
+        }
+    });
+    std::thread freer([&] {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (auto id : ids) {
+            Status freed = multi.freeBatchID(id);
+            if (!freed.ok() && !freed.IsBatchCleanupDeferred()) {
+                ADD_FAILURE() << freed.ToString();
+                return;
+            }
+        }
+    });
+    go.store(true, std::memory_order_release);
+    freer.join();
+    drainer.join();
+    std::vector<BatchCompletion> tail;
+    ASSERT_TRUE(multi.drainCompletions(tail).ok());
+    drained.insert(drained.end(), tail.begin(), tail.end());
+
+    std::unordered_set<Transport::BatchID> seen;
+    for (const auto& item : drained) {
+        if (item.batch_id == 0) continue;
+        EXPECT_TRUE(seen.insert(item.batch_id).second);
+        EXPECT_EQ(item.status.s, Transport::COMPLETED);
+    }
+    for (auto id : ids) forget(batches, id);
 #endif
 }
 }  // namespace

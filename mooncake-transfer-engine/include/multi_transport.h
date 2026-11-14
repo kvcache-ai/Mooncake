@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -166,10 +167,9 @@ class MultiTransport {
 
     void deferredCleanupLoop();
 
-    // Drops a still-queued id and ignores a later terminal callback. The
-    // batch must still be alive. Called only once freeBatchID has committed
-    // to invalidating the handle.
-    void discardQueuedCompletion(BatchID batch_id);
+    // Stop a future or already-published event record from being delivered.
+    // Does not delete the batch.
+    void suppressCompletion(BatchDesc *batch);
 
     void enqueueTerminal(BatchID batch_id, TransferStatus status);
 
@@ -195,12 +195,22 @@ class MultiTransport {
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 
-    // completion_mu_ guards ready_ and BatchDesc::terminal_suppressed.
-    // The eventfd is written only when ready_ goes from empty to non-empty.
-    // The write stays outside the lock and is not retried.
-    std::mutex completion_mu_;
-    std::vector<BatchCompletion> ready_;
+    // Unbounded MPSC completion queue. CQ threads push; one drain thread
+    // pops. The stub and every record are queue-owned heap nodes.
+    // completion_tail_ is consumer-only. completion_queued_ counts linked
+    // records so a write is needed only when the count leaves 0.
+    using CompletionRecord = Transport::CompletionRecord;
+    std::atomic<CompletionRecord *> completion_head_{nullptr};
+    CompletionRecord *completion_tail_ = nullptr;
+    CompletionRecord *completion_stub_ = nullptr;
+    std::atomic<uint64_t> completion_queued_{0};
     int completion_fd_ = -1;
+
+    void pushCompletion(CompletionRecord *node);
+    // Single consumer. false when the consumer has observed an empty queue.
+    // Drops the queue's ref on the previous tail.
+    bool popCompletion(BatchCompletion &out);
+    void releaseCompletionRecord(CompletionRecord *record);
 };
 }  // namespace mooncake
 

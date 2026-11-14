@@ -98,6 +98,9 @@ namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {
+    completion_stub_ = new CompletionRecord;
+    completion_tail_ = completion_stub_;
+    completion_head_.store(completion_stub_, std::memory_order_relaxed);
 #ifdef __linux__
     // Counter mode, not EFD_SEMAPHORE. Drain reads the sum once.
     completion_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -116,10 +119,20 @@ MultiTransport::~MultiTransport() {
     if (deferred_cleanup_thread_.joinable()) {
         deferred_cleanup_thread_.join();
     }
-    // transport_map_ is declared before the completion queue. Destroying it
-    // here joins RDMA workers while completion_mu_, ready_, and the fd are
-    // still alive, so a last callback cannot touch a destroyed queue.
+    // Joining transports first stops CQ threads before the completion queue
+    // is destroyed, so a last callback cannot push onto a freed list.
     transport_map_.clear();
+    BatchCompletion leftover;
+    while (popCompletion(leftover)) {
+    }
+    // pop leaves the newest node as the tail. It is not inside a batch.
+    if (completion_tail_ != nullptr && completion_tail_ != completion_stub_) {
+        releaseCompletionRecord(completion_tail_);
+    }
+    delete completion_stub_;
+    completion_stub_ = nullptr;
+    completion_tail_ = nullptr;
+    completion_head_.store(nullptr, std::memory_order_relaxed);
 #ifdef __linux__
     if (completion_fd_ >= 0) {
         const uint64_t one = 1;
@@ -167,9 +180,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
         return status;
     }
 
-    // The handle is already invalid for the caller. Drop a queued wake
-    // before the deferred thread deletes the descriptor.
-    discardQueuedCompletion(batch_id);
+    // The handle is already invalid for the caller. A later publish must
+    // not deliver this id. The descriptor stays until it is not busy.
+    suppressCompletion(&Transport::toBatchDesc(batch_id));
     deferred_cleanup_batches_.emplace(batch_id, before_delete);
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
@@ -233,13 +246,11 @@ Status MultiTransport::tryFreeBatchID(
             "BatchID cannot be freed until completion callbacks are "
             "quiescent");
     }
-    // Remove the id before the descriptor is deleted. A completion callback
-    // still holding a pin cannot pass the pin check above; one that runs
-    // after this sees terminal_suppressed and does not touch the queue.
-    discardQueuedCompletion(batch_id);
-    if (before_delete) {
-        before_delete();
-    }
+    // The queue holds its own nodes, so the descriptor can be deleted once
+    // no callback is still inside it. suppressCompletion keeps a published
+    // id out of a later drain.
+    if (batch_desc.event_enabled) suppressCompletion(&batch_desc);
+    if (before_delete) before_delete();
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
@@ -248,16 +259,61 @@ Status MultiTransport::tryFreeBatchID(
     return Status::OK();
 }
 
-void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
-    // Legacy free must not take the completion lock or scan ready_.
-    if (!Transport::toBatchDesc(batch_id).event_enabled) return;
-    std::lock_guard<std::mutex> lock(completion_mu_);
-    Transport::toBatchDesc(batch_id).terminal_suppressed = true;
-    ready_.erase(std::remove_if(ready_.begin(), ready_.end(),
-                                [batch_id](const BatchCompletion& item) {
-                                    return item.batch_id == batch_id;
-                                }),
-                 ready_.end());
+void MultiTransport::suppressCompletion(BatchDesc* batch) {
+    if (batch == nullptr || !batch->event_enabled) return;
+    uint32_t expected = BatchDesc::kCompletionIdle;
+    if (batch->completion_queue_state.compare_exchange_strong(
+            expected, BatchDesc::kCompletionSuppressed,
+            std::memory_order_acq_rel, std::memory_order_acquire) ||
+        expected == BatchDesc::kCompletionSuppressed) {
+        return;
+    }
+    // Publish won. The pointer is stored before the callback drops its
+    // pin, so a free that already observed pin == 0 does not wait. A free
+    // that raced the callback waits until that store is visible. A second
+    // suppress (the deferred free after the busy path) must see
+    // kCompletionSuppressed once the pointer has been claimed.
+    CompletionRecord* record = nullptr;
+    while ((record = batch->completion_record.exchange(
+                nullptr, std::memory_order_acq_rel)) == nullptr) {
+        if (batch->completion_queue_state.load(std::memory_order_acquire) !=
+            BatchDesc::kCompletionQueued) {
+            return;
+        }
+    }
+    record->skip.store(true, std::memory_order_release);
+    batch->completion_queue_state.store(BatchDesc::kCompletionSuppressed,
+                                        std::memory_order_release);
+    releaseCompletionRecord(record);
+}
+
+void MultiTransport::releaseCompletionRecord(CompletionRecord* record) {
+    if (record->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete record;
+    }
+}
+
+void MultiTransport::pushCompletion(CompletionRecord* node) {
+    node->next.store(nullptr, std::memory_order_relaxed);
+    CompletionRecord* prev =
+        completion_head_.exchange(node, std::memory_order_acq_rel);
+    prev->next.store(node, std::memory_order_release);
+}
+
+bool MultiTransport::popCompletion(BatchCompletion& out) {
+    CompletionRecord* next =
+        completion_tail_->next.load(std::memory_order_acquire);
+    if (next == nullptr) return false;
+    if (next->skip.load(std::memory_order_acquire)) {
+        out.batch_id = 0;
+    } else {
+        out.batch_id = next->batch_id;
+        out.status = next->status;
+    }
+    CompletionRecord* old = completion_tail_;
+    completion_tail_ = next;
+    if (old != completion_stub_) releaseCompletionRecord(old);
+    return true;
 }
 
 Status MultiTransport::enableBatchCompletionNotification(BatchID batch_id) {
@@ -277,8 +333,8 @@ Status MultiTransport::enableBatchCompletionNotification(BatchID batch_id) {
             "submitTransfer");
     }
     batch_desc.event_enabled = true;
-    // Install once here. CQ threads read the pointer without
-    // completion_mu_; terminal_suppressed drops publication instead.
+    // Installed once. CQ threads read the pointer without a lock.
+    // freeBatchID and drain race on completion_queue_state instead.
     batch_desc.terminal_notify = &MultiTransport::onTerminal;
     batch_desc.terminal_notify_ctx = this;
     return Status::OK();
@@ -290,22 +346,30 @@ void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
 }
 
 void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
-    bool wake = false;
-    {
-        std::lock_guard<std::mutex> lock(completion_mu_);
-        auto& batch = Transport::toBatchDesc(batch_id);
-        if (batch.terminal_suppressed) return;
-        // Drain reads the fd and then takes the queue. A non-empty queue
-        // already holds that wake, so later records skip the write.
-        wake = ready_.empty();
-        ready_.push_back(BatchCompletion{batch_id, status});
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto* record = new CompletionRecord;
+    record->batch_id = batch_id;
+    record->status = status;
+    // freeBatchID may already have suppressed this batch while the transfer
+    // was still in flight. A lost CAS means the id must not be queued.
+    uint32_t expected = BatchDesc::kCompletionIdle;
+    if (!batch.completion_queue_state.compare_exchange_strong(
+            expected, BatchDesc::kCompletionQueued, std::memory_order_release,
+            std::memory_order_acquire)) {
+        delete record;
+        return;
     }
-    if (!wake) return;
+    batch.completion_record.store(record, std::memory_order_release);
+    pushCompletion(record);
     // Local completion only. Peer notify stays on getBatchTransferStatus;
     // do not sendNotify from the CQ / completion path (RFC #5164).
-    // enableBatchCompletionNotification already rejected a missing fd, so
-    // every event batch that reaches here has a valid completion_fd_.
+    // One write when the queued count leaves zero. Later records stay in
+    // the list until drainCompletions, which already holds the wake.
+    if (completion_queued_.fetch_add(1, std::memory_order_acq_rel) != 0) {
+        return;
+    }
 #ifdef __linux__
+    if (completion_fd_ < 0) return;
     const uint64_t one = 1;
     // Wake only. EAGAIN or a short write leaves the id on the queue.
     // Do not retry here: this runs on the completion path.
@@ -329,8 +393,21 @@ Status MultiTransport::drainCompletions(std::vector<BatchCompletion>& out) {
         PLOG(WARNING) << "completion eventfd read failed";
     }
 #endif
-    std::lock_guard<std::mutex> lock(completion_mu_);
-    out.swap(ready_);
+    for (;;) {
+        const uint64_t queued =
+            completion_queued_.exchange(0, std::memory_order_acq_rel);
+        if (queued == 0) break;
+        for (uint64_t i = 0; i < queued; ++i) {
+            BatchCompletion item;
+            while (!popCompletion(item)) {
+                // The producer has bumped the count after linking the node.
+                // A lost race with the release store is retried.
+            }
+            // batch_id 0 is a record freeBatchID asked drain to drop.
+            // The BatchDesc is not consulted; free may already have deleted it.
+            if (item.batch_id != 0) out.push_back(item);
+        }
+    }
     return Status::OK();
 }
 
