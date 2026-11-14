@@ -245,6 +245,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "tent/runtime/fenced_session.h"
 
 namespace mooncake {
 class TransferEngine;
@@ -335,6 +336,21 @@ class TransferEngine {
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
 
+    // Fenced sessions (RFC #5182, PR 1). Off unless MC_TE_FENCED_SESSIONS is
+    // 1/true/on; while off, these return NotImplemented and the existing
+    // submitTransfer overloads are unchanged. A fenced submit checks the writer
+    // lease before that path. Abort, heartbeat, and destination checks are
+    // later PRs.
+    Status openSession(SessionHandle& out, SegmentID dst_segment,
+                       const std::vector<BufferRange>& dst_ranges,
+                       const SessionOptions& opts);
+
+    Status getLease(SessionHandle session, WriterLease& out);
+
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const WriterLease& lease);
+
     // Best-effort task cancellation. Work that has not reached the transport
     // is prevented from being submitted. Device work already posted may still
     // complete, so callers must continue polling for a terminal status.
@@ -380,6 +396,7 @@ class TransferEngine {
         BatchID batch_id, const std::vector<Request>& request_list);
 
     std::unique_ptr<TransferEngineImpl> impl_;
+    FencedSessions fenced_;
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };
