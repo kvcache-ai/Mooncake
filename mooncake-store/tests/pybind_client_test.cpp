@@ -140,7 +140,7 @@ class RealClientTest : public ::testing::Test {
     std::string master_address_;
     std::string ssd_path_;
 
-    void StartMasterAndSetupClient() {
+    void StartMasterAndSetupClient(const std::string& tenant = "default") {
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
             << "Failed to start in-proc master";
         master_address_ = master_.master_address();
@@ -148,10 +148,10 @@ class RealClientTest : public ::testing::Test {
         const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                              ? FLAGS_device_name
                                              : std::string("");
-        ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                         16 * 1024 * 1024, 16 * 1024 * 1024,
-                                         FLAGS_protocol, rdma_devices,
-                                         master_address_),
+        ASSERT_EQ(py_client_->setup_real(
+                      "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                      16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                      master_address_, nullptr, "", false, "", tenant),
                   0);
     }
 
@@ -187,7 +187,7 @@ class RealClientTest : public ::testing::Test {
 };
 
 TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
-    StartMasterAndSetupClient();
+    StartMasterAndSetupClient("reader-tenant");
 
     constexpr size_t object_size = 16;
     auto make_local_disk = [object_size](const std::string& endpoint,
@@ -206,6 +206,8 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
         std::string name;
         std::vector<Replica::Descriptor> replicas;
         std::string expected_endpoint;
+        std::optional<std::string> resolved_tenant;
+        std::string expected_tenant = "reader-tenant";
     };
     std::vector<TestCase> test_cases;
     // SelectBestReplica currently chooses the last COMPLETE LOCAL_DISK
@@ -227,24 +229,39 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
                       make_local_disk("endpoint-complete",
                                       ReplicaStatus::COMPLETE)},
          .expected_endpoint = "endpoint-complete"});
+    test_cases.push_back(
+        {.name = "resolved_tenant",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a",
+         .resolved_tenant = "tenant-a",
+         .expected_tenant = "tenant-a"});
+    test_cases.push_back(
+        {.name = "empty_legacy_tenant",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a",
+         .resolved_tenant = ""});
 
     for (auto& test_case : test_cases) {
         SCOPED_TRACE(test_case.name);
         std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
         query_results.emplace_back(QueryResult(
             std::move(test_case.replicas),
-            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+            std::chrono::steady_clock::now() + std::chrono::minutes(1),
+            std::nullopt, test_case.resolved_tenant));
 
         std::vector<char> destination(object_size);
         std::string visited_endpoint;
+        std::string visited_tenant;
         // Stop at the offload RPC boundary after recording its destination.
         // The injected error also prevents checksum verification of the
         // intentionally untouched destination buffer.
-        auto local_disk_reader = [&visited_endpoint](
+        auto local_disk_reader = [&visited_endpoint, &visited_tenant](
                                      const std::string& endpoint,
+                                     const std::string& tenant,
                                      RealClient::LocalDiskOffloadObjects&)
             -> tl::expected<void, ErrorCode> {
             visited_endpoint = endpoint;
+            visited_tenant = tenant;
             return tl::make_unexpected(ErrorCode::RPC_FAIL);
         };
 
@@ -257,9 +274,42 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
         }
 
         EXPECT_EQ(visited_endpoint, test_case.expected_endpoint);
+        EXPECT_EQ(visited_tenant, test_case.expected_tenant);
         ASSERT_EQ(results.size(), 1);
         ASSERT_FALSE(results[0].has_value());
         EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
+    }
+
+    SCOPED_TRACE("same_owner_distinct_tenants");
+    std::vector<tl::expected<QueryResult, ErrorCode>> queries;
+    const auto owner = make_local_disk("endpoint-a", ReplicaStatus::COMPLETE);
+    for (const auto* tenant : {"tenant-a", "tenant-b"}) {
+        queries.emplace_back(QueryResult(
+            {owner}, std::chrono::steady_clock::now() + std::chrono::minutes(1),
+            std::nullopt, tenant));
+    }
+    char first[object_size]{}, second[object_size]{};
+    std::map<std::string, std::string> routed;
+    GLogMuter muter;
+    const auto results = py_client_->batch_get_into_internal(
+        {"key-a", "key-b"}, {first, second}, {object_size, object_size},
+        queries,
+        [&](const std::string& endpoint, const std::string& tenant,
+            RealClient::LocalDiskOffloadObjects& objects)
+            -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(endpoint, "endpoint-a");
+            EXPECT_EQ(objects.size(), 1);
+            for (const auto& [key, slices] : objects) {
+                EXPECT_TRUE(routed.emplace(key, tenant).second);
+            }
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        });
+    EXPECT_EQ(routed, (std::map<std::string, std::string>{
+                          {"key-a", "tenant-a"}, {"key-b", "tenant-b"}}));
+    ASSERT_EQ(results.size(), 2);
+    for (const auto& result : results) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
     }
 }
 
@@ -4868,16 +4918,9 @@ TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
     std::remove(quota_path);
 }
 
-// fcczzz's review on #3889 (isolation-off follow-up): with tenant isolation
-// disabled the master resolves every request to "default", so the offload
-// file is written under the default scope no matter what tenant a reader is
-// configured with. A tenant-a reader's verify then probed the tenant-a
-// scope, reported the healthy default-scoped file missing, and the master
-// normalized the follow-up eviction to "default" and deleted that healthy
-// replica. On a scoped miss the handler now also probes the default scope
-// and answers undetermined instead of evicting on the ambiguity.
-TEST_F(RealClientTest,
-       GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) {
+// With tenant isolation disabled, both reads and replica verification must
+// use the master's resolved default scope, regardless of the reader's tenant.
+TEST_F(RealClientTest, LocalDiskReadsUseResolvedTenantWhenTenancyIsOff) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
@@ -4892,7 +4935,7 @@ TEST_F(RealClientTest,
     // No enable_multi_tenants: the master resolves everything to "default".
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_enable_offload(true)
-                                  .set_default_kv_lease_ttl(10)
+                                  .set_default_kv_lease_ttl(100)
                                   .build()));
     master_address_ = master_.master_address();
     ASSERT_EQ(
@@ -4914,7 +4957,9 @@ TEST_F(RealClientTest,
     bool disk_ready = false;
     while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
         for (const auto& replica : py_client_->get_replica_desc(key)) {
-            if (replica.is_local_disk_replica()) disk_ready = true;
+            if (replica.is_local_disk_replica() &&
+                replica.status == ReplicaStatus::COMPLETE)
+                disk_ready = true;
         }
         if (!disk_ready) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -4934,10 +4979,7 @@ TEST_F(RealClientTest,
     }
     ASSERT_TRUE(memory_cleared);
 
-    // A reader configured for tenant-a still sees the replica (the master
-    // resolves its query to "default"), but its storage read is scoped with
-    // its own tenant and misses. Its verify must NOT evict the healthy
-    // default replica.
+    // The reader must use the query's resolved "default" scope for SSD reads.
     auto reader = RealClient::create();
     ASSERT_EQ(
         reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
@@ -4945,7 +4987,52 @@ TEST_F(RealClientTest,
                            nullptr, "", false, "", "tenant-a"),
         0);
 
-    EXPECT_EQ(reader->get_buffer(key), nullptr);
+    for (const auto& replica : reader->get_replica_desc(key)) {
+        ASSERT_FALSE(replica.is_memory_replica());
+    }
+    auto buffer = reader->get_buffer(key);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(std::memcmp(buffer->ptr(), source.data(), kSize), 0);
+    const auto buffers = reader->batch_get_buffer({key});
+    ASSERT_EQ(buffers.size(), 1);
+    ASSERT_NE(buffers[0], nullptr);
+    EXPECT_EQ(std::memcmp(buffers[0]->ptr(), source.data(), kSize), 0);
+
+    std::vector<char> destination(kSize, '\0');
+    EXPECT_EQ(reader->get_into(key, destination.data(), kSize),
+              static_cast<int64_t>(kSize));
+    EXPECT_EQ(destination, source);
+    std::fill(destination.begin(), destination.end(), '\0');
+    EXPECT_EQ(reader->batch_get_into({key}, {destination.data()}, {kSize}),
+              std::vector<int64_t>{kSize});
+    EXPECT_EQ(destination, source);
+    std::fill(destination.begin(), destination.end(), '\0');
+    EXPECT_EQ(reader->batch_get_into_multi_buffers(
+                  {key}, {{destination.data(), destination.data() + kSize / 2}},
+                  {{kSize / 2, kSize / 2}}, false),
+              std::vector<int>{kSize});
+    EXPECT_EQ(destination, source);
+
+    ASSERT_EQ(reader->register_buffer(destination.data(), kSize), 0);
+    constexpr size_t kOffset = 123;
+    constexpr size_t kLength = 4096;
+    const auto ranged = reader->get_into_ranges(
+        {destination.data()}, {{key}}, {{{0}}}, {{{kOffset}}}, {{{kLength}}});
+    ASSERT_EQ(ranged.size(), 1);
+    ASSERT_EQ(ranged[0].size(), 1);
+    ASSERT_EQ(ranged[0][0].size(), 1);
+    EXPECT_EQ(ranged[0][0][0], static_cast<int64_t>(kLength));
+    EXPECT_TRUE(std::equal(destination.begin(), destination.begin() + kLength,
+                           source.begin() + kOffset));
+    EXPECT_EQ(reader->batch_get_session_start({key}), std::vector<int>{0});
+    std::fill(destination.begin(), destination.end(), '\0');
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {key}, {{destination.data()}}, {{kLength}}, {{kOffset}}),
+              std::vector<int>{kLength});
+    EXPECT_TRUE(std::equal(destination.begin(), destination.begin() + kLength,
+                           source.begin() + kOffset));
+    EXPECT_EQ(reader->batch_get_session_end({key}), 0);
+    EXPECT_EQ(reader->unregister_buffer(destination.data()), 0);
     bool disk_replica_survives = false;
     for (const auto& replica : py_client_->get_replica_desc(key)) {
         if (replica.is_local_disk_replica()) disk_replica_survives = true;
