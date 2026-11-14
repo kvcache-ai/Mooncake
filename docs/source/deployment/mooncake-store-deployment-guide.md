@@ -930,7 +930,9 @@ Flags for controlling data movement between DRAM and SSD.
 | `--offload_on_evict` | `false` | Defer offload to eviction time rather than at `Put` |
 | `--offload_force_evict` | `false` | Force-evict objects exceeding capacity without offload |
 | `--offloading_queue_limit` | `50000` | Max number of objects allowed in the offloading queue per local disk segment. Increase to allow more objects to be offloaded to SSD before force-eviction kicks in |
-| `--offload_cap_ratio` | `0.5` | Per-cycle offload cap as a fraction of `offloading_queue_limit` (range `[0.0, 1.0]`). Controls how many objects can be queued for offload in a single eviction cycle before falling back to force-evict |
+| `--offloading_queue_use_bytes` | `false` | Use the byte limit instead of the object-count limit for pending offloads |
+| `--offloading_queue_limit_bytes` | `100000000000` | Maximum pending offload payload bytes per local disk segment when byte mode is enabled |
+| `--offload_cap_ratio` | `0.5` | Per-cycle offload cap as a fraction of the active queue limit (range `[0.0, 1.0]`) |
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |
 | `--promotion_admission_threshold` | `2` | Min CountMinSketch count to allow promotion (`1` = disable gating) |
 | `--promotion_max_per_heartbeat` | `1` | Max promotion tasks handed to a single client per heartbeat. Each task is a synchronous SSD-read + RDMA-write on the client; serializing them avoids blocking past the client-liveness window |
@@ -942,7 +944,9 @@ Start with `--enable_offload=true` for eager asynchronous SSD persistence after 
 
 For SSD offload, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use the legacy `--root_fs_dir` parameter with `--enable_offload=true`.
 
-When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap fall back to force-evict (discard) if `--offload_force_evict=true`, otherwise they remain in memory. For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
+When `--offload_on_evict=true` and `--offload_force_evict=true`, each eviction cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap are force-evicted (discarded). For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
+
+Set `--offloading_queue_use_bytes=true` on the master to use `--offloading_queue_limit_bytes` instead of the object-count limit. The per-cycle cap then uses bytes as well: with the default 100 GB (decimal) queue limit and `offload_cap_ratio=0.5`, the cap is 50 GB. No corresponding store setting is required.
 
 ### CXL Memory
 

@@ -2,6 +2,8 @@
 
 // The observers every eviction run reports to: its metrics and its log.
 
+#include <cstdint>
+
 #include "eviction/observer.h"
 
 namespace mooncake {
@@ -21,15 +23,15 @@ class MetricsObserver final : public EvictionObserver {
 // skipped.
 class LogObserver final : public EvictionObserver {
    public:
-    // `offload_cap` is how many offloads a run may queue, for the warning.
-    explicit LogObserver(long offload_cap) : offload_cap_(offload_cap) {}
+    // `offload_cap` is the run's offload limit, for the warning.
+    explicit LogObserver(uint64_t offload_cap) : offload_cap_(offload_cap) {}
 
     bool SupportsParallel() const override { return true; }
 
     void OnRunEnd(const Scope& scope, const Report& report) override;
 
    private:
-    const long offload_cap_;
+    const uint64_t offload_cap_;
 };
 
 }  // namespace eviction
