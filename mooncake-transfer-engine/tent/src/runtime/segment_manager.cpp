@@ -16,7 +16,10 @@
 
 #include <cassert>
 #include <filesystem>
+#include <iomanip>
+#include <random>
 #include <set>
+#include <sstream>
 
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
@@ -30,6 +33,15 @@ uint64_t nextManagerId() {
     static std::atomic<uint64_t> counter{0};
     return counter.fetch_add(1, std::memory_order_relaxed);
 }
+
+std::string nextOwnerId() {
+    std::random_device random;
+    std::ostringstream out;
+    for (int i = 0; i < 4; ++i) {
+        out << std::hex << std::setw(8) << std::setfill('0') << random();
+    }
+    return out.str();
+}
 }  // namespace
 
 SegmentManager::SegmentManager(std::unique_ptr<SegmentRegistry> agent)
@@ -38,6 +50,7 @@ SegmentManager::SegmentManager(std::unique_ptr<SegmentRegistry> agent)
       manager_id_(nextManagerId()),
       registry_(std::move(agent)) {
     local_desc_ = std::make_shared<SegmentDesc>();
+    local_desc_->owner_id = nextOwnerId();
     subscribers_lock_ = std::make_shared<RWSpinlock>();
     subscribers_ = std::make_shared<std::unordered_set<std::string>>();
 }
@@ -283,7 +296,8 @@ Status SegmentManager::synchronizeLocal() {
 }
 
 Status SegmentManager::deleteLocal() {
-    return registry_->deleteSegmentDesc(getLocal()->name);
+    auto local = getLocal();
+    return registry_->deleteSegmentDescIfOwned(local->name, local);
 }
 
 }  // namespace tent

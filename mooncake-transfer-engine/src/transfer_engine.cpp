@@ -733,8 +733,23 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         config->set("transports/memfabric/store_te_init",
                     globalConfig().ascend_store_te_init);
 #endif
-        impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
-        if (!impl_tent_->available()) return ERR_CONTEXT;
+        auto candidate =
+            std::make_shared<mooncake::tent::TransferEngine>(config);
+        if (!candidate->available()) {
+            // The candidate may already have published the same name before a
+            // later setup step failed. Restore the live instance before the
+            // candidate's ownership-checked destructor runs.
+            if (impl_tent_ && impl_tent_->available()) {
+                auto status = impl_tent_->republishLocalSegment();
+                if (!status.ok()) {
+                    LOG(ERROR) << "Failed to restore local metadata after "
+                                  "TENT reinitialization failure: "
+                               << status.ToString();
+                }
+            }
+            return ERR_CONTEXT;
+        }
+        impl_tent_ = std::move(candidate);
         metadata_conn_string_ = metadata_conn_string;
         return 0;
     }
@@ -798,7 +813,7 @@ std::string TransferEngine::getLocalIpAndPort() {
 
 int TransferEngine::getRpcPort() {
     if (use_tent_) {
-        return impl_tent_->getRpcServerPort();
+        return impl_tent_ ? impl_tent_->getRpcServerPort() : 0;
     } else
         return impl_->getRpcPort();
 }

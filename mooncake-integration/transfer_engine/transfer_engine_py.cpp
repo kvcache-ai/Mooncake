@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "managed_buffer_release.h"
 #include "shared_segment_py.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
@@ -316,6 +317,7 @@ TransferEnginePy::TransferEnginePy() {
 }
 
 TransferEnginePy::~TransferEnginePy() {
+    std::unique_lock<std::shared_mutex> engine_guard(engine_mutex_);
     for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
@@ -383,11 +385,27 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
+    pybind11::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (engine_ && engine_->isUsingTent() &&
+        !external_registered_buffers_.empty()) {
+        std::vector<uintptr_t> addresses(external_registered_buffers_.begin(),
+                                         external_registered_buffers_.end());
+        reconcileExternalRegistrations(addresses, false, -1);
+    }
+    if (engine_ && (!handle_map_.empty() || !active_managed_buffers_.empty() ||
+                    !external_registered_buffers_.empty())) {
+        LOG(ERROR) << "Cannot replace a transfer engine with registered "
+                      "buffers or cached segment handles; release them first";
+        return -1;
+    }
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
         return -1;
     }
+    if (engine_ && releaseManagedBuffers() != 0) return -1;
     if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
@@ -396,6 +414,26 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     bool use_flagcx = (proto == "flagcx");
+    std::unique_ptr<TransferEngine> candidate;
+    auto failInitialization = [&]() {
+#ifdef USE_TENT
+        // A failed candidate may already have published the same segment name.
+        // Keep the original wrapper alive and restore its metadata before the
+        // candidate's ownership-checked destructor runs.
+        if (engine_) {
+            auto tent = engine_->getTentEngine();
+            if (tent && tent->available()) {
+                auto status = tent->republishLocalSegment();
+                if (!status.ok()) {
+                    LOG(ERROR) << "Failed to restore local metadata after "
+                                  "Python reinitialization failure: "
+                               << status.ToString();
+                }
+            }
+        }
+#endif
+        return -1;
+    };
 
 #ifdef USE_EFA
     // Only protocol=efa is set up by hand. Every other protocol goes through
@@ -403,38 +441,38 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     // the RDMA transport, so the EFA wheel behaves like the default wheel on
     // IB/RoCE hosts.
     bool use_efa = (proto == "efa");
-    engine_ = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
-                                               device_filter);
+    candidate = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
+                                                 device_filter);
     if (use_efa) {
-        engine_->getLocalTopology()->discover(device_filter);
+        candidate->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
+                  << candidate->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #elif defined(USE_CXI)
 
     bool use_cxi = (proto == "cxi");
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    candidate = std::make_unique<TransferEngine>(false, device_filter);
     if (use_cxi) {
-        engine_->getLocalTopology()->discover(device_filter);
+        candidate->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for CXI. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
+                  << candidate->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+    candidate = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret = engine_->init(conn_string, local_hostname,
-                                hostname_port.first.c_str(),
-                                hostname_port.second, proto);
-        if (ret) return -1;
+        int ret = candidate->init(conn_string, local_hostname,
+                                  hostname_port.first.c_str(),
+                                  hostname_port.second, proto);
+        if (ret) return failInitialization();
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
-        if (ret) return -1;
+        int ret = candidate->init(conn_string, local_hostname, "", 0, proto);
+        if (ret) return failInitialization();
     }
 
 #ifdef USE_EFA
@@ -442,19 +480,19 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("efa", nullptr);
+        auto transport = candidate->installTransport("efa", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install EFA transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "EFA transport installed successfully";
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "FlagCX transport installed successfully";
     }
@@ -462,19 +500,19 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_cxi) {
         LOG(INFO)
             << "Installing CXI transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("cxi", nullptr);
+        auto transport = candidate->installTransport("cxi", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install CXI transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "CXI transport installed successfully";
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "FlagCX transport installed successfully";
     } else {
@@ -483,10 +521,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in CXI build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
+        auto transport = candidate->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "TCP transport installed successfully";
     }
@@ -494,20 +532,37 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "FlagCX transport installed successfully";
     }
 #endif
 
     free_list_.resize(kSlabSizeKBTabLen);
+    engine_ = std::move(candidate);
     return 0;
 }
 
-int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+int TransferEnginePy::getRpcPort() {
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    return engine_ ? engine_->getRpcPort() : 0;
+}
+
+int TransferEnginePy::releaseManagedBuffers() {
+    const int status = detail::releaseManagedBuffers(
+        buffer_list_, large_buffer_list_, free_list_, active_managed_buffers_,
+        kDefaultBufferCapacity,
+        [this](void* buffer) { return engine_->unregisterLocalMemory(buffer); },
+        [](void* buffer) { freeMemory(buffer); });
+    if (status != 0) {
+        LOG(ERROR) << "Cannot release managed buffers while transport "
+                      "deregistration is incomplete";
+    }
+    return status;
+}
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (allocateMemory == nullptr || freeMemory == nullptr) {
@@ -558,7 +613,10 @@ uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
     int class_id = findClassId(length);
     if (class_id < 0) {
         char* buffer = allocateRawBuffer(length);
-        if (buffer) large_buffer_list_.insert(buffer);
+        if (buffer) {
+            large_buffer_list_.insert(buffer);
+            active_managed_buffers_.insert((uintptr_t)buffer);
+        }
         return (uintptr_t)buffer;
     }
     if (free_list_[class_id].empty())
@@ -566,6 +624,7 @@ uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
     assert(!free_list_[class_id].empty());
     char* buffer = free_list_[class_id].top();
     free_list_[class_id].pop();
+    active_managed_buffers_.insert((uintptr_t)buffer);
     return (uintptr_t)buffer;
 }
 
@@ -577,8 +636,10 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
         large_buffer_list_.erase(buffer);
         engine_->unregisterLocalMemory(buffer);
         freeMemory(buffer);
+        active_managed_buffers_.erase(buffer_addr);
         return 0;
     }
+    active_managed_buffers_.erase(buffer_addr);
     free_list_[class_id].push(buffer);
     return 0;
 }
@@ -693,6 +754,7 @@ TransferEnginePy::scatterTransferSyncWithTicket(
     const std::vector<std::vector<size_t>>& remote_offsets,
     const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     auto submission = submitScatterWithTicket(
         engine_, endpoint, local_base_addresses, local_capacities,
         remote_base_addresses, remote_capacities, local_offsets, remote_offsets,
@@ -967,6 +1029,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                                    const std::string& transport_hint,
                                    const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1078,6 +1141,7 @@ int TransferEnginePy::batchTransferSync(
     TransferOpcode opcode, TransferNotify* notify,
     const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1210,6 +1274,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const std::vector<size_t>& lengths, TransferOpcode opcode,
     const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1275,6 +1340,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto& batch_id : batch_ids) {
@@ -1338,6 +1404,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     uintptr_t peer_buffer_address, size_t length,
     const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1373,6 +1440,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
     LOG_ASSERT(s.ok());
@@ -1390,43 +1458,98 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     }
 }
 
+void TransferEnginePy::reconcileExternalRegistrations(
+    const std::vector<uintptr_t>& addresses, bool registration, int result) {
+    if (addresses.empty()) return;
+    if (!engine_->isUsingTent()) {
+        if (result != 0) return;
+        if (registration) {
+            external_registered_buffers_.insert(addresses.begin(),
+                                                addresses.end());
+        } else {
+            for (auto address : addresses) {
+                external_registered_buffers_.erase(address);
+            }
+        }
+        return;
+    }
+
+    // TENT can change its local tracker before metadata publication fails.
+    // Reconcile against that tracker rather than treating the return code as
+    // proof that registration or removal did not happen.
+    std::vector<SegmentBufferInfo> buffers;
+    if (engine_->getSegmentBuffers(0, buffers) != 0) {
+        LOG(ERROR)
+            << "Failed to reconcile registered buffers; keeping "
+               "reinitialization blocked until a later snapshot succeeds";
+        external_registered_buffers_.insert(addresses.begin(), addresses.end());
+        return;
+    }
+    std::unordered_set<uintptr_t> live_addresses;
+    live_addresses.reserve(buffers.size());
+    for (const auto& buffer : buffers) live_addresses.insert(buffer.addr);
+    for (auto address : addresses) {
+        if (live_addresses.count(address) != 0) {
+            external_registered_buffers_.insert(address);
+        } else {
+            external_registered_buffers_.erase(address);
+        }
+    }
+}
+
 int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
     const std::string& location) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    std::lock_guard<std::mutex> guard(mutex_);
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
     for (size_t i = 0; i < batch_size; i++) {
         buffers.push_back(
             BufferEntry{(void*)buffer_addresses[i], capacities[i]});
     }
-    return engine_->registerLocalMemoryBatch(buffers, location);
+    int result = engine_->registerLocalMemoryBatch(buffers, location);
+    reconcileExternalRegistrations(buffer_addresses, true, result);
+    return result;
 }
 
 int TransferEnginePy::batchUnregisterMemory(
     std::vector<uintptr_t> buffer_addresses) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    std::lock_guard<std::mutex> guard(mutex_);
     auto batch_size = buffer_addresses.size();
     std::vector<void*> buffers;
     for (size_t i = 0; i < batch_size; i++) {
         buffers.push_back(reinterpret_cast<char*>(buffer_addresses[i]));
     }
-    return engine_->unregisterLocalMemoryBatch(buffers);
+    int result = engine_->unregisterLocalMemoryBatch(buffers);
+    reconcileExternalRegistrations(buffer_addresses, false, result);
+    return result;
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    std::lock_guard<std::mutex> guard(mutex_);
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, location,
-                                        remote_accessible);
+    int result = engine_->registerLocalMemory(buffer, capacity, location,
+                                              remote_accessible);
+    reconcileExternalRegistrations({buffer_addr}, true, result);
+    return result;
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    std::lock_guard<std::mutex> guard(mutex_);
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->unregisterLocalMemory(buffer);
+    int result = engine_->unregisterLocalMemory(buffer);
+    reconcileExternalRegistrations({buffer_addr}, false, result);
+    return result;
 }
 
 #ifdef USE_CUDA
@@ -1520,6 +1643,7 @@ void TransferEnginePy::batchTransferOnCuda(
     uintptr_t stream_ptr, const std::string& transport_hint,
     const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1643,6 +1767,7 @@ void TransferEnginePy::batchTransferReadOnCuda(
 int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 #ifdef USE_EFA
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     auto* t = engine_->getTransport("efa");
     if (!t) return 0;  // EFA transport not installed; nothing to do.
     auto* efa = dynamic_cast<EfaTransport*>(t);
@@ -1657,6 +1782,7 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     if (segment_id ==
@@ -1670,6 +1796,7 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     auto device_name_safe = device_name ? std::string(device_name) : "";
 
     const bool use_tent =
@@ -1706,6 +1833,7 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
 }
 
 std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::vector<TransferMetadata::NotifyDesc> notifies;
     std::vector<TransferNotify> result;
 
@@ -1724,8 +1852,9 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 }
 
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
-    if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    if (!engine_) return -1;
 
     if (engine_->isUsingTent()) {
         auto handle = engine_->openSegment(peer_server_name);

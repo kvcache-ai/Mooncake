@@ -836,7 +836,7 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
     }
 #endif  // USE_HTTP
 
-    LOG(FATAL) << "Unable to find metadata storage plugin "
+    LOG(ERROR) << "Unable to find metadata storage plugin "
                << parsed_conn_string.first
                << " with conn string: " << conn_string;
     return nullptr;

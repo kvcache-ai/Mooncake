@@ -21,6 +21,8 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <stack>
 #include <string>
 #include <vector>
@@ -307,9 +309,15 @@ class TransferEnginePy {
 
     int sendProbe(const std::string &peer_server_name);
 
-    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
+    std::shared_ptr<TransferEngine> getEngine() const {
+        std::shared_lock<std::shared_mutex> guard(engine_mutex_);
+        return engine_;
+    }
 
-    uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
+    uintptr_t getEnginePtr() const {
+        std::shared_lock<std::shared_mutex> guard(engine_mutex_);
+        return (uintptr_t)engine_.get();
+    }
 
    private:
     std::shared_ptr<ScatterTransferTicket> scatterTransferSyncWithTicket(
@@ -330,14 +338,22 @@ class TransferEnginePy {
 
     int doBuddyAllocate(int class_id);
 
+    void reconcileExternalRegistrations(const std::vector<uintptr_t> &addresses,
+                                        bool registration, int result);
+
+    int releaseManagedBuffers();
+
    private:
     std::shared_ptr<TransferEngine> engine_;
     Transport *xport_;
 
+    mutable std::shared_mutex engine_mutex_;
     std::mutex mutex_;
     std::vector<std::stack<char *>> free_list_;
     std::vector<char *> buffer_list_;
     std::unordered_set<char *> large_buffer_list_;
+    std::unordered_set<uintptr_t> active_managed_buffers_;
+    std::unordered_set<uintptr_t> external_registered_buffers_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
     bool auto_discovery_;
 

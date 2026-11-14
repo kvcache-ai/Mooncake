@@ -294,6 +294,10 @@ class TransferEngine {
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
+    // Reassert this instance's current local publication after another
+    // candidate failed during initialization and may have replaced the record.
+    Status republishLocalSegment();
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);
