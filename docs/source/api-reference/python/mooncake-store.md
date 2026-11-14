@@ -1265,13 +1265,23 @@ hosts with RDMA HCAs to select MNNVL instead of RDMA.
 Initialize the store with a dummy client for testing purposes.
 
 ```python
-def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str) -> int
+def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str,
+                ipc_socket_path: str = "") -> int
 ```
 
 **Parameters:**
 - `mem_pool_size` (int): Memory pool size in bytes
 - `local_buffer_size` (int): Local buffer size in bytes
 - `server_address` (str): Server address in format "hostname:port"
+- `ipc_socket_path` (str, optional): Unix socket shared with the real client
+  for fd passing. Empty falls back to `$MOONCAKE_IPC_SOCKET_PATH`, then
+  `@mooncake_client_<port>.sock`. A value starting with `/` is a filesystem
+  socket, which is required when the real client runs in another pod; mount
+  the same directory into both pods. Any other value is a Linux abstract
+  socket, visible only inside one network namespace. It must match the real
+  client's `--ipc_socket_path`. The real client creates a filesystem socket
+  with mode `0660`, so this process must run with the real client's uid or
+  in its group.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)

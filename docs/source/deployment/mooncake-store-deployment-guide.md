@@ -1382,6 +1382,7 @@ mooncake_client \
 |------|---------|-------------|
 | `--host` | `0.0.0.0` | Client service bind host. Accepts `ip:port` to specify the data plane port for TransferEngine |
 | `--port` | `50052` | Client RPC listen port (dummy↔real client control plane) |
+| `--ipc_socket_path` | empty | Unix socket that dummy clients use to pass shared-memory fds. A value starting with `/` is a filesystem socket, needed when dummy clients run in another pod (share the parent directory, e.g. via `hostPath`); any other value is a Linux abstract socket. Empty falls back to `$MOONCAKE_IPC_SOCKET_PATH`, then `@mooncake_client_<port>.sock`. Dummy clients must use the same value. A filesystem socket is created with mode `0660`, so dummy clients must run with the real client's uid or in the socket's group: use the same `runAsUser`, or the same `runAsGroup`, in both Pods (`fsGroup` alone is not applied to `hostPath` volumes). The parent directory must not be writable by other users (e.g. `0750`, or `0770` owned by the shared group), since anyone who can write it can replace the socket or its `<path>.lock` file. The lock file ensures only one real client owns the path |
 | `--global_segment_size` | `4 GB` | Global segment size contributed by the client |
 | `--master_server_address` | `127.0.0.1:50051` | Master service address |
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Transfer Engine metadata service |
