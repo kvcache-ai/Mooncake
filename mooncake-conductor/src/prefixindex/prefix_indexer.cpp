@@ -365,6 +365,10 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
             return ref.first.instance_id == instance_id &&
                    ref.first.dp_rank == dp_rank;
         });
+        std::erase_if(presence.vllm_cpu_chunk_end_refs, [&](const auto& ref) {
+            return ref.first.instance_id == instance_id &&
+                   ref.first.dp_rank == dp_rank;
+        });
         std::erase_if(presence.disk_owners, matches_engine);
     }
     EraseEmptyBlocks(*state);
@@ -405,6 +409,9 @@ std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
             presence.cpu_local_owners.insert(mutation.owner);
             if (vllm_local) {
                 ++presence.cpu_local_refs[mutation.owner];
+                if (prefix == mutation.prefixes.back()) {
+                    ++presence.vllm_cpu_chunk_end_refs[mutation.owner];
+                }
             }
         } else {
             presence.disk_owners.insert(mutation.owner);
@@ -432,6 +439,15 @@ std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
             if (mutation.tier == StorageTier::kDevice) {
                 block->second.device_owners.erase(mutation.owner);
             } else if (mutation.tier == StorageTier::kCpuLocal) {
+                if (prefix == mutation.prefixes.back()) {
+                    auto& ends = block->second.vllm_cpu_chunk_end_refs;
+                    if (auto end = ends.find(mutation.owner);
+                        end != ends.end()) {
+                        if (--end->second == 0) {
+                            ends.erase(end);
+                        }
+                    }
+                }
                 auto& refs = block->second.cpu_local_refs;
                 if (auto ref = refs.find(mutation.owner); ref != refs.end()) {
                     if (--ref->second > 0) {
@@ -470,6 +486,7 @@ std::string PrefixCacheTable::ClearEngine(const EngineClear& clear) {
         if (!clear.tier || *clear.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.erase(clear.owner);
             presence.cpu_local_refs.erase(clear.owner);
+            presence.vllm_cpu_chunk_end_refs.erase(clear.owner);
         }
         if (!clear.tier || *clear.tier == StorageTier::kDisk) {
             presence.disk_owners.erase(clear.owner);
@@ -507,6 +524,10 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
             std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
                 return !presence.cpu_local_owners.contains(ref.first);
             });
+            std::erase_if(
+                presence.vllm_cpu_chunk_end_refs, [&](const auto& ref) {
+                    return !presence.cpu_local_owners.contains(ref.first);
+                });
         } else {
             presence.disk_owners.insert(mutation.owner);
         }
@@ -672,6 +693,52 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         }
     };
 
+    // vLLM looks up one OffloadKey per chunk, not one key per block. Commit a
+    // local run only when its last block is a recorded chunk boundary; a prompt
+    // suffix or a partial run from another request's chunk is not loadable.
+    auto advance_chunked_cursor = [&](size_t& cursor, const auto& present,
+                                      const auto& chunk_end,
+                                      const auto& device_hit) {
+        while (cursor < block_count) {
+            // Device blocks are directly loadable and need no OffloadKey. Only
+            // a run backed by the CPU tier has to end at a complete chunk key.
+            const HashBlock* current = chain->At(cursor, &chain_error);
+            if (current == nullptr) {
+                cursor = block_count;
+                return;
+            }
+            auto current_block = state->blocks.find(current->projected);
+            if (current_block != state->blocks.end() &&
+                device_hit(current_block->second)) {
+                ++cursor;
+                continue;
+            }
+
+            size_t chunk_cursor = cursor;
+            bool complete_chunk = false;
+            while (chunk_cursor < block_count) {
+                const HashBlock* hashed = chain->At(chunk_cursor, &chain_error);
+                if (hashed == nullptr) {
+                    cursor = block_count;
+                    return;
+                }
+                auto block = state->blocks.find(hashed->projected);
+                if (block == state->blocks.end() || !present(block->second)) {
+                    break;
+                }
+                if (chunk_end(block->second)) {
+                    cursor = chunk_cursor + 1;
+                    complete_chunk = true;
+                    break;
+                }
+                ++chunk_cursor;
+            }
+            if (!complete_chunk) {
+                break;
+            }
+        }
+    };
+
     for (const auto& [instance_id, ranks] : selected_instances) {
         CacheHitResult result;
 
@@ -707,22 +774,57 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                 return device_present(block) ||
                        engine_present(block.cpu_local_owners);
             };
+            auto chunk_end_present = [&](const BlockPresence& block) {
+                return std::any_of(block.vllm_cpu_chunk_end_refs.begin(),
+                                   block.vllm_cpu_chunk_end_refs.end(),
+                                   [&](const auto& entry) {
+                                       const auto& owner = entry.first;
+                                       return owner.instance_id ==
+                                                  instance_id &&
+                                              owner.dp_rank == rank;
+                                   });
+            };
+            const bool vllm_rank =
+                state->instance_publishers.at(instance_id).at(rank) ==
+                common::PublisherKind::kVllm;
+            if (vllm_rank) {
+                advance_chunked_cursor(cursor, local_present, chunk_end_present,
+                                       device_present);
+            } else {
+                advance_cursor(cursor, local_present);
+            }
             // The allowed sets are nested; keep one cursor for all four tiers.
             // Each successful prefix is visited once per rank, not per tier.
-            advance_cursor(cursor, local_present);
             rank_match.cpu_local =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
+            // Do not let a partial local chunk leak into the cumulative tiers.
+            // A genuinely independent shared/disk prefix may still continue
+            // when the next block is not part of that local run.
+            bool partial_local_chunk = false;
+            if (vllm_rank && cursor < block_count) {
+                const HashBlock* hashed = chain->At(cursor, &chain_error);
+                if (hashed != nullptr) {
+                    auto block = state->blocks.find(hashed->projected);
+                    partial_local_chunk = block != state->blocks.end() &&
+                                          local_present(block->second);
+                }
+            }
             auto shared_present = [&](const BlockPresence& block) {
                 return !block.cpu_share_owners.empty() || local_present(block);
             };
-            advance_cursor(cursor, shared_present);
+            if (!partial_local_chunk) {
+                advance_cursor(cursor, shared_present);
+            }
             rank_match.cpu_share =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
-            advance_cursor(cursor, [&](const BlockPresence& block) {
-                return shared_present(block) || accessible(block.disk_owners);
-            });
+            if (!partial_local_chunk) {
+                advance_cursor(cursor, [&](const BlockPresence& block) {
+                    return shared_present(block) ||
+                           accessible(block.disk_owners);
+                });
+            }
             rank_match.disk =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 

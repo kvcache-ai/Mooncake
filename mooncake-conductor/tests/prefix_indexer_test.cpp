@@ -1241,6 +1241,11 @@ TEST(Mutations, VllmCpuLocalOverlappingChunksSurviveOneChunkEviction) {
             .at("instance-a")
             .rank_matches.at(0);
     };
+    auto a_hit = [&] {
+        return table.Query(TestContext(), tokens_a)
+            .at("instance-a")
+            .rank_matches.at(0);
+    };
     auto local_owners = [&](ProjectedPrefix prefix) {
         const auto presence =
             PrefixCacheTableTestPeer::Presence(table, TestContext(), prefix);
@@ -1249,12 +1254,22 @@ TEST(Mutations, VllmCpuLocalOverlappingChunksSurviveOneChunkEviction) {
     ASSERT_EQ(table.StoreEngine(a_chunk0), "");
     ASSERT_EQ(table.StoreEngine(a_chunk1), "");
     ASSERT_EQ(table.StoreEngine(b_chunk1), "");
+    EXPECT_EQ(a_hit(), RankMatch(0, 128, 128, 128));
     EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
+    // A prompt that ends two blocks into A's second chunk can load only the
+    // first complete chunk, even though every announced block is resident.
+    EXPECT_EQ(
+        table
+            .Query(TestContext(), std::span<const int32_t>(tokens_a.data(), 96))
+            .at("instance-a")
+            .rank_matches.at(0),
+        RankMatch(0, 64, 64, 64));
 
     // vLLM evicts A's second chunk: BlockRemoved for ha[4..7]. Both of B's
     // chunks are still in vLLM's CPU tier, so all of B's prompt can still be
     // loaded from it.
     ASSERT_EQ(table.RemoveEngine(a_chunk1), "");
+    EXPECT_EQ(a_hit(), RankMatch(0, 64, 64, 64));
     EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
     EXPECT_EQ(local_owners(ha[4]), (std::set<EngineOwner>{a_chunk1.owner}));
     EXPECT_EQ(local_owners(ha[5]), (std::set<EngineOwner>{a_chunk1.owner}));
@@ -1271,6 +1286,28 @@ TEST(Mutations, VllmCpuLocalOverlappingChunksSurviveOneChunkEviction) {
     EXPECT_TRUE(local_owners(ha[4]).empty());
     EXPECT_TRUE(local_owners(ha[5]).empty());
     EXPECT_EQ(b_hit(), RankMatch(0, 64, 64, 64));
+}
+
+TEST(Mutations, VllmCpuLocalDuplicateAnnouncementKeepsChunkEnd) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    const auto hashes = Hashes(Tokens(16));
+    ASSERT_EQ(hashes.size(), 1u);
+    auto local = Device(hashes);
+    local.tier = StorageTier::kCpuLocal;
+    ASSERT_EQ(table.StoreEngine(local), "");
+    ASSERT_EQ(table.StoreEngine(local), "");
+
+    ASSERT_EQ(table.RemoveEngine(local), "");
+    EXPECT_EQ(table.Query(TestContext(), Tokens(16))
+                  .at("instance-a")
+                  .rank_matches.at(0),
+              RankMatch(0, 16, 16, 16));
+    ASSERT_EQ(table.RemoveEngine(local), "");
+    EXPECT_EQ(table.Query(TestContext(), Tokens(16))
+                  .at("instance-a")
+                  .rank_matches.at(0),
+              RankMatch(0, 0, 0, 0));
 }
 
 // A vLLM owner's announcement count must not outlive its ownership: after a
@@ -1294,6 +1331,11 @@ TEST(Mutations, VllmCpuLocalCountsResetWhenOwnershipIsDropped) {
         ASSERT_EQ(table.StoreEngine(local), "");
         ASSERT_EQ(table.RemoveEngine(local), "");
         EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+        EXPECT_EQ(table.Query(TestContext(), Tokens(16))
+                      .at("instance-a")
+                      .rank_matches.at(0)
+                      .cpu_local,
+                  0);
     };
 
     // A clear of every local tier, as vLLM's AllBlocksCleared is applied.

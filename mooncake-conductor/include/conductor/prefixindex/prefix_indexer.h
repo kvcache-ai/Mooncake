@@ -31,12 +31,17 @@ struct BlockPresence {
     // chunk eviction out to all of the chunk's hashes, so an owner leaves
     // cpu_local_owners only when its last announcement is removed.
     std::map<EngineOwner, uint32_t> cpu_local_refs;
+    // The last hash in each vLLM CPU store event is the chunk's OffloadKey.
+    // Reference-count those boundaries alongside the blocks so Query can tell
+    // which local runs form complete chunks that vLLM can actually load.
+    std::map<EngineOwner, uint32_t> vllm_cpu_chunk_end_refs;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
 
     bool Empty() const {
         return device_owners.empty() && cpu_local_owners.empty() &&
-               cpu_share_owners.empty() && disk_owners.empty();
+               cpu_share_owners.empty() && disk_owners.empty() &&
+               vllm_cpu_chunk_end_refs.empty();
     }
 };
 
