@@ -268,6 +268,9 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Bucket-level POSIX offload parallelism; one retains serial execution.
+    uint32_t offload_write_workers = 1;  // Valid range: [1, 16].
+
     // DFS control-plane mode. Enabled for filesystem-mode distributed storage
     // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
@@ -1155,8 +1158,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param disk_hint Restrict selection to this disk (>= 0). Used by
      *        watermark eviction, which drives one disk at a time.
      * @return PendingEviction with all keys and bucket metadata removed;
-     *         NO_AVAILABLE_DISK if no disk can hold the incoming bucket;
-     *         FILE_WRITE_FAIL if the quota is still exceeded afterwards.
+     *         NO_AVAILABLE_DISK if no disk has capacity for the incoming
+     *         bucket, including space reserved by writes or pending eviction.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
         int64_t required_size, const std::vector<std::string>& write_keys = {},

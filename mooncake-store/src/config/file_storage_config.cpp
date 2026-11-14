@@ -1,5 +1,6 @@
 #include "storage_backend.h"
 
+#include <charconv>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -165,6 +166,16 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
+    const auto workers = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_WRITE_WORKERS, std::string{"1"});
+    const auto [end, error] =
+        std::from_chars(workers.data(), workers.data() + workers.size(),
+                        config.offload_write_workers);
+    if (error != std::errc{} || end != workers.data() + workers.size()) {
+        config.offload_write_workers =
+            0;  // Validate() rejects malformed input.
+    }
+
     return config;
 }
 
@@ -230,6 +241,17 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
+    if (offload_write_workers < 1 || offload_write_workers > 16) {
+        LOG(ERROR) << "MOONCAKE_OFFLOAD_WRITE_WORKERS must be in [1,16]";
+        return false;
+    }
+    if (offload_write_workers > 1 &&
+        (enable_dfs || storage_backend_type != StorageBackendType::kBucket)) {
+        LOG(ERROR) << "Parallel offload requires local bucket storage with DFS "
+                      "disabled";
+        return false;
+    }
+
     // storage_filepath may be a comma-separated multi-disk list. ValidatePath
     // stats a single path and would reject the raw list string (stat of
     // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed

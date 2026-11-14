@@ -2172,6 +2172,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                           "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE selects packed";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (direct_write.value() && file_storage_config_.use_uring &&
+            file_storage_config_.offload_write_workers > 1) {
+            LOG(ERROR) << "Parallel offload supports io_uring reads with POSIX "
+                          "writes; set MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=0 "
+                          "or MOONCAKE_OFFLOAD_WRITE_WORKERS=1 for packed "
+                          "io_uring writes";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (direct_write.value()) {
 #ifdef USE_URING
             if (!file_storage_config_.use_uring) {
@@ -3583,6 +3591,25 @@ BucketStorageBackend::PrepareEviction(
             result.write_keys.push_back(key);
         }
         if (!result.write_keys.empty()) {
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::NONE) {
+                int64_t reserved_size = 0;
+                for (const auto& entry : disks_) {
+                    reserved_size +=
+                        entry.total_size + entry.pending_write_size;
+                }
+                // IsEnableOffloading() is only an advisory snapshot. Reserve
+                // against committed data and every concurrent writer here.
+                if (object_bucket_map_.size() + pending_write_keys_.size() +
+                            result.write_keys.size() >
+                        static_cast<size_t>(
+                            file_storage_config_.total_keys_limit) ||
+                    reserved_size + required_size >
+                        file_storage_config_.total_size_limit) {
+                    // Reservations may be released by another writer.
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
+                }
+            }
             result.write_size = required_size;
             disk.pending_write_size += required_size;
             pending_write_keys_.insert(result.write_keys.begin(),
@@ -3615,9 +3642,9 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
-                                  ? static_cast<uint64_t>(required_size)
-                                  : 0;
+            // Files of other reserved writes may not be visible to fs::space
+            // yet. Counting a partially written file twice is conservative.
+            uint64_t req_sz = static_cast<uint64_t>(disk.pending_write_size);
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
             if (initial_disk_full) {
                 deficit = req_sz + kMinFreeSpace - actual_available;
@@ -3637,12 +3664,8 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
-    // On-disk footprint of the incoming write (~required_size); 0 for
-    // watermark-driven eviction, which has no incoming write. Added to the
-    // physical check below so we free enough room for THIS write, not merely
-    // enough to bring current usage back under the cap.
-    const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
+    // Include every reserved write on this disk, not only this caller.
+    const int64_t incoming_physical_size = disk.pending_write_size;
 
     // Ground-truth physical usage of the offload directory (cached),
     // snapshotted once. As buckets are selected for eviction their files get
@@ -3736,13 +3759,13 @@ BucketStorageBackend::PrepareEviction(
                                     synthetic_required_size >
                                 quota_limit;
     // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
-    // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
+    // reject admission without reporting an I/O failure
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     disk.pending_eviction_size += result.evicted_size;
     if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
     }
 
     if (!result.buckets.empty()) {

@@ -73,6 +73,7 @@ struct FileStorageEnvironment {
         "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
+    ScopedEnvVar write_workers{"MOONCAKE_OFFLOAD_WRITE_WORKERS"};
 };
 
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
@@ -87,6 +88,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
     EXPECT_FALSE(config.use_uring);
+    EXPECT_EQ(config.offload_write_workers, 1u);
     EXPECT_FALSE(config.enable_dfs);
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
@@ -373,5 +375,35 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
 }
 
 }  // namespace
+
+TEST_F(FileStorageConfigTest, OffloadWriteWorkersValidateConfiguration) {
+    for (const char* value : {"1", "2", "16"}) {
+        env.write_workers.Set(value);
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path.string();
+        EXPECT_EQ(config.offload_write_workers, std::stoul(value));
+        EXPECT_TRUE(config.Validate());
+    }
+    for (const char* value :
+         {"", "0", "17", "-1", "+2", " 2", "2 ", "2x", "4294967296"}) {
+        env.write_workers.Set(value);
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path.string();
+        EXPECT_FALSE(config.Validate()) << value;
+    }
+    FileStorageConfig config;
+    config.storage_filepath = data_path.string();
+    config.offload_write_workers = 2;
+    ASSERT_TRUE(config.Validate());
+    config.use_uring = true;
+    EXPECT_TRUE(config.Validate());
+    config.enable_dfs = true;
+    EXPECT_FALSE(config.Validate());
+    config.enable_dfs = false;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    EXPECT_FALSE(config.Validate());
+    config.offload_write_workers = 1;
+    EXPECT_TRUE(config.Validate());
+}
 
 }  // namespace mooncake

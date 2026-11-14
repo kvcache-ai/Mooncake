@@ -258,6 +258,26 @@ TEST(BucketDirectWriteConfigTest, AcceptsAlignedAndRejectsItWithPacked) {
     std::filesystem::remove_all(path);
 }
 
+TEST(BucketDirectWriteConfigTest, ParallelWorkersRejectPackedUringWrites) {
+    char directory[] = "/tmp/mooncake-parallel-mode-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    const std::filesystem::path path = directory;
+    FileStorageConfig config;
+    config.storage_filepath = path.string();
+    config.use_uring = true;
+    config.offload_write_workers = 2;
+    for (const char* setting : {"packed", "true", "1"}) {
+        SCOPED_TRACE(setting);
+        ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", setting);
+        BucketStorageBackend backend(config, BucketBackendConfig{});
+        const auto result = backend.Init();
+        EXPECT_FALSE(result);
+        if (!result) EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(std::filesystem::is_empty(path));
+    }
+    std::filesystem::remove_all(path);
+}
+
 TEST_P(BucketDirectWriteTest, LayoutRollbackAndRestartReadback) {
     Values all_values;
     std::unordered_map<std::string, StorageObjectMetadata> committed;

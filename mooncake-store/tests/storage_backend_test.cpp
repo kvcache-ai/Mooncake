@@ -4077,7 +4077,7 @@ TEST_F(StorageBackendTest,
 
     ASSERT_TRUE(concurrent_result.has_value());
     ASSERT_FALSE(concurrent_result->has_value());
-    EXPECT_EQ(concurrent_result->error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(concurrent_result->error(), ErrorCode::NO_AVAILABLE_DISK);
     ASSERT_FALSE(failed_eviction_result.has_value());
     EXPECT_EQ(failed_eviction_result.error(), ErrorCode::INTERNAL_ERROR);
 
@@ -5860,16 +5860,18 @@ namespace {
 // Writes one bucket holding a single key of `size` bytes. bucket_keys_limit=1
 // in these tests makes every call produce exactly one bucket, so the number of
 // .meta files per directory equals the number of buckets routed to that disk.
-tl::expected<int64_t, ErrorCode> OffloadOneKey(BucketStorageBackend& backend,
-                                               const std::string& key,
-                                               size_t size, char fill = 'a') {
+tl::expected<int64_t, ErrorCode> OffloadOneKey(
+    BucketStorageBackend& backend, const std::string& key, size_t size,
+    char fill = 'a',
+    StorageBackendInterface::EvictionHandler eviction = nullptr) {
     std::vector<char> value(size, fill);
     std::unordered_map<std::string, std::vector<Slice>> batch;
     batch.emplace(key, std::vector<Slice>{Slice{value.data(), value.size()}});
-    return backend.BatchOffload(batch, [](const std::vector<std::string>&,
-                                          std::vector<StorageObjectMetadata>&) {
-        return ErrorCode::OK;
-    });
+    return backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+        std::move(eviction));
 }
 
 int CountMetaFiles(const std::string& dir) {
@@ -6879,5 +6881,87 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
     }
 }
 #endif
+
+TEST_F(StorageBackendTest, OffloadWriteNonePolicyRespectsConcurrentLimits) {
+    for (bool key_limit : {true, false}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/none0," + data_path + "/none1";
+        config.total_keys_limit = key_limit ? 1 : 100;
+        config.total_size_limit = key_limit ? 1024 * 1024 : 48 * 1024;
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_size_limit = 40 * 1024;
+        bucket_config.bucket_keys_limit = 1;
+        bucket_config.eviction_policy = BucketEvictionPolicy::NONE;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        std::promise<void> start;
+        auto gate = start.get_future().share();
+        std::vector<std::future<tl::expected<int64_t, ErrorCode>>> jobs;
+        for (int worker = 0; worker < 4; ++worker) {
+            jobs.push_back(std::async(std::launch::async, [&, worker] {
+                gate.wait();
+                return OffloadOneKey(backend, "w" + std::to_string(worker),
+                                     32 * 1024);
+            }));
+        }
+        start.set_value();
+        int succeeded = 0;
+        for (auto& job : jobs) {
+            auto result = job.get();
+            succeeded += result.has_value();
+            if (!result) {
+                EXPECT_TRUE(result.error() == ErrorCode::KEYS_ULTRA_LIMIT ||
+                            result.error() == ErrorCode::NO_AVAILABLE_DISK);
+            }
+        }
+        EXPECT_EQ(succeeded, 1);
+        auto metadata = backend.GetStoreMetadata();
+        ASSERT_TRUE(metadata);
+        EXPECT_EQ(metadata->total_keys, 1);
+        EXPECT_LE(metadata->total_size, config.total_size_limit);
+        backend.RemoveAll();
+    }
+}
+
+TEST_F(StorageBackendTest, OffloadWritePhysicalCapCountsPendingWriters) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 1;
+    bucket_config.bucket_size_limit = 40 * 1024;
+    bucket_config.max_total_size = 1024 * 1024;
+    bucket_config.max_physical_bytes = 56 * 1024;
+    bucket_config.disk_scan_cache_ms = 0;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(OffloadOneKey(backend, "old", 32 * 1024));
+    std::promise<void> entered, release;
+    auto ready = entered.get_future();
+    auto gate = release.get_future().share();
+    auto writing = std::async(std::launch::async, [&] {
+        return OffloadOneKey(
+            backend, "first", 32 * 1024, 'a',
+            [&](const auto&) -> tl::expected<void, ErrorCode> {
+                entered.set_value();
+                gate.wait();  // The incoming reservation is still in flight.
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            });
+    });
+    const auto status = ready.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(status, std::future_status::ready);
+    if (status == std::future_status::ready) {
+        auto blocked = OffloadOneKey(backend, "second", 8 * 1024);
+        EXPECT_FALSE(blocked);
+        if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::NO_AVAILABLE_DISK);
+    }
+    release.set_value();
+    auto failed = writing.get();
+    EXPECT_FALSE(failed);
+    if (!failed) EXPECT_EQ(failed.error(), ErrorCode::RPC_FAIL);
+    EXPECT_TRUE(backend.IsExist("old").value());
+    // Failed notification must release the reservation, allowing a small write.
+    EXPECT_TRUE(OffloadOneKey(backend, "second", 8 * 1024));
+}
 
 }  // namespace mooncake::test
