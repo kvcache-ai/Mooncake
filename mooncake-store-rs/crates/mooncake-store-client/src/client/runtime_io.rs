@@ -475,10 +475,41 @@ impl StoreClient {
             let (targets, reservations) = match reserve_result {
                 Ok(reserved) => reserved,
                 Err(error) => {
-                    let _ = self.abort_tenant_quota_reservation(
+                    let quota_abort = self.abort_tenant_quota_reservation(
                         quota_reservation.as_ref(),
                         "allocation_reserve_failed",
                     );
+                    if attempt < max_write_attempts
+                        && self.should_retry_put_after_reservation_failure(&error, &policy)
+                    {
+                        quota_abort?;
+                        match refresh_live_client_cache(
+                            self.metadata.as_ref(),
+                            &self.live_client_cache,
+                            "live_client_snapshot_put_reserve_failure",
+                        ) {
+                            Ok(_) => {
+                                debug!(
+                                    runtime = %self.lease.runtime,
+                                    tenant,
+                                    key,
+                                    attempt,
+                                    max_write_attempts,
+                                    error = %error,
+                                    "retrying put after placement reservation failure and membership refresh"
+                                );
+                                continue;
+                            }
+                            Err(refresh_error) => debug!(
+                                runtime = %self.lease.runtime,
+                                tenant,
+                                key,
+                                error = %error,
+                                refresh_error = %refresh_error,
+                                "membership refresh failed after placement reservation failure"
+                            ),
+                        }
+                    }
                     return Err(error);
                 }
             };
@@ -2066,7 +2097,7 @@ impl StoreClient {
                 .min_by_key(|candidate| candidate.priority)
                 .is_some_and(|primary| primary.owner != replica.owner)
             {
-                self.prune_unreadable_replicas_best_effort(candidate, &readable_runtimes);
+                self.prune_unreadable_replicas_best_effort(candidate);
             }
         }
 
@@ -2128,11 +2159,19 @@ impl StoreClient {
             .unwrap_or_default()
     }
 
-    fn prune_unreadable_replicas_best_effort(
-        &self,
-        route: &ObjectRoute,
-        readable_runtimes: &BTreeSet<ClientRuntimeId>,
-    ) {
+    fn prune_unreadable_replicas_best_effort(&self, route: &ObjectRoute) {
+        let readable_runtimes = match self.readable_runtime_set(true) {
+            Ok(readable_runtimes) => readable_runtimes,
+            Err(error) => {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    key = %route.key.0,
+                    error = %error,
+                    "skipping route prune because membership refresh failed"
+                );
+                return;
+            }
+        };
         let filtered = route
             .replicas
             .iter()
@@ -2184,6 +2223,18 @@ impl StoreClient {
             && left.segment_name == right.segment_name
             && left.segment_offset == right.segment_offset
             && left.length == right.length
+    }
+
+    fn should_retry_put_after_reservation_failure(
+        &self,
+        error: &StoreError,
+        policy: &ResolvedReplicationPolicy,
+    ) -> bool {
+        policy.required_preferred_segments.is_empty()
+            && matches!(
+                error,
+                StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+            )
     }
 
     fn should_retry_put_after_write_failure(
@@ -2303,11 +2354,7 @@ impl StoreClient {
         false
     }
 
-    fn maybe_prune_route_after_failover(
-        &self,
-        entry: &ResolvedObject,
-        readable_runtimes: &BTreeSet<ClientRuntimeId>,
-    ) {
+    fn maybe_prune_route_after_failover(&self, entry: &ResolvedObject) {
         if entry
             .route
             .replicas
@@ -2315,7 +2362,7 @@ impl StoreClient {
             .min_by_key(|candidate| candidate.priority)
             .is_some_and(|primary| primary.owner != entry.replica.owner)
         {
-            self.prune_unreadable_replicas_best_effort(&entry.route, readable_runtimes);
+            self.prune_unreadable_replicas_best_effort(&entry.route);
         }
     }
 
@@ -2366,7 +2413,7 @@ impl StoreClient {
         entry.route = route;
         entry.replica = replica;
         entry.fallback_replicas = fallback_replicas;
-        self.maybe_prune_route_after_failover(entry, &readable_runtimes);
+        self.maybe_prune_route_after_failover(entry);
         Ok(true)
     }
 
@@ -2457,7 +2504,7 @@ impl StoreClient {
             .min_by_key(|candidate| candidate.priority)
             .is_some_and(|primary| primary.owner != replica.owner)
         {
-            self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
+            self.prune_unreadable_replicas_best_effort(&route);
         }
         let fallback_replicas = Self::fallback_replicas_for_route(
             &route,
@@ -2557,7 +2604,7 @@ impl StoreClient {
                         .min_by_key(|candidate| candidate.priority)
                         .is_some_and(|primary| primary.owner != replica.owner)
                     {
-                        self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
+                        self.prune_unreadable_replicas_best_effort(&route);
                     }
                     let fallback_replicas = Self::fallback_replicas_for_route(
                         &route,
@@ -5966,8 +6013,7 @@ impl StoreClient {
                         return Err(error);
                     }
                     self.mark_runtime_suspect(&failed_owner, "route_read_replica_failed");
-                    let pruned_runtimes = self.readable_runtime_set(true)?;
-                    self.maybe_prune_route_after_failover(resolved, &pruned_runtimes);
+                    self.maybe_prune_route_after_failover(resolved);
                     debug!(
                         runtime = %self.lease.runtime,
                         tenant = %resolved.tenant,
