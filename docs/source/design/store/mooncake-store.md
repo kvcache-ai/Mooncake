@@ -105,18 +105,20 @@ tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
 
 The storage node (Client) unregisters the storage segment space with the Master Service.
 
-The Master Service handles object-related interfaces as follows:
+The Master Service handles object-related interfaces as follows. The signatures below are the `MasterService` RPC declarations in `mooncake-store/include/rpc_service.h`; `MasterClient` exposes wrappers over them and does not add arguments.
 
 - Put
 
 ```C++
-    ErrorCode PutStart(const std::string& key,
-                       uint64_t value_length,
-                       const std::vector<uint64_t>& slice_lengths,
-                       const ReplicateConfig& config,
-                       std::vector<ReplicaInfo>& replica_list);
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    const UUID& client_id, const std::string& key,
+    const uint64_t slice_length, const ReplicateConfig& config,
+    const std::string& tenant_id = "default");
 
-    ErrorCode PutEnd(const std::string& key);
+tl::expected<void, ErrorCode> PutEnd(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
 ```
 
 Before writing an object, the Client calls PutStart to request storage space allocation from the Master Service. After completing data writing, the Client calls PutEnd to notify the Master Service to mark the object write as completed.
@@ -158,10 +160,13 @@ path.
 - GetReplicaList
 
 ```C++
-ErrorCode GetReplicaList(const std::string& key,
-                         std::vector<ReplicaInfo>& replica_list);
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
-GetReplicaListByRegex(const std::string& str);
+tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+    const std::string& key, const std::string& tenant_id = "default");
+
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+GetReplicaListByRegex(const std::string& str,
+                      const std::string& tenant_id = "default");
 ```
 
 The Client requests the Master Service to retrieve the replica list for a specified key or for all object keys matching a specified regular expression, allowing the Client to select an appropriate replica for reading based on this information.

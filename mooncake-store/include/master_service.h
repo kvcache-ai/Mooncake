@@ -373,7 +373,8 @@ class MasterService {
     /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
-     * @param str The regular expression string to match against object keys.
+     * @param regex_pattern The regular expression string to match against
+     * object keys.
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
@@ -385,7 +386,6 @@ class MasterService {
 
     /**
      * @brief Get list of replicas for an object
-     * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
@@ -419,8 +419,6 @@ class MasterService {
 
     /**
      * @brief Start a put operation for an object
-     * @param[out] replica_list Vector to store replica information for the
-     * slice
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid

@@ -321,16 +321,28 @@ class Client {
      * @param keys Object keys
      * @param batched_slices Vector of vectors of data slices to store (indexed
      * to match keys)
-     * @param config Replication configuration
-     * @param group_by_target Write every memory replica on the same segment
-     * with one transfer submission. A failed submission or transfer then
-     * fails that replica for every key in the group. Defaults to false.
-     * prefer_alloc_in_same_node also groups through this path.
+     * @param config Replication configuration. Target grouping is requested
+     * only through its prefer_alloc_in_same_node flag here; the overload that
+     * takes a WriteBufferStager also accepts group_by_target.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    /**
+     * @brief Batch put data with replication, staging write buffers first
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices to store (indexed
+     * to match keys)
+     * @param config Replication configuration
+     * @param stager Called with a key's slices when that key has a replica
+     * that cannot be copied locally; it returns the slices to transfer, and an
+     * error fails that key. An empty stager stages nothing.
+     * @param group_by_target Write every memory replica on the same segment
+     * with one transfer submission. A failed submission or transfer then
+     * fails that replica for every key in the group. Defaults to false;
+     * prefer_alloc_in_same_node also groups through this path.
+     */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
@@ -403,13 +415,23 @@ class Client {
      * @brief Batch upsert data with replication
      * @param keys Object keys
      * @param batched_slices Vector of vectors of data slices
-     * @param config Replication configuration
-     * @param group_by_target Same as BatchPut. Defaults to false.
+     * @param config Replication configuration. Target grouping is requested
+     * only through its prefer_alloc_in_same_node flag here; the overload that
+     * takes a WriteBufferStager also accepts group_by_target.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    /**
+     * @brief Batch upsert data with replication, staging write buffers first
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices
+     * @param config Replication configuration
+     * @param stager Called with a key's slices when that key has a replica
+     * that cannot be copied locally; see BatchPut.
+     * @param group_by_target Same as BatchPut. Defaults to false.
+     */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
