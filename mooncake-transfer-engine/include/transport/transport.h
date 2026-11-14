@@ -357,9 +357,8 @@ class Transport {
                 &task->end_ticks,
                 std::chrono::steady_clock::now().time_since_epoch().count(),
                 __ATOMIC_RELAXED);
-            const bool failed =
-                __atomic_load_n(&task->failed_slice_count, __ATOMIC_ACQUIRE) !=
-                0;
+            const bool failed = __atomic_load_n(&task->failed_slice_count,
+                                                __ATOMIC_ACQUIRE) != 0;
             __atomic_store_n(&task->end_status,
                              failed ? TransferStatusEnum::FAILED
                                     : TransferStatusEnum::COMPLETED,
