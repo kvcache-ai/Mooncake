@@ -118,53 +118,6 @@ DefaultNofInitiatorFactoryForTestingSlot() {
     return factory;
 }
 
-struct ContiguousSliceRange {
-    void* ptr = nullptr;
-    size_t size = 0;
-};
-
-std::optional<ContiguousSliceRange> GetContiguousSliceRange(
-    std::span<const Slice> slices) {
-    if (slices.empty()) {
-        return std::nullopt;
-    }
-
-    uintptr_t expected_ptr = 0;
-    uintptr_t start_ptr = 0;
-    size_t total_size = 0;
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-        if (slice.ptr == nullptr) {
-            return std::nullopt;
-        }
-
-        const auto current_ptr = reinterpret_cast<uintptr_t>(slice.ptr);
-        if (i == 0) {
-            start_ptr = current_ptr;
-            expected_ptr = current_ptr;
-        } else if (current_ptr != expected_ptr) {
-            return std::nullopt;
-        }
-
-        if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
-            return std::nullopt;
-        }
-        if (slice.size > std::numeric_limits<uintptr_t>::max() - current_ptr) {
-            return std::nullopt;
-        }
-
-        total_size += slice.size;
-        expected_ptr = current_ptr + slice.size;
-    }
-
-    if (total_size == 0) {
-        return std::nullopt;
-    }
-
-    return ContiguousSliceRange{.ptr = reinterpret_cast<void*>(start_ptr),
-                                .size = total_size};
-}
-
 ErrorCode ScatterFragmentError(const Status& status) {
     return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
                                       : ErrorCode::TRANSFER_FAIL;
@@ -1860,15 +1813,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             dfs_read_replicas.push_back(replica);
             continue;
         } else if (replica.is_nof_replica()) {
-            auto contiguous_range = GetContiguousSliceRange(slices_it->second);
-            if (!contiguous_range.has_value()) {
-                LOG(ERROR) << "NoF transfer requires contiguous slices";
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
             future = transfer_submitter_->submit(
                 replica, slices_it->second, TransferRequest::READ,
-                contiguous_range->ptr, contiguous_range->size,
                 TransferIntent::kForegroundGet);
         } else if (group_by_target && replica.is_memory_replica() &&
                    CalculateSliceSize(slices_it->second) ==
@@ -1886,7 +1832,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         } else {
             future = transfer_submitter_->submit(
-                replica, slices_it->second, TransferRequest::READ, nullptr, 0,
+                replica, slices_it->second, TransferRequest::READ,
                 TransferIntent::kForegroundGet);
         }
         if (!future) {
@@ -2997,28 +2943,10 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops,
                 const auto replica_type = replica.is_memory_replica()
                                               ? ReplicaType::MEMORY
                                               : ReplicaType::NOF_SSD;
-                std::optional<TransferFuture> submit_result;
-                if (replica.is_nof_replica()) {
-                    auto contiguous_range = GetContiguousSliceRange(op.slices);
-                    if (!contiguous_range.has_value()) {
-                        std::string failure_context =
-                            "NoF transfer requires contiguous slices for "
-                            "replica " +
-                            std::to_string(replica_idx);
-                        op.transfer_summary.RecordFailure(
-                            replica_type, ErrorCode::INVALID_PARAMS);
-                        op.AppendFailureContext(failure_context);
-                        continue;
-                    }
-                    submit_result = transfer_submitter_->submit(
-                        replica, op.slices, TransferRequest::WRITE,
-                        contiguous_range->ptr, contiguous_range->size,
-                        TransferIntent::kUnspecified);
-                } else {
-                    submit_result = transfer_submitter_->submit(
-                        replica, op.slices, TransferRequest::WRITE, nullptr, 0,
-                        TransferIntent::kUnspecified);
-                }
+                std::optional<TransferFuture> submit_result =
+                    transfer_submitter_->submit(replica, op.slices,
+                                                TransferRequest::WRITE,
+                                                TransferIntent::kUnspecified);
 
                 if (!submit_result) {
                     std::string failure_context =
@@ -4944,20 +4872,8 @@ tl::expected<TransferFuture, ErrorCode> Client::SubmitSingleTransfer(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::optional<TransferFuture> future;
-    if (replica_descriptor.is_nof_replica()) {
-        auto contiguous_range = GetContiguousSliceRange(slices);
-        if (!contiguous_range.has_value()) {
-            LOG(ERROR) << "NoF transfer requires contiguous slices";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        future = transfer_submitter_->submit(replica_descriptor, slices,
-                                             op_code, contiguous_range->ptr,
-                                             contiguous_range->size, intent);
-    } else {
-        future = transfer_submitter_->submit(replica_descriptor, slices,
-                                             op_code, nullptr, 0, intent);
-    }
+    std::optional<TransferFuture> future = transfer_submitter_->submit(
+        replica_descriptor, slices, op_code, intent);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return tl::unexpected(ErrorCode::TRANSFER_FAIL);
