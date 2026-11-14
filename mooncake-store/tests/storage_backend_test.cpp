@@ -456,10 +456,11 @@ TEST_F(StorageBackendTest, BucketScan) {
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metadatas;
     std::vector<int64_t> scan_buckets;
-    auto res = storage_backend.BucketScan(0, scan_keys, scan_metadatas,
+    auto res = storage_backend.BucketScan({0, 0}, scan_keys, scan_metadatas,
                                           scan_buckets, 10);
     ASSERT_TRUE(res);
-    ASSERT_EQ(res.value(), buckets.at(1));
+    ASSERT_EQ(res.value().bucket_id, buckets.at(1));
+    ASSERT_EQ(res.value().key_index, 0);
     for (size_t i = 0; i < scan_keys.size(); i++) {
         ASSERT_EQ(scan_metadatas[i].data_size,
                   batch_data.at(scan_keys[i]).size());
@@ -471,59 +472,180 @@ TEST_F(StorageBackendTest, BucketScan) {
     scan_keys.clear();
     scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(0, scan_keys, scan_metadatas, scan_buckets,
-                                     45);
+    res = storage_backend.BucketScan({0, 0}, scan_keys, scan_metadatas,
+                                     scan_buckets, 45);
     ASSERT_TRUE(res);
 
-    ASSERT_EQ(res.value(), buckets.at(4));
-    ASSERT_EQ(scan_buckets.size(), 4);
-    for (int i = 0; i < 4; i++) {
+    ASSERT_EQ(res.value().bucket_id, buckets.at(4));
+    ASSERT_EQ(res.value().key_index, 5);
+    ASSERT_EQ(scan_buckets.size(), 5);
+    for (int i = 0; i < 5; i++) {
         ASSERT_EQ(scan_buckets.at(i), buckets.at(i));
     }
 
     scan_keys.clear();
     scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(buckets.at(4), scan_keys, scan_metadatas,
+    res = storage_backend.BucketScan(res.value(), scan_keys, scan_metadatas,
                                      scan_buckets, 45);
     ASSERT_TRUE(res);
 
-    ASSERT_EQ(res.value(), buckets.at(8));
-    ASSERT_EQ(scan_buckets.size(), 4);
-    for (int i = 0; i < 4; i++) {
+    ASSERT_EQ(res.value().bucket_id, buckets.at(9));
+    ASSERT_EQ(res.value().key_index, 0);
+    ASSERT_EQ(scan_buckets.size(), 5);
+    for (int i = 0; i < 5; i++) {
         ASSERT_EQ(scan_buckets.at(i), buckets.at(i + 4));
     }
 
     scan_keys.clear();
     scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(buckets.at(9), scan_keys, scan_metadatas,
-                                     scan_buckets, 45);
+    res = storage_backend.BucketScan({buckets.at(9), 0}, scan_keys,
+                                     scan_metadatas, scan_buckets, 45);
 
     ASSERT_TRUE(res);
-    ASSERT_EQ(res.value(), 0);
+    ASSERT_EQ(res.value().bucket_id, 0);
     ASSERT_EQ(scan_buckets.size(), 1);
     ASSERT_EQ(scan_buckets.at(0), buckets.at(9));
 
     scan_keys.clear();
     scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(buckets.at(9) + 10, scan_keys,
+    res = storage_backend.BucketScan({buckets.at(9) + 10, 0}, scan_keys,
                                      scan_metadatas, scan_buckets, 45);
     ASSERT_TRUE(res);
-    ASSERT_EQ(res.value(), 0);
+    ASSERT_EQ(res.value().bucket_id, 0);
     ASSERT_EQ(scan_buckets.size(), 0);
 
     scan_keys.clear();
     scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(0, scan_keys, scan_metadatas, scan_buckets,
-                                     8);
-    ASSERT_TRUE(!res);
-    ASSERT_EQ(res.error(), ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
-    ASSERT_EQ(scan_buckets.size(), 0);
-    ASSERT_EQ(scan_keys.size(), 0);
-    ASSERT_EQ(scan_metadatas.size(), 0);
+    res = storage_backend.BucketScan({0, 0}, scan_keys, scan_metadatas,
+                                     scan_buckets, 8);
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res.value().bucket_id, buckets.at(0));
+    ASSERT_EQ(res.value().key_index, 8);
+    ASSERT_EQ(scan_buckets.size(), 1);
+    ASSERT_EQ(scan_keys.size(), 8);
+    ASSERT_EQ(scan_metadatas.size(), 8);
+
+    for (int64_t limit : {0, -1}) {
+        scan_keys.clear();
+        scan_metadatas.clear();
+        scan_buckets.clear();
+        res = storage_backend.BucketScan({0, 0}, scan_keys, scan_metadatas,
+                                         scan_buckets, limit);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_EQ(res.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(scan_keys.empty());
+    }
+}
+
+class BucketScanBatchingTest : public StorageBackendTest,
+                               public ::testing::WithParamInterface<int64_t> {};
+
+TEST_P(BucketScanBatchingTest, RecoveryUsesBoundedBatches) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    std::unordered_map<std::string, std::string> data;
+    std::unordered_map<std::string, StorageObjectMetadata> expected;
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        ASSERT_TRUE(BatchOffloadUtil(backend, keys, sizes, data, buckets));
+        ASSERT_TRUE(backend.BatchQuery(keys, expected));
+    }
+
+    // The persisted buckets contain ten keys each. A smaller recovery batch
+    // limit must not require rewriting or discarding those buckets.
+    config.scanmeta_iterator_keys_limit = GetParam();
+    BucketStorageBackend recovered(config, bucket_config);
+    ASSERT_TRUE(recovered.Init());
+    const auto file_count = CountDataFiles(data_path);
+    std::unordered_map<std::string, StorageObjectMetadata> scanned;
+    auto result =
+        recovered.ScanMeta([&](const std::vector<std::string>& batch_keys,
+                               std::vector<StorageObjectMetadata>& metadata) {
+            EXPECT_FALSE(batch_keys.empty());
+            EXPECT_LE(batch_keys.size(), static_cast<size_t>(GetParam()));
+            EXPECT_EQ(batch_keys.size(), metadata.size());
+            if (batch_keys.size() != metadata.size()) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+            for (size_t i = 0; i < batch_keys.size(); ++i) {
+                EXPECT_TRUE(scanned.emplace(batch_keys[i], metadata[i]).second);
+            }
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(result.has_value()) << result.error();
+    // Batching must preserve every key and its original storage coordinates.
+    ASSERT_EQ(scanned.size(), expected.size());
+    for (const auto& [key, metadata] : expected) {
+        ASSERT_TRUE(scanned.contains(key));
+        const auto& actual = scanned.at(key);
+        EXPECT_EQ(actual.bucket_id, metadata.bucket_id);
+        EXPECT_EQ(actual.offset, metadata.offset);
+        EXPECT_EQ(actual.key_size, metadata.key_size);
+        EXPECT_EQ(actual.data_size, metadata.data_size);
+    }
+    EXPECT_EQ(CountDataFiles(data_path), file_count);
+}
+
+// Exercise smaller, exact-bucket, and cross-bucket batch limits.
+INSTANTIATE_TEST_SUITE_P(ScanLimits, BucketScanBatchingTest,
+                         ::testing::Values(1, 4, 10, 25));
+
+TEST_F(StorageBackendTest, BucketScanRetriesFailedBatchWithoutSkippingKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.scanmeta_iterator_keys_limit = 4;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(BatchOffloadUtil(backend, keys, sizes, data, buckets));
+
+    // Accept one batch, then reject the next batch within the same bucket.
+    std::vector<std::string> accepted;
+    std::vector<std::string> rejected;
+    auto result =
+        backend.ScanMeta([&](const std::vector<std::string>& batch_keys,
+                             std::vector<StorageObjectMetadata>&) {
+            if (!accepted.empty()) {
+                rejected = batch_keys;
+                return ErrorCode::RPC_FAIL;
+            }
+            accepted.insert(accepted.end(), batch_keys.begin(),
+                            batch_keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_FALSE(result.has_value());
+    ASSERT_EQ(result.error(), ErrorCode::RPC_FAIL);
+    ASSERT_FALSE(rejected.empty());
+
+    // A caller retry must start with the rejected batch, not skip past it.
+    bool first_retry = true;
+    result = backend.ScanMeta([&](const std::vector<std::string>& batch_keys,
+                                  std::vector<StorageObjectMetadata>&) {
+        if (first_retry) {
+            EXPECT_EQ(batch_keys, rejected);
+            first_retry = false;
+        }
+        accepted.insert(accepted.end(), batch_keys.begin(), batch_keys.end());
+        return ErrorCode::OK;
+    });
+    ASSERT_TRUE(result.has_value()) << result.error();
+    // Successful batches across both scans must cover every key exactly once.
+    std::sort(accepted.begin(), accepted.end());
+    std::sort(keys.begin(), keys.end());
+    EXPECT_EQ(accepted, keys);
 }
 
 TEST_F(StorageBackendTest, InitializeWithValidStart) {
