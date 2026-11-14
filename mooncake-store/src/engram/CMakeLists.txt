@@ -1,3 +1,17 @@
+install(
+  DIRECTORY remote/
+  DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}/_engram
+  COMPONENT python
+  FILES_MATCHING
+  PATTERN "*.py"
+  PATTERN "*.cpp"
+  PATTERN "DEEP_EP_LICENSE"
+  PATTERN "__pycache__" EXCLUDE)
+
+if(NOT USE_CUDA)
+  return()
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 # Set defaults locally: CUDA may already be enabled in a sibling directory.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
