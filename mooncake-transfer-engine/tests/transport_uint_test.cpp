@@ -1485,10 +1485,11 @@ Transport* installSharedRegistrationTcp(Engine& engine) {
     auto output = testing::internal::GetCapturedStderr();
     std::istringstream lines(output);
     for (std::string line; std::getline(lines, line);) {
-        if (!line.empty() && line.front() == 'E')
+        if (!line.empty() && line.front() == 'E') {
             EXPECT_NE(line.find("Local segment descriptor not found"),
                       std::string::npos)
                 << line;
+        }
     }
     return transport;
 }
@@ -1678,6 +1679,33 @@ TEST_F(TransportTest, SharedMemoryRegistrationRetriesFailedCleanup) {
     EXPECT_EQ(engine.unregisterLocalMemory(base), 0);
     EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
     EXPECT_EQ(engine.unregisterLocalMemory(base), ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(TransportTest, SharedMemoryRegistrationRetriesFailedRollback) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(installSharedRegistrationTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableSharedMemoryRegistration(), 0);
+    auto transport = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    TransferEngineImplTestPeer::addTransport(engine, transport);
+    std::array<char, 64> allocation{};
+    auto* base = allocation.data();
+    transport->setRegisterResult(ERR_MEMORY);
+    testing::internal::CaptureStderr();
+    auto result = engine.registerLocalMemory(base, allocation.size());
+    auto errors = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(result, ERR_MEMORY);
+    EXPECT_NE(errors.find("Failed to register a batch"), std::string::npos);
+    EXPECT_NE(errors.find("Failed to roll back batch registration"),
+              std::string::npos);
+    EXPECT_TRUE(engine.checkOverlap(base, allocation.size()));
+    EXPECT_EQ(engine.registerLocalMemory(base, allocation.size()), ERR_CONTEXT);
+    EXPECT_EQ(engine.unregisterLocalMemory(base), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
+    EXPECT_EQ(engine.unregisterLocalMemory(base), ERR_ADDRESS_NOT_REGISTERED);
+    transport->setRegisterResult(0);
+    ASSERT_EQ(engine.registerLocalMemory(base, allocation.size()), 0);
+    ASSERT_EQ(engine.unregisterLocalMemory(base), 0);
 }
 
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {

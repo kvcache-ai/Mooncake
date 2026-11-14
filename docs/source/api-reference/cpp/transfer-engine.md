@@ -199,7 +199,8 @@ Shared registrations are always remote-accessible and published, regardless of
 Release each registration at its requested start address. Keep the allocation
 alive until all users release it, and finish transfers before release. Failed
 cleanup can be retried; affected regions cannot be acquired until it succeeds.
-Store clients must still use their own buffer registration API.
+If a failed registration cannot be rolled back, unregister its start address to
+retry the cleanup. Store clients must still use their own buffer registration API.
 
 #### TransferEngine::registerLocalMemory
 

@@ -855,10 +855,18 @@ int TransferEngineImpl::unregisterSharedMemory(
         for (auto ptr : addresses) {
             auto addr = reinterpret_cast<uintptr_t>(ptr);
             if (!unique.insert(addr).second) return ERR_INVALID_ARGUMENT;
-            if (!shared_memory_users_.count(addr))
+            if (shared_memory_users_.count(addr)) {
+                auto region =
+                    std::prev(local_memory_regions_.upper_bound(addr));
+                ++releases[region->first];
+                continue;
+            }
+            // A registration whose rollback failed leaves a userless record.
+            auto orphan = local_memory_regions_.find(addr);
+            if (orphan == local_memory_regions_.end() ||
+                !orphan->second.releasing || orphan->second.users)
                 return ERR_ADDRESS_NOT_REGISTERED;
-            auto region = std::prev(local_memory_regions_.upper_bound(addr));
-            ++releases[region->first];
+            releases[addr];
         }
         for (const auto& [base, count] : releases) {
             auto& region = local_memory_regions_.at(base);
@@ -894,7 +902,8 @@ int TransferEngineImpl::unregisterSharedMemory(
     }
     for (auto ptr : addresses) {
         auto user = shared_memory_users_.find(reinterpret_cast<uintptr_t>(ptr));
-        if (--user->second == 0) shared_memory_users_.erase(user);
+        if (user != shared_memory_users_.end() && --user->second == 0)
+            shared_memory_users_.erase(user);
     }
     return 0;
 }
@@ -1155,17 +1164,25 @@ int TransferEngineImpl::registerLocalMemoryBatchImpl(
                        << transport->getName() << " (ret=" << ret
                        << "); unregistering the whole batch, so none of its "
                           "regions stays registered";
+            bool rollback_failed = false;
             for (auto it = attempted_transports.rbegin();
                  it != attempted_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
                 if (rollback_ret != 0 &&
                     rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                    rollback_failed = true;
                     LOG(WARNING)
                         << "Failed to roll back batch registration for "
                         << (*it)->getName() << ", ret=" << rollback_ret;
                 }
             }
-            releaseMemoryRegions(regions);
+            if (rollback_failed && shared_memory_registration_) {
+                // Keep the records so unregistering them retries the cleanup.
+                for (auto& region : regions) region.releasing = true;
+                commitMemoryRegions(regions);
+            } else {
+                releaseMemoryRegions(regions);
+            }
             return ret;
         }
     }
