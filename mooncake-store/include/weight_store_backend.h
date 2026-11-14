@@ -34,6 +34,8 @@ class WeightStoreBackend {
     virtual tl::expected<void, ErrorCode> RemoveObject(
         const std::string& key, const TenantId& tenant_id, bool force,
         bool allow_managed_weight) = 0;
+    virtual bool QueueManagedWeightMemberOffload(
+        const WeightRevisionMetadata& revision, const std::string& key) = 0;
     virtual void EvictManagedWeightMembersToCold(
         const WeightRevisionMetadata& revision,
         const std::vector<std::string>& member_keys) = 0;
@@ -60,6 +62,8 @@ class MasterStoreBackend final : public WeightStoreBackend {
     tl::expected<void, ErrorCode> RemoveObject(
         const std::string& key, const TenantId& tenant_id, bool force,
         bool allow_managed_weight) override;
+    bool QueueManagedWeightMemberOffload(const WeightRevisionMetadata& revision,
+                                         const std::string& key) override;
     void EvictManagedWeightMembersToCold(
         const WeightRevisionMetadata& revision,
         const std::vector<std::string>& member_keys) override;

@@ -43,6 +43,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     promotion_candidate_tracker.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
+    weight_residency_planner.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
     placement/index.cpp

@@ -82,6 +82,15 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
     return parsed_value;
 }
 
+bool ValidatePositiveWeightLimitFlag(const char* flagname, uint64_t value) {
+    if (value == 0) {
+        LOG(ERROR) << "Invalid value for --" << flagname
+                   << ": expected a positive integer";
+        return false;
+    }
+    return true;
+}
+
 // Derive the metadata server address for cleanup when it is deployed
 // separately. Priority: MOONCAKE_TE_META_DATA_SERVER, then the
 // "metadata_server" field of MOONCAKE_CONFIG_PATH. Returns "" if none found;
@@ -156,12 +165,23 @@ DEFINE_string(max_kv_soft_pin_ttl, kDefaultMaxKvSoftPinTtlFlagValue,
               "Maximum request-level soft pin TTL for kv objects. Supports "
               "raw milliseconds or duration strings with ms, s, m, or h "
               "suffixes");
+DEFINE_uint64(weight_migration_max_members_per_round,
+              mooncake::DEFAULT_WEIGHT_MIGRATION_MAX_MEMBERS_PER_ROUND,
+              "Maximum managed weight members migrated per revision round");
+DEFINE_uint64(weight_migration_max_bytes_per_round,
+              mooncake::DEFAULT_WEIGHT_MIGRATION_MAX_BYTES_PER_ROUND,
+              "Maximum managed weight logical bytes migrated per revision "
+              "round");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_validator(max_kv_soft_pin_ttl, ValidateDurationFlag);
+DEFINE_validator(weight_migration_max_members_per_round,
+                 ValidatePositiveWeightLimitFlag);
+DEFINE_validator(weight_migration_max_bytes_per_round,
+                 ValidatePositiveWeightLimitFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -565,6 +585,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDurationMs("max_kv_soft_pin_ttl",
                                  &master_config.max_kv_soft_pin_ttl,
                                  mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS);
+    default_config.GetUInt64(
+        "weight_migration_max_members_per_round",
+        &master_config.weight_migration_max_members_per_round,
+        FLAGS_weight_migration_max_members_per_round);
+    default_config.GetUInt64(
+        "weight_migration_max_bytes_per_round",
+        &master_config.weight_migration_max_bytes_per_round,
+        FLAGS_weight_migration_max_bytes_per_round);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
@@ -899,6 +927,20 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.max_kv_soft_pin_ttl = ParseDurationFlagOrDie(
             "max_kv_soft_pin_ttl", FLAGS_max_kv_soft_pin_ttl);
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "weight_migration_max_members_per_round", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.weight_migration_max_members_per_round =
+            FLAGS_weight_migration_max_members_per_round;
+    }
+    if ((google::GetCommandLineFlagInfo("weight_migration_max_bytes_per_round",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.weight_migration_max_bytes_per_round =
+            FLAGS_weight_migration_max_bytes_per_round;
     }
     if ((google::GetCommandLineFlagInfo("allow_evict_soft_pinned_objects",
                                         &info) &&
@@ -1621,6 +1663,10 @@ int main(int argc, char* argv[]) {
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
+        << ", weight_migration_max_members_per_round="
+        << master_config.weight_migration_max_members_per_round
+        << ", weight_migration_max_bytes_per_round="
+        << master_config.weight_migration_max_bytes_per_round
         << ", allow_evict_soft_pinned_objects="
         << master_config.allow_evict_soft_pinned_objects
         << ", eviction_ratio=" << master_config.eviction_ratio

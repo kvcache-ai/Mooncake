@@ -41,6 +41,7 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
+add_store_test(weight_residency_planner_test weight_residency_planner_test.cpp)
 add_store_test(weight_revision_lease_test weight_revision_lease_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
@@ -111,6 +112,9 @@ add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(weight_group_lifecycle_test weight_group_lifecycle_test.cpp)
+add_store_test(weight_manual_residency_e2e_test
+               weight_manual_residency_e2e_test.cpp)
+set_tests_properties(weight_manual_residency_e2e_test PROPERTIES TIMEOUT 420)
 add_store_test(weight_reconciliation_test weight_reconciliation_test.cpp)
 add_store_test(weight_management_rpc_test weight_management_rpc_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)

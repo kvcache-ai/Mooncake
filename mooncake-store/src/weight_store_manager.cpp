@@ -1,4 +1,5 @@
 #include "weight_store_manager.h"
+#include "weight_residency_planner.h"
 
 #include "master_metric_manager.h"
 
@@ -8,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <unordered_set>
 
 #include <glog/logging.h>
@@ -150,6 +152,19 @@ void WeightStoreManager::Clear() {
     weight_metadata_.Clear();
     std::lock_guard lock(import_activity_mutex_);
     import_activity_.clear();
+}
+
+WeightStoreManager::WeightStoreManager(WeightStoreBackend& backend,
+                                       uint64_t migration_max_members_per_round,
+                                       uint64_t migration_max_bytes_per_round)
+    : backend_(backend),
+      weight_migration_max_members_per_round_(migration_max_members_per_round),
+      weight_migration_max_bytes_per_round_(migration_max_bytes_per_round) {
+    if (weight_migration_max_members_per_round_ == 0 ||
+        weight_migration_max_bytes_per_round_ == 0) {
+        throw std::invalid_argument(
+            "Weight migration batch limits must be positive");
+    }
 }
 
 std::unique_lock<std::mutex> WeightStoreManager::LockGroup(
@@ -554,12 +569,26 @@ WeightStoreManager::StartWeightResidencyOperation(
                 mutation->metadata.next->manifest.payload_count + 1) {
             return tl::make_unexpected(WeightManagementError::NOT_READY);
         }
-        if (request.target_residency == WeightResidencyState::COLD &&
-            std::any_of(members->begin(), members->end(),
-                        [](const auto& member) {
-                            return !member.readable || !member.has_cold;
-                        })) {
-            return tl::make_unexpected(WeightManagementError::NOT_READY);
+        if (request.target_residency == WeightResidencyState::MIXED) {
+            std::map<std::string, uint64_t> affinity_bytes;
+            for (const auto& member : *members) {
+                if (member.data_type == ObjectDataType::WEIGHT) {
+                    affinity_bytes[member.residency_affinity_id] += member.size;
+                }
+            }
+            std::vector<WeightAffinityUnit> units;
+            units.reserve(affinity_bytes.size());
+            for (const auto& [affinity_id, logical_bytes] : affinity_bytes) {
+                units.push_back(WeightAffinityUnit{
+                    .affinity_id = affinity_id,
+                    .logical_bytes = logical_bytes,
+                });
+            }
+            auto plan =
+                PlanMixedWeightResidency(units, *request.mixed_hot_ratio);
+            if (!plan) {
+                return tl::make_unexpected(plan.error());
+            }
         }
     }
     return PersistAndPublishWeightOperationMutation(*mutation);
@@ -582,29 +611,6 @@ WeightMetadataStore::Result<WeightRevisionMetadata>
 WeightStoreManager::ReconcileWeightRevision(
     const ReconcileWeightRevisionRequest& request) {
     return ReconcileWeightRevisionBounded(request, nullptr);
-}
-
-std::vector<std::string> WeightStoreManager::SelectReconciliationMembers(
-    const WeightRevisionMetadata& revision, size_t* member_budget) {
-    auto keys =
-        backend_.GetGroupMemberKeys(TenantId(revision.identity.tenant_id),
-                                    revision.manifest.payload_group_id);
-    if (!member_budget || keys.empty()) {
-        return keys;
-    }
-    std::sort(keys.begin(), keys.end());
-    const size_t count = std::min(*member_budget, keys.size());
-    {
-        std::lock_guard lock(member_cursor_mutex_);
-        auto& offset =
-            member_cursors_[MakeWeightRevisionMetadataKey(revision.identity)];
-        offset %= keys.size();
-        std::rotate(keys.begin(), keys.begin() + offset, keys.end());
-        offset = (offset + count) % keys.size();
-    }
-    keys.resize(count);
-    *member_budget -= count;
-    return keys;
 }
 
 void WeightStoreManager::ForgetReconciliationCursor(
@@ -646,7 +652,11 @@ WeightMetadataStore::Result<void> WeightStoreManager::RemoveWeightMembers(
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WeightStoreManager::ReconcileWeightRevisionBounded(
     const ReconcileWeightRevisionRequest& request, size_t* member_budget) {
-    auto group_operation_lock = LockGroup(request.identity);
+    const auto canonical_group = MakeWeightPayloadGroupId(request.identity);
+    if (canonical_group.empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    [[maybe_unused]] auto group_operation_lock = LockGroup(request.identity);
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -660,34 +670,19 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
         ForgetReconciliationCursor(current.identity);
         return current;
     }
-    std::optional<WeightResidencyOperation> active_operation;
-    if (current.operation_id) {
-        auto operation = weight_metadata_.QueryOperation(*current.operation_id);
-        if (!operation) return tl::make_unexpected(operation.error());
-        active_operation = *operation;
-    }
     if (current.availability == WeightAvailabilityState::DELETING) {
         auto removed = RemoveWeightMembers(current, member_budget);
         if (!removed) {
             return tl::make_unexpected(removed.error());
         }
-    } else if (active_operation &&
-               active_operation->kind == WeightOperationKind::MIGRATING &&
-               active_operation->target_residency ==
-                   WeightResidencyState::COLD) {
-        backend_.EvictManagedWeightMembersToCold(
-            current, SelectReconciliationMembers(current, member_budget));
-    } else if (active_operation &&
-               active_operation->kind == WeightOperationKind::MIGRATING &&
-               active_operation->target_residency ==
-                   WeightResidencyState::HOT) {
-        const auto tenant_id = TenantId(current.identity.tenant_id);
-        for (const auto& key :
-             SelectReconciliationMembers(current, member_budget)) {
-            const auto result = backend_.PromoteWeightObject(tenant_id, key);
-            VLOG(1) << "weight_rehydrate_promotion key=" << key
-                    << " result=" << static_cast<int>(result);
+    }
+    std::optional<WeightResidencyOperation> active_operation;
+    if (current.operation_id.has_value()) {
+        auto operation = weight_metadata_.QueryOperation(*current.operation_id);
+        if (!operation) {
+            return tl::make_unexpected(operation.error());
         }
+        active_operation = *operation;
     }
 
     auto members = backend_.SnapshotWeightGroup(
@@ -718,42 +713,216 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
         return deleted;
     }
 
-    bool complete =
-        !absent && members->size() == current.manifest.payload_count + 1;
-    bool manifest_found = false;
+    struct AffinityObservation {
+        uint64_t logical_bytes{0};
+        bool all_memory{true};
+        bool all_cold{true};
+        bool all_have_cold{true};
+    };
+    auto aggregate_affinities = [](const auto& member_snapshots) {
+        std::map<std::string, AffinityObservation> affinities;
+        for (const auto& member : member_snapshots) {
+            if (member.data_type != ObjectDataType::WEIGHT) {
+                continue;
+            }
+            auto& affinity = affinities[member.residency_affinity_id];
+            affinity.logical_bytes += member.size;
+            affinity.all_memory = affinity.all_memory && member.has_memory;
+            affinity.all_cold =
+                affinity.all_cold && member.has_cold && !member.has_memory;
+            affinity.all_have_cold = affinity.all_have_cold && member.has_cold;
+        }
+        return affinities;
+    };
+
+    bool complete = false;
+    bool payload_layout_complete = false;
     bool any_payload_readable = false;
-    uint64_t logical_bytes = 0;
-    uint64_t hot_bytes = 0;
-    std::vector<std::string> payload_keys;
-    if (!absent) {
-        for (const auto& member : *members) {
-            complete = complete && member.readable;
-            if (member.key == current.manifest.manifest_key &&
-                member.data_type == ObjectDataType::METADATA) {
-                manifest_found = member.readable && member.has_memory;
-            } else if (member.data_type == ObjectDataType::WEIGHT &&
-                       member.size <= std::numeric_limits<uint64_t>::max() -
-                                          logical_bytes) {
-                logical_bytes += member.size;
-                any_payload_readable = any_payload_readable || member.readable;
-                if (member.readable && member.has_memory)
-                    hot_bytes += member.size;
-                payload_keys.push_back(member.key);
-            } else {
-                complete = false;
+    double observed_hot_ratio = 0.0;
+    std::map<std::string, AffinityObservation> affinities;
+    // Observe before planning, then refresh after migration changes replicas.
+    // Missing members must not turn a partial layout into a new mixed plan.
+    auto observe_members = [&] {
+        complete =
+            !absent && members->size() == current.manifest.payload_count + 1;
+        bool layout_valid = complete;
+        bool manifest_present = false;
+        bool manifest_found = false;
+        any_payload_readable = false;
+        uint64_t logical_bytes = 0;
+        uint64_t hot_bytes = 0;
+        std::vector<std::string> payload_keys;
+        if (!absent) {
+            for (const auto& member : *members) {
+                complete = complete && member.readable;
+                if (member.key == current.manifest.manifest_key &&
+                    member.data_type == ObjectDataType::METADATA) {
+                    manifest_present = true;
+                    manifest_found = member.readable && member.has_memory;
+                } else if (member.data_type == ObjectDataType::WEIGHT &&
+                           member.size <= std::numeric_limits<uint64_t>::max() -
+                                              logical_bytes) {
+                    logical_bytes += member.size;
+                    payload_keys.push_back(member.key);
+                    any_payload_readable =
+                        any_payload_readable || member.readable;
+                    if (member.readable && member.has_memory) {
+                        hot_bytes += member.size;
+                    }
+                } else {
+                    complete = false;
+                    layout_valid = false;
+                }
             }
         }
+        payload_layout_complete =
+            layout_valid && manifest_present &&
+            payload_keys.size() == current.manifest.payload_count &&
+            logical_bytes == current.manifest.logical_bytes &&
+            ComputeWeightPayloadKeysSha256(payload_keys) ==
+                current.manifest.payload_keys_sha256;
+        affinities = absent ? std::map<std::string, AffinityObservation>{}
+                            : aggregate_affinities(*members);
+        payload_layout_complete = payload_layout_complete &&
+                                  !affinities.contains("") &&
+                                  affinities.size() == current.affinity_count;
+        complete = complete && manifest_found && payload_layout_complete;
+        observed_hot_ratio =
+            current.manifest.logical_bytes == 0
+                ? 0.0
+                : static_cast<double>(hot_bytes) /
+                      static_cast<double>(current.manifest.logical_bytes);
+    };
+    observe_members();
+
+    std::set<std::string> hot_affinities;
+    bool offload_failed = false;
+    if (active_operation.has_value() && !absent &&
+        (active_operation->target_residency != WeightResidencyState::MIXED ||
+         payload_layout_complete) &&
+        active_operation->kind == WeightOperationKind::MIGRATING) {
+        if (active_operation->target_residency == WeightResidencyState::HOT) {
+            for (const auto& [affinity_id, affinity] : affinities) {
+                static_cast<void>(affinity);
+                hot_affinities.insert(affinity_id);
+            }
+        } else if (active_operation->target_residency ==
+                   WeightResidencyState::MIXED) {
+            std::vector<WeightAffinityUnit> units;
+            units.reserve(affinities.size());
+            for (const auto& [affinity_id, affinity] : affinities) {
+                units.push_back(WeightAffinityUnit{
+                    .affinity_id = affinity_id,
+                    .logical_bytes = affinity.logical_bytes,
+                });
+            }
+            auto plan = PlanMixedWeightResidency(
+                units, *active_operation->target_hot_ratio);
+            if (!plan) {
+                return tl::make_unexpected(plan.error());
+            }
+            hot_affinities.insert(plan->hot_affinity_ids.begin(),
+                                  plan->hot_affinity_ids.end());
+        }
+
+        const TenantId tenant_id(current.identity.tenant_id);
+        const auto manifest = std::find_if(
+            members->begin(), members->end(), [&](const auto& member) {
+                return member.key == current.manifest.manifest_key &&
+                       member.data_type == ObjectDataType::METADATA;
+            });
+        if (manifest != members->end() && !manifest->has_memory &&
+            (!member_budget || *member_budget > 0)) {
+            if (member_budget) --*member_budget;
+            const auto result =
+                backend_.PromoteWeightObject(tenant_id, manifest->key);
+            VLOG(1) << "weight_manifest_promotion key=" << manifest->key
+                    << " result=" << static_cast<int>(result);
+        }
+
+        uint64_t scheduled_members = 0;
+        uint64_t scheduled_bytes = 0;
+        auto reserve_member = [&](uint64_t bytes) {
+            if ((member_budget && *member_budget == 0) ||
+                scheduled_members >= weight_migration_max_members_per_round_) {
+                return false;
+            }
+            if (scheduled_members != 0 &&
+                (scheduled_bytes >= weight_migration_max_bytes_per_round_ ||
+                 bytes >
+                     weight_migration_max_bytes_per_round_ - scheduled_bytes)) {
+                return false;
+            }
+            ++scheduled_members;
+            scheduled_bytes +=
+                std::min(bytes, weight_migration_max_bytes_per_round_);
+            if (member_budget) --*member_budget;
+            return true;
+        };
+
+        std::vector<std::string> cold_eviction_candidates;
+        std::vector<size_t> member_keys;
+        for (size_t index = 0; index < members->size(); ++index) {
+            if ((*members)[index].data_type == ObjectDataType::WEIGHT) {
+                member_keys.push_back(index);
+            }
+        }
+        std::sort(member_keys.begin(), member_keys.end(),
+                  [&](size_t a, size_t b) {
+                      return (*members)[a].key < (*members)[b].key;
+                  });
+        size_t start = 0;
+        const auto cursor_key = MakeWeightRevisionMetadataKey(current.identity);
+        if (member_budget && !member_keys.empty()) {
+            std::lock_guard lock(member_cursor_mutex_);
+            start = member_cursors_[cursor_key] % member_keys.size();
+        }
+        for (size_t examined = 0; examined < member_keys.size(); ++examined) {
+            const size_t index = (start + examined) % member_keys.size();
+            const auto& member = (*members)[member_keys[index]];
+            const auto& key = member.key;
+            const auto& affinity_id = member.residency_affinity_id;
+            const auto& affinity = affinities.at(affinity_id);
+            const bool should_be_hot = hot_affinities.contains(affinity_id);
+            if (should_be_hot ? member.has_memory
+                              : (member.has_cold && !member.has_memory)) {
+                continue;
+            }
+            if (!reserve_member(member.size)) {
+                break;
+            }
+            if (member_budget) {
+                std::lock_guard lock(member_cursor_mutex_);
+                member_cursors_[cursor_key] = (index + 1) % member_keys.size();
+            }
+            if (should_be_hot) {
+                const auto result =
+                    backend_.PromoteWeightObject(tenant_id, key);
+                VLOG(1) << "weight_rehydrate_promotion key=" << key
+                        << " result=" << static_cast<int>(result);
+            } else if (!member.has_cold) {
+                offload_failed =
+                    !backend_.QueueManagedWeightMemberOffload(current, key) ||
+                    offload_failed;
+            } else if (affinity.all_have_cold &&
+                       view->active_lease_count == 0) {
+                // Every member must be durable before any memory is evicted.
+                cold_eviction_candidates.push_back(key);
+            }
+        }
+        if (!cold_eviction_candidates.empty()) {
+            backend_.EvictManagedWeightMembersToCold(current,
+                                                     cold_eviction_candidates);
+        }
+
+        members = backend_.SnapshotWeightGroup(
+            request.identity, current.manifest.payload_group_id);
+        if (!members) {
+            return tl::make_unexpected(members.error());
+        }
+        observe_members();
     }
-    complete = complete && manifest_found &&
-               payload_keys.size() == current.manifest.payload_count &&
-               logical_bytes == current.manifest.logical_bytes &&
-               ComputeWeightPayloadKeysSha256(payload_keys) ==
-                   current.manifest.payload_keys_sha256;
-    const double observed_hot_ratio =
-        current.manifest.logical_bytes == 0
-            ? 0.0
-            : static_cast<double>(hot_bytes) /
-                  static_cast<double>(current.manifest.logical_bytes);
+
     const auto observed_residency =
         absent || !any_payload_readable
             ? WeightResidencyState::ABSENT
@@ -762,13 +931,35 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
                    : (observed_hot_ratio == 0.0 ? WeightResidencyState::COLD
                                                 : WeightResidencyState::MIXED));
 
-    if (active_operation) {
-        const auto& operation = active_operation;
-        if (complete &&
-            operation->target_residency != WeightResidencyState::MIXED &&
-            observed_residency == operation->target_residency) {
+    if (active_operation.has_value()) {
+        const auto& operation = *active_operation;
+        uint64_t processed_units = 0;
+        uint64_t processed_bytes = 0;
+        std::string cursor;
+        for (const auto& [affinity_id, affinity] : affinities) {
+            if (operation.target_residency == WeightResidencyState::MIXED &&
+                !payload_layout_complete) {
+                break;
+            }
+            const bool should_be_hot =
+                operation.target_residency == WeightResidencyState::HOT ||
+                (operation.target_residency == WeightResidencyState::MIXED &&
+                 hot_affinities.contains(affinity_id));
+            const bool satisfied =
+                should_be_hot ? affinity.all_memory : affinity.all_cold;
+            if (satisfied) {
+                ++processed_units;
+                processed_bytes += affinity.logical_bytes;
+                cursor = affinity_id;
+            }
+        }
+        const bool operation_complete =
+            complete && processed_units == operation.total_units &&
+            processed_bytes == operation.total_bytes &&
+            observed_residency == operation.target_residency;
+        if (operation_complete) {
             auto mutation = weight_metadata_.PrepareFinishOperation(
-                operation->operation_id, observed_residency, observed_hot_ratio,
+                operation.operation_id, observed_residency, observed_hot_ratio,
                 now_ms);
             if (!mutation) {
                 return tl::make_unexpected(mutation.error());
@@ -784,37 +975,22 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
             }
             return reconciled->metadata;
         }
-        uint64_t processed_units = operation->processed_units;
-        uint64_t processed_bytes = operation->processed_bytes;
-        std::string cursor = operation->cursor;
-        if (!absent &&
-            operation->target_residency != WeightResidencyState::MIXED) {
-            std::map<std::string, std::pair<bool, uint64_t>> affinities;
-            for (const auto& member : *members) {
-                if (member.data_type != ObjectDataType::WEIGHT) continue;
-                const bool satisfied =
-                    operation->target_residency == WeightResidencyState::HOT
-                        ? member.has_memory
-                        : member.has_cold && !member.has_memory;
-                auto [it, inserted] = affinities.try_emplace(
-                    member.residency_affinity_id, true, 0);
-                it->second.first = it->second.first && satisfied;
-                it->second.second += member.size;
-            }
-            uint64_t satisfied_units = 0;
-            uint64_t satisfied_bytes = 0;
-            for (const auto& [affinity, state] : affinities) {
-                if (state.first) {
-                    ++satisfied_units;
-                    satisfied_bytes += state.second;
-                }
-            }
-            processed_units = std::max(processed_units, satisfied_units);
-            processed_bytes = std::max(processed_bytes, satisfied_bytes);
+        // Progress is a high-water mark; current readability is reported
+        // independently so lost replicas do not block availability updates.
+        processed_units =
+            std::max(operation.processed_units,
+                     std::min(processed_units, operation.total_units));
+        processed_bytes =
+            std::max(operation.processed_bytes,
+                     std::min(processed_bytes, operation.total_bytes));
+        if (processed_units == operation.processed_units &&
+            processed_bytes == operation.processed_bytes) {
+            cursor = operation.cursor;
         }
         auto progress = weight_metadata_.PrepareUpdateOperationProgress(
-            operation->operation_id, processed_units, operation->total_units,
-            processed_bytes, operation->total_bytes, std::move(cursor), "",
+            operation.operation_id, processed_units, operation.total_units,
+            processed_bytes, operation.total_bytes, std::move(cursor),
+            offload_failed ? "cold replica write failed" : "",
             complete ? WeightAvailabilityState::READY
                      : WeightAvailabilityState::DEGRADED,
             observed_residency, observed_hot_ratio, now_ms);
@@ -892,13 +1068,15 @@ WeightStoreManager::DeleteWeightRevision(
         return tl::make_unexpected(deleting.error());
     }
 
-    auto removed = RemoveWeightMembers(*deleting, nullptr);
+    size_t remaining_budget = 64;
+    auto removed = RemoveWeightMembers(*deleting, &remaining_budget);
     if (!removed) {
         return tl::make_unexpected(removed.error());
     }
     group_operation_lock.unlock();
-    return ReconcileWeightRevision(
-        ReconcileWeightRevisionRequest{.identity = request.identity});
+    return ReconcileWeightRevisionBounded(
+        ReconcileWeightRevisionRequest{.identity = request.identity},
+        &remaining_budget);
 }
 
 WeightMetadataStore::Result<WeightResidencyOperation>
@@ -980,12 +1158,12 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
 
     size_t member_budget = limit - actions;
     const auto snapshot = weight_metadata_.ExportSnapshot();
-    bool has_member_cursors;
+    bool has_affinity_cursors;
     {
         std::lock_guard cursor_lock(member_cursor_mutex_);
-        has_member_cursors = !member_cursors_.empty();
+        has_affinity_cursors = !member_cursors_.empty();
     }
-    if (has_member_cursors) {
+    if (has_affinity_cursors) {
         // Build the lookup outside the cursor lock; retry hints need no
         // persistence when the owning metadata disappears or is deleted.
         std::unordered_set<std::string> live_revisions;
@@ -1074,6 +1252,73 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
     MasterMetricManager::instance().project_weight_metadata(
         weight_metadata_.ExportSnapshot(), now_ms);
     return actions;
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::UpdateWeightPolicy(
+    const UpdateWeightPolicyRequest& request) {
+    if (MakeWeightPayloadGroupId(request.identity).empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    auto group_operation_lock = LockGroup(request.identity);
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto mutation = weight_metadata_.PrepareUpdatePolicy(request, now_ms);
+    if (!mutation) {
+        return tl::make_unexpected(mutation.error());
+    }
+    return PersistAndPublishWeightMutation(*mutation);
+}
+
+bool WeightStoreManager::RecordOffloadFailures(
+    std::vector<uint64_t> failed_weight_operation_ids) {
+    std::sort(failed_weight_operation_ids.begin(),
+              failed_weight_operation_ids.end());
+    failed_weight_operation_ids.erase(
+        std::unique(failed_weight_operation_ids.begin(),
+                    failed_weight_operation_ids.end()),
+        failed_weight_operation_ids.end());
+    bool operation_error_persist_failed = false;
+    for (const uint64_t operation_id : failed_weight_operation_ids) {
+        auto operation = weight_metadata_.QueryOperation(operation_id);
+        if (!operation) {
+            if (operation.error() != WeightManagementError::NOT_FOUND) {
+                operation_error_persist_failed = true;
+            }
+            continue;
+        }
+        const auto canonical_group =
+            MakeWeightPayloadGroupId(operation->identity);
+        if (canonical_group.empty()) {
+            operation_error_persist_failed = true;
+            continue;
+        }
+        [[maybe_unused]] auto group_operation_lock =
+            LockGroup(operation->identity);
+        const auto now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        auto mutation = weight_metadata_.PrepareRecordOperationError(
+            operation_id, "cold replica write failed", now_ms);
+        if (!mutation) {
+            if (mutation.error() != WeightManagementError::NOT_FOUND &&
+                mutation.error() != WeightManagementError::CONFLICT) {
+                operation_error_persist_failed = true;
+            }
+            continue;
+        }
+        auto published = PersistAndPublishWeightOperationMutation(*mutation);
+        if (!published) {
+            operation_error_persist_failed = true;
+            LOG(ERROR) << "Failed to persist weight offload error"
+                       << ", operation_id=" << operation_id
+                       << ", error=" << static_cast<int>(published.error());
+        }
+    }
+    return !operation_error_persist_failed;
 }
 
 }  // namespace mooncake
