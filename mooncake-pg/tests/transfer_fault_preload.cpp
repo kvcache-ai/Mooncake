@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -42,6 +43,12 @@ std::unordered_map<mooncake::SegmentID, mooncake::GlobalRank>
     segment_id_to_rank;
 std::unordered_map<mooncake::BatchID, std::vector<mooncake::GlobalRank>>
     batch_id_to_target_ranks;
+
+// While set, a batch of sync flag writes is sent at once but reports completion
+// only after this delay, so its rank finishes the collective late.
+std::atomic<int64_t> flag_completion_delay_us{0};
+std::unordered_map<mooncake::BatchID, std::chrono::steady_clock::time_point>
+    held_flag_batches;
 
 constexpr char kGetTransferStatusSymbol[] =
     "_ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_"
@@ -130,6 +137,18 @@ Status TransferEngine::submitTransfer(
         }
         batch_id_to_target_ranks.insert_or_assign(batch_id,
                                                   std::move(target_ranks));
+        const auto delay_us =
+            flag_completion_delay_us.load(std::memory_order_acquire);
+        bool flags_only = !entries.empty();
+        for (const auto& entry : entries) {
+            flags_only &= entry.length == sizeof(int32_t);
+        }
+        held_flag_batches.erase(batch_id);
+        if (delay_us > 0 && flags_only) {
+            held_flag_batches.emplace(batch_id,
+                                      std::chrono::steady_clock::now() +
+                                          std::chrono::microseconds(delay_us));
+        }
     }
     return result;
 }
@@ -139,6 +158,14 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     auto real = findRealGetTransferStatus();
     if (!real) std::abort();
     auto result = real(this, batch_id, task_id, status);
+    if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+        std::lock_guard<std::mutex> lock(mapping_mutex);
+        auto held = held_flag_batches.find(batch_id);
+        if (held != held_flag_batches.end() &&
+            std::chrono::steady_clock::now() < held->second) {
+            status.s = TransferStatusEnum::WAITING;
+        }
+    }
     if (result.ok() && status.s == TransferStatusEnum::COMPLETED &&
         fault_enabled.load(std::memory_order_acquire)) {
         GlobalRank target_rank = kInvalidGlobalRank;
@@ -182,6 +209,10 @@ extern "C" void mooncakePgTestSetFaultEnabled(int enabled) {
 
 extern "C" void mooncakePgTestResetFailureCount() {
     injected_failure_count.store(0, std::memory_order_release);
+}
+
+extern "C" void mooncakePgTestDelayFlagCompletion(int64_t delay_us) {
+    flag_completion_delay_us.store(delay_us, std::memory_order_release);
 }
 
 extern "C" uint64_t mooncakePgTestGetFailureCount() {

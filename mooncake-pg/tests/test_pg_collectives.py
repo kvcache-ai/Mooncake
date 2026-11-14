@@ -10,6 +10,7 @@ from pg_test_utils import (
     MooncakePGMUSABackendTestCase,
     MooncakePGWorkerContext,
 )
+from transfer_fault_injection import TransferFault, preload_transfer_fault
 
 
 def _collective_payload(
@@ -322,6 +323,38 @@ def _async_ops_on_independent_streams_worker(
     )
 
 
+def _slow_finisher_of_a_half_worker(
+    ctx: MooncakePGWorkerContext, fault_library: str, rank_one_passed: mp.Event
+) -> None:
+    """Rank 1 finishes a collective after rank 0 flags the half's next run."""
+    device = ctx.init_group()
+    fault = TransferFault(fault_library, local_rank=ctx.rank)
+    # Larger than a flag, so that only flag writes are delayed.
+    tensor = torch.full((64,), ctx.rank + 1, dtype=torch.int32, device=device)
+
+    if ctx.rank == 1:
+        fault.delay_flag_completion(0.5)
+    dist.all_reduce(tensor)
+    ctx.synchronize()
+    fault.delay_flag_completion(0)
+
+    # A capture takes the other half without running, so the barrier runs on
+    # the all_reduce's half.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dist.all_reduce(tensor)
+    ctx.synchronize()
+    dist.barrier()
+    ctx.synchronize()
+    # Rank 0 stays until rank 1 passes: rank 0 leaving the group would also end
+    # rank 1's wait for a lost flag.
+    if ctx.rank == 1:
+        rank_one_passed.set()
+    elif not rank_one_passed.wait(timeout=30.0):
+        raise TimeoutError("rank 1 did not pass the barrier")
+    ctx.record_result({"value": int(tensor[0].cpu().item())})
+
+
 class _CollectiveTestMixin:
     def test_world_init_without_pg_options(self) -> None:
         rows = self.spawn_backend_and_collect(
@@ -438,6 +471,19 @@ class TestMooncakePGCollectivesCUDA(
     _CollectiveTestMixin, MooncakePGCUDABackendTestCase
 ):
     world_size = 2
+
+    def test_slow_finisher_keeps_flag_of_the_next_run_of_a_half(self) -> None:
+        rank_one_passed = mp.get_context("spawn").Event()
+        with preload_transfer_fault() as fault_library:
+            rows = self.spawn_backend_and_collect(
+                _slow_finisher_of_a_half_worker,
+                str(fault_library),
+                rank_one_passed,
+                timeout_s=90.0,
+            )
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["value"], 3)
 
     def test_async_ops_on_independent_streams(self) -> None:
         spawn_ctx = mp.get_context("spawn")

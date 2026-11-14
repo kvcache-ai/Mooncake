@@ -15,7 +15,6 @@ enum WorkerTaskStatus {
     IDLE = 0,
     TRANSFERRED_1 = 1,
     SIGNALED_1 = 2,
-    DONE = 3,
 };
 
 static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
@@ -100,6 +99,8 @@ void MooncakeWorker::startWorker() {
         // Per-slot state owned exclusively by this worker thread.
         clock::time_point activeTime[kNumTasks_];
         BatchID batchIDs[kNumTasks_]{};
+        // Offset of the task's sync flag set within its half's flag region.
+        size_t syncFlagOffset[kNumTasks_]{};
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
         int32_t failedRanks[kNumTasks_][kMaxNumRanks]{};
         int32_t attemptedRanks[kNumTasks_][kMaxNumRanks]{};
@@ -147,6 +148,12 @@ void MooncakeWorker::startWorker() {
                     }
                     task_detected_failure[i] = false;
                     active_failed_ranks_hint[i] = task.failedRanksHint;
+                    // Consecutive runs of a half alternate between its two
+                    // sets of sync flags.
+                    syncFlagOffset[i] =
+                        group->bufferHalfRuns[task.bufferOffset].fetch_add(
+                            1, std::memory_order_relaxed) %
+                        2 * kMaxNumRanks;
 
                     if (task.resetFailedRanksHint &&
                         active_failed_ranks_hint[i]) {
@@ -318,7 +325,8 @@ void MooncakeWorker::startWorker() {
                             .target_id = group->segmentIDs[j],
                             .target_offset = group->segmentInfos[j]
                                                  .recv_sync[task.bufferOffset] +
-                                             group->rank * sizeof(int32_t),
+                                             (syncFlagOffset[i] + group->rank) *
+                                                 sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
                         markAttempted(i, j);
@@ -332,7 +340,8 @@ void MooncakeWorker::startWorker() {
                            SIGNALED_1) {
                     bool task_done = true;
                     auto signal_ptr = (int32_t*)group->segmentInfos[group->rank]
-                                          .recv_sync[task.bufferOffset];
+                                          .recv_sync[task.bufferOffset] +
+                                      syncFlagOffset[i];
 
                     auto now = clock::now();
                     auto diff =
@@ -464,7 +473,11 @@ void MooncakeWorker::startWorker() {
                                       group->globalRank);
                         }
 
-                        task_status[i].store(DONE, std::memory_order_release);
+                        // The slot is idle again once it is released: the GPU
+                        // may publish the slot's next task before this thread
+                        // looks at the slot again, and that task starts from
+                        // IDLE.
+                        task_status[i].store(IDLE, std::memory_order_release);
                         task.active = false;
                         if (hasCallback_[i]) {
                             // Move the callback to release the captured values
