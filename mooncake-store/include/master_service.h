@@ -2388,6 +2388,15 @@ class MasterService {
     std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& should_remove) const;
+
+    // Caller holds master_state_mutex_ exclusively.
+    tl::expected<void, ErrorCode> MountNoFSegmentLocked(
+        const NoFSegment& segment, const UUID& client_id);
+
+    // NoF descriptors are quarantined until their occupied ranges have been
+    // imported. Keep this separate from memory aliases on the same endpoint.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_nof_allocator_keepalive_;
 };
 
 }  // namespace mooncake

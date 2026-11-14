@@ -852,13 +852,15 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
 }
 
 /* ScopedNoFSegmentAccess Implementation */
-ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
-                                               const UUID& client_id) {
+ErrorCode ScopedNoFSegmentAccess::MountSegment(
+    const NoFSegment& segment, const UUID& client_id,
+    std::shared_ptr<BufferAllocatorBase> restored_allocator,
+    const std::vector<std::unique_ptr<AllocatedBuffer>>& restored_buffers) {
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
     // NoF segment base is an NVMe namespace offset, so 0 is valid.
-    if (size == 0) {
+    if (size == 0 || buffer > std::numeric_limits<uintptr_t>::max() - size) {
         LOG(ERROR) << "NoF segment mount: buffer=" << buffer
                    << " or size=" << size << " is invalid";
         return ErrorCode::INVALID_PARAMS;
@@ -875,14 +877,59 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    if (restored_allocator &&
+        (restored_allocator->base() != buffer ||
+         restored_allocator->capacity() != size ||
+         restored_allocator->getSegmentName() != segment.name ||
+         restored_allocator->getTransportEndpoint() != segment.te_endpoint ||
+         restored_allocator->getTransportProtocol() != "nvmeof")) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (std::any_of(restored_buffers.begin(), restored_buffers.end(),
+                    [&](const auto& buffer) {
+                        return !restored_allocator || !buffer ||
+                               buffer->getAllocator() != restored_allocator;
+                    })) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto bind_restored_buffers = [&](const auto& registration) {
+        for (const auto& buffer : restored_buffers) {
+            registration->BindBuffer(*buffer);
+        }
+    };
+
     auto exist_segment_it =
         nof_segment_manager_->mounted_segments_.find(segment.id);
+    const auto replace_restored_allocator = [&](MountedNoFSegment& mounted) {
+        if (!restored_allocator) return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        if (mounted.segment.name != segment.name ||
+            mounted.segment.te_endpoint != segment.te_endpoint ||
+            mounted.segment.base != buffer || mounted.segment.size != size) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        auto registration =
+            mounted.allocator_registration->WithAllocator(restored_allocator);
+        bind_restored_buffers(registration);
+        if (!nof_segment_manager_->allocator_manager_.replaceRegistrations(
+                {{segment.name, mounted.allocator_registration,
+                  registration}})) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        restored_allocator->AttachUsageTracker(
+            nof_segment_manager_->usage_tracker_);
+        mounted.allocator_registration->SetAllocatable(false);
+        mounted.allocator_registration = std::move(registration);
+        mounted.buf_allocator = std::move(restored_allocator);
+        // Keep the registered ID and owner, as ordinary endpoint-idempotent
+        // mounts do. The register CLI generates fresh UUIDs on every run.
+        return ErrorCode::OK;
+    };
     if (exist_segment_it != nof_segment_manager_->mounted_segments_.end()) {
         auto& exist_segment = exist_segment_it->second;
         if (exist_segment.status == SegmentStatus::OK) {
             LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
                          << ", warn=segment_already_exists_by_id";
-            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+            return replace_restored_allocator(exist_segment);
         }
         LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
                    << ", error=segment_already_exists_but_not_ok"
@@ -892,28 +939,32 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
 
     // Treat the same transport endpoint as the same remote SSD namespace even
     // if a retry arrives with a different generated UUID.
-    for (const auto& [existing_id, existing_segment] :
+    for (auto& [existing_id, existing_segment] :
          nof_segment_manager_->mounted_segments_) {
         if (existing_segment.status == SegmentStatus::OK &&
             existing_segment.segment.te_endpoint == segment.te_endpoint) {
             LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
                          << ", endpoint=" << segment.te_endpoint
                          << ", warn=segment_already_exists_with_different_id";
-            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+            return replace_restored_allocator(existing_segment);
         }
     }
 
-    auto created = CreateBufferAllocator(
-        nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
-        segment.te_endpoint, "nvmeof", ReplicaType::NOF_SSD);
-    if (!created) {
-        return created.error();
+    auto allocator = std::move(restored_allocator);
+    if (!allocator) {
+        auto created = CreateBufferAllocator(
+            nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
+            segment.te_endpoint, "nvmeof", ReplicaType::NOF_SSD);
+        if (!created) {
+            return created.error();
+        }
+        allocator = std::move(*created);
     }
-    auto allocator = std::move(*created);
 
     allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
     auto registration = nof_segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator);
+    bind_restored_buffers(registration);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
     nof_segment_manager_->mounted_segments_[segment.id] = {
         segment, client_id, SegmentStatus::OK, std::move(allocator),
@@ -922,6 +973,14 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
     return ErrorCode::OK;
+}
+
+void ScopedNoFSegmentAccess::QuarantineEndpoint(const std::string& endpoint) {
+    for (auto& [id, mounted] : nof_segment_manager_->mounted_segments_) {
+        if (mounted.segment.te_endpoint == endpoint) {
+            mounted.allocator_registration->SetAllocatable(false);
+        }
+    }
 }
 
 ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
