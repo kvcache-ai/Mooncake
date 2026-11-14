@@ -352,6 +352,65 @@ TEST(OpLogBatchStandbyReaderTest, RangeReadsBatchesWhenDurablePrefixAdvances) {
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
+// The reader drops already-applied entries before calling the applier, so
+// this is the only production observation point for skipped entries (the
+// equivalent branch inside OpLogApplier is unreachable through the poll
+// loop). HotStandbyService forwards the counter to
+// ha_oplog_skipped_entries_total after PollOnce.
+TEST(OpLogBatchStandbyReaderTest, ReportsEntriesSkippedBelowApplierWatermark) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 3})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 3))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    applier.Recover(2);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    ASSERT_EQ(ErrorCode::OK, result.error);
+    EXPECT_EQ(2u, result.skipped_entries);
+    EXPECT_EQ(1u, result.applied_entries);
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+}
+
+// PollOnce retries PollBatches when pruning advances the compaction floor to
+// the reader's cursor mid-poll. The first attempt has already filtered entries
+// by then, so the retry must not overwrite that count.
+TEST(OpLogBatchStandbyReaderTest, KeepsSkippedEntriesAcrossCompactionRetry) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 5})));
+    // Batch 2 is absent, so the first attempt applies batch 1 (skipping the
+    // two entries at or below the watermark) and then fails on the gap.
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 3))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 3),
+                          EncodeOpLogBatchRecord(MakeBatch(3, 5, 5))));
+    // The floor moves to the reader's cursor (batch 1) after that attempt,
+    // which is what makes PollOnce retry instead of declaring corruption.
+    backend.before_range = [&] {
+        backend.Put("/oplog/clusterA/snapshot/compaction_floor", "1");
+    };
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    applier.Recover(2);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    const auto result = reader.PollOnce();
+
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, result.disposition);
+    EXPECT_EQ(2u, result.skipped_entries);
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+}
+
 TEST(OpLogBatchStandbyReaderTest, DoesNothingWhenDurablePrefixDoesNotAdvance) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,

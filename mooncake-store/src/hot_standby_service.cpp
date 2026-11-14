@@ -1197,6 +1197,15 @@ void HotStandbyService::ReplicationLoop() {
         });
     };
 
+    // Mirror GetSyncStatus()'s lag definition (primary minus applied, floored
+    // at 0) into the gauge. Called wherever the sequence atomics may have
+    // moved, including before the poll-error branches below, so a retry,
+    // rebootstrap or fatal exit does not leave the gauge behind them.
+    auto publish_standby_lag = [](uint64_t applied, uint64_t primary) {
+        HAMetricManager::instance().set_oplog_standby_lag(
+            primary > applied ? static_cast<int64_t>(primary - applied) : 0);
+    };
+
     while (replication_loop_running_.load(std::memory_order_acquire) &&
            IsRunning()) {
         if (!IsConnected()) {
@@ -1206,6 +1215,7 @@ void HotStandbyService::ReplicationLoop() {
 
         if (recovering_.load(std::memory_order_acquire)) {
             const auto error = RebootstrapBatchOpLog(recovery_floor);
+            publish_standby_lag(applied_seq_id_.load(), primary_seq_id_.load());
             last_error_.store(error, std::memory_order_release);
             NotifySyncStatus();
             if (error != ErrorCode::OK) {
@@ -1222,6 +1232,10 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            if (result.skipped_entries > 0) {
+                HAMetricManager::instance().inc_oplog_skipped_entries(
+                    static_cast<int64_t>(result.skipped_entries));
+            }
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
@@ -1266,6 +1280,7 @@ void HotStandbyService::ReplicationLoop() {
             if (expected_after > 0) {
                 applied_seq_id_.store(expected_after - 1);
             }
+            publish_standby_lag(applied_seq_id_.load(), primary_seq_id_.load());
             if (result.error != ErrorCode::OK) {
                 last_error_.store(result.error, std::memory_order_release);
                 const bool made_progress = expected_after > expected_before;
@@ -1321,6 +1336,11 @@ void HotStandbyService::ReplicationLoop() {
 
         const uint64_t applied_seq_id = applied_seq_id_.load();
         const uint64_t primary_seq_id = primary_seq_id_.load();
+        // Written every iteration, not only on change: while disconnected the
+        // loop does not reach here, so the last observed lag survives and
+        // stays usable as a stuck-replication signal alongside
+        // ha_standby_state.
+        publish_standby_lag(applied_seq_id, primary_seq_id);
         if (applied_seq_id != last_reported_applied_seq_id ||
             primary_seq_id != last_reported_primary_seq_id) {
             last_reported_applied_seq_id = applied_seq_id;
