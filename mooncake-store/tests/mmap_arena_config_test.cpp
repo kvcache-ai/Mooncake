@@ -68,13 +68,17 @@ TEST_F(MmapArenaConfigTest, UnsetAndEmptyEnvironmentPreserveFlagInputs) {
 }
 
 TEST_F(MmapArenaConfigTest, PoolSizeEnvironmentOptsInAndOverridesFlag) {
-    env.pool_size.Set(" 1.5 MB ");
+    for (const char* value : {" 1.5 MB ", " 1.5 MiB ", "1536KiB"}) {
+        SCOPED_TRACE(value);
+        env.pool_size.Set(value);
 
-    const auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+        const auto config =
+            MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
 
-    EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.pool_size, 1572864);
-    EXPECT_FALSE(config.hugepages_explicitly_requested);
+        EXPECT_TRUE(config.enabled);
+        EXPECT_EQ(config.pool_size, 1572864);
+        EXPECT_FALSE(config.hugepages_explicitly_requested);
+    }
 }
 
 TEST_F(MmapArenaConfigTest, PreservesAcceptedInfinitePoolSize) {

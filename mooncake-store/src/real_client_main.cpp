@@ -21,8 +21,10 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
               "Master server address");
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
-DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
-DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
+DEFINE_string(global_segment_size, "4 GB",
+              "Size of global segment (e.g., 4GiB or 4GB)");
+DEFINE_string(local_buffer_size, "0",
+              "Size of local buffer (e.g., 16MiB or 16MB)");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_string(tenant_id, "default", "Tenant identifier");
 DEFINE_bool(enable_offload, false, "Enable offload availability");

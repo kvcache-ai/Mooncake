@@ -32,3 +32,49 @@ TEST(UtilsTest, StringToByteSize) {
     EXPECT_FALSE(try_string_to_byte_size("16XB").has_value());
     EXPECT_EQ(string_to_byte_size("-5"), 0);
 }
+
+TEST(UtilsTest, BinaryByteSizeSuffixes) {
+    struct Case {
+        const char* input;
+        uint64_t expected;
+    };
+    const Case cases[] = {
+        {"1KiB", 1024},
+        {"1mib", 1048576},
+        {"1GIB", 1073741824},
+        {"1tIb", 1099511627776},
+        {"256MiB", 268435456},
+        {"1.5 KiB", 1536},
+        {"1.5 MiB", 1572864},
+        {"1.5 GiB", 1610612736},
+        {"1.5 TiB", 1649267441664},
+        {" \t2\tMiB\r\n", 2097152},
+        {"0KiB", 0},
+        {"0MiB", 0},
+        {"0GiB", 0},
+        {"0TiB", 0},
+        {"1K", 1024},
+        {"1KB", 1024},
+        {"1M", 1048576},
+        {"1MB", 1048576},
+        {"1G", 1073741824},
+        {"1GB", 1073741824},
+        {"1T", 1099511627776},
+        {"1TB", 1099511627776},
+    };
+    for (const auto& entry : cases) {
+        SCOPED_TRACE(entry.input);
+        const auto parsed = try_string_to_byte_size(entry.input);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ(*parsed, entry.expected);
+        EXPECT_EQ(string_to_byte_size(entry.input), entry.expected);
+    }
+}
+
+TEST(UtilsTest, RejectsInvalidBinaryByteSizeSuffixes) {
+    for (const char* input : {"KiB", "MiB", "GiB", "TiB", "1Ki", "1MiBB",
+                              "256XiB", "1PiB", "1MiBjunk", "1Mi B", "-1MiB"}) {
+        SCOPED_TRACE(input);
+        EXPECT_FALSE(try_string_to_byte_size(input).has_value());
+    }
+}

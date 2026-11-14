@@ -1316,7 +1316,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_TE_META_DATA_SERVER` | `metadata_server` | `P2PHANDSHAKE` | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
 | `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
 | `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; `auto-discovery` supported |
-| `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
+| `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500GiB` or `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
@@ -1327,8 +1327,15 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
-`MooncakeConfig` (Method B) defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB. A direct `setup()` (Method A) has **no** default for these — they are required arguments. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes (`kb`/`mb`/`gb`/…) because they are parsed by `MooncakeConfig`.
+`MooncakeConfig` (Method B) defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB. A direct `setup()` (Method A) has **no** default for these — they are required arguments. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes because they are parsed by `MooncakeConfig`.
 ```
+
+The size fields in `MooncakeConfig` JSON files and the two environment variables
+above accept case-insensitive `KiB`, `MiB`, `GiB`, and `TiB` suffixes. Existing
+`K`/`KB`, `M`/`MB`, `G`/`GB`, and `T`/`TB` suffixes keep their binary meaning:
+`1MiB = 1MB = 1048576` bytes. Spaces and fractional amounts are accepted, for
+example `"1.5 GiB"`; fractional bytes are truncated. Plain byte counts and `B`
+remain supported. JSON size values with a suffix must be strings.
 
 **Launch examples:**
 
@@ -1383,6 +1390,7 @@ mooncake_client \
 | `--host` | `0.0.0.0` | Client service bind host. Accepts `ip:port` to specify the data plane port for TransferEngine |
 | `--port` | `50052` | Client RPC listen port (dummy↔real client control plane) |
 | `--global_segment_size` | `4 GB` | Global segment size contributed by the client |
+| `--local_buffer_size` | `0` | Local transfer buffer size |
 | `--master_server_address` | `127.0.0.1:50051` | Master service address |
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Transfer Engine metadata service |
 | `--protocol` | `tcp` | Transfer protocol |
@@ -1393,6 +1401,11 @@ mooncake_client \
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
+
+`--global_segment_size` and `--local_buffer_size` accept the same IEC and legacy
+binary suffixes described for `MooncakeConfig`, for example
+`--global_segment_size=256MiB --local_buffer_size=16MiB`. A global segment size
+of `0` still selects a client that contributes no storage memory.
 
 `mooncake_client --version` prints the release version plus the short git hash,
 and the same value is logged at startup.
@@ -1515,8 +1528,8 @@ Do not run binaries from before and after checksum support was introduced in the
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
-| `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `512MB`, `1GB` |
-| `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
+| `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported page sizes: `2MiB`, `512MiB`, `1GiB`; legacy `MB`/`GB` aliases remain accepted |
+| `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8GiB` or `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 | `MC_STORE_REGISTER_SPDK` | unset | Set `1` to register `ShmHelper`-allocated shared memory (host pool, dummy local buffer) with SPDK for NoF zero-copy transfers. Forces HugeTLB backing for those allocations, defaulting to 2MB hugepages when `MC_STORE_USE_HUGEPAGE` is unset. Must be set on BOTH the dummy and the real process (SPDK registration is per-process) |
 
