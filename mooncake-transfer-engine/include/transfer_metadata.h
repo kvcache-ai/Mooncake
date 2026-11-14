@@ -68,6 +68,11 @@ class TransferMetadata {
 
     struct BufferDesc {
         std::string name;
+#ifdef MOONCAKE_ENABLE_PXN
+        bool isGpuMem;
+        // physical gpuid
+        uint32_t gpuid;
+#endif
         uint64_t addr;
         uint64_t length;
         int32_t device_id = -1;  // CUDA device (NCCL) or Ascend engine index

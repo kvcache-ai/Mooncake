@@ -63,6 +63,12 @@ class RdmaContextTestPeer;
 class WorkerPool;
 class EndpointStore;
 
+#ifdef MOONCAKE_ENABLE_PXN
+namespace pxn {
+struct PxnContextResource;  // defined in pxn/pxn_context_resource.h
+}
+#endif
+
 // Enum to represent the network state of the GID found
 enum class GidNetworkState {
     GID_WITH_NETWORK = 0,     // Found a GID with network device (best choice)
@@ -436,6 +442,19 @@ class RdmaContext {
     std::shared_ptr<WorkerPool> worker_pool_;
 
     std::atomic<bool> active_;
+#ifdef MOONCAKE_ENABLE_PXN
+    // Per-NIC PXN resource
+    std::unique_ptr<pxn::PxnContextResource> pxn_resource_;
+#endif
+
+#ifdef MOONCAKE_ENABLE_PXN
+   public:
+    std::shared_ptr<WorkerPool> getWorkerPool() const { return worker_pool_; }
+
+    pxn::PxnContextResource *getPxnResource() const {
+        return pxn_resource_.get();
+    }
+#endif
 };
 
 }  // namespace mooncake
