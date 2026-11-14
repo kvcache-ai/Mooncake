@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -31,6 +32,19 @@ enum class ReplicaType {
     NOF_SSD = 3,     // Nvme-oF SSD replica
     ALL = 4,         // All synchronous replicas in put finalize path
     DFS = 100,       // Distributed filesystem page-offset replica
+};
+
+/**
+ * @brief How a reader transfers the contents of an allocated buffer.
+ *
+ * TCP needs no per-buffer protocol state. `kCxl` keeps the client segment name,
+ * while `kOther` preserves every other mounted or restored protocol so that
+ * readers use the segment's transport and descriptors round-trip unchanged.
+ */
+enum class BufferProtocol : uint8_t {
+    kTcp = 0,  // Regular segment memory, addressed by its allocator
+    kCxl = 1,  // CXL memory, addressed by the client's segment name
+    kOther = 2,
 };
 
 struct LiveAllocation {
@@ -156,16 +170,34 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
+    // The protocol of a buffer that is not plain TCP. Plain TCP is the null
+    // pointer: it is the common case, and everything it needs is already in
+    // the allocator.
+    struct ProtocolState {
+        // Never kTcp: plain TCP is the null pointer.
+        BufferProtocol kind;
+        // kCxl: the client segment name the buffer transfers from.
+        // kOther: a mounted or restored protocol other than TCP/CXL.
+        std::string value;
+    };
+
+    [[nodiscard]] BufferProtocol protocolKind() const noexcept {
+        return protocol_ ? protocol_->kind : BufferProtocol::kTcp;
+    }
+
+    [[nodiscard]] std::string_view protocolName() const noexcept;
+
     std::weak_ptr<BufferAllocatorBase> allocator_;
     // Set before publication; its validity is atomic and its owner session is
     // immutable.
     SegmentLifetime segment_lifetime_;
+    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
-    // The protocol a reader routes by, as get_descriptor() reports it: the
-    // mounted segment's protocol, or "cxl" once change_to_cxl() ran.
-    std::string protocol;
+    // Null for TCP; otherwise stores the mounted/restored protocol or the
+    // client segment name once change_to_cxl() ran.
+    std::unique_ptr<ProtocolState> protocol_;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};

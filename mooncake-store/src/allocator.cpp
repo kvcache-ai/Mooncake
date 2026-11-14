@@ -115,18 +115,48 @@ AllocatedBuffer::AllocatedBuffer(
     : allocator_(allocator),
       buffer_ptr_(buffer_ptr),
       size_(size),
-      protocol(allocator ? allocator->getTransportProtocol() : std::string()),
-      offset_handle_(std::move(offset_handle)) {}
+      offset_handle_(std::move(offset_handle)) {
+    auto protocol =
+        allocator ? allocator->getTransportProtocol() : std::string();
+    if (protocol != "tcp") {
+        protocol_ = std::make_unique<ProtocolState>();
+        protocol_->kind =
+            protocol == "cxl" ? BufferProtocol::kCxl : BufferProtocol::kOther;
+        if (protocol_->kind == BufferProtocol::kOther) {
+            protocol_->value = std::move(protocol);
+        }
+    }
+}
 
 AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
-      size_(descriptor.size_),
-      protocol(descriptor.protocol_) {
-    if (protocol == "cxl") {
-        segment_name_ = descriptor.transport_endpoint_;
+      size_(descriptor.size_) {
+    if (descriptor.protocol_ == "cxl") {
+        protocol_ = std::make_unique<ProtocolState>();
+        protocol_->kind = BufferProtocol::kCxl;
+        protocol_->value = descriptor.transport_endpoint_;
+    } else if (descriptor.protocol_ != "tcp") {
+        // Keep every other protocol so the descriptor still round-trips
+        // through restore unchanged.
+        protocol_ = std::make_unique<ProtocolState>();
+        protocol_->kind = BufferProtocol::kOther;
+        protocol_->value = descriptor.protocol_;
     }
+}
+
+std::string_view AllocatedBuffer::protocolName() const noexcept {
+    if (!protocol_) return "tcp";
+    switch (protocol_->kind) {
+        case BufferProtocol::kCxl:
+            return "cxl";
+        case BufferProtocol::kOther:
+            return protocol_->value;
+        case BufferProtocol::kTcp:
+            break;
+    }
+    return "tcp";
 }
 
 std::string AllocatedBuffer::getTransportEndpoint(
@@ -140,8 +170,8 @@ std::string AllocatedBuffer::getTransportEndpoint(
         LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
     }
 
-    if (this->protocol == "cxl") {
-        endpoint = this->segment_name_;
+    if (protocolKind() == BufferProtocol::kCxl) {
+        endpoint = protocol_->value;
     }
     return endpoint;
 }
@@ -150,15 +180,23 @@ std::string AllocatedBuffer::getTransportEndpoint(
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
     std::optional<SegmentLocality>* locality) const {
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol,
-            getTransportEndpoint(locality)};
+            reinterpret_cast<uintptr_t>(buffer_ptr_),
+            std::string(protocolName()), getTransportEndpoint(locality)};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
+    // Reuse the state already created for a non-TCP segment. Only TCP needs
+    // an allocation here; do it before converting the address so unwinding
+    // cannot free an offset as a host address (see
+    // CachelibBufferAllocator::deallocate). The remaining steps are noexcept.
+    auto state =
+        protocol_ ? std::move(protocol_) : std::make_unique<ProtocolState>();
+    state->kind = BufferProtocol::kCxl;
+    state->value = std::move(client_segment_name);
+
     uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
     buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);
-    protocol = "cxl";
-    segment_name_ = client_segment_name;
+    protocol_ = std::move(state);
 }
 
 void* AllocatedBuffer::get_vaddr_from_cxl() {
