@@ -120,8 +120,23 @@ finally:
 
 Keep registered Tensor owners alive until transfers finish and buffers are
 unregistered. For a producer on a nondefault stream, synchronize its event or
-stream before calling Store. Tensor writes currently gather metadata and payload
-into host staging; registered-pointer writes use the Transfer Engine path.
+stream before calling Store.
+
+With the C++ Store backend, TENT (`MC_USE_TENT=1`) and `protocol="rdma"`,
+Tensor put/upsert APIs can retain registered CUDA and MLU payload pointers for
+ordinary memory replicas. Register the full source range with
+`store.register_buffer()` before writing; a registration may cover a larger
+contiguous Tensor containing the payload view. Metadata and unregistered slices
+use host staging. Noncontiguous inputs create temporary contiguous allocations,
+which keep the staging path unless those allocations are registered.
+
+TENT selects direct RDMA or staging according to the device and NIC capabilities.
+TCP clients, classic Transfer Engine, CXL and mixed file/NoF replicas keep full
+Store staging. Object checksums still copy payload bytes to the host for CRC.
+After a successful synchronous write, the source can be unregistered and
+released. Unregistration waits for concurrent Tensor writes using the
+registration; keep Tensor owners alive and finish all operations before closing
+Store.
 
 With `mooncake_master` running, run the real-device regression suite from the
 repository root:

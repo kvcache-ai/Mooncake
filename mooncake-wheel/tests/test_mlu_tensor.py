@@ -150,6 +150,58 @@ class TestMluTensorStore(unittest.TestCase):
         self.assertEqual(tuple(actual.shape), tuple(expected.shape))
         self.assertTrue(self.torch.equal(actual, expected))
 
+    def test_registered_slices_mixed_batch_and_upsert(self):
+        torch = self.torch
+        expected = expected_tensor(torch, (1 << 20) + 257, 13)
+        owner = torch.empty(expected.shape, dtype=expected.dtype, device="mlu")
+        producer = torch.mlu.Stream()
+        with torch.mlu.stream(producer):
+            owner.copy_(expected)
+        producer.synchronize()
+        # Interior pointers must be covered by the logical registered range.
+        view = owner[123:-17]
+        staged = expected_tensor(torch, 65537, 23).to("mlu")
+        cpu = expected_tensor(torch, 8192, 7)
+        torch.mlu.synchronize()
+        keys = [self.key(str(i)) for i in range(3)]
+        with registered(self.store, owner):
+            self.assertEqual(
+                self.store.batch_put_tensor(keys, [view, staged, cpu]), [0, 0, 0]
+            )
+            expected = expected + 1
+            with torch.mlu.stream(producer):
+                owner.copy_(expected)
+            producer.synchronize()
+            self.assertEqual(self.store.upsert_tensor(keys[0], view), 0)
+            self.assertEqual(
+                self.store.batch_upsert_tensor(keys, [view, staged, cpu]),
+                [0, 0, 0],
+            )
+        del view, owner
+        gc.collect()
+        torch.mlu.empty_cache()
+        for key, value in zip(
+            keys, [expected[123:-17], expected_tensor(torch, 65537, 23), cpu]
+        ):
+            self.assertTensorEqual(self.store.get_tensor(key), value)
+
+    def test_registered_noncontiguous_tensor_keeps_materialized_owner(self):
+        torch = self.torch
+        expected = expected_tensor(torch, 128 * 256, 43).reshape(128, 256)
+        owner = expected.to("mlu")
+        view = owner.t()
+        self.assertFalse(view.is_contiguous())
+        torch.mlu.synchronize()
+        key = self.key("registered_transpose")
+        with registered(self.store, owner):
+            # contiguous() creates a different allocation, which must use
+            # staging rather than borrow the original owner's registration.
+            self.assertEqual(self.store.put_tensor(key, view), 0)
+        del view, owner
+        gc.collect()
+        torch.mlu.empty_cache()
+        self.assertTensorEqual(self.store.get_tensor(key), expected.t())
+
     def test_dtypes_and_metadata(self):
         torch = self.torch
         for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.uint8):

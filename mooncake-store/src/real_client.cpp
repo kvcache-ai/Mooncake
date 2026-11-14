@@ -228,20 +228,26 @@ BuildNestedSlicesFromBuffers(
 tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     const std::shared_ptr<ClientBufferAllocator> &allocator,
     const std::vector<Slice> &slices,
-    std::vector<BufferHandle> &staging_handles) {
-    if (!allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
+    std::vector<BufferHandle> &staging_handles,
+    const std::function<bool(const Slice &)> &keep_device_slice = {}) {
     size_t total_size = 0;
+    size_t staged_size = 0;
+    std::vector<bool> direct;
+    direct.reserve(slices.size());
     for (const auto &slice : slices) {
         if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
             return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
         total_size += slice.size;
+        direct.push_back(keep_device_slice && keep_device_slice(slice));
+        if (!direct.back()) staged_size += slice.size;
     }
-    auto allocation = allocator->allocate(total_size);
+    if (keep_device_slice && staged_size == 0) return slices;
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto allocation = allocator->allocate(staged_size);
     if (!allocation) {
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -252,7 +258,12 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     std::vector<Slice> staged_slices;
     staged_slices.reserve(slices.size());
     size_t offset = 0;
-    for (const auto &slice : slices) {
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto &slice = slices[i];
+        if (direct[i]) {
+            staged_slices.push_back(slice);
+            continue;
+        }
         if (!runtime_accelerator.CopyToHost(destination + offset, slice.ptr,
                                             slice.size)) {
             LOG(ERROR) << "Failed to stage non-local write buffer";
@@ -275,7 +286,8 @@ bool GroupMultiBufferTransfers(const std::string &protocol,
 
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool,
+    const Client::WriteBufferStager &);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -283,7 +295,8 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &allocator,
-    bool stage_nonlocal, BatchWriteMethod write) {
+    bool stage_nonlocal, BatchWriteMethod write,
+    const std::function<bool(const Slice &)> &keep_device_slice) {
     if (!client) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -299,15 +312,22 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     std::vector<BufferHandle> staging_handles;
     staging_handles.reserve(stage_nonlocal ? keys.size() : 0);
     Client::WriteBufferStager stager;
+    Client::WriteBufferStager rdma_stager;
     if (stage_nonlocal) {
         stager = [&](const std::vector<Slice> &slices) {
             return StageWriteSlices(allocator, slices, staging_handles);
         };
+        if (keep_device_slice) {
+            rdma_stager = [&](const std::vector<Slice> &slices) {
+                return StageWriteSlices(allocator, slices, staging_handles,
+                                        keep_device_slice);
+            };
+        }
     }
     const bool group_by_target = GroupMultiBufferTransfers(
         client->GetProtocol(), config.prefer_alloc_in_same_node);
     return ((*client).*write)(keys, batched_slices.value(), config, stager,
-                              group_by_target);
+                              group_by_target, rdma_stager);
 }
 
 // Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
@@ -4793,6 +4813,7 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     // Gather reads are owner-initiated WRITEs. Publish Store output buffers
     // on supported classic transports; TE's registration defaults stay intact.
     auto result = client_->RegisterLocalMemory(
@@ -4825,12 +4846,9 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
                             "MC_NOF_BACKEND=none if NoF is not intended.";
         }
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        // The record keeps the logical size: writable-region resolution must
-        // not expose the physical segment beyond what the caller registered.
-        registered_buffer_sizes_[buffer] = {size};
-    }
+    // The record keeps the logical size: writable-region resolution must
+    // not expose the physical segment beyond what the caller registered.
+    registered_buffer_sizes_[buffer] = {size};
     return result;
 }
 
@@ -4844,6 +4862,12 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Direct writes hold a shared lock through transfer completion. Acquire
+    // the exclusive lock before touching TE, not merely before record erase.
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto rec_it = registered_buffer_sizes_.find(buffer);
+    if (rec_it != registered_buffer_sizes_.end())
+        rec_it->second.direct_write_eligible = false;
     auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
         auto &hook = TeUnregisterHookForTestingSlot();
         if (hook) {
@@ -4854,8 +4878,6 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
 
     // Record check, NoF cleanup and record erase stay in one critical
     // section (teardown's unregister walk takes the same lock).
-    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-    auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
         // Fall through to the NoF cleanup only when TE reports the buffer as
         // not registered and the record is still present. NOT_REGISTERED is
@@ -4896,6 +4918,29 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
 
 int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
+}
+
+bool RealClient::is_registered_device_write_source(
+    const Slice &slice,
+    std::shared_lock<std::shared_mutex> &registration_guard) const {
+    if (protocol != "rdma" || slice.size == 0) return false;
+    const auto *accelerator = device::GetAcceleratorRegistry()
+                                  .RuntimeAccelerators()
+                                  .FindDeviceForPointer(slice.ptr);
+    if (!accelerator ||
+        (accelerator->Vendor() != device::AcceleratorVendor::kNvidia &&
+         accelerator->Vendor() != device::AcceleratorVendor::kMlu))
+        return false;
+    if (!registration_guard.owns_lock()) registration_guard.lock();
+    const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+    for (const auto &[buffer, record] : registered_buffer_sizes_) {
+        const auto base = reinterpret_cast<uintptr_t>(buffer);
+        if (record.direct_write_eligible && address >= base &&
+            address - base < record.size &&
+            slice.size <= record.size - (address - base))
+            return true;
+    }
+    return false;
 }
 
 std::optional<RealClient::WritableBufferRegion>
@@ -8593,9 +8638,13 @@ RealClient::batch_upsert_from_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config, bool stage_nonlocal) {
-    return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
-                                      config, client_buffer_allocator_,
-                                      stage_nonlocal, &Client::BatchUpsert);
+    std::shared_lock<std::shared_mutex> registration_guard(
+        registered_buffer_mutex_, std::defer_lock);
+    return BatchWriteFromMultiBuffers(
+        client_, keys, all_buffers, all_sizes, config, client_buffer_allocator_,
+        stage_nonlocal, &Client::BatchUpsert, [&](const Slice &slice) {
+            return is_registered_device_write_source(slice, registration_guard);
+        });
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -8604,9 +8653,13 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config, bool stage_nonlocal) {
-    return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
-                                      config, client_buffer_allocator_,
-                                      stage_nonlocal, &Client::BatchPut);
+    std::shared_lock<std::shared_mutex> registration_guard(
+        registered_buffer_mutex_, std::defer_lock);
+    return BatchWriteFromMultiBuffers(
+        client_, keys, all_buffers, all_sizes, config, client_buffer_allocator_,
+        stage_nonlocal, &Client::BatchPut, [&](const Slice &slice) {
+            return is_registered_device_write_source(slice, registration_guard);
+        });
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(

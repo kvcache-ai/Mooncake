@@ -1228,7 +1228,13 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
         size_t size;
+        // Cleanup-pending entries remain recorded but must not supply new
+        // direct writes after a partial or failed TE unregistration.
+        bool direct_write_eligible = true;
     };
+    bool is_registered_device_write_source(
+        const Slice &slice,
+        std::shared_lock<std::shared_mutex> &registration_guard) const;
     // A present record means "registered OR cleanup-pending": a record is
     // retained when NoF/TE cleanup failed, in which case the buffer must
     // stay mapped until the cleanup retry succeeds (or process exit).
@@ -1454,6 +1460,7 @@ class RealClient : public PyClient {
         bool enable_embedded_master);
 
     friend class DirectGpuReadTest;
+    friend class DirectDeviceWriteTest;
     friend class test::PrefetchTeardownTest;
     friend class RangedDiskLeaseTest;
 

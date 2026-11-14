@@ -3,6 +3,9 @@
 #include <cnrt.h>
 
 namespace mooncake::testing {
+std::atomic<size_t> mlu_d2h_bytes{0};
+std::atomic<bool> pause_mlu_d2h{false};
+std::atomic<bool> mlu_d2h_paused{false};
 std::atomic<bool> fail_mlu_h2d{false};
 std::atomic<bool> fail_mlu_d2h{false};
 std::atomic<bool> fail_mlu_pinned_allocation{false};
@@ -20,6 +23,14 @@ cnrtRet_t __real_cnrtFreeHost(void*);
 cnrtRet_t __wrap_cnrtMemcpy(void* dst, void* src, size_t size,
                             cnrtMemTransDir_t direction) {
     using namespace mooncake::testing;
+    if (direction == cnrtMemcpyDevToHost) {
+        mlu_d2h_bytes.fetch_add(size);
+        if (pause_mlu_d2h.load()) {
+            mlu_d2h_paused.store(true);
+            pause_mlu_d2h.wait(true);
+            mlu_d2h_paused.store(false);
+        }
+    }
     if ((direction == cnrtMemcpyHostToDev && fail_mlu_h2d.load()) ||
         (direction == cnrtMemcpyDevToHost && fail_mlu_d2h.load())) {
         ++mlu_injected_copy_failures;
