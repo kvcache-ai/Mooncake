@@ -1,4 +1,5 @@
 #include <string>
+#include <utility>
 
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.h"
@@ -6,34 +7,30 @@
 
 namespace mooncake {
 HostProxyRoute::HostProxyRoute(TransferEngine& engine,
-                               LinkManager& link_manager,
-                               uint32_t max_world_size)
-    : engine_(engine),
-      proxy_(std::make_unique<HostTransferProxy>(engine, link_manager,
-                                                 max_world_size)),
-      max_world_size_(max_world_size) {}
+                               std::unique_ptr<HostTransferProxy> proxy,
+                               std::string device_location,
+                               uint32_t max_world_size,
+                               HostProxyCommandSlot* device_slots)
+    : RouteProvider(DeviceRouteType::HostProxy, kRouteKey, kEndpointVersion),
+      engine_(engine),
+      proxy_(std::move(proxy)),
+      device_location_(std::move(device_location)),
+      max_world_size_(max_world_size),
+      device_slots_(device_slots) {}
+
+PGResult<std::unique_ptr<HostProxyRoute>> HostProxyRoute::create(
+    int device_index, TransferEngine& engine, LinkManager& link_manager,
+    uint32_t max_world_size) {
+    auto proxy = std::make_unique<HostTransferProxy>(engine, link_manager,
+                                                     max_world_size);
+    PG_TRY(proxy->start());
+    PG_TRY(auto device_slots, proxy->initializeDevice(device_index));
+    return std::unique_ptr<HostProxyRoute>(new HostProxyRoute(
+        engine, std::move(proxy), GPU_PREFIX + std::to_string(device_index),
+        max_world_size, device_slots));
+}
 
 HostProxyRoute::~HostProxyRoute() noexcept = default;
-
-PGResult<void> HostProxyRoute::initialize(int device_index) {
-    PG_VALIDATE_STATE(!shutdown_requested_, "HostProxyRoute is shutting down");
-    if (initialized_) return {};
-    PG_TRY(proxy_->start());
-    PG_TRY(device_slots_, proxy_->initializeDevice(device_index));
-    device_location_ = GPU_PREFIX + std::to_string(device_index);
-    initialized_ = true;
-    return {};
-}
-
-DeviceHostProxyContext HostProxyRoute::deviceContext() const noexcept {
-    return DeviceHostProxyContext{.command_slots = device_slots_};
-}
-
-std::string_view HostProxyRoute::routeKey() const noexcept { return kRouteKey; }
-
-uint32_t HostProxyRoute::routeVersion() const noexcept {
-    return kEndpointVersion;
-}
 
 std::optional<RouteEndpoint> HostProxyRoute::localEndpoint() {
     return RouteEndpoint{
@@ -45,9 +42,10 @@ std::optional<RouteEndpoint> HostProxyRoute::localEndpoint() {
     };
 }
 
-PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::resolveRoutes(
-    std::span<const std::optional<DeviceTransferEndpoint>> endpoints) {
-    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
+PGResult<void> HostProxyRoute::installEndpoints(
+    const DeviceTransferSnapshot& snapshot, uint64_t) {
+    const auto& endpoints = snapshot.endpoints;
+    PG_VALIDATE_STATE(!shutdown_requested_, "HostProxyRoute is shutting down");
     PG_VALIDATE_ARG(
         endpoints.size() == max_world_size_,
         "host-proxy route endpoint snapshot size does not match max world "
@@ -68,12 +66,22 @@ PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::resolveRoutes(
                 },
         };
     }
-    return routes;
+    pending_routes_ = std::move(routes);
+    return {};
+}
+
+PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::updateRoutes() {
+    return std::move(pending_routes_);
+}
+
+void HostProxyRoute::fillDeviceContext(
+    DeviceRouteContext& context) const noexcept {
+    context.host_proxy = DeviceHostProxyContext{.command_slots = device_slots_};
 }
 
 PGResult<void> HostProxyRoute::registerRegion(DeviceRegionKind kind, void* addr,
                                               size_t size) {
-    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
+    PG_VALIDATE_STATE(!shutdown_requested_, "HostProxyRoute is shutting down");
     PG_VALIDATE_ARG(addr && size != 0, "host-proxy region is empty");
 
     switch (kind) {
@@ -98,9 +106,6 @@ PGResult<void> HostProxyRoute::registerRegion(DeviceRegionKind kind, void* addr,
 
 PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
                                                 void* addr, size_t size) {
-    PG_VALIDATE_STATE(initialized_ || shutdown_requested_,
-                      "HostProxyRoute cannot unregister regions before "
-                      "initialization");
     PG_VALIDATE_ARG(addr && size != 0, "host-proxy region is empty");
     switch (kind) {
         case DeviceRegionKind::PeerAccessible:
@@ -118,16 +123,10 @@ PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
 
 PGResult<void> HostProxyRoute::shutdown() {
     if (shutdown_requested_) return {};
-    if (!initialized_) {
-        PG_TRY(proxy_->shutdown());
-        shutdown_requested_ = true;
-        return {};
-    }
     PG_TRY(proxy_->shutdown());
     shutdown_requested_ = true;
     device_slots_ = nullptr;
     device_location_.clear();
-    initialized_ = false;
     return {};
 }
 

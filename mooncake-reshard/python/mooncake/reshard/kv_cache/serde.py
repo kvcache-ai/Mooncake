@@ -267,7 +267,7 @@ def _topology_from_wire(value: object) -> KVCacheTopology:
 
 
 def _descriptor_to_wire(descriptor: KVCacheDescriptor) -> dict[str, JsonValue]:
-    return {
+    result: dict[str, JsonValue] = {
         "global_layer_ids": list(descriptor.global_layer_ids),
         "dtype": descriptor.dtype,
         "itemsize": descriptor.itemsize,
@@ -277,9 +277,14 @@ def _descriptor_to_wire(descriptor: KVCacheDescriptor) -> dict[str, JsonValue]:
         "value_head_dim": descriptor.value_head_dim,
         "layout": descriptor.layout.value,
     }
+    if descriptor.components != (KVCacheComponent.KEY, KVCacheComponent.VALUE):
+        result["components"] = [component.value for component in descriptor.components]
+    return result
 
 
 def _descriptor_from_wire(value: object) -> KVCacheDescriptor:
+    value = _mapping(value, "KV-cache descriptor")
+    fields: set[str] = {"components"} if "components" in value else set()
     descriptor = _require_exact_fields(
         value,
         {
@@ -291,7 +296,8 @@ def _descriptor_from_wire(value: object) -> KVCacheDescriptor:
             "key_head_dim",
             "value_head_dim",
             "layout",
-        },
+        }
+        | fields,
         "KV-cache descriptor",
     )
     return KVCacheDescriptor(
@@ -309,6 +315,12 @@ def _descriptor_from_wire(value: object) -> KVCacheDescriptor:
             descriptor["value_head_dim"], "value_head_dim", minimum=1
         ),
         layout=KVCacheLayout(_string(descriptor["layout"], "layout")),
+        components=tuple(
+            KVCacheComponent(_string(component, "component"))
+            for component in _sequence(
+                descriptor.get("components", ["key", "value"]), "components"
+            )
+        ),
     )
 
 

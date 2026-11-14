@@ -79,11 +79,10 @@ class ScopedSegmentAccess {
         : segment_manager_(segment_manager), lock_(mutex) {}
 
     /**
-     * @brief Mount a segment
+     * @brief Mount a segment under its non-null owner's client ID.
      */
-    ErrorCode MountSegment(
-        const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode MountSegment(const Segment& segment,
+                           ClientSessionSharedPtr owner_session);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -91,9 +90,8 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             ClientSessionSharedPtr owner_session);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
@@ -141,15 +139,10 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Rebind restored client-owned segment resources to a fresh
-     *        liveness record. Segment snapshots intentionally do not persist
-     *        record implementation state.
+     * @brief Bind all segments of the owner's client ID to `owner_session`.
      */
-    void BindClientLiveness(
-        const UUID& client_id,
-        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
-    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments

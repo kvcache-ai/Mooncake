@@ -366,6 +366,11 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
+    // Receives each failed disk syscall's errno and name, on the I/O thread.
+    // Set before any I/O starts; backends without errno reporting ignore it.
+    using DiskErrorObserver = std::function<void(int err, const char* op)>;
+    virtual void SetDiskErrorObserver(DiskErrorObserver /* observer */) {}
+
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
@@ -927,6 +932,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         next_bucket_ = -1;
     }
 
+    void SetDiskErrorObserver(DiskErrorObserver observer) override {
+        disk_error_observer_ = std::move(observer);
+    }
+
     /**
      * @brief Checks whether the backend is allowed to continue offloading.
      * @return tl::expected<bool, ErrorCode>
@@ -944,9 +953,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
      * @param deferred_keys Optional output: keys moved to the internal
-     * ungrouped pool this call (the tail partial bucket, deferred so the next
-     * call can write them as part of a full bucket). These keys are NOT in
-     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * ungrouped pool this call (the tail partial bucket). These keys are NOT
+     * in buckets_keys now. FileStorage replays carried keys on the next pass,
+     * which may emit a partial bucket; empty backend input does not flush. The
      * caller must keep their offload tasks alive across the deferral — a key
      * re-emitted from the pool arrives without a task otherwise
      * (neuralwatt: the silent deferred-tail loss, upstream #3006).
@@ -1029,6 +1038,17 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs,
         std::vector<StorageObjectMetadata>& metadatas);
 
+    // BuildBucket for bucket_backend_config_.aligned_direct_write: every
+    // iovec starts and ends on a 4 KiB boundary of the file. The copied
+    // bytes live in a per-thread buffer that stays valid until the next
+    // call on the same thread.
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
+    BuildAlignedDirectBucket(
+        int64_t bucket_id,
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::vector<iovec>& iovs,
+        std::vector<StorageObjectMetadata>& metadatas);
+
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs, int disk_index);
@@ -1049,8 +1069,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::string, ErrorCode> GetBucketDataPath(
         int64_t bucket_id, int disk_index) const;
 
+    // direct_write (Write only): an aligned direct bucket data file, opened
+    // for O_DIRECT where the file system allows it.
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
-        const std::string& path, FileMode mode) const;
+        const std::string& path, FileMode mode,
+        bool direct_write = false) const;
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
@@ -1243,7 +1266,26 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
 
+    // Test-only: bytes the last aligned direct bucket copied (key blocks,
+    // partial value blocks, unaligned values).
+    size_t GetLastAlignedCopyBytesForTest() const {
+        return last_aligned_copy_bytes_.load(std::memory_order_relaxed);
+    }
+
+    // Test-only: open aligned direct bucket files as on a file system that
+    // refuses O_DIRECT.
+    void SetDirectIOUnavailableForTest(bool unavailable) {
+        test_direct_io_unavailable_.store(unavailable,
+                                          std::memory_order_relaxed);
+    }
+
    private:
+    void NotifyDiskError(int err, const char* op) const {
+        if (err != 0 && disk_error_observer_) disk_error_observer_(err, op);
+    }
+
+    DiskErrorObserver disk_error_observer_;
+
     /**
      * @brief Take the exclusive owner lock on every disk root.
      *
@@ -1259,6 +1301,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     void ReleaseDiskOwnerLocks();
 
     std::atomic<bool> test_datasync_failure_{false};
+    std::atomic<size_t> last_aligned_copy_bytes_{0};
+    std::atomic<bool> test_direct_io_unavailable_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1278,11 +1322,6 @@ class BucketStorageBackend : public StorageBackendInterface {
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
-    // Aligned buffer for O_DIRECT I/O operations
-    // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
-    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
-                                                              [](void*) {}};
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *

@@ -8,8 +8,11 @@
 
 namespace mooncake {
 
+// A request that carries no data.
+struct D2HEmptyRequest {};
+
 // A reply that only acknowledges the request, without returning a value.
-struct D2HRequestAck {};
+struct D2HEmptyReply {};
 
 // One device-to-host request and its host-to-device reply in host-mapped
 // memory. There is one GPU submitter and one serialized host receiver. Host
@@ -29,7 +32,7 @@ struct D2HRequestAck {};
 // Dropping a handle or timing out does not cancel the request: the slot cannot
 // be reused until the host replies. Waiting and timeout policies belong to the
 // caller.
-template <typename Request, typename Reply = D2HRequestAck>
+template <typename Request = D2HEmptyRequest, typename Reply = D2HEmptyReply>
 class D2HRequestSlot {
     static_assert(std::is_trivially_copyable_v<Request>);
     static_assert(std::is_trivially_copyable_v<Reply>);

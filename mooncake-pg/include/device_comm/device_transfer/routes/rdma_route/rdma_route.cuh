@@ -7,7 +7,7 @@
 #include <transport/device/device_ops.cuh>
 #include <transport/device/ibgda_device.cuh>
 
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
@@ -85,7 +85,7 @@ __device__ __forceinline__ uint32_t rdmaLocalKey(
     if (context.peer_accessible_region.contains(source, size)) {
         return context.peer_accessible_lkey;
     }
-    PG_DEVICE_ASSERT(context.local_staging_region.contains(source, size));
+    PG_ASSERT(context.local_staging_region.contains(source, size));
     return context.local_staging_lkey;
 }
 
@@ -113,7 +113,7 @@ __device__ __forceinline__ void appendRdmaSignal(
         case SignalAction::Kind::None:
             return;
     }
-    PG_DEVICE_UNREACHABLE();
+    PG_UNREACHABLE();
 }
 
 static __device__ __noinline__ RdmaTransferTicket
@@ -140,7 +140,7 @@ rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
     const uint64_t batch_size =
         write_count + (signal.kind != SignalAction::Kind::None ? 1 : 0);
     const uint32_t capacity = qp->wqeid_mask + 1;
-    PG_DEVICE_ASSERT(batch_size != 0 && batch_size <= capacity);
+    PG_ASSERT(batch_size != 0 && batch_size <= capacity);
     const uint32_t outstanding =
         static_cast<uint16_t>(qp->wq_head - qp->wq_tail);
     if (outstanding + batch_size > capacity) {

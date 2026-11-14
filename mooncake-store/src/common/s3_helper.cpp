@@ -5,6 +5,7 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/utils/memory/stl/AWSVector.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
@@ -129,9 +130,6 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         bucket_ = bucket;
     }
 
-    Aws::Auth::AWSCredentials credentials(env.access_key_id,
-                                          env.secret_access_key);
-
     // Concatenate log information into member variable connection_info_
     connection_info_ = fmt::format(
         "S3 client config: "
@@ -141,21 +139,33 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         "connectTimeoutMs={} "
         "requestTimeoutMs={} "
         "scheme={} "
-        "credentials={}/{} "
+        "credentials={} "
         "useVirtualAddressing={}",
         config.region.empty() ? "unset" : config.region,
         config.endpointOverride.empty() ? "unset" : config.endpointOverride,
         bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs,
         config.requestTimeoutMs,
         config.scheme == Aws::Http::Scheme::HTTPS ? "HTTPS" : "HTTP",
-        !env.access_key_id.empty() ? "set" : "unset",
-        !env.secret_access_key.empty() ? "set" : "unset",
+        env.UsesStaticCredentials() ? "static" : "default-chain",
         env.use_virtual_addressing ? "true" : "false");
 
-    s3_client_ = Aws::S3::S3Client(
-        credentials, config,
-        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-        env.use_virtual_addressing);
+    // Without static keys, use the default provider chain so that
+    // temporary credentials (EKS Pod Identity, IRSA, instance profiles)
+    // work and refresh before they expire.
+    if (env.UsesStaticCredentials()) {
+        Aws::Auth::AWSCredentials credentials(env.access_key_id,
+                                              env.secret_access_key);
+        s3_client_ = Aws::S3::S3Client(
+            credentials, config,
+            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+            env.use_virtual_addressing);
+    } else {
+        s3_client_ = Aws::S3::S3Client(
+            Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>(
+                "S3Helper"),
+            config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+            env.use_virtual_addressing);
+    }
 }
 
 S3Helper::~S3Helper() = default;

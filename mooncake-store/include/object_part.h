@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "replica.h"
 
 namespace mooncake {
@@ -29,7 +31,9 @@ class ObjectPart {
     ObjectPart& operator=(ObjectPart&&) = delete;
 
     ObjectPart(size_t length, std::vector<Replica>&& replicas)
-        : length_(length), replicas_(std::move(replicas)) {}
+        : length_(length),
+          replicas_(std::move_iterator(replicas.begin()),
+                    std::move_iterator(replicas.end())) {}
 
     size_t length() const { return length_; }
 
@@ -40,9 +44,14 @@ class ObjectPart {
     }
 
     // Elements may be modified; adding or removing goes through the calls
-    // below.
-    std::span<Replica> replicas() { return replicas_; }
-    std::span<const Replica> replicas() const { return replicas_; }
+    // below. The first replica sits in the part itself, so the common one
+    // replica case allocates nothing.
+    std::span<Replica> replicas() {
+        return {replicas_.data(), replicas_.size()};
+    }
+    std::span<const Replica> replicas() const {
+        return {replicas_.data(), replicas_.size()};
+    }
 
     void AddReplicas(std::vector<Replica>&& replicas) {
         replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
@@ -70,13 +79,18 @@ class ObjectPart {
     }
 
     [[nodiscard]] std::vector<Replica> PopReplicas() {
-        return std::move(replicas_);
+        std::vector<Replica> popped_replicas;
+        popped_replicas.reserve(replicas_.size());
+        std::move(replicas_.begin(), replicas_.end(),
+                  std::back_inserter(popped_replicas));
+        replicas_.clear();
+        return popped_replicas;
     }
 
    private:
     const size_t length_;
     std::optional<uint64_t> checksum_;
-    std::vector<Replica> replicas_;
+    boost::container::small_vector<Replica, 1> replicas_;
 };
 
 }  // namespace mooncake

@@ -19,6 +19,9 @@ class GpuEvent;
 // compatibility restriction will be fixed as the new collective runtime
 // matures.
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+// Convert microseconds to clock64() ticks.
+PGResult<uint64_t> gpuTimeoutTicks(int device_index, size_t timeout_us);
+
 struct GpuCaptureInfo {
     bool active = false;
     cudaStream_t origin = nullptr;
@@ -135,6 +138,8 @@ class GpuEvent {
 
     GpuEvent(GpuEvent&& other) noexcept;
     GpuEvent& operator=(GpuEvent&& other) noexcept;
+
+    [[nodiscard]] cudaEvent_t get() const noexcept { return event_; }
 
     [[nodiscard]] PGResult<void> record(const GpuStream& stream);
     [[nodiscard]] PGResult<bool> query() const;

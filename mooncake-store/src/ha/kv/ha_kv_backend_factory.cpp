@@ -29,7 +29,10 @@ tl::expected<std::shared_ptr<HaKvBackend>, ErrorCode> CreateHaKvBackend(
             if (spec.connstring.empty()) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            auto backend = std::make_shared<RedisHaKvBackend>();
+            // Keep the factory's supported one-replica deployment explicit
+            // until HA configuration and topology validation supply the count.
+            auto backend = std::make_shared<RedisHaKvBackend>(
+                KvWriteDurabilityPolicy{.replicas_required = 1});
             const ErrorCode err = backend->Connect(spec.connstring);
             if (err != ErrorCode::OK) {
                 return tl::make_unexpected(err);

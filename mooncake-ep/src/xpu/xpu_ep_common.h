@@ -70,6 +70,14 @@ constexpr size_t kSlotShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
 //               top-k weights, row[num_ranks][T] (per source token, the
 //               weighted sum of this rank's experts' rows)
 // A call uses one half; consecutive calls alternate halves, as on CUDA.
+//
+// When some peers are on other nodes (the hybrid path), those peers push
+// instead: a host proxy RDMA-writes what they would have pulled into this
+// rank's half. Dispatch then also uses the landing zones and outboxes of
+// DispatchStaging, and combine an inbox after its rows:
+//     inbox[num_ranks][num_local][T]  rows a remote source wrote here, at the
+//                                     offsets this rank would have pulled
+//                                     them from in that source's staging
 struct HalfLayout {
     int* ready;  // rank r's flag at ready[r * kReadyStride]
     uint8_t* staging;
@@ -91,10 +99,34 @@ inline size_t dispatch_msg_bytes(int hidden, bool use_fp8);
 //                           top-k weight}, written when weights are given
 // local_stage[R][T] is this rank's own: the receive kernel pulls each token
 // a peer sent here into it once, then copies it to every expert that picked it.
+// A remote peer's proxy writes them there instead. The hybrid path adds
+//   landing[R]              per remote source, what this rank would have read
+//                           from its staging (see DispatchLanding)
+//   outbox[R][T]            this rank's messages for each remote rank, in
+//                           that rank's token-list order
 // Offsets follow the BF16 message size, so FP8 and BF16 calls share a layout.
+// Within local_stage and outbox, messages are packed at the call's own size,
+// so an FP8 dispatch writes half the bytes over RDMA.
+struct DispatchLanding {
+    size_t counts, lists, rank_list, picks, bytes;
+    DispatchLanding(int T, int num_local) {
+        const size_t t = T;
+        counts = 0;  // [num_local]
+        lists =
+            round_up(num_local * sizeof(int), kLineBytes);  // [num_local][T]
+        rank_list = lists + round_up(num_local * t * sizeof(int), kLineBytes);
+        picks = rank_list + round_up(t * sizeof(int), kLineBytes);
+        bytes = picks +
+                round_up(t * kTopkShadowMaxTopk * 2 * sizeof(int), kLineBytes);
+    }
+};
+
 struct DispatchStaging {
     size_t counts, lists, rank_counts, rank_lists, rank_picks, local_stage, end;
-    DispatchStaging(int hidden, int T, int num_experts, int num_ranks) {
+    DispatchLanding land;
+    size_t landing, outbox, hybrid_end;
+    DispatchStaging(int hidden, int T, int num_experts, int num_ranks)
+        : land(T, num_experts / num_ranks) {
         const size_t msg = dispatch_msg_bytes(hidden, false);
         const size_t t = T, r = num_ranks;
         counts = t * msg;
@@ -107,6 +139,9 @@ struct DispatchStaging {
             rank_picks +
             round_up(r * t * kTopkShadowMaxTopk * 2 * sizeof(int), kLineBytes);
         end = local_stage + r * t * msg;
+        landing = end;
+        outbox = landing + r * land.bytes;
+        hybrid_end = outbox + r * t * msg;
     }
 };
 
@@ -123,19 +158,22 @@ inline size_t recv_table_ints(int num_ranks) {
 struct BufferPair {
     size_t total_bytes = 0;
     size_t half_bytes = 0;
+    size_t combine_bytes = 0;  // combine rows; the hybrid inbox follows them
     HalfLayout halves[2];
 
     BufferPair(void* base, int num_max_dispatch_tokens_per_rank, int hidden,
-               int num_ranks, int num_experts) {
+               int num_ranks, int num_experts, bool hybrid) {
         const size_t T = num_max_dispatch_tokens_per_rank;
         const size_t ready_bytes = round_up(num_ranks * kLineBytes, 4096);
-        const size_t dispatch_bytes =
-            DispatchStaging(hidden, static_cast<int>(T), num_experts, num_ranks)
-                .end;
-        const size_t combine_bytes =
+        const DispatchStaging st(hidden, static_cast<int>(T), num_experts,
+                                 num_ranks);
+        const size_t dispatch_bytes = hybrid ? st.hybrid_end : st.end;
+        combine_bytes =
             static_cast<size_t>(num_experts) * T * hidden * kBf16Size;
-        half_bytes = round_up(
-            ready_bytes + std::max(dispatch_bytes, combine_bytes), 4096);
+        half_bytes =
+            round_up(ready_bytes + std::max(dispatch_bytes,
+                                            (hybrid ? 2 : 1) * combine_bytes),
+                     4096);
         for (int i = 0; i < 2; ++i) {
             uint8_t* h = static_cast<uint8_t*>(base) + i * half_bytes;
             halves[i] = {reinterpret_cast<int*>(h), h + ready_bytes};
@@ -144,11 +182,13 @@ struct BufferPair {
     }
 };
 
+// Sized for the hybrid path, which needs more than ranks on one node do; a
+// buffer of the smaller single-node size still works on one node.
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,
                                       int hidden, int num_ranks,
                                       int num_experts) {
     return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
-                      num_ranks, num_experts)
+                      num_ranks, num_experts, true)
         .total_bytes;
 }
 

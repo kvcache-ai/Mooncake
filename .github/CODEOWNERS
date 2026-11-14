@@ -44,7 +44,7 @@
 /python/tests/ssd/ @ykwd @stmatengss
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc
-/mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov
+/mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @staryxchen @amd-arozanov
 /mooncake-transfer-engine/*/transport/ascend_transport/ @alogfans @ascend-direct-dev
 /mooncake-transfer-engine/*/transport/efa_transport/ @alogfans @whn09
 /mooncake-transfer-engine/tent/src/transport/hp_tcp/ @alogfans @staryxchen @jacklin78911-collab

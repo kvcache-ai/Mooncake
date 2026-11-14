@@ -301,7 +301,9 @@ void TransportSelector::loadPolicies() {
 }
 
 TransportSelector::TransportSelector(std::shared_ptr<Config> config)
-    : config_(config), force_tcp_(config_->get("transports/force_tcp", false)) {
+    : config_(config),
+      force_tcp_(config_->get("transports/force_tcp", false)),
+      force_fabric_(config_->get("transports/force_fabric", false)) {
     loadPolicies();
 }
 
@@ -502,9 +504,9 @@ bool TransportSelector::isTransportAvailable(
     // and the staging capability checks share one device-type list and cannot
     // disagree. TPU and Intel XPU are included so their device<->host staging
     // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu).
-    // XPU also satisfies gpu_to_gpu, but only for the local segment (checked
-    // above), so cross-node device traffic without GPUDirect RDMA is always
-    // staged through host DRAM.
+    // XPU also satisfies gpu_to_gpu locally (checked above). Cross-node XPU
+    // and MLU traffic uses direct RDMA only when both buffers registered on
+    // RDMA; otherwise the engine stages it through host DRAM.
     auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
 
     // For file segments, check file-specific capabilities (original logic)
@@ -578,8 +580,11 @@ SelectionResult TransportSelector::select(
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
+    static const std::vector<TransportType> kFabricOnly{FABRIC};
     const auto& raw =
         force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        : force_fabric_ && context.segment_type == SegmentType::Memory
+            ? kFabricOnly
         : !matching_policy->transports.empty() ? matching_policy->transports
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;

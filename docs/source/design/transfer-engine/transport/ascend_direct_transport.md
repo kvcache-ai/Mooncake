@@ -6,13 +6,19 @@ Ascend Direct Transport (referred to as Transport throughout this document) is l
 
 Transport is a transmission adapter layer built on CANN's ADXL capabilities, providing direct compatibility with the Mooncake Transfer Engine. With Transport, users can perform Host-to-Device, Device-to-Host, and Device-to-Device transfers in Ascend environments using various communication protocols such as HCCS and RDMA. Future enhancements will enable data transfer between heterogeneous Ascend and GPU environments.
 
-To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option.
+To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option (the legacy `USE_ASCEND` option now selects the same Ascend Direct transport).
 
 ### Additional Dependencies
 
 **Ascend Compute Architecture for Neural Networks (CANN)**
 
 Please install the latest version of Ascend Compute Architecture for Neural Networks.
+
+The TENT transport backend for Ascend (`MC_USE_TENT=1`) uses HIXL's AutoConnect
+session mode and keeps peer sessions open until teardown, so it requires
+**CANN/HIXL 9.2.0 or newer**. On 9.1.x and earlier, deregistering a memory
+region while AutoConnect sessions to that peer are still open fails; use the
+classic `ascend` transport on those versions.
 
 ### Test Cases
 

@@ -19,6 +19,7 @@ struct RegionResourceSpec {
     uintptr_t base{0};
     size_t size{0};
     std::string transport_endpoint;
+    std::string transport_protocol;
 };
 
 }  // namespace mooncake

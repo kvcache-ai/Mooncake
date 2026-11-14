@@ -65,10 +65,10 @@ class AllocatorManager {
     std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        ClientSessionSharedPtr owner_session) {
         auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
-            new SegmentAllocatorRegistration(allocator,
-                                             std::move(client_liveness)));
+            new SegmentAllocatorRegistration(
+                allocator, SegmentLifetime(std::move(owner_session))));
         addRegistration(name, registration);
         return registration;
     }
@@ -109,32 +109,37 @@ class AllocatorManager {
         return registration_removed;
     }
 
-    struct Replacement {
+    struct RegistrationReplacement {
         std::string name;
-        std::shared_ptr<BufferAllocatorBase> expected;
-        std::shared_ptr<BufferAllocatorBase> replacement;
+        std::shared_ptr<SegmentAllocatorRegistration> expected;
+        std::shared_ptr<SegmentAllocatorRegistration> replacement;
     };
 
-    bool replaceAllocators(const std::vector<Replacement>& replacements) {
-        std::vector<decltype(allocators_)::mapped_type::iterator> targets;
+    bool replaceRegistrations(
+        const std::vector<RegistrationReplacement>& replacements) {
+        // Slot addresses remain stable: validation never resizes the per-name
+        // vectors, and commit only overwrites their elements.
+        std::vector<std::shared_ptr<SegmentAllocatorRegistration>*> targets;
         targets.reserve(replacements.size());
         for (const auto& replacement : replacements) {
             auto it = allocators_.find(replacement.name);
             if (it == allocators_.end() || !replacement.replacement) {
                 return false;
             }
-            auto target = std::find_if(
-                it->second.begin(), it->second.end(),
-                [&replacement](const auto& registration) {
-                    return registration->GetAllocator() == replacement.expected;
-                });
+            auto target = std::find(it->second.begin(), it->second.end(),
+                                    replacement.expected);
             if (target == it->second.end()) {
                 return false;
             }
-            targets.push_back(target);
+            auto* slot = std::addressof(*target);
+            if (std::find(targets.begin(), targets.end(), slot) !=
+                targets.end()) {
+                return false;
+            }
+            targets.push_back(slot);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            (*targets[i])->BindAllocator(replacements[i].replacement);
+            *targets[i] = replacements[i].replacement;
         }
         return true;
     }
@@ -165,15 +170,21 @@ class AllocatorManager {
      */
     const std::vector<std::string>& getNames() const { return names_; }
 
+    // A segment is serving while any of its registrations is.
+    [[nodiscard]] bool isServing(const std::string& name) const {
+        const auto it = allocators_.find(name);
+        return it != allocators_.end() &&
+               std::any_of(it->second.begin(), it->second.end(),
+                           [](const auto& registration) {
+                               return registration->IsAllocatable();
+                           });
+    }
+
     [[nodiscard]] std::vector<std::string> getServingNames() const {
         std::vector<std::string> serving_names;
         serving_names.reserve(names_.size());
         for (const auto& name : names_) {
-            const auto& registrations = allocators_.at(name);
-            if (std::any_of(registrations.begin(), registrations.end(),
-                            [](const auto& registration) {
-                                return registration->IsServing();
-                            })) {
+            if (isServing(name)) {
                 serving_names.push_back(name);
             }
         }
@@ -322,7 +333,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         // Check available segments.
-        const auto names = allocator_manager.getServingNames();
+        const auto& names = allocator_manager.getNames();
         if (names.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -371,29 +382,32 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         // If replica_num is not satisfied, allocate the remaining replicas
-        // randomly.
-        size_t start_idx = randomIndex(names.size());
-
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        // randomly. Non-serving segments are skipped here instead of building
+        // the serving list, which would check every segment per allocation;
+        // they do not count toward the retry limit.
+        const size_t start_idx = randomStartIndex(allocator_manager, names);
         size_t try_count = 0;
 
-        while (replicas.size() < replica_num && try_count < max_retry) {
-            auto index = start_idx % names.size();
-            start_idx++;
+        for (size_t i = 0; i < names.size() && replicas.size() < replica_num &&
+                           try_count < kMaxRetryLimit;
+             ++i) {
+            const auto& name = names[(start_idx + i) % names.size()];
+            if (!allocator_manager.isServing(name)) {
+                continue;
+            }
             try_count++;
 
             // Skip excluded and used segments
-            if (excluded_segments.contains(names[index]) ||
-                used_segments.contains(names[index])) {
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
                 continue;
             }
 
-            auto buffer =
-                allocateSingle(allocator_manager, names[index], slice_length);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
-                // Nit: no need to insert names[index] into used_segments here
+                // Nit: no need to insert name into used_segments here
                 // because we only traverse all names once, thus there is no
                 // chance to try allocating from a segment for the second time.
             }
@@ -452,11 +466,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
             for (size_t i = 0; i < num_segs; ++i) {
                 const auto& registration =
                     (*allocators)[(i + seg_offset) % num_segs];
-                if (!preferred_hca_names.empty() &&
-                    HcaAffinityTier(
-                        registration->GetAllocator()->GetLocalityHandle().get(),
-                        preferred_hca_names) != tier) {
-                    continue;
+                if (!preferred_hca_names.empty()) {
+                    const auto& allocator = registration->GetAllocator();
+                    if (HcaAffinityTier(
+                            allocator ? allocator->GetLocalityHandle().get()
+                                      : nullptr,
+                            preferred_hca_names) != tier) {
+                        continue;
+                    }
                 }
                 if (auto buffer = registration->Allocate(slice_length)) {
                     return buffer;
@@ -467,8 +484,23 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return nullptr;
     }
 
+   protected:
+    // Draws again on a non-serving segment, so the serving segment right after
+    // a run of them is not more likely to come first.
+    static size_t randomStartIndex(const AllocatorManager& allocator_manager,
+                                   const std::vector<std::string>& names) {
+        size_t start_idx = randomIndex(names.size());
+        for (int draw = 0; draw < kMaxStartDraws &&
+                           !allocator_manager.isServing(names[start_idx]);
+             ++draw) {
+            start_idx = randomIndex(names.size());
+        }
+        return start_idx;
+    }
+
    private:
     static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr int kMaxStartDraws = 16;
 };
 
 /**
@@ -489,7 +521,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        const auto names = allocator_manager.getServingNames();
+        const auto& names = allocator_manager.getNames();
         if (names.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -516,19 +548,24 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
         }
 
         const size_t remaining = replica_num - replicas.size();
-        const size_t sample_count =
-            std::min(kCandidateMultiplier * remaining, names.size());
-        const size_t start_idx = randomIndex(names.size());
+        const size_t sample_count = kCandidateMultiplier * remaining;
+        const size_t start_idx = randomStartIndex(allocator_manager, names);
 
         struct Candidate {
             size_t name_idx;
             double score;
         };
         std::vector<Candidate> candidates;
-        candidates.reserve(sample_count);
-        for (size_t i = 0; i < sample_count; ++i) {
+        candidates.reserve(std::min(sample_count, names.size()));
+        size_t sampled = 0;
+        // Non-serving segments do not take a sample slot.
+        for (size_t i = 0; i < names.size() && sampled < sample_count; ++i) {
             const size_t idx = (start_idx + i) % names.size();
             const auto& name = names[idx];
+            if (!allocator_manager.isServing(name)) {
+                continue;
+            }
+            ++sampled;
             if (excluded_segments.contains(name) ||
                 used_segments.contains(name)) {
                 continue;
@@ -557,14 +594,16 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return replicas;
         }
 
-        size_t fallback_idx = randomIndex(names.size());
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        const size_t fallback_idx = randomIndex(names.size());
         size_t try_count = 0;
-        while (replicas.size() < replica_num && try_count < max_retry) {
-            const size_t index = fallback_idx % names.size();
-            ++fallback_idx;
+        for (size_t i = 0; i < names.size() && replicas.size() < replica_num &&
+                           try_count < kMaxRetryLimit;
+             ++i) {
+            const auto& name = names[(fallback_idx + i) % names.size()];
+            if (!allocator_manager.isServing(name)) {
+                continue;
+            }
             ++try_count;
-            const auto& name = names[index];
             if (excluded_segments.contains(name) ||
                 used_segments.contains(name)) {
                 continue;
@@ -616,10 +655,13 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
         uint64_t total_capacity = 0;
         uint64_t total_free = 0;
         for (const auto& registration : *allocators) {
-            if (!registration->IsServing()) {
+            if (!registration->IsAllocatable()) {
                 continue;
             }
-            const auto buffer_allocator = registration->GetAllocator();
+            const auto& buffer_allocator = registration->GetAllocator();
+            if (!buffer_allocator) {
+                continue;
+            }
             const auto capacity =
                 static_cast<uint64_t>(buffer_allocator->capacity());
             total_capacity += capacity;
@@ -698,7 +740,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
 
         std::unique_ptr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
-            if (registration->IsServing()) {
+            if (registration->IsAllocatable()) {
                 buffer = registration->Allocate(slice_length);
                 if (buffer) {
                     break;

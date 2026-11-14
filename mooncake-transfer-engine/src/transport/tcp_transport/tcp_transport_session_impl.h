@@ -64,7 +64,32 @@ static int getCudaDeviceId(void* addr) {
     if (attributes.type == cudaMemoryTypeDevice) return attributes.device;
     return -1;
 }
+#endif
 
+#ifdef MOONCAKE_TCP_ASCEND
+static int getAscendDeviceId(void* addr) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    recordStagingDeviceQueryForTest();
+#endif
+    aclrtPtrAttributes attributes{};
+    if (aclrtPointerGetAttributes(addr, &attributes) != ACL_SUCCESS ||
+        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE)
+        return -1;
+    // ACL returns a user device ID, as accepted by aclrtSetDevice.
+    return static_cast<int>(attributes.location.id);
+}
+
+static aclError copyTcpAscendMemory(void* dst, const void* src, size_t size,
+                                    int device, aclrtMemcpyKind kind) {
+    auto status = aclrtSetDevice(device);
+    if (status != ACL_SUCCESS) return status;
+    return aclrtMemcpy(dst, size, src, size, kind);
+}
+#endif
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA) || defined(MOONCAKE_TCP_ASCEND)
 class TcpStagingBuffer {
    public:
     char* ensure(size_t size) {
@@ -80,6 +105,7 @@ class TcpStagingBuffer {
    private:
     std::vector<char> buffer_;
 };
+#endif
 
 #ifdef USE_MACA
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
@@ -96,7 +122,6 @@ static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
     cudaError_t destroy_status = cudaStreamDestroy(stream);
     return status == cudaSuccess ? destroy_status : status;
 }
-#endif
 #endif
 
 // Forward declaration
@@ -160,6 +185,13 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
     int cuda_device_ = -1;
+#endif
+#ifdef MOONCAKE_TCP_ASCEND
+    int ascend_device_ = -1;
+#endif
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA) || defined(MOONCAKE_TCP_ASCEND)
     TcpStagingBuffer staging_buffer_;
 #endif
 
@@ -221,6 +253,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX) || defined(USE_SUPA)
                 cuda_device_ = getCudaDeviceId(local_buffer_);
 #endif
+#ifdef MOONCAKE_TCP_ASCEND
+                ascend_device_ = getAscendDeviceId(local_buffer_);
+#endif
                 if (opcode == (uint8_t)TransferRequest::WRITE) {
                     readBody();
                 } else if (v2_) {
@@ -266,6 +301,19 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
                 return;  // Connection will be closed
+            }
+        }
+#endif
+
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+            auto status = copyTcpAscendMemory(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size,
+                ascend_device_, ACL_MEMCPY_DEVICE_TO_HOST);
+            if (status != ACL_SUCCESS) {
+                LOG(ERROR) << "TCP Ascend D2H copy failed: " << status;
+                return;
             }
         }
 #endif
@@ -318,6 +366,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 #endif
 
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0)
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+#endif
+
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, self](const asio::error_code& ec,
@@ -360,6 +413,18 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     }
                 }
 #endif
+#ifdef MOONCAKE_TCP_ASCEND
+                if (ascend_device_ >= 0) {
+                    auto status = copyTcpAscendMemory(
+                        addr + total_transferred_bytes_, dram_buffer,
+                        transferred_bytes, ascend_device_,
+                        ACL_MEMCPY_HOST_TO_DEVICE);
+                    if (status != ACL_SUCCESS) {
+                        LOG(ERROR) << "TCP Ascend H2D copy failed: " << status;
+                        return;
+                    }
+                }
+#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
@@ -387,6 +452,13 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
     int cuda_device_ = -1;
+#endif
+#ifdef MOONCAKE_TCP_ASCEND
+    int ascend_device_ = -1;
+#endif
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA) || defined(MOONCAKE_TCP_ASCEND)
     TcpStagingBuffer staging_buffer_;
 #endif
     // v2 WRITE runs the body stream and the ack read concurrently (one
@@ -447,6 +519,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
         cuda_device_ = getCudaDeviceId(local_buffer_);
+#endif
+#ifdef MOONCAKE_TCP_ASCEND
+        ascend_device_ = getAscendDeviceId(local_buffer_);
 #endif
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
@@ -773,6 +848,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
 #endif
 
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0)
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+#endif
+
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, self](const asio::error_code& ec,
@@ -821,6 +901,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             << "ClientSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                }
+#endif
+#ifdef MOONCAKE_TCP_ASCEND
+                if (ascend_device_ >= 0) {
+                    auto status = copyTcpAscendMemory(
+                        addr + total_transferred_bytes_, dram_buffer,
+                        transferred_bytes, ascend_device_,
+                        ACL_MEMCPY_HOST_TO_DEVICE);
+                    if (status != ACL_SUCCESS) {
+                        LOG(ERROR) << "TCP Ascend H2D copy failed: " << status;
                         finalize(TransferStatusEnum::FAILED, false);
                         return;
                     }
@@ -884,6 +977,20 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
+                abortWrite();
+                return;
+            }
+        }
+#endif
+
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+            auto status = copyTcpAscendMemory(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size,
+                ascend_device_, ACL_MEMCPY_DEVICE_TO_HOST);
+            if (status != ACL_SUCCESS) {
+                LOG(ERROR) << "TCP Ascend D2H copy failed: " << status;
                 abortWrite();
                 return;
             }

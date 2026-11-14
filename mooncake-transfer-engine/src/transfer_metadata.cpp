@@ -1739,9 +1739,8 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
         // Update cache with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto old_iter = segment_id_to_desc_map_.find(segment_id);
-        auto old_desc = old_iter == segment_id_to_desc_map_.end()
-                            ? nullptr
-                            : old_iter->second;
+        if (old_iter == segment_id_to_desc_map_.end()) return nullptr;
+        auto old_desc = old_iter->second;
         if (!shouldInstallFetchedSegmentDesc(segment_name, segment_id, old_desc,
                                              segment_desc)) {
             return old_desc;

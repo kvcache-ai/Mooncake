@@ -8,6 +8,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <ctime>
 #include <cstring>
@@ -403,6 +404,14 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PrepareRequest(
 
     const std::string url = BuildUrl(physical_key, query);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    // Honor custom CA bundles while retaining TLS verification.
+    if (const char* ca_bundle = std::getenv("AWS_CA_BUNDLE");
+        ca_bundle != nullptr && *ca_bundle != '\0') {
+        if (curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle) != CURLE_OK) {
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+    }
+
     // Send the path exactly as it was signed. By default libcurl collapses
     // "." and ".." segments, so a key prefix such as "a/../b" (or a key named
     // "..") would reach the service under a different path than the canonical

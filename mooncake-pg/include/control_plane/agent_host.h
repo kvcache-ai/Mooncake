@@ -111,6 +111,9 @@ class AgentRpcServiceImpl : public AgentRpcService {
 
     void onPeerJoined(PeerJoinedPush push) override;
     void onRankStateUpdate(RankStatePush push) override;
+    void onTransferEndpointUpdate(
+        coro_rpc::context<TransferEndpointUpdateAck> ctx,
+        TransferEndpointUpdatePush push) override;
     void onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                       ViewUpdatePush push) override;
 
@@ -172,12 +175,18 @@ class AgentHost : public AgentInterface {
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStatePush push);
+    void postTransferEndpointUpdate(
+        coro_rpc::context<TransferEndpointUpdateAck> ctx,
+        TransferEndpointUpdatePush push);
     void postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                         ViewUpdatePush push);
 
    private:
     AgentStateMachine agent_;
     SerializedExecutor executor_;
+    // Runs blocking DTS endpoint installation and sends the RPC reply.
+    SerializedExecutor transfer_endpoint_installer_{
+        "TransferEndpointInstaller"};
 
     DeviceTransferService* device_transfer_service_ = nullptr;
     DeviceCollectiveWorkspace* device_collective_workspace_ = nullptr;
@@ -198,6 +207,11 @@ class AgentHost : public AgentInterface {
     std::unique_ptr<RpcServer> rpc_server_;
     std::unique_ptr<RpcClient> rpc_client_;
     std::unique_ptr<AgentRpcServiceImpl> rpc_impl_;
+
+    // RPC contexts awaiting effect dispatch.
+    uint64_t next_transfer_endpoint_request_id_{1};
+    std::unordered_map<uint64_t, coro_rpc::context<TransferEndpointUpdateAck>>
+        pending_transfer_endpoint_resps_;
 
     // Bootstrap synchronization: one-shot latch with executor-managed promises.
     bool agent_registration_done_ = false;
@@ -225,6 +239,10 @@ class AgentHost : public AgentInterface {
     // Communicator registry: for view application and link reset.
     // Accessed only from the executor thread.
     std::unordered_map<GroupId, MooncakeCommunicator*> communicators_;
+
+    void enqueueTransferEndpointInstallation(
+        const InstallTransferEndpoints& effect,
+        coro_rpc::context<TransferEndpointUpdateAck> ctx);
 
     void startAgentRegistration(bool start_new_session = false);
     bool shouldLogAgentRegistrationError();

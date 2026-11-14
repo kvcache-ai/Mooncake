@@ -5,80 +5,73 @@
 namespace mooncake {
 
 SegmentAllocatorRegistration::SegmentAllocatorRegistration(
-    std::shared_ptr<BufferAllocatorBase> allocator,
-    std::shared_ptr<ClientLivenessRecord> client_liveness)
+    std::shared_ptr<BufferAllocatorBase> allocator, SegmentLifetime lifetime,
+    bool allocatable)
     : allocator_(std::move(allocator)),
-      client_liveness_(std::move(client_liveness)) {}
+      allocatable_(allocatable),
+      lifetime_(std::move(lifetime)) {}
 
-bool SegmentAllocatorRegistration::IsServing() const {
-    if (!allocation_lifetime_.isAvailable()) {
-        return false;
-    }
-    const auto record =
-        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
-    return !record || record->IsServing();
+bool SegmentAllocatorRegistration::IsAllocatable() const noexcept {
+    return allocatable_.load(std::memory_order_acquire) &&
+           lifetime_.isServing();
 }
 
 std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     size_t size) const {
-    if (!allocation_lifetime_.isAvailable()) {
+    if (!IsAllocatable()) {
         return nullptr;
     }
-    const auto record =
-        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
-    if (record && !record->IsServing()) {
-        return nullptr;
-    }
-    auto buffer = GetAllocator()->allocate(size);
+    auto buffer = allocator_->allocate(size);
     if (!buffer) {
         return nullptr;
     }
-    buffer->bindSegmentLifetime(buffer_lifetime_);
-    buffer->bindClientLiveness(record);
-    if (!allocation_lifetime_.isAvailable() ||
-        record != std::atomic_load_explicit(&client_liveness_,
-                                            std::memory_order_acquire) ||
-        (record && !record->IsServing())) {
+    if (!IsAllocatable()) {
         return nullptr;
     }
+    buffer->bindSegmentLifetime(lifetime_);
     return buffer;
 }
 
-std::shared_ptr<BufferAllocatorBase>
-SegmentAllocatorRegistration::GetAllocator() const {
-    return std::atomic_load_explicit(&allocator_, std::memory_order_acquire);
+const ClientSessionSharedPtr& SegmentAllocatorRegistration::GetClientSession()
+    const noexcept {
+    return lifetime_.getClientSession();
 }
 
-void SegmentAllocatorRegistration::BindAllocator(
-    std::shared_ptr<BufferAllocatorBase> replacement) {
-    std::atomic_store_explicit(&allocator_, std::move(replacement),
-                               std::memory_order_release);
+std::shared_ptr<SegmentAllocatorRegistration>
+SegmentAllocatorRegistration::WithAllocator(
+    std::shared_ptr<BufferAllocatorBase> replacement) const {
+    return std::shared_ptr<SegmentAllocatorRegistration>(
+        new SegmentAllocatorRegistration(std::move(replacement), lifetime_));
 }
 
-void SegmentAllocatorRegistration::BindClientLiveness(
-    std::shared_ptr<ClientLivenessRecord> record) {
-    std::atomic_store_explicit(&client_liveness_, std::move(record),
-                               std::memory_order_release);
+std::shared_ptr<SegmentAllocatorRegistration>
+SegmentAllocatorRegistration::ReplaceClientSession(
+    ClientSessionSharedPtr session,
+    std::shared_ptr<BufferAllocatorBase> allocator, bool allocatable) {
+    SegmentLifetime next_lifetime(std::move(session));
+    if (!lifetime_.isValid()) {
+        next_lifetime.Invalidate();
+    }
+    // Old buffers and detached snapshots retain the old generation and become
+    // invalid; they must not silently migrate to a new client incarnation with
+    // the same UUID.
+    Invalidate();
+    return std::shared_ptr<SegmentAllocatorRegistration>(
+        new SegmentAllocatorRegistration(
+            std::move(allocator), std::move(next_lifetime), allocatable));
 }
 
 void SegmentAllocatorRegistration::BindBuffer(AllocatedBuffer& buffer) const {
-    buffer.bindSegmentLifetime(buffer_lifetime_);
-    buffer.bindClientLiveness(std::atomic_load_explicit(
-        &client_liveness_, std::memory_order_acquire));
+    buffer.bindSegmentLifetime(lifetime_);
 }
 
-bool SegmentAllocatorRegistration::OwnsBuffer(
-    const AllocatedBuffer& buffer) const {
-    return buffer.segment_lifetime_ == buffer_lifetime_;
+void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) noexcept {
+    allocatable_.store(allocatable, std::memory_order_release);
 }
 
-void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) {
-    allocation_lifetime_.setAvailable(allocatable);
-}
-
-void SegmentAllocatorRegistration::Invalidate() {
-    allocation_lifetime_.setAvailable(false);
-    buffer_lifetime_.setAvailable(false);
+void SegmentAllocatorRegistration::Invalidate() noexcept {
+    allocatable_.store(false, std::memory_order_release);
+    lifetime_.Invalidate();
 }
 
 }  // namespace mooncake

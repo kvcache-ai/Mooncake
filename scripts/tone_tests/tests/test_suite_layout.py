@@ -85,6 +85,72 @@ class TestSuiteLayout(unittest.TestCase):
                 "! declare -f parse"
             )
 
+    def test_store_rs_case_is_appended_to_the_existing_tone_lane(self):
+        runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
+        regular = self.shell(f'"{runner}" list-tests')
+        store_rs_job = self.shell(
+            f'RUN_STORE_RS_TESTS=true "{runner}" list-tests SGLANG'
+        )
+
+        regular_cases = regular.splitlines()
+        self.assertEqual(
+            store_rs_job.splitlines(),
+            regular_cases[:5]
+            + ["test_hicache_storage_mooncake_store_rs.sh"]
+            + regular_cases[5:],
+        )
+        self.assertNotIn("mooncake_store_rs", regular)
+
+    def test_store_rs_controller_uses_the_matching_framework(self):
+        controller = SCRIPTS / "e2e" / "scripts" / "controller.sh"
+        output = self.shell(
+            f"""All_TEST_SCRIPTS_VLLM=(regular-vllm.sh)
+            source "{controller}"
+            get_framework_from_test_name test_hicache_storage_mooncake_store_rs.sh
+            """
+        )
+        self.assertEqual(output.strip(), "SGLANG")
+
+    def test_store_rs_tone_job_reuses_the_sglang_run_all_lifecycle(self):
+        runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
+        output = self.shell(
+            f"""RUN_STORE_RS_TESTS=true LOCAL_IP=192.0.2.1 REMOTE_IP=192.0.2.2
+            source "{runner}"
+            main() {{ printf '%s\\n' "$@"; }}
+            run_requested_suite run-all SGLANG"""
+        )
+        self.assertEqual(output.splitlines(), ["run-all"])
+
+    def test_store_rs_e2e_job_selects_the_exact_combined_wheel(self):
+        repository_root = SCRIPTS.parent
+        nightly_workflow = (
+            repository_root / ".github/workflows/nightly.yml"
+        ).read_text()
+        integration_workflow = (
+            repository_root / ".github/workflows/integration-test.yml"
+        ).read_text()
+        wheel_workflow = (
+            repository_root / ".github/workflows/_build-wheel.yaml"
+        ).read_text()
+
+        self.assertIn("build-wheel-store-rs-tone:", nightly_workflow)
+        self.assertIn("artifact-prefix: tone-store-rs-wheel", nightly_workflow)
+        self.assertIn("artifact_name: tone-store-rs-wheel-py312", nightly_workflow)
+        self.assertIn("run-store-rs: true", nightly_workflow)
+        self.assertNotIn("tone-store-rs-integration:", nightly_workflow)
+        self.assertNotIn("tone-store-rs-integration-tent:", nightly_workflow)
+        self.assertEqual(nightly_workflow.count("run-store-rs: true"), 2)
+        self.assertNotIn("store-rs-transport-backend:", nightly_workflow)
+        self.assertNotIn("store-rs-transport-backend:", integration_workflow)
+        self.assertNotIn("artifact-prefix: nightly-store-rs", nightly_workflow)
+        self.assertIn("RUN_STORE_RS_TESTS=true", integration_workflow)
+        self.assertIn("BRANCH=${{ github.ref_name }}", integration_workflow)
+        self.assertIn("use-store-rs:", wheel_workflow)
+        self.assertIn("default: false", wheel_workflow)
+        self.assertIn("-DBUILD_SHARED_LIBS=ON", wheel_workflow)
+        self.assertIn("-DUSE_REDIS=ON", wheel_workflow)
+        self.assertIn('package_dir / "libtransfer_engine.so"', wheel_workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

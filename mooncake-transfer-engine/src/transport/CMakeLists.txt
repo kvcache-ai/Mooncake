@@ -44,11 +44,9 @@ endif()
 add_subdirectory(shm_transport)
 target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
 
+
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
-elseif(USE_ASCEND)
-  add_subdirectory(ascend_transport)
-  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
 endif()
 
 if(USE_ASCEND_HETEROGENEOUS)
