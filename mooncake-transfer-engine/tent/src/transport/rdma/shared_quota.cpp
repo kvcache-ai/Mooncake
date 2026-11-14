@@ -59,7 +59,8 @@ Status SharedSlotManager::initMutex(pthread_mutex_t* m) {
         pthread_mutexattr_destroy(&attr);
         return Status::InternalError("pthread_mutexattr_setpshared failed");
     }
-#if defined(PTHREAD_MUTEX_ROBUST)
+#ifdef __linux__
+    // PTHREAD_MUTEX_ROBUST is an enum constant on glibc, not a macro.
     if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0) {
         pthread_mutexattr_destroy(&attr);
         return Status::InternalError("pthread_mutexattr_setrobust failed");
@@ -134,14 +135,27 @@ Status SharedSlotManager::detach() {
         fd_ = -1;
     }
 
+    const int error = background_error_.load(std::memory_order_acquire);
+    if (error != 0) {
+        return Status::InternalError("Shared quota publisher failed: " +
+                                     std::string(std::strerror(error)));
+    }
     return Status::OK();
 }
 
 bool SharedSlotManager::canSend(int priority) {
     if (!hdr_) return true;
 
-    // Get current global slot
-    int current_slot = hdr_->current_slot.load(std::memory_order_acquire);
+    int current_slot;
+    if (background_error_.load(std::memory_order_acquire) != 0) {
+        // The slot is time-derived. A stopped publisher can still follow the
+        // same host-wide arbitration schedule using the local clock.
+        const uint64_t now = getCurrentTimeInNano();
+        const uint64_t base_slot = now / (rotation_interval_ms_ * 1000000ull);
+        current_slot = static_cast<int>(base_slot % NUM_SLOTS);
+    } else {
+        current_slot = hdr_->current_slot.load(std::memory_order_acquire);
+    }
 
     // Check if the given priority is allowed in current global slot
     // Slot 0: HIGH only (priority 0 <= 0)
@@ -153,11 +167,12 @@ bool SharedSlotManager::canSend(int priority) {
 void SharedSlotManager::startBackgroundThread() {
     if (background_running_.exchange(true)) return;
 
+    background_error_.store(0, std::memory_order_release);
     background_thread_ = std::thread([this]() { backgroundThreadLoop(); });
 }
 
 void SharedSlotManager::stopBackgroundThread() {
-    if (!background_running_.exchange(false)) return;
+    background_running_.store(false, std::memory_order_relaxed);
 
     if (background_thread_.joinable()) {
         background_thread_.join();
@@ -167,17 +182,47 @@ void SharedSlotManager::stopBackgroundThread() {
 // Background thread: advance global slot periodically
 void SharedSlotManager::backgroundThreadLoop() {
     const uint64_t SLEEP_INTERVAL_US = 1000;  // 1ms
+    auto report_error = [this](const char* operation, int error) {
+        background_error_.store(error, std::memory_order_release);
+        LOG(ERROR) << "Shared quota " << operation
+                   << " failed: " << std::strerror(error);
+    };
 
     while (background_running_.load(std::memory_order_relaxed)) {
-        // Calculate base slot from time
+        // Never block shutdown on another publisher (including old shared
+        // objects initialized with a non-robust mutex).
+        int error = pthread_mutex_trylock(&hdr_->global_mutex);
+        if (error == EBUSY) {
+            usleep(SLEEP_INTERVAL_US);
+            continue;
+        }
+        bool owner_died = false;
+#ifdef __linux__
+        owner_died = error == EOWNERDEAD;
+#endif
+        if (error != 0 && !owner_died) {
+            report_error("pthread_mutex_trylock", error);
+            return;
+        }
+
+        // The slot is the only protected state. Recompute it after acquiring
+        // the mutex, also repairing any update interrupted by owner death.
         uint64_t now = getCurrentTimeInNano();
         uint64_t base_slot = now / (rotation_interval_ms_ * 1000000ull);
-
-        pthread_mutex_lock(&hdr_->global_mutex);
-        // Update global slot
         int global_slot = static_cast<int>(base_slot % NUM_SLOTS);
         hdr_->current_slot.store(global_slot, std::memory_order_release);
-        pthread_mutex_unlock(&hdr_->global_mutex);
+#ifdef __linux__
+        if (owner_died) {
+            error = pthread_mutex_consistent(&hdr_->global_mutex);
+            if (error != 0) report_error("pthread_mutex_consistent", error);
+        }
+#endif
+        const int unlock_error = pthread_mutex_unlock(&hdr_->global_mutex);
+        if (unlock_error != 0) {
+            report_error("pthread_mutex_unlock", unlock_error);
+            return;
+        }
+        if (background_error_.load(std::memory_order_acquire) != 0) return;
 
         usleep(SLEEP_INTERVAL_US);
     }
