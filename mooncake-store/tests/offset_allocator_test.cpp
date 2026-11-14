@@ -333,7 +333,8 @@ class OffsetAllocatorTest : public ::testing::Test {
         const OffsetAllocationHandle& handle,
         const std::shared_ptr<OffsetAllocator>& new_allocator) {
         return OffsetAllocationHandle(new_allocator, handle.m_allocation,
-                                      handle.real_base, handle.requested_size);
+                                      handle.real_base, handle.requested_size,
+                                      handle.reserved_size_);
     }
 
     void substituteWithNewAllocator(

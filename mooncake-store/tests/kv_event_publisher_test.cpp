@@ -636,15 +636,15 @@ TEST(KvEventPublisherTest, MemoryCleanupDefersInvalidNoFRemoval) {
             Accessor accessor(&service, object_id, Accessor::AsIs{});
             ASSERT_TRUE(accessor.IsPublished());
             std::vector<Replica> replicas;
-            replicas.emplace_back(std::make_unique<AllocatedBuffer>(
-                                      expired_allocator, nullptr, 1024),
-                                  ReplicaStatus::COMPLETE,
-                                  ReplicaType::NOF_SSD);
+            replicas.emplace_back(
+                std::make_unique<AllocatedBuffer>(expired_allocator, nullptr,
+                                                  1024, std::nullopt),
+                ReplicaStatus::COMPLETE, ReplicaType::NOF_SSD);
             if (surviving_nof) {
-                replicas.emplace_back(std::make_unique<AllocatedBuffer>(
-                                          live_allocator, nullptr, 1024),
-                                      ReplicaStatus::COMPLETE,
-                                      ReplicaType::NOF_SSD);
+                replicas.emplace_back(
+                    std::make_unique<AllocatedBuffer>(live_allocator, nullptr,
+                                                      1024, std::nullopt),
+                    ReplicaStatus::COMPLETE, ReplicaType::NOF_SSD);
             }
             accessor.Get().AddReplicas(std::move(replicas));
         }

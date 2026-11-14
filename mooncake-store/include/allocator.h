@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -81,10 +82,14 @@ class AllocatedBuffer {
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
-    // A buffer carved from an allocator advertises the allocator's transport
-    // protocol.
+    // Owning constructor. `reserved_size` is the allocator-reported extent of
+    // the underlying allocation. It may only be nullopt when no physical
+    // allocation has been reconstructed (metadata-only reconstruction); it is
+    // never a silent fallback for a failed reservation lookup. A buffer carved
+    // from an allocator advertises the allocator's transport protocol.
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
+                    std::optional<std::size_t> reserved_size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt);
 
@@ -100,7 +105,22 @@ class AllocatedBuffer {
 
     [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
 
+    // Legacy accessor: the caller-requested byte count used for transfer and
+    // for the existing usage counters. Its meaning is unchanged.
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+
+    // Explicit name for the same logical request length.
+    [[nodiscard]] std::size_t requested_size() const noexcept {
+        return this->size_;
+    }
+
+    // Allocator-reserved byte count for this live allocation (allocator class
+    // chunk, offset-allocator node extent). `nullopt` means the physical
+    // allocation has not been reconstructed; it does not mean zero and must
+    // not be substituted with requested_size().
+    [[nodiscard]] std::optional<std::size_t> reserved_size() const noexcept {
+        return this->reserved_size_;
+    }
 
     [[nodiscard]] bool isAllocatorValid() const {
         return !allocator_.expired() && segment_lifetime_.isValid();
@@ -163,6 +183,9 @@ class AllocatedBuffer {
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
+    // Runtime-only. Never serialized; rebuilt from allocator metadata after a
+    // restore, and left unknown for descriptor-only (metadata-only) buffers.
+    std::optional<std::size_t> reserved_size_{std::nullopt};
     // The protocol a reader routes by, as get_descriptor() reports it: the
     // mounted segment's protocol, or "cxl" once change_to_cxl() ran.
     std::string protocol;
@@ -224,6 +247,19 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+    /**
+     * Best-effort lookup of the allocator-reserved extent for a live
+     * allocation address owned by this allocator. Returns nullopt when the
+     * allocator cannot attribute the address, for example metadata-only
+     * allocators or a descriptor that only carries a CXL offset. Callers must
+     * treat nullopt as unknown rather than as requested_size().
+     */
+    [[nodiscard]] virtual std::optional<std::size_t> lookupReservedSize(
+        const void* buffer) const {
+        (void)buffer;
+        return std::nullopt;
+    }
 
     /**
      * Attach this allocator to a domain usage tracker exactly once, before it
@@ -337,6 +373,11 @@ class CachelibBufferAllocator
         return kAllocatorUnknownFreeSpace;
     }
 
+    // Reads the allocation class size of the chunk that owns `buffer` from
+    // CacheLib's own slab header. No rounding rule is re-implemented here.
+    [[nodiscard]] std::optional<std::size_t> lookupReservedSize(
+        const void* buffer) const override;
+
    private:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
@@ -344,7 +385,7 @@ class CachelibBufferAllocator
                             ReplicaType replica_type);
 
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
-        const LiveAllocation& allocation);
+        const LiveAllocation& allocation, std::size_t reserved_size);
     // metadata
     const std::string segment_name_;
     const size_t base_;
