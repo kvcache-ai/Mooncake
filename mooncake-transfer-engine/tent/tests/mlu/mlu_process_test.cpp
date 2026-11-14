@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Two exec'd processes, separate MLU allocations and loopback TCP. Pipes carry
-// only test control messages; all payload bytes must pass through TENT.
+// Two exec'd processes with separate MLU allocations. Pipes carry only test
+// control messages; all payload bytes must pass through TENT.
 #include <cnrt.h>
 #include <gtest/gtest.h>
 #include <fcntl.h>
@@ -64,7 +64,7 @@ constexpr size_t kOffset = 17;
 
 using Params = std::tuple<bool, bool, bool>;  // HP TCP, legacy, runtime queue
 
-std::shared_ptr<Config> config(Params params = {}) {
+std::shared_ptr<Config> config(Params params = {}, bool enable_ipc = false) {
     auto c = std::make_shared<Config>();
     c->set("metadata_type", "p2p");
     c->set("metadata_servers", "");
@@ -77,10 +77,11 @@ std::shared_ptr<Config> config(Params params = {}) {
     c->set("transports/hp_tcp/enable", std::get<0>(params));
     c->set("use_legacy_transport_selection", std::get<1>(params));
     c->set("enable_runtime_queue", std::get<2>(params));
-    c->set("max_failover_attempts", 1);
+    c->set("max_failover_attempts", enable_ipc ? 0 : 1);
     c->set("transports/shm/enable", false);
     c->set("transports/io_uring/enable", false);
     c->set("transports/mlu/enable", true);
+    c->set("transports/mlu/disable_ipc", !enable_ipc);
     return c;
 }
 
@@ -174,8 +175,8 @@ struct Command {
     size_t length = 0;
 };
 
-int peerMain(Params params) {
-    TransferEngineImpl engine(config(params));
+int peerMain(Params params, bool enable_ipc) {
+    TransferEngineImpl engine(config(params, enable_ipc));
     if (!engine.available()) return 1;
     TransferEngineImplTestPeer::smallStagePool(engine);
     Buffers addresses(engine);
@@ -220,7 +221,7 @@ class Peer {
             waitpid(pid, nullptr, 0);
         }
     }
-    bool start(Params params = {}) {
+    bool start(Params params = {}, bool enable_ipc = false) {
         int in[2], out[2];
         if (pipe2(in, O_CLOEXEC)) return false;
         if (pipe2(out, O_CLOEXEC)) {
@@ -233,11 +234,12 @@ class Peer {
         posix_spawn_file_actions_adddup2(&actions, in[0], STDIN_FILENO);
         posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
         char executable[] = "/proc/self/exe", option[] = "--mlu-peer";
-        char hp[] = "0", legacy[] = "0", queue[] = "0";
+        char hp[] = "0", legacy[] = "0", queue[] = "0", ipc[] = "0";
         hp[0] += std::get<0>(params);
         legacy[0] += std::get<1>(params);
         queue[0] += std::get<2>(params);
-        char* argv[] = {executable, option, hp, legacy, queue, nullptr};
+        ipc[0] += enable_ipc;
+        char* argv[] = {executable, option, hp, legacy, queue, ipc, nullptr};
         int error =
             posix_spawn(&pid, executable, &actions, nullptr, argv, environ);
         posix_spawn_file_actions_destroy(&actions);
@@ -347,6 +349,71 @@ TEST(MluProcessTest, TcpReadWriteWithIndependentDeviceAllocations) {
     EXPECT_EQ(peer.finish(), 0);
 }
 
+TEST(MluProcessTest, IpcReadWriteWithIndependentDeviceAllocations) {
+    unsigned int count = 0;
+    ASSERT_EQ(cnrtGetDeviceCount(&count), cnrtSuccess);
+    if (count == 0) GTEST_SKIP() << "No MLU device visible";
+
+    Peer peer;
+    ASSERT_TRUE(peer.start({}, true));
+    TransferEngineImpl engine(config({}, true));
+    ASSERT_TRUE(engine.available());
+    Buffers addresses(engine);
+    ASSERT_TRUE(addresses.allocate().ok());
+    SegmentID remote;
+    ASSERT_TRUE(engine.openSegment(remote, peer.hello.segment).ok());
+
+    auto& platform = Platform::getLoader();
+    constexpr size_t length = 65539;
+    auto* local = static_cast<uint8_t*>(addresses[1]) + kOffset;
+    int seed = 0;
+    for (auto op : {Request::READ, Request::WRITE}) {
+        SCOPED_TRACE(op);
+        auto expected = pattern(length, ++seed);
+        auto initial = op == Request::WRITE ? expected : pattern(length, 0);
+        ASSERT_TRUE(
+            peer.command(1, false, op == Request::READ ? seed : 0, length));
+        ASSERT_TRUE(platform.copy(local, initial.data(), length).ok());
+
+        Request request{};
+        request.opcode = op;
+        request.source = local;
+        request.target_id = remote;
+        request.target_offset = peer.hello.addresses[1] + kOffset;
+        request.length = length;
+        // A failed IPC mapping must fail this test rather than use TCP.
+        request.transport_hint = MLU;
+        const auto route = TransferEngineImplTestPeer::route(engine, request);
+        ASSERT_EQ(route.transport, MLU);
+        ASSERT_TRUE(route.staging_params.empty());
+
+        BatchGuard owner(engine);
+        ASSERT_NE(owner.id, 0u);
+        ASSERT_TRUE(engine.submitTransfer(owner.id, {request}).ok());
+        TransferStatus status{};
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        do {
+            ASSERT_TRUE(engine.progressBatch(owner.id, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, length);
+        ASSERT_TRUE(owner.release().ok());
+
+        if (op == Request::WRITE) {
+            ASSERT_TRUE(peer.command(1, true, seed, length));
+        } else {
+            std::vector<uint8_t> actual(length);
+            ASSERT_TRUE(platform.copy(actual.data(), local, length).ok());
+            EXPECT_EQ(actual, expected);
+        }
+    }
+    EXPECT_TRUE(addresses.cleanup().ok());
+    EXPECT_EQ(peer.finish(), 0);
+}
+
 class MluPeerRecoveryTest : public ::testing::TestWithParam<Params> {};
 
 TEST_P(MluPeerRecoveryTest, CachedPeerExitThenNewPeerRestoresTransfers) {
@@ -431,9 +498,10 @@ INSTANTIATE_TEST_SUITE_P(NetworkAndDispatchModes, MluPeerRecoveryTest,
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
-    if (argc == 5 && std::strcmp(argv[1], "--mlu-peer") == 0)
+    if (argc == 6 && std::strcmp(argv[1], "--mlu-peer") == 0)
         return mooncake::tent::peerMain(
-            {argv[2][0] == '1', argv[3][0] == '1', argv[4][0] == '1'});
+            {argv[2][0] == '1', argv[3][0] == '1', argv[4][0] == '1'},
+            argv[5][0] == '1');
     signal(SIGPIPE, SIG_IGN);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -813,6 +813,42 @@ TEST(TransportSelectorTest, XpuIpcKeepsNetworkFallbackStaged) {
     EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
 }
 
+TEST(TransportSelectorTest, MluIpcKeepsNetworkFallbackStaged) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[MLU] = std::make_shared<FakeTransport>(MLU);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[MLU].get())->setGpuToGpu(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> candidates{MLU, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = false;
+    ctx.mlu_ipc = true;
+    ctx.host_staging = true;
+    ctx.local_memory_type = MTYPE_MLU;
+    ctx.remote_memory_type = MTYPE_MLU;
+    ctx.buffer_transports = &candidates;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, TCP);
+
+    ctx.mlu_ipc = false;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, TCP);
+    ctx.mlu_ipc = true;
+    ctx.same_machine = false;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, TCP);
+
+    ctx.same_machine = true;
+    ctx.host_staging = false;
+    ctx.mlu_ipc_only = true;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+}
+
 // Regression: a SelectionPolicy memory pattern of "xpu" must match XPU VRAM
 // (MTYPE_XPU). matchesMemoryPattern maps MTYPE_XPU -> "xpu"; without that arm
 // XPU fell through to "unknown" and no xpu-scoped policy could ever match.

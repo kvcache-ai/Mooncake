@@ -14,9 +14,11 @@
 
 #include "tent/runtime/segment_manager.h"
 
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
 #include <set>
+#include <time.h>
 
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
@@ -29,6 +31,12 @@ namespace {
 uint64_t nextManagerId() {
     static std::atomic<uint64_t> counter{0};
     return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t snapshotTimeNs() {
+    timespec ts{};
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
 }
 }  // namespace
 
@@ -77,6 +85,8 @@ Status SegmentManager::updateLocal(
     // reading local_desc_ without local_desc_lock_ is safe here.
     auto next = std::make_shared<SegmentDesc>(*local_desc_);
     CHECK_STATUS(mutator(*next));
+    next->snapshot_generation =
+        std::max(local_desc_->snapshot_generation + 1, snapshotTimeNs());
     {
         std::unique_lock<std::shared_mutex> guard(local_desc_lock_);
         local_desc_ = std::move(next);

@@ -476,15 +476,19 @@ bool TransportSelector::isTransportAvailable(
         return false;
     }
 
-    // MLU requires process-local addresses. XPU also supports a same-host
-    // peer's buffer mapped into this process over IPC.
-    if (type == MLU && !context.local_segment) return false;
+    // Device IPC makes a same-host peer's buffer locally addressable.
+    const bool mlu_ipc =
+        type == MLU && !context.local_segment && context.mlu_ipc;
+    if (type == MLU && !context.local_segment &&
+        !(context.mlu_ipc && context.same_machine))
+        return false;
     const bool xpu_ipc =
         type == XPU && !context.local_segment && context.xpu_ipc;
     if (type == XPU && !context.local_segment &&
         !(context.xpu_ipc && context.same_machine))
         return false;
     if (context.xpu_ipc_only && type != XPU) return false;
+    if (context.mlu_ipc_only && type != MLU) return false;
     if ((type == NVLINK || type == SHM || type == TPU) &&
         !context.same_machine) {
         return false;
@@ -493,7 +497,7 @@ bool TransportSelector::isTransportAvailable(
     const auto& caps = transport->capabilities();
     // The IPC route copies the original buffers; only the network leg of a
     // staged request runs on host stage buffers.
-    if (context.host_staging && !xpu_ipc) {
+    if (context.host_staging && !xpu_ipc && !mlu_ipc) {
         return (type == RDMA || type == FABRIC || type == TCP ||
                 type == HP_TCP) &&
                caps.dram_to_dram;

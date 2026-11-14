@@ -445,15 +445,15 @@ class TransferEngineImpl {
     // One selection pass behind getTransportType(). `allow_device_direct` lets
     // dma-buf-registered XPU or MLU buffers route directly over RDMA (see
     // deviceDirectRdmaReady); when false device buffers are host-staged for the
-    // network transports. `allow_xpu_ipc` additionally offers XpuTransport,
-    // unstaged, for a same-host peer's XPU buffer that may be IPC-mapped (see
-    // xpuIpcCandidate); the mapping is made only if XPU is selected, and the
+    // network transports. `allow_local_ipc` additionally offers XPU or MLU,
+    // unstaged, for a same-host peer buffer that may be IPC-mapped. The
+    // mapping is made only if that transport is selected, and the
     // pass is redone without IPC if that fails. `device_direct`, if given,
     // reports whether this pass planned the network transports unstaged, so
     // the caller can retry staged when it yields no transport.
     SelectionResult planTransport(const Request& request, int transport_index,
-                                  bool allow_device_direct, bool allow_xpu_ipc,
-                                  bool* device_direct);
+                                  bool allow_device_direct,
+                                  bool allow_local_ipc, bool* device_direct);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
@@ -604,6 +604,11 @@ class TransferEngineImpl {
     // request can run as a local PCIe P2P copy instead of RDMA or staging.
     // Imports on first use; always false without USE_XPU.
     bool xpuIpcReady(const Request& req, const SegmentDesc* desc,
+                     const BufferDesc* remote_entry);
+
+    bool mluIpcCandidate(const Request& req, const SegmentDesc* desc,
+                         const BufferDesc* remote_entry);
+    bool mluIpcReady(const Request& req, const SegmentDesc* desc,
                      const BufferDesc* remote_entry);
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);

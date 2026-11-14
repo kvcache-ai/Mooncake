@@ -461,6 +461,21 @@ TEST_P(MluEngineTest, DefaultRegistrationSelectsLocalMluCopy) {
     EXPECT_TRUE(route.staging_params.empty());
 }
 
+TEST_P(MluEngineTest, LocalDevicePairSelectsDirectMluCopy) {
+    void *source = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &source));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &target));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target);
+    request.length = kLength;
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    EXPECT_EQ(route.transport, MLU);
+    EXPECT_TRUE(route.staging_params.empty());
+}
+
 TEST_P(MluEngineTest, StaleLocalRouteCannotSubmitAfterUnregister) {
     void *device = nullptr, *host = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &device));

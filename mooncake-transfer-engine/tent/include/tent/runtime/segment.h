@@ -174,6 +174,8 @@ struct SegmentDesc {
     SegmentType type;
     std::string machine_id;
     std::string rpc_server_addr;
+    // Monotonic publication time, including updates that only remove buffers.
+    uint64_t snapshot_generation = 0;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
     // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
@@ -201,7 +203,8 @@ inline void to_json(json& j, const SegmentDesc& s) {
     j = json{{"name", s.name},
              {"type", s.type},
              {"machine_id", s.machine_id},
-             {"rpc_server_addr", s.rpc_server_addr}};
+             {"rpc_server_addr", s.rpc_server_addr},
+             {"snapshot_generation", s.snapshot_generation}};
     if (!s.rdma_server_name.empty()) {
         j["rdma_server_name"] = s.rdma_server_name;
     }
@@ -217,6 +220,7 @@ inline void from_json(const json& j, SegmentDesc& s) {
     j.at("type").get_to(s.type);
     j.at("machine_id").get_to(s.machine_id);
     j.at("rpc_server_addr").get_to(s.rpc_server_addr);
+    s.snapshot_generation = j.value("snapshot_generation", uint64_t{0});
     if (j.contains("rdma_server_name")) {
         j.at("rdma_server_name").get_to(s.rdma_server_name);
     }
