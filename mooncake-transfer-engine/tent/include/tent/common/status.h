@@ -113,6 +113,16 @@ class Status final {
         kRpcFunctionNotFound = 135,
         kInternalError = 199,
 
+        // Memory Engine (GVA) specific failures. Kept in a separate range so
+        // callers can map them to the tent_memory_engine_* error codes.
+        kMemoryEngineNotJoined = 150,
+        kMemoryEngineAlreadyJoined = 151,
+        kMemoryEngineNoSpace = 152,
+        kMemoryEngineTimeout = 153,
+        kMemoryEngineUnsupported = 154,
+        kMemoryEngineBackendError = 155,
+        kMemoryEngineDisabled = 156,
+
         kNotImplemented = 200,
         kTimedOut = 201,
         kMaxCode
@@ -175,6 +185,14 @@ class Status final {
     }
     TYPE_CHECK(MalformedJson);
     TYPE_CHECK(InternalError);
+
+    TYPE_CHECK(MemoryEngineNotJoined);
+    TYPE_CHECK(MemoryEngineAlreadyJoined);
+    TYPE_CHECK(MemoryEngineNoSpace);
+    TYPE_CHECK(MemoryEngineTimeout);
+    TYPE_CHECK(MemoryEngineUnsupported);
+    TYPE_CHECK(MemoryEngineBackendError);
+    TYPE_CHECK(MemoryEngineDisabled);
 
     TYPE_CHECK(NotImplemented);
     TYPE_CHECK(TimedOut);

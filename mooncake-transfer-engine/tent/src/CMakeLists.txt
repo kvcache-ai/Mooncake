@@ -13,7 +13,9 @@ target_compile_features(tent_interface INTERFACE cxx_std_20)
 if(USE_ASCEND OR USE_ASCEND_DIRECT)
   target_include_directories(
     tent_interface
-    INTERFACE ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator)
+    INTERFACE
+      ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator
+  )
 endif()
 
 if(TARGET asio_shared)
@@ -140,7 +142,8 @@ if(USE_FABRIC
     # USE_EFA/USE_CXI wheel builds may provision libfabric headers only (the
     # classic engine dlopens the library at runtime). With no linkable library,
     # build TENT without its fabric transport instead of failing the configure.
-    message(WARNING "libfabric library not found; TENT fabric transport disabled")
+    message(
+      WARNING "libfabric library not found; TENT fabric transport disabled")
     set(TENT_WITH_FABRIC
         OFF
         CACHE INTERNAL "")
@@ -151,7 +154,8 @@ if(USE_FABRIC
         CACHE INTERNAL "")
     message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
     target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
-    target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+    target_include_directories(tent_interface
+                               INTERFACE ${LIBFABRIC_INCLUDE_DIR})
     target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
   endif()
 else()
@@ -202,12 +206,17 @@ else()
 endif()
 
 file(GLOB TENT_ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB TENT_MEMORY_ENGINE_SOURCES
+     "${CMAKE_CURRENT_SOURCE_DIR}/memory_engine/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/memory_engine/backend/*.cpp")
+list(APPEND TENT_ENGINE_SOURCES ${TENT_MEMORY_ENGINE_SOURCES})
 
 add_library(tent STATIC ${TENT_ENGINE_SOURCES})
-target_link_libraries(tent PUBLIC tent_runtime tent_interface)
+target_link_libraries(tent PUBLIC tent_runtime tent_interface ${CMAKE_DL_LIBS})
 
 add_library(tent_shared SHARED ${TENT_ENGINE_SOURCES})
-target_link_libraries(tent_shared PUBLIC tent_runtime tent_interface)
+target_link_libraries(tent_shared PUBLIC tent_runtime tent_interface
+                                         ${CMAKE_DL_LIBS})
 set_target_properties(tent_shared PROPERTIES INSTALL_RPATH "$ORIGIN")
 
 add_library(tent_link_group INTERFACE)
