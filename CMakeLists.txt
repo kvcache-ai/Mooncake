@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 4.0)
 project(mooncake CXX C)
 
 # EP and PG are separate components. Declare these before the scikit-build

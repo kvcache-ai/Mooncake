@@ -113,8 +113,6 @@ jobs:
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           rm -rf build
-          mkdir build
-          cd build
           cmake_args=(
             -DUSE_MUSA=ON
             -DWITH_EP=ON
@@ -126,7 +124,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
             -DPython3_EXECUTABLE="${PYTHON_BIN}"
           )
-          cmake -G Ninja .. "${cmake_args[@]}"
+          cmake -B build -G Ninja "${cmake_args[@]}"
 
       - name: Build project
         shell: bash
@@ -136,8 +134,7 @@ jobs:
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           # Limit the nested PG setup.py build to avoid OOM in the release container.
           export MAX_JOBS=2
-          cd build
-          cmake --build . -j"$(nproc)"
+          cmake --build build
 
       - name: Build MUSA allocator
         shell: bash
@@ -151,8 +148,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          cd build
-          cmake --install .
+          cmake --install build
 
       - name: Generate Python version tag
         id: generate_tag_release

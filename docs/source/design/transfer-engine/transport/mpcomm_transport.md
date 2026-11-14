@@ -152,11 +152,10 @@ git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 
 # Enable TENT + MPComm. Add -DUSE_CUDA=ON if you need VRAM segments.
-mkdir build && cd build
-cmake .. -DUSE_TENT=ON -DUSE_MPCOMM=ON -DMPCOMM_ROOT=/opt/mpcomm
+cmake -B build -G Ninja -DUSE_TENT=ON -DUSE_MPCOMM=ON -DMPCOMM_ROOT=/opt/mpcomm
 
 # Build
-make -j$(nproc)
+cmake --build build
 ```
 
 `MPCOMM_ROOT` is mandatory when `USE_MPCOMM=ON`. Configuration fails early if it is unset, or if
@@ -286,7 +285,7 @@ neither an RDMA device nor libmpcomm and is built in every configuration:
 
 ```bash
 cmake .. -DUSE_TENT=ON -DBUILD_UNIT_TESTS=ON   # USE_MPCOMM not required
-make -j tent_mpcomm_boundary_test
+cmake --build . --target tent_mpcomm_boundary_test
 ctest -R tent_mpcomm_boundary_test --output-on-failure
 ```
 
@@ -302,7 +301,7 @@ installation, and skips itself when the engine cannot be brought up:
 
 ```bash
 cmake .. -DUSE_TENT=ON -DUSE_MPCOMM=ON -DBUILD_UNIT_TESTS=ON -DMPCOMM_ROOT=<prefix>
-make -j tent_mpcomm_transport_test
+cmake --build . --target tent_mpcomm_transport_test
 ctest -R tent_mpcomm_transport_test --output-on-failure
 ```
 
