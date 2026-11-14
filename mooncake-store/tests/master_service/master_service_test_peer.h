@@ -73,6 +73,9 @@ class MasterServiceTestPeer {
 
     void RefreshKvcsDfsUsageForTesting();
 
+    void StartKvcsCapacityRefreshForTesting();
+    void ScheduleKvcsCapacityRefreshForTesting();
+
     // Queue one segment through the private HTTP metadata cleanup path, as the
     // client monitor does when a client times out.
     void CleanupHttpMetadataForTesting(const std::string& segment_name);

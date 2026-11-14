@@ -26,6 +26,7 @@ class WrappedMasterService {
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
+    void StopKvcsCapacityRefresh();
     void StopHttpMetadataCleanup();
     // Restore lifecycle hooks (RFC #4700, slice 1). Serving means "committed
     // to normal operation, restore refused from here on", not "already

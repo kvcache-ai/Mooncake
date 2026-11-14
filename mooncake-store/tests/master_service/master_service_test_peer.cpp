@@ -67,6 +67,20 @@ void MasterServiceTestPeer::RefreshKvcsDfsUsageForTesting() {
     service_.RefreshKvcsDfsUsage();
 }
 
+void MasterServiceTestPeer::StartKvcsCapacityRefreshForTesting() {
+    // Let the test schedule this worker explicitly, without the periodic
+    // eviction thread racing it.
+    service_.eviction_running_ = false;
+    if (service_.eviction_thread_.joinable()) {
+        service_.eviction_thread_.join();
+    }
+    service_.kvcs_capacity_refresh_worker_.Start();
+}
+
+void MasterServiceTestPeer::ScheduleKvcsCapacityRefreshForTesting() {
+    service_.kvcs_capacity_refresh_worker_.Schedule();
+}
+
 void MasterServiceTestPeer::CleanupHttpMetadataForTesting(
     const std::string& segment_name) {
     service_.cleanupHttpMetadata(segment_name);

@@ -1945,6 +1945,67 @@ TEST_F(HighAvailabilityTest, SigtermReleasesAfterAdminDrain) {
     EXPECT_TRUE(LogContains(ReadTextFile(log_path), kReleasedLine));
 }
 
+// These barriers cover the real supervisor teardown, while the MasterService
+// test holds an accepted provider delete across the worker's drain itself.
+TEST_F(HighAvailabilityTest, KvcsDrainPrecedesWriterStopAndLeadershipRelease) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    for (bool lose_lease : {false, true}) {
+        SCOPED_TRACE(lose_lease ? "leadership loss" : "SIGTERM");
+        ScopedFailPointDir failpoints;
+        failpoints.Arm("supervisor_before_kvcs_drain");
+        failpoints.Arm("supervisor_before_oplog_writer_stop");
+        if (lose_lease) failpoints.Arm("supervisor_after_term_release");
+        const auto ports = FreePortPairs(1);
+        ASSERT_EQ(ports.size(), 1u);
+        const std::string name =
+            lose_lease ? "kvcs-drain-loss" : "kvcs-drain-stop";
+        const std::string cluster_id = ClusterIdFor(name);
+        const std::string log_path = TempPath(name, ".log");
+        SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                     /*enable_oplog=*/true, log_path);
+        ASSERT_TRUE(child.Start());
+        const std::string key = MasterViewKey(cluster_id);
+        const auto lease_id = WaitForWarmingLeaseId(child, key, 20s);
+        ASSERT_TRUE(lease_id.has_value());
+        ASSERT_TRUE(WaitForServing(child, ports[0].admin, 20s));
+        if (lose_lease) {
+            ASSERT_EQ(EtcdHelper::RevokeLease(*lease_id), ErrorCode::OK);
+        } else {
+            ASSERT_TRUE(child.Signal(SIGTERM));
+        }
+
+        ASSERT_TRUE(failpoints.WaitForHit("supervisor_before_kvcs_drain", 10s));
+        EXPECT_FALSE(failpoints.WaitForHit(
+            "supervisor_before_oplog_writer_stop", 100ms));
+        auto held_log = ReadTextFile(log_path);
+        EXPECT_FALSE(LogContains(held_log, "Shutdown releasing leadership"));
+        EXPECT_FALSE(LogContains(held_log, "Release leadership: "));
+        if (!lose_lease) EXPECT_TRUE(ReadEtcdKey(key).has_value());
+
+        failpoints.Release("supervisor_before_kvcs_drain");
+        ASSERT_TRUE(
+            failpoints.WaitForHit("supervisor_before_oplog_writer_stop", 10s));
+        held_log = ReadTextFile(log_path);
+        EXPECT_FALSE(LogContains(held_log, "Shutdown releasing leadership"));
+        EXPECT_FALSE(LogContains(held_log, "Release leadership: "));
+        failpoints.Release("supervisor_before_oplog_writer_stop");
+
+        if (lose_lease) {
+            ASSERT_TRUE(
+                failpoints.WaitForHit("supervisor_after_term_release", 10s));
+            ASSERT_TRUE(child.Signal(SIGTERM));
+            failpoints.Release("supervisor_after_term_release");
+        }
+        ExpectExitedWith(child.WaitForExit(10s), 0);
+    }
+}
+
 // The release fails because the child cannot reach etcd. The real lease is
 // kept alive from the test process, so the key is still present at the exit,
 // and expires by its TTL once that stops.

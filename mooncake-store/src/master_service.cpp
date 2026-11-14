@@ -188,6 +188,16 @@ struct MasterService::MemoryEviction {
                     return tl::make_unexpected(eviction::SkipReason::kDeferred);
                 }
             }
+            // Decide and Apply share the key's write guard. A restored
+            // COMPLETE memory replica may still be awaiting remount.
+            if (kind_ == ReplicaKind::kKvcsDfs &&
+                !candidate.metadata.HasReplica([this](const Replica& replica) {
+                    return replica.is_memory_replica() &&
+                           service_.IsReplicaReadable(replica);
+                })) {
+                return tl::make_unexpected(
+                    eviction::SkipReason::kNothingToRelease);
+            }
             eviction::Plan plan;
             for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
                 const bool evictable =
@@ -263,6 +273,23 @@ struct MasterService::MemoryEviction {
         tl::expected<eviction::Effect, ErrorCode> Apply(
             metadata::Namespace& ns, const route::WriteGuard& hold,
             const eviction::Plan& plan, const eviction::Report&) override {
+            auto reservation = service_.ReserveBatchOpLogSlot();
+            if (!reservation) {
+                LOG(WARNING)
+                    << "Eviction: OpLog reservation failed for key="
+                    << hold.key()
+                    << ", err=" << static_cast<int>(reservation.error())
+                    << ", stopping eviction scan";
+                return tl::make_unexpected(reservation.error());
+            }
+            return ApplyReserved(ns, hold, plan, std::move(*reservation));
+        }
+
+        tl::expected<eviction::Effect, ErrorCode> ApplyReserved(
+            metadata::Namespace& ns, const route::WriteGuard& hold,
+            const eviction::Plan& plan,
+            OrderedOpLogWriter::Reservation&& reservation,
+            bool restore_on_failure = true) {
             ObjectMetadata& metadata = hold.metadata();
             const std::string& key = hold.key();
             const auto in_plan = [&plan](const Replica& replica) {
@@ -271,23 +298,17 @@ struct MasterService::MemoryEviction {
             auto remaining =
                 service_.BuildRemainingReplicaDescriptors(metadata, in_plan);
 
-            // Keep the removed IDs local until submission succeeds so a
-            // consumed reservation cannot strand REMOVED replicas.
-            auto reservation = service_.ReserveBatchOpLogSlot();
-            if (!reservation) {
-                LOG(WARNING)
-                    << "Eviction: OpLog reservation failed for key=" << key
-                    << ", err=" << static_cast<int>(reservation.error())
-                    << ", stopping eviction scan";
-                return tl::make_unexpected(reservation.error());
-            }
+            // Memory eviction rolls back a rejected submission. KVCS keeps
+            // deleted replicas unreadable until its metadata-only retry.
             std::vector<ReplicaID> removed_ids;
             metadata.VisitReplicas(in_plan, [&removed_ids](Replica& replica) {
                 removed_ids.push_back(replica.id());
-                replica.mark_removed();
+                if (replica.status() != ReplicaStatus::REMOVED) {
+                    replica.mark_removed();
+                }
             });
             auto persisted = service_.AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()),
+                std::move(reservation),
                 remaining.empty() ? OpType::REMOVE : OpType::PUT_END,
                 ns.id().value(), key,
                 remaining.empty()
@@ -299,10 +320,12 @@ struct MasterService::MemoryEviction {
                                                                  removed_ids);
                 });
             if (!persisted) {
-                for (const auto& id : removed_ids) {
-                    if (auto* replica = metadata.GetReplicaByID(id);
-                        replica != nullptr) {
-                        replica->cancel_remove();
+                if (restore_on_failure) {
+                    for (const auto& id : removed_ids) {
+                        if (auto* replica = metadata.GetReplicaByID(id);
+                            replica != nullptr) {
+                            replica->cancel_remove();
+                        }
                     }
                 }
                 LOG(WARNING) << "Eviction: OpLog persist failed for key=" << key
@@ -424,32 +447,103 @@ struct MasterService::KvcsDfsEviction {
     class Reclaimer final : public eviction::Reclaimer {
        public:
         explicit Reclaimer(MasterService& service)
-            : service_(service), metadata_(service) {}
+            : service_(service), immediate_(service), oplog_(service) {}
 
         tl::expected<eviction::Effect, ErrorCode> Apply(
             metadata::Namespace& ns, const route::WriteGuard& hold,
             const eviction::Plan& plan,
             const eviction::Report& report) override {
-            auto deleted =
-                service_.dfs_kvcs_capacity_provider_->DeleteObject(hold.key());
-            if (deleted) return metadata_.Apply(ns, hold, plan, report);
-            ++failures_;
-            LOG(ERROR) << "KVCS DFS watermark provider delete failed, key="
-                       << hold.key() << ", error=" << toString(deleted.error());
-            return tl::make_unexpected(deleted.error());
+            if (service_.enable_oplog_) {
+                auto reservation = service_.ReserveBatchOpLogSlot();
+                if (!reservation) {
+                    return tl::make_unexpected(reservation.error());
+                }
+                PendingRemoval pending{ns.id(), hold.ref(), plan};
+                auto deleted = DeleteProviderObject(hold.key());
+                if (!deleted) return tl::make_unexpected(deleted.error());
+                auto applied = oplog_.ApplyReserved(
+                    ns, hold, plan, std::move(*reservation),
+                    /*restore_on_failure=*/false);
+                if (!applied) {
+                    // Apply failure stops the scan. Do not start another
+                    // provider delete until this metadata-only retry finishes.
+                    pending_ = std::move(pending);
+                }
+                return applied;
+            }
+            auto deleted = DeleteProviderObject(hold.key());
+            if (!deleted) return tl::make_unexpected(deleted.error());
+            return immediate_.Apply(ns, hold, plan, report);
+        }
+
+        // Called before sampling capacity, including when usage is now below
+        // the watermark or the capacity query fails. Never delete by key again:
+        // either the original publication/replicas remain or this work is
+        // stale.
+        bool RetryPendingRemoval() {
+            if (!pending_) return true;
+            auto* ns = service_.namespaces_.Lookup(pending_->tenant_id);
+            auto hold = ns ? ns->objects.Write(pending_->object) : std::nullopt;
+            if (!hold) {
+                pending_.reset();
+                return true;
+            }
+            eviction::Plan remaining;
+            for (const auto& id : pending_->plan.release) {
+                auto* replica = hold->metadata().GetReplicaByID(id);
+                if (replica && replica->is_dfs_replica() &&
+                    replica->status() == ReplicaStatus::REMOVED) {
+                    remaining.release.push_back(id);
+                }
+            }
+            if (remaining.release.empty()) {
+                pending_.reset();
+                return true;
+            }
+            auto reservation = service_.ReserveBatchOpLogSlot();
+            if (reservation &&
+                oplog_.ApplyReserved(*ns, *hold, remaining,
+                                     std::move(*reservation),
+                                     /*restore_on_failure=*/false)) {
+                pending_.reset();
+                return true;
+            }
+            return false;
         }
 
         void TearDown(metadata::Namespace& ns,
                       const route::WriteGuard& hold) override {
-            metadata_.TearDown(ns, hold);
+            if (service_.enable_oplog_) {
+                oplog_.TearDown(ns, hold);
+            } else {
+                immediate_.TearDown(ns, hold);
+            }
         }
 
         size_t TakeFailures() { return std::exchange(failures_, 0); }
 
        private:
+        tl::expected<void, ErrorCode> DeleteProviderObject(
+            const std::string& key) {
+            auto deleted =
+                service_.dfs_kvcs_capacity_provider_->DeleteObject(key);
+            if (deleted) return {};
+            ++failures_;
+            LOG(ERROR) << "KVCS DFS watermark provider delete failed, key="
+                       << key << ", error=" << toString(deleted.error());
+            return tl::make_unexpected(deleted.error());
+        }
+
         MasterService& service_;
-        MemoryEviction::ImmediateReclaimer metadata_;
+        MemoryEviction::ImmediateReclaimer immediate_;
+        MemoryEviction::OpLogReclaimer oplog_;
         size_t failures_{0};
+        struct PendingRemoval {
+            TenantId tenant_id;
+            route::ObjectRef object;
+            eviction::Plan plan;
+        };
+        std::optional<PendingRemoval> pending_;
     };
 
     KvcsDfsEviction(MasterService& service, bool allow_soft_pinned)
@@ -458,7 +552,10 @@ struct MasterService::KvcsDfsEviction {
           reclaimer(service),
           kv_events(service, "disk"),
           evictor(service.namespaces_, policy, reclaimer,
-                  {&metrics, &kv_events}) {}
+                  service.enable_oplog_
+                      ? std::vector<eviction::EvictionObserver*>{&metrics}
+                      : std::vector<eviction::EvictionObserver*>{&metrics,
+                                                                 &kv_events}) {}
 
     MemoryEviction::Policy policy;
     Reclaimer reclaimer;
@@ -973,7 +1070,7 @@ MasterService::~MasterService() {
     }
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
-    kvcs_capacity_refresh_worker_.Stop();
+    StopKvcsCapacityRefresh();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -7937,13 +8034,19 @@ void MasterService::RunDfsEviction() {
 void MasterService::RefreshKvcsDfsUsage() {
     if (!dfs_kvcs_capacity_provider_) return;
 
+    bool retry_complete = true;
+    if (kvcs_dfs_eviction_) {
+        std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+        retry_complete = kvcs_dfs_eviction_->reclaimer.RetryPendingRemoval();
+    }
+
     auto capacity = dfs_kvcs_capacity_provider_->GetCapacity();
     if (capacity) {
         {
             std::lock_guard lock(dfs_kvcs_usage_mutex_);
             dfs_kvcs_usage_ = *capacity;
         }
-        RunKvcsDfsEviction(*capacity);
+        if (retry_complete) RunKvcsDfsEviction(*capacity);
     } else {
         // Do not let a stale success drive a later watermark decision.
         std::lock_guard lock(dfs_kvcs_usage_mutex_);
@@ -7966,11 +8069,6 @@ void MasterService::RunKvcsDfsEviction(const DfsUsageSnapshot& usage) {
         usage.capacity_bytes == 0) {
         return;
     }
-    if (enable_oplog_) {
-        VLOG(1) << "KVCS DFS watermark eviction is disabled with OpLog";
-        return;
-    }
-
     const long double high_bytes =
         static_cast<long double>(usage.capacity_bytes) *
         dfs_kvcs_eviction_high_watermark_;
@@ -11638,6 +11736,17 @@ void MasterService::StopHttpMetadataCleanup() {
     }
     http_metadata_cleanup_cv_.notify_all();
     http_metadata_cleanup_thread_.join();
+}
+
+void MasterService::StopKvcsCapacityRefresh() {
+    kvcs_capacity_refresh_worker_.Stop();
+    if (kvcs_dfs_eviction_) {
+        std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+        if (!kvcs_dfs_eviction_->reclaimer.RetryPendingRemoval()) {
+            LOG(ERROR) << "KVCS metadata removal is still unsubmitted at stop; "
+                          "the OpLog writer is unavailable";
+        }
+    }
 }
 
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {

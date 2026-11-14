@@ -34,6 +34,8 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_driver.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -167,6 +169,91 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
     std::condition_variable cv_;
     ErrorCode txn_error_{ErrorCode::OK};
     size_t txn_calls_{0};
+};
+
+class HaKvcsWatermarkDriver final : public KvcsDriver {
+   public:
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    uint64_t MaxValueSize() const override { return 4 * 1024 * 1024; }
+    tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
+    GetMountpointStats() override {
+        std::lock_guard lock(mutex_);
+        ++refresh_count_;
+        if (capacity_error_ != ErrorCode::OK) {
+            return tl::make_unexpected(capacity_error_);
+        }
+        return std::vector<KvcsMountpointStat>{{.index = 1,
+                                                .id = "target-mp",
+                                                .total_bytes = 100,
+                                                .used_bytes = used_bytes_}};
+    }
+    KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
+        {
+            std::unique_lock lock(mutex_);
+            deleted_keys_.insert(deleted_keys_.end(), keys.begin(), keys.end());
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return !block_deletes_; });
+        }
+        return KvcsIoResults(keys.size());
+    }
+
+    void BlockDeletes() {
+        std::lock_guard lock(mutex_);
+        block_deletes_ = true;
+    }
+
+    void ReleaseDeletes() {
+        {
+            std::lock_guard lock(mutex_);
+            block_deletes_ = false;
+        }
+        cv_.notify_all();
+    }
+
+    size_t DeletedKeyCount() const {
+        std::lock_guard lock(mutex_);
+        return deleted_keys_.size();
+    }
+
+    size_t RefreshCount() const {
+        std::lock_guard lock(mutex_);
+        return refresh_count_;
+    }
+
+    void SetUsedBytes(uint64_t bytes) {
+        std::lock_guard lock(mutex_);
+        used_bytes_ = bytes;
+    }
+
+    void SetCapacityError(ErrorCode error) {
+        std::lock_guard lock(mutex_);
+        capacity_error_ = error;
+    }
+
+    bool WaitForDelete(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [this] { return !deleted_keys_.empty(); });
+    }
+
+   private:
+    static KvcsIoResults Errors(size_t count, ErrorCode error) {
+        return KvcsIoResults(count, tl::make_unexpected(error));
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool block_deletes_{false};
+    size_t refresh_count_{0};
+    uint64_t used_bytes_{95};
+    ErrorCode capacity_error_{ErrorCode::OK};
+    std::vector<ObjectKey> deleted_keys_;
 };
 
 class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
@@ -686,6 +773,21 @@ class MasterServiceHATest : public ::testing::Test {
                       std::move(backend)));
         return static_cast<GatedOrderedOpLogWriter*>(
             MasterServiceTestPeer::OrderedOplogWriter(service).get());
+    }
+
+    static HaKvcsWatermarkDriver* ConfigureKvcsWatermark(
+        MasterService& service) {
+        MasterServiceTestPeer peer(service);
+        // Synchronous refreshes own the cadence in these tests.
+        peer.StartKvcsCapacityRefreshForTesting();
+        service.StopKvcsCapacityRefresh();
+        auto driver = std::make_unique<HaKvcsWatermarkDriver>();
+        auto* state = driver.get();
+        peer.ConfigureKvcsCapacityForTesting(
+            std::make_unique<KvcsCapacityProvider>(1, "target-mp",
+                                                   std::move(driver)),
+            true, 0.9, 0.7);
+        return state;
     }
 
     static RejectingOrderedOpLogWriter* InstallRejectingWriter(
@@ -1225,6 +1327,345 @@ class MasterServiceHATest : public ::testing::Test {
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
+
+TEST_F(MasterServiceHATest, KvcsWatermarkUsesOpLogForMetadataRemoval) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(1)
+                      .set_default_kv_soft_pin_ttl(1)
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("kvcs_watermark_oplog")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto writer =
+        InstallGatedWriter(service, std::make_shared<FakeBatchHaKvBackend>());
+    const auto segment = PrepareSimpleSegment(service);
+
+    auto driver = std::make_unique<HaKvcsWatermarkDriver>();
+    auto* driver_state = driver.get();
+    MasterServiceTestPeer peer(service);
+    peer.ConfigureKvcsCapacityForTesting(std::make_unique<KvcsCapacityProvider>(
+                                             1, "target-mp", std::move(driver)),
+                                         true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    const std::string key = "kvcs-watermark-oplog";
+    ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant, 64,
+                                 replicate));
+    ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                               ReplicaType::ALL));
+    ASSERT_TRUE(writer->PauseCallbacksAfter(1));
+
+    peer.RefreshKvcsDfsUsageForTesting();
+    ASSERT_TRUE(driver_state->WaitForDelete(std::chrono::seconds(1)));
+    ASSERT_TRUE(writer->WaitForSubmittedCount(2, std::chrono::seconds(1)));
+    auto pending = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(pending);
+    ASSERT_EQ(pending->replicas.size(), 1u);
+    EXPECT_TRUE(pending->replicas.front().is_memory_replica());
+
+    ASSERT_TRUE(writer->RunCallbacksThrough(2));
+    auto remaining = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+}
+
+TEST_F(MasterServiceHATest, KvcsReservesOpLogBeforeProviderDelete) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("kvcs_admission")
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    auto writer =
+        InstallGatedWriter(service, std::make_shared<FakeBatchHaKvBackend>());
+    const auto segment = PrepareSimpleSegment(service);
+    auto* driver = ConfigureKvcsWatermark(service);
+    MasterServiceTestPeer peer(service);
+    ReplicateConfig replicas;
+    replicas.replica_num = 1;
+    replicas.dfs_replica_num = 1;
+    const std::string key = "kvcs-admission";
+    ASSERT_TRUE(
+        service.PutStart(segment.client_id, key, kDefaultTenant, 64, replicas));
+    ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                               ReplicaType::ALL));
+    ASSERT_TRUE(writer->PauseCallbacksAfter(1));
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, key, {});
+    {
+        auto reservation = ReserveBatchSlotForTesting(service);
+        ASSERT_TRUE(reservation);
+        peer.RefreshKvcsDfsUsageForTesting();
+        EXPECT_EQ(driver->DeletedKeyCount(), 0u);
+        const auto descriptors =
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+        ASSERT_EQ(descriptors.size(), 2u);
+        for (const auto& replica : descriptors) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+    }
+    peer.RefreshKvcsDfsUsageForTesting();
+    EXPECT_EQ(driver->DeletedKeyCount(), 1u);
+    service.StopBatchOpLogWriter();
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1u);
+}
+
+TEST_F(MasterServiceHATest, KvcsRetriesMetadataWithoutCapacityOrAnotherDelete) {
+    // Low usage, failed capacity query, and stop before the next refresh.
+    for (int scenario : {0, 1, 2}) {
+        SCOPED_TRACE(scenario);
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_enable_ha(true)
+                                  .set_enable_oplog(true)
+                                  .set_cluster_id("kvcs_metadata_retry")
+                                  .set_oplog_batch_max_entries(1)
+                                  .build());
+        auto writer = InstallRejectingWriter(
+            service, std::make_shared<FakeBatchHaKvBackend>());
+        const auto segment = PrepareSimpleSegment(service);
+        auto* driver = ConfigureKvcsWatermark(service);
+        MasterServiceTestPeer peer(service);
+        ReplicateConfig replicas;
+        replicas.replica_num = 1;
+        replicas.dfs_replica_num = 1;
+        const std::string key = "kvcs-metadata-retry";
+        ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant, 64,
+                                     replicas));
+        ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                                   ReplicaType::ALL));
+        SetLeaseDeadlineForTesting(service, kDefaultTenant, key, {});
+        writer->RejectCommitsWith(ErrorCode::PERSISTENT_FAIL);
+        peer.RefreshKvcsDfsUsageForTesting();
+        ASSERT_EQ(driver->DeletedKeyCount(), 1u);
+        auto descriptors =
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+        ASSERT_EQ(descriptors.size(), 2u);
+        for (const auto& replica : descriptors) {
+            if (replica.is_dfs_replica()) {
+                EXPECT_EQ(replica.status, ReplicaStatus::REMOVED);
+            }
+        }
+        auto readable = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(readable);
+        ASSERT_EQ(readable->replicas.size(), 1u);
+        EXPECT_TRUE(readable->replicas.front().is_memory_replica());
+        driver->SetUsedBytes(10);
+        if (scenario == 1) driver->SetCapacityError(ErrorCode::PERSISTENT_FAIL);
+        peer.RefreshKvcsDfsUsageForTesting();
+        EXPECT_EQ(writer->rejected_commits(), 2u);
+        EXPECT_EQ(driver->DeletedKeyCount(), 1u);
+        writer->RejectCommitsWith(ErrorCode::OK);
+        if (scenario == 2) {
+            service.StopKvcsCapacityRefresh();
+        } else {
+            peer.RefreshKvcsDfsUsageForTesting();
+        }
+        // Stop joins accepted callbacks, including the metadata finalizer.
+        service.StopBatchOpLogWriter();
+        EXPECT_EQ(driver->DeletedKeyCount(), 1u);
+        descriptors =
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+        ASSERT_EQ(descriptors.size(), 1u);
+        EXPECT_TRUE(descriptors.front().is_memory_replica());
+    }
+}
+
+TEST_F(MasterServiceHATest, KvcsMetadataRetryDoesNotTouchReplacement) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("kvcs_retry_replacement")
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    auto writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    const auto segment = PrepareSimpleSegment(service);
+    auto* driver = ConfigureKvcsWatermark(service);
+    MasterServiceTestPeer peer(service);
+    ReplicateConfig replicas;
+    replicas.replica_num = 1;
+    replicas.dfs_replica_num = 1;
+    const std::string key = "kvcs-retry-replacement";
+    ASSERT_TRUE(
+        service.PutStart(segment.client_id, key, kDefaultTenant, 64, replicas));
+    ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                               ReplicaType::ALL));
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, key, {});
+    writer->RejectNextCommit();
+    peer.RefreshKvcsDfsUsageForTesting();
+    ASSERT_EQ(driver->DeletedKeyCount(), 1u);
+    const auto original =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    // A different size forces replacement rather than an in-place upsert.
+    ASSERT_TRUE(service.UpsertStart(segment.client_id, key, kDefaultTenant, 128,
+                                    replicas));
+    ASSERT_TRUE(service.UpsertEnd(segment.client_id, key, kDefaultTenant,
+                                  ReplicaType::ALL));
+    const auto before =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(before.size(), 2u);
+    for (const auto& replica : before) {
+        for (const auto& old : original) EXPECT_NE(replica.id, old.id);
+    }
+    driver->SetUsedBytes(10);
+    peer.RefreshKvcsDfsUsageForTesting();
+    service.StopBatchOpLogWriter();
+    const auto after =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(after.size(), before.size());
+    for (size_t i = 0; i < after.size(); ++i) {
+        EXPECT_EQ(after[i].id, before[i].id);
+        EXPECT_EQ(after[i].status, ReplicaStatus::COMPLETE);
+    }
+    EXPECT_EQ(driver->DeletedKeyCount(), 1u);
+}
+
+TEST_F(MasterServiceHATest, KvcsWatermarkWaitsForReadableMemoryAfterRemount) {
+    for (bool enable_oplog : {false, true}) {
+        SCOPED_TRACE(enable_oplog ? "OpLog" : "immediate");
+        auto config = MasterServiceConfig::builder()
+                          .set_enable_ha(true)
+                          .set_enable_oplog(enable_oplog)
+                          .set_cluster_id("kvcs_readable_after_remount")
+                          .set_oplog_batch_max_entries(1)
+                          .build();
+        MasterService service(config);
+        MasterServiceTestPeer peer(service);
+        auto* driver_state = ConfigureKvcsWatermark(service);
+
+        constexpr uint64_t kSize = 1024;
+        const std::string key = "kvcs-readable-remount";
+        const std::string endpoint = "kvcs-readable-remount-segment";
+        auto object = MakeStandbyObject(key, endpoint, kSize);
+        object.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        DistributedFSDescriptor dfs;
+        dfs.object_size = kSize;
+        dfs.aligned_size = kSize;
+        dfs.shard_idx = -1;
+        Replica dfs_replica(std::move(dfs), ReplicaStatus::COMPLETE);
+        auto dfs_descriptor = dfs_replica.get_descriptor();
+        dfs_descriptor.id = 2;  // MakeStandbyObject uses memory replica id 1.
+        object.metadata.replicas.push_back(std::move(dfs_descriptor));
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+            {object}, 0, {MakeStandbyMemorySegment(endpoint)}));
+        if (enable_oplog) {
+            // No rejection is armed: use the existing normal writer fixture.
+            InstallRejectOnceWriter(service,
+                                    std::make_shared<FakeBatchHaKvBackend>());
+        }
+
+        auto memory_readable = [&] {
+            MasterServiceTestPeer::MetadataAccessorRO accessor(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key});
+            return accessor.Exists() &&
+                   accessor.Get().HasReplica([&](const Replica& replica) {
+                       return replica.is_memory_replica() &&
+                              peer.IsReplicaReadable(replica);
+                   });
+        };
+        auto restored =
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+        ASSERT_EQ(restored.size(), 2u);
+        for (const auto& replica : restored) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+        EXPECT_FALSE(memory_readable());
+        SetLeaseDeadlineForTesting(service, kDefaultTenant, key, {});
+        peer.RefreshKvcsDfsUsageForTesting();
+        EXPECT_EQ(driver_state->RefreshCount(), 1u);
+        EXPECT_EQ(driver_state->DeletedKeyCount(), 0u);
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 2u);
+
+        ASSERT_TRUE(
+            service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid()));
+        ASSERT_TRUE(memory_readable());
+        // Remount grants a new read lease; expire it without sleeping.
+        SetLeaseDeadlineForTesting(service, kDefaultTenant, key, {});
+        peer.RefreshKvcsDfsUsageForTesting();
+        EXPECT_EQ(driver_state->RefreshCount(), 2u);
+        EXPECT_EQ(driver_state->DeletedKeyCount(), 1u);
+        // With the successful fake backend, Stop joins the writer and its
+        // durable callbacks before checking the finalized metadata.
+        if (enable_oplog) service.StopBatchOpLogWriter();
+        auto remaining =
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+        ASSERT_EQ(remaining.size(), 1u);
+        EXPECT_TRUE(remaining.front().is_memory_replica());
+        EXPECT_TRUE(memory_readable());
+    }
+}
+
+TEST_F(MasterServiceHATest, KvcsDrainWaitsForDeleteBeforeStoppingOpLog) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(1)
+                      .set_default_kv_soft_pin_ttl(1)
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("kvcs_watermark_drain")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto writer =
+        InstallGatedWriter(service, std::make_shared<FakeBatchHaKvBackend>());
+    const auto segment = PrepareSimpleSegment(service);
+    auto driver = std::make_unique<HaKvcsWatermarkDriver>();
+    auto* driver_state = driver.get();
+    driver_state->BlockDeletes();
+    MasterServiceTestPeer peer(service);
+    peer.ConfigureKvcsCapacityForTesting(std::make_unique<KvcsCapacityProvider>(
+                                             1, "target-mp", std::move(driver)),
+                                         true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    const std::string key = "kvcs-watermark-drain";
+    ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant, 64,
+                                 replicate));
+    ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                               ReplicaType::ALL));
+    ASSERT_TRUE(writer->PauseCallbacksAfter(1));
+    peer.StartKvcsCapacityRefreshForTesting();
+    peer.ScheduleKvcsCapacityRefreshForTesting();
+    const bool delete_entered =
+        driver_state->WaitForDelete(std::chrono::seconds(1));
+    if (!delete_entered) driver_state->ReleaseDeletes();
+    ASSERT_TRUE(delete_entered);
+
+    std::promise<void> drain_started;
+    auto drain = std::async(std::launch::async, [&] {
+        drain_started.set_value();
+        service.StopKvcsCapacityRefresh();
+    });
+    drain_started.get_future().wait();
+    EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    driver_state->ReleaseDeletes();
+    ASSERT_EQ(drain.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    drain.get();
+    EXPECT_EQ(driver_state->RefreshCount(), 1u);
+
+    // The accepted delete can still enqueue its metadata removal: the
+    // supervisor must stop the writer only after this drain has returned.
+    ASSERT_TRUE(writer->WaitForSubmittedCount(2, std::chrono::seconds(1)));
+    ASSERT_TRUE(writer->RunCallbacksThrough(2));
+    auto remaining = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+    peer.ScheduleKvcsCapacityRefreshForTesting();
+    service.StopKvcsCapacityRefresh();
+    EXPECT_EQ(driver_state->DeletedKeyCount(), 1u);
+    EXPECT_EQ(driver_state->RefreshCount(), 1u);
+}
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
 

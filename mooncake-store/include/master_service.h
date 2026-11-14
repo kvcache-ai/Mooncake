@@ -1066,6 +1066,11 @@ class MasterService {
      */
     void StopHttpMetadataCleanup();
 
+    // Stop scheduling KVCS capacity refresh/eviction and join the current
+    // pass. Call before stopping the OpLog writer or releasing leadership.
+    // Sequential calls are safe; an SDK timeout is not a provider-side fence.
+    void StopKvcsCapacityRefresh();
+
    private:
     // Lifecycle wrapper around the restore implementation: performs the
     // {Constructed, Ready, Failed} -> Recovering -> {Ready, Failed}
