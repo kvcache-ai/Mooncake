@@ -1393,6 +1393,10 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
 int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
     const std::string& location) {
+    if (buffer_addresses.size() != capacities.size()) {
+        LOG(ERROR) << "buffer_addresses and capacities have different sizes";
+        return -1;
+    }
     pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
