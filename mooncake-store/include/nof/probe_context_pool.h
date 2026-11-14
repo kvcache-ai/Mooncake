@@ -23,6 +23,10 @@ struct NofProbeContext {
     // drain to find the qpair a timed-out probe is still outstanding on.
     // Null when the context is idle.
     NofSegmentHandle* seg{nullptr};
+    // Initiator-owned probe buffer the read targets. The completion drops the
+    // reference the read holds on it, so the buffer is never freed while the
+    // device may still write into it. Null when the context is idle.
+    void* probe_buffer{nullptr};
 
     void Reset();
 };
