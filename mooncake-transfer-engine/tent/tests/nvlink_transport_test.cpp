@@ -18,12 +18,16 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda.h>
@@ -305,6 +309,88 @@ TEST(NVLinkTransportTest,
         NVLinkTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID), 1u);
     verifyRelocatedData(relocated.front(), kBufferLength);
     ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(NVLinkTransportTest, FreeSubBatchWaitsForPendingCudaWork) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is required for asynchronous drain test";
+    }
+
+    CUDAStreamPool pool;
+    CUDAStreamHandle stream;
+    ASSERT_TRUE(pool.acquire(stream, 0).ok());
+
+    NVLinkTransport transport;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto* nv_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    ASSERT_NE(nv_batch, nullptr);
+    nv_batch->stream_device_id = 0;
+    nv_batch->async_stream = std::move(stream);
+
+    struct CallbackBarrier {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false;
+        bool release = false;
+    } barrier;
+
+    const auto callback = [](void* user_data) {
+        auto& state = *static_cast<CallbackBarrier*>(user_data);
+        {
+            std::lock_guard<std::mutex> guard(state.mutex);
+            state.entered = true;
+        }
+        state.cv.notify_all();
+        std::unique_lock<std::mutex> guard(state.mutex);
+        state.cv.wait(guard, [&] { return state.release; });
+    };
+
+    if (cudaLaunchHostFunc(nv_batch->async_stream.get(), callback, &barrier) !=
+        cudaSuccess) {
+        ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+        GTEST_SKIP() << "CUDA host callback cannot be enqueued";
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(barrier.mutex);
+        if (!barrier.cv.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return barrier.entered; })) {
+            barrier.release = true;
+            lock.unlock();
+            barrier.cv.notify_all();
+            ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+            GTEST_SKIP() << "CUDA host callback did not start";
+        }
+    }
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> finished{false};
+    std::atomic<bool> succeeded{false};
+    std::thread cleanup([&] {
+        started.store(true, std::memory_order_release);
+        const auto status = transport.freeSubBatch(batch);
+        succeeded.store(status.ok(), std::memory_order_release);
+        finished.store(true, std::memory_order_release);
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool prematurely_freed = finished.load(std::memory_order_acquire);
+
+    {
+        std::lock_guard<std::mutex> lock(barrier.mutex);
+        barrier.release = true;
+    }
+    barrier.cv.notify_all();
+    cleanup.join();
+
+    EXPECT_FALSE(prematurely_freed)
+        << "A CUDA stream still using batch resources was released";
+    EXPECT_TRUE(succeeded.load(std::memory_order_acquire));
+    EXPECT_EQ(batch, nullptr);
 }
 
 }  // namespace tent

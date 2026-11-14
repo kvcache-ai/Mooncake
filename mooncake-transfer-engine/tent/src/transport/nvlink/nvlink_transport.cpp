@@ -172,6 +172,42 @@ Status NVLinkTransport::freeSubBatch(SubBatchRef& batch) {
     auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    // A transfer can report failure after earlier asynchronous copies were
+    // accepted by CUDA. Keep the batch and completion events alive until the
+    // stream is known to be drained; otherwise callers may reuse its buffers
+    // while the GPU is still accessing them.
+    if (shm_batch->async_stream.get() != nullptr) {
+        int saved_device = -1;
+        auto select_err = cudaGetDevice(&saved_device);
+        if (select_err != cudaSuccess) {
+            return Status::InternalError(
+                "unable to read CUDA device before NVLink cleanup" LOC_MARK);
+        }
+        if (shm_batch->stream_device_id >= 0 &&
+            saved_device != shm_batch->stream_device_id) {
+            select_err = cudaSetDevice(shm_batch->stream_device_id);
+            if (select_err != cudaSuccess) {
+                return Status::InternalError(
+                    "unable to select NVLink stream device for "
+                    "cleanup" LOC_MARK);
+            }
+        }
+        const auto sync_err =
+            cudaStreamSynchronize(shm_batch->async_stream.get());
+        if (saved_device != shm_batch->stream_device_id &&
+            shm_batch->stream_device_id >= 0) {
+            const auto restore_err = cudaSetDevice(saved_device);
+            if (restore_err != cudaSuccess) {
+                return Status::InternalError(
+                    "unable to restore CUDA device after NVLink "
+                    "cleanup" LOC_MARK);
+            }
+        }
+        if (sync_err != cudaSuccess) {
+            return Status::InternalError(
+                "NVLink stream drain failed; retaining sub-batch" LOC_MARK);
+        }
+    }
     // Completion events are destroyed by ~NVLinkSubBatch(), which Slab's
     // deallocate() invokes before returning the storage. Streams are
     // pool-managed and not destroyed here.
