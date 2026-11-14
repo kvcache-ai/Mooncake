@@ -1718,6 +1718,68 @@ Request makeLocalWriteReq(uint8_t* ptr, size_t length) {
     return req;
 }
 
+class RetryableFreeTransport : public FakeTransport {
+   public:
+    explicit RetryableFreeTransport(TransportType type) : FakeTransport(type) {}
+
+    Status freeSubBatch(SubBatchRef& batch) override {
+        ++free_calls;
+        if (failures_remaining.load(std::memory_order_acquire) > 0) {
+            --failures_remaining;
+            return Status::InternalError(
+                "injected sub-batch free failure" LOC_MARK);
+        }
+        return FakeTransport::freeSubBatch(batch);
+    }
+
+    std::atomic<int> failures_remaining{0};
+    std::atomic<int> free_calls{0};
+};
+
+TEST(BatchLifecycle, FailedSubBatchFreeRetainsBatchForRetry) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<RetryableFreeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<RetryableFreeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Request rdma = makeLocalWriteReq(buf.data(), kBufLen);
+    rdma.transport_hint = RDMA;
+    Request tcp = makeLocalWriteReq(buf.data(), kBufLen);
+    tcp.transport_hint = TCP;
+    BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {rdma, tcp}).ok());
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    fake_tcp->failures_remaining.store(3, std::memory_order_release);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_EQ(fake_rdma->free_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->free_calls.load(), 2);
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED)
+        << "a failed sub-batch release must not invalidate the Batch";
+
+    EXPECT_FALSE(engine.freeBatch(batch_id).ok());
+    EXPECT_EQ(fake_rdma->free_calls.load(), 1)
+        << "an already released sibling must not be freed twice";
+    EXPECT_EQ(fake_tcp->free_calls.load(), 3);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_EQ(fake_rdma->free_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->free_calls.load(), 4);
+    EXPECT_FALSE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
 template <typename Fn>
 void runOrAbortOnTimeout(Fn&& fn, std::chrono::milliseconds timeout,
                          const char* what) {
