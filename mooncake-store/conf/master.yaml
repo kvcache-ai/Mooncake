@@ -60,6 +60,8 @@ enable_oplog_snapshot: false
 snapshot_chunk_object_count: 1000000
 # Batch standby base polling/retry delay in milliseconds
 oplog_poll_interval_ms: 1000
+# Maximum durable batch records fetched by one standby poll
+oplog_standby_max_batches_per_poll: 256
 # Maximum consecutive retryable batch-standby failure window in seconds
 batch_oplog_retry_timeout_sec: 180
 

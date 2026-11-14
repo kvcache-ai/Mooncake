@@ -546,6 +546,7 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
     const auto legacy_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
     auto last_progress = std::chrono::steady_clock::now();
+    std::optional<std::chrono::steady_clock::time_point> no_progress_since;
     auto retry_delay = initial_retry_delay;
     auto wait_to_retry = [&] {
         const auto now = std::chrono::steady_clock::now();
@@ -563,14 +564,26 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         return true;
     };
     for (;;) {
-        if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
-            std::chrono::steady_clock::now() >= legacy_deadline) {
+        const auto poll_started = std::chrono::steady_clock::now();
+        const bool legacy_deadline_reached =
+            policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
+            poll_started >= legacy_deadline;
+        // The legacy total deadline can expire before the suffix timeout.
+        // Verify a pending suffix once before failing at that deadline.
+        const bool strong_revalidation_due =
+            no_progress_since &&
+            (legacy_deadline_reached ||
+             poll_started - *no_progress_since >= no_progress_timeout);
+        if (legacy_deadline_reached && !strong_revalidation_due) {
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
         const uint64_t expected_before =
             oplog_applier_->GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
-        auto result = reader->PollOnce();
+        auto result = reader->PollOnce(
+            config_.oplog_standby_max_batches_per_poll,
+            strong_revalidation_due ? OpLogBatchStandbyReadMode::LINEARIZABLE
+                                    : OpLogBatchStandbyReadMode::SERIALIZABLE);
         const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
         const auto cursor_after = reader->GetLastAppliedDurablePrefix();
         const bool made_progress =
@@ -581,6 +594,14 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         } else if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
                    result.error == ErrorCode::OK) {
             retry_delay = initial_retry_delay;
+        }
+        if (result.disposition ==
+            OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+            if (made_progress || !no_progress_since) {
+                no_progress_since = std::chrono::steady_clock::now();
+            }
+        } else if (result.error == ErrorCode::OK) {
+            no_progress_since.reset();
         }
         if (result.error != ErrorCode::OK) {
             if (result.disposition !=
@@ -599,7 +620,37 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             result.durable_prefix.last_seq) {
             return ErrorCode::OK;
         }
+        if (legacy_deadline_reached) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
         if (!made_progress && !wait_to_retry()) {
+            if (result.disposition ==
+                OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+                const auto expected_before_revalidation =
+                    oplog_applier_->GetExpectedSequenceId();
+                const auto cursor_before_revalidation =
+                    reader->GetLastAppliedDurablePrefix();
+                const auto verified =
+                    reader->PollOnce(config_.oplog_standby_max_batches_per_poll,
+                                     OpLogBatchStandbyReadMode::LINEARIZABLE);
+                const auto cursor_after_revalidation =
+                    reader->GetLastAppliedDurablePrefix();
+                if (verified.error != ErrorCode::OK ||
+                    !verified.durable_prefix_present) {
+                    return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+                }
+                if (GetLocalLastAppliedSequenceIdLocked() >=
+                    verified.durable_prefix.last_seq) {
+                    return ErrorCode::OK;
+                }
+                if (oplog_applier_->GetExpectedSequenceId() >
+                        expected_before_revalidation ||
+                    cursor_after_revalidation != cursor_before_revalidation) {
+                    last_progress = std::chrono::steady_clock::now();
+                    retry_delay = initial_retry_delay;
+                    continue;
+                }
+            }
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
     }
@@ -1116,16 +1167,53 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     auto err = reader->SetBaselineCursor(baseline);
     if (err != ErrorCode::OK) return err;
     // Recheck the floor and durable suffix after restoring the candidate.
+    const auto catch_up_poll_interval =
+        std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
+    const auto catch_up_no_progress_timeout =
+        std::chrono::seconds(config_.batch_oplog_retry_timeout_sec);
     OpLogBatchStandbyPollResult poll;
-    do {
+    std::optional<std::chrono::steady_clock::time_point> no_progress_since;
+    for (;;) {
         if (!replication_loop_running_.load(std::memory_order_acquire)) {
             return ErrorCode::ETCD_CTX_CANCELLED;
         }
-        poll = reader->PollOnce();
+        const auto poll_started = std::chrono::steady_clock::now();
+        const auto read_mode =
+            no_progress_since && poll_started - *no_progress_since >=
+                                     catch_up_no_progress_timeout
+                ? OpLogBatchStandbyReadMode::LINEARIZABLE
+                : OpLogBatchStandbyReadMode::SERIALIZABLE;
+        const uint64_t expected_before = applier->GetExpectedSequenceId();
+        poll = reader->PollOnce(config_.oplog_standby_max_batches_per_poll,
+                                read_mode);
+        const bool made_progress =
+            applier->GetExpectedSequenceId() > expected_before ||
+            poll.applied_batches > 0;
+        if (poll.disposition ==
+            OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+            if (made_progress) {
+                no_progress_since = std::chrono::steady_clock::now();
+            } else if (!no_progress_since) {
+                no_progress_since = std::chrono::steady_clock::now();
+            }
+        } else if (poll.error == ErrorCode::OK) {
+            no_progress_since.reset();
+        }
         if (poll.error != ErrorCode::OK) return poll.error;
-    } while (poll.durable_prefix_present &&
-             applier->GetExpectedSequenceId() - 1 <
-                 poll.durable_prefix.last_seq);
+        if (!poll.durable_prefix_present ||
+            applier->GetExpectedSequenceId() - 1 >=
+                poll.durable_prefix.last_seq) {
+            break;
+        }
+        if (poll.has_more_pages) continue;
+
+        std::unique_lock<std::mutex> wait_lock(replication_loop_mutex_);
+        replication_loop_cv_.wait_for(
+            wait_lock, catch_up_poll_interval, [this] {
+                return !replication_loop_running_.load(
+                    std::memory_order_acquire);
+            });
+    }
     auto cursor = reader->GetLastAppliedDurablePrefix();
     if (!poll.durable_prefix_present || !cursor ||
         *cursor != poll.durable_prefix ||
@@ -1188,6 +1276,7 @@ void HotStandbyService::ReplicationLoop() {
         std::max(retry_base, std::chrono::milliseconds(5000));
     auto retry_delay = retry_base;
     std::optional<std::chrono::steady_clock::time_point> retry_started;
+    std::optional<std::chrono::steady_clock::time_point> no_progress_since;
     uint64_t recovery_floor = 0;
 
     auto wait_for_next_poll = [this](std::chrono::milliseconds delay) {
@@ -1213,15 +1302,25 @@ void HotStandbyService::ReplicationLoop() {
                 retry_delay = std::min(retry_delay * 2, max_retry_delay);
             } else {
                 retry_started.reset();
+                no_progress_since.reset();
                 retry_delay = retry_base;
             }
             continue;
         }
 
+        bool standby_has_more_pages = false;
         if (batch_standby_reader_) {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
-            auto result = batch_standby_reader_->PollOnce();
+            const auto poll_started = std::chrono::steady_clock::now();
+            const auto read_mode =
+                no_progress_since &&
+                        poll_started - *no_progress_since >= retry_limit
+                    ? OpLogBatchStandbyReadMode::LINEARIZABLE
+                    : OpLogBatchStandbyReadMode::SERIALIZABLE;
+            auto result = batch_standby_reader_->PollOnce(
+                config_.oplog_standby_max_batches_per_poll, read_mode);
+            standby_has_more_pages = result.has_more_pages;
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
@@ -1263,12 +1362,23 @@ void HotStandbyService::ReplicationLoop() {
 
             const uint64_t expected_after =
                 oplog_applier_->GetExpectedSequenceId();
+            const bool made_progress =
+                expected_after > expected_before || result.applied_batches > 0;
+            if (result.disposition ==
+                OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+                if (made_progress) {
+                    no_progress_since = std::chrono::steady_clock::now();
+                } else if (!no_progress_since) {
+                    no_progress_since = std::chrono::steady_clock::now();
+                }
+            } else if (result.error == ErrorCode::OK) {
+                no_progress_since.reset();
+            }
             if (expected_after > 0) {
                 applied_seq_id_.store(expected_after - 1);
             }
             if (result.error != ErrorCode::OK) {
                 last_error_.store(result.error, std::memory_order_release);
-                const bool made_progress = expected_after > expected_before;
                 if (result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
                     recovery_floor = result.compaction_floor;
@@ -1328,8 +1438,10 @@ void HotStandbyService::ReplicationLoop() {
             NotifySyncStatus();
         }
 
-        wait_for_next_poll(
-            std::chrono::milliseconds(config_.oplog_poll_interval_ms));
+        if (!standby_has_more_pages) {
+            wait_for_next_poll(
+                std::chrono::milliseconds(config_.oplog_poll_interval_ms));
+        }
     }
 
     replication_loop_running_.store(false, std::memory_order_release);

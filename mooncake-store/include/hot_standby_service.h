@@ -51,6 +51,7 @@ struct HotStandbyConfig {
     bool enable_oplog_following{true};
 
     int oplog_poll_interval_ms{1000};
+    uint32_t oplog_standby_max_batches_per_poll{1024};
     uint32_t batch_oplog_retry_timeout_sec{180};
 };
 

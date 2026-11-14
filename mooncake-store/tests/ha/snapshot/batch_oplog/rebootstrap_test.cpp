@@ -44,14 +44,50 @@ class MemoryBackend final : public HaKvBackend {
     ErrorCode Range(std::string_view begin, std::string_view end, size_t limit,
                     std::vector<KvPair>& output) override {
         std::lock_guard<std::mutex> lock(mutex_);
+        return RangeLocked(begin, end, limit, output);
+    }
+    ErrorCode RangeSerializable(std::string_view begin, std::string_view end,
+                                size_t limit,
+                                std::vector<KvPair>& output) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        serializable_range_times_.push_back(std::chrono::steady_clock::now());
         output.clear();
-        for (auto it = values_.lower_bound(std::string(begin));
-             it != values_.end() && it->first < end &&
-             (limit == 0 || output.size() < limit);
-             ++it) {
-            output.push_back({it->first, it->second});
+        if (stale_serializable_ranges_ > 0) {
+            --stale_serializable_ranges_;
+            return ErrorCode::OK;
         }
-        return ErrorCode::OK;
+        const auto error = RangeLocked(begin, end, limit, output);
+        if (error == ErrorCode::OK && !advance_after_batch_key_.empty()) {
+            bool found_trigger = false;
+            for (const auto& pair : output) {
+                if (pair.key == advance_after_batch_key_) {
+                    found_trigger = true;
+                    break;
+                }
+            }
+            if (found_trigger) {
+                values_[advance_batch_.key] = advance_batch_.value;
+                values_[advance_prefix_.key] = advance_prefix_.value;
+                stale_serializable_ranges_ = stale_ranges_after_advance_;
+                advance_after_batch_key_.clear();
+            }
+        }
+        return error;
+    }
+    void AdvancePrefixAfterRangeContaining(std::string trigger_batch_key,
+                                           KvPair batch, KvPair prefix,
+                                           size_t stale_ranges) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        advance_after_batch_key_ = std::move(trigger_batch_key);
+        advance_batch_ = std::move(batch);
+        advance_prefix_ = std::move(prefix);
+        stale_ranges_after_advance_ = stale_ranges;
+        serializable_range_times_.clear();
+    }
+    std::vector<std::chrono::steady_clock::time_point>
+    SerializableRangeTimes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return serializable_range_times_;
     }
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override {
@@ -61,8 +97,26 @@ class MemoryBackend final : public HaKvBackend {
     }
 
    private:
+    ErrorCode RangeLocked(std::string_view begin, std::string_view end,
+                          size_t limit, std::vector<KvPair>& output) {
+        output.clear();
+        for (auto it = values_.lower_bound(std::string(begin));
+             it != values_.end() && it->first < end &&
+             (limit == 0 || output.size() < limit);
+             ++it) {
+            output.push_back({it->first, it->second});
+        }
+        return ErrorCode::OK;
+    }
     std::mutex mutex_;
     std::map<std::string, std::string> values_;
+    size_t stale_serializable_ranges_{0};
+    std::string advance_after_batch_key_;
+    KvPair advance_batch_;
+    KvPair advance_prefix_;
+    size_t stale_ranges_after_advance_{0};
+    std::vector<std::chrono::steady_clock::time_point>
+        serializable_range_times_;
 };
 
 template <typename Predicate>
@@ -87,7 +141,7 @@ class RebootstrapTest : public ::testing::Test {
         HotStandbyConfig config;
         config.enable_snapshot_bootstrap = true;
         config.enable_verification = false;
-        config.oplog_poll_interval_ms = 1;
+        config.oplog_poll_interval_ms = 10;
         service_ = std::make_unique<HotStandbyService>(config);
         service_->SetCatchUpBatchKvBackendForTesting(backend_);
         service_->SetBatchOpLogSnapshotProvider(
@@ -177,9 +231,9 @@ class RebootstrapTest : public ::testing::Test {
         batch.entries = {entry};
         backend_->Put(BuildBatchRecordKey("n09", 4),
                       EncodeOpLogBatchRecord(batch));
-        Prefix(4);
         backend_->Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey("n09"),
                       "3");
+        Prefix(4);
         service_->EndBatchOpLogSnapshotCapture(*capture);
     }
     void ExpectOldState() {
@@ -295,6 +349,34 @@ TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
                   .errors);
     EXPECT_EQ(1u, metrics.get_snapshot_runtime().suffix_batches);
     EXPECT_EQ(3u, metrics.get_snapshot_runtime().compaction_floor);
+}
+
+TEST_F(RebootstrapTest, WaitsBetweenPagesWhileSerializableRangeLags) {
+    Publish(3, "new", false);
+    OpLogEntry entry;
+    entry.sequence_id = 5;
+    entry.op_type = OpType::REMOVE;
+    entry.tenant_id = "default";
+    entry.object_key = "remove-me";
+    OpLogBatchRecord batch;
+    batch.batch_id = batch.first_seq = batch.last_seq = 5;
+    batch.entries = {entry};
+    backend_->AdvancePrefixAfterRangeContaining(
+        BuildBatchRecordKey("n09", 4),
+        {.key = BuildBatchRecordKey("n09", 5),
+         .value = EncodeOpLogBatchRecord(batch)},
+        {.key = BuildDurablePrefixKey("n09"),
+         .value = EncodeDurablePrefix({.batch_id = 5, .last_seq = 5})},
+        3);
+    Compact();
+
+    ASSERT_TRUE(WaitUntil([&] {
+        return service_->GetLatestAppliedSequenceId() == 5 &&
+               !service_->GetSyncStatus().is_recovering;
+    }));
+    const auto range_times = backend_->SerializableRangeTimes();
+    ASSERT_GE(range_times.size(), 5u);
+    EXPECT_GE(range_times[4] - range_times[1], std::chrono::milliseconds(20));
 }
 
 TEST_F(RebootstrapTest, NoEligibleSnapshotPreservesStateAndRetriesOnline) {

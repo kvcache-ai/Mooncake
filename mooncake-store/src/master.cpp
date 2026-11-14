@@ -407,6 +407,9 @@ DEFINE_int32(oplog_poll_interval_ms, 1000,
 DEFINE_uint32(oplog_batch_max_entries, 1024,
               "Maximum number of committed/reserved entries in the open "
               "batch-record OpLog waiting batch.");
+DEFINE_uint32(oplog_standby_max_batches_per_poll, 256,
+              "Maximum number of durable batch records fetched per standby "
+              "poll.");
 DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
               "Maximum time to retry transient batch OpLog standby errors.");
 
@@ -719,6 +722,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("oplog_batch_max_entries",
                              &master_config.oplog_batch_max_entries,
                              FLAGS_oplog_batch_max_entries);
+    default_config.GetUInt32("oplog_standby_max_batches_per_poll",
+                             &master_config.oplog_standby_max_batches_per_poll,
+                             FLAGS_oplog_standby_max_batches_per_poll);
     default_config.GetUInt32("batch_oplog_retry_timeout_sec",
                              &master_config.batch_oplog_retry_timeout_sec,
                              FLAGS_batch_oplog_retry_timeout_sec);
@@ -1226,6 +1232,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.oplog_batch_max_entries = FLAGS_oplog_batch_max_entries;
     }
+    if ((google::GetCommandLineFlagInfo("oplog_standby_max_batches_per_poll",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_standby_max_batches_per_poll =
+            FLAGS_oplog_standby_max_batches_per_poll;
+    }
     if ((google::GetCommandLineFlagInfo("batch_oplog_retry_timeout_sec",
                                         &info) &&
          !info.is_default) ||
@@ -1535,6 +1548,10 @@ int main(int argc, char* argv[]) {
     }
     if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
         LOG(FATAL) << *error;
+        return 1;
+    }
+    if (master_config.oplog_standby_max_batches_per_poll == 0) {
+        LOG(FATAL) << "oplog_standby_max_batches_per_poll must be positive";
         return 1;
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||

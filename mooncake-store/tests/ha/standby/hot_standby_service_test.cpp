@@ -136,17 +136,26 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
         std::lock_guard<std::mutex> lock(mutex_);
+        ++range_calls_;
         if (range_error_ != ErrorCode::OK) {
             return range_error_;
         }
-        kvs.clear();
-        for (const auto& [key, value] : values_) {
-            if (key >= begin_key && key < end_key) {
-                kvs.push_back({.key = key, .value = value});
-                if (kvs.size() >= limit) break;
-            }
+        return RangeLocked(begin_key, end_key, limit, kvs);
+    }
+    ErrorCode RangeSerializable(std::string_view begin_key,
+                                std::string_view end_key, size_t limit,
+                                std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++serializable_range_calls_;
+        if (stale_serializable_ranges_ > 0) {
+            --stale_serializable_ranges_;
+            kvs.clear();
+            return ErrorCode::OK;
         }
-        return ErrorCode::OK;
+        if (range_error_ != ErrorCode::OK) {
+            return range_error_;
+        }
+        return RangeLocked(begin_key, end_key, limit, kvs);
     }
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override {
@@ -179,13 +188,40 @@ class FakeHaKvBackend : public HaKvBackend {
         std::lock_guard<std::mutex> lock(mutex_);
         next_get_error_ = err;
     }
+    void StaleNextSerializableRange() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stale_serializable_ranges_;
+    }
+    int range_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return range_calls_;
+    }
+    int serializable_range_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return serializable_range_calls_;
+    }
 
    private:
+    ErrorCode RangeLocked(std::string_view begin_key, std::string_view end_key,
+                          size_t limit, std::vector<KvPair>& kvs) {
+        kvs.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin_key && key < end_key) {
+                kvs.push_back({.key = key, .value = value});
+                if (kvs.size() >= limit) break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+
     mutable std::mutex mutex_;
     std::map<std::string, std::string> values_;
     ErrorCode get_error_{ErrorCode::OK};
     ErrorCode range_error_{ErrorCode::OK};
     ErrorCode next_get_error_{ErrorCode::OK};
+    size_t stale_serializable_ranges_{0};
+    int range_calls_{0};
+    int serializable_range_calls_{0};
 };
 
 OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
@@ -814,6 +850,76 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
 
     EXPECT_EQ(StandbyState::FAILED, service->GetState());
     EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest,
+       SerializableSuffixLagUsesStrongRevalidationAndContinues) {
+    const std::string cluster_id = "batch-standby-lagged-suffix";
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 2),
+                                 EncodeOpLogBatchRecord(MakeBatch(2, 2, 2))));
+    batch_backend->StaleNextSerializableRange();
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(2u, service->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1, batch_backend->serializable_range_calls());
+    EXPECT_EQ(1, batch_backend->range_calls());
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest,
+       PersistentSuffixGapIsStronglyRevalidatedBeforeFailure) {
+    const std::string cluster_id = "batch-standby-missing-suffix";
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::FAILED, service->GetState());
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
               service->GetSyncStatus().last_error);
     service->Stop();
 }

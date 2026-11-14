@@ -114,6 +114,14 @@ class HaKvBackend {
     virtual ErrorCode Range(std::string_view begin_key,
                             std::string_view end_key, size_t limit,
                             std::vector<KvPair>& kvs) = 0;
+    // Best-effort local read for immutable data whose committed progress was
+    // already established separately. Backends without a relaxed read path
+    // may use their normal Range implementation.
+    virtual ErrorCode RangeSerializable(std::string_view begin_key,
+                                        std::string_view end_key, size_t limit,
+                                        std::vector<KvPair>& kvs) {
+        return Range(begin_key, end_key, limit, kvs);
+    }
     // Delete [begin_key, end_key). Both bounds must be nonempty and finite.
     // Equal bounds are a no-op for backends supporting deletion.
     // Unsupported backends must return INVALID_PARAMS.
