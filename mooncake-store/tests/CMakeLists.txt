@@ -221,6 +221,12 @@ add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
+add_executable(thread_pool_exception_test thread_pool_exception_test.cpp
+                                          ../src/thread_pool.cpp)
+target_include_directories(thread_pool_exception_test
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(thread_pool_exception_test PRIVATE pthread glog::glog)
+add_test(NAME thread_pool_exception_test COMMAND thread_pool_exception_test)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
