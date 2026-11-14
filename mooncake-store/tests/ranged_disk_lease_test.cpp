@@ -167,4 +167,124 @@ TEST_F(RangedDiskLeaseTest, DiskRangeReadSucceedsWithLiveLease) {
               0);
 }
 
+class LocalDiskRangedDiskLeaseTest
+    : public RangedDiskLeaseTest,
+      public ::testing::WithParamInterface<bool> {
+   protected:
+    void SetUp() override {
+        setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1", 1);
+        setenv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1", 1);
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+                   ("mc_local_disk_ranged_lease_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(tmp_dir_ / "master");
+        std::filesystem::create_directories(tmp_dir_ / "offload");
+
+        ASSERT_TRUE(
+            master_.Start(InProcMasterConfigBuilder()
+                              .set_root_fs_dir((tmp_dir_ / "master").string())
+                              .set_enable_offload(true)
+                              .build()));
+        master_address_ = master_.master_address();
+
+        client_ = RealClient::create();
+        ASSERT_EQ(client_->setup_real(
+                      "localhost:17832", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                      16 * 1024 * 1024, FLAGS_protocol, "", master_address_,
+                      nullptr, "", true, (tmp_dir_ / "offload").string()),
+                  0);
+    }
+
+    void TearDown() override {
+        RangedDiskLeaseTest::TearDown();
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        unsetenv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+    }
+
+    std::optional<Replica::Descriptor> WaitForLocalDiskReplica(
+        const std::string &key, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto &replica : client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) return replica;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return std::nullopt;
+    }
+};
+
+TEST_P(LocalDiskRangedDiskLeaseTest,
+       ReadRejectsAfterTransferWhenLeaseAlreadyExpired) {
+    constexpr size_t kObjectSize = 4096;
+    const bool partial = GetParam();
+    const size_t offset = partial ? 512 : 0;
+    const size_t size = partial ? 1024 : kObjectSize;
+    std::string payload(kObjectSize, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = partial ? "local_disk_range_lease_expired"
+                                    : "local_disk_full_lease_expired";
+    ASSERT_EQ(client_->put(key, std::span<const char>(payload)), 0);
+    auto disk = WaitForLocalDiskReplica(key, std::chrono::seconds(10));
+    ASSERT_TRUE(disk.has_value()) << "LOCAL_DISK replica did not appear";
+
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0].has_value());
+    RealClient::RangedReadMetadata metadata{
+        .query_result = QueryResult(
+            std::vector<Replica::Descriptor>{*disk},
+            std::chrono::steady_clock::now() - std::chrono::seconds(1),
+            queries[0]->object_checksum),
+        .replica = *disk,
+        .total_size = kObjectSize,
+    };
+
+    auto destination = client_->allocate_client_buffer(size);
+    ASSERT_TRUE(destination.has_value());
+    auto result = client_->execute_ranged_read(
+        key, destination->ptr(), 0, offset, size, metadata, false, false);
+    ASSERT_FALSE(result.has_value())
+        << "an expired master lease must not report a successful read";
+    EXPECT_EQ(result.error(), ErrorCode::LEASE_EXPIRED);
+}
+
+TEST_F(LocalDiskRangedDiskLeaseTest, PartialReadSucceedsWithLiveLease) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kOffset = 256;
+    constexpr size_t kSize = 768;
+    std::string payload(kObjectSize, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>((i * 17) % 251);
+    }
+    const std::string key = "local_disk_range_lease_live";
+    ASSERT_EQ(client_->put(key, std::span<const char>(payload)), 0);
+    auto disk = WaitForLocalDiskReplica(key, std::chrono::seconds(10));
+    ASSERT_TRUE(disk.has_value()) << "LOCAL_DISK replica did not appear";
+
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0].has_value());
+    RealClient::RangedReadMetadata metadata{
+        .query_result =
+            QueryResult(std::vector<Replica::Descriptor>{*disk},
+                        queries[0]->lease_timeout, queries[0]->object_checksum),
+        .replica = *disk,
+        .total_size = kObjectSize,
+    };
+
+    auto destination = client_->allocate_client_buffer(kSize);
+    ASSERT_TRUE(destination.has_value());
+    auto result = client_->execute_ranged_read(
+        key, destination->ptr(), 0, kOffset, kSize, metadata, false, false);
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    EXPECT_EQ(*result, static_cast<int64_t>(kSize));
+    EXPECT_EQ(std::memcmp(destination->ptr(), payload.data() + kOffset, kSize),
+              0);
+}
+
+INSTANTIATE_TEST_SUITE_P(FullAndPartial, LocalDiskRangedDiskLeaseTest,
+                         ::testing::Values(false, true));
+
 }  // namespace mooncake

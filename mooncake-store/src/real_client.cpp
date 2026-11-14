@@ -5008,6 +5008,12 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const auto &query_result = metadata.query_result;
     const auto &replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
+    auto check_lease_after_read = [&]() -> tl::expected<void, ErrorCode> {
+        if (!query_result.IsLeaseExpired()) return {};
+        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                     << key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    };
 
     if (size_is_buffer_capacity) {
         if (size < total_size) {
@@ -5044,6 +5050,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 if (!checksum_result) {
                     return tl::unexpected(checksum_result.error());
                 }
+            }
+            if (auto lease_check = check_lease_after_read(); !lease_check) {
+                return tl::unexpected(lease_check.error());
             }
             return static_cast<int64_t>(total_size);
         }
@@ -5193,10 +5202,13 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             auto result = batch_get_into_offload_object_internal(
                 endpoint, objects, &read_range);
             if (!result) return tl::unexpected(result.error());
+            if (auto lease_check = check_lease_after_read(); !lease_check) {
+                return tl::unexpected(lease_check.error());
+            }
             return static_cast<int64_t>(size);
         }
 
-        return partial_disk_read(
+        auto result = partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(key, std::vector<Slice>{
@@ -5205,6 +5217,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                                                               &read_range);
             },
             size);
+        if (!result) return result;
+        if (auto lease_check = check_lease_after_read(); !lease_check) {
+            return tl::unexpected(lease_check.error());
+        }
+        return result;
     }
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
@@ -5238,11 +5255,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         if (!result) return result;
         // Same contract as Client::Get: the window may finish transferring
         // after the QueryResult lease deadline. Reject after the successful
-        // read so a DFS/DISK allocation is not treated as still leased.
-        if (query_result.IsLeaseExpired()) {
-            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                         << key;
-            return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        // read so a file-backed allocation is not treated as still leased.
+        if (auto lease_check = check_lease_after_read(); !lease_check) {
+            return tl::unexpected(lease_check.error());
         }
         return result;
     }
