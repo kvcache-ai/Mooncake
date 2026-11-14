@@ -184,7 +184,9 @@ For large transfers, TENT distributes slices across multiple devices:
 **Multi Path** (large requests):
 - **Normal mode** (99% of calls): Slices distributed proportionally to device capacity
   - Each device gets: `(device_weight / total_weight) × num_slices`
-  - Remaining slices assigned to best device
+  - Rounded by largest remainder: each device keeps the whole part of its share,
+    and the leftover slices go one each to the largest fractional parts, so
+    equal devices split evenly
 - **Probe mode** (1% of calls, every 100th call): Slices distributed round-robin
   - Purpose: Ensure all devices are continuously sampled for EWMA updates
   - Prevents EWMA starvation for less-used devices
