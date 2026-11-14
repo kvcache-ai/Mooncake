@@ -48,7 +48,8 @@
 #include <infiniband/mlx5dv.h>
 #endif
 
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
 #define MOONCAKE_EP_SPLIT_SEND_RECV 1
 #endif
 

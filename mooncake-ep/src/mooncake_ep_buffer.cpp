@@ -119,7 +119,7 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
 }
 
 static bool macaHostPhaseFenceCoversPeers() {
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_HYGON)
     return true;
 #else
     return false;
@@ -192,6 +192,10 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
             ibgda_disabled_ = true;
         }
     } else {
+#if defined(MOONCAKE_EP_USE_HYGON)
+        ibgda_disabled_ = true;
+        LOG(INFO) << "[EP] IBGDA disabled on Hygon DCU, using P2P-only path";
+#else
         // Read optional NIC whitelist from env var (same convention as PG
         // tests).
         std::vector<std::string> device_filter;
@@ -213,6 +217,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
             ibgda_disabled_ = true;
             LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
         }
+#endif
     }
 
     // Create 32 MiB workspace

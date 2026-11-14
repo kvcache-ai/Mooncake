@@ -28,12 +28,17 @@
 #endif
 
 #ifndef EP_DEVICE_ASSERT
+#ifdef MOONCAKE_EP_USE_HYGON
+#define EP_DEVICE_TRAP() __builtin_trap()
+#else
+#define EP_DEVICE_TRAP() asm("trap;")
+#endif
 #define EP_DEVICE_ASSERT(cond)                                           \
     do {                                                                 \
         if (not(cond)) {                                                 \
             printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, \
                    __LINE__, #cond);                                     \
-            asm("trap;");                                                \
+            EP_DEVICE_TRAP();                                            \
         }                                                                \
     } while (0)
 #endif

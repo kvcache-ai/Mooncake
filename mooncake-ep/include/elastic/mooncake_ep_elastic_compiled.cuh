@@ -39,7 +39,8 @@ __device__ __forceinline__ dtype_t __ldg(const dtype_t* ptr) {
 }
 #endif
 
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(DISABLE_SM90_FEATURES)
+#if defined(MOONCAKE_EP_USE_HYGON) || \
+    (!defined(MOONCAKE_EP_USE_MUSA) && !defined(DISABLE_SM90_FEATURES))
 #include <cuda_fp8.h>
 #elif !defined(MOONCAKE_EP_USE_MUSA)
 // Ampere does not support FP8 features

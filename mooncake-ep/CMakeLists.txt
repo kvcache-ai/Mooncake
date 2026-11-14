@@ -9,6 +9,8 @@ find_package(
 if(USE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+elseif(USE_HYGON AND NOT DTK_NVCC_EXECUTABLE)
+  message(FATAL_ERROR "USE_HYGON=ON requires DTK_NVCC_EXECUTABLE")
 endif()
 
 include_directories(include)
