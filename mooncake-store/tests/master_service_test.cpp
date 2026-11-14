@@ -81,6 +81,28 @@ class ScopedEnvVar {
 struct KvcsWatermarkDriverState {
     std::vector<ObjectKey> deleted_keys;
     bool fail_delete{false};
+    bool block_delete{false};
+    bool delete_started{false};
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    void BlockDelete() {
+        std::lock_guard lock(mutex);
+        block_delete = true;
+    }
+
+    bool WaitForDelete(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, timeout, [this] { return delete_started; });
+    }
+
+    void ReleaseDelete() {
+        {
+            std::lock_guard lock(mutex);
+            block_delete = false;
+        }
+        cv.notify_all();
+    }
 };
 
 class KvcsWatermarkDriver final : public KvcsDriver {
@@ -105,6 +127,10 @@ class KvcsWatermarkDriver final : public KvcsDriver {
         return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
     }
     KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
+        std::unique_lock lock(state_->mutex);
+        state_->delete_started = true;
+        state_->cv.notify_all();
+        state_->cv.wait(lock, [this] { return !state_->block_delete; });
         KvcsIoResults results;
         results.reserve(keys.size());
         for (const auto& key : keys) {
@@ -199,6 +225,110 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(usage.enabled);
     EXPECT_EQ(usage.used_bytes, 95u);
     EXPECT_EQ(usage.capacity_bytes, 100u);
+}
+
+TEST_F(MasterServiceTest, KvcsRemoveKeepsMetadataWhenProviderDeleteFails) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar clear_adapter("MOONCAKE_DFS_FS_ADAPTER");
+
+    MasterServiceConfig config;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+
+    auto driver_state = std::make_shared<KvcsWatermarkDriverState>();
+    driver_state->fail_delete = true;
+    peer.ConfigureKvcsCapacityForTesting(
+        std::make_unique<KvcsCapacityProvider>(
+            1, "target-mp",
+            std::make_unique<KvcsWatermarkDriver>(driver_state)),
+        false, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    const std::string key = "kvcs-remove-delete-failure";
+    ASSERT_TRUE(service.PutStart(context.client_id, key, TenantId::Default(),
+                                 64, replicate));
+    ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
+                               ReplicaType::ALL));
+
+    auto removed = service.Remove(key, TenantId::Default(), /*force=*/true);
+    ASSERT_FALSE(removed);
+    EXPECT_EQ(removed.error(), ErrorCode::RPC_FAIL);
+
+    auto unchanged = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(unchanged->replicas.size(), 2u);
+    ASSERT_EQ(driver_state->deleted_keys.size(), 1u);
+    EXPECT_EQ(driver_state->deleted_keys.front(), EncodeKvcsKey(key));
+}
+
+TEST_F(MasterServiceTest, KvcsBatchRemoveSerializesConcurrentRewrite) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar clear_adapter("MOONCAKE_DFS_FS_ADAPTER");
+
+    MasterServiceConfig config;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+
+    auto driver_state = std::make_shared<KvcsWatermarkDriverState>();
+    driver_state->BlockDelete();
+    peer.ConfigureKvcsCapacityForTesting(
+        std::make_unique<KvcsCapacityProvider>(
+            1, "target-mp",
+            std::make_unique<KvcsWatermarkDriver>(driver_state)),
+        false, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    const std::string key = "kvcs-remove-concurrent-rewrite";
+    ASSERT_TRUE(service.PutStart(context.client_id, key, TenantId::Default(),
+                                 64, replicate));
+    ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
+                               ReplicaType::ALL));
+
+    auto remove = std::async(std::launch::async, [&] {
+        return service.BatchRemove({key}, TenantId::Default(),
+                                   /*force=*/true);
+    });
+    const bool delete_started =
+        driver_state->WaitForDelete(std::chrono::seconds(1));
+    if (!delete_started) {
+        driver_state->ReleaseDelete();
+        remove.wait();
+        FAIL() << "KVCS provider delete was not called";
+    }
+
+    std::barrier rewrite_ready(2);
+    auto rewrite = std::async(std::launch::async, [&] {
+        rewrite_ready.arrive_and_wait();
+        return service.PutStart(context.client_id, key, TenantId::Default(), 64,
+                                replicate);
+    });
+    rewrite_ready.arrive_and_wait();
+    EXPECT_EQ(rewrite.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+
+    driver_state->ReleaseDelete();
+    auto removed = remove.get();
+    ASSERT_EQ(removed.size(), 1u);
+    ASSERT_TRUE(removed[0]);
+
+    auto rewrite_started = rewrite.get();
+    ASSERT_TRUE(rewrite_started);
+    ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
+                               ReplicaType::ALL));
+
+    auto rewritten = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(rewritten);
+    EXPECT_EQ(rewritten->replicas.size(), 2u);
+    ASSERT_EQ(driver_state->deleted_keys.size(), 1u);
+    EXPECT_EQ(driver_state->deleted_keys.front(), EncodeKvcsKey(key));
 }
 
 TEST_F(MasterServiceTest,

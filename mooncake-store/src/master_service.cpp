@@ -431,7 +431,7 @@ struct MasterService::KvcsDfsEviction {
             const eviction::Plan& plan,
             const eviction::Report& report) override {
             auto deleted =
-                service_.dfs_kvcs_capacity_provider_->DeleteObject(hold.key());
+                service_.DeleteKvcsObject(hold.key(), hold.metadata());
             if (deleted) return metadata_.Apply(ns, hold, plan, report);
             ++failures_;
             LOG(ERROR) << "KVCS DFS watermark provider delete failed, key="
@@ -7374,6 +7374,9 @@ auto MasterService::RemoveObject(const std::string& key,
         return removable;
     }
 
+    auto deleted = DeleteKvcsObject(key, metadata);
+    if (!deleted) return deleted;
+
     if (enable_ha_ && enable_oplog_) {
         return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
     }
@@ -7681,6 +7684,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             continue;
         }
 
+        // Keep provider deletion inside the key lock. Otherwise a rewrite can
+        // commit after metadata removal and be erased by a delayed delete.
+        auto deleted = DeleteKvcsObject(key, metadata);
+        if (!deleted) {
+            results[original_idx] = tl::make_unexpected(deleted.error());
+            continue;
+        }
+
         if (enable_ha_ && enable_oplog_) {
             results[original_idx] =
                 MarkRemovedAndPersist(normalized_tenant, key, metadata);
@@ -7951,6 +7962,17 @@ void MasterService::RefreshKvcsDfsUsage() {
         VLOG(1) << "KVCS DFS capacity is unknown: "
                 << toString(capacity.error());
     }
+}
+
+tl::expected<void, ErrorCode> MasterService::DeleteKvcsObject(
+    const std::string& key, const ObjectMetadata& metadata) {
+    if (!use_kvcs_ || !metadata.HasReplica(&Replica::fn_is_dfs_replica)) {
+        return {};
+    }
+    if (!dfs_kvcs_capacity_provider_) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    return dfs_kvcs_capacity_provider_->DeleteObject(key);
 }
 
 void MasterService::InitKvcsDfsEviction() {

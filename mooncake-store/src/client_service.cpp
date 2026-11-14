@@ -3835,13 +3835,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
-        auto results = BatchRemove({key}, force);
-        if (results.size() != 1)
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        return std::move(results.front());
-    }
-
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
@@ -3908,28 +3901,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
 
     const size_t result_count = std::min(keys.size(), results.size());
     std::vector<std::string> removed_keys;
-    std::vector<size_t> removed_indices;
     removed_keys.reserve(result_count);
-    removed_indices.reserve(result_count);
     for (size_t i = 0; i < result_count; ++i) {
         if (results[i]) {
             removed_keys.emplace_back(keys[i]);
-            removed_indices.push_back(i);
-        }
-    }
-
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
-        !removed_keys.empty()) {
-        const auto deleted =
-            dfs_storage_backend_->BatchDeleteObjects(removed_keys);
-        if (deleted.size() != removed_keys.size()) {
-            for (size_t index : removed_indices) {
-                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-        } else {
-            for (size_t i = 0; i < deleted.size(); ++i) {
-                if (!deleted[i]) results[removed_indices[i]] = deleted[i];
-            }
         }
     }
 
