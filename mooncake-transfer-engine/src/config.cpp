@@ -759,6 +759,7 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     for (const auto& [env_name, field] :
          {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
+          std::pair{"MOONCAKE_RDMA_HOST_ONLY", &config.rdma_host_only},
           std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct},
           std::pair{"MC_RDMA_DATA_DIRECT_PAIRING",
                     &config.rdma_data_direct_pairing}}) {

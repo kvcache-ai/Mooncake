@@ -169,6 +169,11 @@ struct GlobalConfig {
     // module instead of exporting a dma_buf. loadGlobalConfig() sets it to
     // whether a peer-memory module is loaded; WITH_NVIDIA_PEERMEM overrides.
     bool with_nvidia_peermem = true;
+    // Host-staged RDMA: only host (pinned CPU) memory may be registered. GPU
+    // buffers are rejected, and the GPU DMA-BUF capability checks are skipped.
+    // Callers copy GPU data into pinned host buffers first. Set via
+    // MOONCAKE_RDMA_HOST_ONLY.
+    bool rdma_host_only = false;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
     // Pair Data Direct registrations and topology with the GPU's PCI root.
