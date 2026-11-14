@@ -139,7 +139,12 @@ class Buffers {
     explicit Buffers(int device) {
         tpu_ = MockTpuEnv::instance().create(kSize, device);
     }
-    ~Buffers() { cleanup(); }
+    // The engine is declared after this object, so it is already destroyed
+    // here: only the adapter-side buffer is left to release.
+    ~Buffers() {
+        engine_ = nullptr;
+        cleanup();
+    }
 
     Status attach(TransferEngineImpl& engine) {
         if (!tpu_) return Status::InternalError("adapter registration failed");
