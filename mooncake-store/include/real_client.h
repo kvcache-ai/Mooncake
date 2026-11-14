@@ -727,6 +727,27 @@ class RealClient : public PyClient {
         const QueryResultCache *query_result_cache = nullptr,
         bool allow_query_refresh = true);
 
+    struct RangedReadMetadataPlan {
+        std::unordered_map<std::string,
+                           tl::expected<RangedReadMetadata, ErrorCode>>
+            entries;
+        // When this plan was resolved. An entry resolved here was leased no
+        // earlier than this moment, and an entry reused from a caller-supplied
+        // cache is measured from here as well because when it was leased is
+        // unknown. Either way a pass can tell how much lease is left and renew
+        // before a descriptor is spent.
+        std::chrono::steady_clock::time_point resolved_at;
+    };
+
+    // Resolves every key a ranged read needs before planning transfers, in the
+    // order given. Each key appears at most once in `entries`. Same
+    // `allow_query_refresh` contract as resolve_ranged_read_metadata: a
+    // snapshot read never reaches the Master and reports INVALID_PARAMS for a
+    // missing entry and LEASE_EXPIRED for an expired one.
+    RangedReadMetadataPlan resolve_ranged_read_metadata_batch(
+        const std::vector<std::string> &keys,
+        const QueryResultCache *query_result_cache, bool allow_query_refresh);
+
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
