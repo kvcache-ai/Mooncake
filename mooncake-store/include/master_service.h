@@ -2080,6 +2080,12 @@ class MasterService {
 
     mutable std::shared_mutex master_state_mutex_;
 
+    // Unmount and offboarding take this shared before master_state_mutex_
+    // and hold it through UNMOUNT submission. Offboarding also holds it
+    // through local HTTP cleanup or remote DELETE enqueue. Remount waits
+    // for exclusive access without holding client or state locks.
+    mutable std::shared_mutex remount_readiness_mutex_;
+
     // Restore lifecycle state (RFC #4700, slice 1). Declared next to
     // master_state_mutex_ because the follow-up slices replace that lock's
     // restore-window protection with this state machine. kConstructed keeps
@@ -2350,6 +2356,13 @@ class MasterService {
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
+
+    // Caller keeps shared master state and the segment access through the
+    // readiness commit; no allocator import or session rebinding is allowed.
+    bool CanCompleteMountedRemount(
+        const std::vector<Segment>& segments,
+        const ClientSessionSharedPtr& owner_session,
+        const ScopedSegmentAccess& segment_access) const;
 
     // True while the replica sits on an endpoint in
     // invalid_replica_endpoints_. The read path asks only this, never the set.
