@@ -127,6 +127,33 @@ class WorkerPoolTestPeer {
         pool.redispatch(slices, 0);
     }
 
+    static int redispatchReadyToOwner(WorkerPool &pool, Transport::Slice *slice,
+                                      const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return owner;
+        std::vector<Transport::Slice *> slices{slice};
+        pool.redispatch(slices, owner, false, false, true);
+        return owner;
+    }
+
+    static size_t collectiveQueuedForPeer(WorkerPool &pool,
+                                          const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        const auto &queues = pool.collective_slice_queue_[owner];
+        const auto it = queues.find(path);
+        return it == queues.end() ? 0 : it->second.size();
+    }
+
+    static void clearCollectiveForPeer(WorkerPool &pool,
+                                       const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return;
+        pool.collective_slice_queue_[owner].erase(path);
+        pool.pending_slice_state_[owner].fetch_and(
+            ~WorkerPool::kCollectiveSlicePendingBit, std::memory_order_release);
+    }
+
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     static size_t admitHandedOffSlices(WorkerPool &pool) {
         size_t admitted = 0;
@@ -164,6 +191,46 @@ class WorkerPoolTestPeer {
         pool.workers_running_.store(false);
         pool.cond_var_.notify_all();
         for (auto &entry : pool.worker_thread_) entry.join();
+    }
+
+    static void enqueuePrepared(WorkerPool &pool,
+                                const std::vector<Transport::Slice *> &slices) {
+        pool.enqueuePreparedSlices(slices, slices.size());
+    }
+
+    static uint64_t pendingForPeer(WorkerPool &pool, const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        return pool.pending_slice_state_[owner].load(std::memory_order_acquire);
+    }
+
+    static size_t queuedForPeer(WorkerPool &pool, const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        std::lock_guard<std::mutex> lock(pool.worker_slice_queue_lock_[owner]);
+        return pool.worker_slice_queue_[owner][path].size();
+    }
+
+    static uint64_t submittedCount(WorkerPool &pool) {
+        return pool.submitted_slice_count_.load(std::memory_order_acquire);
+    }
+
+    static bool hasPendingWork(WorkerPool &pool) {
+        return pool.hasPendingWork(0);
+    }
+
+    static void setPendingSetup(WorkerPool &pool, std::future<int> result) {
+        pool.pending_setups_[0]["pending-peer"].result = std::move(result);
+    }
+
+    static void setPendingRedispatch(WorkerPool &pool,
+                                     std::future<int> result) {
+        pool.pending_redispatch_[0][77].result = std::move(result);
+    }
+
+    static void clearPendingControlWork(WorkerPool &pool) {
+        pool.pending_setups_[0].clear();
+        pool.pending_redispatch_[0].clear();
     }
 
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
@@ -626,6 +693,92 @@ TEST_F(WorkerPoolCongestionOffHealthTest,
     EXPECT_EQ(slice.status, Transport::Slice::FAILED);
 }
 #endif
+
+TEST_F(WorkerPoolRailStateTest, BatchedEnqueuePublishesPerWorkerPendingState) {
+    Transport::Slice first{}, second{}, third{};
+    first.peer_nic_path = kPeerA;
+    second.peer_nic_path = kPeerB;
+    third.peer_nic_path = kPeerA;
+
+    WorkerPoolTestPeer::enqueuePrepared(*worker_pool_,
+                                        {&first, &second, &third});
+
+    EXPECT_EQ(WorkerPoolTestPeer::queuedForPeer(*worker_pool_, kPeerA), 2);
+    EXPECT_EQ(WorkerPoolTestPeer::queuedForPeer(*worker_pool_, kPeerB), 1);
+    EXPECT_EQ(WorkerPoolTestPeer::submittedCount(*worker_pool_), 3);
+    const auto pending_a =
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPeerA);
+    const auto pending_b =
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPeerB);
+    // Both peer paths may hash to the same worker. The queued-count bits
+    // describe that worker's complete cross-thread queue in either case.
+    EXPECT_GE(pending_a, 2 * 2);
+    EXPECT_GE(pending_b, 1 * 2);
+    EXPECT_EQ(pending_a & 1, 0);
+    EXPECT_EQ(pending_b & 1, 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, PendingControlWorkPreventsIdleWithoutSlices) {
+    EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+
+    std::promise<int> setup;
+    WorkerPoolTestPeer::setPendingSetup(*worker_pool_, setup.get_future());
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    setup.set_value(0);
+    // Ready results still need a worker pass to consume them.
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    WorkerPoolTestPeer::clearPendingControlWork(*worker_pool_);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+
+    std::promise<int> redispatch;
+    WorkerPoolTestPeer::setPendingRedispatch(*worker_pool_,
+                                             redispatch.get_future());
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    redispatch.set_value(0);
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    WorkerPoolTestPeer::clearPendingControlWork(*worker_pool_);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       LocalRedispatchPublishesCollectivePendingState) {
+    constexpr SegmentID kTargetId = 88;
+    constexpr uint64_t kBufferAddr = 0x20000;
+    constexpr const char *kPendingPeer = "pending-peer";
+    constexpr const char *kPendingPeerPath = "pending-peer@mlx5_bond_0";
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = kPendingPeer;
+    desc->protocol = "rdma";
+    desc->devices.push_back({"mlx5_bond_0", 1, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = kBufferAddr;
+    buffer.length = 4096;
+    buffer.rkey = {11};
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0": [["mlx5_bond_0"], []]})"), 0);
+    ASSERT_EQ(
+        metadata_->addLocalSegment(kTargetId, kPendingPeer, std::move(desc)),
+        0);
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+
+    Transport::Slice slice{};
+    slice.target_id = kTargetId;
+    slice.rdma.dest_addr = kBufferAddr;
+    slice.rdma.max_retry_cnt = 2;
+    slice.length = 64;
+
+    ASSERT_GE(WorkerPoolTestPeer::redispatchReadyToOwner(*worker_pool_, &slice,
+                                                         kPendingPeerPath),
+              0);
+    EXPECT_EQ(WorkerPoolTestPeer::collectiveQueuedForPeer(*worker_pool_,
+                                                          kPendingPeerPath),
+              1u);
+    EXPECT_EQ(
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPendingPeerPath) & 1,
+        1u);
+    WorkerPoolTestPeer::clearCollectiveForPeer(*worker_pool_, kPendingPeerPath);
+}
 
 TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
     for (int i = 0; i < WorkerPoolTestPeer::errorThreshold() - 1; ++i)

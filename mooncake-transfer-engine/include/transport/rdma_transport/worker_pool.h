@@ -139,6 +139,7 @@ class WorkerPool {
     void transferWorker(int thread_id);
 
     bool hasOutstandingCq(int thread_id);
+    bool hasPendingWork(int thread_id) const;
 
     void monitorWorker();
 
@@ -234,6 +235,13 @@ class WorkerPool {
         collective_slice_queue_;
     std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
     std::vector<std::mutex> worker_slice_queue_lock_;
+    // Per-worker pending state. The low bit records whether the worker-owned
+    // collective queue contains slices; the remaining bits encode twice the
+    // number of slices in the cross-thread worker queue. Keeping both in one
+    // atomic lets an idle worker decide whether it has work with one load.
+    static constexpr uint64_t kCollectiveSlicePendingBit = 1;
+    static constexpr uint64_t kQueuedSliceCountUnit = 2;
+    std::unique_ptr<std::atomic<uint64_t>[]> pending_slice_state_;
 
     // Each posting worker owns its pending handshakes; no task retains slices.
     struct PendingEndpointSetup {

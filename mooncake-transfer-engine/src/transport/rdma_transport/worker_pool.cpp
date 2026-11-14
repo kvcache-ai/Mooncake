@@ -709,6 +709,8 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       redispatch_counter_(0),
       worker_slice_queue_(worker_count_),
       worker_slice_queue_lock_(worker_count_),
+      pending_slice_state_(
+          std::make_unique<std::atomic<uint64_t>[]>(worker_count_)),
       submitted_slice_count_(0),
       processed_slice_count_(0)
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
@@ -723,9 +725,11 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     collective_slice_queue_.resize(worker_count_);
     pending_setups_.resize(worker_count_);
     pending_redispatch_.resize(worker_count_);
-    for (int i = 0; i < worker_count_; ++i)
+    for (int i = 0; i < worker_count_; ++i) {
+        pending_slice_state_[i].store(0, std::memory_order_relaxed);
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
+    }
     worker_thread_.emplace_back(
         std::thread(std::bind(&WorkerPool::monitorWorker, this)));
 }
@@ -753,6 +757,9 @@ void WorkerPool::enqueueSlicesToOwner(int owner_thread,
         }
         dst->push_back(slice);
     }
+    pending_slice_state_[owner_thread].fetch_add(
+        static_cast<uint64_t>(slices.size()) * kQueuedSliceCountUnit,
+        std::memory_order_release);
 }
 
 void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
@@ -769,6 +776,8 @@ void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
             worker_slice_queue_lock_[owner_thread]);
         worker_slice_queue_[owner_thread][slice->peerNicPath()].push_back(
             slice);
+        pending_slice_state_[owner_thread].fetch_add(kQueuedSliceCountUnit,
+                                                     std::memory_order_release);
     }
 }
 
@@ -1083,6 +1092,18 @@ void WorkerPool::untrackPostedSlices(
 
 void WorkerPool::performPostSend(int thread_id) {
     auto &local_slice_queue = collective_slice_queue_[thread_id];
+    const auto refresh_pending = [&]() {
+        const bool pending = std::any_of(
+            local_slice_queue.begin(), local_slice_queue.end(),
+            [](const auto &entry) { return !entry.second.empty(); });
+        if (pending) {
+            pending_slice_state_[thread_id].fetch_or(kCollectiveSlicePendingBit,
+                                                     std::memory_order_release);
+        } else {
+            pending_slice_state_[thread_id].fetch_and(
+                ~kCollectiveSlicePendingBit, std::memory_order_release);
+        }
+    };
     auto &pending_setups = pending_setups_[thread_id];
     std::unordered_map<std::string, SliceList> incoming;
     std::chrono::steady_clock::time_point incoming_cutoff;
@@ -1090,6 +1111,17 @@ void WorkerPool::performPostSend(int thread_id) {
         std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[thread_id]);
         incoming.swap(worker_slice_queue_[thread_id]);
         incoming_cutoff = std::chrono::steady_clock::now();
+        uint64_t queued_slice_count = 0;
+        for (const auto &entry : incoming) {
+            queued_slice_count += entry.second.size();
+        }
+        if (queued_slice_count != 0) {
+            pending_slice_state_[thread_id].fetch_sub(
+                queued_slice_count * kQueuedSliceCountUnit,
+                std::memory_order_acq_rel);
+            pending_slice_state_[thread_id].fetch_or(kCollectiveSlicePendingBit,
+                                                     std::memory_order_release);
+        }
     }
 
     // Process the old batch before merging submissions taken above. No slice
@@ -1149,6 +1181,8 @@ void WorkerPool::performPostSend(int thread_id) {
     if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
+        pending_slice_state_[thread_id].fetch_and(~kCollectiveSlicePendingBit,
+                                                  std::memory_order_release);
         for (auto &entry : local_slice_queue_clone) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
             if (adaptive_congestion_control_.enabled()) {
@@ -1162,6 +1196,7 @@ void WorkerPool::performPostSend(int thread_id) {
 #endif
             redispatch(entry.second, thread_id, true);
         }
+        refresh_pending();
         return;
     }
 
@@ -1173,9 +1208,12 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch_counter_.load(std::memory_order_relaxed);
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
+        pending_slice_state_[thread_id].fetch_and(~kCollectiveSlicePendingBit,
+                                                  std::memory_order_release);
         bool handoff_to_local_worker = !context_.active();
         for (auto &entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id, handoff_to_local_worker);
+        refresh_pending();
         return;
     }
 
@@ -1433,6 +1471,7 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!local_retry_list.empty())
             redispatch(local_retry_list, thread_id, true);
     }
+    refresh_pending();
 }
 
 int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
@@ -1852,6 +1891,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             if (owner_thread == thread_id && !defer_local_redispatch) {
                 collective_slice_queue_[thread_id][*peer_nic_path].push_back(
                     slice);
+                pending_slice_state_[thread_id].fetch_or(
+                    kCollectiveSlicePendingBit, std::memory_order_release);
             } else {
                 enqueueSliceToOwner(slice);
                 shared_redispatch_count++;
@@ -1980,20 +2021,40 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
                std::memory_order_relaxed) > 0;
 }
 
+bool WorkerPool::hasPendingWork(int thread_id) const {
+    // Only the posting worker reads its asynchronous setup/redispatch maps.
+    // These tasks can remain pending after the slice queue and CQ are empty.
+    return pending_slice_state_[thread_id].load(std::memory_order_acquire) !=
+               0 ||
+           !pending_setups_[thread_id].empty() ||
+           !pending_redispatch_[thread_id].empty();
+}
+
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     // Busy-poll this long after the pool goes idle before parking
     // (MC_RDMA_WORKER_IDLE_SPIN_US, 100 ms by default).
     const uint64_t idle_spin_ns =
         globalConfig().rdma_worker_idle_spin_us * 1000;
+    constexpr uint32_t kIdleClockCheckInterval = 64;
+    const int cq_index = cqIndexForPostingThread(thread_id);
+    std::atomic<int> *cq_outstanding =
+        cq_index >= 0 && cq_index < context_.cqCount()
+            ? context_.cqOutstandingCount(cq_index)
+            : nullptr;
     uint64_t last_wait_ts = getCurrentTimeInNano();
+    uint32_t idle_clock_check_count = 0;
     while (workers_running_.load(std::memory_order_relaxed)) {
-        auto processed_slice_count =
-            processed_slice_count_.load(std::memory_order_relaxed);
-        auto submitted_slice_count =
-            submitted_slice_count_.load(std::memory_order_relaxed);
-        if (processed_slice_count == submitted_slice_count &&
-            !hasOutstandingCq(thread_id)) {
+        const bool has_outstanding_cq =
+            cq_outstanding &&
+            cq_outstanding->load(std::memory_order_relaxed) > 0;
+        if (!hasPendingWork(thread_id) && !has_outstanding_cq) {
+            // Keep polling the worker-local atomic on every idle iteration,
+            // but sample the clock less often. This preserves submission
+            // latency while avoiding a clock read and global queue comparison
+            // for every empty pass.
+            if (++idle_clock_check_count < kIdleClockCheckInterval) continue;
+            idle_clock_check_count = 0;
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > idle_spin_ns) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
@@ -2001,9 +2062,9 @@ void WorkerPool::transferWorker(int thread_id) {
                 // Double-check condition after acquiring lock to avoid lost
                 // wakeup. parked_worker_count_ is set before this check so
                 // producers that submit after it will notify this worker.
-                if (processed_slice_count_.load(std::memory_order_relaxed) ==
-                        submitted_slice_count_.load() &&
-                    !hasOutstandingCq(thread_id)) {
+                if (!hasPendingWork(thread_id) &&
+                    !(cq_outstanding &&
+                      cq_outstanding->load(std::memory_order_relaxed) > 0)) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
                 parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);
@@ -2011,6 +2072,7 @@ void WorkerPool::transferWorker(int thread_id) {
             }
             continue;
         }
+        idle_clock_check_count = 0;
         performPostSend(thread_id);
 #ifndef USE_FAKE_POST_SEND
         performPollCq(thread_id);
