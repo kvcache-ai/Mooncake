@@ -17,8 +17,10 @@
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
+#include "config.h"
 #include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
+#include "memory_location.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
@@ -414,6 +416,10 @@ void FileStorage::RegisterZeroCopyRegion() {
     auto reg = client_->RegisterLocalMemory(region->base, region->size,
                                             location, true, true);
     if (reg) {
+        // Set before zero_copy_base_ publishes the region to PinBatch.
+        const size_t page = detectBufferPageSize(region->base);
+        zero_copy_huge_page_ =
+            page > static_cast<size_t>(sysconf(_SC_PAGESIZE)) ? page : 0;
         zero_copy_base_ = region->base;
         LOG(INFO) << "Zero-copy offload reads enabled, region size="
                   << region->size << ", location=" << location;
@@ -432,6 +438,22 @@ std::shared_ptr<FileStorage::AllocatedBatch> FileStorage::PinBatch(
                 << "); falling back to copy";
         if (ssd_metric_) ssd_metric_->ssd_zero_copy_fallbacks.inc();
         return nullptr;
+    }
+    // The transfer engine registers the region as one memory region per
+    // max_mr_size chunk and a remote read must fit inside one of them, so a
+    // value that straddles a chunk boundary is served by copy. Like
+    // RdmaTransport, round the chunk down to a huge-page multiple.
+    const uint64_t base = reinterpret_cast<uintptr_t>(zero_copy_base_.load());
+    uint64_t chunk = globalConfig().max_mr_size;
+    if (zero_copy_huge_page_ != 0) chunk -= chunk % zero_copy_huge_page_;
+    for (size_t i = 0; chunk != 0 && i < sizes.size(); ++i) {
+        if (sizes[i] <= 0) continue;
+        const uint64_t first = pinned->pointers[i] - base;
+        const uint64_t last = first + static_cast<uint64_t>(sizes[i]) - 1;
+        if (first / chunk != last / chunk) {
+            if (ssd_metric_) ssd_metric_->ssd_zero_copy_fallbacks.inc();
+            return nullptr;
+        }
     }
     // Registered and released exactly like a copied batch (ReleaseBuffer,
     // lease GC); dropping it drops the pins.

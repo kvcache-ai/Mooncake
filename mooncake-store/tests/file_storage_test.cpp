@@ -19,6 +19,7 @@
 #include "allocator.h"
 #include "client_metric.h"
 #include "common/network.h"
+#include "config.h"
 #include "file_storage.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
@@ -1673,6 +1674,19 @@ TEST_F(FileStorageTest, BatchGetServesDaxArenaZeroCopy) {
     ASSERT_TRUE(fileStorage.ReleaseBuffer(pinned->batch_id));
     EXPECT_EQ(PinnedBytes(fileStorage), 0);
     ASSERT_TRUE(fileStorage.ReleaseBuffer(copied_again->batch_id));
+
+    // A value that straddles two transfer-engine MR chunks cannot be read
+    // remotely in place (every 210-byte value straddles a 128-byte chunk):
+    // served by copy, nothing left pinned.
+    const auto saved_mr_size = globalConfig().max_mr_size;
+    globalConfig().max_mr_size = 128;
+    auto straddling = fileStorage.BatchGet(keys, sizes);
+    globalConfig().max_mr_size = saved_mr_size;
+    ASSERT_TRUE(straddling);
+    check(*straddling);
+    EXPECT_EQ(PinnedBytes(fileStorage), 0);
+    EXPECT_EQ(metric.ssd_zero_copy_fallbacks.value(), 2);
+    ASSERT_TRUE(fileStorage.ReleaseBuffer(straddling->batch_id));
 }
 
 // End to end over the TCP transport: the owner registers the arena through a

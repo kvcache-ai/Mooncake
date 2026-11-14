@@ -361,6 +361,9 @@ class FileStorage {
     // Base of the backend's zero-copy region once it is registered with the
     // transfer engine; nullptr keeps BatchGet on the copy path.
     std::atomic<void*> zero_copy_base_{nullptr};
+    // Page size of that region's mapping when it is a huge page (device-DAX,
+    // hugetlbfs), else 0; written once before zero_copy_base_.
+    size_t zero_copy_huge_page_{0};
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
