@@ -294,6 +294,8 @@ class WrappedMasterService {
 
     tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
 
+    tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
 
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
@@ -365,7 +367,14 @@ class WrappedMasterService {
                                                  const std::string& source,
                                                  const std::string& target);
 
+    tl::expected<void, ErrorCode> CancelTask(const UUID& task_id,
+                                             const std::string& tenant_id);
+    tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& client_id, const UUID& task_id);
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
 
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);

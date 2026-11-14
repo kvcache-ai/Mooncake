@@ -250,6 +250,20 @@ YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
          last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
          blocked_units, active_units, migrated_bytes, message);
 
+struct DrainJobListRequest {
+    std::optional<JobStatus> status;
+    std::optional<std::string> segment;
+    std::string page_token;
+    uint32_t limit = 100;
+};
+YLT_REFL(DrainJobListRequest, status, segment, page_token, limit);
+
+struct ListDrainJobsResponse {
+    std::vector<QueryJobResponse> jobs;
+    std::string next_page_token;
+};
+YLT_REFL(ListDrainJobsResponse, jobs, next_page_token);
+
 /**
  * @brief Response structure for QueryTask operation
  */
@@ -280,6 +294,12 @@ struct QueryTaskResponse {
 };
 YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch,
          last_updated_at_ms_epoch, assigned_client, message);
+
+struct ListTasksResponse {
+    std::vector<QueryTaskResponse> tasks;
+    std::string next_page_token;
+};
+YLT_REFL(ListTasksResponse, tasks, next_page_token);
 
 /**
  * @brief Task execution structure

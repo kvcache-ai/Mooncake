@@ -4586,12 +4586,20 @@ tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     return master_client_.CreateMoveTask(key, tenant_id, source, target);
 }
 
+bool Client::IsTaskCancellationRequested(const UUID* task_id) {
+    if (!task_id) {
+        return false;
+    }
+    // A failed check is best effort, including calls to older masters.
+    return master_client_.IsTaskCancellationRequested(*task_id).value_or(false);
+}
+
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     const std::string& key, const std::string& action_name,
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets, const UUID* task_id) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -4601,43 +4609,73 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         }
     };
 
-    // currently only memory source replica is supported
-    if (!source.is_memory_replica()) {
-        LOG(ERROR) << "action=replica_" << action_name << "_failed"
-                   << ", key=" << key << ", error=invalid_replica_type";
-        revoke_lambda();
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    std::vector<Slice> slices;
+    if (!targets.empty()) {
+        // currently only memory source replica is supported
+        if (!source.is_memory_replica()) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key << ", error=invalid_replica_type";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Validate that source replica is in local memory
+        if (!IsReplicaOnLocalMemory(source)) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key
+                       << ", error=source_replica_not_in_local_memory";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
+        }
+
+        // Split the source replica into slices for transfer
+        // This avoids data copy because the source replica is already in memory
+        const auto& buffer_descriptor =
+            source.get_memory_descriptor().buffer_descriptor;
+        void* buffer =
+            reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
+        slices = split_into_slices(buffer, buffer_descriptor.size_);
     }
 
-    // Validate that source replica is in local memory
-    if (!IsReplicaOnLocalMemory(source)) {
-        LOG(ERROR) << "action=replica_" << action_name << "_failed"
-                   << ", key=" << key
-                   << ", error=source_replica_not_in_local_memory";
-        revoke_lambda();
-        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
-    }
-
-    // Split the source replica into slices for transfer
-    // This avoids data copy because the source replica is already in memory
-    const auto& buffer_descriptor =
-        source.get_memory_descriptor().buffer_descriptor;
-    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    auto slices = split_into_slices(buffer, buffer_descriptor.size_);
-
-    // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices, TransferIntent::kMigration) !=
-            ErrorCode::OK) {
+        if (IsTaskCancellationRequested(task_id)) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::TASK_CANCELED);
+        }
+        if (task_id && slices.size() > 1 && target.is_memory_replica()) {
+            uint64_t offset = 0;
+            std::vector<Slice> chunk(1);
+            for (const auto& slice : slices) {
+                if (offset != 0 && IsTaskCancellationRequested(task_id)) {
+                    revoke_lambda();
+                    return tl::unexpected(ErrorCode::TASK_CANCELED);
+                }
+                chunk.front() = slice;
+                if (TransferWriteRange(target, chunk, offset,
+                                       TransferIntent::kMigration) !=
+                    ErrorCode::OK) {
+                    revoke_lambda();
+                    return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+                offset += slice.size;
+            }
+        } else if (TransferWrite(target, slices, TransferIntent::kMigration) !=
+                   ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
     }
 
-    // Call end function to finalize
+    // A cancellation observed before commit can safely revoke the allocation.
+    if (IsTaskCancellationRequested(task_id)) {
+        revoke_lambda();
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    }
     auto end_result = end_fn();
     if (!end_result.has_value()) {
-        revoke_lambda();
+        if (!targets.empty()) {
+            revoke_lambda();
+        }
         return tl::unexpected(end_result.error());
     }
 
@@ -4660,7 +4698,10 @@ tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets,
     const UUID& dynamic_replication_lease_id,
-    uint64_t dynamic_replication_version_epoch) {
+    uint64_t dynamic_replication_version_epoch, const UUID* task_id) {
+    if (IsTaskCancellationRequested(task_id)) {
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    }
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
@@ -4687,25 +4728,6 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     const auto& response = start_result.value();
-    if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
-                  << ", info=target_replicas_already_exist";
-        // Target replicas already exist, consider it success
-        auto copy_end_result =
-            dynamic_replication_lease_id == UUID{}
-                ? master_client_.CopyEnd(key, tenant_id)
-                : master_client_.DynamicReplicaCopyEnd(
-                      key, tenant_id, dynamic_replication_lease_id,
-                      dynamic_replication_version_epoch);
-        if (!copy_end_result.has_value()) {
-            ErrorCode error = copy_end_result.error();
-            LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                       << ", error=copy_end_failed" << ", error_code=" << error;
-            return tl::unexpected(error);
-        }
-        return {};
-    }
-
     auto copy_end = [&]() {
         return dynamic_replication_lease_id == UUID{}
                    ? master_client_.CopyEnd(key, tenant_id)
@@ -4720,8 +4742,9 @@ tl::expected<void, ErrorCode> Client::Copy(
                          key, tenant_id, dynamic_replication_lease_id,
                          dynamic_replication_version_epoch);
     };
-    auto result = ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
-                                         response.source, response.targets);
+    auto result =
+        ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
+                               response.source, response.targets, task_id);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4740,7 +4763,11 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
-                                           const std::string& target) {
+                                           const std::string& target,
+                                           const UUID* task_id) {
+    if (IsTaskCancellationRequested(task_id)) {
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    }
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
@@ -4757,26 +4784,15 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     const auto& response = move_start_result.value();
-    if (!response.target.has_value()) {
-        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
-                  << ", info=target_replica_already_exists";
-        // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key, tenant_id);
-        if (!move_end_result.has_value()) {
-            ErrorCode error = move_end_result.error();
-            LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                       << ", error=move_end_failed" << ", error_code=" << error;
-            return tl::unexpected(error);
-        }
-        return {};
+    std::vector<Replica::Descriptor> targets;
+    if (response.target) {
+        targets.push_back(*response.target);
     }
-
-    std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
         key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
-        response.source, targets);
+        response.source, targets, task_id);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -4785,6 +4801,34 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     return result;
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    return master_client_.CreateDrainJob(request);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> Client::QueryDrainJob(
+    const UUID& job_id) {
+    return master_client_.QueryDrainJob(job_id);
+}
+
+tl::expected<void, ErrorCode> Client::CancelDrainJob(const UUID& job_id) {
+    return master_client_.CancelDrainJob(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> Client::ListDrainJobs(
+    const DrainJobListRequest& request) {
+    return master_client_.ListDrainJobs(request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> Client::ListTasks(
+    const TaskListRequest& request) {
+    return master_client_.ListTasks(request);
+}
+
+tl::expected<void, ErrorCode> Client::CancelTask(const UUID& task_id) {
+    return master_client_.CancelTask(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
@@ -4986,13 +5030,13 @@ std::optional<TransferFuture> Client::SubmitRangeRead(
 
 std::optional<TransferFuture> Client::SubmitRangeWrite(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, TransferIntent intent) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitRangeWrite(
-        replica_descriptor, slices, dst_offset, TransferIntent::kUnspecified);
+    return transfer_submitter_->submitRangeWrite(replica_descriptor, slices,
+                                                 dst_offset, intent);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
@@ -5283,8 +5327,9 @@ ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferWriteRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
-    auto future = SubmitRangeWrite(replica_descriptor, slices, dst_offset);
+    uint64_t dst_offset, TransferIntent intent) {
+    auto future =
+        SubmitRangeWrite(replica_descriptor, slices, dst_offset, intent);
     if (!future) {
         LOG(ERROR) << "Failed to submit range write operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -5579,10 +5624,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 const UUID dynamic_lease_id{
                     payload.dynamic_replication_lease_id_high,
                     payload.dynamic_replication_lease_id_low};
-                auto copy_result =
-                    Copy(payload.key, payload.tenant_id, payload.source,
-                         payload.targets, dynamic_lease_id,
-                         payload.dynamic_replication_version_epoch);
+                auto copy_result = Copy(
+                    payload.key, payload.tenant_id, payload.source,
+                    payload.targets, dynamic_lease_id,
+                    payload.dynamic_replication_version_epoch, &assignment.id);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5593,8 +5638,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result = Move(payload.key, payload.tenant_id,
-                                        payload.source, payload.target);
+                auto move_result =
+                    Move(payload.key, payload.tenant_id, payload.source,
+                         payload.target, &assignment.id);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5617,11 +5663,15 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
-    if (result == ErrorCode::OK) {
+    if (result == ErrorCode::OK || result == ErrorCode::TASK_CANCELED) {
         TaskCompleteRequest complete_request;
         complete_request.id = assignment.id;
-        complete_request.status = TaskStatus::SUCCESS;
-        complete_request.message = "Task completed successfully";
+        complete_request.status = result == ErrorCode::OK
+                                      ? TaskStatus::SUCCESS
+                                      : TaskStatus::CANCELED;
+        complete_request.message = result == ErrorCode::OK
+                                       ? "Task completed successfully"
+                                       : "Task canceled";
         auto complete_result =
             master_client_.MarkTaskToComplete(complete_request);
         if (!complete_result.has_value()) {

@@ -107,6 +107,12 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::allocate_buffer_dummy>(&real_client);
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
+    server.register_handler<&RealClient::create_drain_job>(&real_client);
+    server.register_handler<&RealClient::query_drain_job>(&real_client);
+    server.register_handler<&RealClient::cancel_drain_job>(&real_client);
+    server.register_handler<&RealClient::list_drain_jobs>(&real_client);
+    server.register_handler<&RealClient::list_tasks>(&real_client);
+    server.register_handler<&RealClient::cancel_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
         &real_client);

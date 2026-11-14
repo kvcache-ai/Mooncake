@@ -14,7 +14,7 @@
 
 //! Runtime `dlopen` bindings for the Mooncake Store C API (`store_c.h`).
 //!
-//! The raw loader (types, layout checks, all `mooncake_store_*` symbols) is
+//! The raw loader (types, layout checks and required C symbols) is
 //! bindgen-generated from `store_c.h` (`dynamic_library_name`, see build.rs), so
 //! the ABI is never hand-maintained; this module wraps it in a process-global
 //! plus free-function shims so `crate::store` is backend-agnostic. The library
@@ -64,7 +64,7 @@ fn library_path() -> OsString {
 }
 
 /// Open the library and resolve every symbol up front (`dynamic_link_require_all`
-/// makes this fail if any `mooncake_store_*` symbol is missing).
+/// makes this fail if a required C symbol is missing).
 fn load(path: &OsStr) -> Result<sys::MooncakeStoreLib, StoreError> {
     unsafe { sys::MooncakeStoreLib::new(path) }.map_err(|e| StoreError::LibraryLoad(e.to_string()))
 }

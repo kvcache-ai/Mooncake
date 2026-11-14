@@ -2086,6 +2086,36 @@ tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
     return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
 }
 
+tl::expected<UUID, ErrorCode> DummyClient::create_drain_job(
+    const CreateDrainJobRequest& request) {
+    return invoke_rpc<&RealClient::create_drain_job, UUID>(request);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> DummyClient::query_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::query_drain_job, QueryJobResponse>(job_id);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::cancel_drain_job, void>(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> DummyClient::list_drain_jobs(
+    const DrainJobListRequest& request) {
+    return invoke_rpc<&RealClient::list_drain_jobs, ListDrainJobsResponse>(
+        request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> DummyClient::list_tasks(
+    const TaskListRequest& request) {
+    return invoke_rpc<&RealClient::list_tasks, ListTasksResponse>(request);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_task(const UUID& task_id) {
+    return invoke_rpc<&RealClient::cancel_task, void>(task_id);
+}
+
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
     const UUID& task_id) {
     return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);

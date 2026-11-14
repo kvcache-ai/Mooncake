@@ -1,7 +1,49 @@
 #include "task_manager.h"
+#include <algorithm>
 #include <glog/logging.h>
+#include <queue>
 
 namespace mooncake {
+namespace {
+
+bool MatchesTaskPayload(const Task& task, const TenantId& tenant,
+                        const std::optional<std::string>& key = std::nullopt) {
+    try {
+        // Validate a complete object before using the typed reader's defaults.
+        if (task.payload.empty()) {
+            return false;
+        }
+        struct_json::jvalue value;
+        auto it = task.payload.begin();
+        auto end = task.payload.end();
+        struct_json::parse<true>(value, it, end, true);
+        if (it != end || !std::holds_alternative<struct_json::jobject>(value)) {
+            return false;
+        }
+        const auto matches = [&](const auto& payload) {
+            const TenantId payload_tenant(payload.tenant_id);
+            return payload_tenant.IsValid() && payload_tenant == tenant &&
+                   (!key || payload.key == *key);
+        };
+        switch (task.type) {
+            case TaskType::REPLICA_COPY: {
+                ReplicaCopyPayload payload;
+                struct_json::from_json(payload, task.payload);
+                return matches(payload);
+            }
+            case TaskType::REPLICA_MOVE: {
+                ReplicaMovePayload payload;
+                struct_json::from_json(payload, task.payload);
+                return matches(payload);
+            }
+        }
+    } catch (const std::exception&) {
+        // A malformed payload cannot be attributed to a tenant.
+    }
+    return false;
+}
+
+}  // namespace
 
 std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     const UUID& task_id) const {
@@ -10,6 +52,84 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
         return it->second;
     }
     return std::nullopt;
+}
+
+tl::expected<bool, ErrorCode> ScopedTaskReadAccess::is_cancellation_requested(
+    const UUID& client_id, const UUID& task_id) const {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end()) {
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    if (it->second.assigned_client != client_id) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    return it->second.cancellation_requested;
+}
+
+tl::expected<TaskListPage, ErrorCode> ScopedTaskReadAccess::list_tasks(
+    const TaskListRequest& request) const {
+    const TenantId tenant(request.tenant_id);
+    if (!tenant.IsValid() || request.limit == 0 || request.limit > 1000 ||
+        (request.status && *request.status != TaskStatus::PENDING &&
+         *request.status != TaskStatus::PROCESSING &&
+         !is_finished_status(*request.status)) ||
+        (request.type && *request.type != TaskType::REPLICA_COPY &&
+         *request.type != TaskType::REPLICA_MOVE)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::optional<UUID> after;
+    constexpr std::string_view prefix = "v1:";
+    if (!request.page_token.empty()) {
+        UUID id;
+        const auto token = std::string_view(request.page_token);
+        if (!token.starts_with(prefix) ||
+            !StringToUuid(std::string(token.substr(prefix.size())), id) ||
+            token.substr(prefix.size()) != UuidToString(id)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        after = id;
+    }
+    const auto less = [](const Task* lhs, const Task* rhs) {
+        return lhs->id < rhs->id;
+    };
+    std::priority_queue<const Task*, std::vector<const Task*>, decltype(less)>
+        selected(less);
+    for (const auto& [id, task] : manager_->all_tasks_) {
+        if ((after && id <= *after) ||
+            (request.status && task.status != *request.status) ||
+            (request.type && task.type != *request.type) ||
+            (request.assigned_client &&
+             task.assigned_client != *request.assigned_client)) {
+            continue;
+        }
+        if (MatchesTaskPayload(task, tenant, request.key)) {
+            selected.push(&task);
+            if (selected.size() > static_cast<size_t>(request.limit) + 1) {
+                selected.pop();
+            }
+        }
+    }
+    const bool has_more = selected.size() > request.limit;
+    if (has_more) {
+        selected.pop();
+    }
+    std::vector<const Task*> ordered;
+    ordered.reserve(selected.size());
+    while (!selected.empty()) {
+        ordered.push_back(selected.top());
+        selected.pop();
+    }
+    std::reverse(ordered.begin(), ordered.end());
+    TaskListPage page;
+    page.tasks.reserve(ordered.size());
+    for (const Task* task : ordered) {
+        page.tasks.push_back(*task);
+    }
+    if (has_more) {
+        page.next_page_token =
+            std::string(prefix) + UuidToString(ordered.back()->id);
+    }
+    return page;
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::begin() const {
@@ -48,7 +168,7 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .max_retry_attempts = manager_->max_retry_attempts_};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
-    manager_->pending_tasks_[client_id].push(task.id);
+    manager_->pending_tasks_[client_id].push_back(task.id);
 
     return task.id;
 }
@@ -72,7 +192,7 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
         }
 
         const UUID task_id = queue.front();
-        queue.pop();
+        queue.pop_front();
 
         auto it = manager_->all_tasks_.find(task_id);
         if (it == manager_->all_tasks_.end()) {
@@ -174,10 +294,10 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
             std::chrono::seconds(manager_->pending_task_timeout_sec_);
 
         for (auto& [client_id, task_queue] : manager_->pending_tasks_) {
-            std::queue<UUID> keep_queue;
+            std::deque<UUID> keep_queue;
             while (!task_queue.empty()) {
                 const UUID task_id = task_queue.front();
-                task_queue.pop();
+                task_queue.pop_front();
 
                 auto it = manager_->all_tasks_.find(task_id);
                 if (it == manager_->all_tasks_.end()) {
@@ -203,7 +323,7 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                     continue;
                 }
 
-                keep_queue.push(task_id);
+                keep_queue.push_back(task_id);
             }
             task_queue = std::move(keep_queue);
         }
@@ -253,6 +373,34 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                 processing_task_set.erase(task_id);
             }
         }
+    }
+}
+
+ErrorCode ScopedTaskWriteAccess::cancel_task(const UUID& task_id,
+                                             const TenantId& tenant_id) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end() ||
+        !MatchesTaskPayload(it->second, tenant_id)) {
+        return ErrorCode::TASK_NOT_FOUND;
+    }
+
+    Task& task = it->second;
+    switch (task.status) {
+        case TaskStatus::PENDING: {
+            auto queue = manager_->pending_tasks_.find(task.assigned_client);
+            if (queue != manager_->pending_tasks_.end()) {
+                std::erase(queue->second, task_id);
+            }
+            return complete_task(task.assigned_client, task_id,
+                                 TaskStatus::CANCELED, "Task canceled");
+        }
+        case TaskStatus::PROCESSING:
+            task.cancellation_requested = true;
+            return ErrorCode::OK;
+        case TaskStatus::CANCELED:
+            return ErrorCode::OK;
+        default:
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 }
 

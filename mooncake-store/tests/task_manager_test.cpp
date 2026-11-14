@@ -269,6 +269,70 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
     EXPECT_EQ(second[0].status, TaskStatus::PROCESSING);
 }
 
+TEST_F(ClientTaskManagerTest, CancelPendingTaskReleasesQuotaAndSkipsDispatch) {
+    ClientTaskManager manager({10, 1, 1, 0, 0, 3});
+    const UUID client = generate_uuid();
+    const ReplicaMovePayload payload{.tenant_id = "tenant-a",
+                                     .key = "key",
+                                     .source = "source",
+                                     .target = "target"};
+    auto submit = [&] {
+        return manager.get_write_access()
+            .submit_task_typed<TaskType::REPLICA_MOVE>(client, payload);
+    };
+    auto task = submit();
+    ASSERT_TRUE(task);
+    EXPECT_EQ(
+        manager.get_write_access().cancel_task(*task, TenantId("tenant-b")),
+        ErrorCode::TASK_NOT_FOUND);
+    EXPECT_EQ(
+        manager.get_write_access().cancel_task(*task, TenantId("tenant-a")),
+        ErrorCode::OK);
+    ASSERT_TRUE(submit());
+    auto dispatched = manager.get_write_access().pop_tasks(client, 10);
+    ASSERT_EQ(dispatched.size(), 1);
+    EXPECT_NE(dispatched.front().id, *task);
+
+    auto page = manager.get_read_access().list_tasks(
+        {.tenant_id = "tenant-a", .status = TaskStatus::CANCELED});
+    ASSERT_TRUE(page);
+    ASSERT_EQ(page->tasks.size(), 1);
+    EXPECT_EQ(page->tasks.front().id, *task);
+}
+
+TEST_F(ClientTaskManagerTest, CancelProcessingTaskWaitsForExecutorResult) {
+    ClientTaskManager manager({10, 10, 1, 0, 0, 3});
+    const UUID client = generate_uuid();
+    auto task =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            client, {.key = "key", .source = "source", .targets = {"target"}});
+    ASSERT_TRUE(task);
+    ASSERT_EQ(manager.get_write_access().pop_tasks(client, 1).size(), 1);
+    EXPECT_EQ(
+        manager.get_write_access().cancel_task(*task, TenantId::Default()),
+        ErrorCode::OK);
+    EXPECT_EQ(manager.get_read_access().find_task_by_id(*task)->status,
+              TaskStatus::PROCESSING);
+    auto requested =
+        manager.get_read_access().is_cancellation_requested(client, *task);
+    ASSERT_TRUE(requested);
+    EXPECT_TRUE(*requested);
+    EXPECT_EQ(manager.get_read_access()
+                  .is_cancellation_requested(generate_uuid(), *task)
+                  .error(),
+              ErrorCode::ILLEGAL_CLIENT);
+
+    // A commit that raced with the request still reports success.
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client, *task, TaskStatus::SUCCESS, "done"),
+              ErrorCode::OK);
+    EXPECT_EQ(manager.get_read_access().find_task_by_id(*task)->status,
+              TaskStatus::SUCCESS);
+    EXPECT_EQ(
+        manager.get_write_access().cancel_task(*task, TenantId::Default()),
+        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
 TEST_F(ClientTaskManagerTest, FailPendingTaskSkipsQueuedAssignment) {
     ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();

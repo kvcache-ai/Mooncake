@@ -1557,6 +1557,15 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
         [] { MasterMetricManager::instance().inc_query_task_failures(); });
 }
 
+tl::expected<ListTasksResponse, ErrorCode> WrappedMasterService::ListTasks(
+    const TaskListRequest& request) {
+    auto scoped_request = request;
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        scoped_request.tenant_id = TenantId::kDefaultValue;
+    }
+    return master_service_.ListTasks(scoped_request);
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode>
 WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
     return execute_rpc(
@@ -1580,6 +1589,26 @@ tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
         },
         [] { MasterMetricManager::instance().inc_update_task_requests(); },
         [] { MasterMetricManager::instance().inc_update_task_failures(); });
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode>
+WrappedMasterService::ListDrainJobs(const DrainJobListRequest& request) {
+    return master_service_.ListDrainJobs(request);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CancelTask(
+    const UUID& task_id, const std::string& tenant_id) {
+    return WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved) {
+            return master_service_.CancelTask(task_id, resolved);
+        });
+}
+
+tl::expected<bool, ErrorCode> WrappedMasterService::IsTaskCancellationRequested(
+    const UUID& client_id, const UUID& task_id) {
+    return master_service_.IsTaskCancellationRequested(client_id, task_id);
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
@@ -2131,6 +2160,11 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::PollRemoveAll,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
+        &WrappedMasterService::CreateDrainJob,
+        &WrappedMasterService::QueryDrainJob,
+        &WrappedMasterService::CancelDrainJob, &WrappedMasterService::ListTasks,
+        &WrappedMasterService::ListDrainJobs, &WrappedMasterService::CancelTask,
+        &WrappedMasterService::IsTaskCancellationRequested,
         &WrappedMasterService::FetchTasks,
         &WrappedMasterService::MarkTaskToComplete,
         &WrappedMasterService::BeginWeightImport,

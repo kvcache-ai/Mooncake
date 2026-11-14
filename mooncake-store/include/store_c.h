@@ -187,6 +187,131 @@ int mooncake_store_register_buffer(mooncake_store_t store, void *buffer,
 
 int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer);
 
+// ---------------------------------------------------------------------------
+// Replica migration tasks and DrainJobs
+// ---------------------------------------------------------------------------
+
+typedef struct mooncake_store_uuid {
+    uint64_t high;
+    uint64_t low;
+} mooncake_store_uuid_t;
+
+enum mooncake_store_task_type {
+    MOONCAKE_STORE_TASK_REPLICA_COPY = 0,
+    MOONCAKE_STORE_TASK_REPLICA_MOVE = 1
+};
+
+enum mooncake_store_task_status {
+    MOONCAKE_STORE_TASK_PENDING = 0,
+    MOONCAKE_STORE_TASK_PROCESSING = 1,
+    MOONCAKE_STORE_TASK_FAILED = 2,
+    MOONCAKE_STORE_TASK_SUCCESS = 3,
+    MOONCAKE_STORE_TASK_CANCELED = 4
+};
+
+typedef struct mooncake_store_task_info {
+    mooncake_store_uuid_t id;
+    int32_t type;   /* enum mooncake_store_task_type */
+    int32_t status; /* enum mooncake_store_task_status */
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
+    mooncake_store_uuid_t assigned_client;
+    const char *message;
+} mooncake_store_task_info_t;
+
+enum mooncake_store_drain_job_status {
+    MOONCAKE_STORE_DRAIN_CREATED = 0,
+    MOONCAKE_STORE_DRAIN_PLANNING = 1,
+    MOONCAKE_STORE_DRAIN_RUNNING = 2,
+    MOONCAKE_STORE_DRAIN_SUCCEEDED = 3,
+    MOONCAKE_STORE_DRAIN_FAILED = 4,
+    MOONCAKE_STORE_DRAIN_CANCELED = 5
+};
+
+typedef struct mooncake_store_drain_job_request {
+    const char *const *segments;
+    size_t segment_count;
+    const char *const *target_segments; /* optional when target_count == 0 */
+    size_t target_count;
+    uint32_t max_concurrency; /* positive, typically 4 */
+} mooncake_store_drain_job_request_t;
+
+typedef struct mooncake_store_drain_job_info {
+    mooncake_store_uuid_t id;
+    int32_t status; /* enum mooncake_store_drain_job_status */
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
+    const char *const *segments;
+    size_t segment_count;
+    uint64_t succeeded_units;
+    uint64_t failed_units;
+    uint64_t blocked_units;
+    uint64_t active_units;
+    uint64_t migrated_bytes;
+    const char *message;
+} mooncake_store_drain_job_info_t;
+
+typedef struct mooncake_store_drain_job_filter {
+    int32_t has_status;     /* zero to disable the status filter */
+    int32_t status;         /* enum mooncake_store_drain_job_status */
+    const char *segment;    /* optional exact source segment name */
+    const char *page_token; /* NULL or empty on the first call */
+    uint32_t limit;         /* 0 for default (100), otherwise 1..1000 */
+} mooncake_store_drain_job_filter_t;
+
+typedef struct mooncake_store_drain_job_page {
+    const mooncake_store_drain_job_info_t *jobs;
+    size_t count;
+    const char *next_page_token; /* empty when there are no more results */
+} mooncake_store_drain_job_page_t;
+
+/*
+ * These operations return 0 or a negative Store error code. Invalid input
+ * returns -600, an unknown task ID returns -1400, and an unknown job ID
+ * returns -1402.
+ *
+ * All input strings must be NUL-terminated. The library borrows inputs only
+ * for the duration of the call. The caller supplies storage for IDs and output
+ * pointers. A failed create leaves its output ID zeroed.
+ *
+ * Successful query and list calls return one malloc-allocated result. The
+ * caller owns it and releases it with free(result), including after destroying
+ * the store. All nested pointers are borrowed from that result and valid until
+ * it is freed. Free only the result pointer. On failure the result is NULL.
+ */
+int mooncake_store_create_copy_task(mooncake_store_t store, const char *key,
+                                    const char *const *targets,
+                                    size_t target_count,
+                                    mooncake_store_uuid_t *task_id_out);
+
+int mooncake_store_create_move_task(mooncake_store_t store, const char *key,
+                                    const char *source, const char *target,
+                                    mooncake_store_uuid_t *task_id_out);
+
+int mooncake_store_query_task(mooncake_store_t store,
+                              mooncake_store_uuid_t task_id,
+                              mooncake_store_task_info_t **result_out);
+
+/* DrainJobs apply to mounted memory segments across the cluster. An empty
+ * target list lets the master choose destinations. */
+int mooncake_store_create_drain_job(
+    mooncake_store_t store, const mooncake_store_drain_job_request_t *request,
+    mooncake_store_uuid_t *job_id_out);
+
+int mooncake_store_query_drain_job(
+    mooncake_store_t store, mooncake_store_uuid_t job_id,
+    mooncake_store_drain_job_info_t **result_out);
+
+/* Cancel a nonterminal job with no active moves. Otherwise returns -1010. */
+int mooncake_store_cancel_drain_job(mooncake_store_t store,
+                                    mooncake_store_uuid_t job_id);
+
+/* Pass NULL for default filters. Reuse next_page_token with the same filters
+ * to read the next page. Each page reads live state in UUID order. */
+int mooncake_store_list_drain_jobs(
+    mooncake_store_t store, const mooncake_store_drain_job_filter_t *filter,
+    mooncake_store_drain_job_page_t **result_out);
+
 #ifdef __cplusplus
 }
 #endif
