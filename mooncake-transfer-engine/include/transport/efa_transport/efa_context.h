@@ -105,6 +105,8 @@ struct EfaMemoryRegionMeta {
 //     ~35 ms per peer (fi_endpoint + fi_enable).
 //   * Scale-out is bounded by peer_map_max_ (MC_MAX_EP_PER_CTX) rather than
 //     by 768 QPs/NIC; the AV is sized to match (max_endpoints + headroom).
+struct EfaOpContext;
+
 class EfaContext {
    public:
     // Per-AV-slot bookkeeping.  Public because EfaOpContext holds a pointer to
@@ -308,6 +310,18 @@ class EfaContext {
     // endpoints are not thread-safe for concurrent post, even with
     // FI_THREAD_SAFE at the domain level.
     std::atomic_flag post_lock_;
+
+   public:
+    // Per-operation contexts come from this context's pool instead of the heap:
+    // one is taken per posted slice and handed back by the CQ poller, so a
+    // cross-thread new / delete per slice was on the hot path of both threads.
+    void takeOpContexts(int n, EfaOpContext** out);
+    void returnOpContexts(EfaOpContext* const* ops, int n);
+
+   private:
+    std::atomic_flag op_pool_lock_;
+    std::vector<EfaOpContext*> op_free_;
+    std::vector<std::unique_ptr<char[]>> op_chunks_;
 
     // ---- Credit-flow diagnostics (observability only) ----
     //
