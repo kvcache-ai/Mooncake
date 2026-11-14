@@ -1,15 +1,19 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_KERNEL_CUH
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_KERNEL_CUH
 
+#include <type_traits>
+
 #include <cooperative_groups.h>
 #include <cuda/atomic>
 
 #include "common_types.h"
+#include "error_types.h"
 #include "device_comm/device_utils/d2h_request_slot.cuh"
 #include "pg_assert.h"
 #include "device_comm/device_collective/device_control_update.cuh"
 #include "device_comm/device_collective/device_collective_local.cuh"
 #include "device_comm/device_collective/device_collective_types.cuh"
+#include "device_comm/device_primitives/value_primitives.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 
 namespace mooncake {
@@ -280,6 +284,116 @@ __device__ __forceinline__ void runCollectiveInvocation(
                                           request.failed_ranks_hint);
 }
 
+// Check support for the complete collective reduction. Avg uses Sum plus
+// scaling in the algorithm; it does not have a binary reduction trait.
+template <typename T, ReduceOp Op>
+constexpr bool supportsDeviceCollectiveReduction() noexcept {
+    if constexpr (Op == ReduceOp::Avg) {
+        return !std::is_same_v<T, bool> &&
+               DeviceReductionTraits<T, ReduceOp::Sum>::kSupported;
+    } else {
+        return DeviceReductionTraits<T, Op>::kSupported;
+    }
+}
+
 }  // namespace mooncake
+
+#define PG_DETAIL_DISPATCH_REDUCTION_CASE(T, operation, launch, request, ...)  \
+    case ::mooncake::ReduceOp::operation:                                      \
+        if constexpr (::mooncake::supportsDeviceCollectiveReduction<           \
+                          T, ::mooncake::ReduceOp::operation>()) {             \
+            return launch<T, ::mooncake::ReduceOp::operation>(request,         \
+                                                              __VA_ARGS__);    \
+        } else {                                                               \
+            return ::mooncake::makePGError(                                    \
+                ::mooncake::PGErrorCode::NotSupported,                         \
+                "device collective datatype/op combination is not supported"); \
+        }
+
+#define PG_DETAIL_DISPATCH_REDUCTION_OP(T, launch, request, ...)               \
+    do {                                                                       \
+        switch ((request).op) {                                                \
+            PG_DETAIL_DISPATCH_REDUCTION_CASE(T, Sum, launch, request,         \
+                                              __VA_ARGS__);                    \
+            PG_DETAIL_DISPATCH_REDUCTION_CASE(T, Avg, launch, request,         \
+                                              __VA_ARGS__);                    \
+            PG_DETAIL_DISPATCH_REDUCTION_CASE(T, Product, launch, request,     \
+                                              __VA_ARGS__);                    \
+            PG_DETAIL_DISPATCH_REDUCTION_CASE(T, Min, launch, request,         \
+                                              __VA_ARGS__);                    \
+            PG_DETAIL_DISPATCH_REDUCTION_CASE(T, Max, launch, request,         \
+                                              __VA_ARGS__);                    \
+            default:                                                           \
+                return ::mooncake::makePGError(                                \
+                    ::mooncake::PGErrorCode::NotSupported,                     \
+                    "device collective reduction operation is not supported"); \
+        }                                                                      \
+    } while (false)
+
+// Dispatch request.datatype and request.op to launch<T, Op>(request, args...).
+// Instantiate kernels only for supported datatype/op combinations.
+// Returns the launch result from the enclosing function, or
+// NotSupported for an unsupported datatype or reduction op.
+#define PG_DISPATCH_REDUCTION(launch, request, ...)                            \
+    do {                                                                       \
+        const auto& pg_reduction_request_internal = (request);                 \
+        switch (pg_reduction_request_internal.datatype) {                      \
+            case ::mooncake::DataType::Float16:                                \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(__half, launch,                \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Uint8:                                  \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(uint8_t, launch,               \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Int8:                                   \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(int8_t, launch,                \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Int16:                                  \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(int16_t, launch,               \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Uint16:                                 \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(uint16_t, launch,              \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Int32:                                  \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(int32_t, launch,               \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Uint32:                                 \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(uint32_t, launch,              \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Int64:                                  \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(int64_t, launch,               \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Uint64:                                 \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(uint64_t, launch,              \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Bfloat16:                               \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(__nv_bfloat16, launch,         \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Float32:                                \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(float, launch,                 \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Float64:                                \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(double, launch,                \
+                                                pg_reduction_request_internal, \
+                                                __VA_ARGS__);                  \
+            case ::mooncake::DataType::Bool:                                   \
+                PG_DETAIL_DISPATCH_REDUCTION_OP(                               \
+                    bool, launch, pg_reduction_request_internal, __VA_ARGS__); \
+            default:                                                           \
+                return ::mooncake::makePGError(                                \
+                    ::mooncake::PGErrorCode::NotSupported,                     \
+                    "device collective reduction datatype is not supported");  \
+        }                                                                      \
+    } while (false)
 
 #endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_KERNEL_CUH

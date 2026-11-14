@@ -57,10 +57,9 @@ struct LLValuePack {
             return __float_as_uint(DeviceReductionTraits<float, Op>::apply(
                 __uint_as_float(left), __uint_as_float(right)));
         } else {
-            static_assert(std::is_same_v<T, int32_t>);
-            return static_cast<uint32_t>(
-                DeviceReductionTraits<int32_t, Op>::apply(
-                    static_cast<int32_t>(left), static_cast<int32_t>(right)));
+            static_assert(std::is_integral_v<T>);
+            return static_cast<uint32_t>(DeviceReductionTraits<T, Op>::apply(
+                static_cast<T>(left), static_cast<T>(right)));
         }
     }
 };

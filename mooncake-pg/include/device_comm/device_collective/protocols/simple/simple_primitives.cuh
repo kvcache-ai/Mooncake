@@ -8,7 +8,7 @@
 namespace mooncake {
 
 // One invocation's Simple communication primitives, currently with one receive
-// and one send connection. send() and Reduce operations read chunk.source;
+// and one send connection. Local input is read from chunk.source;
 // Copy operations write chunk.destination. Call begin() once before data
 // operations and finish() once after them.
 template <typename T>
@@ -70,12 +70,20 @@ class SimplePrimitives {
     [[nodiscard]] __device__ __forceinline__ CollectiveResult
     send(const CollectiveChunk<T>& chunk,
          cooperative_groups::thread_block block) {
+        return transformSend(chunk, block, Identity{});
+    }
+
+    // Transform source values while writing the outgoing payload, then send.
+    template <typename Transform>
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
+    transformSend(const CollectiveChunk<T>& chunk,
+                  cooperative_groups::thread_block block, Transform transform) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto send = slotFor(send_cursor_);
         PG_COLL_TRY(waitPrevSendConsumed(send, block));
         const auto payload = outgoingPayload(send);
-        copyValuesTo(chunk.source, chunk.count, block,
-                     payload.template dataAs<T>());
+        transformValuesTo(chunk.source, chunk.count, block, transform,
+                          payload.template dataAs<T>());
         publishSend(send, payload, chunk.count, block);
         return {};
     }
@@ -95,11 +103,13 @@ class SimplePrimitives {
         return {};
     }
 
-    // Receive the next message and send Op(source, received). No local copy.
-    template <ReduceOp Op>
-    [[nodiscard]] __device__ __forceinline__ CollectiveResult
-    recvReduceSend(const CollectiveChunk<T>& chunk,
-                   cooperative_groups::thread_block block) {
+    // Receive the next message, apply transform(local, received) to
+    // corresponding values from chunk.source and the message, and send the
+    // results.
+    template <typename Transform>
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult recvTransformSend(
+        const CollectiveChunk<T>& chunk, cooperative_groups::thread_block block,
+        Transform transform) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
@@ -107,33 +117,38 @@ class SimplePrimitives {
         PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
-        reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
-                              block, payload.template dataAs<T>());
+        transformValuesTo(chunk.source, receivedPayload(recv), chunk.count,
+                          block, transform, payload.template dataAs<T>());
         publishSend(send, payload, chunk.count, block);
         releaseRecv(recv, block);
         return {};
     }
 
-    // Receive the next message and store Op(source, received) to destination.
-    template <ReduceOp Op>
-    [[nodiscard]] __device__ __forceinline__ CollectiveResult
-    recvReduceCopy(const CollectiveChunk<T>& chunk,
-                   cooperative_groups::thread_block block) {
+    // Receive the next message, apply transform(local, received) to
+    // corresponding values from chunk.source and the message, and store the
+    // results in chunk.destination.
+    template <typename Transform>
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult recvTransformCopy(
+        const CollectiveChunk<T>& chunk, cooperative_groups::thread_block block,
+        Transform transform) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         PG_COLL_TRY(waitRecvReady(recv, block));
 
-        reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
-                              block, chunk.destination);
+        transformValuesTo(chunk.source, receivedPayload(recv), chunk.count,
+                          block, transform, chunk.destination);
         releaseRecv(recv, block);
         return {};
     }
 
-    // Store Op(source, received) to destination and send the same result.
-    template <ReduceOp Op>
+    // Receive the next message, apply transform(local, received) to
+    // corresponding values from chunk.source and the message, then store the
+    // results in chunk.destination and send them.
+    template <typename Transform>
     [[nodiscard]] __device__ __forceinline__ CollectiveResult
-    recvReduceCopySend(const CollectiveChunk<T>& chunk,
-                       cooperative_groups::thread_block block) {
+    recvTransformCopySend(const CollectiveChunk<T>& chunk,
+                          cooperative_groups::thread_block block,
+                          Transform transform) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
@@ -141,9 +156,9 @@ class SimplePrimitives {
         PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
-        reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
-                              block, chunk.destination,
-                              payload.template dataAs<T>());
+        transformValuesTo(chunk.source, receivedPayload(recv), chunk.count,
+                          block, transform, chunk.destination,
+                          payload.template dataAs<T>());
         publishSend(send, payload, chunk.count, block);
         releaseRecv(recv, block);
         return {};

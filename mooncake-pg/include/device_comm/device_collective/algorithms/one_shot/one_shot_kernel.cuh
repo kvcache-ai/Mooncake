@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_KERNEL_CUH
 
 #include <cooperative_groups.h>
+#include <type_traits>
 
 #include "device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.cuh"
 #include "device_comm/device_collective/protocols/ll/ll_primitives.cuh"
@@ -75,10 +76,13 @@ class OneShotExchange {
 
     // Before X sends n+2, it receives Y's n+1, so Y has consumed X's n.
     // Empty/local-only calls consume no sequence, preserving this dependency.
+    // rank_stride is measured in T elements. Send count elements starting at
+    // source + r * rank_stride to peer r, using its in-group rank. A zero
+    // stride sends the same values to every peer.
     __device__ __forceinline__ void sendAll(
-        CollectiveChunk<T> chunk,
+        const T* source, uint64_t count, uint64_t rank_stride,
         cooperative_groups::thread_block block) const {
-        const uint64_t pack_count = packCount(chunk.count);
+        const uint64_t pack_count = packCount(count);
         const uint64_t work = pack_count * view_.participant_count;
         const LLPacketOps packets(sequence_, timeout_ticks_);
         for (uint64_t index = block.thread_rank(); index < work;
@@ -88,8 +92,10 @@ class OneShotExchange {
                 continue;
             const auto& peer = view_.participants[active_index];
             const uint64_t pack_index = index % pack_count;
-            const auto value =
-                Pack::load(chunk.source, chunk.count, pack_index);
+            const auto* peer_source =
+                source +
+                static_cast<uint64_t>(peer.in_group_rank) * rank_stride;
+            const auto value = Pack::load(peer_source, count, pack_index);
             const uint64_t remote_offset =
                 plan_.packet_offsets[active_index] +
                 plan_.layout.packetIndex(
@@ -145,6 +151,11 @@ class OneShotExchange {
     [[nodiscard]] __device__ __forceinline__ InGroupRank
     reducePeersScalar(CollectiveChunk<T> chunk, uint64_t pack_count,
                       cooperative_groups::thread_block block) const {
+        constexpr auto reduction_op = Op == ReduceOp::Avg ? ReduceOp::Sum : Op;
+        T factor{};
+        if constexpr (Op == ReduceOp::Avg && !std::is_integral_v<T>)
+            factor = reciprocal<T>(view_.participant_count);
+
         for (uint64_t pack_index = block.thread_rank(); pack_index < pack_count;
              pack_index += block.size()) {
             typename Pack::Value reduced = 0;
@@ -155,11 +166,16 @@ class OneShotExchange {
                 } else if (!readReceived(peer, pack_index, value)) {
                     return view_.participants[peer].in_group_rank;
                 }
+                if constexpr (Op == ReduceOp::Avg && !std::is_integral_v<T>)
+                    value = Mul<T>{factor}(value);
                 // Start with the first participant; no identity value is
                 // needed.
                 reduced = peer == 0 ? value
-                                    : Pack::template reduce<Op>(reduced, value);
+                                    : Pack::template reduce<reduction_op>(
+                                          reduced, value);
             }
+            if constexpr (Op == ReduceOp::Avg && std::is_integral_v<T>)
+                reduced = Div<T>{view_.participant_count}(reduced);
             Pack::store(chunk.destination, chunk.count, pack_index, reduced);
         }
         return kInvalidInGroupRank;
@@ -169,6 +185,11 @@ class OneShotExchange {
     [[nodiscard]] __device__ __forceinline__ InGroupRank
     reducePeersTiled(CollectiveChunk<T> chunk, uint64_t pack_count,
                      cooperative_groups::thread_block block) const {
+        constexpr auto reduction_op = Op == ReduceOp::Avg ? ReduceOp::Sum : Op;
+        T factor{};
+        if constexpr (Op == ReduceOp::Avg && !std::is_integral_v<T>)
+            factor = reciprocal<T>(view_.participant_count);
+
         const auto tile =
             cooperative_groups::tiled_partition<kReductionTileSize>(block);
         for (uint64_t pack_index = tile.meta_group_rank();
@@ -191,6 +212,8 @@ class OneShotExchange {
                 const auto failures =
                     tile.ballot(failed != kInvalidInGroupRank);
                 if (failures) return tile.shfl(failed, __ffs(failures) - 1);
+                if constexpr (Op == ReduceOp::Avg && !std::is_integral_v<T>)
+                    value = Mul<T>{factor}(value);
 #pragma unroll
                 for (uint32_t lane = 0; lane < kReductionTileSize; ++lane) {
                     const uint32_t low =
@@ -204,12 +227,15 @@ class OneShotExchange {
                     }
                     if (tile.thread_rank() == 0 &&
                         base + lane < view_.participant_count)
-                        reduced = base + lane == 0 ? received
-                                                   : Pack::template reduce<Op>(
-                                                         reduced, received);
+                        reduced = base + lane == 0
+                                      ? received
+                                      : Pack::template reduce<reduction_op>(
+                                            reduced, received);
                 }
             }
             if (tile.thread_rank() == 0) {
+                if constexpr (Op == ReduceOp::Avg && std::is_integral_v<T>)
+                    reduced = Div<T>{view_.participant_count}(reduced);
                 Pack::store(chunk.destination, chunk.count, pack_index,
                             reduced);
             }

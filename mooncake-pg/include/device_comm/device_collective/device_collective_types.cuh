@@ -14,8 +14,16 @@
 
 namespace mooncake {
 
+enum class CollectiveFailureType : uint32_t {
+    Communication,
+    // The request requires a participant absent from the installed view.
+    // e.g. broadcast without active root.
+    UnavailableParticipant,
+};
+
 struct CollectiveResult {
     InGroupRank failed_rank = kInvalidInGroupRank;
+    CollectiveFailureType failure_type = CollectiveFailureType::Communication;
 
     [[nodiscard]] __device__ __forceinline__ bool succeeded() const {
         return failed_rank == kInvalidInGroupRank;
@@ -54,8 +62,91 @@ struct AllGatherRequest {
     int32_t* failed_ranks_hint = nullptr;
 };
 
+struct ReduceScatterRequest {
+    static constexpr OpType kOperation = OpType::ReduceScatter;
+
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    // Number of output elements per participant. Input uses in-group rank
+    // slots.
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    ReduceOp op = ReduceOp::Sum;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+struct BroadcastRequest {
+    static constexpr OpType kOperation = OpType::Broadcast;
+
+    // Only the root uses send_buffer; every participant uses recv_buffer.
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    InGroupRank root = kInvalidInGroupRank;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+struct ReduceRequest {
+    static constexpr OpType kOperation = OpType::Reduce;
+
+    // Every participant uses send_buffer; only the root uses recv_buffer.
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    ReduceOp op = ReduceOp::Sum;
+    InGroupRank root = kInvalidInGroupRank;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+struct AllToAllRequest {
+    static constexpr OpType kOperation = OpType::AllToAll;
+
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    // Number of elements per peer. Both buffers use in-group rank slots.
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+struct GatherRequest {
+    static constexpr OpType kOperation = OpType::Gather;
+
+    // Only the root uses recv_buffer, with one slot per in-group rank.
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    // Number of input elements contributed by each participant.
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    InGroupRank root = kInvalidInGroupRank;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+struct ScatterRequest {
+    static constexpr OpType kOperation = OpType::Scatter;
+
+    // Only the root uses send_buffer, with one slot per in-group rank.
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    // Number of output elements per participant.
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    InGroupRank root = kInvalidInGroupRank;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+struct BarrierRequest {
+    static constexpr OpType kOperation = OpType::Barrier;
+
+    int32_t* failed_ranks_hint = nullptr;
+};
+
 using DeviceCollectiveRequest =
-    std::variant<AllReduceRequest, AllGatherRequest>;
+    std::variant<AllReduceRequest, AllGatherRequest, ReduceScatterRequest,
+                 BroadcastRequest, ReduceRequest, AllToAllRequest,
+                 GatherRequest, ScatterRequest, BarrierRequest>;
 
 // Identity and shared addressing for one participant. Offsets are relative to
 // that participant's DTS region.
@@ -71,10 +162,31 @@ struct DeviceGroupView {
     uint64_t epoch = kInvalidViewEpoch;
     int32_t self_active_index = -1;
     uint32_t participant_count = 0;
+    // Active participants in increasing in-group rank order.
     CollectivePeer participants[kMaxNumRanks] = {};
     // Set by the startup CTA after the handshake; reset when a view is
     // installed.
     bool synchronized = false;
+
+    [[nodiscard]] __device__ __forceinline__ int32_t
+    activeIndex(InGroupRank rank) const {
+        // Fast path: active indices match in-group ranks before the first gap.
+        if (static_cast<uint32_t>(rank) < participant_count &&
+            participants[rank].in_group_rank == rank)
+            return rank;
+
+        // Missing ranks shift active indices left. Scan backward from the
+        // nearest unchecked index.
+        int32_t index = static_cast<int32_t>(participant_count);
+        if (rank < index) index = rank;
+        while (index > 0) {
+            --index;
+            const auto peer_rank = participants[index].in_group_rank;
+            if (peer_rank == rank) return index;
+            if (peer_rank < rank) break;
+        }
+        return -1;
+    }
 
     [[nodiscard]] __device__ __forceinline__ const CollectivePeer& self()
         const {
@@ -99,34 +211,6 @@ static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
 // Reserve capacity for additional protocol and algorithm updates.
 inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 128;
 inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;
-
-inline constexpr bool isDeviceReductionCombinationSupported(
-    DataType datatype, ReduceOp op) noexcept {
-    switch (op) {
-        case ReduceOp::Sum:
-        case ReduceOp::Product:
-        case ReduceOp::Min:
-        case ReduceOp::Max:
-            break;
-        default:
-            return false;
-    }
-    switch (datatype) {
-        case DataType::Float16:
-        case DataType::Uint8:
-        case DataType::Int8:
-        case DataType::Int16:
-        case DataType::Int32:
-        case DataType::Int64:
-        case DataType::Bfloat16:
-        case DataType::Float32:
-        case DataType::Float64:
-        case DataType::Bool:
-            return true;
-        default:
-            return false;
-    }
-}
 
 enum class DevicePlanStatus : uint8_t {
     Unavailable = 0,

@@ -21,9 +21,9 @@ struct OneShotEndpointMetadata {
 OneShotAlgorithm::OneShotAlgorithm(RegionSlice packets,
                                    OneShotBufferLayout layout,
                                    const LLProtocol& ll)
-    : AlgorithmProvider(DeviceCollectiveAlgorithm::OneShot, kAlgorithmKey,
-                        kEndpointVersion, ll,
-                        {OpType::AllReduce, OpType::AllGather}),
+    : AlgorithmProvider(
+          DeviceCollectiveAlgorithm::OneShot, kAlgorithmKey, kEndpointVersion,
+          ll, {OpType::AllReduce, OpType::AllGather, OpType::ReduceScatter}),
       packets_(std::move(packets)),
       layout_(layout) {}
 
@@ -120,6 +120,12 @@ PGResult<void> OneShotAlgorithm::enqueueImpl(const AllReduceRequest& request,
 PGResult<void> OneShotAlgorithm::enqueueImpl(const AllGatherRequest& request,
                                              cudaStream_t stream) const {
     PG_TRY(launchOneShotAllGatherKernel(request, state_.get(), stream));
+    return {};
+}
+
+PGResult<void> OneShotAlgorithm::enqueueImpl(
+    const ReduceScatterRequest& request, cudaStream_t stream) const {
+    PG_TRY(launchOneShotReduceScatterKernel(request, state_.get(), stream));
     return {};
 }
 
