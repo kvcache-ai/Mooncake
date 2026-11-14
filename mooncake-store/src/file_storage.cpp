@@ -1605,7 +1605,8 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    auto batched_query_results = client_->BatchQuery(keys, tenant_id);
+    // Source lookup for a mem->SSD write must not count as a client read hit.
+    auto batched_query_results = client_->BatchQueryReadOnly(keys, tenant_id);
     if (batched_query_results.empty()) {
         return {};
     }
