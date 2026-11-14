@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -3710,10 +3711,451 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
 
     auto public_replicas =
         service.GetReplicaList("standby_restore_nof_key", kDefaultTenant);
-    ASSERT_TRUE(public_replicas.has_value());
-    ASSERT_EQ(public_replicas->replicas.size(), 1);
-    EXPECT_TRUE(public_replicas->replicas.front().is_nof_replica());
+    ASSERT_FALSE(public_replicas.has_value());
+    EXPECT_EQ(public_replicas.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
+
+#ifdef USE_NOF
+TEST_F(MasterServiceHATest, NoFFreshRemountPreservesInvalidItemSkipping) {
+    const auto config = MasterServiceConfig::builder()
+                            .set_memory_allocator(BufferAllocatorType::OFFSET)
+                            .set_eviction_ratio(0)
+                            .set_nof_eviction_ratio(0)
+                            .set_nof_heartbeat_interval_sec(3600)
+                            .build();
+    MasterService service(config);
+    MasterServiceTestPeer(service).SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string*) { return true; });
+    const auto owner = generate_uuid();
+    auto invalid = MakeNoFSegment("invalid-fresh", "invalid-fresh-endpoint", 0);
+    invalid.size = 0;
+    auto valid = MakeNoFSegment("valid-fresh", "valid-fresh-endpoint", 0);
+    // With no standby ranges, a permanently invalid item must not prevent the
+    // rest of the batch from mounting, as in the original remount contract.
+    ASSERT_TRUE(service.ReMountNoFSegment({invalid, valid}, owner));
+    auto mounted = service.GetAllNoFSegments();
+    ASSERT_TRUE(mounted);
+    ASSERT_EQ(mounted->size(), 1u);
+    EXPECT_EQ(mounted->front().id, valid.id);
+    EXPECT_EQ(service.GetStorageUsageSnapshot().nof.capacity_bytes, valid.size);
+    ASSERT_TRUE(service.ReMountNoFSegment({valid, invalid}, owner));
+    EXPECT_EQ(service.GetAllNoFSegments()->size(), 1u);
+    EXPECT_EQ(service.GetStorageUsageSnapshot().nof.capacity_bytes, valid.size);
+
+    auto restored =
+        MakeNoFSegment("restored-batch", "restored-batch-endpoint", 0);
+    auto trailing =
+        MakeNoFSegment("trailing-fresh", "trailing-fresh-endpoint", 0);
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    NoFDescriptor nof;
+    nof.buffer_descriptor = {4096, restored.base, "nvmeof",
+                             restored.te_endpoint};
+    replica.descriptor_variant = nof;
+    StandbyObjectMetadata metadata;
+    metadata.client_id = owner;
+    metadata.size = 4096;
+    metadata.replicas = {replica};
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {{kDefaultTenant.value(), "restored-batch-key", metadata}}, 1, {}));
+    auto bad_restore = restored;
+    bad_restore.size = 2048;
+    auto rejected = service.ReMountNoFSegment(
+        {invalid, valid, bad_restore, trailing}, owner);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(service.GetAllNoFSegments()->size(), 1u);
+    EXPECT_FALSE(service.GetReplicaList("restored-batch-key", kDefaultTenant));
+    ASSERT_TRUE(service.ReMountNoFSegment(
+        {invalid, valid, restored, invalid, trailing}, owner));
+    EXPECT_EQ(service.GetAllNoFSegments()->size(), 3u);
+    EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes, 4096u);
+    EXPECT_TRUE(service.GetReplicaList("restored-batch-key", kDefaultTenant));
+}
+
+TEST_F(MasterServiceHATest, MemoryRemountDoesNotReleaseNoFQuarantine) {
+    MasterService service(
+        MasterServiceConfig::builder().set_eviction_ratio(0).build());
+    auto memory = MakeSegment("shared-endpoint");
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    NoFDescriptor nof;
+    nof.buffer_descriptor = {4096, memory.base, "nvmeof", memory.te_endpoint};
+    replica.descriptor_variant = nof;
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = 4096;
+    metadata.replicas = {replica};
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {{kDefaultTenant.value(), "old-nof", metadata}}, 1, {}));
+    ASSERT_TRUE(service.ReMountSegment({memory}, metadata.client_id));
+    auto readable = service.GetReplicaList("old-nof", kDefaultTenant);
+    ASSERT_FALSE(readable);
+    EXPECT_EQ(readable.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(MasterServiceHATest, NoFRemountPreservesRestoredAllocationRanges) {
+    constexpr size_t kObjectSize = 4096;
+    for (auto allocator :
+         {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {
+        for (bool use_mount : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "allocator=" << static_cast<int>(allocator)
+                         << " mount=" << use_mount);
+            const auto config = MasterServiceConfig::builder()
+                                    .set_memory_allocator(allocator)
+                                    .set_eviction_ratio(0)
+                                    .set_nof_eviction_ratio(0)
+                                    .set_nof_heartbeat_interval_sec(3600)
+                                    .build();
+            const auto client_id = generate_uuid();
+            auto segment = MakeNoFSegment(
+                "recovered-nof", "recovered-nof-endpoint",
+                allocator == BufferAllocatorType::OFFSET ? 0
+                                                         : kDefaultSegmentBase);
+            ReplicateConfig replicas;
+            replicas.replica_num = 0;
+            replicas.nof_replica_num = 1;
+            std::vector<StandbyObjectEntry> snapshot;
+            std::vector<AllocatedBuffer::Descriptor> old_ranges;
+            {
+                MasterService original(config);
+                MasterServiceTestPeer(original).SetNoFProbeFnForTesting(
+                    [](const std::string&, uint32_t, std::string*) {
+                        return true;
+                    });
+                ASSERT_TRUE(original.MountNoFSegment(segment, client_id));
+                for (size_t i = 0; i < 3; ++i) {
+                    const std::string key = "old-" + std::to_string(i);
+                    ASSERT_TRUE(original.PutStart(
+                        client_id, key, kDefaultTenant, kObjectSize, replicas));
+                    ASSERT_TRUE(original.PutEnd(client_id, key, kDefaultTenant,
+                                                ReplicaType::NOF_SSD));
+                    auto readable =
+                        original.GetReplicaList(key, kDefaultTenant);
+                    ASSERT_TRUE(readable);
+                    ASSERT_EQ(readable->replicas.size(), 1u);
+                    if (i == 1)
+                        continue;  // Leave a gap in the restored layout.
+                    old_ranges.push_back(readable->replicas.front()
+                                             .get_nof_descriptor()
+                                             .buffer_descriptor);
+                    StandbyObjectMetadata metadata;
+                    metadata.client_id = client_id;
+                    metadata.size = kObjectSize;
+                    metadata.replicas = readable->replicas;
+                    snapshot.push_back(
+                        {kDefaultTenant.value(), key, std::move(metadata)});
+                }
+            }
+
+            MasterService recovered(config);
+            MasterServiceTestPeer(recovered).SetNoFProbeFnForTesting(
+                [](const std::string&, uint32_t, std::string*) {
+                    return true;
+                });
+            ASSERT_TRUE(recovered.RestoreFromStandbySnapshot(snapshot, 3, {}));
+            if (use_mount) {
+                ASSERT_TRUE(recovered.MountNoFSegment(segment, client_id));
+            } else {
+                ASSERT_TRUE(recovered.ReMountNoFSegment({segment}, client_id));
+            }
+            EXPECT_EQ(recovered.GetStorageUsageSnapshot().nof.used_bytes,
+                      old_ranges.size() * kObjectSize);
+            ASSERT_TRUE(recovered.ReMountNoFSegment({segment}, client_id));
+            EXPECT_EQ(recovered.GetStorageUsageSnapshot().nof.used_bytes,
+                      old_ranges.size() * kObjectSize);
+            auto added = recovered.PutStart(client_id, "new", kDefaultTenant,
+                                            kObjectSize, replicas);
+            ASSERT_TRUE(added);
+            ASSERT_EQ(added->size(), 1u);
+            const auto fresh =
+                added->front().get_nof_descriptor().buffer_descriptor;
+            for (const auto& old : old_ranges) {
+                const bool overlaps =
+                    fresh.buffer_address_ < old.buffer_address_ + old.size_ &&
+                    old.buffer_address_ < fresh.buffer_address_ + fresh.size_;
+                std::cout << "NOF_RANGE allocator="
+                          << static_cast<int>(allocator)
+                          << " mount=" << use_mount
+                          << " endpoint=" << fresh.transport_endpoint_
+                          << " old_begin=" << old.buffer_address_
+                          << " old_end=" << old.buffer_address_ + old.size_
+                          << " new_begin=" << fresh.buffer_address_
+                          << " new_end=" << fresh.buffer_address_ + fresh.size_
+                          << " overlaps=" << overlaps << std::endl;
+                EXPECT_FALSE(overlaps);
+            }
+            for (const auto& entry : snapshot) {
+                auto old = recovered.GetReplicaList(entry.key, kDefaultTenant);
+                ASSERT_TRUE(old);
+                const auto& actual = old->replicas.front()
+                                         .get_nof_descriptor()
+                                         .buffer_descriptor;
+                const auto& expected = entry.metadata.replicas.front()
+                                           .get_nof_descriptor()
+                                           .buffer_descriptor;
+                EXPECT_EQ(actual.buffer_address_, expected.buffer_address_);
+                EXPECT_EQ(actual.size_, expected.size_);
+                EXPECT_EQ(actual.transport_endpoint_,
+                          expected.transport_endpoint_);
+            }
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest, NoFImportedBuffersInvalidateOnUnmount) {
+    for (auto allocator :
+         {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {
+        for (bool pre_mounted : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "allocator=" << static_cast<int>(allocator)
+                         << " pre_mounted=" << pre_mounted);
+            const auto config = MasterServiceConfig::builder()
+                                    .set_memory_allocator(allocator)
+                                    .set_eviction_ratio(0)
+                                    .set_nof_eviction_ratio(0)
+                                    .set_nof_heartbeat_interval_sec(3600)
+                                    .build();
+            MasterService service(config);
+            MasterServiceTestPeer(service).SetNoFProbeFnForTesting(
+                [](const std::string&, uint32_t, std::string*) {
+                    return true;
+                });
+            auto segment = MakeNoFSegment(
+                "unmount-imported-nof", "unmount-imported-nof-endpoint",
+                allocator == BufferAllocatorType::OFFSET ? 0
+                                                         : kDefaultSegmentBase);
+            const auto owner = generate_uuid();
+            if (pre_mounted) {
+                ASSERT_TRUE(service.MountNoFSegment(segment, owner));
+            }
+            Replica::Descriptor replica;
+            replica.id = 1;
+            replica.status = ReplicaStatus::COMPLETE;
+            NoFDescriptor nof;
+            nof.buffer_descriptor = {4096, segment.base, "nvmeof",
+                                     segment.te_endpoint};
+            replica.descriptor_variant = nof;
+            StandbyObjectMetadata metadata;
+            metadata.client_id = owner;
+            metadata.size = 4096;
+            metadata.replicas = {replica};
+            ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+                {{kDefaultTenant.value(), "restored", metadata}}, 1, {}));
+            auto retry = segment;
+            if (pre_mounted) retry.id = generate_uuid();
+            ASSERT_TRUE(service.MountNoFSegment(retry, owner));
+
+            // A request snapshot can outlive registration removal. Keeping the
+            // allocator alive must not keep either kind of buffer readable.
+            AllocatorManager detached;
+            {
+                auto access = MasterServiceTestPeer::NofSegmentManager(service)
+                                  .getAllocatorAccess();
+                detached = access.SnapshotAllocatorManager();
+            }
+            ReplicateConfig replicas;
+            replicas.replica_num = 0;
+            replicas.nof_replica_num = 1;
+            ASSERT_TRUE(service.PutStart(owner, "fresh", kDefaultTenant, 4096,
+                                         replicas));
+            ASSERT_TRUE(service.PutEnd(owner, "fresh", kDefaultTenant,
+                                       ReplicaType::NOF_SSD));
+            ASSERT_TRUE(service.GetReplicaList("restored", kDefaultTenant));
+            ASSERT_TRUE(service.GetReplicaList("fresh", kDefaultTenant));
+            ASSERT_TRUE(service.UnmountNoFSegment(segment.id, owner));
+            const auto restored =
+                service.GetReplicaList("restored", kDefaultTenant);
+            const auto fresh = service.GetReplicaList("fresh", kDefaultTenant);
+            std::cout << "NOF_UNMOUNT allocator=" << static_cast<int>(allocator)
+                      << " pre_mounted=" << pre_mounted
+                      << " restored_readable=" << restored.has_value()
+                      << " fresh_readable=" << fresh.has_value() << std::endl;
+            EXPECT_FALSE(restored);
+            EXPECT_FALSE(fresh);
+            EXPECT_TRUE(ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                     "restored")
+                            .empty());
+            EXPECT_TRUE(
+                ReplicaDescriptorsForTesting(service, kDefaultTenant, "fresh")
+                    .empty());
+            EXPECT_TRUE(service.GetAllNoFSegments()->empty());
+            EXPECT_FALSE(detached.isServing(segment.name));
+            const auto registrations = detached.getAllocators(segment.name);
+            ASSERT_NE(registrations, nullptr);
+            ASSERT_EQ(registrations->size(), 1u);
+            EXPECT_FALSE(registrations->front()->Allocate(4096));
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       NoFRestoreReregistrationAcceptsFreshClientAndSegmentUUIDs) {
+    for (auto allocator :
+         {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {
+        for (bool use_mount : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "allocator=" << static_cast<int>(allocator)
+                         << " mount=" << use_mount);
+            const auto config = MasterServiceConfig::builder()
+                                    .set_memory_allocator(allocator)
+                                    .set_eviction_ratio(0)
+                                    .set_nof_eviction_ratio(0)
+                                    .set_nof_heartbeat_interval_sec(3600)
+                                    .build();
+            MasterService service(config);
+            MasterServiceTestPeer(service).SetNoFProbeFnForTesting(
+                [](const std::string&, uint32_t, std::string*) {
+                    return true;
+                });
+            auto segment = MakeNoFSegment(
+                "pre-mounted-nof", "pre-mounted-nof-endpoint",
+                allocator == BufferAllocatorType::OFFSET ? 0
+                                                         : kDefaultSegmentBase);
+            const auto owner = generate_uuid();
+            ASSERT_TRUE(service.MountNoFSegment(segment, owner));
+            Replica::Descriptor replica;
+            replica.id = 1;
+            replica.status = ReplicaStatus::COMPLETE;
+            NoFDescriptor nof;
+            nof.buffer_descriptor = {4096, segment.base, "nvmeof",
+                                     segment.te_endpoint};
+            replica.descriptor_variant = nof;
+            StandbyObjectMetadata metadata;
+            metadata.client_id = owner;
+            metadata.size = 4096;
+            metadata.replicas = {replica};
+            ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+                {{kDefaultTenant.value(), "old", metadata}}, 1, {}));
+            ReplicateConfig replicas;
+            replicas.replica_num = 0;
+            replicas.nof_replica_num = 1;
+            EXPECT_FALSE(service.PutStart(owner, "before-import",
+                                          kDefaultTenant, 4096, replicas));
+            EXPECT_FALSE(service.GetReplicaList("old", kDefaultTenant));
+            const auto new_owner = generate_uuid();
+            auto retry = segment;
+            retry.id = generate_uuid();
+            auto invalid = retry;
+            invalid.base += segment.size;
+            EXPECT_FALSE(service.ReMountNoFSegment({invalid}, new_owner));
+            EXPECT_FALSE(service.PutStart(owner, "after-failed-import",
+                                          kDefaultTenant, 4096, replicas));
+            auto mounted = use_mount
+                               ? service.MountNoFSegment(retry, new_owner)
+                               : service.ReMountNoFSegment({retry}, new_owner);
+            ASSERT_TRUE(mounted);
+            auto owners = service.GetNoFSegmentsByName(segment.name);
+            ASSERT_TRUE(owners);
+            ASSERT_EQ(owners->size(), 1u);
+            EXPECT_EQ(owners->front().segment_id, segment.id);
+            EXPECT_EQ(owners->front().client_id, owner);
+            auto repeated = retry;
+            repeated.id = generate_uuid();
+            ASSERT_TRUE(service.MountNoFSegment(repeated, generate_uuid()));
+            EXPECT_EQ(service.GetAllNoFSegments()->size(), 1u);
+            EXPECT_EQ(service.GetStorageUsageSnapshot().nof.capacity_bytes,
+                      segment.size);
+            EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes, 4096u);
+            auto old = service.GetReplicaList("old", kDefaultTenant);
+            ASSERT_TRUE(old);
+            EXPECT_EQ(old->replicas.front()
+                          .get_nof_descriptor()
+                          .buffer_descriptor.buffer_address_,
+                      segment.base);
+            std::cout << "NOF_UUID allocator=" << static_cast<int>(allocator)
+                      << " mount=" << use_mount << " stored_id_preserved="
+                      << (owners->front().segment_id == segment.id)
+                      << " stored_owner_preserved="
+                      << (owners->front().client_id == owner) << " used_bytes="
+                      << service.GetStorageUsageSnapshot().nof.used_bytes
+                      << std::endl;
+            auto fresh = service.PutStart(new_owner, "after-import",
+                                          kDefaultTenant, 4096, replicas);
+            ASSERT_TRUE(fresh);
+            EXPECT_GE(fresh->front()
+                          .get_nof_descriptor()
+                          .buffer_descriptor.buffer_address_,
+                      segment.base + 4096);
+            ASSERT_TRUE(service.UnmountNoFSegment(owners->front().segment_id,
+                                                  owners->front().client_id));
+            EXPECT_TRUE(service.GetAllNoFSegments()->empty());
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest, NoFRemountRejectsInvalidRangesWithoutPublishing) {
+    for (auto allocator :
+         {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {
+        for (bool overlapping : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "allocator=" << static_cast<int>(allocator)
+                         << " overlapping=" << overlapping);
+            auto segment = MakeNoFSegment(
+                "invalid-nof", "invalid-nof-endpoint",
+                allocator == BufferAllocatorType::OFFSET ? 0
+                                                         : kDefaultSegmentBase);
+            const auto owner = generate_uuid();
+            Replica::Descriptor replica;
+            replica.id = 1;
+            replica.status = ReplicaStatus::COMPLETE;
+            NoFDescriptor nof;
+            nof.buffer_descriptor = {4096, segment.base, "nvmeof",
+                                     segment.te_endpoint};
+            replica.descriptor_variant = nof;
+            StandbyObjectMetadata metadata;
+            metadata.client_id = owner;
+            metadata.size = 4096;
+            metadata.replicas = {replica};
+            StandbyMetadataStore store;
+            ASSERT_TRUE(
+                store.RestoreMetadata(kDefaultTenant.value(), "old", metadata));
+            if (overlapping) {
+                metadata.replicas.front().id = 2;
+                ASSERT_TRUE(store.RestoreMetadata(kDefaultTenant.value(),
+                                                  "overlap", metadata));
+            }
+            const auto config = MasterServiceConfig::builder()
+                                    .set_memory_allocator(allocator)
+                                    .set_eviction_ratio(0)
+                                    .set_nof_eviction_ratio(0)
+                                    .set_nof_heartbeat_interval_sec(3600)
+                                    .build();
+            MasterService service(config);
+            MasterServiceTestPeer(service).SetNoFProbeFnForTesting(
+                [](const std::string&, uint32_t, std::string*) {
+                    return true;
+                });
+            ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(
+                store, DurablePrefix{1, 1}, {}, overlapping ? 2 : 1, 1));
+            auto invalid = segment;
+            if (!overlapping) invalid.base += segment.size;
+            auto mounted = service.ReMountNoFSegment({invalid}, owner);
+            ASSERT_FALSE(mounted);
+            EXPECT_EQ(mounted.error(), ErrorCode::INVALID_PARAMS);
+            EXPECT_TRUE(service.GetAllNoFSegments()->empty());
+            EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes, 0u);
+            auto readable = service.GetReplicaList("old", kDefaultTenant);
+            ASSERT_FALSE(readable);
+            EXPECT_EQ(readable.error(), ErrorCode::REPLICA_IS_NOT_READY);
+            MasterServiceTestPeer(service).RunNoFBatchEvictForTesting(1.0, 1.0);
+            EXPECT_EQ(
+                ReplicaDescriptorsForTesting(service, kDefaultTenant, "old")
+                    .size(),
+                1u);
+            if (!overlapping) {
+                ASSERT_TRUE(service.ReMountNoFSegment({segment}, owner));
+                EXPECT_TRUE(service.GetReplicaList("old", kDefaultTenant));
+                EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes,
+                          4096u);
+            }
+        }
+    }
+}
+#endif
 
 TEST_F(MasterServiceHATest, OplogDisabledByDefaultDoesNotCreateWriter) {
     auto config = MasterServiceConfig::builder()

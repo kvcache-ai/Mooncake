@@ -235,8 +235,16 @@ class ScopedNoFSegmentAccess {
 
     /**
      * @brief Mount a segment
+     * Restored buffers are bound to the actual published registration, even
+     * when an endpoint-idempotent retry supplies a different segment UUID.
      */
-    ErrorCode MountSegment(const NoFSegment& segment, const UUID& client_id);
+    ErrorCode MountSegment(
+        const NoFSegment& segment, const UUID& client_id,
+        std::shared_ptr<BufferAllocatorBase> restored_allocator = nullptr,
+        const std::vector<std::unique_ptr<AllocatedBuffer>>& restored_buffers =
+            {});
+
+    void QuarantineEndpoint(const std::string& endpoint);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
