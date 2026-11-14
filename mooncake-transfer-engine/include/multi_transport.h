@@ -15,17 +15,27 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "transport/transport.h"
 #include "task_congestion_status.h"
 
 namespace mooncake {
+
+// Snapshot of a batch that reached a terminal state. Drain copies this out
+// of the ready queue and does not look the batch up again.
+struct BatchCompletion {
+    Transport::BatchID batch_id = 0;
+    Transport::TransferStatus status{};
+};
+
 class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
@@ -89,6 +99,15 @@ class MultiTransport {
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status,
                                   bool walk_tasks = false);
 
+    // See TransferEngine::completionFd() / RFC #5164.
+    int completionFd() const { return completion_fd_; }
+
+    // See TransferEngine::enableBatchCompletionNotification().
+    Status enableBatchCompletionNotification(BatchID batch_id);
+
+    // See TransferEngine::drainCompletions().
+    Status drainCompletions(std::vector<BatchCompletion> &out);
+
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
 
@@ -148,6 +167,14 @@ class MultiTransport {
 
     void deferredCleanupLoop();
 
+    // Stop a future or already-published event record from being delivered.
+    // Does not delete the batch.
+    void suppressCompletion(BatchDesc *batch);
+
+    void enqueueTerminal(BatchID batch_id, TransferStatus status);
+
+    static void onTerminal(void *ctx, BatchID batch_id, TransferStatus status);
+
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
                               Transport *&transport,
@@ -167,6 +194,23 @@ class MultiTransport {
         deferred_cleanup_batches_;
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
+
+    // Unbounded MPSC completion queue. CQ threads push; one drain thread
+    // pops. The stub and every record are queue-owned heap nodes.
+    // completion_tail_ is consumer-only. completion_queued_ counts linked
+    // records so a write is needed only when the count leaves 0.
+    using CompletionRecord = Transport::CompletionRecord;
+    std::atomic<CompletionRecord *> completion_head_{nullptr};
+    CompletionRecord *completion_tail_ = nullptr;
+    CompletionRecord *completion_stub_ = nullptr;
+    std::atomic<uint64_t> completion_queued_{0};
+    int completion_fd_ = -1;
+
+    void pushCompletion(CompletionRecord *node);
+    // Single consumer. false when the consumer has observed an empty queue.
+    // Drops the queue's ref on the previous tail.
+    bool popCompletion(BatchCompletion &out);
+    void releaseCompletionRecord(CompletionRecord *record);
 };
 }  // namespace mooncake
 

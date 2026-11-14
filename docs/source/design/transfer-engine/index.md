@@ -663,3 +663,11 @@ task-congestion-status-api
 
 transfer-engine-bench-tuning
 :::
+
+## Completion notification
+
+:::{toctree}
+:maxdepth: 1
+
+completion-notification
+:::

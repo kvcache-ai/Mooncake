@@ -156,6 +156,14 @@ class TransferEngineImpl {
         if (entries.empty()) {
             return Status::InvalidArgument("entries must not be empty");
         }
+        // The notify is stored after submit and sent only from
+        // getBatchTransferStatus. An event-enabled batch can be drained and
+        // freed before it is stored and is not polled, so reject it.
+        if (Transport::toBatchDesc(batch_id).event_enabled) {
+            return Status::InvalidArgument(
+                "submitTransferWithNotify is not supported on an "
+                "event-enabled batch; send the notify after draining");
+        }
         auto target_id = entries[0].target_id;
         Status s = multi_transports_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
@@ -347,6 +355,8 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            // Post a pending submitTransferWithNotify message once. Not
+            // invoked from the eventfd / CQ completion path (RFC #5164).
             std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
             {
                 RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -362,6 +372,28 @@ class TransferEngineImpl {
             }
         }
         return result;
+    }
+
+    int completionFd() const {
+        if (!multi_transports_) return -1;
+        return multi_transports_->completionFd();
+    }
+
+    Status enableBatchCompletionNotification(BatchID batch_id) {
+        if (!multi_transports_) {
+            return Status::NotSupportedTransport(
+                "transfer engine is not initialized");
+        }
+        return multi_transports_->enableBatchCompletionNotification(batch_id);
+    }
+
+    Status drainCompletions(std::vector<BatchCompletion>& out) {
+        if (!multi_transports_) {
+            out.clear();
+            return Status::NotSupportedTransport(
+                "transfer engine is not initialized");
+        }
+        return multi_transports_->drainCompletions(out);
     }
 
     Transport* getTransport(const std::string& proto) {

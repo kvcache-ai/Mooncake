@@ -2,7 +2,7 @@
 #
 # pybind11 classes use the pybind11_type metaclass, which cannot be named in
 # a stub; stubtest reports it against each class object itself.
-mooncake\.engine\.(InnerTransferEngine|ReceivedData|ReceivedTensor|RpcInterface|ScatterTransferCompletionStatus|ScatterTransferTicket|SharedSegment|TransferEngine|TransferNotify|TransferOpcode)
+mooncake\.engine\.(InnerTransferEngine|ReceivedData|ReceivedTensor|RpcInterface|ScatterTransferCompletionStatus|ScatterTransferTicket|SharedSegment|TransferEngine|TransferNotify|TransferOpcode|TransferStatus)
 
 # No py::init is bound, so these cannot be constructed from Python.
 mooncake\.engine\.(InnerTransferEngine|ReceivedData|ReceivedTensor|ScatterTransferTicket|SharedSegment)\.__init__

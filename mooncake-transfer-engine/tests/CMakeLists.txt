@@ -242,6 +242,16 @@ add_test(NAME rdma_native_notify_test COMMAND rdma_native_notify_test)
 set_tests_properties(rdma_native_notify_test PROPERTIES LABELS "rdma" TIMEOUT
                                                         120)
 
+# Real CQ completions through the eventfd. Self-skips without an RDMA device
+# or when MC_SLICE_TIMEOUT disables the notification path.
+add_executable(rdma_completion_fd_test
+               ${WORKSPACE}/rdma_completion_fd_test.cpp)
+target_link_libraries(rdma_completion_fd_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_completion_fd_test COMMAND rdma_completion_fd_test)
+set_tests_properties(rdma_completion_fd_test PROPERTIES LABELS "rdma" TIMEOUT
+                                                       120)
+
 # CtrlChannel RDMA notify correctness. Self-skips without RDMA.
 add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
 target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags

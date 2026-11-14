@@ -310,7 +310,7 @@ class Transport {
             // getTransferStatus; packing both into one word is a follow-up.
             const uint64_t state =
                 __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
-            finishIfComplete(t, state, false);
+            finishIfComplete(t, state);
         }
 
         void markFailed() {
@@ -318,9 +318,19 @@ class Transport {
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            // An event batch publishes one snapshot from whichever slice
+            // drops the latch, and that snapshot only reads has_failure.
+            // The flag must be visible before completion_state. Legacy
+            // batches still record it in finishIfComplete, after the count.
+            const bool event_batch =
+                t->batch_id && toBatchDesc(t->batch_id).event_enabled;
+            if (event_batch) {
+                toBatchDesc(t->batch_id)
+                    .has_failure.store(true, std::memory_order_release);
+            }
             const uint64_t state =
                 __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
-            finishIfComplete(t, state, true);
+            finishIfComplete(t, state, /*record_failure=*/!event_batch);
         }
 
         static void unsealTaskSubmission(TransferTask *task) {
@@ -331,20 +341,41 @@ class Transport {
             CompletionCallbackPin pin(task);
             const uint64_t state = __atomic_or_fetch(
                 &task->completion_state, kCompletionSealBit, __ATOMIC_ACQ_REL);
-            finishIfComplete(task, state, false);
+            finishIfComplete(task, state);
         }
 
         volatile int64_t ts;
 
        private:
+        // Stamp the completion time for metrics. No-op unless collection
+        // was enabled before submit (start_time is left at 0 otherwise).
+        // Does not set is_finished.
+        static inline void stampMetricsOutcome(TransferTask *task) {
+#ifdef WITH_METRICS
+            if (task->start_time.time_since_epoch().count() == 0) return;
+            __atomic_store_n(
+                &task->end_ticks,
+                std::chrono::steady_clock::now().time_since_epoch().count(),
+                __ATOMIC_RELAXED);
+            const bool failed = __atomic_load_n(&task->failed_slice_count,
+                                                __ATOMIC_ACQUIRE) != 0;
+            __atomic_store_n(&task->end_status,
+                             failed ? TransferStatusEnum::FAILED
+                                    : TransferStatusEnum::COMPLETED,
+                             __ATOMIC_RELAXED);
+#else
+            (void)task;
+#endif
+        }
+
         static inline void finishIfComplete(TransferTask *task, uint64_t state,
-                                            bool is_failed) {
+                                            bool record_failure = false) {
             // Handshake / dummy slices are not attached to a BatchDesc.
             if (!task->batch_id) return;
             // Callers hold a pin on this BatchDesc across the publish and
             // this callback; see CompletionCallbackPin.
             auto &batch_desc = toBatchDesc(task->batch_id);
-            if (is_failed) {
+            if (record_failure) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
 
@@ -363,31 +394,32 @@ class Transport {
             // Non-EDC: is_finished stays with getTransferStatus on the
             // completion walk. The WAITING fast path never frees the batch;
             // COMPLETED always walks first, so CQ must not write is_finished.
+            // The terminal notify is a separate wake. It does not settle
+            // is_finished and does not require a status poll.
+            // Metrics still need the callback time. A later free or status
+            // query would otherwise time the task until that call.
+            if (batch_desc.event_enabled) stampMetricsOutcome(task);
             batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_acq_rel);
+            batch_desc.releaseCompletionLatchToken();
 #else
             // EDC waiters can freeBatchID after the CV without a walk.
-#ifdef WITH_METRICS
-            // Save the outcome only for tasks the metrics record.
-            if (task->start_time.time_since_epoch().count() != 0) {
-                __atomic_store_n(
-                    &task->end_ticks,
-                    std::chrono::steady_clock::now().time_since_epoch().count(),
-                    __ATOMIC_RELAXED);
-                const bool failed = __atomic_load_n(&task->failed_slice_count,
-                                                    __ATOMIC_ACQUIRE) != 0;
-                __atomic_store_n(&task->end_status,
-                                 failed ? TransferStatusEnum::FAILED
-                                        : TransferStatusEnum::COMPLETED,
-                                 __ATOMIC_RELAXED);
-            }
-#endif
+            stampMetricsOutcome(task);
             __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
 
             auto prev = batch_desc.finished_task_count.fetch_add(
                 1, std::memory_order_acq_rel);
-            if (prev + 1 == batch_desc.batch_size) {
-                // Last task in the batch: wake up waiting thread directly.
+            // #5147 sync wait stays on allocated capacity. A legacy batch
+            // may submit again, so this thread must not read task_list.size()
+            // unless the batch opted into the eventfd path, which rejects a
+            // second submit and keeps that size stable. The eventfd latch
+            // is the only submitted-count boundary.
+            const uint64_t wake_at =
+                batch_desc.event_enabled
+                    ? static_cast<uint64_t>(batch_desc.task_list.size())
+                    : static_cast<uint64_t>(batch_desc.batch_size);
+            if (prev + 1 == wake_at) {
+                // Wake transferSync on the boundary chosen above.
                 // Publish completion under the same mutex used by the waiter
                 // to avoid lost notifications.
                 //
@@ -407,6 +439,7 @@ class Transport {
                 // only to block again on the mutex.
                 batch_desc.completion_cv.notify_all();
             }
+            batch_desc.releaseCompletionLatchToken();
 #endif
         }
 
@@ -567,6 +600,20 @@ class Transport {
         }
     };
 
+    // One heap node per published event batch. The queue owns it, so
+    // freeing the BatchDesc does not unlink the queue.
+    struct CompletionRecord {
+        std::atomic<CompletionRecord *> next{nullptr};
+        BatchID batch_id = 0;
+        TransferStatus status{};
+        // freeBatchID sets this after the record is published. Drain
+        // drops the id and does not touch the BatchDesc.
+        std::atomic<bool> skip{false};
+        // One ref for the queue, one for the batch. free releases the
+        // batch ref; pop releases the queue ref.
+        std::atomic<uint32_t> refs{2};
+    };
+
     struct BatchDesc {
         BatchID id;
         size_t batch_size;
@@ -588,11 +635,88 @@ class Transport {
         // As with task_list, submission and polling must be serialized.
         bool counter_eligible = false;
 
+        // Opt-in for the engine-owned completion eventfd (RFC #5164 v1).
+        // Set by enableBatchCompletionNotification before the first submit.
+        // Only an event-enabled, counter-eligible batch installs
+        // terminal_notify and writes the fd. Legacy batches leave this false
+        // and keep today's submit/status path with no eventfd write.
+        bool event_enabled = false;
+
         // Number of completion callbacks currently holding a pin on this
         // BatchDesc and therefore still allowed to read or update it and the
         // TransferTask objects in task_list. freeBatchID() must not delete
         // this object while a pin is held.
         std::atomic<uint64_t> active_completion_callbacks{0};
+
+        // Installed once by enableBatchCompletionNotification. Null when
+        // this batch did not opt in. The callback must not throw and must
+        // not call getBatchTransferStatus.
+        using TerminalNotifyFn = void (*)(void *ctx, BatchID batch_id,
+                                          TransferStatus status);
+        TerminalNotifyFn terminal_notify = nullptr;
+        void *terminal_notify_ctx = nullptr;
+
+        // Event-batch publish state. The queue node is not stored here.
+        // Suppressed means freeBatchID won before publish, so the callback
+        // must not enqueue. After publish, free only sets the node's skip
+        // flag; drain reads that flag and does not need this object.
+        static constexpr uint32_t kCompletionIdle = 0;
+        static constexpr uint32_t kCompletionQueued = 1;
+        static constexpr uint32_t kCompletionSuppressed = 2;
+        std::atomic<uint32_t> completion_queue_state{kCompletionIdle};
+        std::atomic<CompletionRecord *> completion_record{nullptr};
+
+        // Event-batch completion latch (RFC #5164 v1). Separate from
+        // finished_task_count, which EDC and the status path still use.
+        //
+        // Invariants:
+        // - Armed to N+1 after rejection checks and before the first
+        //   submitTransferTask (N = submitted tasks). Non-opt-in batches
+        //   leave it at 0 and never touch it.
+        // - Each finished task releases one token from finishIfComplete.
+        //   Any future path that finishes a task (timeout, cancel) must
+        //   go through finishIfComplete so the latch still publishes.
+        // - The submit tail releases the extra token only on success.
+        //   Whoever drops the counter to 0 is the single publisher.
+        // - A failed submit never releases the extra token, so the latch
+        //   never reaches 0 and nothing is erased from the ready queue.
+        std::atomic<uint64_t> pending{0};
+
+        // Same accounting as a settled getBatchTransferStatus walk: a
+        // FAILED task contributes no bytes.
+        uint64_t settledTransferredBytes() const {
+            uint64_t bytes = 0;
+            for (const auto &task : task_list) {
+                if (__atomic_load_n(&task.failed_slice_count,
+                                    __ATOMIC_ACQUIRE) != 0)
+                    continue;
+                bytes +=
+                    __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
+            }
+            return bytes;
+        }
+
+        // Publish COMPLETED or FAILED onto the engine queue. v1 does not
+        // publish TIMEOUT or CANCELED. The notify target drops the event
+        // if freeBatchID already suppressed it.
+        void publishTerminalSnapshot() {
+            if (terminal_notify == nullptr) return;
+            TransferStatus status;
+            status.s = has_failure.load(std::memory_order_acquire)
+                           ? TransferStatusEnum::FAILED
+                           : TransferStatusEnum::COMPLETED;
+            status.transferred_bytes = settledTransferredBytes();
+            terminal_notify(terminal_notify_ctx, id, status);
+        }
+
+        // Release one latch token. No-op for non-event batches. Whoever
+        // observes the previous value as 1 publishes the terminal snapshot.
+        void releaseCompletionLatchToken() {
+            if (!event_enabled) return;
+            if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                publishTerminalSnapshot();
+            }
+        }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Synchronization primitives for direct notification
