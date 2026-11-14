@@ -456,14 +456,11 @@ Status IntraNodeNvlinkTransport::submitTransfer(
                                std::string(cudaGetErrorString(sync_err)));
     }
 
-    // Phase 1: Prepare slices and collect memcpy parameters
-    std::vector<void *> dsts, srcs;
-    std::vector<size_t> sizes;
-    std::vector<Slice *> slices;
-
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
-        ++task_id;
+    // Resolve the whole request group before publishing any slice. Otherwise
+    // a later IPC failure leaves earlier slices pending and the batch busy.
+    std::vector<uint64_t> resolved_targets;
+    resolved_targets.reserve(entries.size());
+    for (const auto &request : entries) {
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             // Open the peer IPC mapping on the source buffer's device so the
@@ -478,8 +475,25 @@ Status IntraNodeNvlinkTransport::submitTransfer(
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
             if (src_device != saved_device) cudaSetDevice(saved_device);
-            if (rc) return Status::Memory("device memory not registered");
+            if (rc) {
+                return Status::Memory(
+                    "failed to relocate NVLink target; check CUDA IPC peer "
+                    "access and buffer registration");
+            }
         }
+        resolved_targets.push_back(dest_addr);
+    }
+
+    // Phase 1: Prepare slices and collect memcpy parameters
+    std::vector<void *> dsts, srcs;
+    std::vector<size_t> sizes;
+    std::vector<Slice *> slices;
+
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto &request = entries[index];
+        TransferTask &task = batch_desc.task_list[task_id];
+        ++task_id;
+        uint64_t dest_addr = resolved_targets[index];
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
@@ -586,16 +600,14 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
                                std::string(cudaGetErrorString(sync_err)));
     }
 
-    // Phase 1: Prepare slices and collect memcpy parameters
-    std::vector<void *> dsts, srcs;
-    std::vector<size_t> sizes;
-    std::vector<Slice *> slices;
-
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto &task = *task_list[index];
-        assert(task.request);
-        auto &request = *task.request;
+    // Keep submission atomic on relocation failures: no task may retain a
+    // pending slice when another request cannot be mapped.
+    std::vector<uint64_t> resolved_targets;
+    resolved_targets.reserve(task_list.size());
+    for (auto *task : task_list) {
+        assert(task);
+        assert(task->request);
+        const auto &request = *task->request;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             // Open the peer IPC mapping on the source buffer's device so the
@@ -610,8 +622,24 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
             if (src_device != saved_device) cudaSetDevice(saved_device);
-            if (rc) return Status::Memory("device memory not registered");
+            if (rc) {
+                return Status::Memory(
+                    "failed to relocate NVLink target; check CUDA IPC peer "
+                    "access and buffer registration");
+            }
         }
+        resolved_targets.push_back(dest_addr);
+    }
+
+    // Phase 1: Prepare slices and collect memcpy parameters
+    std::vector<void *> dsts, srcs;
+    std::vector<size_t> sizes;
+    std::vector<Slice *> slices;
+
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        auto &task = *task_list[index];
+        auto &request = *task.request;
+        uint64_t dest_addr = resolved_targets[index];
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
