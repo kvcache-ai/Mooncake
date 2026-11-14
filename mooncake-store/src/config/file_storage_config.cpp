@@ -82,7 +82,7 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
         config.storage_backend_type = StorageBackendType::kNvmeKv;
     } else {
-        LOG(ERROR) << "Unknown storage backend.";
+        LOG(ERROR) << "Unknown storage backend: " << storage_backend_descriptor;
     }
 
     config.storage_filepath = Environ::ReadOr(
@@ -264,8 +264,8 @@ bool FileStorageConfig::Validate() const {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
         return false;
     }
-    if (total_size_limit == 0) {
-        LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
+    if (total_size_limit <= 0) {
+        LOG(ERROR) << "FileStorageConfig: total_size_limit must > 0";
         return false;
     }
     if (pinned_restore_arena_size < 0) {
@@ -275,6 +275,12 @@ bool FileStorageConfig::Validate() const {
     }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
+        return false;
+    }
+    // The client buffer GC thread sleeps for this long between scans.
+    if (client_buffer_gc_interval_seconds == 0) {
+        LOG(ERROR)
+            << "FileStorageConfig: client_buffer_gc_interval_seconds must > 0";
         return false;
     }
     if (disk_eviction_low_watermark_ratio <= 0.0 ||

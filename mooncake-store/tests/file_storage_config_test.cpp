@@ -349,6 +349,8 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     config.total_keys_limit = 1;
     config.total_size_limit = 0;
     EXPECT_FALSE(config.Validate());
+    config.total_size_limit = -1;
+    EXPECT_FALSE(config.Validate());
 
     config.total_size_limit = 1;
     config.pinned_restore_arena_size = -1;
@@ -359,6 +361,10 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     EXPECT_FALSE(config.Validate());
 
     config.heartbeat_interval_seconds = 1;
+    config.client_buffer_gc_interval_seconds = 0;
+    EXPECT_FALSE(config.Validate());
+
+    config.client_buffer_gc_interval_seconds = 1;
     config.disk_eviction_low_watermark_ratio = 0.9;
     config.disk_eviction_high_watermark_ratio = 0.8;
     EXPECT_FALSE(config.Validate());
