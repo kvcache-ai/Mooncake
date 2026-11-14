@@ -1,5 +1,5 @@
-// C ABI over ConductorClient, consumed by the Rust bindings in
-// mooncake-conductor/rust. Mirrors the Python _conductor module: the same
+// C ABI over ConductorClient, consumed by the Rust and Go bindings.
+// Mirrors the Python _conductor module: the same
 // operations, defaults, and numeric return codes.
 
 #ifndef MOONCAKE_CONDUCTOR_C_H
@@ -252,6 +252,11 @@ void mooncake_conductor_close(mooncake_conductor_t conductor);
  */
 int mooncake_conductor_health_check(mooncake_conductor_t conductor);
 
+// Like health_check, with the status in *status and the original RPC error
+// returned separately. Existing health_check keeps its status-only contract.
+int mooncake_conductor_health_check_ex(mooncake_conductor_t conductor,
+                                       int *status);
+
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
@@ -275,6 +280,14 @@ int mooncake_conductor_register(
 int mooncake_conductor_unregister(mooncake_conductor_t conductor,
                                   const char *instance_id,
                                   const char *tenant_id, int dp_rank);
+
+// Like unregister, also returning the server's removed service key. The output
+// is NULL on failure; release a successful key with string_free.
+int mooncake_conductor_unregister_ex(mooncake_conductor_t conductor,
+                                     const char *instance_id,
+                                     const char *tenant_id, int dp_rank,
+                                     char **removed_key);
+void mooncake_conductor_string_free(char *value);
 
 int mooncake_conductor_get_global_view(mooncake_conductor_t conductor,
                                        mooncake_conductor_global_view_t *view);

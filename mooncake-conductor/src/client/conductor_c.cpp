@@ -247,17 +247,28 @@ void mooncake_conductor_close(mooncake_conductor_t conductor) {
 }
 
 int mooncake_conductor_health_check(mooncake_conductor_t conductor) {
-    if (!conductor) return MOONCAKE_CONDUCTOR_HEALTH_NOT_INITIALIZED;
+    int status = MOONCAKE_CONDUCTOR_HEALTH_NOT_INITIALIZED;
+    mooncake_conductor_health_check_ex(conductor, &status);
+    return status;
+}
+
+int mooncake_conductor_health_check_ex(mooncake_conductor_t conductor,
+                                       int *status) {
+    if (!status) return MOONCAKE_CONDUCTOR_INVALID_PARAMS;
+    *status = MOONCAKE_CONDUCTOR_HEALTH_NOT_INITIALIZED;
+    if (!conductor) return MOONCAKE_CONDUCTOR_OK;
     auto *handle = as_handle(conductor);
     if (!handle->setup_called.load()) {
-        return MOONCAKE_CONDUCTOR_HEALTH_NOT_INITIALIZED;
+        return MOONCAKE_CONDUCTOR_OK;
     }
+    *status = MOONCAKE_CONDUCTOR_HEALTH_UNREACHABLE;
     try {
-        return handle->client.HealthCheck()
-                   ? MOONCAKE_CONDUCTOR_HEALTH_OK
-                   : MOONCAKE_CONDUCTOR_HEALTH_UNREACHABLE;
+        auto result = handle->client.ListServices();
+        if (!result) return to_rc(result.error());
+        *status = MOONCAKE_CONDUCTOR_HEALTH_OK;
+        return MOONCAKE_CONDUCTOR_OK;
     } catch (...) {
-        return MOONCAKE_CONDUCTOR_HEALTH_UNREACHABLE;
+        return MOONCAKE_CONDUCTOR_INTERNAL_ERROR;
     }
 }
 
@@ -271,7 +282,8 @@ int mooncake_conductor_query(mooncake_conductor_t conductor,
     if (!result) return MOONCAKE_CONDUCTOR_INVALID_PARAMS;
     *result = {};
     if (!conductor || !request ||
-        (!request->token_ids && request->token_count > 0)) {
+        (!request->token_ids && request->token_count > 0) ||
+        request->token_count > std::vector<int32_t>().max_size()) {
         return MOONCAKE_CONDUCTOR_INVALID_PARAMS;
     }
     try {
@@ -353,16 +365,29 @@ int mooncake_conductor_register(
 int mooncake_conductor_unregister(mooncake_conductor_t conductor,
                                   const char *instance_id,
                                   const char *tenant_id, int dp_rank) {
+    return mooncake_conductor_unregister_ex(conductor, instance_id, tenant_id,
+                                            dp_rank, nullptr);
+}
+
+int mooncake_conductor_unregister_ex(mooncake_conductor_t conductor,
+                                     const char *instance_id,
+                                     const char *tenant_id, int dp_rank,
+                                     char **removed_key) {
+    if (removed_key) *removed_key = nullptr;
     if (!conductor) return MOONCAKE_CONDUCTOR_INVALID_PARAMS;
     try {
         auto rpc = as_handle(conductor)->client.Unregister(
             to_string_or_empty(instance_id), to_string_or_empty(tenant_id),
             dp_rank);
-        return rpc ? MOONCAKE_CONDUCTOR_OK : to_rc(rpc.error());
+        if (!rpc) return to_rc(rpc.error());
+        if (removed_key) *removed_key = dup_string(rpc->removed_key);
+        return MOONCAKE_CONDUCTOR_OK;
     } catch (...) {
         return MOONCAKE_CONDUCTOR_INTERNAL_ERROR;
     }
 }
+
+void mooncake_conductor_string_free(char *value) { std::free(value); }
 
 int mooncake_conductor_get_global_view(mooncake_conductor_t conductor,
                                        mooncake_conductor_global_view_t *view) {
