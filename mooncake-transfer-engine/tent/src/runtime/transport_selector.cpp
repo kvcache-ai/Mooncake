@@ -301,7 +301,9 @@ void TransportSelector::loadPolicies() {
 }
 
 TransportSelector::TransportSelector(std::shared_ptr<Config> config)
-    : config_(config), force_tcp_(config_->get("transports/force_tcp", false)) {
+    : config_(config),
+      force_tcp_(config_->get("transports/force_tcp", false)),
+      force_fabric_(config_->get("transports/force_fabric", false)) {
     loadPolicies();
 }
 
@@ -578,8 +580,11 @@ SelectionResult TransportSelector::select(
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
+    static const std::vector<TransportType> kFabricOnly{FABRIC};
     const auto& raw =
         force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        : force_fabric_ && context.segment_type == SegmentType::Memory
+            ? kFabricOnly
         : !matching_policy->transports.empty() ? matching_policy->transports
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;
