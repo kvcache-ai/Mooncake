@@ -16,6 +16,7 @@
 #define TENT_ENDPOINT_H
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -139,6 +140,26 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     RdmaContext& context() const { return *context_; }
 
     std::string name() const { return endpoint_name_; }
+
+    // Last moment this endpoint was observed in use, on the steady clock.
+    // Stamped by every endpoint-store lookup (the data path takes one per
+    // slice post) and by every notification received on it, which is the
+    // only CPU-visible sign of life on the passive side of a transfer.
+    void noteUsed() {
+        last_used_ts_.store(steadyNowNs(), std::memory_order_relaxed);
+    }
+
+    uint64_t lastUsedTs() const {
+        return last_used_ts_.load(std::memory_order_relaxed);
+    }
+
+    // Deliberately the steady clock, not getCurrentTimeInNano(): a wall-clock
+    // step would otherwise make every endpoint look idle at once.
+    static uint64_t steadyNowNs() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
 
     // Notification QP operations
     uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
@@ -317,6 +338,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     // Two-phase destruction: timestamp when EP entered EP_DESTROYING
     std::atomic<uint64_t> destroy_start_time_;
+
+    // Drives idle eviction in the endpoint store. See noteUsed().
+    std::atomic<uint64_t> last_used_ts_;
 
     std::string peer_server_name_;
     std::string peer_nic_name_;

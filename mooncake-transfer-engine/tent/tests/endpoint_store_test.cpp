@@ -14,7 +14,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
+#include <string>
+#include <thread>
+#include <utility>
 
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint.h"
@@ -40,6 +44,25 @@ class EndpointStoreTestAccess {
         if (store.waiting_list_.insert(std::move(endpoint)).second) {
             store.waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    // Publishes an endpoint under `key` the way getOrInsert() would, minus
+    // the construct() that needs a real device.
+    static void insertActive(FIFOEndpointStore& store, const std::string& key,
+                             std::shared_ptr<RdmaEndPoint> endpoint) {
+        RWSpinlock::WriteGuard guard(store.endpoint_map_lock_);
+        store.endpoint_map_[key] = std::move(endpoint);
+        store.fifo_list_.push_back(key);
+        auto it = store.fifo_list_.end();
+        store.fifo_map_[key] = --it;
+    }
+
+    static void insertActive(SIEVEEndpointStore& store, const std::string& key,
+                             std::shared_ptr<RdmaEndPoint> endpoint) {
+        RWSpinlock::WriteGuard guard(store.endpoint_map_lock_);
+        store.endpoint_map_[key] = std::make_pair(std::move(endpoint), false);
+        store.fifo_list_.push_front(key);
+        store.fifo_map_[key] = store.fifo_list_.begin();
     }
 
     static size_t waitingListSize(FIFOEndpointStore& store) {
@@ -76,6 +99,19 @@ class EndpointStoreTest : public testing::TestWithParam<StoreType> {
         } else {
             EndpointStoreTestAccess::insertWaiting(
                 static_cast<SIEVEEndpointStore&>(store), std::move(endpoint));
+        }
+    }
+
+    void insertActive(EndpointStore& store, const std::string& key,
+                      std::shared_ptr<RdmaEndPoint> endpoint) {
+        if (GetParam() == StoreType::FIFO) {
+            EndpointStoreTestAccess::insertActive(
+                static_cast<FIFOEndpointStore&>(store), key,
+                std::move(endpoint));
+        } else {
+            EndpointStoreTestAccess::insertActive(
+                static_cast<SIEVEEndpointStore&>(store), key,
+                std::move(endpoint));
         }
     }
 
@@ -145,6 +181,53 @@ TEST_P(EndpointStoreTest, ClearDeconstructsExternallyOwnedWaitingEndpoint) {
     EXPECT_EQ(endpoint->status(), RdmaEndPoint::EP_DESTROYED);
     endpoint.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+// A peer that has left is never looked up again, so capacity eviction - which
+// only runs when a new endpoint is inserted - never reaches its endpoints, and
+// each one keeps its QPs and its 32 MiB of pinned notification buffers for the
+// lifetime of the process. Idle eviction is what gives them back, and it must
+// leave an endpoint that is still carrying traffic alone.
+TEST_P(EndpointStoreTest, EvictIdleRetiresUnusedEndpointsAndKeepsFreshOnes) {
+    // Stamp both endpoints explicitly instead of relying on a zero
+    // last-used time: the steady clock counts from boot, so on a freshly
+    // started machine "never used" is not yet older than any long window.
+    constexpr uint64_t kIdleWindowNs = 1000ull * 1000000ull;  // 1s
+    auto store = makeStore();
+    auto departed = std::make_shared<RdmaEndPoint>();
+    auto active = std::make_shared<RdmaEndPoint>();
+    insertActive(*store, "10.0.0.1:12345@mlx5_0", departed);
+    insertActive(*store, "10.0.0.2:12345@mlx5_0", active);
+    departed->noteUsed();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    active->noteUsed();
+    ASSERT_EQ(store->size(), 2);
+
+    EXPECT_EQ(store->evictIdle(kIdleWindowNs), 1);
+    EXPECT_EQ(store->size(), 1);
+    EXPECT_EQ(store->get("10.0.0.2:12345@mlx5_0"), active);
+    EXPECT_EQ(store->get("10.0.0.1:12345@mlx5_0"), nullptr);
+
+    // Retirement is two-phase: the endpoint is only released once reclaim()
+    // finds it quiescent.
+    ASSERT_EQ(waitingListSize(*store), 1);
+    store->reclaim();
+    EXPECT_EQ(waitingListSize(*store), 0);
+    EXPECT_EQ(departed->status(), RdmaEndPoint::EP_DESTROYED);
+
+    // A second sweep inside the window must not touch the survivor.
+    EXPECT_EQ(store->evictIdle(kIdleWindowNs), 0);
+    EXPECT_EQ(store->size(), 1);
+}
+
+TEST_P(EndpointStoreTest, EvictIdleIsDisabledByAZeroTimeout) {
+    auto store = makeStore();
+    insertActive(*store, "10.0.0.1:12345@mlx5_0",
+                 std::make_shared<RdmaEndPoint>());
+
+    EXPECT_EQ(store->evictIdle(0), 0);
+    EXPECT_EQ(store->size(), 1);
+    EXPECT_EQ(waitingListSize(*store), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllStoreTypes, EndpointStoreTest,

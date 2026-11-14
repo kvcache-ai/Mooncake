@@ -202,6 +202,12 @@ class Workers {
     // failure load.
     void reclaimEndpoints();
 
+    // Same heartbeat: retires endpoints that have carried no traffic for
+    // endpoint_idle_timeout_secs, so a departed peer's QPs and pinned
+    // notification buffers are given back instead of being held until the
+    // process exits.
+    void evictIdleEndpoints();
+
     // dev_id is the NicID (context_set_ index), which is also the
     // DeviceSelector id, so port events can flip that device's availability.
     // Drains the whole async event queue: the async fd is edge-triggered and
