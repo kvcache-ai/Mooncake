@@ -388,6 +388,11 @@ class SegmentManager {
         return usage_tracker_->GetUsage();
     }
 
+    // The global eviction watermark includes Offset DRAM rounding overhead.
+    [[nodiscard]] StorageUsage GetMemoryEvictionUsage() const noexcept {
+        return usage_tracker_->GetEvictionUsage();
+    }
+
     ErrorCode initializeCxlAllocator(const std::string& cxl_path,
                                      size_t cxl_size);
 

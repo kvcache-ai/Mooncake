@@ -9624,10 +9624,13 @@ void MasterService::EvictionThreadFunc() {
         }
 
         const auto now = std::chrono::system_clock::now();
-        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+        const double used_ratio =
+            segment_manager_.GetMemoryEvictionUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio="
+                      << segment_manager_.GetMemoryUsage().used_ratio()
+                      << " eviction_memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
                       << " eviction_ratio=" << eviction_ratio_;

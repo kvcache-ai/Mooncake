@@ -72,20 +72,28 @@ void BufferAllocatorBase::AttachUsageTracker(
         return;
     }
     usage_registration_ = std::make_unique<StorageUsageRegistration>(
-        usage_tracker, cur_size_, capacity());
+        usage_tracker, cur_size_, rounding_bytes_, capacity());
 }
 
-void BufferAllocatorBase::RecordAllocation(size_t bytes) noexcept {
+void BufferAllocatorBase::RecordAllocation(size_t bytes,
+                                           size_t rounding_bytes) noexcept {
     cur_size_.fetch_add(bytes, std::memory_order_relaxed);
+    if (rounding_bytes != 0) {
+        rounding_bytes_.fetch_add(rounding_bytes, std::memory_order_relaxed);
+    }
     if (usage_registration_) {
-        usage_registration_->AddUsedBytes(bytes);
+        usage_registration_->AddUsedBytes(bytes, rounding_bytes);
     }
 }
 
-void BufferAllocatorBase::RecordDeallocation(size_t bytes) noexcept {
+void BufferAllocatorBase::RecordDeallocation(size_t bytes,
+                                             size_t rounding_bytes) noexcept {
     cur_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    if (rounding_bytes != 0) {
+        rounding_bytes_.fetch_sub(rounding_bytes, std::memory_order_relaxed);
+    }
     if (usage_registration_) {
-        usage_registration_->RemoveUsedBytes(bytes);
+        usage_registration_->RemoveUsedBytes(bytes, rounding_bytes);
     }
 }
 
@@ -450,6 +458,17 @@ OffsetBufferAllocator::~OffsetBufferAllocator() {
     }
 };
 
+size_t OffsetBufferAllocator::GetRoundingBytes(
+    size_t requested_bytes) const noexcept {
+    if (replica_type_ != ReplicaType::MEMORY) {
+        return 0;
+    }
+    // The extent of a successful new allocation depends only on the request
+    // and the segment's quantum. The allocator splits off any remainder.
+    return offset_allocator_->reservedAllocationSize(requested_bytes) -
+           requested_bytes;
+}
+
 std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     if (!offset_allocator_) {
         LOG(ERROR) << "allocator_status=not_initialized";
@@ -474,8 +493,6 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
             shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
-        VLOG(1) << "allocation_succeeded size=" << size
-                << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
         LOG(ERROR) << "allocation_exception error=" << e.what();
         return nullptr;
@@ -484,7 +501,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         return nullptr;
     }
 
-    RecordAllocation(size);
+    RecordAllocation(size, GetRoundingBytes(size));
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
                                                                size);
@@ -492,6 +509,9 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
+    VLOG(1) << "allocation_succeeded size=" << size
+            << " segment=" << segment_name_
+            << " address=" << allocated_buffer->data();
     return allocated_buffer;
 }
 
@@ -501,7 +521,7 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         // when the OffsetAllocationHandle goes out of scope
         size_t freed_size = handle->size();
         handle->offset_handle_.reset();
-        RecordDeallocation(freed_size);
+        RecordDeallocation(freed_size, GetRoundingBytes(freed_size));
         if (replica_type_ == ReplicaType::MEMORY) {
             MasterMetricManager::instance().dec_allocated_mem_size(
                 segment_name_, freed_size);
