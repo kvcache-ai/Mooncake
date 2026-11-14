@@ -14,6 +14,7 @@
 #include "ha/standby_controller.h"
 #include "hot_standby_service.h"
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 namespace mooncake::test {
 namespace {
@@ -215,6 +216,44 @@ TEST(BatchOpLogPromotionTest, EmptyStoreRestoresWithoutChunks) {
     EXPECT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
     ASSERT_TRUE(handoff.metadata_store);
     EXPECT_EQ(0u, handoff.metadata_store->GetKeyCount());
+}
+
+TEST(BatchOpLogPromotionTest,
+     RestoresBatchSnapshotMetadataWithManagedAttributes) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto metadata = std::make_unique<StandbyMetadataStore>();
+    StandbyObjectMetadata object;
+    object.client_id = {4, 9};
+    object.size = 8192;
+    object.group_id = "managed-group";
+    object.data_type = ObjectDataType::WEIGHT;
+    object.hard_pinned = true;
+    object.replicas.push_back(
+        {.id = 11,
+         .descriptor_variant = DiskDescriptor{.file_path = "managed-weight",
+                                              .object_size = object.size},
+         .status = ReplicaStatus::COMPLETE});
+    ASSERT_TRUE(metadata->PutMetadata("tenant", "managed-weight", object));
+
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(metadata);
+    handoff.applied_cursor = {.batch_id = 1, .last_seq = 1};
+    handoff.max_replica_id = 11;
+    const auto result = service.RestoreFromBatchOpLogPromotion(handoff, 1);
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer::ObjectIdentity{TenantId("tenant"),
+                                                        "managed-weight"});
+    ASSERT_TRUE(accessor.IsPublished());
+    const auto& restored = accessor.Get();
+    EXPECT_EQ(object.client_id, restored.client_id);
+    EXPECT_EQ(object.group_id, restored.group_id);
+    EXPECT_EQ(object.data_type, restored.data_type);
+    EXPECT_TRUE(restored.IsHardPinned());
+    EXPECT_EQ(TenantId("tenant"), restored.tenant_id);
+    EXPECT_EQ("managed-weight", restored.user_key);
 }
 
 }  // namespace mooncake::test

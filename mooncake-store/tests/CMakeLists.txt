@@ -606,6 +606,8 @@ add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ha_metric_manager_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(oplog_batch_storage_test
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ordered_oplog_writer_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()

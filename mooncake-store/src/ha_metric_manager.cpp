@@ -174,9 +174,22 @@ HAMetricManager::HAMetricManager()
           "ha_batch_record_batch_bytes",
           "Encoded bytes per durable batch-record batch",
           {256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304}),
+      batch_record_encode_latency_us_(
+          "ha_batch_record_encode_latency_us",
+          "OpLog batch JSON encoding and checksum latency in microseconds",
+          {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}),
+      batch_record_decode_latency_us_(
+          "ha_batch_record_decode_latency_us",
+          "Successful OpLog batch JSON decoding and validation latency in "
+          "microseconds",
+          {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}),
+      batch_record_backend_txn_latency_us_(
+          "ha_batch_record_backend_txn_latency_us",
+          "HA KV backend Txn attempt latency in microseconds",
+          {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000}),
       batch_record_txn_latency_us_(
           "ha_batch_record_txn_latency_us",
-          "Batch-record backend transaction latency in microseconds",
+          "End-to-end WriteBatchAndAdvancePrefix latency in microseconds",
           {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000}),
       batch_record_commit_to_durable_us_(
           "ha_batch_record_commit_to_durable_us",
@@ -417,6 +430,21 @@ void HAMetricManager::observe_batch_record_batch_bytes(int64_t bytes) {
     batch_record_batch_bytes_.observe(bytes);
 }
 
+void HAMetricManager::observe_batch_record_encode_latency_us(
+    int64_t latency_us) {
+    batch_record_encode_latency_us_.observe(latency_us);
+}
+
+void HAMetricManager::observe_batch_record_decode_latency_us(
+    int64_t latency_us) {
+    batch_record_decode_latency_us_.observe(latency_us);
+}
+
+void HAMetricManager::observe_batch_record_backend_txn_latency_us(
+    int64_t latency_us) {
+    batch_record_backend_txn_latency_us_.observe(latency_us);
+}
+
 void HAMetricManager::observe_batch_record_txn_latency_us(int64_t latency_us) {
     batch_record_txn_latency_us_.observe(latency_us);
 }
@@ -652,6 +680,9 @@ std::string HAMetricManager::serialize_metrics() {
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     serialize_metric(batch_record_batch_entries_);
     serialize_metric(batch_record_batch_bytes_);
+    serialize_metric(batch_record_encode_latency_us_);
+    serialize_metric(batch_record_decode_latency_us_);
+    serialize_metric(batch_record_backend_txn_latency_us_);
     serialize_metric(batch_record_txn_latency_us_);
     serialize_metric(batch_record_commit_to_durable_us_);
     serialize_metric(batch_record_callback_latency_us_);

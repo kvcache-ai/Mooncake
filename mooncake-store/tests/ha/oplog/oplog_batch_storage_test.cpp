@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
+#include "ha_metric_manager.h"
 
 namespace mooncake::test {
 namespace {
@@ -191,6 +193,20 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
     }
     return batch;
 }
+
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+uint64_t HistogramCount(const std::string& name) {
+    std::istringstream lines(HAMetricManager::instance().serialize_metrics());
+    std::string line;
+    const auto prefix = name + "_count ";
+    while (std::getline(lines, line)) {
+        if (line.rfind(prefix, 0) == 0) {
+            return std::stoull(line.substr(prefix.size()));
+        }
+    }
+    return 0;
+}
+#endif
 
 }  // namespace
 
@@ -572,6 +588,47 @@ TEST(OpLogBatchStorageTest, WriteBatchAndAdvancePrefixCommitsAtomically) {
     EXPECT_EQ(2u, prefix.batch_id);
     EXPECT_EQ(5u, prefix.last_seq);
 }
+
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+TEST(OpLogBatchStorageTest, CollectsPhaseLatenciesAcrossReadsAndTxnAttempts) {
+    FakeHaKvBackend backend;
+    const DurablePrefix old_prefix{.batch_id = 1, .last_seq = 3};
+    // A different JSON representation forces a compare retry on the first
+    // write, even though the durable cursor has not changed.
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          " " + EncodeDurablePrefix(old_prefix)));
+    OpLogBatchStorage storage("clusterA", backend);
+    const std::string encode = "ha_batch_record_encode_latency_us";
+    const std::string decode = "ha_batch_record_decode_latency_us";
+    const std::string txn = "ha_batch_record_backend_txn_latency_us";
+    const auto encode_before = HistogramCount(encode);
+    const auto decode_before = HistogramCount(decode);
+    const auto txn_before = HistogramCount(txn);
+
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
+                                 MakeBatch(2, 4, 2), old_prefix));
+    EXPECT_EQ(encode_before + 1, HistogramCount(encode));
+    EXPECT_EQ(decode_before, HistogramCount(decode));
+    EXPECT_EQ(txn_before + 2, HistogramCount(txn));
+
+    OpLogBatchRecord batch;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(2, batch));
+    EXPECT_EQ(decode_before + 1, HistogramCount(decode));
+    std::vector<OpLogBatchRecord> batches;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatchesAfter(1, 10, batches));
+    ASSERT_EQ(1u, batches.size());
+    EXPECT_EQ(decode_before + 2, HistogramCount(decode));
+
+    backend.FailNextTxn(ErrorCode::ETCD_OPERATION_ERROR);
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              storage.WriteBatchAndAdvancePrefix(
+                  MakeBatch(3, 6, 1), {.batch_id = 2, .last_seq = 5}));
+    EXPECT_EQ(encode_before + 2, HistogramCount(encode));
+    EXPECT_EQ(txn_before + 3, HistogramCount(txn));
+    EXPECT_EQ(decode_before + 2, HistogramCount(decode));
+}
+#endif
 
 TEST(OpLogBatchStorageTest, FencedAdvanceDoesNotModifyProducerView) {
     FakeHaKvBackend backend;
