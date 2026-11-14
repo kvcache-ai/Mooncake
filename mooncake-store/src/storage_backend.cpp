@@ -6495,7 +6495,10 @@ CreateStorageBackend(const FileStorageConfig& config) {
             std::unique_ptr<FileSystemAdapter> fs_adapter;
             std::unique_ptr<ObjectStorageAdapter> object_storage_adapter;
             if (distributed_config.fs_adapter_type == "posix") {
-                fs_adapter = std::make_unique<PosixFsAdapter>();
+                fs_adapter = std::make_unique<PosixFsAdapter>(
+                    distributed_config.posix_direct_io,
+                    distributed_config.alignment,
+                    distributed_config.posix_direct_io_fsync);
             } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
                 fs_adapter = std::make_unique<Hf3fsAdapter>();

@@ -1074,6 +1074,8 @@ is required.
 | `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Initial shard count. The master also discovers existing contiguous shard files at startup; running clients open added shards on demand. |
 | `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
 | `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
+| `MOONCAKE_DFS_POSIX_DIRECT_IO` | Clients | `false` | `posix` adapter only. Read and write all DFS files with `O_DIRECT`. `MOONCAKE_DFS_ALIGNMENT` must then be a power of two of at least 512. Backend initialization fails if the DFS cannot serve `O_DIRECT`; there is no page-cache fallback. |
+| `MOONCAKE_DFS_POSIX_DIRECT_IO_FSYNC` | Clients | `false` | `posix` adapter only. With `MOONCAKE_DFS_POSIX_DIRECT_IO`, `fsync` each written file once per batch write before reporting success. Ignored, with a warning, when direct I/O is off. |
 | `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
 | `MOONCAKE_DFS_EVICTION_ENABLED` | Master | `true` | Enable DFS allocator eviction. |
 | `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | Master | `0.9` | Usage ratio that triggers eviction. |
@@ -1159,8 +1161,12 @@ For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
 memory and NoF replicas, stages device buffers to host memory when necessary,
 and then performs positional DFS writes. A successful request means the
 requested DFS `WriteAt` operations completed. It does **not** imply that an
-additional `fsync` completed. Batch operations isolate failures by key; a
-failed key is revoked without downgrading successful keys.
+additional `fsync` completed, unless the `posix` adapter runs with both
+`MOONCAKE_DFS_POSIX_DIRECT_IO` and `MOONCAKE_DFS_POSIX_DIRECT_IO_FSYNC`. In
+that mode each written shard or bucket file is fsynced once per batch, and a
+key is reported successful only after the fsync covering it returned; a
+failed fsync fails the keys written to that file. Batch operations isolate
+failures by key; a failed key is revoked without downgrading successful keys.
 
 For a same-size `Upsert`, if either the existing object or the new request has
 a DFS replica, the requested memory, NoF, and DFS replica counts must match the

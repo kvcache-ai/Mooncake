@@ -181,6 +181,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
+    config.posix_direct_io = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_POSIX_DIRECT_IO, config.posix_direct_io);
+    config.posix_direct_io_fsync =
+        Environ::ReadOr(Variables::MOONCAKE_DFS_POSIX_DIRECT_IO_FSYNC,
+                        config.posix_direct_io_fsync);
     config.single_tenant = Environ::ReadOr(
         Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
     config.eviction_enabled = Environ::ReadOr(
@@ -213,7 +218,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", shard_capacity=" << shard_capacity
         << ", bucket_capacity=" << bucket_capacity
         << ", max_bucket_count=" << max_bucket_count
-        << ", alignment=" << alignment << ", single_tenant=" << single_tenant
+        << ", alignment=" << alignment
+        << ", posix_direct_io=" << posix_direct_io
+        << ", posix_direct_io_fsync=" << posix_direct_io_fsync
+        << ", single_tenant=" << single_tenant
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark
         << ", eviction_low_watermark=" << eviction_low_watermark

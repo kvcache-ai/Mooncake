@@ -54,6 +54,8 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
     ScopedEnvVar alignment{"MOONCAKE_DFS_ALIGNMENT"};
+    ScopedEnvVar posix_direct_io{"MOONCAKE_DFS_POSIX_DIRECT_IO"};
+    ScopedEnvVar posix_direct_io_fsync{"MOONCAKE_DFS_POSIX_DIRECT_IO_FSYNC"};
     ScopedEnvVar single_tenant{"MOONCAKE_DFS_SINGLE_TENANT"};
     ScopedEnvVar eviction_enabled{"MOONCAKE_DFS_EVICTION_ENABLED"};
     ScopedEnvVar eviction_high_watermark{
@@ -71,6 +73,8 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.shard_count, 64);
     EXPECT_EQ(config.shard_capacity, 4ULL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.alignment, 4096);
+    EXPECT_FALSE(config.posix_direct_io);
+    EXPECT_FALSE(config.posix_direct_io_fsync);
     EXPECT_TRUE(config.single_tenant);
     EXPECT_TRUE(config.eviction_enabled);
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);
@@ -117,6 +121,8 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     env.shard_count.Set("8");
     env.shard_capacity.Set("1048576");
     env.alignment.Set("4096");
+    env.posix_direct_io.Set("true");
+    env.posix_direct_io_fsync.Set("true");
     env.single_tenant.Set("1");
     env.eviction_enabled.Set("1");
     env.eviction_high_watermark.Set("0.85");
@@ -132,6 +138,8 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     EXPECT_EQ(config.shard_count, 8);
     EXPECT_EQ(config.shard_capacity, 1048576);
     EXPECT_EQ(config.alignment, 4096);
+    EXPECT_TRUE(config.posix_direct_io);
+    EXPECT_TRUE(config.posix_direct_io_fsync);
     EXPECT_TRUE(config.single_tenant);
     EXPECT_TRUE(config.eviction_enabled);
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.85);
@@ -144,6 +152,8 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     const std::string formatted = config.FormatStr();
     EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
     EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
+    EXPECT_NE(formatted.find("posix_direct_io=1"), std::string::npos);
+    EXPECT_NE(formatted.find("posix_direct_io_fsync=1"), std::string::npos);
     EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
               std::string::npos);
 }

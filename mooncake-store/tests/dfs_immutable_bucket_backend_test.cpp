@@ -135,6 +135,27 @@ class ZeroProgressPosixAdapter : public CountingPosixAdapter {
     }
 };
 
+// Requires write sync without O_DIRECT, recording the writes before each sync.
+class SyncRecordingPosixAdapter : public RecordingPosixAdapter {
+   public:
+    bool RequiresWriteSync() const override { return true; }
+    tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
+                                            int iovcnt,
+                                            int64_t offset) override {
+        ++writes;
+        return RecordingPosixAdapter::WriteAt(fd, iov, iovcnt, offset);
+    }
+    tl::expected<void, ErrorCode> SyncFile(int) override {
+        writes_at_sync.push_back(writes);
+        if (fail_sync) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return {};
+    }
+
+    std::vector<int> writes_at_sync;
+    int writes = 0;
+    bool fail_sync = false;
+};
+
 class ImmutableBucketShortIoTest : public ::testing::TestWithParam<bool> {};
 
 TEST_P(ImmutableBucketShortIoTest, BufferedScatterIoUsesRequestScopedHandles) {
@@ -321,6 +342,58 @@ TEST(ImmutableBucketBackendTest, BatchBoundsOpenBucketsPerSubmission) {
     EXPECT_EQ(outputs, values);
     EXPECT_EQ(recorded->read_batches, (std::vector<size_t>{kMaxOpen, 1}));
     EXPECT_EQ(recorded->peak_open, static_cast<int>(kMaxOpen));
+}
+
+TEST(ImmutableBucketBackendTest, WriteSyncOpensAndSyncsEachBucketOnce) {
+    TempDir dir;
+    const auto config = MakeConfig(dir);
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    auto first = allocator.Allocate("first", 4);
+    auto second = allocator.Allocate("second", 4);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_EQ(first->file_path, second->file_path);
+
+    auto adapter = std::make_unique<SyncRecordingPosixAdapter>();
+    auto* recorded = adapter.get();
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend.Init());
+
+    std::string first_value = "abcd";
+    std::string second_value = "wxyz";
+    const std::vector<DfsWriteRequest> requests{
+        {"first", *first, {{first_value.data(), 4}}},
+        {"second", *second, {{second_value.data(), 4}}}};
+    auto writes = backend.BatchWrite(requests);
+    ASSERT_EQ(writes.size(), 2u);
+    EXPECT_TRUE(writes[0]);
+    EXPECT_TRUE(writes[1]);
+    EXPECT_EQ(recorded->opens, 1);
+    EXPECT_EQ(recorded->closes, 1);
+    EXPECT_EQ(recorded->writes_at_sync, std::vector<int>{2});
+
+    std::string first_output(4, '\0');
+    std::string second_output(4, '\0');
+    auto reads =
+        backend.BatchRead({{"first", *first, {{first_output.data(), 4}}},
+                           {"second", *second, {{second_output.data(), 4}}}});
+    ASSERT_TRUE(reads[0]);
+    ASSERT_TRUE(reads[1]);
+    EXPECT_EQ(first_output, first_value);
+    EXPECT_EQ(second_output, second_value);
+    EXPECT_EQ(recorded->writes_at_sync.size(), 1u);
+
+    // A failed sync fails the bucket's writes and still closes it.
+    recorded->fail_sync = true;
+    writes = backend.BatchWrite(requests);
+    ASSERT_EQ(writes.size(), 2u);
+    for (const auto& result : writes) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+    }
+    EXPECT_EQ(recorded->open_now, 0);
 }
 
 TEST(ImmutableBucketBackendTest, RejectsEscapesMismatchAndMissingFile) {

@@ -30,6 +30,12 @@ plane opens an existing bucket for each request and uses synchronous buffered
 positional I/O. A successful request means that the requested `WriteAt` calls
 completed; it is not an `fsync` durability guarantee.
 
+With the `posix` adapter, `MOONCAKE_DFS_POSIX_DIRECT_IO` switches all bucket
+reads and writes to `O_DIRECT`. Adding `MOONCAKE_DFS_POSIX_DIRECT_IO_FSYNC`
+groups the writes of one batch per bucket: each bucket is opened once,
+written, fsynced once and closed, and its requests succeed only after that
+fsync returned. A failed fsync or close fails that bucket's requests.
+
 Allocations append in request order. A rollback or removal changes the
 in-memory entry to a tombstone but never rewinds the append cursor and never
 reuses that range. This rule also applies when the same key is allocated again.
@@ -63,8 +69,10 @@ are consumed only by the master allocator.
 | `MOONCAKE_DFS_BUCKET_CAPACITY` | `1073741824` (1 GiB) | Logical and preallocated size of every bucket; must be nonzero, aligned, fit in a signed 64-bit file offset, and match on the master and every DFS client. |
 | `MOONCAKE_DFS_MAX_BUCKET_COUNT` | `64` | Maximum number of live bucket files; must be positive. Buckets awaiting a successful deletion still count. |
 | `MOONCAKE_DFS_ROOT_DIR` | `/mnt/3fs/mooncake` | Absolute shared directory containing the bucket files. |
-| `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter (`hf3fs` or `posix`). This version uses its buffered synchronous interface. |
-| `MOONCAKE_DFS_ALIGNMENT` | `4096` | Power-of-two entry alignment; must divide the bucket capacity. |
+| `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter (`hf3fs` or `posix`). This version uses its synchronous interface, buffered unless `posix` direct I/O is enabled. |
+| `MOONCAKE_DFS_ALIGNMENT` | `4096` | Power-of-two entry alignment; must divide the bucket capacity. At least 512 with `posix` direct I/O. |
+| `MOONCAKE_DFS_POSIX_DIRECT_IO` | `false` | `posix` adapter only, clients. Use `O_DIRECT` for all bucket reads and writes; backend initialization fails if the DFS cannot serve it. |
+| `MOONCAKE_DFS_POSIX_DIRECT_IO_FSYNC` | `false` | `posix` adapter only, clients. With direct I/O, fsync each written bucket once per batch before reporting success. Ignored, with a warning, without direct I/O. |
 | `MOONCAKE_DFS_EVICTION_ENABLED` | `true` | Enable bucket-level eviction. |
 | `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | `0.9` | Usage ratio that starts normal eviction. |
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | `0.7` | Usage ratio at which normal eviction stops. |
@@ -96,8 +104,9 @@ This initial backend intentionally provides only the minimal runtime path:
 - Snapshot restore, OpLog recovery, standby promotion, and HA continuity do not
   reconstruct bucket state. Do not select `bucket` when those guarantees are
   required.
-- I/O is synchronous and buffered. There is no asynchronous DFS pipeline,
-  Direct I/O (`O_DIRECT`), read coalescing, prefetch, or bucket read cache.
+- I/O is synchronous, and buffered unless `posix` direct I/O is enabled.
+  There is no asynchronous DFS pipeline, read coalescing, prefetch, or bucket
+  read cache. The `hf3fs` adapter has no `O_DIRECT` or per-batch fsync option.
 - There is no public administrator API for changing the maximum bucket count
   while the service is running.
 - The backend remains single-tenant and experimental. Only one active master

@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1366,7 +1367,504 @@ class BlockingShardFsAdapter : public PosixFsAdapter {
 
 TEST_F(DfsBackendTest, PosixAdapterAcceptsArbitraryHostReadBuffers) {
     EXPECT_TRUE(PosixFsAdapter().SupportsArbitraryHostReadBuffers());
+    EXPECT_TRUE(PosixFsAdapter(true, 4096).SupportsArbitraryHostReadBuffers());
     EXPECT_TRUE(backend_->SupportsArbitraryHostReadBuffers());
+}
+
+bool FdUsesDirectIo(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL);
+    return flags >= 0 && (flags & O_DIRECT) != 0;
+}
+
+// Number of pages of [offset, offset + len) resident in the page cache.
+size_t ResidentPages(const std::string& path, uint64_t offset, size_t len) {
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return std::numeric_limits<size_t>::max();
+    void* map = ::mmap(nullptr, len, PROT_READ, MAP_SHARED, fd,
+                       static_cast<off_t>(offset));
+    ::close(fd);
+    if (map == MAP_FAILED) return std::numeric_limits<size_t>::max();
+    std::vector<unsigned char> vec((len + page - 1) / page);
+    size_t resident = std::numeric_limits<size_t>::max();
+    if (::mincore(map, len, vec.data()) == 0) {
+        resident = 0;
+        for (unsigned char v : vec) resident += v & 1;
+    }
+    ::munmap(map, len);
+    return resident;
+}
+
+char DirectIoPattern(uint64_t pos) { return static_cast<char>(pos % 251 + 1); }
+
+// Reads through a separate page-cache fd to check what reached the file.
+std::string ReadBuffered(const std::string& path, uint64_t offset, size_t len) {
+    std::string out(len, '\0');
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return {};
+    ssize_t n = ::pread(fd, out.data(), len, static_cast<off_t>(offset));
+    ::close(fd);
+    out.resize(n < 0 ? 0 : static_cast<size_t>(n));
+    return out;
+}
+
+std::string ExpectedPattern(uint64_t offset, size_t len) {
+    std::string out(len, '\0');
+    for (size_t i = 0; i < len; ++i) out[i] = DirectIoPattern(offset + i);
+    return out;
+}
+
+// Whether `dir` accepts O_DIRECT; checked independently of the adapter.
+bool DirAcceptsDirectIo(const std::string& dir) {
+    const std::string path = dir + "/.direct_io_check";
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    const bool ok = ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_DIRECT) == 0;
+    ::close(fd);
+    ::unlink(path.c_str());
+    return ok;
+}
+
+// Runs against TMPDIR; tests skip where the filesystem refuses O_DIRECT.
+class PosixDirectIoTest : public ::testing::Test {
+   protected:
+    static constexpr size_t kFileSize = 64 * 1024;
+
+    void SetUp() override {
+        tmp_ = std::make_unique<TempDir>("dfs_direct_io_test");
+        if (!DirAcceptsDirectIo(tmp_->path())) {
+            GTEST_SKIP() << "O_DIRECT is unavailable under " << tmp_->path();
+        }
+        adapter_ = std::make_unique<PosixFsAdapter>(true, 4096);
+        ASSERT_TRUE(adapter_->Init(tmp_->path()).has_value());
+        path_ = tmp_->file("shard0.data");
+        ASSERT_TRUE(adapter_->PreallocateFile(path_, kFileSize).has_value());
+        auto fd = adapter_->OpenFile(path_);
+        ASSERT_TRUE(fd.has_value());
+        fd_ = *fd;
+        ASSERT_TRUE(FdUsesDirectIo(fd_));
+        AlignedBuffer fill(kFileSize);
+        for (size_t i = 0; i < kFileSize; ++i) {
+            fill.data()[i] = DirectIoPattern(i);
+        }
+        iovec iov{fill.data(), kFileSize};
+        auto written = adapter_->WriteAt(fd_, &iov, 1, 0);
+        ASSERT_TRUE(written.has_value());
+        ASSERT_EQ(*written, kFileSize);
+    }
+
+    void TearDown() override {
+        if (fd_ >= 0) adapter_->CloseFile(fd_);
+        adapter_.reset();
+        tmp_.reset();
+    }
+
+    std::unique_ptr<TempDir> tmp_;
+    std::unique_ptr<PosixFsAdapter> adapter_;
+    std::string path_;
+    int fd_ = -1;
+};
+
+TEST_F(PosixDirectIoTest, AlignedFillReachesFile) {
+    EXPECT_TRUE(ReadBuffered(path_, 0, kFileSize) ==
+                ExpectedPattern(0, kFileSize));
+}
+
+TEST_F(PosixDirectIoTest, OpenedFdsUseDirectIo) {
+    EXPECT_TRUE(FdUsesDirectIo(fd_));
+    auto fd = adapter_->OpenExistingFile(path_);
+    ASSERT_TRUE(fd.has_value());
+    EXPECT_TRUE(FdUsesDirectIo(*fd));
+    adapter_->CloseFile(*fd);
+}
+
+TEST_F(PosixDirectIoTest, WritesBypassPageCache) {
+    EXPECT_EQ(ResidentPages(path_, 0, kFileSize), 0u);
+
+    // Misaligned source buffer: goes through the bounce buffer.
+    std::vector<char> storage(5001, 'q');
+    iovec iov{storage.data() + 1, 5000};
+    auto written = adapter_->WriteAt(fd_, &iov, 1, 4096);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, 5000u);
+    EXPECT_EQ(ResidentPages(path_, 0, kFileSize), 0u);
+}
+
+TEST_F(PosixDirectIoTest, UnalignedWriteZeroPadsToBoundary) {
+    constexpr uint64_t kOffset = 4096;
+    constexpr size_t kLen = 5000;
+    constexpr uint64_t kPaddedEnd = kOffset + 8192;
+    std::vector<char> storage(kLen + 1);
+    char* data = storage.data() + 1;  // Deliberately misaligned.
+    for (size_t i = 0; i < kLen; ++i) data[i] = static_cast<char>('a' + i % 26);
+    iovec wiovs[2] = {{data, 1234}, {data + 1234, kLen - 1234}};
+    auto written = adapter_->WriteAt(fd_, wiovs, 2, kOffset);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, kLen);
+
+    EXPECT_TRUE(ReadBuffered(path_, 0, kOffset) == ExpectedPattern(0, kOffset));
+    EXPECT_TRUE(ReadBuffered(path_, kOffset, kLen) == std::string(data, kLen));
+    EXPECT_TRUE(
+        ReadBuffered(path_, kOffset + kLen, kPaddedEnd - kOffset - kLen) ==
+        std::string(kPaddedEnd - kOffset - kLen, '\0'));
+    EXPECT_TRUE(ReadBuffered(path_, kPaddedEnd, kFileSize - kPaddedEnd) ==
+                ExpectedPattern(kPaddedEnd, kFileSize - kPaddedEnd));
+
+    std::vector<char> out_storage(kLen + 3);
+    char* out = out_storage.data() + 3;
+    iovec riovs[2] = {{out, 777}, {out + 777, kLen - 777}};
+    auto read = adapter_->ReadAt(fd_, riovs, 2, kOffset);
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*read, kLen);
+    EXPECT_EQ(std::memcmp(out, data, kLen), 0);
+}
+
+TEST_F(PosixDirectIoTest, AlignedBuffersPadOnlyTheTail) {
+    // Aligned buffers and an unaligned final length: the zero-copy path.
+    constexpr uint64_t kOffset = 16384;
+    AlignedBuffer a(4096), b(8192);
+    a.Fill('x');
+    b.Fill('y');
+    iovec wiovs[2] = {{a.data(), a.size()}, {b.data(), 5000}};
+    auto written = adapter_->WriteAt(fd_, wiovs, 2, kOffset);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, 9096u);
+    EXPECT_EQ(ResidentPages(path_, kOffset, 12288), 0u);
+
+    const std::string expected = std::string(4096, 'x') +
+                                 std::string(5000, 'y') +
+                                 std::string(12288 - 9096, '\0');
+    EXPECT_TRUE(ReadBuffered(path_, kOffset, 12288) == expected);
+    EXPECT_TRUE(ReadBuffered(path_, kOffset + 12288, 4096) ==
+                ExpectedPattern(kOffset + 12288, 4096));
+}
+
+TEST_F(PosixDirectIoTest, RangeReadAtUnalignedOffset) {
+    constexpr uint64_t kOffset = 4096 + 777;
+    constexpr size_t kLen = 9000;  // Spans three blocks.
+    std::vector<char> storage(kLen + 5);
+    char* out = storage.data() + 5;
+    iovec iov{out, kLen};
+    auto read = adapter_->ReadAt(fd_, &iov, 1, kOffset);
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(*read, kLen);
+    EXPECT_TRUE(std::string(out, kLen) == ExpectedPattern(kOffset, kLen));
+}
+
+TEST_F(PosixDirectIoTest, ReadPastEofReturnsAvailableBytes) {
+    std::vector<char> storage(501);
+    iovec iov{storage.data() + 1, 500};
+    auto read = adapter_->ReadAt(fd_, &iov, 1, kFileSize - 100);
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(*read, 100u);
+    EXPECT_TRUE(std::string(storage.data() + 1, 100) ==
+                ExpectedPattern(kFileSize - 100, 100));
+
+    auto beyond = adapter_->ReadAt(fd_, &iov, 1, kFileSize + 10);
+    ASSERT_TRUE(beyond.has_value());
+    EXPECT_EQ(*beyond, 0u);
+}
+
+TEST_F(PosixDirectIoTest, AlignedMultiIovRoundTrip) {
+    AlignedBuffer a(4096), b(8192);
+    a.Fill('x');
+    b.Fill('y');
+    iovec wiovs[2] = {{a.data(), a.size()}, {b.data(), b.size()}};
+    auto written = adapter_->WriteAt(fd_, wiovs, 2, 16384);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, 12288u);
+
+    AlignedBuffer out(12288);
+    iovec riov{out.data(), out.size()};
+    auto read = adapter_->ReadAt(fd_, &riov, 1, 16384);
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(*read, 12288u);
+    EXPECT_TRUE(std::string(out.data(), 4096) == std::string(4096, 'x'));
+    EXPECT_TRUE(std::string(out.data() + 4096, 8192) == std::string(8192, 'y'));
+}
+
+TEST_F(PosixDirectIoTest, UnalignedWriteOffsetIsRejected) {
+    // Padding from an unaligned offset would overwrite bytes the caller
+    // does not own.
+    char data[64];
+    std::memset(data, 'z', sizeof(data));
+    iovec iov{data, sizeof(data)};
+    auto written = adapter_->WriteAt(fd_, &iov, 1, 100);
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(ReadBuffered(path_, 0, kFileSize) ==
+                ExpectedPattern(0, kFileSize));
+}
+
+TEST_F(PosixDirectIoTest, LargeUnalignedTransferIsChunked) {
+    // Larger than the bounce buffer, so the copy runs in several chunks.
+    constexpr size_t kLen = (8u << 20) * 2 + 12345;
+    const std::string path = tmp_->file("bucket0.data");
+    ASSERT_TRUE(adapter_->PreallocateFile(path, 20u << 20).has_value());
+    auto fd = adapter_->OpenExistingFile(path);
+    ASSERT_TRUE(fd.has_value());
+    ASSERT_TRUE(FdUsesDirectIo(*fd));
+
+    std::vector<char> storage(kLen + 1);
+    char* data = storage.data() + 1;
+    for (size_t i = 0; i < kLen; ++i) data[i] = DirectIoPattern(i * 7);
+    iovec wiov{data, kLen};
+    auto written = adapter_->WriteAt(*fd, &wiov, 1, 4096);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, kLen);
+
+    std::vector<char> out_storage(kLen + 1);
+    char* out = out_storage.data() + 1;
+    iovec riov{out, kLen};
+    auto read = adapter_->ReadAt(*fd, &riov, 1, 4096);
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*read, kLen);
+    EXPECT_EQ(std::memcmp(out, data, kLen), 0);
+    const size_t pad = 4096 - kLen % 4096;
+    EXPECT_TRUE(ReadBuffered(path, 4096 + kLen, pad) == std::string(pad, '\0'));
+    adapter_->CloseFile(*fd);
+}
+
+TEST(PosixDirectIoConfigTest, InvalidAlignmentFailsInit) {
+    TempDir tmp("dfs_direct_io_bad_align");
+    for (uint64_t alignment : {uint64_t{256}, uint64_t{6144}}) {
+        PosixFsAdapter adapter(true, alignment);
+        auto init = adapter.Init(tmp.path());
+        ASSERT_FALSE(init.has_value()) << alignment;
+        EXPECT_EQ(init.error(), ErrorCode::INVALID_PARAMS);
+    }
+    // Without direct I/O the alignment is not checked.
+    EXPECT_TRUE(PosixFsAdapter(false, 256).Init(tmp.path()).has_value());
+}
+
+TEST(PosixDirectIoConfigTest, InitProbeLeavesNoFiles) {
+    TempDir tmp("dfs_direct_io_probe");
+    if (!DirAcceptsDirectIo(tmp.path())) {
+        GTEST_SKIP() << "O_DIRECT is unavailable under " << tmp.path();
+    }
+    PosixFsAdapter adapter(true, 4096, true);
+    ASSERT_TRUE(adapter.Init(tmp.path()).has_value());
+    EXPECT_TRUE(std::filesystem::is_empty(tmp.path()));
+}
+
+// tmpfs refuses O_DIRECT before Linux 6.6; use it when that is the case.
+TEST(PosixDirectIoConfigTest, UnsupportedFilesystemFailsInit) {
+    const std::string shm = "/dev/shm";
+    if (!std::filesystem::is_directory(shm) || DirAcceptsDirectIo(shm)) {
+        GTEST_SKIP() << "no filesystem that refuses O_DIRECT at " << shm;
+    }
+    const std::string root =
+        shm + "/dfs_direct_io_unsupported_" + std::to_string(::getpid());
+    PosixFsAdapter adapter(true, 4096);
+    auto init = adapter.Init(root);
+    ASSERT_FALSE(init.has_value());
+    EXPECT_EQ(init.error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_TRUE(std::filesystem::is_empty(root));
+    std::filesystem::remove_all(root);
+}
+
+TEST(PosixDirectIoConfigTest, FsyncWithoutDirectIoIsIgnored) {
+    TempDir tmp("dfs_direct_io_fsync_only");
+    PosixFsAdapter adapter(false, 4096, true);
+    ASSERT_TRUE(adapter.Init(tmp.path()).has_value());
+    const std::string path = tmp.file("shard0.data");
+    ASSERT_TRUE(adapter.PreallocateFile(path, 4096).has_value());
+    auto fd = adapter.OpenFile(path);
+    ASSERT_TRUE(fd.has_value());
+    EXPECT_FALSE(FdUsesDirectIo(*fd));
+
+    char data[3] = {'a', 'b', 'c'};
+    iovec iov{data, sizeof(data)};
+    auto written = adapter.WriteAt(*fd, &iov, 1, 7);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, sizeof(data));
+    EXPECT_TRUE(ReadBuffered(path, 7, sizeof(data)) == "abc");
+    EXPECT_FALSE(adapter.RequiresWriteSync());
+    adapter.CloseFile(*fd);
+}
+
+// Both write paths (zero-copy with a padded tail, and bounce), then fsync.
+TEST(PosixDirectIoFsyncTest, FsyncedWritesReachFile) {
+    TempDir tmp("dfs_direct_io_fsync");
+    if (!DirAcceptsDirectIo(tmp.path())) {
+        GTEST_SKIP() << "O_DIRECT is unavailable under " << tmp.path();
+    }
+    PosixFsAdapter adapter(true, 4096, true);
+    ASSERT_TRUE(adapter.Init(tmp.path()).has_value());
+    const std::string path = tmp.file("shard0.data");
+    ASSERT_TRUE(adapter.PreallocateFile(path, 32 * 1024).has_value());
+    auto fd = adapter.OpenFile(path);
+    ASSERT_TRUE(fd.has_value());
+    ASSERT_TRUE(FdUsesDirectIo(*fd));
+
+    constexpr size_t kLen = 5000;
+    constexpr size_t kPad = 8192 - kLen;
+    AlignedBuffer aligned(8192);
+    for (size_t i = 0; i < kLen; ++i) aligned.data()[i] = 'x';
+    iovec zero_copy{aligned.data(), kLen};
+    auto written = adapter.WriteAt(*fd, &zero_copy, 1, 0);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, kLen);
+
+    std::vector<char> storage(kLen + 1, 'y');
+    iovec bounce{storage.data() + 1, kLen};
+    written = adapter.WriteAt(*fd, &bounce, 1, 16384);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, kLen);
+    EXPECT_TRUE(adapter.RequiresWriteSync());
+    EXPECT_TRUE(adapter.SyncFile(*fd).has_value());
+
+    EXPECT_TRUE(ReadBuffered(path, 0, kLen) == std::string(kLen, 'x'));
+    EXPECT_TRUE(ReadBuffered(path, kLen, kPad) == std::string(kPad, '\0'));
+    EXPECT_TRUE(ReadBuffered(path, 16384, kLen) == std::string(kLen, 'y'));
+    EXPECT_TRUE(ReadBuffered(path, 16384 + kLen, kPad) ==
+                std::string(kPad, '\0'));
+    adapter.CloseFile(*fd);
+}
+
+TEST(PosixDirectIoBackendTest, UnalignedObjectsDoNotClobberNeighbours) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    constexpr uint64_t kShardCapacity = 1024 * 1024;
+    TempDir tmp("dfs_direct_io_backend");
+    if (!DirAcceptsDirectIo(tmp.path())) {
+        GTEST_SKIP() << "O_DIRECT is unavailable under " << tmp.path();
+    }
+    ShardAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096)));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageBackend client(
+        file_config, MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096),
+        std::make_unique<PosixFsAdapter>(true, 4096));
+    ASSERT_TRUE(client.Init());
+
+    const std::vector<size_t> sizes{1, 4095, 4096, 4097, 10000, 12288, 777};
+    std::vector<DistributedFSDescriptor> descs;
+    std::vector<std::string> values;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        auto desc = alloc.Allocate("k" + std::to_string(i), sizes[i]);
+        ASSERT_TRUE(desc.has_value());
+        descs.push_back(*desc);
+        values.emplace_back(sizes[i], static_cast<char>('a' + i));
+        values.back().back() = static_cast<char>('A' + i);
+    }
+    // Write back to front: a write or bounce read that spilled past an
+    // object would expose or clobber its neighbour, already on disk.
+    for (size_t i = sizes.size(); i-- > 0;) {
+        auto writes = client.BatchWrite({{"k" + std::to_string(i),
+                                          descs[i],
+                                          {{values[i].data(), sizes[i]}}}});
+        ASSERT_EQ(writes.size(), 1u);
+        ASSERT_TRUE(writes[0]) << "write " << i;
+    }
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        std::vector<char> storage(sizes[i] + 1);
+        auto reads = client.BatchRead({{"k" + std::to_string(i),
+                                        descs[i],
+                                        {{storage.data() + 1, sizes[i]}}}});
+        ASSERT_EQ(reads.size(), 1u);
+        ASSERT_TRUE(reads[0]) << "read " << i;
+        EXPECT_TRUE(std::string(storage.data() + 1, sizes[i]) == values[i])
+            << "readback mismatch " << i;
+    }
+}
+
+// Records SyncFile per file path and the writes issued before each sync.
+class SyncRecordingPosixAdapter : public PosixFsAdapter {
+   public:
+    bool RequiresWriteSync() const override { return true; }
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        auto fd = PosixFsAdapter::OpenFile(path);
+        if (fd) paths[*fd] = path;
+        return fd;
+    }
+    tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
+                                            int iovcnt,
+                                            int64_t offset) override {
+        ++writes;
+        return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
+    }
+    tl::expected<void, ErrorCode> SyncFile(int fd) override {
+        const std::string& path = paths[fd];
+        ++syncs[path];
+        writes_at_sync.push_back(writes);
+        if (path == fail_path) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    }
+
+    std::map<int, std::string> paths;
+    std::map<std::string, int> syncs;
+    std::vector<int> writes_at_sync;
+    std::string fail_path;
+    int writes = 0;
+};
+
+TEST(PosixWriteSyncBackendTest, SyncsEachShardOncePerBatch) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_write_sync_shard");
+    const auto config = MakeAllocatorConfig(tmp.path(), 2, 64 * 1024, 4096);
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    auto adapter = std::make_unique<SyncRecordingPosixAdapter>();
+    auto* recorded = adapter.get();
+    DistributedStorageBackend client(file_config, config, std::move(adapter));
+    ASSERT_TRUE(client.Init());
+
+    constexpr int kObjects = 8;
+    std::vector<DistributedFSDescriptor> descs;
+    std::vector<std::string> values;
+    std::map<std::string, int> per_shard;
+    for (int i = 0; i < kObjects; ++i) {
+        auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+        ASSERT_TRUE(desc.has_value());
+        descs.push_back(*desc);
+        values.emplace_back(100, static_cast<char>('a' + i));
+        ++per_shard[std::filesystem::path(desc->file_path)
+                        .lexically_normal()
+                        .string()];
+    }
+    auto batch = [&] {
+        std::vector<DfsWriteRequest> requests;
+        for (int i = 0; i < kObjects; ++i) {
+            requests.push_back({"k" + std::to_string(i),
+                                descs[i],
+                                {{values[i].data(), values[i].size()}}});
+        }
+        return client.BatchWrite(requests);
+    };
+
+    auto results = batch();
+    ASSERT_EQ(results.size(), static_cast<size_t>(kObjects));
+    for (const auto& result : results) EXPECT_TRUE(result);
+    EXPECT_EQ(recorded->syncs.size(), per_shard.size());
+    for (const auto& [path, count] : recorded->syncs) {
+        EXPECT_TRUE(per_shard.count(path)) << path;
+        EXPECT_EQ(count, 1) << path;
+    }
+    for (int writes : recorded->writes_at_sync) EXPECT_EQ(writes, kObjects);
+
+    // A failed sync fails only the requests written to that shard.
+    recorded->fail_path = per_shard.begin()->first;
+    results = batch();
+    ASSERT_EQ(results.size(), static_cast<size_t>(kObjects));
+    for (int i = 0; i < kObjects; ++i) {
+        const bool failed_shard =
+            std::filesystem::path(descs[i].file_path).lexically_normal() ==
+            recorded->fail_path;
+        EXPECT_EQ(results[i].has_value(), !failed_shard) << i;
+        if (failed_shard) {
+            EXPECT_EQ(results[i].error(), ErrorCode::FILE_WRITE_FAIL);
+        }
+    }
 }
 
 TEST_F(DfsBackendTest, HostReadBufferCapabilityIgnoresAdapterName) {
