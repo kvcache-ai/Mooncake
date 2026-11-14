@@ -49,6 +49,74 @@ check_success() {
     fi
 }
 
+
+# Install MessagePack C++ from source on openEuler.
+install_msgpack_from_source() {
+    local msgpack_tag="cpp-6.1.1"
+    local expected_commit="44c0f705c9a60217d7e07de844fb13ce4c1c1e6e"
+    local work_dir
+    local source_dir
+    local build_dir
+    local actual_commit
+    local source_url="${GITHUB_PROXY%/}/msgpack/msgpack-c.git"
+
+    print_section "Installing MessagePack C++ from source"
+
+    work_dir=$(mktemp -d) || \
+        print_error "Failed to create temporary directory"
+
+    source_dir="${work_dir}/msgpack-c"
+    build_dir="${work_dir}/build"
+
+    # Download the pinned source version.
+    if ! git clone --depth 1 --branch "$msgpack_tag" \
+        "$source_url" "$source_dir"; then
+        rm -rf "$work_dir"
+        print_error "Failed to download msgpack-c"
+    fi
+
+    # Verify the exact source revision.
+    actual_commit=$(git -C "$source_dir" rev-parse HEAD)
+
+    if [ "$actual_commit" != "$expected_commit" ]; then
+        rm -rf "$work_dir"
+        print_error "Unexpected msgpack-c commit: $actual_commit"
+    fi
+
+    # Configure.
+    if ! cmake -S "$source_dir" -B "$build_dir" \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DMSGPACK_BUILD_DOCS=OFF \
+        -DMSGPACK_BUILD_EXAMPLES=OFF \
+        -DMSGPACK_BUILD_TESTS=OFF; then
+        rm -rf "$work_dir"
+        print_error "Failed to configure msgpack-c"
+    fi
+
+    # Build.
+    if ! cmake --build "$build_dir" --parallel "$(nproc)"; then
+        rm -rf "$work_dir"
+        print_error "Failed to build msgpack-c"
+    fi
+
+    # Install.
+    if ! cmake --install "$build_dir"; then
+        rm -rf "$work_dir"
+        print_error "Failed to install msgpack-c"
+    fi
+
+    # Verify the installed C++ header.
+    if [ ! -f /usr/local/include/msgpack.hpp ]; then
+        rm -rf "$work_dir"
+        print_error "MessagePack header installation verification failed"
+    fi
+
+    rm -rf "$work_dir"
+
+    print_success "MessagePack C++ installed successfully"
+}
+
 # Detect ScaleFabric SHCA (shca-tools).
 has_shca_tools() {
     if command -v dpkg-query >/dev/null 2>&1; then
@@ -149,6 +217,15 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get update
     check_success "Failed to update package lists"
 elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
+    # Package names for openEuler
+    if [ "$OS" = "openeuler" ]; then
+        BOOST_PACKAGE="boost-devel"
+        MSGPACK_PACKAGE=""
+    else
+        BOOST_PACKAGE="boost1.78-devel"
+        MSGPACK_PACKAGE="msgpack-devel"
+    fi
+
     yum install -y dnf-plugins-core epel-release || true
     yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
     yum clean all
@@ -229,7 +306,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost1.78-devel \
+                     $BOOST_PACKAGE \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -237,7 +314,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
-                     msgpack-devel \
+                     $MSGPACK_PACKAGE \
                      zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
@@ -318,6 +395,11 @@ else
 fi
 
 print_success "System packages installed successfully"
+
+# openEuler does not provide the required MessagePack C++ development package.
+if [ "$OS" = "openeuler" ]; then
+    install_msgpack_from_source
+fi
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
