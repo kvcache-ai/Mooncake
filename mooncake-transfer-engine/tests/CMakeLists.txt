@@ -433,6 +433,11 @@ if(USE_HIP)
   add_test(NAME hip_stream_pool_unset_test
            COMMAND ${CMAKE_COMMAND} -E env --unset=MC_HIP_STREAM_PRIORITY
                    $<TARGET_FILE:hip_stream_pool_test>)
+
+  add_executable(hip_fabric_test ${WORKSPACE}/hip_fabric_test.cpp)
+  target_link_libraries(hip_fabric_test PUBLIC transfer_engine gtest
+                                               gtest_main)
+  add_test(NAME hip_fabric_test COMMAND hip_fabric_test)
 endif()
 
 if(USE_UBSHMEM)

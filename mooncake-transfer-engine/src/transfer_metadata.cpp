@@ -14,7 +14,13 @@
 
 #include "transfer_metadata.h"
 
+#include <json/reader.h>
 #include <json/value.h>
+#include <json/writer.h>
+#include <unistd.h>
+
+#include <random>
+#include <sstream>
 
 #include <cassert>
 #include <set>
@@ -312,6 +318,14 @@ struct TransferHandshakeUtil {
 
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
     next_segment_id_.store(1);
+    {
+        std::random_device rd;
+        local_incarnation_ =
+            (static_cast<uint64_t>(rd()) << 32) ^ rd() ^
+            static_cast<uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count()) ^
+            (static_cast<uint64_t>(getpid()) << 16);
+    }
 
     std::string protocol = extractProtocolFromConnString(conn_string);
     std::string custom_key;
@@ -334,6 +348,13 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
         LOG(ERROR)
             << "Unable to create metadata handshake plugin with conn string: "
             << conn_string;
+    }
+    if (conn_string == EXTERNAL_METADATA) {
+        // Local descriptor updates stay in-process like P2P mode; peers are
+        // only known through importSegment, so there is nothing to poll.
+        p2p_handshake_mode_ = true;
+        external_mode_ = true;
+        return;
     }
     if (conn_string == P2PHANDSHAKE) {
         p2p_handshake_mode_ = true;
@@ -1354,6 +1375,21 @@ std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
                                          bool force_rpc_update,
                                          GetResult *status) {
+    {
+        RWSpinlock::ReadGuard guard(imported_lock_);
+        auto it = imported_segments_.find(segment_name);
+        if (it != imported_segments_.end()) {
+            if (status) *status = GetResult::kFound;
+            return it->second.desc;
+        }
+    }
+    if (external_mode_) {
+        LOG(WARNING) << "Segment " << segment_name
+                     << " has not been imported (EXTERNAL metadata mode)";
+        if (status) *status = GetResult::kNotFound;
+        return nullptr;
+    }
+
     Json::Value peer_json;
 
     if (p2p_handshake_mode_) {
@@ -1826,6 +1862,121 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
     return 0;
 }
 
+int TransferMetadata::exportLocalSegment(std::string &blob) {
+    std::shared_ptr<SegmentDesc> desc;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        desc = it->second;
+    }
+    Json::Value root;
+    int ret = encodeSegmentDesc(*desc, root["segment"]);
+    if (ret) return ret;
+    root["format"] = "mooncake-segment-v1";
+    root["name"] = desc->name;
+    root["incarnation"] = Json::UInt64(local_incarnation_);
+    root["version"] = Json::UInt64(local_version_.load());
+    Json::StreamWriterBuilder writer;
+    writer["indentation"] = "";
+    blob = Json::writeString(writer, root);
+    return 0;
+}
+
+int TransferMetadata::importSegment(const std::string &segment_name,
+                                    const std::string &blob,
+                                    SegmentID &segment_id, bool &replaced) {
+    replaced = false;
+    Json::Value root;
+    Json::CharReaderBuilder reader;
+    std::string errors;
+    std::istringstream stream(blob);
+    if (!Json::parseFromStream(reader, stream, &root, &errors) ||
+        !root.isObject() ||
+        root["format"].asString() != "mooncake-segment-v1" ||
+        !root["segment"].isObject()) {
+        LOG(ERROR) << "importSegment: malformed segment blob " << errors;
+        return ERR_MALFORMED_JSON;
+    }
+    const std::string name =
+        segment_name.empty() ? root["name"].asString() : segment_name;
+    if (name.empty()) {
+        LOG(ERROR) << "importSegment: segment name missing";
+        return ERR_INVALID_ARGUMENT;
+    }
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_name_to_id_map_.find(name);
+        if (it != segment_name_to_id_map_.end() &&
+            it->second == LOCAL_SEGMENT_ID) {
+            LOG(ERROR) << "importSegment: " << name << " is the local segment";
+            return ERR_INVALID_ARGUMENT;
+        }
+    }
+    auto desc = decodeSegmentDesc(root["segment"], name);
+    if (!desc) {
+        LOG(ERROR) << "importSegment: cannot decode segment " << name;
+        return ERR_METADATA;
+    }
+    desc->name = name;
+    const uint64_t incarnation = root["incarnation"].asUInt64();
+    const uint64_t version = root["version"].asUInt64();
+
+    {
+        RWSpinlock::WriteGuard guard(imported_lock_);
+        auto it = imported_segments_.find(name);
+        if (it != imported_segments_.end()) {
+            if (it->second.incarnation == incarnation &&
+                version < it->second.version) {
+                LOG(WARNING) << "importSegment: ignoring stale descriptor of "
+                             << name << " (version " << version << " < "
+                             << it->second.version << ")";
+                desc = it->second.desc;
+            } else {
+                replaced = it->second.incarnation != incarnation ||
+                           !(*it->second.desc == *desc);
+                it->second = {desc, incarnation, version};
+            }
+        } else {
+            imported_segments_[name] = {desc, incarnation, version};
+        }
+    }
+
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto it = segment_name_to_id_map_.find(name);
+    if (it != segment_name_to_id_map_.end()) {
+        segment_id = it->second;
+        auto old = segment_id_to_desc_map_.find(segment_id);
+        if (old != segment_id_to_desc_map_.end() && old->second &&
+            !(*old->second == *desc))
+            replaced = true;
+    } else {
+        segment_id = next_segment_id_.fetch_add(1);
+        segment_name_to_id_map_[name] = segment_id;
+    }
+    segment_id_to_desc_map_[segment_id] = desc;
+    return 0;
+}
+
+TransferMetadata::SegmentID TransferMetadata::removeImportedSegment(
+    const std::string &segment_name) {
+    {
+        RWSpinlock::WriteGuard guard(imported_lock_);
+        imported_segments_.erase(segment_name);
+    }
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto it = segment_name_to_id_map_.find(segment_name);
+    if (it == segment_name_to_id_map_.end() || it->second == LOCAL_SEGMENT_ID)
+        return static_cast<SegmentID>(-1);
+    SegmentID segment_id = it->second;
+    segment_id_to_desc_map_.erase(segment_id);
+    segment_name_to_id_map_.erase(it);
+    return segment_id;
+}
+
 int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name)) {
@@ -1846,6 +1997,7 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         new_segment_desc->rebuildBufferRangeIndex();
         segment_desc = new_segment_desc;
     }
+    local_version_.fetch_add(1);
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
 }
@@ -1882,6 +2034,7 @@ int TransferMetadata::removeLocalMemoryBuffer(
         }
     }
     if (addr_exist) {
+        local_version_.fetch_add(1);
         if (update_metadata) return updateLocalSegmentDesc();
         return 0;
     }

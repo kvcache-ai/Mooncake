@@ -54,6 +54,9 @@ enum class GetResult {
 };
 
 #define P2PHANDSHAKE "P2PHANDSHAKE"
+// Segment descriptors are exchanged by the caller (exportLocalSegment /
+// importSegment) instead of a metadata server or the handshake daemon.
+#define EXTERNAL_METADATA "EXTERNAL"
 
 class TransferMetadata {
    public:
@@ -342,6 +345,23 @@ class TransferMetadata {
 
     void dumpMetadataContentUnlocked();
 
+    bool externalMode() const { return external_mode_; }
+
+    // Serializes the local segment descriptor, tagged with this process's
+    // incarnation and a version bumped on every local buffer change.
+    int exportLocalSegment(std::string &blob);
+
+    // Installs a peer descriptor produced by exportLocalSegment. Imported
+    // descriptors take precedence over metadata server / handshake lookups.
+    // `replaced` is set when an existing descriptor of the same name was
+    // swapped out (new incarnation or changed buffers).
+    int importSegment(const std::string &segment_name, const std::string &blob,
+                      SegmentID &segment_id, bool &replaced);
+
+    // Forgets an imported (or cached) peer segment. Returns the id it had,
+    // or -1 when unknown.
+    SegmentID removeImportedSegment(const std::string &segment_name);
+
    private:
     std::shared_ptr<SegmentDesc> getSegmentDescInternal(
         const std::string &segment_name, bool force_rpc_update,
@@ -364,6 +384,16 @@ class TransferMetadata {
     void metadataRefreshPollingLoop(uint64_t refresh_interval_seconds);
 
     bool p2p_handshake_mode_{false};
+    bool external_mode_{false};
+    uint64_t local_incarnation_{0};
+    std::atomic<uint64_t> local_version_{0};
+    struct ImportedSegment {
+        std::shared_ptr<SegmentDesc> desc;
+        uint64_t incarnation = 0;
+        uint64_t version = 0;
+    };
+    RWSpinlock imported_lock_;
+    std::unordered_map<std::string, ImportedSegment> imported_segments_;
     std::string common_key_prefix_;
     std::string rpc_meta_prefix_;
     // local cache

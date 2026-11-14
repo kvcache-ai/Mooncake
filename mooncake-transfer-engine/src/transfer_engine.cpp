@@ -185,6 +185,23 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     return impl_->removeLocalSegment(segment_name);
 }
 
+int TransferEngine::exportLocalSegment(std::string& blob) {
+    return impl_->exportLocalSegment(blob);
+}
+
+SegmentHandle TransferEngine::importSegment(const std::string& segment_name,
+                                            const std::string& blob) {
+    return impl_->importSegment(segment_name, blob);
+}
+
+int TransferEngine::bindSegment(SegmentHandle handle, int local_device) {
+    return impl_->bindSegment(handle, local_device);
+}
+
+int TransferEngine::removeSegment(const std::string& segment_name) {
+    return impl_->removeSegment(segment_name);
+}
+
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
@@ -845,6 +862,27 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
         return 0;
     else
         return impl_->removeLocalSegment(segment_name);
+}
+
+int TransferEngine::exportLocalSegment(std::string& blob) {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->exportLocalSegment(blob);
+}
+
+SegmentHandle TransferEngine::importSegment(const std::string& segment_name,
+                                            const std::string& blob) {
+    if (use_tent_) return static_cast<SegmentHandle>(ERR_NOT_IMPLEMENTED);
+    return impl_->importSegment(segment_name, blob);
+}
+
+int TransferEngine::bindSegment(SegmentHandle handle, int local_device) {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->bindSegment(handle, local_device);
+}
+
+int TransferEngine::removeSegment(const std::string& segment_name) {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->removeSegment(segment_name);
 }
 
 int TransferEngine::registerLocalMemory(void* addr, size_t length,

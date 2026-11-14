@@ -345,9 +345,10 @@ std::pair<std::string, std::string> parseConnectionString(
     if (pos != std::string::npos) {
         proto = conn_string.substr(0, pos);
         domain = conn_string.substr(pos + 3);
-    } else if (conn_string == P2PHANDSHAKE) {
+    } else if (conn_string == P2PHANDSHAKE ||
+               conn_string == EXTERNAL_METADATA) {
         proto = "";
-        domain = P2PHANDSHAKE;
+        domain = conn_string;
     } else {
         domain = conn_string;
     }
@@ -359,8 +360,9 @@ std::pair<std::string, std::string> parseConnectionString(
 
 std::string buildConnString(const std::string& metadata_type,
                             const std::string& metadata_server) {
-    if (metadata_server == P2PHANDSHAKE) {
-        return P2PHANDSHAKE;
+    if (metadata_server == P2PHANDSHAKE ||
+        metadata_server == EXTERNAL_METADATA) {
+        return metadata_server;
     }
 
     std::string conn_string = metadata_server;
@@ -388,6 +390,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                    << "Use 'hip' instead.";
         return -1;
     }
+    // "ualoe" is HipTransport with fabric-exportable allocations.
+    if (protocol && strcmp(protocol, "ualoe") == 0) protocol = "hip";
     if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
@@ -1654,6 +1658,49 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 #endif
 }
 
+pybind11::bytes TransferEnginePy::exportLocalSegment() {
+    std::string blob;
+    {
+        pybind11::gil_scoped_release release;
+        int ret = engine_->exportLocalSegment(blob);
+        if (ret) blob.clear();
+    }
+    if (blob.empty()) throw std::runtime_error("export_local_segment failed");
+    return pybind11::bytes(blob);
+}
+
+int64_t TransferEnginePy::importSegment(const std::string& segment_name,
+                                        const std::string& blob) {
+    pybind11::gil_scoped_release release;
+    auto handle = engine_->importSegment(segment_name, blob);
+    auto sid = static_cast<int64_t>(handle);
+    if (sid < 0) return sid;
+    std::string name = segment_name;
+    if (name.empty()) {
+        auto desc = engine_->getMetadata()->getSegmentDescByID(handle);
+        if (desc) name = desc->name;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!name.empty()) handle_map_[name] = handle;
+    return sid;
+}
+
+int TransferEnginePy::bindSegment(int64_t segment_id, int local_device) {
+    pybind11::gil_scoped_release release;
+    if (segment_id < 0) return ERR_INVALID_ARGUMENT;
+    return engine_->bindSegment(
+        static_cast<Transport::SegmentHandle>(segment_id), local_device);
+}
+
+int TransferEnginePy::removeSegment(const std::string& segment_name) {
+    pybind11::gil_scoped_release release;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        handle_map_.erase(segment_name);
+    }
+    return engine_->removeSegment(segment_name);
+}
+
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
     pybind11::gil_scoped_release release;
@@ -1775,6 +1822,12 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_HIP") = true;
 #else
     m.attr("SUPPORT_HIP") = false;
+#endif
+
+#if defined(USE_HIP) && defined(MC_HIP_HAS_FABRIC_HANDLE)
+    m.attr("SUPPORT_UALOE") = true;
+#else
+    m.attr("SUPPORT_UALOE") = false;
 #endif
 
 #ifdef USE_MNNVL
@@ -2029,6 +2082,13 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("device_name") = nullptr)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
+            .def("export_local_segment", &TransferEnginePy::exportLocalSegment)
+            .def("import_segment", &TransferEnginePy::importSegment,
+                 py::arg("segment_name"), py::arg("blob"))
+            .def("bind_segment", &TransferEnginePy::bindSegment,
+                 py::arg("segment_id"), py::arg("local_device") = -1)
+            .def("remove_segment", &TransferEnginePy::removeSegment,
+                 py::arg("segment_name"))
             .def("warmup_efa_segment", &TransferEnginePy::warmupEfaSegment,
                  py::arg("segment_name"))
             .def("get_notifies", &TransferEnginePy::getNotifies)

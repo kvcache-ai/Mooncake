@@ -21,6 +21,34 @@ enum class MemoryBackendType { use_cudamalloc, use_cumemcreate, unknown };
 
 namespace {
 
+// The fabric attribute only says the GPU has the link. An accelerator that is
+// not provisioned yet (UALink) still creates fabric allocations and fails at
+// export, so a caller trusting the attribute ends up with memory no peer can
+// map. Probe the whole export/import cycle instead.
+bool FabricHandleRoundTrip(CUmemGenericAllocationHandle handle) {
+#if defined(USE_HIP) && !defined(MC_HIP_HAS_FABRIC_HANDLE)
+    // CU_MEM_HANDLE_TYPE_FABRIC is a POSIX fd here (see gpu_vendor/hip.h);
+    // creating the allocation already proved it.
+    (void)handle;
+    return true;
+#else
+    CUmemFabricHandle fabric_handle = {};
+    if (cuMemExportToShareableHandle(&fabric_handle, handle,
+                                     CU_MEM_HANDLE_TYPE_FABRIC,
+                                     0) != CUDA_SUCCESS) {
+        return false;
+    }
+    CUmemGenericAllocationHandle imported;
+    if (cuMemImportFromShareableHandle(&imported, &fabric_handle,
+                                       CU_MEM_HANDLE_TYPE_FABRIC) !=
+        CUDA_SUCCESS) {
+        return false;
+    }
+    cuMemRelease(imported);
+    return true;
+#endif
+}
+
 MemoryBackendType ProbeAllocatorBackend(int device_id) {
     CUdevice dev;
     CUresult res = cuDeviceGet(&dev, device_id);
@@ -41,15 +69,32 @@ MemoryBackendType ProbeAllocatorBackend(int device_id) {
     prop.location.id = dev;
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 
-    CUmemGenericAllocationHandle handle;
-    size_t size = 4096;
-
-    res = cuMemCreate(&handle, size, &prop, 0);
-    if (res == CUDA_SUCCESS) {
-        cuMemRelease(handle);
-        return MemoryBackendType::use_cumemcreate;
+    size_t granularity = 0;
+    res = cuMemGetAllocationGranularity(&granularity, &prop,
+                                        CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (res != CUDA_SUCCESS || granularity == 0) {
+        // Failures here are expected off-fabric; on HIP each one leaves a
+        // sticky error that would surface at the caller's next runtime call.
+        (void)cudaGetLastError();
+        return MemoryBackendType::use_cudamalloc;
     }
-    return MemoryBackendType::use_cudamalloc;
+
+    CUmemGenericAllocationHandle handle;
+    res = cuMemCreate(&handle, granularity, &prop, 0);
+    if (res != CUDA_SUCCESS) {
+        (void)cudaGetLastError();
+        return MemoryBackendType::use_cudamalloc;
+    }
+    const bool usable = FabricHandleRoundTrip(handle);
+    cuMemRelease(handle);
+    if (!usable) {
+        (void)cudaGetLastError();
+        std::cerr << "mc_allocator_probe: device " << device_id
+                  << " creates fabric memory but cannot export or import it; "
+                     "falling back to cudaMalloc\n";
+        return MemoryBackendType::use_cudamalloc;
+    }
+    return MemoryBackendType::use_cumemcreate;
 }
 
 void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
@@ -109,10 +154,12 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         return nullptr;
     }
     result = cuMemMap((CUdeviceptr)ptr, size, 0, handle, 0);
+    // The mapping keeps the allocation alive; FreeFabricMemory retains a
+    // fresh handle to release it.
+    cuMemRelease(handle);
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuMemMap failed: " << result;
         cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
         return nullptr;
     }
     int device_count;
@@ -128,7 +175,6 @@ void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
         std::cerr << "cuMemSetAccess failed: " << result;
         cuMemUnmap((CUdeviceptr)ptr, size);
         cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
         return nullptr;
     }
     return ptr;

@@ -167,6 +167,20 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Framework-driven metadata exchange. With metadata conn string
+    // "EXTERNAL" this is the only way peers become known: the framework
+    // carries exportLocalSegment() blobs over its own control channel and
+    // calls importSegment() on the receiving side. bindSegment() optionally
+    // pre-maps the peer's buffers (local_device < 0: all local devices).
+    int exportLocalSegment(std::string& blob);
+
+    SegmentHandle importSegment(const std::string& segment_name,
+                                const std::string& blob);
+
+    int bindSegment(SegmentHandle handle, int local_device = -1);
+
+    int removeSegment(const std::string& segment_name);
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,

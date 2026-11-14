@@ -662,6 +662,17 @@ class Transport {
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
 
+    /// @brief Eagerly prepare access to every buffer of a remote segment
+    /// (e.g. import and map shared device memory) so the first transfer does
+    /// not pay that cost. local_device < 0 means all local devices.
+    virtual int bindSegment(SegmentID segment_id, int local_device) {
+        return 0;
+    }
+
+    /// @brief Drop cached per-segment state after the segment descriptor was
+    /// replaced or removed. No transfer to the segment may be in flight.
+    virtual void invalidateSegment(SegmentID segment_id) {}
+
    protected:
     virtual int install(std::string &local_server_name,
                         std::shared_ptr<TransferMetadata> meta,
