@@ -347,6 +347,28 @@ class Transport {
         volatile int64_t ts;
 
        private:
+        // Stamp the completion time for metrics. No-op unless collection
+        // was enabled before submit (start_time is left at 0 otherwise).
+        // Does not set is_finished.
+        static inline void stampMetricsOutcome(TransferTask *task) {
+#ifdef WITH_METRICS
+            if (task->start_time.time_since_epoch().count() == 0) return;
+            __atomic_store_n(
+                &task->end_ticks,
+                std::chrono::steady_clock::now().time_since_epoch().count(),
+                __ATOMIC_RELAXED);
+            const bool failed =
+                __atomic_load_n(&task->failed_slice_count, __ATOMIC_ACQUIRE) !=
+                0;
+            __atomic_store_n(&task->end_status,
+                             failed ? TransferStatusEnum::FAILED
+                                    : TransferStatusEnum::COMPLETED,
+                             __ATOMIC_RELAXED);
+#else
+            (void)task;
+#endif
+        }
+
         static inline void finishIfComplete(TransferTask *task, uint64_t state,
                                             bool record_failure = false) {
             // Handshake / dummy slices are not attached to a BatchDesc.
@@ -375,26 +397,15 @@ class Transport {
             // COMPLETED always walks first, so CQ must not write is_finished.
             // The terminal notify is a separate wake. It does not settle
             // is_finished and does not require a status poll.
+            // Metrics still need the callback time. A later free or status
+            // query would otherwise time the task until that call.
+            if (batch_desc.event_enabled) stampMetricsOutcome(task);
             batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_acq_rel);
             batch_desc.releaseCompletionLatchToken();
 #else
             // EDC waiters can freeBatchID after the CV without a walk.
-#ifdef WITH_METRICS
-            // Save the outcome only for tasks the metrics record.
-            if (task->start_time.time_since_epoch().count() != 0) {
-                __atomic_store_n(
-                    &task->end_ticks,
-                    std::chrono::steady_clock::now().time_since_epoch().count(),
-                    __ATOMIC_RELAXED);
-                const bool failed = __atomic_load_n(&task->failed_slice_count,
-                                                    __ATOMIC_ACQUIRE) != 0;
-                __atomic_store_n(&task->end_status,
-                                 failed ? TransferStatusEnum::FAILED
-                                        : TransferStatusEnum::COMPLETED,
-                                 __ATOMIC_RELAXED);
-            }
-#endif
+            stampMetricsOutcome(task);
             __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
 
             auto prev = batch_desc.finished_task_count.fetch_add(
