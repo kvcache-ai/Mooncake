@@ -97,6 +97,12 @@ Owner maintenance consumes pages through a visitor and retains only the current 
 The compatibility `Vec` API has a fixed 256-route total limit and returns an explicit error when a
 continuation exists. Custom authority services keep source compatibility and fail closed until they
 implement the paginated service method. `MetadataOnly` applies the same fixed compatibility limit.
+An unreachable mirrored authority is marked suspect and omitted from ordinary routing queries.
+Destructive owner scans retain active suspect authorities in their coverage set, so a repeated
+failure keeps the scan incomplete until the authority recovers or leaves membership. The legacy
+owner visitor and compatibility `Vec` API return an error for incomplete coverage; the explicit
+status visitor delivers partial routes with `Incomplete`. Storage-owner evacuation stops before
+stale allocation reclamation while that status is incomplete.
 
 Route authority policy is bootstrap-validated through metadata:
 
