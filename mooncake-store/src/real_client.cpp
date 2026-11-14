@@ -525,6 +525,13 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
         qr.resolved_tenant_id);
 }
 
+bool IsLocalDiskMasterLeaseExpired(const QueryResult &query_result,
+                                   const std::string &key) {
+    if (!query_result.IsLeaseExpired()) return false;
+    LOG(WARNING) << "lease_expired_before_data_transfer_completed key=" << key;
+    return true;
+}
+
 // Shared object-byte range overflow check (same semantics as
 // execute_ranged_read / session ranged get-put).
 inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
@@ -4128,6 +4135,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(checksum_result.error());
             return nullptr;
         }
+        if (IsLocalDiskMasterLeaseExpired(query_result.value(), key)) {
+            return nullptr;
+        }
         return buffer_handle;
     }
 
@@ -4649,6 +4659,11 @@ RealClient::batch_get_buffer_internal(
                             tl::make_unexpected(checksum_result.error());
                         continue;
                     }
+                    if (IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
+                        op_status[idx_it->second] =
+                            tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
+                        continue;
+                    }
                     op_status[idx_it->second] =
                         static_cast<int64_t>(op.total_size);
                 } else {
@@ -4719,6 +4734,7 @@ RealClient::batch_get_buffer_internal(
             }
         }
 
+        // Healed reads already checked their fresh lease in the recursive call.
         std::vector<DuplicateFanOutJob> dup_jobs;
         for (const auto &[dup_idx, primary_idx] : duplicate_disk_ops) {
             const auto &dup_op = disk_ops[dup_idx];
@@ -7225,6 +7241,12 @@ RealClient::batch_get_into_internal(
             if (!checksum_result) {
                 results[op.original_index] =
                     tl::make_unexpected(checksum_result.error());
+                continue;
+            }
+            if (IsLocalDiskMasterLeaseExpired(op.query_result,
+                                              offload_object_it.first)) {
+                results[op.original_index] =
+                    tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
             }
         }
     }
@@ -8963,6 +8985,11 @@ RealClient::batch_get_into_multi_buffers_internal(
                     if (!checksum_result) {
                         results[op.original_index] =
                             tl::make_unexpected(checksum_result.error());
+                        continue;
+                    }
+                    if (IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
                     }
                 }
             }
