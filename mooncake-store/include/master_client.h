@@ -81,7 +81,7 @@ class MasterClient {
                 pool_conf.client_config.socket_config);
         }
         detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
-                                        RpcTimeoutConfig::FromEnvironment());
+                                         RpcTimeoutConfig::FromEnvironment());
         // TODO(F02-T013, replace-in=UPG1-F14-I07):
         // Fixed U: d01447808d10af78011e9203d53796a15a032a03.
         // Source: UPG1-F02-B09; owner: UPG1-F14-I07.

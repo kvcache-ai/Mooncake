@@ -15,8 +15,7 @@ namespace mooncake {
 // the active RPC service binds the same metrics port.
 class P2PStatusHttpServer {
    public:
-    explicit P2PStatusHttpServer(uint16_t port,
-                                 std::string host = "0.0.0.0")
+    explicit P2PStatusHttpServer(uint16_t port, std::string host = "0.0.0.0")
         : port_(port), host_(std::move(host)) {}
 
     P2PStatusHttpServer(const P2PStatusHttpServer&) = delete;

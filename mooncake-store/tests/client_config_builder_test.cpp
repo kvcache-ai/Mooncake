@@ -90,7 +90,8 @@ TEST(ClientConfigBuilderTest, CentralizedDictParsesCapacitySyntax) {
         auto invalid = values;
         invalid[key] = "invalid";
         auto result =
-            CentralizedClientConfigBuilder::build_centralized_real_client(invalid);
+            CentralizedClientConfigBuilder::build_centralized_real_client(
+                invalid);
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
@@ -100,8 +101,8 @@ TEST(ClientConfigBuilderTest, CentralizedDictParsesCapacitySyntax) {
     config =
         CentralizedClientConfigBuilder::build_centralized_real_client(values);
     auto typed = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
-        "127.0.0.1:50051", 1023, 0);
+        "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt, "127.0.0.1:50051",
+        1023, 0);
     ASSERT_TRUE(config);
     ASSERT_TRUE(typed);
     EXPECT_EQ(config->global_segment_size, 1023u);

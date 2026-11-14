@@ -136,7 +136,7 @@ class PausedReadMaster {
     using Service = WrappedMasterService;
     using ReadRequest = const std::vector<std::string>&;
     using ReadResponse =
-        std::vector<tl::expected<GetReplicaListResponse, ErrorCode> >;
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>;
 #endif
 
     explicit PausedReadMaster(Service& service)

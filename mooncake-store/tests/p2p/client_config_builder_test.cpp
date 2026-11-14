@@ -410,9 +410,8 @@ TEST(ClientConfigBuilderTest, BuildP2PTransferModesPreserveWorkerArguments) {
         size_t poll_workers;
         bool start_local_only;
     };
-    const ModeCase cases[] = {
-        {"te", LocalTransferMode::TE, 18, true},
-        {"memcpy", LocalTransferMode::MEMCPY, 99, false}};
+    const ModeCase cases[] = {{"te", LocalTransferMode::TE, 18, true},
+                              {"memcpy", LocalTransferMode::MEMCPY, 99, false}};
     for (const auto& test : cases) {
         SCOPED_TRACE(test.name);
         auto config = P2PClientConfigBuilder::build_p2p_real_client(

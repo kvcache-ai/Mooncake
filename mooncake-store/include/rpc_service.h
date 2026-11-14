@@ -28,7 +28,9 @@ class WrappedMasterService {
     void init_http_server();
 
     bool http_server_started() const { return http_server_started_; }
-    uint16_t http_port() const { return http_server_ ? http_server_->port() : 0; }
+    uint16_t http_port() const {
+        return http_server_ ? http_server_->port() : 0;
+    }
 
     // TODO-REF(F02-T015, receiver=UPG1-F06-S80):
     // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).

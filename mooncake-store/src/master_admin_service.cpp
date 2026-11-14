@@ -111,7 +111,8 @@ bool MasterAdminServer::Start() {
     // Replace this temporary path with fixed U MasterAdminServer::Start
     // storage/HA metric projection and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(WARNING) << "Additional storage and HA metrics are not available in this build";
+    LOG(WARNING)
+        << "Additional storage and HA metrics are not available in this build";
     RegisterHandler();
 
     auto ec = http_server_.async_start();
@@ -128,16 +129,16 @@ bool MasterAdminServer::Start() {
             while (metric_report_running_.load()) {
                 const auto snapshot = SnapshotState();
                 std::ostringstream log_stream;
-                log_stream << "Master Admin Metrics: role="
-                           << ha::MasterRuntimeRoleToString(snapshot.state)
-                           << ", state="
-                           << ha::MasterRuntimeStateToString(snapshot.state)
-                           << ", service_ready="
-                           << (snapshot.service_available ? "true" : "false")
-                           << ", master={"
-                           << MasterMetricManager::instance()
-                                  .get_summary_string()
-                           << "}";
+                log_stream
+                    << "Master Admin Metrics: role="
+                    << ha::MasterRuntimeRoleToString(snapshot.state)
+                    << ", state="
+                    << ha::MasterRuntimeStateToString(snapshot.state)
+                    << ", service_ready="
+                    << (snapshot.service_available ? "true" : "false")
+                    << ", master={"
+                    << MasterMetricManager::instance().get_summary_string()
+                    << "}";
                 if (snapshot.leader_view.has_value()) {
                     log_stream
                         << ", leader=" << snapshot.leader_view->leader_address
@@ -262,7 +263,8 @@ struct HttpHealthResponse {
     std::optional<std::string> leader_address;
     std::optional<uint64_t> view_version;
 };
-YLT_REFL(HttpHealthResponse, status, role, ha_state, service_ready, leader_address, view_version);
+YLT_REFL(HttpHealthResponse, status, role, ha_state, service_ready,
+         leader_address, view_version);
 
 struct HttpVersionResponse {
     std::string version;
@@ -371,12 +373,12 @@ void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
         auto key = req.get_query_value("key");
-    // TODO-REF(F02-T015, receiver=UPG1-F05-S44):
-    // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).
-    // Stage: UPG1 / F05-S44 / implementation; due before F05-S44 acceptance.
-    // Replace this temporary path with fixed U HandleQueryKey tenant-aware
-    // GetReplicaList and its real provider.
-    // Close with source/owner comparison, verification, review and receipt SHA.
+        // TODO-REF(F02-T015, receiver=UPG1-F05-S44):
+        // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).
+        // Stage: UPG1 / F05-S44 / implementation; due before F05-S44
+        // acceptance. Replace this temporary path with fixed U HandleQueryKey
+        // tenant-aware GetReplicaList and its real provider. Close with
+        // source/owner comparison, verification, review and receipt SHA.
         auto get_result = service->GetReplicaList(std::string(key));
         resp.add_header("Content-Type", "application/json; charset=utf-8");
         if (get_result) {
@@ -490,80 +492,79 @@ void MasterAdminServer::HandleBatchQueryKeys(
     // BatchGetReplicaListForAdmin and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
     WithActiveService(resp, [&](auto service) {
-            auto keys_view = req.get_query_value("keys");
-            std::vector<std::string> keys;
+        auto keys_view = req.get_query_value("keys");
+        std::vector<std::string> keys;
 
-            if (!keys_view.empty()) {
-                std::string keys_str(keys_view);
-                std::string key;
-                std::istringstream iss(keys_str);
-                while (std::getline(iss, key, ',')) {
-                    keys.push_back(std::move(key));
-                }
+        if (!keys_view.empty()) {
+            std::string keys_str(keys_view);
+            std::string key;
+            std::istringstream iss(keys_str);
+            while (std::getline(iss, key, ',')) {
+                keys.push_back(std::move(key));
+            }
+        }
+
+        resp.add_header("Content-Type", "application/json; charset=utf-8");
+
+        if (keys.empty()) {
+            resp.set_status_and_content(
+                status_type::bad_request,
+                "{\"success\":false,\"error\":\"No keys provided. Use "
+                "?keys=key1,key2,...\"}");
+            return;
+        }
+
+        auto results = service->BatchGetReplicaList(keys);
+        const size_t n = std::min(keys.size(), results.size());
+
+        std::string ss;
+        ss.reserve(n * 512);
+
+        ss += "{\"success\":true,\"data\":{";
+
+        for (size_t i = 0; i < n; ++i) {
+            if (i > 0) ss += ",";
+
+            const auto& key = keys[i];
+            const auto& r = results[i];
+
+            ss += "\"";
+            ss += key;
+            ss += "\":";
+
+            if (!r.has_value()) {
+                ss += "{\"ok\":false,\"error\":\"";
+                ss += toString(r.error());
+                ss += "\"}";
+                continue;
             }
 
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            ss += "{\"ok\":true,\"values\":[";
+            bool first = true;
 
-            if (keys.empty()) {
-                resp.set_status_and_content(
-                    status_type::bad_request,
-                    "{\"success\":false,\"error\":\"No keys provided. Use "
-                    "?keys=key1,key2,...\"}");
-                return;
+            const auto& replicas = r.value().replicas;
+            for (const auto& rep : replicas) {
+                if (!rep.is_memory_replica()) continue;
+
+                auto& mem_desc = rep.get_memory_descriptor();
+                std::string tmp;
+                struct_json::to_json(mem_desc.buffer_descriptor, tmp);
+                if (!first) ss += ",";
+                ss += tmp;
+                first = false;
             }
+            ss += "]}";
+        }
 
-            auto results = service->BatchGetReplicaList(keys);
-            const size_t n = std::min(keys.size(), results.size());
+        ss += "}}";
 
-            std::string ss;
-            ss.reserve(n * 512);
+        if (results.size() != keys.size()) {
+            LOG(WARNING) << "BatchGetReplicaList size mismatch: keys="
+                         << keys.size() << " results=" << results.size();
+        }
 
-            ss += "{\"success\":true,\"data\":{";
-
-            for (size_t i = 0; i < n; ++i) {
-                if (i > 0) ss += ",";
-
-                const auto& key = keys[i];
-                const auto& r = results[i];
-
-                ss += "\"";
-                ss += key;
-                ss += "\":";
-
-                if (!r.has_value()) {
-                    ss += "{\"ok\":false,\"error\":\"";
-                    ss += toString(r.error());
-                    ss += "\"}";
-                    continue;
-                }
-
-                ss += "{\"ok\":true,\"values\":[";
-                bool first = true;
-
-                const auto& replicas = r.value().replicas;
-                for (const auto& rep : replicas) {
-                    if (!rep.is_memory_replica()) continue;
-
-                    auto& mem_desc = rep.get_memory_descriptor();
-                    std::string tmp;
-                    struct_json::to_json(mem_desc.buffer_descriptor, tmp);
-                    if (!first) ss += ",";
-                    ss += tmp;
-                    first = false;
-                }
-                ss += "]}";
-            }
-
-            ss += "}}";
-
-            if (results.size() != keys.size()) {
-                LOG(WARNING)
-                    << "BatchGetReplicaList size mismatch: keys=" << keys.size()
-                    << " results=" << results.size();
-            }
-
-            resp.set_status_and_content(status_type::ok, std::move(ss));
-            });
+        resp.set_status_and_content(status_type::ok, std::move(ss));
+    });
 }
 
 void MasterAdminServer::HandleGetSegmentsDetail(
@@ -574,9 +575,10 @@ void MasterAdminServer::HandleGetSegmentsDetail(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleGetSegmentsDetail and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleGetSegmentsDetail: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Segment details is not available in this build");
+    LOG(ERROR)
+        << "HandleGetSegmentsDetail: U business provider is not available yet";
+    SetServiceUnavailable(resp,
+                          "Segment details is not available in this build");
 }
 
 void MasterAdminServer::HandleGetDfsShardCount(
@@ -587,7 +589,8 @@ void MasterAdminServer::HandleGetDfsShardCount(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleGetDfsShardCount and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleGetDfsShardCount: U business provider is not available yet";
+    LOG(ERROR)
+        << "HandleGetDfsShardCount: U business provider is not available yet";
     SetServiceUnavailable(
         resp, "DFS shard management is not available in this build");
 }
@@ -600,9 +603,10 @@ async_simple::coro::Lazy<void> MasterAdminServer::HandleExpandDfsShards(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleExpandDfsShards and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleExpandDfsShards: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "DFS shard expansion is not available in this build");
+    LOG(ERROR)
+        << "HandleExpandDfsShards: U business provider is not available yet";
+    SetServiceUnavailable(resp,
+                          "DFS shard expansion is not available in this build");
     co_return;
 }
 
@@ -614,9 +618,9 @@ void MasterAdminServer::HandleCreateDrainJob(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleCreateDrainJob and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleCreateDrainJob: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Drain jobs is not available in this build");
+    LOG(ERROR)
+        << "HandleCreateDrainJob: U business provider is not available yet";
+    SetServiceUnavailable(resp, "Drain jobs is not available in this build");
 }
 
 void MasterAdminServer::HandleQueryDrainJob(
@@ -627,9 +631,9 @@ void MasterAdminServer::HandleQueryDrainJob(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleQueryDrainJob and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleQueryDrainJob: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Drain jobs is not available in this build");
+    LOG(ERROR)
+        << "HandleQueryDrainJob: U business provider is not available yet";
+    SetServiceUnavailable(resp, "Drain jobs is not available in this build");
 }
 
 void MasterAdminServer::HandleCancelDrainJob(
@@ -640,9 +644,9 @@ void MasterAdminServer::HandleCancelDrainJob(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleCancelDrainJob and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleCancelDrainJob: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Drain jobs is not available in this build");
+    LOG(ERROR)
+        << "HandleCancelDrainJob: U business provider is not available yet";
+    SetServiceUnavailable(resp, "Drain jobs is not available in this build");
 }
 
 void MasterAdminServer::HandleSegmentStatus(
@@ -653,7 +657,8 @@ void MasterAdminServer::HandleSegmentStatus(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleSegmentStatus and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleSegmentStatus: U business provider is not available yet";
+    LOG(ERROR)
+        << "HandleSegmentStatus: U business provider is not available yet";
     SetServiceUnavailable(
         resp, "Segment status management is not available in this build");
 }
@@ -666,7 +671,8 @@ void MasterAdminServer::HandleSetSegmentStatus(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleSetSegmentStatus and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleSetSegmentStatus: U business provider is not available yet";
+    LOG(ERROR)
+        << "HandleSetSegmentStatus: U business provider is not available yet";
     SetServiceUnavailable(
         resp, "Segment status management is not available in this build");
 }
@@ -679,9 +685,10 @@ void MasterAdminServer::HandleKvEventsStatus(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleKvEventsStatus and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleKvEventsStatus: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "KV event status is not available in this build");
+    LOG(ERROR)
+        << "HandleKvEventsStatus: U business provider is not available yet";
+    SetServiceUnavailable(resp,
+                          "KV event status is not available in this build");
 }
 
 void MasterAdminServer::HandleGetTenantQuotas(
@@ -692,9 +699,9 @@ void MasterAdminServer::HandleGetTenantQuotas(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleGetTenantQuotas and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleGetTenantQuotas: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Tenant quotas is not available in this build");
+    LOG(ERROR)
+        << "HandleGetTenantQuotas: U business provider is not available yet";
+    SetServiceUnavailable(resp, "Tenant quotas is not available in this build");
 }
 
 void MasterAdminServer::HandleUpsertTenantQuota(
@@ -705,9 +712,9 @@ void MasterAdminServer::HandleUpsertTenantQuota(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleUpsertTenantQuota and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleUpsertTenantQuota: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Tenant quotas is not available in this build");
+    LOG(ERROR)
+        << "HandleUpsertTenantQuota: U business provider is not available yet";
+    SetServiceUnavailable(resp, "Tenant quotas is not available in this build");
 }
 
 void MasterAdminServer::HandleDeleteTenantQuota(
@@ -718,9 +725,9 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     // Replace this temporary path with fixed U
     // MasterAdminServer::HandleDeleteTenantQuota and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
-    LOG(ERROR) << "HandleDeleteTenantQuota: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Tenant quotas is not available in this build");
+    LOG(ERROR)
+        << "HandleDeleteTenantQuota: U business provider is not available yet";
+    SetServiceUnavailable(resp, "Tenant quotas is not available in this build");
 }
 
 void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
@@ -746,8 +753,8 @@ void MasterAdminServer::HandleSoftPin(coro_http::coro_http_request& req,
     // and its real provider.
     // Close with source/owner comparison, verification, review and receipt SHA.
     LOG(ERROR) << "HandleSoftPin: U business provider is not available yet";
-    SetServiceUnavailable(
-        resp, "Soft pin management is not available in this build");
+    SetServiceUnavailable(resp,
+                          "Soft pin management is not available in this build");
 }
 
 void MasterAdminServer::RegisterHandler() {

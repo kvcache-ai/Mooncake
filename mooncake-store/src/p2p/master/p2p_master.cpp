@@ -789,8 +789,8 @@ int P2PMaster::RunWithHA() {
                                                  primary_service));
             primary_snapshot_server =
                 std::make_unique<coro_rpc::coro_rpc_server>(
-                    1, buildHostNameWithPort(
-                           config_.rpc.address, config_.ha.snapshot_service_port));
+                    1, buildHostNameWithPort(config_.rpc.address,
+                                             config_.ha.snapshot_service_port));
             RegisterP2PStandbySnapshotRpcHandlers(
                 *primary_snapshot_server, primary_snapshot_service.get());
             auto snapshot_result = primary_snapshot_server->async_start();

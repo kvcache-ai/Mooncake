@@ -318,7 +318,8 @@ void NormalizeRedisEndpoint(std::string& endpoint) {
 tl::expected<void, std::string> ValidateAndNormalize(
     P2PMasterConfig& config, const std::string& election_backend) {
     if (config.metrics.http_port > std::numeric_limits<uint16_t>::max()) {
-        return tl::make_unexpected("metrics_port must be in the range 0..65535");
+        return tl::make_unexpected(
+            "metrics_port must be in the range 0..65535");
     }
     NormalizeRedisEndpoint(config.redis.endpoint);
 

@@ -258,7 +258,7 @@ jobs:
     - name: Start metadata server
       run: |
         source test_env/bin/activate
-        mooncake_http_metadata_server --port 8080 &
+        mooncake_http_metadata_server --host 127.0.0.1 --port 8080 &
       shell: bash
 
     - name: Prepare P2P test configurations

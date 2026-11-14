@@ -64,7 +64,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_GID_INDEX";
     }
 
-    const char* pkey_index_env = std::getenv("MC_PKEY_INDEX");
+    const char *pkey_index_env = std::getenv("MC_PKEY_INDEX");
     if (pkey_index_env) {
         try {
             int val = std::stoi(pkey_index_env);
@@ -76,7 +76,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                     << "value " << pkey_index_env
                     << " out of range (should be 0-65535)";
             }
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
                          << pkey_index_env << ". Error: " << e.what();
         }
@@ -271,9 +271,9 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char* min_port_env = std::getenv("MC_MIN_RPC_PORT");
+    const char *min_port_env = std::getenv("MC_MIN_RPC_PORT");
     if (!min_port_env) min_port_env = std::getenv("MC_MIN_PRC_PORT");
-    const char* max_port_env = std::getenv("MC_MAX_RPC_PORT");
+    const char *max_port_env = std::getenv("MC_MAX_RPC_PORT");
     if (!max_port_env) max_port_env = std::getenv("MC_MAX_PRC_PORT");
     {
         int raw_min = min_port_env ? atoi(min_port_env) : config.rpc_min_port;
@@ -346,7 +346,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char* service_level_env = std::getenv("MC_IB_SL");
+    const char *service_level_env = std::getenv("MC_IB_SL");
     if (service_level_env) {
         try {
             int val = std::stoi(service_level_env);
@@ -358,7 +358,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                     << "value " << service_level_env
                     << " out of range (should be 0-15)";
             }
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             LOG(WARNING) << "Invalid MC_IB_SL environment value: "
                          << service_level_env << ". Error: " << e.what();
         }

@@ -28,7 +28,7 @@ bool isPortAvailable(int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
-    bool available = (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    bool available = (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     close(sock);
     return available;
 }
@@ -55,7 +55,7 @@ int AutoPortBinder::tryBindPort() {
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port);
 
-        if (bind(socket_fd_, (sockaddr*)&addr, sizeof(addr)) == 0) {
+        if (bind(socket_fd_, (sockaddr *)&addr, sizeof(addr)) == 0) {
             port_ = port;
             return port;
         } else {
@@ -81,7 +81,7 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-tl::expected<std::string, int> httpGet(const std::string& url) {
+tl::expected<std::string, int> httpGet(const std::string &url) {
     coro_http::coro_http_client client;
     auto res = client.get(url);
     if (res.status == 200) {
@@ -152,12 +152,12 @@ int getFreeTcpPort() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(0);
-    if (::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
         ::close(sock);
         return -1;
     }
     socklen_t len = sizeof(addr);
-    if (::getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+    if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
         ::close(sock);
         return -1;
     }
