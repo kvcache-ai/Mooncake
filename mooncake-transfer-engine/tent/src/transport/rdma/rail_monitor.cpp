@@ -58,6 +58,63 @@ bool sameRailLayout(const Topology* a, const Topology* b) {
     return true;
 }
 
+// What the monitors of one peer, one per worker, know about a NIC pair. The
+// workers share its endpoints too, so what one of them learns holds for all.
+struct SharedRail {
+    int error_count = 0;
+    std::chrono::steady_clock::time_point last_error{};
+    std::chrono::steady_clock::time_point resume_time{};  // {}: not paused
+    std::chrono::seconds cooldown{0};
+};
+
+// Locked with a RailMonitor::mutex_ held; it never calls back into a monitor.
+struct SharedRails {
+    std::mutex mutex;
+    std::atomic<uint64_t> generation{0};  // bumped by pauses and withdrawals
+    std::unordered_map<std::string, std::unordered_map<std::string, SharedRail>>
+        peers;
+};
+
+SharedRails& sharedRails() {
+    static auto* rails = new SharedRails;  // never destroyed: used at exit
+    return *rails;
+}
+
+int recordFailure(const std::string& peer, const std::string& rail,
+                  std::chrono::steady_clock::time_point now,
+                  std::chrono::seconds window) {
+    auto& shared = sharedRails();
+    std::lock_guard<std::mutex> guard(shared.mutex);
+    auto& entry = shared.peers[peer][rail];
+    if (entry.error_count == 0 || now - entry.last_error > window)
+        entry.error_count = 1;
+    else
+        entry.error_count++;
+    entry.last_error = now;
+    return entry.error_count;
+}
+
+void publishPause(const std::string& peer, const std::string& rail,
+                  std::chrono::steady_clock::time_point resume_time,
+                  std::chrono::seconds cooldown) {
+    auto& shared = sharedRails();
+    std::lock_guard<std::mutex> guard(shared.mutex);
+    auto& entry = shared.peers[peer][rail];
+    // Only a success (withdraw) undoes an escalation by a failed trial.
+    if (cooldown > entry.cooldown) entry.cooldown = cooldown;
+    if (resume_time <= entry.resume_time) return;  // a longer pause stands
+    entry.resume_time = resume_time;
+    shared.generation.fetch_add(1, std::memory_order_release);
+}
+
+void withdraw(const std::string& peer, const std::string& rail) {
+    auto& shared = sharedRails();
+    std::lock_guard<std::mutex> guard(shared.mutex);
+    auto it = shared.peers.find(peer);
+    if (it != shared.peers.end() && it->second.erase(rail))
+        shared.generation.fetch_add(1, std::memory_order_release);
+}
+
 }  // namespace
 
 Status RailMonitor::load(std::shared_ptr<const Topology> local,
@@ -90,6 +147,7 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
         }
     }
     if (same_layout) return Status::OK();
+    synced_generation_ = 0;  // the rebuilt states take over every pause again
     if (!rail_topo_json.empty()) {
         auto status = loadFromJson(rail_topo_json);
         if (status.ok()) return status;
@@ -143,6 +201,7 @@ uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
 
 bool RailMonitor::admit(int local_nic, int remote_nic, uint64_t& probe_token) {
     std::lock_guard<std::mutex> guard(mutex_);
+    syncSharedPauses();
     probe_token = 0;
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
@@ -204,6 +263,7 @@ void RailMonitor::cancelProbe(int local_nic, int remote_nic,
     if (st.probe_in_flight && st.active_probe_token == probe_token) {
         st.probe_in_flight = false;
         st.active_probe_token = 0;
+        synced_generation_ = 0;  // a sync skipped this rail while it flew
         // Revert a Half-Open trial to expired-Open so the next admit() re-arms
         // a fresh trial. A plain Open probe just clears its flag.
         st.half_open = false;
@@ -231,7 +291,10 @@ void RailMonitor::markFailed(int local_nic, int remote_nic,
         (!st.probe_in_flight || st.active_probe_token != probe_token))
         return;
     auto now = std::chrono::steady_clock::now();
-    if (st.error_count == 0 || now - st.last_error > error_window_) {
+    if (sharing()) {
+        st.error_count = recordFailure(
+            machine_id_, railKey(local_nic, remote_nic), now, error_window_);
+    } else if (st.error_count == 0 || now - st.last_error > error_window_) {
         st.error_count = 1;
     } else {
         st.error_count++;
@@ -245,6 +308,7 @@ void RailMonitor::markFailed(int local_nic, int remote_nic,
     if (probe_token != 0 && st.probe_in_flight) {
         st.probe_in_flight = false;
         st.active_probe_token = 0;
+        synced_generation_ = 0;  // a sync skipped this rail while it flew
         if (st.half_open) {
             st.half_open = false;
             st.cooldown *= 2;
@@ -256,6 +320,9 @@ void RailMonitor::markFailed(int local_nic, int remote_nic,
                       << local_nic << " remote_nic=" << remote_nic
                       << " (cooldown escalated to " << st.cooldown.count()
                       << "s)";
+            if (sharing())
+                publishPause(machine_id_, railKey(local_nic, remote_nic),
+                             st.resume_time, st.cooldown);
             updateBestMapping();
         }
         // Open-phase probe failed: leave resume_time and cooldown untouched.
@@ -300,6 +367,9 @@ void RailMonitor::markFailed(int local_nic, int remote_nic,
             // last_probe_time defaults to epoch and admit() would arm a probe
             // the instant the pause arms, defeating the throttle.
             st.last_probe_time = now;
+            if (sharing())
+                publishPause(machine_id_, railKey(local_nic, remote_nic),
+                             st.resume_time, st.cooldown);
             updateBestMapping();
         }
         // Already paused (Open, no probe in flight): leave resume_time and
@@ -333,6 +403,7 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic,
         st.last_probe_time = {};
         LOG(INFO) << "Rail recovered: local_nic=" << local_nic
                   << " remote_nic=" << remote_nic << " (probe/trial succeeded)";
+        if (sharing()) withdraw(machine_id_, railKey(local_nic, remote_nic));
         updateBestMapping();
         return;
     }
@@ -350,6 +421,7 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic,
     st.resume_time = {};
     st.cooldown = std::chrono::seconds(0);
     st.last_probe_time = {};
+    if (sharing()) withdraw(machine_id_, railKey(local_nic, remote_nic));
     if (was_paused) {
         LOG(INFO) << "Rail recovered: local_nic=" << local_nic
                   << " remote_nic=" << remote_nic
@@ -360,6 +432,7 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic,
 
 int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
     std::lock_guard<std::mutex> guard(mutex_);
+    syncSharedPauses();
     if (remote_numa >= 0 && remote_numa < (int)kMaxNuma) {
         if (best_mapping_[remote_numa].count(local_nic))
             return best_mapping_[remote_numa][local_nic];
@@ -379,6 +452,66 @@ int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
             return best_mapping_[remote_numa][local_nic];
     }
     return -1;
+}
+
+void RailMonitor::setPeerMachine(const std::string& machine_id) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    machine_id_ = machine_id;
+}
+
+std::string RailMonitor::railKey(int local_nic, int remote_nic) const {
+    // NIC ids are per snapshot; names mean the same pair on every monitor.
+    return local_->getNicEntry(local_nic)->name + "|" +
+           remote_->getNicEntry(remote_nic)->name;
+}
+
+void RailMonitor::syncSharedPauses() {
+    if (!sharing() || !ready_) return;
+    auto& shared = sharedRails();
+    const auto generation = shared.generation.load(std::memory_order_acquire);
+    if (generation == synced_generation_) return;
+    synced_generation_ = generation;
+    std::unordered_map<std::string, SharedRail> verdicts;
+    {
+        std::lock_guard<std::mutex> guard(shared.mutex);
+        auto it = shared.peers.find(machine_id_);
+        if (it != shared.peers.end()) verdicts = it->second;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    bool changed = false;
+    for (auto& [rail, st] : rail_states_) {
+        // A probe or trial of this worker is on the wire: its result decides.
+        if (st.probe_in_flight) continue;
+        auto it = verdicts.find(railKey(rail.first, rail.second));
+        // Gone or counting again: a transfer or probe worked since the pause.
+        // A pause armed here is published at once, so it never looks so.
+        if (it == verdicts.end() ||
+            it->second.resume_time == std::chrono::steady_clock::time_point{}) {
+            if (!st.paused()) continue;
+            st = RailState{};
+            LOG(INFO) << "Rail recovered: local_nic=" << rail.first
+                      << " remote_nic=" << rail.second
+                      << " (recovered on another worker)";
+            changed = true;
+            continue;
+        }
+        const auto& verdict = it->second;
+        if (now >= verdict.resume_time ||  // expired: no verdict until a trial
+            (st.paused() && verdict.resume_time <= st.resume_time))
+            continue;
+        if (!st.paused()) {
+            LOG(INFO) << "Rail paused: local_nic=" << rail.first
+                      << " remote_nic=" << rail.second
+                      << " (paused by another worker, cooldown="
+                      << verdict.cooldown.count() << "s)";
+            changed = true;
+        }
+        // As for a pause armed here, the first probe waits one interval.
+        st.cooldown = verdict.cooldown;
+        st.resume_time = verdict.resume_time;
+        st.last_probe_time = now;
+    }
+    if (changed) updateBestMapping();
 }
 
 /**

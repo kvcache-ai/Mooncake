@@ -813,6 +813,273 @@ TEST(RailMonitorProbeTest, StaleCompletionCannotResolveNewProbe) {
     EXPECT_TRUE(rail.isAvailable(0, 0));
 }
 
+// ---------------------------------------------------------------------------
+// Monitors of one peer machine (one per worker) share failure counts and
+// pause verdicts. The table is process-wide and outlives a test, so each test
+// (and each --gtest_repeat round) uses peer ids of its own.
+// ---------------------------------------------------------------------------
+
+static std::string uniquePeer(const std::string& name) {
+    static int serial = 0;
+    return name + "#" + std::to_string(++serial);
+}
+
+// Loads `rail` over one NIC on each side unless topologies are given.
+static void loadShared(RailMonitor& rail, const std::string& peer,
+                       int threshold, int cooldown_secs,
+                       int probe_interval_secs,
+                       std::shared_ptr<Topology> local = nullptr,
+                       std::shared_ptr<Topology> remote = nullptr) {
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, threshold);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, cooldown_secs);
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, probe_interval_secs);
+    if (!peer.empty()) rail.setPeerMachine(peer);
+    if (!local) local = makeSingleNicTopology("mlx5_0");
+    if (!remote) remote = makeSingleNicTopology("mlx5_1");
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+}
+
+TEST(RailMonitorShareTest, PauseOnOneWorkerPausesTheOthers) {
+    const auto peer = uniquePeer("PauseOnOneWorkerPausesTheOthers");
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    RailMonitor a, b, c;
+    loadShared(a, peer, 1, 10, 60, local, remote);
+    loadShared(b, peer, 1, 10, 60, local, remote);
+    loadShared(c, peer, 1, 10, 60, local, remote);
+    ASSERT_EQ(b.findBestRemoteDevice(0, 0), 0);
+
+    a.markFailed(0, 0, 0);
+    // The best path of B moves off the pair before B ever tries it ...
+    EXPECT_EQ(b.findBestRemoteDevice(0, 0), 1);
+    EXPECT_FALSE(b.isAvailable(0, 0));
+    // ... and C refuses it the first time it is asked.
+    uint64_t token = 0;
+    EXPECT_FALSE(c.admit(0, 0, token));
+}
+
+TEST(RailMonitorShareTest, FailuresAreCountedAcrossWorkers) {
+    const auto peer = uniquePeer("FailuresAreCountedAcrossWorkers");
+    RailMonitor a, b, c, d;
+    for (auto* rail : {&a, &b, &c, &d}) loadShared(*rail, peer, 3, 10, 60);
+    uint64_t token = 0;
+    a.markFailed(0, 0, 0);
+    b.markFailed(0, 0, 0);
+    EXPECT_TRUE(d.admit(0, 0, token)) << "two failures are below the threshold";
+    c.markFailed(0, 0, 0);
+    for (auto* rail : {&a, &b, &c, &d}) EXPECT_FALSE(rail->admit(0, 0, token));
+}
+
+TEST(RailMonitorShareTest, RecoveryOnOneWorkerRecoversTheOthers) {
+    const auto peer = uniquePeer("RecoveryOnOneWorkerRecoversTheOthers");
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    RailMonitor a, b;
+    loadShared(a, peer, 1, 10, 60, local, remote);
+    loadShared(b, peer, 1, 10, 60, local, remote);
+    a.markFailed(0, 0, 0);
+    ASSERT_EQ(b.findBestRemoteDevice(0, 0), 1);
+    a.markRecovered(0, 0, 0);  // a transfer A posted before the pause worked
+    EXPECT_EQ(b.findBestRemoteDevice(0, 0), 0) << "B's best path is back";
+    uint64_t token = 0;
+    EXPECT_TRUE(b.admit(0, 0, token));
+    EXPECT_EQ(token, 0u) << "a closed rail, not a probe";
+}
+
+TEST(RailMonitorShareTest, SuccessResetsTheCountForAll) {
+    const auto peer = uniquePeer("SuccessResetsTheCountForAll");
+    RailMonitor a, b, c;
+    for (auto* rail : {&a, &b, &c}) loadShared(*rail, peer, 3, 10, 60);
+    a.markFailed(0, 0, 0);
+    b.markFailed(0, 0, 0);
+    a.markRecovered(0, 0, 0);  // the pair carried a transfer after all
+    c.markFailed(0, 0, 0);
+    uint64_t token = 0;
+    EXPECT_TRUE(c.admit(0, 0, token)) << "the count restarted at one";
+}
+
+TEST(RailMonitorShareTest, ProbeSuccessOnOneWorkerRecoversTheOthers) {
+    const auto peer = uniquePeer("ProbeSuccessOnOneWorkerRecoversTheOthers");
+    RailMonitor a, b;
+    loadShared(a, peer, 1, 10, /*probe_interval_secs=*/0);
+    loadShared(b, peer, 1, 10, /*probe_interval_secs=*/60);
+    a.markFailed(0, 0, 0);
+    uint64_t token = 0;
+    ASSERT_FALSE(b.admit(0, 0, token));
+    uint64_t probe = 0;
+    ASSERT_TRUE(a.admit(0, 0, probe));
+    ASSERT_NE(probe, 0u);
+    a.markRecovered(0, 0, probe);
+    EXPECT_TRUE(b.admit(0, 0, token));
+    EXPECT_EQ(token, 0u);
+}
+
+TEST(RailMonitorShareTest, OtherPeersAreNotAffected) {
+    const auto peer_a = uniquePeer("OtherPeersAreNotAffectedA");
+    const auto peer_b = uniquePeer("OtherPeersAreNotAffectedB");
+    RailMonitor a, b;
+    loadShared(a, peer_a, 1, 10, 60);
+    loadShared(b, peer_b, 1, 10, 60);
+    a.markFailed(0, 0, 0);
+    uint64_t token = 0;
+    EXPECT_TRUE(b.admit(0, 0, token));
+}
+
+TEST(RailMonitorShareTest, MonitorsWithoutAPeerShareNothing) {
+    const auto unrelated = uniquePeer("MonitorsWithoutAPeerShareNothing");
+    RailMonitor a, b, other;
+    loadShared(a, "", 2, 10, 60);
+    loadShared(b, "", 2, 10, 60);
+    loadShared(other, unrelated, 1, 10, 60);
+    uint64_t token = 0;
+    a.markFailed(0, 0, 0);
+    b.markFailed(0, 0, 0);
+    EXPECT_TRUE(a.admit(0, 0, token)) << "failures are not counted together";
+    EXPECT_TRUE(b.admit(0, 0, token));
+    a.markFailed(0, 0, 0);
+    EXPECT_FALSE(a.admit(0, 0, token));
+    EXPECT_TRUE(b.admit(0, 0, token)) << "pauses are not shared";
+    other.markFailed(0, 0, 0);  // the shared table changes
+    EXPECT_FALSE(a.admit(0, 0, token)) << "a pause of its own stays";
+}
+
+TEST(RailMonitorShareTest, ExpiredPauseIsNotAdopted) {
+    const auto peer = uniquePeer("ExpiredPauseIsNotAdopted");
+    RailMonitor a, b;
+    loadShared(a, peer, 1, 1, 60);
+    loadShared(b, peer, 1, 1, 60);
+    a.markFailed(0, 0, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    uint64_t token = 0;
+    EXPECT_TRUE(b.admit(0, 0, token));
+    EXPECT_EQ(token, 0u) << "B never paused, so it has no trial to make";
+    EXPECT_TRUE(b.isAvailable(0, 0));
+}
+
+TEST(RailMonitorShareTest, ReescalatedPauseExtendsAdopters) {
+    const auto peer = uniquePeer("ReescalatedPauseExtendsAdopters");
+    RailMonitor a, b;
+    loadShared(a, peer, 1, 1, 60);
+    loadShared(b, peer, 1, 1, 60);
+    a.markFailed(0, 0, 0);  // 1s pause
+    uint64_t token = 0;
+    ASSERT_FALSE(b.admit(0, 0, token));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    uint64_t trial = 0;
+    ASSERT_TRUE(a.admit(0, 0, trial));
+    a.markFailed(0, 0, trial);  // the trial fails: 2s pause
+    EXPECT_FALSE(b.admit(0, 0, token))
+        << "B must not run a trial of its own on the expired 1s pause";
+}
+
+TEST(RailMonitorShareTest, ShorterPauseDoesNotCutALongerOne) {
+    const auto peer = uniquePeer("ShorterPauseDoesNotCutALongerOne");
+    RailMonitor a, b, c;
+    for (auto* rail : {&a, &b, &c}) loadShared(*rail, peer, 1, 1, 60);
+    a.markFailed(0, 0, 0);  // 1s pause
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    uint64_t trial = 0;
+    ASSERT_TRUE(a.admit(0, 0, trial));
+    a.markFailed(0, 0, trial);  // 2s pause
+    c.markFailed(0, 0, 0);      // C has not seen it and arms a 1s pause
+    uint64_t token = 0;
+    ASSERT_FALSE(b.admit(0, 0, token));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(b.admit(0, 0, token)) << "B took the 2s pause, not C's 1s";
+}
+
+TEST(RailMonitorShareTest, AdoptionLeavesAnInFlightProbeAlone) {
+    const auto peer = uniquePeer("AdoptionLeavesAnInFlightProbeAlone");
+    RailMonitor a, b;
+    loadShared(a, peer, 1, 10, /*probe_interval_secs=*/60);
+    loadShared(b, peer, 1, 10, /*probe_interval_secs=*/0);
+    a.markFailed(0, 0, 0);
+    uint64_t probe = 0;
+    ASSERT_TRUE(b.admit(0, 0, probe)) << "B takes the pause and probes";
+    ASSERT_NE(probe, 0u);
+    a.markRecovered(0, 0, 0);
+    uint64_t token = 0;
+    EXPECT_FALSE(b.admit(0, 0, token)) << "B's probe is still on the wire";
+    b.markRecovered(0, 0, probe);
+    EXPECT_TRUE(b.admit(0, 0, token));
+    EXPECT_EQ(token, 0u);
+}
+
+TEST(RailMonitorShareTest, AWithdrawalOutlivesALaterFailure) {
+    const auto peer = uniquePeer("AWithdrawalOutlivesALaterFailure");
+    RailMonitor a, b, c;
+    for (auto* rail : {&a, &b, &c}) loadShared(*rail, peer, 2, 10, 60);
+    a.markFailed(0, 0, 0);
+    a.markFailed(0, 0, 0);  // paused at two
+    uint64_t token = 0;
+    ASSERT_FALSE(b.admit(0, 0, token));
+    a.markRecovered(0, 0, 0);
+    c.markFailed(0, 0, 0);  // counting again, below the threshold
+    EXPECT_TRUE(b.admit(0, 0, token)) << "B missed the withdrawal";
+    EXPECT_EQ(token, 0u);
+}
+
+TEST(RailMonitorShareTest, AResolvedProbeRereadsTheTable) {
+    const auto peer = uniquePeer("AResolvedProbeRereadsTheTable");
+    RailMonitor a, b, c;
+    loadShared(a, peer, 1, 10, /*probe_interval_secs=*/60);
+    loadShared(b, peer, 1, 10, /*probe_interval_secs=*/0);
+    loadShared(c, peer, 1, 10, /*probe_interval_secs=*/0);
+    a.markFailed(0, 0, 0);
+    uint64_t b_probe = 0, c_probe = 0, token = 0;
+    ASSERT_TRUE(b.admit(0, 0, b_probe)) << "B takes the pause and probes";
+    ASSERT_TRUE(c.admit(0, 0, c_probe)) << "so does C";
+    a.markRecovered(0, 0, 0);  // withdrawn while both probes fly
+    ASSERT_FALSE(b.admit(0, 0, token));
+    ASSERT_FALSE(c.admit(0, 0, token));
+    b.cancelProbe(0, 0, b_probe);  // never reached the wire
+    c.markFailed(0, 0, c_probe);   // an Open-phase probe failed
+    for (auto* rail : {&b, &c}) {
+        EXPECT_TRUE(rail->admit(0, 0, token));
+        EXPECT_EQ(token, 0u) << "the withdrawal skipped while it flew";
+    }
+}
+
+TEST(RailMonitorShareTest, EscalationIsKeptUntilASuccess) {
+    const auto peer = uniquePeer("EscalationIsKeptUntilASuccess");
+    RailMonitor a, b, c;
+    for (auto* rail : {&a, &b, &c}) loadShared(*rail, peer, 1, 1, 60);
+    uint64_t token = 0, trial = 0;
+    a.markFailed(0, 0, 0);  // 1s pause
+    ASSERT_FALSE(b.admit(0, 0, token));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(a.admit(0, 0, trial));
+    a.markFailed(0, 0, trial);  // escalated: 2s
+    ASSERT_FALSE(b.admit(0, 0, token));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    c.markFailed(0, 0, 0);  // C never saw it: a fresh 1s pause, ending later
+    ASSERT_FALSE(b.admit(0, 0, token));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(b.admit(0, 0, trial));
+    b.markFailed(0, 0, trial);  // must escalate 2s to 4s, not 1s to 2s
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    EXPECT_FALSE(b.admit(0, 0, token)) << "the escalation was lost";
+}
+
+TEST(RailMonitorShareTest, RebuiltMonitorTakesOverPausesAgain) {
+    const auto peer = uniquePeer("RebuiltMonitorTakesOverPausesAgain");
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    RailMonitor a, b;
+    loadShared(a, peer, 1, 10, 60, local, remote);
+    loadShared(b, peer, 1, 10, 60, local, remote);
+    a.markFailed(0, 0, 0);
+    uint64_t token = 0;
+    ASSERT_FALSE(b.admit(0, 0, token));
+    // A new peer layout rebuilds B's rail states; local0 -> remote0 is still
+    // the same pair.
+    loadShared(b, peer, 1, 10, 60, local,
+               makeTwoNicTopology("remote0", "remote2"));
+    EXPECT_FALSE(b.admit(0, 0, token));
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

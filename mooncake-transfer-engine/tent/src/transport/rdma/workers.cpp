@@ -50,6 +50,7 @@ std::shared_ptr<RailMonitor> getOrCreateRail(
     auto it = rails.find(machine_id);
     if (it != rails.end()) return it->second;
     auto rail = std::make_shared<RailMonitor>();
+    rail->setPeerMachine(machine_id);
     rails.emplace(machine_id, rail);
     return rail;
 }
