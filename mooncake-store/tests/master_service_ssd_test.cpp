@@ -330,6 +330,78 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
     EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
 }
 
+// One NotifyOffloadSuccess batch mixing an offload completion, a NACK and a
+// rescan entry for a key the master does not know, as a client sends after a
+// master failover. Without a namespace policy the batch is applied under a
+// single state-lock section; each entry must still get its per-key outcome.
+TEST_F(MasterServiceSSDTest, NotifyOffloadSuccessMixedBatch) {
+    auto& metrics = MasterMetricManager::instance();
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    const std::string segment = "ssd_mixed_batch_segment";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0xd00000000);
+    const int64_t baseline = metrics.get_file_cache_nums();
+
+    // Two objects with a queued offload task each; "mixed_rescan" exists only
+    // on the client's disk.
+    for (const std::string key : {"mixed_done", "mixed_nack"}) {
+        ASSERT_TRUE(service
+                        ->PutStart(client_id, key, TenantId::Default(), 128,
+                                   {.replica_num = 1})
+                        .has_value());
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    }
+    auto task = [](const std::string& key) {
+        return OffloadTaskItem{
+            .tenant_id = TenantId::Default().value(), .key = key, .size = 128};
+    };
+    auto meta = [&](int64_t size) {
+        StorageObjectMetadata m;
+        m.data_size = size;
+        m.transport_endpoint = segment;
+        return m;
+    };
+    std::vector<OffloadTaskItem> tasks = {
+        task("mixed_done"), task("mixed_nack"), task("mixed_rescan")};
+    std::vector<StorageObjectMetadata> metas = {meta(128), meta(-1), meta(128)};
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, tasks, metas).has_value());
+    // The completion and the rescan entry each add a LOCAL_DISK replica; the
+    // NACK only drops its task.
+    EXPECT_EQ(metrics.get_file_cache_nums(), baseline + 2);
+    auto nack = service->GetReplicaList("mixed_nack", TenantId::Default());
+    ASSERT_TRUE(nack.has_value());
+    for (const auto& replica : nack.value().replicas) {
+        EXPECT_FALSE(replica.is_local_disk_replica());
+    }
+    auto rescan = service->GetReplicaList("mixed_rescan", TenantId::Default());
+    ASSERT_TRUE(rescan.has_value());
+    ASSERT_EQ(1u, rescan.value().replicas.size());
+    EXPECT_TRUE(rescan.value().replicas[0].is_local_disk_replica());
+
+    // Re-reporting a key that already has this client's LOCAL_DISK replica
+    // updates it in place.
+    ASSERT_TRUE(service
+                    ->NotifyOffloadSuccess(client_id, {task("mixed_rescan")},
+                                           {meta(128)})
+                    .has_value());
+    EXPECT_EQ(metrics.get_file_cache_nums(), baseline + 2);
+
+    // Once the LOCAL_DISK segment is gone, the registration is refused.
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
+    const int64_t after_unmount = metrics.get_file_cache_nums();
+    auto refused = service->NotifyOffloadSuccess(
+        client_id, {task("mixed_late")}, {meta(128)});
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(metrics.get_file_cache_nums(), after_unmount);
+    EXPECT_FALSE(
+        service->GetReplicaList("mixed_late", TenantId::Default()).has_value());
+}
+
 // Real-path performance comparison: MasterService PutStart throughput for
 // three configurations:
 //   (A) RANDOM, no offload        — baseline, original behavior

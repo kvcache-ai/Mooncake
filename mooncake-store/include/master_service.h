@@ -1447,6 +1447,39 @@ class MasterService {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     class MetadataAccessorRW;
+    // The body of AddReplicaForRetainedClient, applied to an accessor the
+    // caller already holds. The caller holds master_state_mutex_ shared and
+    // has checked that the client's LOCAL_DISK segment is mounted.
+    auto AddReplicaInAccessor(MetadataAccessorRW& accessor,
+                              const ObjectIdentity& object_id,
+                              const UUID& client_id, Replica& replica)
+        -> tl::expected<bool, ErrorCode>;
+    // NotifyOffloadSuccess without a namespace policy: the whole batch runs
+    // under one master_state_mutex_ section. Caller holds the client's
+    // retaining guard.
+    auto NotifyOffloadSuccessBatched(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record,
+        const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas)
+        -> tl::expected<void, ErrorCode>;
+    // Shared by NotifyOffloadSuccess and NotifyOffloadSuccessBatched. The
+    // caller holds master_state_mutex_ shared and the object's accessor.
+    // Drops a failed offload's task and releases its source replica.
+    void ReleaseOffloadingTask(MetadataAccessorRW& accessor,
+                               const UUID& client_id);
+    enum class OffloadTaskOutcome {
+        kNoTask,   // no offload task: register as a regular replica
+        kRefused,  // LOCAL_DISK segment not mounted: registration refused
+        kAdded,    // new LOCAL_DISK replica added
+        kUpdated,  // existing LOCAL_DISK replica's endpoint/size updated
+    };
+    // Completes the offload task on an existing object.
+    auto CompleteOffloadTask(MetadataAccessorRW& accessor,
+                             const ObjectIdentity& object_id,
+                             const UUID& client_id, bool segment_mounted,
+                             Replica& replica)
+        -> tl::expected<OffloadTaskOutcome, ErrorCode>;
     // Publishes a new object under the key `accessor` holds, which must hold
     // none.
     auto InsertMetadata(MetadataAccessorRW& accessor, const UUID& client_id,
