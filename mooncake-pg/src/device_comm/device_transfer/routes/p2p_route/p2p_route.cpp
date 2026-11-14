@@ -1,6 +1,5 @@
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
 
-#include <cstring>
 #include <utility>
 
 #include <transport/device/device_transport.h>
@@ -8,6 +7,14 @@
 #include "gpu_runtime.h"
 
 namespace mooncake {
+namespace {
+
+struct P2pEndpointMetadata {
+    std::vector<int32_t> handle;
+    GpuUuid device_uuid{};
+};
+
+}  // namespace
 
 P2pRoute::P2pRoute(int device_index, GlobalRank self_rank,
                    uint32_t max_world_size)
@@ -22,44 +29,16 @@ PGResult<std::unique_ptr<P2pRoute>> P2pRoute::create(int device_index,
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
     auto route = std::unique_ptr<P2pRoute>(
         new P2pRoute(device_index, self_rank, max_world_size));
-
-    // Scan visible hardware once; peer mappings are resolved separately.
-    cudaDeviceProp properties{};
-    PG_TRY_CUDA(cudaGetDeviceProperties(&properties, device_index));
-    static_assert(sizeof(properties.uuid.bytes) == sizeof(DeviceUUID));
-    std::memcpy(route->device_uuid_.data(), properties.uuid.bytes,
-                route->device_uuid_.size());
-    int device_count = 0;
-    PG_TRY_CUDA(cudaGetDeviceCount(&device_count));
-    for (int peer = 0; peer < device_count; ++peer) {
-        if (peer == device_index) continue;
-        int accessible = 0;
-        PG_TRY_CUDA(cudaDeviceCanAccessPeer(&accessible, device_index, peer));
-        if (!accessible) continue;
-        int native_atomics = 0;
-        PG_TRY_CUDA(cudaDeviceGetP2PAttribute(
-            &native_atomics, cudaDevP2PAttrNativeAtomicSupported, device_index,
-            peer));
-        if (!native_atomics) continue;
-        PG_TRY_CUDA(cudaGetDeviceProperties(&properties, peer));
-        DeviceUUID uuid;
-        std::memcpy(uuid.data(), properties.uuid.bytes, uuid.size());
-        route->native_atomic_peer_uuids_.push_back(uuid);
-    }
-
+    PG_TRY(route->device_uuid_, queryGpuUuid(device_index));
     return route;
 }
 
 std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
     if (local_handle_.empty()) return std::nullopt;
-    return RouteEndpoint{
-        .route_key = std::string(kRouteKey),
-        .version = routeVersion(),
-        .metadata = encodeEndpointMetadata(local_handle_),
-    };
+    return encodeEndpoint(P2pEndpointMetadata{local_handle_, device_uuid_});
 }
 
-PGResult<void> P2pRoute::installEndpoints(
+PGResult<std::vector<DeviceTransferRoute>> P2pRoute::installEndpoints(
     const DeviceTransferSnapshot& snapshot, uint64_t reclaim_before_version) {
     PG_VALIDATE_STATE(local_ptr_, "P2P region is not registered");
     PG_VALIDATE_ARG(snapshot.endpoints.size() == max_world_size_,
@@ -69,14 +48,14 @@ PGResult<void> P2pRoute::installEndpoints(
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
 
     // Decode the complete snapshot before changing the imported mappings.
-    std::vector<std::vector<int32_t>> handles(max_world_size_);
+    std::vector<P2pEndpointMetadata> peers(max_world_size_);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
-        PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
+        if (!endpoints[rank]) continue;
+        const auto* endpoint = findEndpoint(endpoints[rank]->routes);
         if (!endpoint) continue;
-        PG_TRY(handles[rank],
-               decodeEndpointMetadata<std::vector<int32_t>>(*endpoint));
-        PG_VALIDATE_ARG(!handles[rank].empty(),
+        PG_TRY(peers[rank], decodeEndpoint<P2pEndpointMetadata>(*endpoint));
+        PG_VALIDATE_ARG(!peers[rank].handle.empty(),
                         "P2P route endpoint handle is empty");
     }
 
@@ -90,17 +69,17 @@ PGResult<void> P2pRoute::installEndpoints(
     auto next = std::make_unique<State>();
     next->installation_version = snapshot.version;
     next->peers.resize(max_world_size_);
-    next->routes.resize(max_world_size_);
+    std::vector<DeviceTransferRoute> routes(max_world_size_);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
-        if (handles[rank].empty()) continue;
+        if (peers[rank].handle.empty()) continue;
         void* address = nullptr;
         if (rank == self_rank_) {
             address = local_ptr_;
         } else {
             auto& peer = next->peers[rank];
             const auto* previous = current_ ? &current_->peers[rank] : nullptr;
-            peer.handle = std::move(handles[rank]);
+            peer.handle = std::move(peers[rank].handle);
             if (previous && previous->mapping &&
                 previous->handle == peer.handle)
                 peer.mapping = previous->mapping;
@@ -110,21 +89,25 @@ PGResult<void> P2pRoute::installEndpoints(
             address = peer.mapping->address();
         }
 
-        next->routes[rank] = DeviceTransferRoute{
+        PG_TRY(const bool native_atomics,
+               gpuPeerSupportsNativeAtomics(device_uuid_,
+                                            peers[rank].device_uuid));
+        routes[rank] = DeviceTransferRoute{
             .type = DeviceRouteType::P2p,
+            .native_atomics = native_atomics,
             .region_size = endpoints[rank]->region_size,
             .p2p = {.mapped_region_address =
                         reinterpret_cast<uint64_t>(address)},
         };
     }
     standby_ = std::move(next);
-    return {};
+    return routes;
 }
 
-PGResult<std::vector<DeviceTransferRoute>> P2pRoute::updateRoutes() {
+PGResult<void> P2pRoute::updateRoutes() {
     PG_VALIDATE_STATE(standby_, "P2P route update requires prepared endpoints");
     current_.swap(standby_);
-    return current_->routes;
+    return {};
 }
 
 PGResult<void> P2pRoute::registerRegion(DeviceRegionKind kind, void* addr,

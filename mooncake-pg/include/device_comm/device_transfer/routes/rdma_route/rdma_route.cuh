@@ -9,6 +9,7 @@
 
 #include "pg_assert.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 
 namespace mooncake {
 
@@ -135,8 +136,7 @@ rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
     device::mc_ibgda_lock(qp);
     // mlx5gda creates these QPs with log_msg_max=30.
     constexpr uint32_t kMaxWriteBytes = uint32_t{1} << 30;
-    const uint64_t write_count =
-        size / kMaxWriteBytes + (size % kMaxWriteBytes != 0 ? 1 : 0);
+    const uint64_t write_count = ceilDiv(size, kMaxWriteBytes);
     const uint64_t batch_size =
         write_count + (signal.kind != SignalAction::Kind::None ? 1 : 0);
     const uint32_t capacity = qp->wqeid_mask + 1;

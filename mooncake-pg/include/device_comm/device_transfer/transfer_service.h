@@ -7,7 +7,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <string_view>
 
 #include "control_plane/control_types.h"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
@@ -61,23 +60,16 @@ class DeviceTransferService {
 
     [[nodiscard]] int deviceIndex() const noexcept;
     [[nodiscard]] DeviceTransferEndpoint localEndpoint() const;
-    // Borrow a loaded provider, or nullptr when it is unavailable.
-    template <typename Route>
-    [[nodiscard]] const Route* findRoute() const noexcept {
-        return static_cast<const Route*>(findRoute(Route::kRouteKey));
-    }
-
     // Device address of the stable kernel-facing service handle.
     const DeviceTransferHandle* deviceHandle();
 
-    // Query whether the selected route has a direct memory mapping. This is a
-    // control-path query; it does not synchronize with or copy from the GPU.
-    PGResult<bool> isDirectlyAddressable(GlobalRank rank);
+    // Query the published route and its capabilities without GPU interaction.
+    PGResult<DeviceTransferRouteInfo> routeInfo(GlobalRank rank) const;
 
-    // Install the snapshot and return the local endpoint after installation.
+    // Return route capabilities and any updated local endpoint.
     // Local DTS users are paused while routes are switched and published.
     // Retired resources below reclaim_before_version may be released.
-    PGResult<DeviceTransferEndpoint> installEndpoints(
+    PGResult<DeviceTransferInstallResult> installEndpoints(
         const DeviceTransferSnapshot& snapshot,
         uint64_t reclaim_before_version);
 
@@ -86,8 +78,6 @@ class DeviceTransferService {
    private:
     struct DeviceState;
     struct PublishedState;
-
-    const RouteProvider* findRoute(std::string_view route_key) const noexcept;
 
     // Caller holds resource_mutex_.
     DeviceState& deviceState();

@@ -17,7 +17,7 @@ namespace mooncake {
 
 struct DeviceCollectiveRecoveryWorker::MailboxState {
     ControlMailbox* mailbox = nullptr;
-    PrepareResumeCallback prepare_resume;
+    HandleFailureCallback handle_failure;
 };
 
 void DeviceCollectiveRecoveryWorker::runLoop() {
@@ -39,22 +39,17 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
             }
         }
 
-        auto prepared_resume = pending->prepare_resume(received.request);
-        if (!prepared_resume.has_value()) {
+        auto result = pending->handle_failure(received);
+        if (!result.has_value()) {
             LOG(ERROR) << "Device collective recovery failed; the last "
                           "channel CTA remains waiting: "
-                       << prepared_resume.error().message;
+                       << result.error().message;
             std::lock_guard<std::mutex> lock(mutex_);
             active_mailbox_ = nullptr;
             terminated_with_error_ = true;
             state_changed_.notify_all();
             return;
         }
-
-        // The callback pinned the update before this acknowledgement. The
-        // acquire load in the last channel CTA therefore observes the complete
-        // update before applying it and leaving the failed collective.
-        received.handle.reply({});
 
         std::lock_guard<std::mutex> lock(mutex_);
         active_mailbox_ = nullptr;
@@ -110,10 +105,10 @@ PGResult<void> DeviceCollectiveRecoveryWorker::start() {
 }
 
 PGResult<void> DeviceCollectiveRecoveryWorker::addMailbox(
-    ControlMailbox* mailbox, PrepareResumeCallback prepare_resume) {
+    ControlMailbox* mailbox, HandleFailureCallback handle_failure) {
     auto state = std::make_unique<MailboxState>();
     state->mailbox = mailbox;
-    state->prepare_resume = std::move(prepare_resume);
+    state->handle_failure = std::move(handle_failure);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);

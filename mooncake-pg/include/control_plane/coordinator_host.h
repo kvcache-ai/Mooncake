@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "coordinator.h"
 #include "rpc.h"
@@ -102,8 +103,8 @@ class CoordinatorHost {
    public:
     CoordinatorHost(const std::string& host_ip, int max_world_size,
                     int64_t fault_reconciliation_window_us,
-                    std::optional<DeviceAllReduceAlgorithm>
-                        all_reduce_algorithm = std::nullopt);
+                    std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>
+                        collective_algorithm_choices_override = std::nullopt);
 
     ~CoordinatorHost();
 

@@ -62,6 +62,9 @@ struct DeviceHostProxyRoute {
 // One entry in the device-resident route table indexed by GlobalRank.
 struct DeviceTransferRoute {
     DeviceRouteType type = DeviceRouteType::Unreachable;
+    // Whether the local GPU can issue CUDA system-scope atomics to the peer's
+    // mapped memory through this route.
+    bool native_atomics = false;
     uint64_t region_size = 0;
     union {
         DeviceP2pRoute p2p = {};

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "device_comm/device_collective/device_collective_types.cuh"
 #include "error_types.h"
@@ -37,10 +38,19 @@ namespace mooncake {
 // not touch the mapped slot.
 class ControlUpdateBuilder {
    public:
+    ControlUpdateBuilder() = default;
+    explicit ControlUpdateBuilder(const ControlUpdate& update)
+        : update_(update) {}
+
     PGResult<void> copyBytes(void* destination, const void* source,
                              size_t size);
-    PGResult<void> fillBytes(void* destination, uint8_t value, size_t count);
-    PGResult<void> fillU64(uint64_t* destination, uint64_t value, size_t count);
+
+    // Fill count elements with value, storing one copy of value in the update.
+    template <typename T>
+    PGResult<void> fill(T* destination, const T& value, size_t count) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        return fillPattern(destination, &value, sizeof(T), count);
+    }
 
     [[nodiscard]] bool empty() const noexcept {
         return update_.operation_count == 0;
@@ -51,6 +61,8 @@ class ControlUpdateBuilder {
     }
 
    private:
+    PGResult<void> fillPattern(void* destination, const void* value,
+                               size_t element_size, size_t count);
     PGResult<void> append(ControlUpdateOp operation);
 
     ControlUpdate update_;

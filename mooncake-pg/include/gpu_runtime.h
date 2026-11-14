@@ -1,8 +1,12 @@
 #ifndef MOONCAKE_PG_GPU_RUNTIME_H
 #define MOONCAKE_PG_GPU_RUNTIME_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <type_traits>
+#include <utility>
 
 #include <cuda_alike.h>
 
@@ -10,6 +14,8 @@
 #include "error_types.h"
 
 namespace mooncake {
+
+using GpuUuid = std::array<uint8_t, 16>;
 
 class GpuStream;
 class GpuEvent;
@@ -19,6 +25,13 @@ class GpuEvent;
 // compatibility restriction will be fixed as the new collective runtime
 // matures.
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+[[nodiscard]] PGResult<GpuUuid> queryGpuUuid(int device_index);
+
+// Whether native atomics from source to destination are known to be supported.
+// Returns false when the capability cannot be determined.
+[[nodiscard]] PGResult<bool> gpuPeerSupportsNativeAtomics(
+    const GpuUuid& source, const GpuUuid& destination);
+
 // Convert microseconds to clock64() ticks.
 PGResult<uint64_t> gpuTimeoutTicks(int device_index, size_t timeout_us);
 
@@ -85,6 +98,233 @@ class GpuDeviceGuard {
 
     int previous_device_ = -1;
     bool restore_device_ = false;
+};
+
+namespace detail {
+
+PGResult<size_t> gpuBufferBytes(size_t count, size_t element_size);
+PGResult<void*> allocateGpuBuffer(int device, size_t bytes);
+PGResult<void> releaseGpuBuffer(int device, void* pointer);
+void resetGpuBuffer(int device, void* pointer) noexcept;
+PGResult<void*> allocatePinnedHostBuffer(size_t bytes, unsigned int flags);
+PGResult<void> releasePinnedHostBuffer(void* pointer);
+void resetPinnedHostBuffer(void* pointer) noexcept;
+PGResult<void*> mappedHostPointer(void* pointer);
+
+}  // namespace detail
+
+// Owns device storage. The caller must finish GPU uses before releasing it.
+// Allocation leaves bytes uninitialized; zeroed() and fromHost() initialize
+// them explicitly. Device objects must be trivially copyable.
+template <typename T>
+class GpuBuffer {
+    static_assert(std::is_trivially_copyable_v<T>);
+
+   public:
+    GpuBuffer() noexcept = default;
+    ~GpuBuffer() noexcept { reset(); }
+
+    GpuBuffer(const GpuBuffer&) = delete;
+    GpuBuffer& operator=(const GpuBuffer&) = delete;
+
+    GpuBuffer(GpuBuffer&& other) noexcept { moveFrom(std::move(other)); }
+    GpuBuffer& operator=(GpuBuffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            moveFrom(std::move(other));
+        }
+        return *this;
+    }
+
+    [[nodiscard]] static PGResult<GpuBuffer> allocate(int device,
+                                                      size_t count = 1) {
+        PG_TRY(auto bytes, detail::gpuBufferBytes(count, sizeof(T)));
+        PG_TRY(auto pointer, detail::allocateGpuBuffer(device, bytes));
+        return GpuBuffer(static_cast<T*>(pointer), count, device);
+    }
+
+    [[nodiscard]] static PGResult<GpuBuffer> zeroed(int device,
+                                                    size_t count = 1) {
+        PG_TRY(auto device_guard, GpuDeviceGuard::create(device));
+        PG_TRY(auto buffer, allocate(device, count));
+        if (count != 0) {
+            PG_TRY_CUDA(cudaMemset(buffer.get(), 0, buffer.sizeBytes()));
+        }
+        return buffer;
+    }
+
+    [[nodiscard]] static PGResult<GpuBuffer> fromHost(int device,
+                                                      const T& initial) {
+        PG_TRY(auto device_guard, GpuDeviceGuard::create(device));
+        PG_TRY(auto buffer, allocate(device));
+        PG_TRY_CUDA(cudaMemcpy(buffer.get(), &initial, sizeof(T),
+                               cudaMemcpyHostToDevice));
+        return buffer;
+    }
+
+    [[nodiscard]] T* get() const noexcept { return pointer_; }
+    [[nodiscard]] size_t size() const noexcept { return count_; }
+    [[nodiscard]] size_t sizeBytes() const noexcept {
+        return count_ * sizeof(T);
+    }
+    [[nodiscard]] int deviceIndex() const noexcept { return device_index_; }
+
+    PGResult<void> release() {
+        PG_TRY(detail::releaseGpuBuffer(device_index_, pointer_));
+        pointer_ = nullptr;
+        count_ = 0;
+        device_index_ = -1;
+        return {};
+    }
+
+    void reset() noexcept {
+        detail::resetGpuBuffer(device_index_, std::exchange(pointer_, nullptr));
+        count_ = 0;
+        device_index_ = -1;
+    }
+
+   private:
+    GpuBuffer(T* pointer, size_t count, int device) noexcept
+        : pointer_(pointer), count_(count), device_index_(device) {}
+
+    void moveFrom(GpuBuffer&& other) noexcept {
+        pointer_ = std::exchange(other.pointer_, nullptr);
+        count_ = std::exchange(other.count_, 0);
+        device_index_ = std::exchange(other.device_index_, -1);
+    }
+
+    T* pointer_ = nullptr;
+    size_t count_ = 0;
+    int device_index_ = -1;
+};
+
+// Owns value-initialized host objects in page-locked memory. Finish transfers
+// that use this storage before releasing it.
+template <typename T>
+class PinnedHostBuffer {
+   public:
+    PinnedHostBuffer() noexcept = default;
+    ~PinnedHostBuffer() noexcept { reset(); }
+
+    PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+
+    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept {
+        moveFrom(std::move(other));
+    }
+    PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            moveFrom(std::move(other));
+        }
+        return *this;
+    }
+
+    [[nodiscard]] static PGResult<PinnedHostBuffer> create(
+        size_t count = 1, unsigned int flags = 0) {
+        PG_TRY(auto bytes, detail::gpuBufferBytes(count, sizeof(T)));
+        PG_TRY(auto pointer, detail::allocatePinnedHostBuffer(bytes, flags));
+        PinnedHostBuffer buffer;
+        buffer.pointer_ = static_cast<T*>(pointer);
+        if (count != 0) {
+            std::uninitialized_value_construct_n(buffer.pointer_, count);
+        }
+        buffer.count_ = count;
+        return buffer;
+    }
+
+    [[nodiscard]] T* get() const noexcept { return pointer_; }
+    [[nodiscard]] size_t size() const noexcept { return count_; }
+    [[nodiscard]] size_t sizeBytes() const noexcept {
+        return count_ * sizeof(T);
+    }
+
+    PGResult<void> release() {
+        if (!pointer_) return {};
+        // End object lifetimes only once if releasing the allocation fails.
+        std::destroy_n(pointer_, std::exchange(count_, 0));
+        PG_TRY(detail::releasePinnedHostBuffer(pointer_));
+        pointer_ = nullptr;
+        return {};
+    }
+
+    void reset() noexcept {
+        if (!pointer_) return;
+        std::destroy_n(pointer_, std::exchange(count_, 0));
+        detail::resetPinnedHostBuffer(std::exchange(pointer_, nullptr));
+    }
+
+   private:
+    void moveFrom(PinnedHostBuffer&& other) noexcept {
+        pointer_ = std::exchange(other.pointer_, nullptr);
+        count_ = std::exchange(other.count_, 0);
+    }
+
+    T* pointer_ = nullptr;
+    size_t count_ = 0;
+};
+
+// Owns host objects mapped into the selected device. host() and device()
+// address the same storage.
+template <typename T>
+class MappedHostBuffer {
+   public:
+    MappedHostBuffer() noexcept = default;
+    ~MappedHostBuffer() noexcept = default;
+
+    MappedHostBuffer(const MappedHostBuffer&) = delete;
+    MappedHostBuffer& operator=(const MappedHostBuffer&) = delete;
+
+    MappedHostBuffer(MappedHostBuffer&& other) noexcept {
+        moveFrom(std::move(other));
+    }
+    MappedHostBuffer& operator=(MappedHostBuffer&& other) noexcept {
+        if (this != &other) moveFrom(std::move(other));
+        return *this;
+    }
+
+    [[nodiscard]] static PGResult<MappedHostBuffer> create(
+        int device, size_t count = 1, unsigned int flags = 0) {
+        PG_TRY(auto device_guard, GpuDeviceGuard::create(device));
+        MappedHostBuffer buffer;
+        PG_TRY(buffer.storage_,
+               PinnedHostBuffer<T>::create(count, flags | cudaHostAllocMapped));
+        PG_TRY(auto pointer, detail::mappedHostPointer(buffer.storage_.get()));
+        buffer.device_pointer_ = static_cast<T*>(pointer);
+        buffer.device_index_ = device;
+        return buffer;
+    }
+
+    [[nodiscard]] T* host() const noexcept { return storage_.get(); }
+    [[nodiscard]] T* device() const noexcept { return device_pointer_; }
+    [[nodiscard]] size_t size() const noexcept { return storage_.size(); }
+    [[nodiscard]] size_t sizeBytes() const noexcept {
+        return storage_.sizeBytes();
+    }
+    [[nodiscard]] int deviceIndex() const noexcept { return device_index_; }
+
+    PGResult<void> release() {
+        device_pointer_ = nullptr;
+        device_index_ = -1;
+        return storage_.release();
+    }
+
+    void reset() noexcept {
+        device_pointer_ = nullptr;
+        device_index_ = -1;
+        storage_.reset();
+    }
+
+   private:
+    void moveFrom(MappedHostBuffer&& other) noexcept {
+        storage_ = std::move(other.storage_);
+        device_pointer_ = std::exchange(other.device_pointer_, nullptr);
+        device_index_ = std::exchange(other.device_index_, -1);
+    }
+
+    PinnedHostBuffer<T> storage_;
+    T* device_pointer_ = nullptr;
+    int device_index_ = -1;
 };
 
 class GpuStream {
