@@ -310,13 +310,15 @@ Local memory supports two backing strategies:
 
 The Python host allocator uses shared `memfd` + `mmap`, and can also request hugepage-backed shm regions when the host kernel is configured for hugepages.
 
-Reclaim is explicit and route-aware.
+Reclaim is explicit, route-aware and generation-fenced. Reservations and replica
+routes carry an allocation ID so cleanup for a prior use of an offset cannot
+release its replacement. Lifecycle-capable storage owners retain pending
+publication and deletion state, confirm unknown outcomes and respect read pins
+and reclaim grace before physical release. Logical route deletion remains
+separate from physical reclamation.
 
-- overwrites schedule release for the old replicas
-- deletes schedule reclaim after route removal
-- `reclaim_grace_ms` controls scheduled delayed release behavior
-- remote release uses batched allocator RPC
-- queued reclaim cleanup is idempotent for duplicate local or remote release, but direct non-cleanup release still surfaces allocator errors
+The [allocation lifecycle](allocation-lifecycle.md) describes the owner protocol,
+authority confirmation, mixed-version behavior and process-local lifetime.
 
 ### Storage-owner CLOCK with route-owner CAS
 
@@ -332,28 +334,70 @@ sequenceDiagram
     Client->>Alloc: reserve local space
     Alloc-->>Client: Allocator error
     Client->>Evict: evict_one(preferred_segment?)
-    Evict->>Evict: stale/orphan pre-pass over tracked local replicas
     Evict->>Evict: pick CLOCK victim
+    Evict->>Evict: claim exact allocation generation
     Evict->>Route: CAS route without victim replica
     Route-->>Evict: applied / current route
-    Evict->>Alloc: release victim bytes after CAS success
+    Evict->>Alloc: exact local commit after applied CAS
     Evict-->>Client: reclaimed or exhausted
     Client->>Alloc: retry reservation
 ```
 
 The important invariants are:
 
-- a stale/orphan pre-pass runs before live CLOCK eviction and can reclaim tracked local allocations whose authoritative route already moved away from this runtime
-- each stale/orphan pre-pass checks only a bounded cursor slice of tracked keys; eligible stale/orphan allocations found in that slice are reclaimed before live CLOCK victims, while later cursor slices are left for subsequent attempts
-- tight eviction retry loops are rate-limited so one allocator miss cannot turn into repeated full route sweeps
-- pending local reservations are still protected until publish or timeout, even during eviction pressure
+- ordinary CLOCK victims remain eligible while compatibility reconciliation is singleflight, rate-limited and processed in bounded batches
+- pending publication identities stay protected until finalize or exact owner recovery resolves them; a deadline alone does not authorize release
 - `reclaim_grace_ms` delays scheduled cleanup, but storage-owner eviction pressure can reclaim stale/orphan local allocations earlier once the authoritative route no longer references them
 - a local replica is never released before the authoritative active route no longer references that local allocation
-- a route-missing lookup is treated as inconclusive for allocator release; reclaiming confirmed-deleted ghost allocations requires a separate confirmed-absent proof path
+- a route-missing lookup is inconclusive for both allocator release and CLOCK removal, including cold reads and offload preparation; reclaiming confirmed-deleted allocations requires a separate exact-reference proof
+- allocator candidate selection takes allocator and CLOCK locks in publication order, preserving a consistent snapshot during concurrent writes
 - a failed CAS refreshes local eviction state instead of guessing
-- a storage owner can rebuild its CLOCK from route state if best-effort tracking falls behind
+- explicit CLOCK rebuild merges observed routes without replacing concurrent publications or access credits; partial snapshots never authorize release
+- cold offload retains materialized payload, pending source, and reserved capacity while its CAS outcome is unknown; repeating the same CAS resolves publication before cleanup and accounting settlement
+- unresolved owner restores retain their allocations outside ordinary publication deadlines, with bounded recovery retrying the same expected-version CAS
+- each staging allocation has a unique opaque ACK segment token, so a late ACK cannot release a newer allocation at the same physical offset
 - local CLOCK eviction is enabled only on clients labeled `storage=true`
 - routed writers without local storage keep the spill-remote behavior
+
+Publication attempts bind each reservation to an exact allocation generation,
+publisher sequence, primary incarnation, and receiver enrollment. Revocation
+closes admission and checks references under the receiver's authority slot lock.
+The storage owner releases bytes only after every registered receiver confirms
+absence. Missing, restarted, or indeterminate receivers retain the allocation.
+Migration registers additional receivers with the pinned primary before importing
+a reference. A delayed retired publication retries from reservation and transfer
+within a bounded retry budget.
+
+Reclamation can remove a strictly older receiver reference only with a newer
+authoritative route or an acknowledged deletion version. An existing-holder
+prune compares the complete expected route and removes only the specified
+allocation under the same slot lock. This includes publication identity: another
+cohort can publish a different route at the same version. A lost prune reply can
+recover the pinned primary's deletion marker through a dedicated operation that
+validates the primary incarnation, enrollment permit, attempt, and allocation.
+Arbitrary missing reads and another receiver's marker do not authorize release.
+
+Publisher enrollment is cached outside the warm write path. Reservation and route
+messages carry typed protobuf publication payloads; warm writes add no metadata
+round trips. Publication control also uses typed protobuf, preserving per-item
+errors, optional fields, and ordering. In-memory attempts share immutable fields
+through `Arc`, with copy-on-write mutation preserving captured values.
+The recovery-only full-route prune embeds lossless JSON in its protobuf envelope
+so equality checks preserve distinctions such as absent versus empty metadata.
+
+Owner completion acknowledgments run in bounded batches even when CLOCK eviction
+is disabled. Publication control reuses the existing foreground control stream
+and unary fallback. Slow maintenance requests can delay foreground requests;
+indeterminate revocation retains allocations rather than authorizing release.
+Admission is bounded to 4,096 publisher enrollments,
+1,024 unresolved attempts per enrollment, 64 receivers per live attempt, and 4,096
+queued owner acknowledgments. Capacity exhaustion applies backpressure.
+
+Publication fencing requires a uniform peer upgrade. Empty provenance retains
+legacy handling; malformed nonempty payloads fail closed. New physical references
+without provenance are rejected, while updates to an existing exact legacy
+reference remain supported. Metadata-only directories retain their existing
+contract. Unresolved legacy reservations without provenance remain retained.
 
 Remote allocator RPC follows the same pattern on the storage owner side. A live remote storage owner returns a real allocator error when it still cannot free capacity. The caller does not silently downgrade that case to metadata allocation.
 
