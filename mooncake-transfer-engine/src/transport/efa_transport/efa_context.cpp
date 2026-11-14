@@ -1606,6 +1606,31 @@ std::string EfaContext::describeInflightBySlot(size_t top_n) const {
     return os.str();
 }
 
+void EfaContext::takeOpContexts(int n, EfaOpContext** out) {
+    constexpr int kChunk = 4096;
+    while (op_pool_lock_.test_and_set(std::memory_order_acquire)) {
+    }
+    while (static_cast<int>(op_free_.size()) < n) {
+        auto chunk = std::make_unique<char[]>(sizeof(EfaOpContext) * kChunk);
+        auto* base = reinterpret_cast<EfaOpContext*>(chunk.get());
+        for (int i = 0; i < kChunk; ++i) op_free_.push_back(&base[i]);
+        op_chunks_.push_back(std::move(chunk));
+    }
+    for (int i = 0; i < n; ++i) {
+        out[i] = op_free_.back();
+        op_free_.pop_back();
+    }
+    op_pool_lock_.clear(std::memory_order_release);
+}
+
+void EfaContext::returnOpContexts(EfaOpContext* const* ops, int n) {
+    if (n <= 0) return;
+    while (op_pool_lock_.test_and_set(std::memory_order_acquire)) {
+    }
+    op_free_.insert(op_free_.end(), ops, ops + n);
+    op_pool_lock_.clear(std::memory_order_release);
+}
+
 int EfaContext::submitSlicesOnPeer(
     fi_addr_t peer_fi_addr, std::vector<Transport::Slice*>& slice_list,
     std::vector<Transport::Slice*>& failed_slice_list) {
@@ -1904,7 +1929,11 @@ int EfaContext::submitSlicesOnPeer(
             return 0;
         }
 
-        std::vector<BatchEntry> batch(batch_count);
+        thread_local std::vector<BatchEntry> batch;
+        thread_local std::vector<EfaOpContext*> ops;
+        batch.resize(batch_count);
+        ops.resize(batch_count);
+        takeOpContexts(batch_count, ops.data());
         int valid_count = 0;
 
         for (int i = 0; i < batch_count; i++) {
@@ -1916,7 +1945,7 @@ int EfaContext::submitSlicesOnPeer(
                 failed_slice_list.push_back(slice);
                 continue;
             }
-            EfaOpContext* op_ctx = new EfaOpContext();
+            EfaOpContext* op_ctx = ops[valid_count];
             memset(op_ctx, 0, sizeof(EfaOpContext));
             op_ctx->slice = slice;
             op_ctx->wr_depth = &wr_depth_;
@@ -1926,6 +1955,8 @@ int EfaContext::submitSlicesOnPeer(
         }
 
         int mr_failures = batch_count - valid_count;
+        // the contexts the MR-rejected slices did not use
+        returnOpContexts(ops.data() + valid_count, mr_failures);
         if (mr_failures > 0) {
             wr_depth_.fetch_sub(mr_failures, std::memory_order_acq_rel);
             if (cq_outstanding)
@@ -1977,14 +2008,14 @@ int EfaContext::submitSlicesOnPeer(
                 } else if (ret == -FI_EAGAIN) {
                     // Nothing was posted, so give the speculative count back.
                     slot->inflight.fetch_sub(1, std::memory_order_acq_rel);
-                    delete entry.op_ctx;
+                    returnOpContexts(&entry.op_ctx, 1);
                     int not_posted = valid_count - i;
                     wr_depth_.fetch_sub(not_posted, std::memory_order_acq_rel);
                     if (cq_outstanding)
                         cq_outstanding->fetch_sub(not_posted,
                                                   std::memory_order_acq_rel);
                     for (int j = i; j < valid_count; j++) {
-                        if (j > i) delete batch[j].op_ctx;
+                        if (j > i) returnOpContexts(&batch[j].op_ctx, 1);
                         retry_slices.push_back(batch[j].slice);
                     }
                     break;
@@ -1996,7 +2027,7 @@ int EfaContext::submitSlicesOnPeer(
                         << ", len=" << entry.slice->length
                         << ", dest=" << (void*)entry.slice->rdma.dest_addr
                         << ", rkey=" << entry.slice->rdma.dest_rkey << ")";
-                    delete entry.op_ctx;
+                    returnOpContexts(&entry.op_ctx, 1);
                     wr_depth_.fetch_sub(1, std::memory_order_acq_rel);
                     if (cq_outstanding)
                         cq_outstanding->fetch_sub(1, std::memory_order_acq_rel);
@@ -2046,25 +2077,37 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
     ssize_t ret = fi_cq_read(cq, entries, to_poll);
 
     if (ret > 0) {
-        std::unordered_map<std::atomic<int>*, int> wr_depth_set;
+        // At most 64 entries a call: fixed arrays, no heap.  The WR counters
+        // are almost always this context's one, so a linear scan is enough.
+        std::pair<std::atomic<int>*, int> wr_depth_set[64];
+        int n_wr = 0;
         // Slots that just saw a completion; any whose deferred removal is now
         // unblocked is retired after the loop (retireSlotIfPending takes
         // post_lock_, so it must not run while we still hold CQ state).
-        std::vector<std::pair<AvSlotState*, fi_addr_t>> touched_slots;
+        std::pair<AvSlotState*, fi_addr_t> touched_slots[64];
+        int n_touched = 0;
+        EfaOpContext* done[64];
+        int n_done = 0;
         for (ssize_t i = 0; i < ret; i++) {
             EfaOpContext* op_ctx =
                 reinterpret_cast<EfaOpContext*>(entries[i].op_context);
             if (op_ctx && op_ctx->slice) {
                 op_ctx->slice->markSuccess();
                 if (op_ctx->wr_depth) {
-                    wr_depth_set[op_ctx->wr_depth]++;
+                    int k = 0;
+                    while (k < n_wr &&
+                           wr_depth_set[k].first != op_ctx->wr_depth)
+                        ++k;
+                    if (k == n_wr) wr_depth_set[n_wr++] = {op_ctx->wr_depth, 0};
+                    wr_depth_set[k].second++;
                 }
                 if (op_ctx->slot) {
                     op_ctx->slot->inflight.fetch_sub(1,
                                                      std::memory_order_acq_rel);
-                    touched_slots.emplace_back(op_ctx->slot, op_ctx->slot_addr);
+                    touched_slots[n_touched++] = {op_ctx->slot,
+                                                  op_ctx->slot_addr};
                 }
-                delete op_ctx;
+                done[n_done++] = op_ctx;
             } else {
                 // The CQ reservation is returned below for every entry in
                 // `ret`, but the wr_depth_ reservation is reachable only
@@ -2073,10 +2116,14 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
                 orphan_completions_.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        for (auto& entry : wr_depth_set) {
-            entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
+        returnOpContexts(done, n_done);
+        for (int k = 0; k < n_wr; ++k) {
+            wr_depth_set[k].first->fetch_sub(wr_depth_set[k].second,
+                                             std::memory_order_acq_rel);
         }
-        for (auto& s : touched_slots) retireSlotIfPending(s.first, s.second);
+        for (int k = 0; k < n_touched; ++k)
+            retireSlotIfPending(touched_slots[k].first,
+                                touched_slots[k].second);
         cq_list_[cq_index]->outstanding.fetch_sub(static_cast<int>(ret),
                                                   std::memory_order_acq_rel);
         // Liveness stamp for the starvation logs: once per non-empty batch of
@@ -2145,7 +2192,7 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
                                                      std::memory_order_acq_rel);
                     touched_slots.emplace_back(op_ctx->slot, op_ctx->slot_addr);
                 }
-                delete op_ctx;
+                returnOpContexts(&op_ctx, 1);
             } else {
                 // Same asymmetry as the success path: err_count returns the CQ
                 // reservation, but the WR reservation is unreachable without
