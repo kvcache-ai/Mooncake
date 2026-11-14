@@ -17,6 +17,90 @@ SSD offload does not use the master's `--root_fs_dir` option. Configure the loca
 
 ## Startup Steps
 
+### Prepare the SSD filesystem and TRIM
+
+For a local NVMe or NVMe RAID0 deployment with `bucket_storage_backend`, use an existing XFS or ext4 filesystem mounted at the offload volume (for example, `/nvme/mooncake_offload`). This deployment targets high-performance NVMe drives, where discard overhead is typically small. Prefer the `discard` mount option to return freed filesystem blocks to the SSD promptly; seconds-level periodic `fstrim` is an alternative. The RAID layer and all underlying devices must support passing discard/TRIM through; Mooncake does not configure mounts or run TRIM itself.
+
+At high KV-cache offload rates, an initially empty local NVMe volume may reach the eviction watermark within a few hours, depending on usable capacity and the write rate. It then operates under sustained writes and eviction.
+
+Deleting bucket files frees filesystem space, but without discard/TRIM those logical blocks remain mapped as valid data in the SSD until overwritten. Garbage collection may therefore copy data that the filesystem has already freed, increasing internal data movement and write amplification. This consumes device bandwidth and can reduce sustained throughput and increase I/O latency. Enable discard or seconds-level periodic TRIM from deployment startup so the SSD can reclaim space released by eviction.
+
+Enable `discard` either in the `mount` command or in `/etc/fstab` using one of the following examples.
+
+**Example 1: mount command**
+
+For an existing XFS filesystem on a RAID0 device such as `/dev/md0`, mount it before starting clients:
+
+```bash
+sudo mkdir -p /nvme/mooncake_offload
+sudo mount -t xfs -o discard /dev/md0 /nvme/mooncake_offload
+```
+
+Replace `/dev/md0` with the actual filesystem device; for ext4, use `-t ext4`. This command configures the current mount.
+
+**Example 2: /etc/fstab configuration**
+
+To preserve the mount configuration across reboots, add `discard` to the volume's `/etc/fstab` entry instead. For XFS:
+
+```text
+UUID=<offload-filesystem-uuid> /nvme/mooncake_offload xfs defaults,discard 0 0
+```
+
+For ext4, use `ext4` as the filesystem type and `0 2` as the final fields. For a volume that is not yet mounted, run `sudo mount /nvme/mooncake_offload` to apply the entry before starting clients. Check the filesystem serving the actual offload path and the block stack's advertised discard support:
+
+```bash
+# Show /nvme/mooncake_offload's mount point, source device, filesystem type, and active options;
+# verify that OPTIONS includes discard when using continuous discard.
+findmnt -T /nvme/mooncake_offload -o TARGET,SOURCE,FSTYPE,OPTIONS
+
+# Show block devices and their advertised discard limits; inspect the RAID
+# device and its NVMe members. DISC-MAX > 0 indicates advertised support.
+lsblk --discard
+```
+
+Alternatively, keep the normal mount options and configure **seconds-level** periodic TRIM for the offload volume. Use a dedicated timer instead of relying on the distribution's long-interval `fstrim.timer` schedule. The following example runs again 10 seconds after each invocation finishes.
+
+Create `/etc/systemd/system/mooncake-offload-fstrim.service` (adjust the `fstrim` executable path to match `command -v fstrim`):
+
+```ini
+[Unit]
+Description=TRIM the Mooncake SSD offload volume
+RequiresMountsFor=/nvme/mooncake_offload
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/fstrim -v /nvme/mooncake_offload
+```
+
+Create `/etc/systemd/system/mooncake-offload-fstrim.timer`:
+
+```ini
+[Unit]
+Description=Run Mooncake offload TRIM at seconds-level intervals
+
+[Timer]
+OnActiveSec=10s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable and verify the dedicated timer:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mooncake-offload-fstrim.timer
+systemctl list-timers mooncake-offload-fstrim.timer
+journalctl -u mooncake-offload-fstrim.service -n 20
+```
+
+Set both interval values to the required number of seconds. `AccuracySec=1s` avoids the default minute-wide coalescing window, and `RandomizedDelaySec=0` adds no random delay. `OnUnitInactiveSec` schedules from completion; a slow TRIM run does not overlap another invocation of this service. See [systemd timer semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html).
+
+For mount-option and command syntax, see the [XFS mount options](https://docs.kernel.org/admin-guide/xfs.html), [ext4 mount options](https://docs.kernel.org/admin-guide/ext4.html), and [fstrim manual](https://man7.org/linux/man-pages/man8/fstrim.8.html).
+
 ### Step 1: Create the SSD storage directory
 
 ```bash
