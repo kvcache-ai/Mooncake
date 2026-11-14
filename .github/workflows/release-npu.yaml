@@ -7,13 +7,58 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0)'
+        description: 'Release tag (e.g. v0.3.14 or v0.3.14-rc1)'
         required: true
         type: string
 
 jobs:
+  version-stamp:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      package_version: ${{ steps.version.outputs.package_version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - name: Checkout release gate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install version parser
+        run: python -m pip install packaging
+
+      - name: Normalize release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            version=$(python scripts/ci/testpypi_wheel_gate.py \
+              normalize-version --tag "$RELEASE_TAG")
+            is_prerelease=true
+          else
+            # Keep the repository-wide stable path for tags without a hyphen.
+            version="${RELEASE_TAG#v}"
+            is_prerelease=false
+          fi
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
+
   build:
-    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
+    needs: version-stamp
 
     strategy:
       max-parallel: 2
@@ -40,7 +85,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          ref: refs/tags/${{ needs.version-stamp.outputs.release_tag }}
           fetch-depth: 0
 
       - name: Setup Python ${{ matrix.python-version }}
@@ -140,6 +185,14 @@ jobs:
         run: |
           echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
 
+      - name: Apply pre-release wheel version
+        if: ${{ needs.version-stamp.outputs.is_prerelease == 'true' }}
+        env:
+          PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
+        run: |
+          sed -i "s/^version = .*/version = \"${PACKAGE_VERSION}\"/" \
+            mooncake-wheel/pyproject.toml
+
       - name: Build Python wheel
         shell: bash
         run: |
@@ -157,21 +210,13 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
-    needs: build
+    needs: [version-stamp, build]
     runs-on: ubuntu-22.04
-    environment: pypi
 
     permissions:
       contents: write
-      id-token: write
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
-
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -186,13 +231,33 @@ jobs:
           ls -la mooncake-wheel/dist-release/
 
       - name: Upload wheels to GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.version-stamp.outputs.release_tag }}
+          prerelease: ${{ needs.version-stamp.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ needs.version-stamp.outputs.is_prerelease == 'true' && 'false' || '' }}
           files: mooncake-wheel/dist-release/*.whl
+          fail_on_unmatched_files: true
+
+  publish-pypi:
+    if: ${{ github.repository == 'kvcache-ai/Mooncake' && needs.version-stamp.outputs.is_prerelease == 'false' }}
+    needs: [version-stamp, publish-release]
+    runs-on: ubuntu-22.04
+    environment: pypi
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-release
+          pattern: mooncake-wheel-npu-*
+          merge-multiple: true
 
       - name: Publish package to PyPI
-        if: github.repository == 'kvcache-ai/Mooncake'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
