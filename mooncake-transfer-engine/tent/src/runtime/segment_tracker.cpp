@@ -14,7 +14,9 @@
 
 #include "tent/runtime/segment_tracker.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <filesystem>
 #include <set>
 #include <unordered_map>
@@ -51,6 +53,30 @@ struct BufferRangeHash {
                (std::hash<size_t>()(range.second) << 1);
     }
 };
+
+// Descriptors with the same range are aliases of one logical registration.
+// Keep their reference counts in sync and remove them together.
+std::vector<size_t> MatchRange(const std::vector<BufferDesc>& buffers,
+                               uint64_t addr, size_t length) {
+    std::vector<size_t> matches;
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (buffers[i].addr == addr && buffers[i].length == length) {
+            matches.push_back(i);
+        }
+    }
+    return matches;
+}
+
+void BumpRange(std::vector<BufferDesc>& buffers,
+               const std::vector<size_t>& matches) {
+    int logical = 0;
+    for (size_t index : matches) {
+        logical = std::max(logical, buffers[index].ref_count);
+    }
+    for (size_t index : matches) {
+        buffers[index].ref_count = logical + 1;
+    }
+}
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
@@ -63,12 +89,10 @@ Status SegmentTracker::add(uint64_t base, size_t length,
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
             assert(desc.type == SegmentType::Memory);
             auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-            for (auto& buf : detail.buffers) {
-                if (buf.addr == base && buf.length == length) {
-                    buf.ref_count++;
-                    found = true;
-                    break;
-                }
+            auto matches = MatchRange(detail.buffers, base, length);
+            if (!matches.empty()) {
+                BumpRange(detail.buffers, matches);
+                found = true;
             }
             return Status::OK();
         }));
@@ -137,15 +161,12 @@ Status SegmentTracker::addInBatch(
             assert(desc.type == SegmentType::Memory);
             auto& detail = std::get<MemorySegmentDesc>(desc.detail);
             for (auto& entry : desc_list) {
-                bool found = false;
-                for (auto& buf : detail.buffers) {
-                    if (buf.addr == entry.addr && buf.length == entry.length) {
-                        buf.ref_count++;
-                        found = true;
-                        break;
-                    }
-                }
-                if (found) {
+                auto matches =
+                    MatchRange(detail.buffers, entry.addr, entry.length);
+                if (!matches.empty()) {
+                    // One input, including a repeated input in this batch, is
+                    // one logical reference on every alias of the range.
+                    BumpRange(detail.buffers, matches);
                     bumped.emplace_back(entry.addr, entry.length);
                 } else {
                     appendNewDescriptor(entry);
@@ -185,21 +206,39 @@ Status SegmentTracker::remove(uint64_t base, size_t length,
     std::lock_guard<std::recursive_mutex> guard(mutex_);
     bool removed = false;
     BufferDesc removed_desc;
+    std::vector<BufferDesc> removed_group;
     CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
         assert(desc.type == SegmentType::Memory);
         auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-        for (auto it = detail.buffers.begin(); it != detail.buffers.end();
-             ++it) {
-            if (it->addr == base && (!length || it->length == length)) {
-                it->ref_count--;
-                if (it->ref_count == 0) {
-                    removed_desc = *it;
-                    detail.buffers.erase(it);
-                    removed = true;
-                }
-                break;
-            }
+        auto first =
+            std::find_if(detail.buffers.begin(), detail.buffers.end(),
+                         [&](const auto& buffer) {
+                             return buffer.addr == base &&
+                                    (!length || buffer.length == length);
+                         });
+        if (first == detail.buffers.end()) return Status::OK();
+        const auto matches = MatchRange(detail.buffers, base, first->length);
+        int logical = 0;
+        for (size_t index : matches) {
+            logical = std::max(logical, detail.buffers[index].ref_count);
         }
+        if (logical > 1) {
+            for (size_t index : matches) {
+                detail.buffers[index].ref_count = logical - 1;
+            }
+            return Status::OK();
+        }
+        removed_group.reserve(matches.size());
+        for (size_t index : matches) {
+            removed_group.push_back(detail.buffers[index]);
+        }
+        for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
+            detail.buffers.erase(detail.buffers.begin() +
+                                 static_cast<std::ptrdiff_t>(*it));
+        }
+        removed_desc = removed_group.front();
+        removed_desc.ref_count = 0;
+        removed = true;
         return Status::OK();
     }));
     if (!removed) return Status::OK();
@@ -207,10 +246,15 @@ Status SegmentTracker::remove(uint64_t base, size_t length,
     if (!status.ok()) {
         // Successful transport removals may have scrubbed their keys. Keep
         // the remaining registrations and one reference for a safe retry.
-        removed_desc.ref_count = 1;
+        if (removed_group.size() == 1) {
+            removed_group.front() = std::move(removed_desc);
+        }
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) {
             auto& buffers = std::get<MemorySegmentDesc>(desc.detail).buffers;
-            buffers.push_back(std::move(removed_desc));
+            for (auto& buffer : removed_group) {
+                buffer.ref_count = 1;
+                buffers.push_back(std::move(buffer));
+            }
             sortBuffers(buffers);
             return Status::OK();
         }));

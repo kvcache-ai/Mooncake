@@ -15,7 +15,6 @@
 
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
-#include <dlfcn.h>
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>

@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -151,6 +152,9 @@ class AscendDirectTransport : public Transport {
     Status resolveRequestWithSegment(
         const Request& request, PreparedRequest& prepared, SegmentDesc* desc,
         const HixlNameResolver* resolver = nullptr) const;
+    std::string selectRemoteHixl(const HixlNameResolver& resolver,
+                                 uint64_t dest_addr, size_t length,
+                                 size_t local_engine_idx) const;
     void startGroup(HixlSubBatch* batch, const std::string& remote_hixl,
                     size_t local_engine_idx, bool write,
                     std::vector<HixlTask*> tasks);
@@ -190,6 +194,9 @@ class AscendDirectTransport : public Transport {
     int64_t transfer_timeout_ns_{0};
 
     std::vector<std::unique_ptr<HixlEngine>> engines_;
+    std::vector<int32_t> engine_physical_ids_;
+    mutable std::once_flag acl_inventory_once_;
+    mutable std::vector<uint32_t> acl_physical_ids_;
     std::vector<std::unique_ptr<LocalCopyEngine>> local_copies_;
     // Indexed like engines_: workers that hand remote groups to HIXL, and the
     // workers a local copy spreads its streams over.
@@ -203,6 +210,8 @@ class AscendDirectTransport : public Transport {
     // ASCEND_USE_SHMEM is read once at install(); when off, no buffer can
     // carry a removable memfd handle, so skip the per-request mapper probe.
     bool use_shmem_{false};
+    // ASCEND_STANDALONE_SINGLE_SEGMENT, read once at install(). Default off.
+    bool standalone_single_segment_{false};
     // Test-only fault injection and inert unless the test peer sets it (no
     // production caller): startLocalCopy() then treats publishing the group as
     // failed (as if groups_.emplace() threw under memory pressure), so the

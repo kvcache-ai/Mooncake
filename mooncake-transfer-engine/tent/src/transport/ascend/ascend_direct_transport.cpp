@@ -39,6 +39,7 @@
 #include "tent/runtime/slab.h"
 #include "tent/thirdparty/nlohmann/json.h"
 #include "ascend_affinity.h"
+#include "ascend_device_index.h"
 #ifdef TENT_HAS_ASCEND_ALLOCATOR
 #include "ascend_allocator.h"
 #endif
@@ -270,6 +271,10 @@ Status AscendDirectTransport::install(std::string& local_segment_name,
     conf_ = conf;
     options_ = LoadAscendDirectOptions(conf_);
     use_shmem_ = EnvFlagEnabled("ASCEND_USE_SHMEM");
+    // Latched with the allocator flags below. Default off; registration also
+    // requires agent_mode and remote access.
+    standalone_single_segment_ =
+        ParseEnvEnabled("ASCEND_STANDALONE_SINGLE_SEGMENT");
     auto cann_status = CheckCannVersion();
     if (!cann_status.ok()) {
         return cann_status;
@@ -278,8 +283,9 @@ Status AscendDirectTransport::install(std::string& local_segment_name,
     // Fallback flags for consumers that load the allocator without a transfer
     // engine (tentpy): a process that links the engine registers a provider
     // reading globalConfig() live, which takes precedence over these.
-    mooncake::ascend_allocator_set_runtime_flags(options_.agent_mode,
-                                                 options_.use_fabric_mem);
+    mooncake::ascend_allocator_set_runtime_flags(
+        options_.agent_mode, options_.use_fabric_mem,
+        ParseEnvEnabled("ASCEND_STANDALONE_SINGLE_SEGMENT"));
 #endif
     init_options_ = BuildHixlInitOptions(options_);
     transfer_timeout_ns_ =
@@ -400,6 +406,15 @@ Status AscendDirectTransport::initEngines() {
     logic_device_ids.reserve(engines_.size());
     for (const auto& engine : engines_) {
         logic_device_ids.push_back(engine->deviceId());
+    }
+    engine_physical_ids_.assign(engines_.size(), -1);
+    for (size_t i = 0; i < engines_.size(); ++i) {
+        int32_t physical = -1;
+        if (aclrtGetPhyDevIdByLogicDevId(engines_[i]->deviceId(), &physical) ==
+                ACL_ERROR_NONE &&
+            physical >= 0) {
+            engine_physical_ids_[i] = physical;
+        }
     }
     const auto engine_cpus = EngineCpuSets(logic_device_ids);
     startPools(engine_cpus);
@@ -572,6 +587,53 @@ Status AscendDirectTransport::freeSubBatch(SubBatchRef& batch) {
     return Status::OK();
 }
 
+std::string AscendDirectTransport::selectRemoteHixl(
+    const HixlNameResolver& resolver, uint64_t dest_addr, size_t length,
+    size_t local_engine_idx) const {
+    const auto indices = resolver.CoveringNameIndices(dest_addr, length);
+    if (indices.empty()) {
+        return resolver.Resolve(dest_addr);
+    }
+    if (indices.size() == 1) {
+        return resolver.NameAt(indices.front());
+    }
+    std::call_once(acl_inventory_once_, [this] {
+        acl_physical_ids_ = mooncake::GetAscendPhysicalDeviceIds();
+    });
+    if (acl_physical_ids_.empty() ||
+        local_engine_idx >= engine_physical_ids_.size()) {
+        LOG(ERROR) << "ACL device set is unavailable for a multi-engine route";
+        return {};
+    }
+    const int32_t physical_id = engine_physical_ids_[local_engine_idx];
+    if (physical_id < 0) {
+        LOG(ERROR) << "Physical device id unavailable for multi-engine route";
+        return {};
+    }
+    const auto it =
+        std::lower_bound(acl_physical_ids_.begin(), acl_physical_ids_.end(),
+                         static_cast<uint32_t>(physical_id));
+    if (it == acl_physical_ids_.end() ||
+        *it != static_cast<uint32_t>(physical_id)) {
+        LOG(ERROR) << "Cannot find client physical device " << physical_id
+                   << " in the ACL device set for multi-engine route";
+        return {};
+    }
+    const auto index = mooncake::ReverseDeviceIndex(
+        static_cast<uint32_t>(it - acl_physical_ids_.begin()),
+        static_cast<uint32_t>(acl_physical_ids_.size()),
+        static_cast<uint32_t>(indices.size()));
+    if (!index || *index >= indices.size()) {
+        return {};
+    }
+    const std::string& remote = resolver.NameAt(indices[*index]);
+    VLOG(1) << "ACL single-segment route physical=" << physical_id
+            << " rank=" << (it - acl_physical_ids_.begin())
+            << " C=" << acl_physical_ids_.size() << " S=" << indices.size()
+            << " index=" << *index << " endpoint=" << remote;
+    return remote;
+}
+
 Status AscendDirectTransport::resolveRequestWithSegment(
     const Request& request, PreparedRequest& prepared, SegmentDesc* desc,
     const HixlNameResolver* resolver) const {
@@ -615,10 +677,14 @@ Status AscendDirectTransport::resolveRequestWithSegment(
     // mapped SHMEM request parses the segment's hixl_names JSON for every
     // request, which dominates the page-granular local-copy workload.
     if (!prepared.shm_local) {
-        prepared.remote_hixl =
-            resolver != nullptr
-                ? resolver->Resolve(request.target_offset)
-                : ResolveRemoteHixlName(detail, request.target_offset);
+        if (resolver != nullptr) {
+            prepared.remote_hixl =
+                selectRemoteHixl(*resolver, request.target_offset,
+                                 request.length, prepared.local_engine_idx);
+        } else {
+            prepared.remote_hixl =
+                ResolveRemoteHixlName(detail, request.target_offset);
+        }
         if (prepared.remote_hixl.empty()) {
             return Status::InvalidArgument("Missing remote hixl_name" LOC_MARK);
         }
@@ -1478,20 +1544,96 @@ Status AscendDirectTransport::addMemoryBuffer(BufferDesc& desc,
 
 Status AscendDirectTransport::addMemoryBuffer(
     std::vector<BufferDesc>& desc_list, const MemoryOptions& options) {
+    auto rollback = [&](const std::vector<void*>& registered) {
+        for (void* addr : registered) {
+            BufferDesc cleanup{};
+            cleanup.addr = reinterpret_cast<uint64_t>(addr);
+            (void)removeMemoryBuffer(cleanup);
+        }
+    };
     std::vector<void*> registered;
     registered.reserve(desc_list.size());
+    std::vector<BufferDesc> shared_records;
     for (auto& desc : desc_list) {
-        auto status = addMemoryBuffer(desc, options);
-        if (!status.ok()) {
-            for (void* addr : registered) {
-                BufferDesc rollback{};
-                rollback.addr = reinterpret_cast<uint64_t>(addr);
-                (void)removeMemoryBuffer(rollback);
+        // Same gate as classic: standalone, the default-off switch, and remote
+        // access. The caller does not need to mark the Store allocation.
+        const bool span_all =
+            options_.agent_mode && standalone_single_segment_ &&
+            engines_.size() > 1 && options.perm != kLocalReadWrite;
+        if (!span_all) {
+            auto status = addMemoryBuffer(desc, options);
+            if (!status.ok()) {
+                rollback(registered);
+                return status;
             }
-            return status;
+            registered.push_back(reinterpret_cast<void*>(desc.addr));
+            continue;
         }
+        const char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+        if (buffer_pool != nullptr && buffer_pool[0] != '\0' &&
+            std::strcmp(buffer_pool, "0:0") != 0) {
+            rollback(registered);
+            return Status::InvalidArgument(
+                "ASCEND_STANDALONE_SINGLE_SEGMENT requires "
+                "ASCEND_BUFFER_POOL=0:0" LOC_MARK);
+        }
+        bool host =
+            IsHostMem(desc.location, reinterpret_cast<void*>(desc.addr));
+#ifdef TENT_HAS_ASCEND_ALLOCATOR
+        if (host && options_.use_fabric_mem &&
+            mooncake::ascend_is_direct_vmm_memory(
+                reinterpret_cast<void*>(desc.addr), desc.length)) {
+            host = false;
+        }
+#endif
+        std::vector<size_t> registered_engines;
+        Status register_error = Status::OK();
+        for (size_t engine_idx = 0; engine_idx < engines_.size();
+             ++engine_idx) {
+            if (!engines_[engine_idx]) {
+                register_error =
+                    Status::InternalError("Invalid HIXL engine index" LOC_MARK);
+                break;
+            }
+            auto status = engines_[engine_idx]->registerMem(
+                reinterpret_cast<void*>(desc.addr), desc.length, host,
+                options.perm == kLocalReadWrite);
+            if (!status.ok()) {
+                register_error = status;
+                break;
+            }
+            registered_engines.push_back(engine_idx);
+        }
+        if (!register_error.ok()) {
+            for (size_t engine_idx : registered_engines) {
+                (void)engines_[engine_idx]->deregisterMem(
+                    reinterpret_cast<void*>(desc.addr));
+            }
+            rollback(registered);
+            return register_error;
+        }
+#ifdef TENT_HAS_ASCEND_ALLOCATOR
+        if (host) {
+            std::string shared_handle;
+            if (mooncake::ascend_get_shared_host_handle(
+                    reinterpret_cast<void*>(desc.addr), &shared_handle)) {
+                desc.shm_path = std::move(shared_handle);
+            }
+        }
+#endif
+        desc.transports.push_back(TransportType::AscendDirect);
+        desc.transport_attrs[TransportType::AscendDirect] = "0";
         registered.push_back(reinterpret_cast<void*>(desc.addr));
+        for (size_t engine_idx = 1; engine_idx < engines_.size();
+             ++engine_idx) {
+            BufferDesc extra = desc;
+            extra.transport_attrs[TransportType::AscendDirect] =
+                std::to_string(engine_idx);
+            shared_records.push_back(std::move(extra));
+        }
     }
+    desc_list.insert(desc_list.end(), shared_records.begin(),
+                     shared_records.end());
     return Status::OK();
 }
 

@@ -39,6 +39,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <set>
@@ -60,6 +61,8 @@ constexpr int kTransferStatusMaxRetries = 1000;
 // threads do not clobber the test thread's current device.
 static thread_local int g_device_id = 0;
 static int g_device_count = 1;
+static std::map<int32_t, int32_t> g_physical_device_ids;
+static aclError g_device_count_status = ACL_ERROR_NONE;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
 static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
@@ -137,6 +140,8 @@ void reset() {
     g_device_id = 0;
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
+    g_physical_device_ids.clear();
+    g_device_count_status = ACL_ERROR_NONE;
     g_context = ContextForDevice(0);
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
@@ -301,6 +306,10 @@ int stream_overlap_count() {
 extern "C" {
 
 aclError aclrtGetDeviceCount(uint32_t* count) {
+    if (g_device_count_status != ACL_ERROR_NONE) {
+        *count = 0;
+        return g_device_count_status;
+    }
     *count = static_cast<uint32_t>(g_device_count);
     return ACL_ERROR_NONE;
 }
@@ -457,7 +466,9 @@ const char* aclGetRecentErrMsg() { return "mock acl error message"; }
 
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
-    *physical_dev_id = logic_dev_id;
+    const auto it = g_physical_device_ids.find(logic_dev_id);
+    *physical_dev_id =
+        it == g_physical_device_ids.end() ? logic_dev_id : it->second;
     return ACL_ERROR_NONE;
 }
 
@@ -569,6 +580,9 @@ static adxl::TransferStatus g_transfer_status_enum =
 static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
 static std::deque<adxl::Status> g_initialize_results;
+static std::deque<adxl::Status> g_register_mem_results;
+static std::deque<adxl::Status> g_deregister_mem_results;
+static std::vector<int> g_registered_devices;
 static std::vector<std::string> g_initialize_names;
 static std::vector<uintptr_t> g_registered_mem_handles;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
@@ -603,6 +617,9 @@ void reset() {
     g_transfer_results.clear();
     g_transfer_async_results.clear();
     g_initialize_results.clear();
+    g_register_mem_results.clear();
+    g_deregister_mem_results.clear();
+    g_registered_devices.clear();
     g_initialize_names.clear();
     g_registered_mem_handles.clear();
     g_deregistered_mem_handles.clear();
@@ -884,12 +901,18 @@ Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
     std::lock_guard<std::mutex> lock(g_mutex);
     g_register_mem_count++;
     g_last_local_only = mem.local_only;
+    if (!g_register_mem_results.empty()) {
+        const auto status = g_register_mem_results.front();
+        g_register_mem_results.pop_front();
+        if (status != adxl::SUCCESS) return status;
+    }
     if (g_register_mem_result != adxl::SUCCESS) {
         return g_register_mem_result;
     }
     mem_handle =
         reinterpret_cast<MemHandle>(static_cast<uintptr_t>(g_next_handle++));
     g_registered_mem_handles.push_back(reinterpret_cast<uintptr_t>(mem_handle));
+    g_registered_devices.push_back(g_device_id);
     return SUCCESS;
 }
 
@@ -898,6 +921,11 @@ Status AdxlEngine::DeregisterMem(MemHandle mem_handle) {
     g_deregister_mem_count++;
     g_deregistered_mem_handles.push_back(
         reinterpret_cast<uintptr_t>(mem_handle));
+    if (!g_deregister_mem_results.empty()) {
+        const auto status = g_deregister_mem_results.front();
+        g_deregister_mem_results.pop_front();
+        return status;
+    }
     return SUCCESS;
 }
 
@@ -949,6 +977,7 @@ class AscendDirectTransportTest : public ::testing::Test {
         unsetenv("MC_CUSTOM_TOPO_JSON");
         mock_acl::reset();
         adxl_mock::reset();
+        globalConfig().ascend_standalone_single_segment = false;
 
         mock_acl::set_pointer_location(test_buffer_src_,
                                        ACL_MEM_LOCATION_TYPE_HOST, 0);
@@ -968,6 +997,8 @@ class AscendDirectTransportTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        globalConfig().ascend_standalone_single_segment = false;
+        globalConfig().ascend_agent_mode = false;
         unsetenv("ASCEND_AUTO_CONNECT");
         unsetenv("MC_CUSTOM_TOPO_JSON");
         unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
@@ -1084,16 +1115,18 @@ class AscendDirectTransportTest : public ::testing::Test {
         return result;
     }
 
-    TransferWaitResult runRemoteTransfer(AscendDirectTransport* transport,
-                                         void* src, int target_id,
-                                         uint64_t target_offset, size_t len) {
+    TransferWaitResult runRemoteTransfer(
+        AscendDirectTransport* transport, void* src, int target_id,
+        uint64_t target_offset, size_t len,
+        Transport::TransferRequest::OpCode opcode =
+            Transport::TransferRequest::WRITE) {
         auto batch_id = transport->allocateBatchID(1);
         if (batch_id == 0) {
             return {false, false, {}};
         }
         std::vector<Transport::TransferRequest> requests;
         Transport::TransferRequest req;
-        req.opcode = Transport::TransferRequest::WRITE;
+        req.opcode = opcode;
         req.source = src;
         req.target_id = target_id;
         req.target_offset = target_offset;
@@ -1872,6 +1905,340 @@ TEST_F(AscendDirectTransportTest,
 // -----------------------------------------------------------------------------
 // Batch tests
 // -----------------------------------------------------------------------------
+
+TEST_F(AscendDirectTransportTest, SingleSegment_RegistersVisibleEnginesOnly) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    for (const auto& physical_ids : std::vector<std::vector<int>>{
+             {0, 1, 2, 3}, {4, 5, 6, 7}, {4, 6}, {7}}) {
+        ContextManager::getInstance().finalize();
+        mock_acl::set_device_count(physical_ids.size());
+        ASSERT_EQ(aclrtSetDevice(0), ACL_ERROR_NONE);
+        g_physical_device_ids.clear();
+        for (size_t i = 0; i < physical_ids.size(); ++i) {
+            g_physical_device_ids[i] = physical_ids[i];
+        }
+        ASSERT_TRUE(ContextManager::getInstance().initialize());
+        auto transport = createTransport();
+        ASSERT_NE(transport, nullptr);
+        g_registered_devices.clear();
+        ASSERT_EQ(
+            transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                           kWildcardLocation, true, true),
+            0);
+        auto desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        ASSERT_EQ(desc->buffers.size(), physical_ids.size());
+        ASSERT_EQ(g_registered_devices.size(), physical_ids.size());
+        for (size_t i = 0; i < physical_ids.size(); ++i) {
+            EXPECT_EQ(desc->buffers[i].addr,
+                      reinterpret_cast<uint64_t>(test_buffer_src_));
+            EXPECT_EQ(desc->buffers[i].name, kWildcardLocation);
+            EXPECT_EQ(desc->buffers[i].device_id, i);
+            EXPECT_EQ(g_registered_devices[i], i);
+        }
+        const int before = adxl_mock::get_deregister_mem_count();
+        mock_acl::set_thread_context_bound(false);
+        ASSERT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+        EXPECT_EQ(adxl_mock::get_deregister_mem_count() - before,
+                  physical_ids.size());
+        EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+        mock_acl::set_thread_context_bound(true);
+    }
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_OffKeepsOneRegistration) {
+    globalConfig().ascend_agent_mode = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    g_physical_device_ids = {{0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(aclrtSetDevice(2), ACL_ERROR_NONE);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    auto desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    EXPECT_EQ(desc->buffers.front().device_id, 2);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_LocalBuffersStayOnOneEngine) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, false, true),
+              0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 1u);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    ASSERT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_EmbeddedClientKeepsOneEngine) {
+    globalConfig().ascend_standalone_single_segment = true;
+    g_physical_device_ids = {{0, 7}};
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 1u);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_RejectsBufferPool) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    auto transport = createTransport();
+    unsetenv("ASCEND_BUFFER_POOL");
+    ASSERT_NE(transport, nullptr);
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_PartialRegisterRollsBack) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    g_register_mem_results = {adxl::SUCCESS, adxl::SUCCESS, adxl::FAILED};
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 3);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 2);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+    EXPECT_EQ(adxl_mock::get_registered_mem_handles(),
+              adxl_mock::get_deregistered_mem_handles());
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_DeregisterRetriesFailedHandleOnly) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    g_deregister_mem_results = {adxl::SUCCESS, adxl::FAILED, adxl::SUCCESS,
+                                adxl::SUCCESS};
+    EXPECT_NE(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 4u);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 5);
+    const auto deregistered = adxl_mock::get_deregistered_mem_handles();
+    EXPECT_EQ(deregistered.back(), deregistered[1]);
+}
+
+TEST(AscendDeviceMappingTest, ReversesAndBalancesClientGroups) {
+    const std::vector<std::vector<uint32_t>> expected = {
+        {7, 6, 5, 4, 3, 2, 1, 0},
+        {3, 3, 2, 2, 1, 1, 0, 0},
+        {1, 1, 1, 1, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0},
+    };
+    for (size_t row = 0; row < expected.size(); ++row) {
+        const uint32_t servers = 8 >> row;
+        for (uint32_t client = 0; client < 8; ++client) {
+            EXPECT_EQ(ReverseDeviceIndex(client, 8, servers),
+                      expected[row][client]);
+        }
+    }
+    const std::vector<uint32_t> uneven = {1, 1, 1, 0, 0};
+    for (uint32_t client = 0; client < uneven.size(); ++client) {
+        EXPECT_EQ(ReverseDeviceIndex(client, 5, 2), uneven[client]);
+    }
+    EXPECT_FALSE(ReverseDeviceIndex(0, 0, 4));
+    EXPECT_FALSE(ReverseDeviceIndex(0, 8, 0));
+    EXPECT_FALSE(ReverseDeviceIndex(8, 8, 4));
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_ClientRoutesByPhysicalDevice) {
+    // C is the ACL-visible set. No client switch or new metadata field.
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    for (uint32_t host_devices : {8, 16}) {
+        mock_acl::set_device_count(static_cast<int>(host_devices));
+        g_physical_device_ids.clear();
+        for (uint32_t id = 0; id < host_devices; ++id) {
+            g_physical_device_ids[static_cast<int32_t>(id)] =
+                static_cast<int32_t>(id);
+        }
+        for (bool use_async : {false, true}) {
+            for (const auto& server_ids :
+                 std::vector<std::vector<int>>{{0, 1, 2, 3, 4, 5, 6, 7},
+                                               {0, 1, 2, 3},
+                                               {4, 5, 6, 7},
+                                               {4, 6},
+                                               {7},
+                                               {1, 3, 5, 7}}) {
+                std::vector<int> counts(server_ids.size());
+                for (uint32_t physical_id = 0; physical_id < host_devices;
+                     ++physical_id) {
+                    SCOPED_TRACE(::testing::Message()
+                                 << "client=" << physical_id
+                                 << " servers=" << server_ids.size()
+                                 << " async=" << use_async);
+                    ASSERT_EQ(aclrtSetDevice(static_cast<int>(physical_id)),
+                              ACL_ERROR_NONE);
+                    auto transport = createTransport(use_async);
+                    ASSERT_NE(transport, nullptr);
+                    auto desc =
+                        std::make_shared<TransferMetadata::SegmentDesc>();
+                    desc->name = "remote";
+                    desc->protocol = "ascend";
+                    desc->rank_info.hostIp = "192.168.1.100";
+                    for (size_t i = 0; i < server_ids.size(); ++i) {
+                        desc->rank_info.endpoints.push_back(
+                            "192.168.1.100:" +
+                            std::to_string(30000 + server_ids[i]));
+                        TransferMetadata::BufferDesc buffer;
+                        buffer.addr = dest;
+                        buffer.length = kRegisterMemSize;
+                        buffer.device_id = i;
+                        desc->buffers.push_back(buffer);
+                    }
+                    // Candidate ordering and duplicate records must not change
+                    // routing.
+                    std::reverse(desc->buffers.begin(), desc->buffers.end());
+                    desc->buffers.push_back(desc->buffers.front());
+                    auto published = desc;
+                    transport->meta()->addLocalSegment(1, desc->name,
+                                                       std::move(published));
+                    const size_t selected =
+                        server_ids.size() - 1 -
+                        physical_id * server_ids.size() / host_devices;
+                    ++counts[selected];
+                    const int connects_before = adxl_mock::get_connect_count();
+                    for (auto opcode : {Transport::TransferRequest::READ,
+                                        Transport::TransferRequest::WRITE}) {
+                        for (size_t offset : {size_t{0}, size_t{8192}}) {
+                            const auto result = runRemoteTransfer(
+                                transport.get(), test_buffer_src_, 1,
+                                dest + offset, kTransferBufSize, opcode);
+                            ASSERT_TRUE(result.finished);
+                            ASSERT_FALSE(result.failed);
+                            EXPECT_EQ(adxl_mock::get_last_connect_target(),
+                                      desc->rank_info.endpoints[selected]);
+                        }
+                    }
+                    EXPECT_EQ(adxl_mock::get_connect_count() - connects_before,
+                              1);
+                }
+                for (int count : counts)
+                    EXPECT_EQ(count, host_devices / server_ids.size());
+            }
+        }
+    }
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_PhysicalInventoryIsSortedAndUnique) {
+    mock_acl::set_device_count(5);
+    g_physical_device_ids = {{0, 11}, {1, 4}, {2, 9}, {3, 6}, {4, 4}};
+    EXPECT_EQ(GetAscendPhysicalDeviceIds(),
+              (std::vector<uint32_t>{4, 6, 9, 11}));
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_UnknownInventoryFailsSharedRouteOnly) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    g_device_count_status = ACL_ERROR_FAILURE;
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    addMultiEndpointRemoteSegment(
+        transport->meta(), 1, "legacy", "192.168.1.100",
+        {"192.168.1.100:30000", "192.168.1.100:30001"}, 1, dest,
+        kRegisterMemSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1, dest,
+                                    kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    auto desc = transport->meta()->getSegmentDescByID(1);
+    auto shared = std::make_shared<TransferMetadata::SegmentDesc>(*desc);
+    shared->name = "shared";
+    shared->buffers.push_back(shared->buffers.front());
+    shared->buffers.back().device_id = 0;
+    transport->meta()->addLocalSegment(2, "shared", std::move(shared));
+    result = runRemoteTransfer(transport.get(), test_buffer_src_, 2, dest,
+                               kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_UsesRankInSparsePhysicalInventory) {
+    mock_acl::set_device_count(4);
+    g_physical_device_ids = {{0, 4}, {1, 6}, {2, 9}, {3, 11}};
+    ASSERT_EQ(aclrtSetDevice(1), ACL_ERROR_NONE);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "shared";
+    desc->rank_info.endpoints = {"192.168.1.100:30004", "192.168.1.100:30007"};
+    for (int device_id : {0, 1}) {
+        TransferMetadata::BufferDesc buffer;
+        buffer.addr = dest;
+        buffer.length = kRegisterMemSize;
+        buffer.device_id = device_id;
+        desc->buffers.push_back(buffer);
+    }
+    transport->meta()->addLocalSegment(1, "shared", std::move(desc));
+    const auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                          dest, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    // Physical 6 is rank 1 of [4,6,9,11]: the first pair uses candidate 1.
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "192.168.1.100:30007");
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_ClientUsesOnlyCoveringCandidates) {
+    g_physical_device_ids = {{0, 0}};
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "remote";
+    desc->protocol = "ascend";
+    desc->rank_info.endpoints = {"192.168.1.100:30004", "192.168.1.100:30005",
+                                 "192.168.1.100:30006", "192.168.1.100:30007"};
+    for (int device_id : {3, 0, 1, 2}) {
+        TransferMetadata::BufferDesc buffer;
+        buffer.addr = device_id == 0 ? dest + kRegisterMemSize : dest;
+        buffer.length = device_id == 2 ? 1 : kRegisterMemSize;
+        buffer.device_id = device_id;
+        desc->buffers.push_back(buffer);
+    }
+    auto published = desc;
+    transport->meta()->addLocalSegment(1, desc->name, std::move(published));
+    const auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                          dest, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    ASSERT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(),
+              desc->rank_info.endpoints[3]);
+}
 
 TEST_F(AscendDirectTransportTest, Batch_ExceedsCapacity) {
     auto transport = createTransport();

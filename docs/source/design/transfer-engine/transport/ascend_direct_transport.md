@@ -64,6 +64,7 @@ The following environment variables can be configured to control Ascend Direct T
 | `ASCEND_USE_SHORT_CONNECTION` | Enable short connection mode (disconnect after each transfer) | 0 (disabled) | `ASCEND_USE_SHORT_CONNECTION=1` |
 | `ASCEND_BUFFER_POOL` | Buffer pool configuration for intermediate transfer mode (BUFFER_NUM:BUFFER_SIZE_MB) | "0:0" (disabled) | `ASCEND_BUFFER_POOL=4:8` |
 | `ASCEND_BASE_PORT` | Base port for ADXL engine port allocation | 20000 | `ASCEND_BASE_PORT=20000` |
+| `ASCEND_STANDALONE_SINGLE_SEGMENT` | Share one Store segment across NPUs to reduce connections | 0 (disabled) | `ASCEND_STANDALONE_SINGLE_SEGMENT=1` |
 | `HCCL_INTRA_ROCE_ENABLE` | Enable RDMA protocol for intra-node communication | 0 (disabled) | `HCCL_INTRA_ROCE_ENABLE=1` |
 | `HCCL_RDMA_TIMEOUT` | RDMA packet retransmission timeout coefficient | - | `HCCL_RDMA_TIMEOUT=14` |
 | `HCCL_RDMA_RETRY_CNT` | RDMA packet retransmission count | - | `HCCL_RDMA_RETRY_CNT=7` |
@@ -73,6 +74,7 @@ The following environment variables can be configured to control Ascend Direct T
 - **ASCEND_AUTO_CONNECT**: Requires CANN 9.0 or later. Default is 1: link can be automatically disconnected when the remote end goes offline abnormally. Set `ASCEND_AUTO_CONNECT=0` to disable.
 - **ASCEND_ENABLE_USE_FABRIC_MEM**: Requires CANN 9.0+ and HDK 26.0+. Recommended when using Mooncake Store on supported A3 platforms: it can significantly improve transmission performance.
 - **ASCEND_USE_ASYNC_TRANSFER**: Requires CANN 8.5+. Enables HIXL asynchronous transfer mode, defaults to synchronous mode.
+- **ASCEND_STANDALONE_SINGLE_SEGMENT**: Set to `1` for standalone Store (classic or TENT) to share one memory segment across all NPU engines and reduce client-to-server connections. Default: `0`. Requires `ASCEND_BUFFER_POOL=0:0`.
 - **ASCEND_GLOBAL_RESOURCE_CONFIG**: Configures HIXL global resources. Refer to HIXL documentation for `OPTION_GLOBAL_RESOURCE_CONFIG` settings.
 - **MC_CUSTOM_TOPO_JSON**: Path to a NIC topology JSON file; Transfer Engine also uses it to configure HIXL's `comm_resource_config.nic_topo_path` (`npu:<user_device_id>` key) for Host RoCE endpoint generation. Under TENT, this is read from `topology/custom_json_path` (set via `MC_TENT_CONF` or `MC_CUSTOM_TOPO_JSON`); when both are set, `MC_CUSTOM_TOPO_JSON` takes precedence.
 

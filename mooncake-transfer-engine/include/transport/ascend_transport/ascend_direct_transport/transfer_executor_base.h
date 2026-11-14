@@ -102,7 +102,8 @@ class TransferExecutorBase {
     void pollLocalCopies();
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool, bool remote_accessible);
+                    bool use_buffer_pool, bool remote_accessible,
+                    bool all_engines = false);
     int deregisterMem(void* addr);
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
@@ -128,7 +129,7 @@ class TransferExecutorBase {
                    int32_t timeout_in_millis);
     std::string resolveTargetAdxlEngineName(
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-        uint64_t dest_addr) const;
+        uint64_t dest_addr, size_t length, size_t local_engine_idx) const;
     // Fills `dest_addrs` with every slice's destination rebased onto this
     // process's address space, and returns true when all of them resolved.
     // On false the caller must use adxl: a partially translated group cannot
@@ -151,6 +152,11 @@ class TransferExecutorBase {
     bool use_shmem_{false};
     std::vector<std::shared_ptr<adxl::AdxlEngine>> adxl_engines_;
     std::vector<aclrtContext> local_engine_contexts_;
+    // Captured during initialization; dispatch threads need no ACL context.
+    std::vector<int32_t> local_engine_physical_ids_;
+    // Queried only when a peer actually offers multiple registrations.
+    mutable std::once_flag physical_inventory_once_;
+    mutable std::vector<uint32_t> physical_device_ids_;
     std::mutex mem_handle_mutex_;
 
     std::unordered_map<size_t, std::set<std::string>> connected_segments_;

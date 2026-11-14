@@ -731,9 +731,10 @@ if(USE_ASCEND_DIRECT)
   # implementations are included in the test file via anonymous namespace
   add_executable(ascend_direct_transport_test
                  ${WORKSPACE}/ascend_direct_transport_test.cpp)
-  target_link_libraries(ascend_direct_transport_test
-                        PUBLIC transfer_engine gtest gtest_main metadef)
-  # Allow shared library undefined symbols (Ascend libraries have circular deps)
+  target_link_libraries(
+    ascend_direct_transport_test PUBLIC transfer_engine gtest gtest_main
+                                        metadef glog::glog)
+  # Allow shared library undefined symbols (Ascend libraries have circular deps).
   set_target_properties(ascend_direct_transport_test
                         PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
 

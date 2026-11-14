@@ -129,6 +129,287 @@ TEST(SegmentManagerTest, JsonCacheInvalidatedOnPublication) {
     EXPECT_NE(dump3->find("8192"), std::string::npos);  // 0x2000 serialized
 }
 
+TEST(SegmentTrackerTest, SharedRangeRecordsRemoveTogether) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto append = [](std::vector<BufferDesc>& descriptors) -> Status {
+        BufferDesc extra = descriptors.front();
+        extra.transport_attrs[TransportType::AscendDirect] = "1";
+        descriptors.push_back(extra);
+        return Status::OK();
+    };
+    auto first = makeBuffer(0x21000, 0x1000);
+    first.location = "*";
+    first.transport_attrs[TransportType::AscendDirect] = "0";
+    std::vector<BufferDesc> descriptors{first};
+    ASSERT_TRUE(tracker.addInBatch(descriptors, append).ok());
+    ASSERT_EQ(buffersOf(manager->getLocal()).size(), 2u);
+
+    int remove_callbacks = 0;
+    ASSERT_TRUE(tracker
+                    .remove(0x21000, 0x1000,
+                            [&](BufferDesc&) -> Status {
+                                remove_callbacks++;
+                                return Status::OK();
+                            })
+                    .ok());
+    EXPECT_EQ(remove_callbacks, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, SharedRangeRemovalWithoutLengthKeepsOtherLengths) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto append = [](std::vector<BufferDesc>& descriptors) -> Status {
+        auto extra = descriptors.front();
+        extra.transport_attrs[TransportType::AscendDirect] = "1";
+        descriptors.push_back(std::move(extra));
+        return Status::OK();
+    };
+    auto first = makeBuffer(0x21100, 0x1000);
+    first.transport_attrs[TransportType::AscendDirect] = "0";
+    auto second = first;
+    second.length = 0x2000;
+    std::vector<BufferDesc> smaller{first};
+    std::vector<BufferDesc> larger{second};
+    ASSERT_TRUE(tracker.addInBatch(smaller, append).ok());
+    ASSERT_TRUE(tracker.addInBatch(larger, append).ok());
+    ASSERT_EQ(buffersOf(manager->getLocal()).size(), 4u);
+    ASSERT_TRUE(tracker
+                    .remove(first.addr, 0,
+                            [&](BufferDesc& removed) {
+                                EXPECT_EQ(removed.length, second.length);
+                                return Status::OK();
+                            })
+                    .ok());
+    const auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    for (const auto& buffer : buffersOf(snapshot)) {
+        EXPECT_EQ(buffer.length, first.length);
+    }
+}
+
+namespace {
+
+auto AppendRangeAlias() {
+    return [](std::vector<BufferDesc>& descriptors) -> Status {
+        if (descriptors.empty()) {
+            return Status::OK();
+        }
+        BufferDesc extra = descriptors.front();
+        extra.transport_attrs[TransportType::AscendDirect] = "1";
+        descriptors.push_back(std::move(extra));
+        return Status::OK();
+    };
+}
+
+BufferDesc SharedRangeBuffer(uint64_t addr) {
+    auto buffer = makeBuffer(addr, 0x1000);
+    buffer.location = "*";
+    buffer.transport_attrs[TransportType::AscendDirect] = "0";
+    return buffer;
+}
+
+}  // namespace
+
+TEST(SegmentTrackerTest, SharedRangeDuplicateAddKeepsAliasesUntilLastRemove) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    int registrations = 0;
+    auto append = [&](std::vector<BufferDesc>& descriptors) -> Status {
+        if (!descriptors.empty()) {
+            registrations++;
+            EXPECT_EQ(descriptors.size(), 1u);
+        }
+        return AppendRangeAlias()(descriptors);
+    };
+    auto first = SharedRangeBuffer(0x22000);
+    std::vector<BufferDesc> once{first};
+    ASSERT_TRUE(tracker.addInBatch(once, append).ok());
+    std::vector<BufferDesc> again{first};
+    ASSERT_TRUE(tracker.addInBatch(again, append).ok());
+    EXPECT_EQ(registrations, 1);
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 2);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 2);
+
+    int remove_callbacks = 0;
+    auto on_remove = [&](BufferDesc&) -> Status {
+        remove_callbacks++;
+        return Status::OK();
+    };
+    ASSERT_TRUE(tracker.remove(first.addr, first.length, on_remove).ok());
+    EXPECT_EQ(remove_callbacks, 0);
+    snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 1);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 1);
+
+    ASSERT_TRUE(tracker.remove(first.addr, first.length, on_remove).ok());
+    EXPECT_EQ(remove_callbacks, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, SharedRangeAddBumpsEveryAlias) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto first = SharedRangeBuffer(0x22100);
+    std::vector<BufferDesc> once{first};
+    ASSERT_TRUE(tracker.addInBatch(once, AppendRangeAlias()).ok());
+
+    int add_callbacks = 0;
+    ASSERT_TRUE(tracker
+                    .add(first.addr, first.length,
+                         [&](BufferDesc&) -> Status {
+                             add_callbacks++;
+                             return Status::OK();
+                         })
+                    .ok());
+    EXPECT_EQ(add_callbacks, 0);
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 2);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 2);
+
+    int remove_callbacks = 0;
+    ASSERT_TRUE(tracker
+                    .remove(first.addr, first.length,
+                            [&](BufferDesc&) -> Status {
+                                remove_callbacks++;
+                                return Status::OK();
+                            })
+                    .ok());
+    EXPECT_EQ(remove_callbacks, 0);
+    ASSERT_EQ(buffersOf(manager->getLocal()).size(), 2u);
+}
+
+TEST(SegmentTrackerTest, SharedRangeBatchDuplicatesShareRefcount) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = SharedRangeBuffer(0x22200);
+    std::vector<BufferDesc> batch{buffer, buffer};
+    ASSERT_TRUE(
+        tracker
+            .addInBatch(batch,
+                        [&](std::vector<BufferDesc>& descriptors) -> Status {
+                            EXPECT_EQ(descriptors.size(), 1u);
+                            EXPECT_EQ(descriptors.front().ref_count, 2);
+                            return AppendRangeAlias()(descriptors);
+                        })
+            .ok());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 2);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 2);
+
+    int remove_callbacks = 0;
+    auto on_remove = [&](BufferDesc&) -> Status {
+        remove_callbacks++;
+        return Status::OK();
+    };
+    ASSERT_TRUE(tracker.remove(buffer.addr, buffer.length, on_remove).ok());
+    EXPECT_EQ(remove_callbacks, 0);
+    snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 1);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 1);
+    ASSERT_TRUE(tracker.remove(buffer.addr, buffer.length, on_remove).ok());
+    EXPECT_EQ(remove_callbacks, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, SharedRangeDuplicateAddFailureRestoresEveryAlias) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = SharedRangeBuffer(0x22300);
+    std::vector<BufferDesc> once{buffer};
+    ASSERT_TRUE(tracker.addInBatch(once, AppendRangeAlias()).ok());
+
+    std::vector<BufferDesc> again{buffer, buffer};
+    EXPECT_FALSE(tracker
+                     .addInBatch(again,
+                                 [](std::vector<BufferDesc>&) -> Status {
+                                     return Status::InternalError(
+                                         "injected transport failure");
+                                 })
+                     .ok());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 1);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 1);
+
+    int remove_callbacks = 0;
+    ASSERT_TRUE(tracker
+                    .remove(buffer.addr, buffer.length,
+                            [&](BufferDesc&) -> Status {
+                                remove_callbacks++;
+                                return Status::OK();
+                            })
+                    .ok());
+    EXPECT_EQ(remove_callbacks, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, SharedRangeFailedRegistrationCanBeRetried) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = SharedRangeBuffer(0x22400);
+    std::vector<BufferDesc> batch{buffer, buffer};
+    EXPECT_FALSE(
+        tracker
+            .addInBatch(batch,
+                        [](std::vector<BufferDesc>& descriptors) -> Status {
+                            BufferDesc extra = descriptors.front();
+                            descriptors.push_back(extra);
+                            return Status::InternalError(
+                                "injected transport failure");
+                        })
+            .ok());
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+
+    ASSERT_TRUE(tracker.addInBatch(batch, AppendRangeAlias()).ok());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 2);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 2);
+}
+
+TEST(SegmentTrackerTest, SharedRangeFailedRemoveRestoresAliasesForRetry) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = SharedRangeBuffer(0x22500);
+    std::vector<BufferDesc> once{buffer};
+    ASSERT_TRUE(tracker.addInBatch(once, AppendRangeAlias()).ok());
+
+    int remove_callbacks = 0;
+    EXPECT_FALSE(tracker
+                     .remove(buffer.addr, buffer.length,
+                             [&](BufferDesc&) -> Status {
+                                 remove_callbacks++;
+                                 return Status::InternalError(
+                                     "injected drain failure");
+                             })
+                     .ok());
+    EXPECT_EQ(remove_callbacks, 1);
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 1);
+    EXPECT_EQ(buffersOf(snapshot)[1].ref_count, 1);
+    EXPECT_EQ(buffersOf(snapshot)[0].location, "*");
+    EXPECT_EQ(buffersOf(snapshot)[1].location, "*");
+
+    ASSERT_TRUE(tracker
+                    .remove(buffer.addr, buffer.length,
+                            [&](BufferDesc&) -> Status {
+                                remove_callbacks++;
+                                return Status::OK();
+                            })
+                    .ok());
+    EXPECT_EQ(remove_callbacks, 2);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
 TEST(SegmentTrackerTest, RefCountedAddRemove) {
     auto manager = makeManager();
     SegmentTracker tracker(*manager);

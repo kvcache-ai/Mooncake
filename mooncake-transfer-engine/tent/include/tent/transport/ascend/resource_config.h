@@ -107,6 +107,14 @@ class HixlNameResolver {
     // segment publishes no engine name.
     const std::string& Resolve(uint64_t dest_addr) const;
 
+    // Endpoint indices whose buffers cover the whole [dest, dest+length).
+    // Sorted and unique. One published name yields {0}. Empty means the caller
+    // should use Resolve() for the legacy point match.
+    std::vector<size_t> CoveringNameIndices(uint64_t dest_addr,
+                                            size_t length) const;
+
+    const std::string& NameAt(size_t index) const;
+
    private:
     struct BufferRange {
         uint64_t begin;

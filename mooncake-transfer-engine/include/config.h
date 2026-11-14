@@ -223,6 +223,8 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    // Share each standalone Store allocation across all local NPU engines.
+    bool ascend_standalone_single_segment = false;
     bool sunrise_use_device_mem = false;
     // Transient flag scoped to a single TE init: set true by the Store entry
     // (Client::InitTransferEngine) before installing the ascend transport, and

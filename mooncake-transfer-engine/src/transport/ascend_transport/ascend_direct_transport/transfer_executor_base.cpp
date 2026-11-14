@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <unistd.h>
 
 #include "common.h"
@@ -63,37 +64,37 @@ void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     }
 }
 
-std::string EngineNameForDestAddr(
+std::set<size_t> EngineIndicesForDestAddr(
     const std::vector<TransferMetadata::BufferDesc>& buffers,
-    const std::vector<std::string>& endpoints, uint64_t dest_addr) {
-    // A single-engine TE (embedded/standalone) publishes one endpoint at
-    // index 0, while buffer device_id is the logical NPU id and is often
-    // >= 1. That id is not an engine index.
-    if (endpoints.size() == 1) {
-        return endpoints.front();
-    }
+    const std::vector<std::string>& endpoints, uint64_t dest_addr,
+    size_t length) {
+    std::set<size_t> candidates;
     for (const auto& buf : buffers) {
-        if (dest_addr < buf.addr || dest_addr - buf.addr >= buf.length) {
+        if (!bufferCoversRange(buf.addr, buf.length, dest_addr, length)) {
             continue;
         }
         if (buf.device_id < 0) {
             LOG(WARNING) << "Dest buffer at " << dest_addr
                          << " has device_id=" << buf.device_id
                          << ", falling back to " << endpoints.front();
-            return endpoints.front();
+            return {0};
         }
         const auto idx = static_cast<size_t>(buf.device_id);
         if (idx < endpoints.size()) {
-            return endpoints[idx];
+            candidates.insert(idx);
+            continue;
         }
         LOG(WARNING) << "Dest buffer device_id=" << buf.device_id
                      << " >= endpoint count " << endpoints.size()
                      << ", falling back to " << endpoints.front();
-        return endpoints.front();
+        return {0};
+    }
+    if (!candidates.empty()) {
+        return candidates;
     }
     LOG(WARNING) << "Dest addr " << dest_addr
                  << " matches no buffer, falling back to " << endpoints.front();
-    return endpoints.front();
+    return {0};
 }
 
 int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
@@ -357,6 +358,14 @@ int TransferExecutorBase::initEngines() {
             return -1;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[idx]));
+        int32_t physical_id = -1;
+        if (aclrtGetPhyDevIdByLogicDevId(params_.local_engine_device_ids[idx],
+                                         &physical_id) != ACL_ERROR_NONE) {
+            physical_id = -1;
+            LOG(WARNING) << "Cannot resolve physical device id for engine "
+                         << idx;
+        }
+        local_engine_physical_ids_.push_back(physical_id);
         std::vector<uint16_t> excluded_ports;
         for (int attempt = 0; attempt < kMaxAdxlInitAttempts; ++attempt) {
             if (attempt > 0) {
@@ -589,7 +598,8 @@ void TransferExecutorBase::rollbackRegisteredMem(
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
                                       bool use_buffer_pool,
-                                      bool remote_accessible) {
+                                      bool remote_accessible,
+                                      bool all_engines) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -615,6 +625,10 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         return -1;
     }
     engine_indices = {engine_idx};
+    if (all_engines) {
+        engine_indices.resize(adxl_engines_.size());
+        std::iota(engine_indices.begin(), engine_indices.end(), 0);
+    }
 
     adxl::MemDesc mem_desc{};
     mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
@@ -697,8 +711,11 @@ int TransferExecutorBase::deregisterMem(void* addr) {
     }
 
     bool deregister_failed = false;
-    for (const auto& [engine_idx, mem_handle] : it->second) {
+    for (auto handle = it->second.begin(); handle != it->second.end();) {
+        const auto [engine_idx, mem_handle] = *handle;
         if (engine_idx >= local_engine_contexts_.size()) {
+            deregister_failed = true;
+            ++handle;
             continue;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[engine_idx]));
@@ -708,6 +725,10 @@ int TransferExecutorBase::deregisterMem(void* addr) {
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
             deregister_failed = true;
+            ++handle;
+        } else {
+            // A later retry must not deregister a successful handle twice.
+            handle = it->second.erase(handle);
         }
     }
     if (deregister_failed) {
@@ -719,10 +740,44 @@ int TransferExecutorBase::deregisterMem(void* addr) {
 
 std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-    uint64_t dest_addr) const {
+    uint64_t dest_addr, size_t length, size_t local_engine_idx) const {
     const auto& endpoints = segment_desc->rank_info.endpoints;
     if (endpoints.empty()) return {};
-    return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
+    // A single-engine peer's logical device id need not be endpoint index 0.
+    if (endpoints.size() == 1) return endpoints.front();
+    const auto candidates = EngineIndicesForDestAddr(
+        segment_desc->buffers, endpoints, dest_addr, length);
+    if (candidates.size() == 1) return endpoints[*candidates.begin()];
+    if (local_engine_idx >= local_engine_physical_ids_.size()) return {};
+    std::call_once(physical_inventory_once_, [this] {
+        physical_device_ids_ = GetAscendPhysicalDeviceIds();
+    });
+    const int32_t physical_id = local_engine_physical_ids_[local_engine_idx];
+    if (physical_id < 0) {
+        LOG(ERROR) << "Physical device id unavailable for multi-engine route";
+        return {};
+    }
+    const auto it = std::lower_bound(physical_device_ids_.begin(),
+                                     physical_device_ids_.end(),
+                                     static_cast<uint32_t>(physical_id));
+    if (it == physical_device_ids_.end() ||
+        *it != static_cast<uint32_t>(physical_id)) {
+        LOG(ERROR) << "Cannot find client physical device " << physical_id
+                   << " in the ACL device set for multi-engine route";
+        return {};
+    }
+    const auto index = ReverseDeviceIndex(
+        static_cast<uint32_t>(it - physical_device_ids_.begin()),
+        static_cast<uint32_t>(physical_device_ids_.size()),
+        static_cast<uint32_t>(candidates.size()));
+    if (!index) return {};
+    const auto selected = *std::next(candidates.begin(), *index);
+    VLOG(1) << "ACL single-segment route physical=" << physical_id
+            << " rank=" << (it - physical_device_ids_.begin())
+            << " C=" << physical_device_ids_.size()
+            << " S=" << candidates.size() << " index=" << *index
+            << " endpoint=" << endpoints[selected];
+    return endpoints[selected];
 }
 
 bool TransferExecutorBase::resolveLocalCopyDestinations(
@@ -794,8 +849,10 @@ TransferExecutorBase::splitByTargetEngine(
 
     std::map<std::string, std::vector<Transport::Slice*>> groups;
     for (auto* slice : slice_list) {
-        groups[resolveTargetAdxlEngineName(target_segment_desc,
-                                           slice->ascend_direct.dest_addr)]
+        groups[resolveTargetAdxlEngineName(
+                   target_segment_desc, slice->ascend_direct.dest_addr,
+                   slice->length,
+                   params_.agent_mode ? slice->ascend_direct.engine_id : 0)]
             .push_back(slice);
     }
     std::vector<std::vector<Transport::Slice*>> result;
@@ -848,7 +905,8 @@ void TransferExecutorBase::processGroupedSliceList(
             return;
         }
         target_adxl_engine_name = resolveTargetAdxlEngineName(
-            target_segment_desc, slice_list[0]->ascend_direct.dest_addr);
+            target_segment_desc, slice_list[0]->ascend_direct.dest_addr,
+            slice_list[0]->length, local_engine_idx);
         if (target_adxl_engine_name.empty()) {
             LOG(ERROR) << "Invalid local_engine_idx: " << local_engine_idx
                        << " target endpoint size:"
