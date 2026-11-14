@@ -17,6 +17,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <unistd.h>
 
@@ -29,6 +30,7 @@
 #endif
 
 #include "config.h"
+#include "../src/config/client_config.h"
 #include "real_client.h"
 #include "nof/dma_buffer_allocator.h"
 #include "nof/nvmeof_initiator.h"
@@ -100,6 +102,135 @@ TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
     EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
     EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
     EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
+
+TEST(ClientConfigTest, SegmentLimitsPreserveZeroAndTotalCapacitySemantics) {
+    ClientConfig config;
+    config.local_hostname = "localhost";
+    config.metadata_server = "P2PHANDSHAKE";
+    for (const size_t size : {size_t{0}, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE}) {
+        config.global_segment_size = size;
+        config.local_buffer_size = size;
+        EXPECT_TRUE(config.Validate().has_value()) << size;
+    }
+    config.global_segment_size = MAX_SEGMENT_SIZE + 1;
+    EXPECT_TRUE(config.Validate().has_value());
+    config.local_buffer_size = MAX_SEGMENT_SIZE + 1;
+    EXPECT_FALSE(config.Validate().has_value());
+    config.local_buffer_size = MIN_SEGMENT_SIZE - 1;
+    EXPECT_FALSE(config.Validate().has_value());
+    config.local_buffer_size = 0;
+    config.global_segment_size = MIN_SEGMENT_SIZE - 1;
+    EXPECT_FALSE(config.Validate().has_value());
+}
+
+TEST(ClientConfigTest, EmbeddedMasterDefaultsPreserveExplicitValues) {
+    auto parsed = ParseClientConfig({{CONFIG_KEY_LOCAL_HOSTNAME, "localhost"}});
+    ASSERT_TRUE(parsed.has_value());
+    auto regular = *parsed;
+    regular.ResolveOverrides(false, false, 9300);
+    EXPECT_EQ(regular.master_server_addr, DEFAULT_MASTER_SERVER_ADDR);
+    EXPECT_FALSE(regular.Validate().has_value());
+
+    parsed->ResolveOverrides(true, false, 9300);
+    EXPECT_TRUE(parsed->enable_embedded_master);
+    EXPECT_EQ(parsed->metadata_server, "P2PHANDSHAKE");
+    EXPECT_EQ(parsed->master_server_addr, DEFAULT_MASTER_SERVER_ADDR);
+    EXPECT_TRUE(parsed->Validate().has_value());
+
+    auto explicit_values = ParseClientConfig(
+        {{CONFIG_KEY_LOCAL_HOSTNAME, "localhost"},
+         {CONFIG_KEY_METADATA_SERVER, "http://metadata/metadata"},
+         {CONFIG_KEY_MASTER_SERVER_ADDR, "master:50051"},
+         {CONFIG_KEY_ENABLE_EMBEDDED_MASTER, "true"}});
+    ASSERT_TRUE(explicit_values.has_value());
+    explicit_values->ResolveOverrides(false, false, 9300);
+    EXPECT_TRUE(explicit_values->enable_embedded_master);
+    EXPECT_EQ(explicit_values->metadata_server, "http://metadata/metadata");
+    EXPECT_EQ(explicit_values->master_server_addr, "master:50051");
+
+    auto empty_master =
+        ParseClientConfig({{CONFIG_KEY_LOCAL_HOSTNAME, "localhost"},
+                           {CONFIG_KEY_MASTER_SERVER_ADDR, ""}});
+    ASSERT_TRUE(empty_master.has_value());
+    empty_master->ResolveOverrides(false, false, 9300);
+    EXPECT_EQ(empty_master->master_server_addr, "");
+    empty_master->ResolveOverrides(true, false, 9300);
+    EXPECT_EQ(empty_master->master_server_addr, "");
+}
+
+TEST(ClientConfigTest, HttpFlagsPreserveEnableAndPortPrecedence) {
+    ClientConfig config;
+    config.local_hostname = "localhost";
+    config.metadata_server = "P2PHANDSHAKE";
+    config.client_http_port = -1;
+    config.ResolveOverrides(false, false, -2);
+    EXPECT_FALSE(config.enable_client_http_server);
+    EXPECT_TRUE(config.Validate().has_value());
+
+    config.ResolveOverrides(false, true, 9301);
+    EXPECT_TRUE(config.enable_client_http_server);
+    EXPECT_EQ(config.client_http_port, 9301);
+    config.client_http_port = 9302;
+    config.ResolveOverrides(false, true, 9303);
+    EXPECT_EQ(config.client_http_port, 9302);
+    EXPECT_TRUE(config.Validate().has_value());
+    for (const int port : {-1, 0, 65536}) {
+        config.client_http_port = port;
+        EXPECT_FALSE(config.Validate().has_value()) << port;
+    }
+}
+
+TEST(ClientConfigTest,
+     OffloadExplicitPathOverridesEnvironmentAndRefreshesRoots) {
+    FileStorageConfig environment;
+    environment.storage_filepath = "/environment";
+    environment.storage_paths = {"/environment"};
+    ClientConfig config;
+    config.ResolveFileStorage(environment, false);
+    ASSERT_TRUE(config.file_storage.has_value());
+    EXPECT_EQ(config.file_storage->storage_filepath, "/environment");
+
+    config.ssd_offload_path = "/explicit0,/explicit1";
+    config.ResolveFileStorage(environment, true);
+    EXPECT_EQ(config.file_storage->storage_filepath, "/explicit0,/explicit1");
+    EXPECT_EQ(config.file_storage->storage_paths,
+              (std::vector<std::string>{"/explicit0", "/explicit1"}));
+    EXPECT_EQ(config.file_storage->storage_backend_type,
+              StorageBackendType::kDistributed);
+}
+
+TEST(ClientConfigTest,
+     DictionaryParsingKeepsDefaultsAndRejectsMalformedValues) {
+    auto defaults = ParseClientConfig({});
+    ASSERT_TRUE(defaults.has_value());
+    EXPECT_EQ(defaults->global_segment_size, DEFAULT_GLOBAL_SEGMENT_SIZE);
+    EXPECT_EQ(defaults->local_buffer_size, DEFAULT_LOCAL_BUFFER_SIZE);
+    EXPECT_EQ(defaults->protocol, DEFAULT_PROTOCOL);
+    EXPECT_TRUE(defaults->start_offload_rpc_server);
+    EXPECT_FALSE(defaults->enable_ssd_prefetch);
+    EXPECT_EQ(defaults->tenant_id, "default");
+
+    auto parsed =
+        ParseClientConfig({{CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "16 MB"},
+                           {CONFIG_KEY_LOCAL_BUFFER_SIZE, "0"},
+                           {CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, "yes"},
+                           {CONFIG_KEY_CLIENT_HTTP_PORT, " 9301 "},
+                           {CONFIG_KEY_ENABLE_EGM_STORE_POOL, "false"},
+                           {CONFIG_KEY_EGM_NUMA_NODES, "invalid"}});
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->global_segment_size, 16 * 1024 * 1024);
+    EXPECT_EQ(parsed->local_buffer_size, 0);
+    EXPECT_TRUE(parsed->enable_client_http_server);
+    EXPECT_EQ(parsed->client_http_port, 9301);
+    EXPECT_FALSE(parsed->egm.enabled);
+
+    for (const ConfigDict& invalid :
+         {ConfigDict{{CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "256MiB"}},
+          ConfigDict{{CONFIG_KEY_LOCAL_BUFFER_SIZE, "-1"}},
+          ConfigDict{{CONFIG_KEY_CLIENT_HTTP_PORT, "9300oops"}}}) {
+        EXPECT_FALSE(ParseClientConfig(invalid).has_value());
+    }
 }
 
 class RealClientTest : public ::testing::Test {
@@ -3812,6 +3943,85 @@ struct TeUnregisterHookGuard {
 };
 
 }  // namespace
+
+TEST_F(RealClientTest, InvalidSetupInputsRejectBeforeRuntimeCreation) {
+    ScopedEnvVar embedded_master("MOONCAKE_ENABLE_EMBEDDED_MASTER");
+    ScopedEnvVar cxl_size("MC_CXL_DEV_SIZE");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "hf3fs");
+    ScopedEnvVar offload_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    NofFactoryGuard guard;
+    int runtime_creations = 0;
+    RealClient::SetNofRuntimeFactoryForTesting([&]() -> NofRuntime {
+        ++runtime_creations;
+        throw std::runtime_error(
+            "runtime must not be created for invalid inputs");
+    });
+    struct InvalidInput {
+        size_t global_size = 0;
+        size_t local_size = 0;
+        std::string protocol = "tcp";
+        bool enable_http = false;
+        int http_port = DEFAULT_CLIENT_HTTP_PORT;
+        bool enable_offload = false;
+        std::string offload_path = "";
+    };
+    const InvalidInput cases[] = {
+        {.global_size = MIN_SEGMENT_SIZE - 1},
+        {.local_size = MIN_SEGMENT_SIZE - 1},
+        {.local_size = MAX_SEGMENT_SIZE + 1},
+        {.protocol = "cxl"},
+        {.enable_http = true, .http_port = 0},
+        {.enable_http = true, .http_port = 65536},
+        {.enable_offload = true, .offload_path = "relative/path"},
+    };
+    for (const auto& input : cases) {
+        ConfigDict dict =
+            MakeConfigDict("localhost:17816", std::to_string(input.global_size),
+                           std::to_string(input.local_size));
+        dict[CONFIG_KEY_PROTOCOL] = input.protocol;
+        dict[CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER] =
+            input.enable_http ? "true" : "false";
+        dict[CONFIG_KEY_CLIENT_HTTP_PORT] = std::to_string(input.http_port);
+        dict["enable_ssd_offload"] = input.enable_offload ? "true" : "false";
+        dict["ssd_offload_path"] = input.offload_path;
+
+        for (const bool use_dict : {false, true}) {
+            SCOPED_TRACE(use_dict ? "dictionary" : "arguments");
+            EXPECT_NO_THROW({
+                auto result =
+                    use_dict ? py_client_->setup_internal(dict)
+                             : py_client_->setup_internal(
+                                   "localhost:17816", "P2PHANDSHAKE",
+                                   input.global_size, input.local_size,
+                                   input.protocol, "", "127.0.0.1:1", nullptr,
+                                   "", 50052, input.enable_offload, false,
+                                   input.offload_path, "default",
+                                   input.enable_http, input.http_port);
+                ASSERT_FALSE(result.has_value());
+                EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+            });
+            EXPECT_EQ(runtime_creations, 0);
+            EXPECT_EQ(py_client_->client_, nullptr);
+            EXPECT_EQ(py_client_->client_buffer_allocator_, nullptr);
+            EXPECT_TRUE(py_client_->segment_ptrs_.empty());
+        }
+    }
+    EXPECT_NO_THROW(
+        EXPECT_NE(py_client_->initAll("tcp", "", MIN_SEGMENT_SIZE - 1), 0));
+    EXPECT_EQ(runtime_creations, 0);
+
+    gflags::FlagSaver flags;
+    gflags::SetCommandLineOption("enable_http_server", "true");
+    gflags::SetCommandLineOption("http_port", "65536");
+    EXPECT_NO_THROW({
+        auto result = py_client_->setup_internal(
+            "localhost:17816", "P2PHANDSHAKE", 0, 0, "tcp", "", "127.0.0.1:1");
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    });
+    EXPECT_EQ(runtime_creations, 0);
+}
 
 // Regression test: closing a client without manually unregistering every
 // buffer must still release its SPDK registrations (they live in the

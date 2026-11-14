@@ -43,7 +43,7 @@ namespace test {
 class PrefetchTeardownTest;
 }  // namespace test
 class NvlinkHostNumaAllocation;
-struct EgmStorePoolConfig;
+struct ClientConfig;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
@@ -1441,17 +1441,7 @@ class RealClient : public PyClient {
         const std::string &object_key, ErrorCode error,
         std::vector<int> &results);
 
-    tl::expected<void, ErrorCode> setup_internal(
-        const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
-        const std::string &metadata_server, size_t global_segment_size,
-        size_t local_buffer_size, const std::string &protocol,
-        const std::string &rdma_devices, const std::string &master_server_addr,
-        const std::shared_ptr<TransferEngine> &transfer_engine,
-        const std::string &ipc_socket_path, int local_rpc_port,
-        bool enable_ssd_offload, bool start_offload_rpc_server,
-        const std::string &ssd_offload_path, const std::string &tenant_id,
-        bool enable_client_http_server, int client_http_port,
-        bool enable_embedded_master);
+    tl::expected<void, ErrorCode> Setup(ClientConfig config);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
