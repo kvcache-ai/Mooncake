@@ -159,6 +159,12 @@ DEFINE_string(max_kv_soft_pin_ttl, kDefaultMaxKvSoftPinTtlFlagValue,
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
+DEFINE_string(kv_cache_kind_evict, "",
+              "Per-kind KV cache eviction control, for example "
+              "\"MAMBA=PROTECT,INDEXER=DEFER,SWA=DEFER\". "
+              "Kinds: UNSPECIFIED, FULL, SWA, DSA, INDEXER, MLA, MAMBA, "
+              "LINEAR. Controls: NORMAL, DEFER, PROTECT. Empty keeps every "
+              "kind on NORMAL.");
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_validator(max_kv_soft_pin_ttl, ValidateDurationFlag);
@@ -568,6 +574,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
+    default_config.GetString("kv_cache_kind_evict",
+                             &master_config.kv_cache_kind_evict,
+                             FLAGS_kv_cache_kind_evict);
     default_config.GetDouble("eviction_ratio", &master_config.eviction_ratio,
                              FLAGS_eviction_ratio);
     default_config.GetDouble("eviction_high_watermark_ratio",

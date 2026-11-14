@@ -79,10 +79,12 @@ struct ObjectMetadata {
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
                    std::string user_key_ = {},
-                   std::string residency_affinity_id_ = "")
+                   std::string residency_affinity_id_ = "",
+                   KVCacheKind kv_cache_kind_ = KVCacheKind::UNSPECIFIED)
         : client_id(client_id_),
           put_start_time(put_start_time_),
           data_type(data_type_),
+          kv_cache_kind(kv_cache_kind_),
           group_id(std::move(group_id_)),
           residency_affinity_id(std::move(residency_affinity_id_)),
           tenant_id(std::move(tenant_id_)),
@@ -110,6 +112,8 @@ struct ObjectMetadata {
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    // Meaningful for KVCACHE objects. UNSPECIFIED keeps legacy eviction.
+    const KVCacheKind kv_cache_kind{KVCacheKind::UNSPECIFIED};
     const std::string group_id;
     const std::string residency_affinity_id;
     const TenantId tenant_id;

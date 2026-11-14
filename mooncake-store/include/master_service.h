@@ -119,6 +119,11 @@ class MasterService {
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
+    [[nodiscard]] KVCacheEvictControl EvictControlForKind(
+        KVCacheKind kind) const {
+        return kv_cache_kind_policy_.ControlFor(kind);
+    }
+
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     // Whether requests name their tenant, which multi-tenancy turns on.
     bool IsTenantQuotaEnabled() const {
@@ -1616,15 +1621,16 @@ class MasterService {
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const uint64_t max_kv_soft_pin_ttl_;      // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+    const KVCacheKindPolicy kv_cache_kind_policy_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the

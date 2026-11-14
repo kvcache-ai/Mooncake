@@ -179,6 +179,16 @@ struct MasterService::MemoryEviction {
                 return tl::make_unexpected(
                     eviction::SkipReason::kExternalEvict);
             }
+            const auto kind_control =
+                service_.EvictControlForKind(candidate.metadata.kv_cache_kind);
+            if (kind_control == KVCacheEvictControl::PROTECT) {
+                return tl::make_unexpected(
+                    eviction::SkipReason::kKindProtected);
+            }
+            if (kind_control == KVCacheEvictControl::DEFER &&
+                !candidate.fallback) {
+                return tl::make_unexpected(eviction::SkipReason::kDeferred);
+            }
             if (service_.IsSoftPinActive(candidate.metadata, candidate.now)) {
                 if (!allow_soft_pinned_) {
                     return tl::make_unexpected(
@@ -494,6 +504,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      kv_cache_kind_policy_(
+          ParseKVCacheKindPolicyOrDie(config.kv_cache_kind_evict)),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
@@ -3603,7 +3615,8 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             std::move(object.replicas), std::nullopt,
             standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
             standby_meta.group_id, object.tenant_id, object.user_key,
-            standby_meta.residency_affinity_id.value_or(""));
+            standby_meta.residency_affinity_id.value_or(""),
+            standby_meta.kv_cache_kind.value_or(KVCacheKind::UNSPECIFIED));
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
@@ -5179,7 +5192,8 @@ auto MasterService::InsertMetadata(
     accessor.Publish(client_id, now, value_length, std::move(replicas),
                      std::move(committed_soft_pin_timeout),
                      config.with_hard_pin, config.data_type, group_id,
-                     tenant_id, key, residency_affinity_id);
+                     tenant_id, key, residency_affinity_id,
+                     config.KVCacheKindForKey(0));
     auto& metadata = accessor.Get();
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
@@ -5299,7 +5313,7 @@ auto MasterService::PrepareWriteStart(
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=" << action << "_begin";
 
-    if (!config.ValidSessionIds(1)) {
+    if (!config.ValidSessionIds(1) || !config.ValidKVCacheKinds(1)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto group_id = GetGroupIdForKey(config, 1, 0);
@@ -11756,6 +11770,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
     payload.residency_affinity_id = metadata.residency_affinity_id;
+    payload.kv_cache_kind = metadata.kv_cache_kind;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
