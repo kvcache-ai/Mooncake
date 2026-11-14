@@ -128,6 +128,21 @@ Likewise, admission-release underflow is fail-closed: counters are preserved,
 new work is rejected, and drain returns an error instead of treating live work
 as complete.
 
+## Failure diagnostics
+
+Client I/O errors, malformed responses, and timeouts emit one warning for
+the failed operation. `peer_id`, `lane`, and `request_id` identify the local
+request; `opcode`, `length`, and `stage` locate the failure. I/O reasons
+include the error category, numeric code, and message. Protocol reasons retain
+the decoder error or the mismatched response ID/committed byte count.
+`write_outcome_unknown=1` means a WRITE header may have reached the peer before
+a valid completion ACK; existing replay restrictions still apply.
+
+Successful operations and explicit cancellations do not emit these warnings.
+These messages omit endpoint addresses, incarnation tokens, buffer addresses,
+and payload data. Other logs and diagnostic bundles still need review before
+sharing.
+
 ## Configuration
 
 The transport is configured under `transports.hp_tcp`:

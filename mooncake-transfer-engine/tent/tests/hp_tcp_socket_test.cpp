@@ -2,13 +2,17 @@
 #include <gtest/gtest.h>
 
 #include <asio.hpp>
+#include <glog/logging.h>
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "tent/transport/hp_tcp/hp_tcp_client.h"
 #include "tent/transport/hp_tcp/hp_tcp_server.h"
@@ -17,6 +21,29 @@ namespace mooncake::tent {
 namespace {
 using namespace std::chrono_literals;
 constexpr char kIncarnation[] = "00112233445566778899aabbccddeeff";
+
+class FailureLogSink : public google::LogSink {
+   public:
+    FailureLogSink() { google::AddLogSink(this); }
+    ~FailureLogSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        std::string text(message, length);
+        if (text.find("HP TCP transfer failed:") == std::string::npos) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.push_back(std::move(text));
+    }
+
+    std::vector<std::string> messages() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::vector<std::string> messages_;
+};
 
 struct Completion {
     std::atomic<bool> done{false};
@@ -132,6 +159,7 @@ HighPerformanceTcpClient::Operation Operation(
 }
 
 TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
+    FailureLogSink logs;
     Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/100);
     runtime.start();
     std::array<uint8_t, 1024> remote{};
@@ -171,6 +199,7 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
     EXPECT_EQ(read.status, COMPLETED);
     EXPECT_TRUE(SocketOrderedEqual(destination, source));
     EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
+    EXPECT_TRUE(logs.messages().empty());
 }
 
 TEST(HighPerformanceTcpSocketTest, IdleClientsReleaseCapacityAndReconnect) {
@@ -351,6 +380,7 @@ TEST(HighPerformanceTcpSocketTest,
 }
 
 TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
+    FailureLogSink logs;
     asio::io_context peer_io;
     asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
     std::thread peer([&] {
@@ -383,6 +413,11 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     EXPECT_TRUE(client.cancelAll().ok());
     EXPECT_TRUE(workers.stop().ok());
     peer.join();
+    const auto messages = logs.messages();
+    ASSERT_EQ(messages.size(), 1u);
+    EXPECT_NE(messages[0].find("request_id=3"), std::string::npos);
+    EXPECT_NE(messages[0].find("stage=timeout"), std::string::npos);
+    EXPECT_NE(messages[0].find("30 ms"), std::string::npos);
 }
 
 TEST(HighPerformanceTcpSocketTest, FragmentedReadBodyCompletesAcrossChunkTail) {
@@ -556,6 +591,7 @@ TEST(HighPerformanceTcpSocketTest, ClientBindsConfiguredSourceAddress) {
 
 TEST(HighPerformanceTcpSocketTest,
      WriteWithoutCompletionAckMarksRemoteOutcomeUnknown) {
+    FailureLogSink logs;
     asio::io_context peer_io;
     asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
     std::thread peer([&] {
@@ -591,6 +627,98 @@ TEST(HighPerformanceTcpSocketTest,
     EXPECT_TRUE(client.cancelAll().ok());
     EXPECT_TRUE(workers.stop().ok());
     peer.join();
+    const auto messages = logs.messages();
+    ASSERT_EQ(messages.size(), 1u);
+    EXPECT_NE(messages[0].find("request_id=31 opcode=WRITE length=64"),
+              std::string::npos);
+    EXPECT_NE(messages[0].find("stage=read_response"), std::string::npos);
+    EXPECT_NE(messages[0].find("write_outcome_unknown=1"), std::string::npos);
+    EXPECT_NE(messages[0].find("asio.misc:2"), std::string::npos);
+    EXPECT_EQ(messages[0].find("127.0.0.1"), std::string::npos);
+    EXPECT_EQ(messages[0].find(kIncarnation), std::string::npos);
+}
+
+TEST(HighPerformanceTcpSocketTest, ProtocolFailuresKeepTheirReasons) {
+    const std::array<std::string, 3> reasons{
+        "Invalid high-performance TCP response header",
+        "response request_id=38 does not match request",
+        "committed_bytes=65 does not match requested length"};
+    for (size_t fault = 0; fault < reasons.size(); ++fault) {
+        SCOPED_TRACE(reasons[fault]);
+        FailureLogSink logs;
+        asio::io_context peer_io;
+        asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
+        std::thread peer([&] {
+            asio::ip::tcp::socket socket(peer_io);
+            acceptor.accept(socket);
+            std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+            asio::read(socket, asio::buffer(request));
+            auto response = EncodeHighPerformanceTcpResponse(
+                {HighPerformanceTcpStatus::kOk, fault == 1 ? 38u : 37u,
+                 fault == 2 ? 65u : 64u});
+            if (fault == 0) response[0] ^= 1;
+            asio::write(socket, asio::buffer(response));
+        });
+        Runtime runtime;
+        runtime.start();
+        std::array<uint8_t, 64> local{};
+        Completion completion;
+        ASSERT_TRUE(
+            runtime
+                .submit(Operation(local.data(), local.size(), 0x1000, 1, 37,
+                                  HighPerformanceTcpOpcode::kRead, &completion,
+                                  acceptor.local_endpoint().port()))
+                .ok());
+        const bool completed = completion.wait();
+        EXPECT_TRUE(runtime.client.cancelAll().ok());
+        peer.join();
+        ASSERT_TRUE(completed);
+        EXPECT_EQ(completion.status, FAILED);
+        EXPECT_FALSE(completion.protocol_status.has_value());
+        const auto messages = logs.messages();
+        ASSERT_EQ(messages.size(), 1u);
+        EXPECT_NE(messages[0].find("peer_id=7 lane=0 request_id=37"),
+                  std::string::npos);
+        EXPECT_NE(messages[0].find("stage=response"), std::string::npos);
+        EXPECT_NE(messages[0].find(reasons[fault]), std::string::npos);
+    }
+}
+
+TEST(HighPerformanceTcpSocketTest, CancellationDoesNotLogTransferFailure) {
+    FailureLogSink logs;
+    Runtime runtime;
+    runtime.start();
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
+    std::promise<void> received;
+    auto ready = received.get_future();
+    std::thread peer([&] {
+        asio::ip::tcp::socket socket(peer_io);
+        acceptor.accept(socket);
+        std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+        asio::read(socket, asio::buffer(request));
+        received.set_value();
+        std::error_code ignored;
+        uint8_t byte;
+        socket.read_some(asio::buffer(&byte, 1), ignored);
+    });
+    std::array<uint8_t, 64> local{};
+    Completion completion;
+    ASSERT_TRUE(
+        runtime
+            .submit(Operation(local.data(), local.size(), 0x1000, 1, 41,
+                              HighPerformanceTcpOpcode::kRead, &completion,
+                              acceptor.local_endpoint().port()))
+            .ok());
+    const auto received_status = ready.wait_for(2s);
+    EXPECT_TRUE(runtime.client.cancelRequest(41).ok());
+    const bool completed = completion.wait();
+    EXPECT_TRUE(runtime.client.cancelAll().ok());
+    peer.join();
+    ASSERT_EQ(received_status, std::future_status::ready);
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(completion.status, CANCELED);
+    EXPECT_TRUE(logs.messages().empty());
 }
 
 TEST(HighPerformanceTcpSocketTest, EmptyAndPartialHeadersReleaseSlot) {
