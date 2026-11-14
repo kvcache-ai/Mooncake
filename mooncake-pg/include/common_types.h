@@ -22,6 +22,11 @@ inline constexpr GlobalRank kInvalidGlobalRank = -1;
 inline constexpr InGroupRank kInvalidInGroupRank = -1;
 inline constexpr uint64_t kInvalidViewEpoch = UINT64_MAX;
 inline constexpr uint32_t kMaxNumRanks = 64;
+// Fixed collective launch and Simple wire layout, shared by admission and
+// kernels.
+inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
+inline constexpr uint32_t kSimplePipelineDepth = 2;
+inline constexpr uint64_t kSimplePayloadAlignment = 16;
 
 enum class OpType : uint8_t {
     Unknown = 0,

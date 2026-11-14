@@ -313,10 +313,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deactivate_ranks", &deactivateRanks, py::arg("backend"),
           py::arg("ranks"));
     m.def("join_group", &joinGroup);
-    m.def("get_failed_ranks_hint", &getFailedRanksHint, py::arg("work"));
+    m.def("get_failed_ranks_hint", &getFailedRanksHint, py::arg("work"),
+          "Return failed-peer hints. Synchronize Graph replay before querying "
+          "captured CUDA Work.");
     m.def("get_local_success", &getLocalSuccess, py::arg("work"),
           "Return True iff all locally-attempted peers succeeded in this "
-          "operation.");
+          "operation. Synchronize Graph replay before querying captured CUDA "
+          "Work.");
     m.def("get_current_epoch", &getCurrentEpoch, py::arg("backend"),
           "Get the current GroupView epoch (monotonically increasing on "
           "membership changes).");

@@ -308,7 +308,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // Resolve actives members' preferences into the backend published in the
     // next GroupView. Called before bootstrap and membership ViewUpdates.
-    void resolveGpuCollectiveBackend(GroupView& view);
+    bool resolveGpuCollectiveBackend(GroupView& view);
 
     void processGroupRegistration(const RegisterGroupRequest& request,
                                   const GroupId& group_id,
