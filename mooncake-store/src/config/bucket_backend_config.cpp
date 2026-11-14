@@ -106,11 +106,18 @@ BucketBackendConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY,
         Environ::ReadOr(Variables::MOONCAKE_BUCKET_EVICTION_POLICY,
                         std::string{"fifo"}));
-    if (policy == "fifo") {
+    if (AsciiCaseInsensitiveEquals(policy, "fifo")) {
         config.eviction_policy = BucketEvictionPolicy::FIFO;
-    } else if (policy == "lru") {
+    } else if (AsciiCaseInsensitiveEquals(policy, "lru")) {
         config.eviction_policy = BucketEvictionPolicy::LRU;
     } else {
+        // Without eviction, offloading stops once total_size_limit is hit,
+        // so a typo here should not go unnoticed.
+        if (!AsciiCaseInsensitiveEquals(policy, "none")) {
+            LOG(WARNING) << "Unknown bucket eviction policy '" << policy
+                         << "' (expected none, fifo or lru); eviction is "
+                            "disabled";
+        }
         config.eviction_policy = BucketEvictionPolicy::NONE;
     }
 
