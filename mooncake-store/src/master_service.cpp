@@ -6279,9 +6279,7 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                     return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
                 }
 
-                const bool requires_fresh_replicas =
-                    (bucket_allocator_ != nullptr &&
-                     metadata.HasReplica(&Replica::fn_is_dfs_replica)) ||
+                const bool requires_fresh_object_replicas =
                     config.os_replica_num ||
                     metadata.HasReplica(
                         &Replica::fn_is_object_storage_replica) ||
@@ -6289,7 +6287,10 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                      object_uploads_->FirstObjectUploadForKey(
                          object_id.tenant_id.value(), key));
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
-                    !requires_fresh_replicas && !restore_missing_bucket_dfs) {
+                    !requires_fresh_object_replicas &&
+                    !(bucket_allocator_ != nullptr &&
+                      metadata.HasReplica(&Replica::fn_is_dfs_replica)) &&
+                    !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
                     metadata.object_storage_write_attempt.reset();
@@ -6360,7 +6361,9 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                 // old metadata so an allocation failure leaves the old object
                 // readable instead of turning it into OBJECT_NOT_FOUND.
                 std::optional<std::vector<Replica>> replacement_replicas;
-                if (has_read_lease || requires_fresh_replicas) {
+                // Bucket DFS indexes reservations by key and must release the
+                // old reservation before allocating its replacement below.
+                if (has_read_lease || requires_fresh_object_replicas) {
                     auto grown = accessor.Grow(SaturatingMultiply(
                         slice_length, allocation_config.replica_num));
                     if (!grown) {

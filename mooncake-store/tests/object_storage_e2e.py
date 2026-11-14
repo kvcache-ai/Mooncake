@@ -631,7 +631,7 @@ def run_cleanup(args):
             "continuous batches, failed DELETE backoff and duplicate notification isolation"
         )
         # Restoring the retired records must rebuild scheduling and admission.
-        # Failed DELETEs may be retried after failover; their in-memory retry
+        # Failed DELETE requests may be retried after failover; their in-memory retry
         # deadlines are not a durability contract.
         primary.kill()
         primary.wait(timeout=15)

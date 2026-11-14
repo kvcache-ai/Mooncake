@@ -406,9 +406,10 @@ DEFINE_uint64(object_storage_max_staging_bytes, 1073741824,
 DEFINE_uint64(object_storage_maintenance_batch_size, 32,
               "Maximum pending records per worker callback; due backlog "
               "continues in the next callback without an interval wait");
-DEFINE_uint64(object_storage_cleanup_interval_ms, 10000,
-              "Retry/recheck interval for failed DELETEs, unknown uploads and "
-              "unfinished writes; not a delay between healthy cleanup batches");
+DEFINE_uint64(
+    object_storage_cleanup_interval_ms, 10000,
+    "Retry/recheck interval for failed deletions, unknown uploads and "
+    "unfinished writes; not a delay between healthy cleanup batches");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
