@@ -1080,6 +1080,7 @@ is required.
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
 | `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+| `MOONCAKE_DFS_READ_THREADS` | Clients | `16` for `posix`, `1` otherwise | Extra worker threads that run DFS batch reads in parallel with the calling thread. `1` or less keeps reads serial; values above `128` are clamped. Ignored by adapters with batched I/O such as `hf3fs`. |
 
 #### Growing DFS capacity online
 

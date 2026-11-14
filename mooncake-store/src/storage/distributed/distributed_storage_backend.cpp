@@ -1,13 +1,18 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string_view>
 
+#include "environ.h"
+#include "environment_variables.h"
 #include "types.h"
 
 namespace mooncake {
@@ -228,6 +233,30 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     // Only descriptors returned by the master identify published shards.
     // Opening files from the configured count or a directory scan can retain
     // handles to staged shards that a failed expansion subsequently unlinks.
+
+    // Extra BatchRead workers for adapters without batch I/O (today: POSIX).
+    // Adapters with SupportsBatchIo() (hf3fs) keep their batched path.
+    constexpr int kMaxDfsReadThreads = 128;
+    const bool posix_adapter = distributed_config_.fs_adapter_type == "posix";
+    const int default_read_threads = posix_adapter ? 16 : 1;
+    dfs_read_threads_ = Environ::ReadOr(
+        DistributedStorageEnvironmentVariables::MOONCAKE_DFS_READ_THREADS,
+        default_read_threads);
+    if (dfs_read_threads_ > kMaxDfsReadThreads) {
+        LOG(WARNING) << "MOONCAKE_DFS_READ_THREADS=" << dfs_read_threads_
+                     << " exceeds the limit, using " << kMaxDfsReadThreads;
+        dfs_read_threads_ = kMaxDfsReadThreads;
+    }
+    if (dfs_read_threads_ > 1 && !fs_adapter_->SupportsBatchIo()) {
+        dfs_read_pool_ = std::make_unique<ThreadPool>(
+            static_cast<size_t>(dfs_read_threads_));
+        LOG(INFO) << "DFS BatchRead parallelism enabled, extra worker threads="
+                  << dfs_read_threads_ << " (plus the calling thread), adapter="
+                  << distributed_config_.fs_adapter_type;
+    } else {
+        dfs_read_threads_ = 1;
+    }
+
     initialized_ = true;
     return {};
 }
@@ -860,13 +889,13 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     // Storage layout: bucket I/O uses temporary fds and completes short reads;
     // shard I/O reuses cached fds and fails short reads.
     const bool bucket_mode = UsesBucketAllocator();
-    // Execution mode: adapters that opt in (currently 3FS) collect validated
-    // reads for submission after the loop. Other adapters (including POSIX)
-    // execute each read in the loop, preserving per-request bucket handles
-    // and shard I/O locking.
+    // Execution mode: adapters that opt in (currently 3FS) submit the
+    // validated reads as one batch. Other adapters (including POSIX) execute
+    // each read through ExecuteSingleIo, preserving per-request bucket handles
+    // and shard I/O locking, optionally fanned out over dfs_read_pool_.
     const bool batch_io = fs_adapter_->SupportsBatchIo();
     std::vector<DfsIoOp> ops;
-    if (batch_io) ops.reserve(requests.size());
+    ops.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         const auto& desc = request.descriptor;
@@ -966,22 +995,92 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                 continue;
             }
         }
-        DfsIoOp op{i,        request.key,
-                   desc,     std::move(iovs),
-                   io_bytes, static_cast<int64_t>(desc.offset + value_offset)};
-        if (batch_io) {
-            ops.push_back(std::move(op));
+        ops.push_back(
+            DfsIoOp{i, request.key, desc, std::move(iovs), io_bytes,
+                    static_cast<int64_t>(desc.offset + value_offset)});
+    }
+
+    if (batch_io) {
+        if (bucket_mode) {
+            ExecuteBucketBatchIo(ops, results, false);
         } else {
-            results[i] = ExecuteSingleIo(op, false);
+            ExecuteShardBatchIo(ops, results, false);
+        }
+        return results;
+    }
+
+    const size_t n = ops.size();
+    if (n == 0) return results;
+
+    // The caller and up to dfs_read_threads_ pool workers claim ops from a
+    // shared cursor. The caller always participates, so concurrent callers are
+    // never capped by the pool size, and with no workers this is the serial
+    // loop. The shared state is heap-owned because a worker may run after this
+    // frame returns; it then only sees next_index >= total and never touches
+    // ops or results.
+    struct ReadFanout {
+        std::atomic<size_t> next_index{0};
+        std::atomic<size_t> remaining{0};
+        std::mutex done_mutex;
+        std::condition_variable done_cv;
+        size_t total = 0;
+    };
+    auto state = std::make_shared<ReadFanout>();
+    state->total = n;
+    state->remaining.store(n, std::memory_order_relaxed);
+
+    auto* ops_ptr = &ops;
+    auto* results_ptr = &results;
+
+    // Nothing may escape drain: a throw on a pool worker terminates the
+    // process, and on the caller it would destroy results while workers still
+    // write to it. Every claimed op must also decrement remaining.
+    auto drain = [this, state, ops_ptr, results_ptr]() {
+        size_t i;
+        while ((i = state->next_index.fetch_add(1, std::memory_order_relaxed)) <
+               state->total) {
+            auto& op = (*ops_ptr)[i];
+            try {
+                (*results_ptr)[op.index] = ExecuteSingleIo(op, false);
+            } catch (...) {
+                (*results_ptr)[op.index] =
+                    tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                try {
+                    LOG(ERROR) << "DFS read threw for key " << op.key
+                               << ", failing the request";
+                } catch (...) {
+                }
+            }
+            if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> lock(state->done_mutex);
+                state->done_cv.notify_one();
+            }
+        }
+    };
+
+    // Each bucket read holds its own fd, so bucket layout keeps the caller plus
+    // workers within kMaxOpenBucketsPerBatch. enqueue() throws once the pool is
+    // stopped; the caller then drains the rest itself.
+    size_t pool_workers =
+        dfs_read_pool_ ? std::min(static_cast<size_t>(dfs_read_threads_), n - 1)
+                       : 0;
+    if (bucket_mode) {
+        pool_workers = std::min(pool_workers, kMaxOpenBucketsPerBatch - 1);
+    }
+    for (size_t t = 0; t < pool_workers; ++t) {
+        try {
+            dfs_read_pool_->enqueue(drain);
+        } catch (...) {
+            break;
         }
     }
 
-    if (!batch_io) return results;
-    if (bucket_mode) {
-        ExecuteBucketBatchIo(ops, results, false);
-    } else {
-        ExecuteShardBatchIo(ops, results, false);
-    }
+    drain();
+
+    std::unique_lock<std::mutex> lock(state->done_mutex);
+    state->done_cv.wait(lock, [&state] {
+        return state->remaining.load(std::memory_order_acquire) == 0;
+    });
     return results;
 }
 
