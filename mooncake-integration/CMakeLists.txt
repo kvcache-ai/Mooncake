@@ -125,10 +125,10 @@ if(WITH_TE)
 endif()
 
 set(ALLOCATOR_SO_PATH
-    "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so"
+    "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/allocator/nvlink_allocator/nvlink_allocator.so"
 )
 set(UBSHMEM_ALLOCATOR_SO_PATH
-    "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so"
+    "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/allocator/ubshmem_allocator/ubshmem_fabric_allocator.so"
 )
 
 set(MOONCAKE_HAS_NVLINK_ALLOCATOR OFF)

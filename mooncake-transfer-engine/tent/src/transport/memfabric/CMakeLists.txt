@@ -1,7 +1,8 @@
 if(USE_MEMFABRIC)
   add_library(
-    tent_xport_memfabric STATIC memfabric_transport.cpp memfabric_under_api.cpp
-                                memfabric_allocator.cpp)
+    tent_xport_memfabric STATIC
+    memfabric_transport.cpp memfabric_under_api.cpp
+    ../../../../allocator/memfabric_allocator/memfabric_allocator.cpp)
   if(BUILD_UNIT_TESTS AND USE_MEMFABRIC)
     target_include_directories(
       tent_xport_memfabric

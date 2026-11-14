@@ -75,9 +75,9 @@ RUN mkdir -p build && \
     export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
-    cd mooncake-transfer-engine/nvlink-allocator && \
-    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
+    mkdir -p build/mooncake-transfer-engine/allocator/nvlink_allocator && \
+    cd mooncake-transfer-engine/allocator/nvlink_allocator && \
+    bash build.sh ../../../build/mooncake-transfer-engine/allocator/nvlink_allocator/ && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
     python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \

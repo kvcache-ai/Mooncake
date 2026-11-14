@@ -77,11 +77,8 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
 endif()
 add_subdirectory(include)
 
-# The shared Ascend allocator/affinity library is used by the classic Ascend
-# Direct transport, the Store and TENT, so build it before the engine.
-if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
-  add_subdirectory(allocator)
-endif()
+# Vendor allocators are shared by the classic engine, Store and TENT.
+add_subdirectory(allocator)
 
 add_subdirectory(src)
 
@@ -95,17 +92,6 @@ endif()
 
 if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
-endif()
-
-# Non-peermem requires cuMem allocated memory pointers; since WITH_NVIDIA_PEERMEM
-# is now a runtime environment variable, always build when GPU support is present.
-if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA OR USE_SUPA)
-  add_subdirectory(nvlink-allocator)
-endif()
-
-# Build ubshmem allocator for Huawei NPU fabric memory
-if (USE_UBSHMEM)
-  add_subdirectory(ubshmem-allocator)
 endif()
 
 if (USE_TENT)

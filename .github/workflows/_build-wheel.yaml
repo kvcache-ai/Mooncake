@@ -229,9 +229,9 @@ jobs:
             export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}
             export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
           fi
-          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-          cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+          mkdir -p build/mooncake-transfer-engine/allocator/nvlink_allocator
+          cd mooncake-transfer-engine/allocator/nvlink_allocator
+          bash build.sh ../../../build/mooncake-transfer-engine/allocator/nvlink_allocator/
 
       - name: Run sccache stat for check
         if: ${{ env.SCCACHE_PATH != '' }}

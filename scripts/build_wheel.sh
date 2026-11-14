@@ -233,12 +233,12 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/nvlink_allocator/nvlink_allocator.so ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
    || [ -f /usr/lib64/libaccl_barex.so ]; then
-    if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/nvlink_allocator/nvlink_allocator.so ]; then
      echo "Copying CUDA nvlink_allocator.so..."
-     cp ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+     cp ${BUILD_DIR}/mooncake-transfer-engine/allocator/nvlink_allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
     fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
@@ -248,9 +248,9 @@ else
 fi
 
 # Copy ubshmem_fabric_allocator.so to mooncake directory (only if it exists - NPU builds only)
-if [ -f ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/ubshmem_allocator/ubshmem_fabric_allocator.so ]; then
     echo "Copying NPU ubshmem_fabric_allocator.so..."
-    cp ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/allocator/ubshmem_allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
     echo "Copying NPU allocator libraries..."
     # Copy allocator_ascend_npu.py
     cp mooncake-integration/allocator_ascend_npu.py mooncake-wheel/mooncake/allocator_ascend_npu.py
