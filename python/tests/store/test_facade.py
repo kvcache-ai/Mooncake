@@ -221,6 +221,9 @@ implementation = importlib.import_module("mooncake.store.rs.store")
 assert store._BACKEND == "rs"
 assert store.MooncakeDistributedStore is implementation.MooncakeDistributedStore
 assert store.ReplicateConfig is implementation.ReplicateConfig
+from mooncake.store import TENSOR_METADATA_WIRE_SIZE
+assert TENSOR_METADATA_WIRE_SIZE == implementation.TENSOR_METADATA_WIRE_SIZE == 304
+assert "TENSOR_METADATA_WIRE_SIZE" in store.__all__
 assert store.BufferPool is implementation.BufferPool
 assert store.RegisteredBufferPool is store.BufferPool
 import mooncake
