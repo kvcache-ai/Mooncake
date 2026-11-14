@@ -23,6 +23,7 @@
 #include "default_config.h"
 #include "config.h"
 #include "device/cuda_ipc_buffer.h"
+#include "device/mlu_ipc_buffer.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
@@ -81,6 +82,18 @@ size_t sum_successful_cuda_ipc_sizes(
     return total;
 }
 
+size_t sum_successful_mlu_ipc_sizes(
+    const std::vector<int>& results,
+    const std::vector<mooncake::MluIpcWriteRequest>& requests) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < requests.size(); ++i) {
+        if (results[i] == 0) {
+            total += requests[i].metadata.size() + requests[i].payload.size;
+        }
+    }
+    return total;
+}
+
 std::optional<std::vector<mooncake::CudaIpcBufferHandle>>
 try_export_cuda_ipc_buffers(const std::vector<void*>& buffers,
                             const std::vector<size_t>& sizes) {
@@ -95,6 +108,21 @@ try_export_cuda_ipc_buffers(const std::vector<void*>& buffers,
         payloads.push_back(*payload);
     }
     return payloads;
+}
+
+std::optional<std::vector<mooncake::device::MluIpcBufferExport>>
+try_export_mlu_ipc_buffers(const std::vector<void*>& buffers,
+                           const std::vector<size_t>& sizes) {
+    if (buffers.size() != sizes.size() || buffers.empty()) return std::nullopt;
+    std::vector<mooncake::device::MluIpcBufferExport> exports;
+    exports.reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        auto exported =
+            mooncake::device::MluIpcBufferExport::Create(buffers[i], sizes[i]);
+        if (!exported) return std::nullopt;
+        exports.push_back(std::move(*exported));
+    }
+    return exports;
 }
 
 size_t sum_positive_results(const std::vector<int64_t>& results) {
@@ -1498,6 +1526,15 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
     if (is_registered_buffer(buffer, size)) {
+        if (auto exports = try_export_mlu_ipc_buffers({buffer}, {size})) {
+            auto results = batch_get_into_mlu_ipc(
+                {MluIpcReadRequest{.key = key,
+                                   .destination = (*exports)[0].handle(),
+                                   .size = size,
+                                   .size_is_buffer_capacity = true}});
+            return results.empty() ? toInt(ErrorCode::INTERNAL_ERROR)
+                                   : results[0];
+        }
         if (auto dst_buffer = try_export_cuda_ipc_buffers({buffer}, {size})) {
             std::vector<CudaIpcReadRequest> requests{
                 CudaIpcReadRequest{
@@ -1725,6 +1762,15 @@ std::vector<int> DummyClient::batch_put_from(
         }
     }
     if (all_buffers_registered) {
+        if (auto exports = try_export_mlu_ipc_buffers(buffer_ptrs, sizes)) {
+            std::vector<MluIpcWriteRequest> requests;
+            requests.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                requests.push_back(MluIpcWriteRequest{
+                    .key = keys[i], .payload = (*exports)[i].handle()});
+            }
+            return batch_put_from_mlu_ipc(requests, config);
+        }
         if (auto payloads = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
             payloads && keys.size() == payloads->size()) {
             std::vector<CudaIpcWriteRequest> requests;
@@ -1797,6 +1843,18 @@ std::vector<int64_t> DummyClient::batch_get_into(
         }
     }
     if (all_buffers_registered) {
+        if (auto exports = try_export_mlu_ipc_buffers(buffer_ptrs, sizes)) {
+            std::vector<MluIpcReadRequest> requests;
+            requests.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                requests.push_back(
+                    MluIpcReadRequest{.key = keys[i],
+                                      .destination = (*exports)[i].handle(),
+                                      .size = sizes[i],
+                                      .size_is_buffer_capacity = true});
+            }
+            return batch_get_into_mlu_ipc(requests);
+        }
         if (auto dst_buffers = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
             dst_buffers && keys.size() == dst_buffers->size()) {
             std::vector<CudaIpcReadRequest> requests;
@@ -1860,6 +1918,24 @@ std::vector<int64_t> DummyClient::batch_get_into_cuda_ipc(
     if (total_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kRead,
                               "batch_get_into_cuda_ipc", total_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+
+    return results;
+}
+
+std::vector<int64_t> DummyClient::batch_get_into_mlu_ipc(
+    const std::vector<mooncake::MluIpcReadRequest>& requests) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_get_into_mlu_ipc_dummy_helper,
+                         int64_t>(requests.size(), requests, client_id_);
+    auto results = expected_results_to_py(internal_results);
+
+    const size_t total_bytes = sum_positive_results(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead,
+                              "batch_get_into_mlu_ipc", total_bytes,
                               elapsed_us_since(start_time), true);
     }
 
@@ -1940,6 +2016,42 @@ std::vector<int> DummyClient::batch_upsert_from_cuda_ipc(
     if (successful_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kWrite,
                               "batch_upsert_from_cuda_ipc", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+std::vector<int> DummyClient::batch_put_from_mlu_ipc(
+    const std::vector<mooncake::MluIpcWriteRequest>& requests,
+    const ReplicateConfig& config) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_put_from_mlu_ipc_dummy_helper,
+                         void>(requests.size(), requests, config, client_id_);
+    auto results = expected_results_to_py<int>(internal_results);
+    const size_t successful_bytes =
+        sum_successful_mlu_ipc_sizes(results, requests);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_put_from_mlu_ipc", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+std::vector<int> DummyClient::batch_upsert_from_mlu_ipc(
+    const std::vector<mooncake::MluIpcWriteRequest>& requests,
+    const ReplicateConfig& config) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_upsert_from_mlu_ipc_dummy_helper,
+                         void>(requests.size(), requests, config, client_id_);
+    auto results = expected_results_to_py<int>(internal_results);
+    const size_t successful_bytes =
+        sum_successful_mlu_ipc_sizes(results, requests);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_upsert_from_mlu_ipc", successful_bytes,
                               elapsed_us_since(start_time), true);
     }
     return results;
