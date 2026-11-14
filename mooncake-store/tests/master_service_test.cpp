@@ -394,6 +394,154 @@ std::string GenerateKeyForSegment(const UUID& client_id,
     }
 }
 
+TEST_F(MasterServiceTest, OffsetDramWatermarkEvictsBeforeBatchAllocationFails) {
+#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    GTEST_SKIP() << "This workload requires bin rounding.";
+#endif
+    using namespace std::chrono_literals;
+    constexpr size_t kSegmentCount = 6;
+    constexpr size_t kSegmentSize = 256 * 1024;
+    constexpr size_t kRequestSize = 24577;
+    constexpr size_t kObjectCount = 9 * kSegmentCount;
+    constexpr double kWatermark = 0.90;
+
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 1;
+    config.enable_metric_reporting = false;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+    config.eviction_ratio = 0.05;
+    config.eviction_high_watermark_ratio = kWatermark;
+    WrappedMasterService service(config);
+    service.MarkReadyForServing();
+    service.ActivateServing();
+
+    const auto writer = generate_uuid();
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const auto segment =
+            MakeSegment("watermark-" + std::to_string(i),
+                        kDefaultSegmentBase + i * kSegmentSize, kSegmentSize);
+        ASSERT_TRUE(
+            service.MountSegment(segment, i == 0 ? writer : generate_uuid()));
+    }
+
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        keys.push_back("watermark-" + std::to_string(i));
+    }
+    const std::vector<uint64_t> lengths(keys.size(), kRequestSize);
+    auto& metrics = MasterMetricManager::instance();
+    const auto failed_allocations = metrics.get_put_start_alloc_failures();
+    const auto successful_evictions = metrics.get_mem_eviction_success();
+    const auto started = service.BatchPutStart(writer, keys, lengths, {});
+    ASSERT_EQ(started.size(), keys.size());
+    for (const auto& result : started) {
+        ASSERT_TRUE(result) << toString(result.error());
+        ASSERT_EQ(result->size(), 1u);
+        EXPECT_EQ(
+            result->front().get_memory_descriptor().buffer_descriptor.size_,
+            kRequestSize);
+    }
+
+    const auto usage = service.GetStorageUsageSnapshot().memory;
+    EXPECT_EQ(usage.used_bytes, kObjectCount * kRequestSize);
+    EXPECT_LT(usage.used_ratio(), kWatermark);
+    const auto committed =
+        service.BatchPutEnd(writer, MakeObjectMetas(keys), ReplicaType::MEMORY);
+    ASSERT_EQ(committed.size(), keys.size());
+    for (const auto& result : committed) {
+        ASSERT_TRUE(result) << toString(result.error());
+    }
+
+    WaitUntil(
+        [&] {
+            return metrics.get_mem_eviction_success() > successful_evictions;
+        },
+        3s, 5ms);
+    ASSERT_GT(metrics.get_mem_eviction_success(), successful_evictions);
+    EXPECT_EQ(metrics.get_put_start_alloc_failures(), failed_allocations);
+    EXPECT_LT(service.GetStorageUsageSnapshot().memory.used_bytes,
+              usage.used_bytes);
+    EXPECT_TRUE(
+        service.BatchPutStart(writer, {"watermark-next"}, {kRequestSize}, {})
+            .front());
+}
+
+TEST_F(MasterServiceTest,
+       OffsetDramEvictionUsageTracksPartialAllocationAndRevoke) {
+    constexpr size_t kSegmentSize = 256 * 1024;
+    constexpr size_t kRequestSize = 24577;
+#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    constexpr size_t kReservedSize = kRequestSize;
+    constexpr size_t kFittingObjects = 10;
+#else
+    constexpr size_t kReservedSize = 26624;
+    constexpr size_t kFittingObjects = 9;
+#endif
+    const auto tenant = TenantId::Default();
+    const auto writer = generate_uuid();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_eviction_ratio(0.0)
+                              .build());
+    auto& segments = MasterServiceTestPeer::SegmentManager(service);
+
+    const auto first =
+        MakeSegment("rollback-full", kDefaultSegmentBase, kSegmentSize);
+    const auto second = MakeSegment(
+        "rollback-available", kDefaultSegmentBase + kSegmentSize, kSegmentSize);
+    ASSERT_TRUE(service.MountSegment(first, writer));
+    ASSERT_TRUE(service.MountSegment(second, writer));
+
+    ReplicateConfig single;
+    single.preferred_segments = {first.name};
+    for (size_t i = 0; i < kFittingObjects; ++i) {
+        ASSERT_TRUE(service.PutStart(writer, "rollback-" + std::to_string(i),
+                                     tenant, kRequestSize, single));
+    }
+    EXPECT_EQ(segments.GetMemoryUsage().used_bytes,
+              kFittingObjects * kRequestSize);
+    EXPECT_EQ(segments.GetMemoryEvictionUsage().used_bytes,
+              kFittingObjects * kReservedSize);
+
+    ReplicateConfig dual;
+    dual.replica_num = 2;
+    dual.preferred_segments = {second.name, first.name};
+    const auto partial = service.PutStart(writer, "rollback-partial", tenant,
+                                          kRequestSize, dual);
+    ASSERT_TRUE(partial);
+    ASSERT_EQ(partial->size(), 1u);
+    EXPECT_EQ(segments.GetMemoryUsage().used_bytes,
+              (kFittingObjects + 1) * kRequestSize);
+    EXPECT_EQ(segments.GetMemoryEvictionUsage().used_bytes,
+              (kFittingObjects + 1) * kReservedSize);
+
+    const auto failed = service.PutStart(writer, "rollback-failed", tenant,
+                                         kSegmentSize, single);
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(segments.GetMemoryEvictionUsage().used_bytes,
+              (kFittingObjects + 1) * kReservedSize);
+    ASSERT_TRUE(service.PutRevoke(writer, "rollback-partial", tenant,
+                                  ReplicaType::MEMORY));
+    EXPECT_EQ(segments.GetMemoryUsage().used_bytes,
+              kFittingObjects * kRequestSize);
+    EXPECT_EQ(segments.GetMemoryEvictionUsage().used_bytes,
+              kFittingObjects * kReservedSize);
+
+    single.preferred_segments = {second.name};
+    ASSERT_TRUE(service.PutStart(writer, "rollback-revoke", tenant,
+                                 kRequestSize, single));
+    EXPECT_EQ(segments.GetMemoryEvictionUsage().used_bytes,
+              (kFittingObjects + 1) * kReservedSize);
+    ASSERT_TRUE(service.PutRevoke(writer, "rollback-revoke", tenant,
+                                  ReplicaType::MEMORY));
+    EXPECT_EQ(segments.GetMemoryUsage().used_bytes,
+              kFittingObjects * kRequestSize);
+    EXPECT_EQ(segments.GetMemoryEvictionUsage().used_bytes,
+              kFittingObjects * kReservedSize);
+}
+
 TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
     MasterService service(MasterServiceConfig::builder()
                               .set_memory_allocator(BufferAllocatorType::OFFSET)

@@ -120,6 +120,14 @@ uint32 floatToUint(uint32 floatValue) {
 }
 }  // namespace SmallFloat
 
+static uint32 allocationExtentSize(uint32 size, uint32 min_bin_index) noexcept {
+#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    return size;
+#else
+    return SmallFloat::floatToUint(min_bin_index);
+#endif
+}
+
 // Utility functions
 uint32 findLowestSetBitAfter(uint32 bitMask, uint32 startBitIndex) {
     uint32 maskBeforeStartIndex = (1 << startBitIndex) - 1;
@@ -241,12 +249,7 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     // Modified in Mooncake project: Round up to bin size. Otherwise when this
     // node is freed, if it cannot be merged with neighbors, it will be inserted
     // to a smaller bin.
-#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
-    uint32 roundupSize = size;
-#else
-    // In default, round up to bin size.
-    uint32 roundupSize = SmallFloat::floatToUint(minBinIndex);
-#endif
+    const uint32 roundupSize = allocationExtentSize(size, minBinIndex);
     node.dataSize = roundupSize;
     node.used = true;
     m_binIndices[binIndex] = node.binListNext;
@@ -579,13 +582,8 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
-    const size_t fake_size =
-        m_multiplier_bits > 0
-            ? ((size + (static_cast<uint64_t>(1) << m_multiplier_bits) - 1u) >>
-               m_multiplier_bits)
-            : size;
-
-    if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+    const uint32 fake_size = toInternalSize(size);
+    if (fake_size == 0) {
         return std::nullopt;
     }
 
@@ -625,20 +623,28 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
                                   size);
 }
 
+uint32 OffsetAllocator::toInternalSize(size_t size) const noexcept {
+    const uint64_t mask = (uint64_t{1} << m_multiplier_bits) - 1;
+    if (size > std::numeric_limits<uint64_t>::max() - mask) {
+        return 0;
+    }
+    const uint64_t internal_size = (size + mask) >> m_multiplier_bits;
+    return internal_size <= SmallFloat::MAX_BIN_SIZE
+               ? static_cast<uint32>(internal_size)
+               : 0;
+}
+
 uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
-    if (size == 0) {
-        return 0;
-    }
-    const uint64_t quantum = uint64_t{1} << m_multiplier_bits;
-    if (size > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
-        return 0;
-    }
-    const uint64_t fake_size = (size + quantum - 1) >> m_multiplier_bits;
-    if (fake_size > SmallFloat::MAX_BIN_SIZE) {
-        return 0;
-    }
-    return static_cast<uint64_t>(SmallFloat::floatToUint(
-               SmallFloat::uintToFloatRoundUp(static_cast<uint32>(fake_size))))
+    const uint32 internal_size = toInternalSize(size);
+    const auto bin = SmallFloat::uintToFloatRoundUp(internal_size);
+    return static_cast<uint64_t>(SmallFloat::floatToUint(bin))
+           << m_multiplier_bits;
+}
+
+uint64_t OffsetAllocator::reservedAllocationSize(size_t size) const noexcept {
+    const uint32 internal_size = toInternalSize(size);
+    const auto bin = SmallFloat::uintToFloatRoundUp(internal_size);
+    return static_cast<uint64_t>(allocationExtentSize(internal_size, bin))
            << m_multiplier_bits;
 }
 

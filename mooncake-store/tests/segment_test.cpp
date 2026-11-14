@@ -334,7 +334,12 @@ TEST_F(SegmentTest, AggregateMemoryUsageDoesNotTakeSegmentMutex) {
 TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;
-    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 24577;
+#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    constexpr size_t kReservedSize = kAllocationSize;
+#else
+    constexpr size_t kReservedSize = 26624;
+#endif
 
     Segment segment;
     segment.id = generate_uuid();
@@ -357,6 +362,9 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
     }
     auto buffer = blocking->allocate(kAllocationSize);
     ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(segment_manager.GetMemoryUsage().used_bytes, kAllocationSize);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes,
+              kReservedSize);
 
     {
         std::thread dealloc_thread([&buffer] { buffer.reset(); });
@@ -383,8 +391,12 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes, 0u);
     blocking.reset();
 
+    const auto eviction_usage = segment_manager.GetMemoryEvictionUsage();
+    EXPECT_EQ(eviction_usage.used_bytes, 0u);
+    EXPECT_EQ(eviction_usage.capacity_bytes, 0u);
     const auto usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(usage.used_bytes, 0u);
     EXPECT_EQ(usage.capacity_bytes, 0u);
@@ -393,8 +405,15 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
 TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;
-    constexpr size_t kOldAllocationSize = 4 * 1024 * 1024;
-    constexpr size_t kRestoredAllocationSize = 8 * 1024 * 1024;
+    constexpr size_t kOldAllocationSize = 24577;
+    constexpr size_t kRestoredAllocationSize = 32769;
+#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    constexpr size_t kOldReservedSize = kOldAllocationSize;
+    constexpr size_t kRestoredReservedSize = kRestoredAllocationSize;
+#else
+    constexpr size_t kOldReservedSize = 26624;
+    constexpr size_t kRestoredReservedSize = 36864;
+#endif
 
     Segment segment;
     segment.id = generate_uuid();
@@ -414,11 +433,25 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     auto old_buffer = old_allocator->allocate(kOldAllocationSize);
     ASSERT_NE(old_buffer, nullptr);
 
-    auto replacement = std::make_shared<OffsetBufferAllocator>(
+    // An overlapping second record fails after allocating the first record and
+    // a temporary filler. The temporary allocator never joins the tracker.
+    const auto invalid_import = ImportOffsetBufferAllocator(
         segment.name, segment.base, segment.size, segment.te_endpoint,
-        segment.protocol);
-    auto restored_buffer = replacement->allocate(kRestoredAllocationSize);
-    ASSERT_NE(restored_buffer, nullptr);
+        segment.protocol,
+        {{4096, kRestoredAllocationSize}, {4097, kRestoredAllocationSize}});
+    EXPECT_FALSE(invalid_import);
+    EXPECT_EQ(segment_manager.GetMemoryUsage().used_bytes, kOldAllocationSize);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes,
+              kOldReservedSize);
+
+    auto imported = ImportOffsetBufferAllocator(
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol, {{4096, kRestoredAllocationSize}});
+    ASSERT_TRUE(imported);
+    auto& replacement = imported->allocator;
+    ASSERT_EQ(imported->buffers.size(), 1u);
+    EXPECT_EQ(imported->buffers.front()->data(),
+              reinterpret_cast<void*>(segment.base + 4096));
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_TRUE(segment_access.ReplaceAllocators(
@@ -429,12 +462,25 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     auto usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
     EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes,
+              kRestoredReservedSize);
 
     old_buffer.reset();
     usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes,
+              kRestoredReservedSize);
 
-    restored_buffer.reset();
+    imported->buffers.front().reset();
+    EXPECT_EQ(segment_manager.GetMemoryUsage().used_bytes, 0u);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes, 0u);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().capacity_bytes,
+              kSegmentSize);
+    imported->buffers.front() = replacement->allocate(kRestoredAllocationSize);
+    ASSERT_NE(imported->buffers.front(), nullptr);
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes,
+              kRestoredReservedSize);
+
     {
         auto segment_access = segment_manager.getSegmentAccess();
         size_t metrics_dec_capacity = 0;
@@ -445,8 +491,15 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
+    // Let the allocator's registration remove its live bytes on destruction.
     replacement.reset();
+    const auto eviction_usage = segment_manager.GetMemoryEvictionUsage();
+    EXPECT_EQ(eviction_usage.used_bytes, 0u);
+    EXPECT_EQ(eviction_usage.capacity_bytes, 0u);
+    EXPECT_EQ(segment_manager.GetMemoryUsage().used_bytes, 0u);
     EXPECT_EQ(segment_manager.GetMemoryUsage().capacity_bytes, 0u);
+    imported->buffers.clear();
+    EXPECT_EQ(segment_manager.GetMemoryEvictionUsage().used_bytes, 0u);
 }
 
 TEST_F(SegmentTest, ReplaceAllocatorsUpdatesMultipleSegmentsAtomically) {

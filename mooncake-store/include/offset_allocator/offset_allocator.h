@@ -167,9 +167,12 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]] std::optional<OffsetAllocationHandle> createHandleAtNode(
         uint32_t node_index, uint64_t real_offset, uint64_t requested_size);
 
-    // Returns the actual region size consumed by allocate(size), or zero when
-    // the request cannot be represented by this allocator.
+    // Returns the minimum bin size needed to find a free region, or zero
+    // when the request cannot be represented by this allocator.
     [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
+
+    // Returns the extent consumed by a successful allocation of this size.
+    [[nodiscard]] uint64_t reservedAllocationSize(size_t size) const noexcept;
 
     // Returns a mutex-free atomic upper-bound hint for the largest allocatable
     // free region. The hint may be larger than the current value after a
@@ -200,6 +203,10 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
    private:
     friend class OffsetAllocationHandle;
+
+    // Returns the request rounded to the segment quantum, in allocator units.
+    // Zero indicates a zero-length or unrepresentable request.
+    [[nodiscard]] uint32 toInternalSize(size_t size) const noexcept;
 
     // Internal method for Handle to free allocation (thread-safe)
     void freeAllocation(const OffsetAllocation& allocation, uint64_t size);

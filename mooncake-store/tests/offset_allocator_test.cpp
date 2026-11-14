@@ -747,6 +747,23 @@ TEST_F(OffsetAllocatorTest, FastFailMatchesAllocatorWithMultipliers) {
     }
 }
 
+TEST_F(OffsetAllocatorTest, ReservedSizeMatchesLiveExtent) {
+    constexpr uint64_t kLargeCapacity = uint64_t{1} << 40;
+    for (const uint64_t capacity : {uint64_t{256 * 1024}, kLargeCapacity}) {
+        auto allocator = OffsetAllocator::create(0, capacity, 8, 8);
+        for (const size_t size : {1, 24576, 24577, 26624, 32769}) {
+            SCOPED_TRACE(::testing::Message() << capacity << " / " << size);
+            const auto allocation = allocator->allocate(size);
+            ASSERT_TRUE(allocation);
+            uint64_t extent = 0;
+            allocator->visit_used_nodes(
+                [&](uint64_t, uint64_t bytes, uint32_t) { extent += bytes; });
+            EXPECT_EQ(allocator->reservedAllocationSize(size), extent);
+            EXPECT_GE(extent, size);
+        }
+    }
+}
+
 // Test multiple allocations
 TEST_F(OffsetAllocatorTest, MultipleAllocations) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
