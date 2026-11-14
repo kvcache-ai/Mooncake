@@ -1734,6 +1734,38 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(LoadOne(restarted, key, value.size()), value);
 }
 
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxRemoveAllSurvivesCrash) {
+    const auto path = MakeFakeDaxDevice(data_path, 8 * 1024 * 1024);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+    OffsetAllocatorBackendConfig dax_cfg;
+    dax_cfg.dax_device_path = path;
+    dax_cfg.persist_mode = OffsetPersistMode::kStrict;
+    ASSERT_TRUE(dax_cfg.Validate());
+
+    const std::string value(16 * 1024, 'n');
+    {
+        OffsetAllocatorStorageBackend backend(config, dax_cfg);
+        ASSERT_TRUE(backend.Init());
+        // kStrict checkpoints this batch, so the checkpoint lists "removed".
+        OffloadOne(backend, "removed", std::string(16 * 1024, 'r'));
+        backend.RemoveAll();
+        // Crash: the arena keeps the record's bytes and no later checkpoint
+        // records that it was removed.
+        backend.SetSkipFinalCheckpointForTest();
+    }
+
+    OffsetAllocatorStorageBackend restarted(config, dax_cfg);
+    ASSERT_TRUE(restarted.Init());
+    EXPECT_FALSE(restarted.IsExist("removed").value());
+    OffloadOne(restarted, "new", value);
+    EXPECT_EQ(LoadOne(restarted, "new", value.size()), value);
+}
+
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Overwrite) {
