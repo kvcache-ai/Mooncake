@@ -247,18 +247,32 @@ class FilereadOperationState : public OperationState {
  */
 class TransferEngineOperationState : public OperationState {
    public:
-    TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+    // Default soft deadline after which a still-running batch is reported as
+    // TRANSFER_FAIL. See wait_for_completion().
+    static constexpr int64_t kDefaultTimeoutMilliseconds = 60 * 1000;
+
+    TransferEngineOperationState(
+        TransferEngine& engine, BatchID batch_id, size_t batch_size,
+        int64_t timeout_milliseconds = kDefaultTimeoutMilliseconds)
         : engine_(engine),
           tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
+          timeout_milliseconds_(timeout_milliseconds),
           start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState();
 
     bool is_completed() override;
 
+    /**
+     * @brief Block until every task in the batch has reached a terminal state.
+     *
+     * If the batch is still running after the timeout, the result is
+     * TRANSFER_FAIL, but this call does not return until the remaining tasks
+     * have drained. Returning earlier would let the caller reuse buffers that
+     * in-flight transfers (e.g. RDMA READs) can still write into.
+     */
     void wait_for_completion() override;
 
     TransferStrategy get_strategy() const override {
@@ -279,7 +293,11 @@ class TransferEngineOperationState : public OperationState {
     mooncake::tent::TransferEngine* tent_engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    const int64_t timeout_milliseconds_;
     const int64_t start_ts_;
+    // Set once the deadline has passed while tasks were still in flight;
+    // forces the final result to TRANSFER_FAIL. Guarded by mutex_.
+    bool timed_out_ = false;
 };
 
 /**
