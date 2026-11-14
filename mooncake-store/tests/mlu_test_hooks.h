@@ -6,6 +6,9 @@
 namespace mooncake::testing {
 
 // Linker wrappers used only by the MLU test executables. No production hooks.
+extern std::atomic<size_t> mlu_d2h_bytes;
+extern std::atomic<bool> pause_mlu_d2h;
+extern std::atomic<bool> mlu_d2h_paused;
 extern std::atomic<bool> fail_mlu_h2d;
 extern std::atomic<bool> fail_mlu_d2h;
 extern std::atomic<bool> fail_mlu_pinned_allocation;

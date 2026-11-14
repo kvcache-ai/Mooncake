@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <barrier>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -104,6 +106,191 @@ class MluStoreTest : public MluTest {
     std::vector<void*> registered_;
     std::vector<std::string> keys_;
 };
+
+// These cases exercise the same metadata + payload, stage_nonlocal=true
+// path as put_tensor/batch_put_tensor. A separate segment provider guarantees
+// that the replica cannot be satisfied by Store's local memcpy shortcut.
+class MluRemoteTensorWriteTest : public MluStoreTest {
+   protected:
+    void SetUp() override {
+        if (!std::getenv("MC_STORE_TEST_MASTER"))
+            GTEST_SKIP() << "Requires a remote segment provider";
+        if (UsesRdma()) {
+            const char* tent = std::getenv("MC_USE_TENT");
+            if (!tent || std::string(tent) != "1")
+                GTEST_SKIP()
+                    << "Set MC_USE_TENT=1 for MLU Tensor direct writes";
+        }
+        MluStoreTest::SetUp();
+    }
+    bool UsesRdma() const {
+        const auto* protocol = std::getenv("PROTOCOL");
+        return protocol && std::string(protocol) == "rdma";
+    }
+    void VerifyObject(const std::string& key,
+                      const std::vector<char>& expected) {
+        std::vector<char> actual(expected.size());
+        ASSERT_EQ(client_->register_buffer(actual.data(), actual.size()), 0);
+        auto result = client_->get_into(key, actual.data(), actual.size());
+        EXPECT_EQ(client_->unregister_buffer(actual.data()), 0);
+        EXPECT_EQ(result, expected.size());
+        EXPECT_EQ(actual, expected);
+    }
+};
+
+TEST_F(MluRemoteTensorWriteTest, RegisteredPayloadSkipsStoreStaging) {
+    // Larger than the client's host pool: success also proves we did not
+    // allocate a payload-sized Store staging buffer.
+    constexpr size_t size = 20 * 1024 * 1024;
+    ASSERT_EQ(source_.allocate(size + 256), cnrtSuccess);
+    ASSERT_NO_FATAL_FAILURE(Register(source_.data(), size + 256));
+    auto payload = Payload(size, 37);
+    ASSERT_EQ(cnrtMemcpy(source_.data(123), payload.data(), size,
+                         cnrtMemcpyHostToDev),
+              cnrtSuccess);
+    auto header = Payload(73, 11);
+    auto expected = header;
+    expected.insert(expected.end(), payload.begin(), payload.end());
+    const auto key = Key();
+    const auto before = mlu_d2h_bytes.load();
+    auto result = client_->batch_put_from_multi_buffers(
+        {key}, {{header.data(), source_.data(123)}}, {{header.size(), size}},
+        ReplicateConfig{}, true);
+    if (UsesRdma()) {
+        EXPECT_EQ(result, std::vector<int>{0});
+        EXPECT_EQ(mlu_d2h_bytes.load() - before, 0);
+        ASSERT_NO_FATAL_FAILURE(Unregister(source_.data()));
+        source_.reset();
+        ASSERT_NO_FATAL_FAILURE(VerifyObject(key, expected));
+    } else {
+        // TCP keeps full staging and cannot fit this object in the pool.
+        ASSERT_EQ(result.size(), 1);
+        EXPECT_LT(result[0], 0);
+    }
+}
+
+TEST_F(MluRemoteTensorWriteTest, MixedSlicesRespectLogicalRegistrationBounds) {
+    constexpr size_t size = 65537;
+    constexpr size_t registered_size = 2 * size;
+    ASSERT_EQ(source_.allocate(4 * size), cnrtSuccess);
+    ASSERT_EQ(target_.allocate(size), cnrtSuccess);
+    ASSERT_NO_FATAL_FAILURE(Register(source_.data(), registered_size));
+    auto first = Payload(size, 3);
+    auto second = Payload(size, 7);
+    auto third = Payload(129, 19);
+    ASSERT_EQ(
+        cnrtMemcpy(source_.data(123), first.data(), size, cnrtMemcpyHostToDev),
+        cnrtSuccess);
+    ASSERT_EQ(
+        cnrtMemcpy(target_.data(), second.data(), size, cnrtMemcpyHostToDev),
+        cnrtSuccess);
+    // The slice starts inside the logical range but extends one byte beyond
+    // it; the physical registration may be larger and must not qualify it.
+    ASSERT_EQ(cnrtMemcpy(source_.data(registered_size - 128), third.data(),
+                         third.size(), cnrtMemcpyHostToDev),
+              cnrtSuccess);
+    auto header = Payload(73, 11);
+    auto trailer = Payload(29, 13);
+    auto expected = header;
+    for (const auto& part : {first, trailer, second, third})
+        expected.insert(expected.end(), part.begin(), part.end());
+    const auto key = Key();
+    std::vector<std::vector<void*>> sources{
+        {header.data(), source_.data(123), trailer.data(), target_.data(),
+         source_.data(registered_size - 128)}};
+    std::vector<std::vector<size_t>> sizes{
+        {header.size(), size, trailer.size(), size, third.size()}};
+    for (bool upsert : {false, true}) {
+        const auto before = mlu_d2h_bytes.load();
+        auto result = upsert
+                          ? client_->batch_upsert_from_multi_buffers(
+                                {key}, sources, sizes, ReplicateConfig{}, true)
+                          : client_->batch_put_from_multi_buffers(
+                                {key}, sources, sizes, ReplicateConfig{}, true);
+        ASSERT_EQ(result, std::vector<int>{0});
+        EXPECT_EQ(mlu_d2h_bytes.load() - before,
+                  (UsesRdma() ? size : 2 * size) + third.size());
+        ASSERT_NO_FATAL_FAILURE(VerifyObject(key, expected));
+    }
+    ASSERT_NO_FATAL_FAILURE(Unregister(source_.data()));
+    const auto before = mlu_d2h_bytes.load();
+    ASSERT_EQ(client_->batch_upsert_from_multi_buffers({key}, sources, sizes,
+                                                       ReplicateConfig{}, true),
+              std::vector<int>{0});
+    EXPECT_EQ(mlu_d2h_bytes.load() - before, 2 * size + third.size());
+    ASSERT_NO_FATAL_FAILURE(VerifyObject(key, expected));
+}
+
+TEST_F(MluRemoteTensorWriteTest, FailedUnregisterDisablesNewDirectWrites) {
+    constexpr size_t size = 4096;
+    ASSERT_EQ(source_.allocate(size), cnrtSuccess);
+    ASSERT_NO_FATAL_FAILURE(Register(source_.data(), size));
+    auto payload = Payload(size, 71);
+    ASSERT_EQ(
+        cnrtMemcpy(source_.data(), payload.data(), size, cnrtMemcpyHostToDev),
+        cnrtSuccess);
+    RealClient::SetTeUnregisterHookForTesting(
+        [](void*) -> tl::expected<void, ErrorCode> {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        });
+    const auto result = client_->unregister_buffer(source_.data());
+    RealClient::SetTeUnregisterHookForTesting(nullptr);
+    ASSERT_LT(result, 0);
+    const auto key = Key();
+    const auto before = mlu_d2h_bytes.load();
+    ASSERT_EQ(client_->batch_put_from_multi_buffers(
+                  {key}, {{source_.data()}}, {{size}}, ReplicateConfig{}, true),
+              std::vector<int>{0});
+    EXPECT_EQ(mlu_d2h_bytes.load() - before, size);
+    ASSERT_NO_FATAL_FAILURE(VerifyObject(key, payload));
+    ASSERT_NO_FATAL_FAILURE(Unregister(source_.data()));
+}
+
+TEST_F(MluRemoteTensorWriteTest,
+       UnregisterWaitsForWriteUsingRegisteredPayload) {
+    if (!UsesRdma()) GTEST_SKIP() << "Requires RDMA";
+    constexpr size_t size = 4096;
+    ASSERT_EQ(source_.allocate(size), cnrtSuccess);
+    ASSERT_EQ(target_.allocate(size), cnrtSuccess);
+    ASSERT_NO_FATAL_FAILURE(Register(source_.data(), size));
+    auto payload = Payload(size, 53);
+    for (auto* ptr : {source_.data(), target_.data()})
+        ASSERT_EQ(cnrtMemcpy(ptr, payload.data(), size, cnrtMemcpyHostToDev),
+                  cnrtSuccess);
+    auto expected = payload;
+    expected.insert(expected.end(), payload.begin(), payload.end());
+    auto key = Key();
+    // The second, unregistered slice blocks in the test copy wrapper after
+    // the first slice has acquired its registration guard.
+    pause_mlu_d2h.store(true);
+    auto write = std::async(std::launch::async, [&] {
+        return client_->batch_put_from_multi_buffers(
+            {key}, {{source_.data(), target_.data()}}, {{size, size}},
+            ReplicateConfig{}, true);
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!mlu_d2h_paused.load() &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool paused = mlu_d2h_paused.load();
+    std::promise<void> entered;
+    auto unregister = std::async(std::launch::async, [&] {
+        entered.set_value();
+        return client_->unregister_buffer(source_.data());
+    });
+    entered.get_future().wait();
+    const auto status = unregister.wait_for(std::chrono::milliseconds(100));
+    pause_mlu_d2h.store(false);
+    pause_mlu_d2h.notify_all();
+    EXPECT_TRUE(paused);
+    EXPECT_EQ(status, std::future_status::timeout);
+    EXPECT_EQ(write.get(), std::vector<int>{0});
+    ASSERT_EQ(unregister.get(), 0);
+    registered_.clear();
+    source_.reset();
+    ASSERT_NO_FATAL_FAILURE(VerifyObject(key, expected));
+}
 
 TEST_F(MluStoreTest, BatchOffloadSurvivesSourceFreeAndReloadsIntoMlu) {
     constexpr size_t stride = 2 * 1024 * 1024;
