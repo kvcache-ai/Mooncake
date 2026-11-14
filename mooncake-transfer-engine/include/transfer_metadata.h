@@ -278,6 +278,9 @@ class TransferMetadata {
 
     int syncSegmentCache(const std::string &segment_name);
 
+    // Strict refresh of one cached remote segment; unchanged metadata succeeds.
+    int refreshCachedSegment(const std::string &segment_name);
+
     int removeSegmentDesc(const std::string &segment_name);
 
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
@@ -343,6 +346,8 @@ class TransferMetadata {
     void dumpMetadataContentUnlocked();
 
    private:
+    int syncSegmentCacheImpl(const std::string &segment_name, bool strict);
+
     std::shared_ptr<SegmentDesc> getSegmentDescInternal(
         const std::string &segment_name, bool force_rpc_update,
         GetResult *status = nullptr);

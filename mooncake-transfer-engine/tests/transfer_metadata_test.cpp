@@ -1270,6 +1270,86 @@ class TransferMetadataStaleSegmentInvalidationTest : public ::testing::Test {
     }
 };
 
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshRequiresCachedRemoteButLegacySyncDoesNot) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    ASSERT_EQ(
+        client.updateSegmentDesc("peer", *makeRdmaSegmentDesc("peer", 0x1000)),
+        0);
+    EXPECT_NE(client.refreshCachedSegment(""), 0);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    // openSegmentNoCache calls sync before its first lookup. Keep that
+    // contract.
+    EXPECT_EQ(client.syncSegmentCache("peer"), 0);
+    ASSERT_TRUE(client.getSegmentDescByName("peer"));
+    EXPECT_EQ(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.syncSegmentCache(""), 0);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshAcceptsUnchangedAndRetainsOldReferences) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    auto old = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(old);
+    ASSERT_EQ(client.refreshCachedSegment("peer"), 0);
+    ASSERT_EQ(
+        client.updateSegmentDesc("peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+        0);
+    ASSERT_EQ(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer")->buffers.front().addr,
+              0x2000);
+    EXPECT_EQ(old->buffers.front().addr, 0x1000);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshRejectsUnavailableAndMissingMetadata) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    auto old = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(old);
+    plugin->failNext("mooncake/ram/peer", 1);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer"), old);
+    EXPECT_EQ(client.refreshCachedSegment("peer"), 0);
+    plugin->drop("mooncake/ram/peer");
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    // All-cache refresh remains best effort even with missing metadata.
+    EXPECT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_EQ(old->buffers.front().addr, 0x1000);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshRejectsRollbackAndSameVersionConflict) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    auto old = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(old);
+    Json::Value original;
+    ASSERT_TRUE(plugin->get("mooncake/ram/peer", original));
+    auto stale = original;
+    stale["metadata_version"] = Json::UInt64(old->metadata_version - 1);
+    plugin->set("mooncake/ram/peer", stale);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.syncSegmentCache("peer"), 0);
+    auto conflict = original;
+    conflict["buffers"][0]["addr"] = Json::UInt64(0x2000);
+    plugin->set("mooncake/ram/peer", conflict);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.syncSegmentCache("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer"), old);
+    original["metadata_version"] = Json::UInt64(old->metadata_version + 1);
+    plugin->set("mooncake/ram/peer", original);
+    EXPECT_EQ(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer")->metadata_version,
+              old->metadata_version + 1);
+}
+
 // Red on master / green on branch: a cached remote segment whose backend key
 // is removed (peer unmount) is invalidated only after the consecutive-failure
 // streak reaches the threshold -- not on the first failure. On master there

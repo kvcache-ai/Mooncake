@@ -676,6 +676,24 @@ Gets the list of pending transfer notifications received from other nodes.
 **Returns:**
 - `List[TransferNotify]`: List of notification objects containing name and message
 
+#### refresh_session()
+
+```python
+refresh_session(peer_server_name)
+```
+
+Refreshes one already-cached remote segment on the classic Transfer Engine.
+Returns 0 when fetched metadata is accepted, including an unchanged descriptor.
+Returns non-zero for an empty or uncached peer, unavailable metadata, rejected
+metadata versions, or an unsupported backend (TENT/TEV1).
+
+This call does not unregister local memory or rebuild RDMA queue pairs. Existing
+transfers retain their shared descriptor references. RPC locations are
+invalidated by the existing refresh path when an accepted descriptor changes
+or advances its version. Success does not prove data-plane health; verify a
+real transfer before restoring traffic. Existing metadata timeouts apply.
+The C++ `syncSegmentCache` and C `openSegmentNoCache` contracts are unchanged.
+
 #### send_probe()
 
 ```python

@@ -1738,6 +1738,14 @@ int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 
+int TransferEnginePy::refreshSession(const std::string& peer_server_name) {
+    if (!engine_) return -1;
+    auto metadata = engine_->getMetadata();
+    if (!metadata) return ERR_NOT_IMPLEMENTED;
+    pybind11::gil_scoped_release release;
+    return metadata->refreshCachedSegment(peer_server_name);
+}
+
 namespace py = pybind11;
 
 // Implementation of coro_rpc_interface binding function
@@ -2032,6 +2040,11 @@ PYBIND11_MODULE(engine, m) {
             .def("warmup_efa_segment", &TransferEnginePy::warmupEfaSegment,
                  py::arg("segment_name"))
             .def("get_notifies", &TransferEnginePy::getNotifies)
+            .def("refresh_session", &TransferEnginePy::refreshSession,
+                 py::arg("peer_server_name"),
+                 "Refresh one cached peer descriptor on the classic backend. "
+                 "Returns 0 if metadata is accepted, including unchanged data; "
+                 "non-zero on failure. Does not prove data-plane health.")
             .def("send_probe", &TransferEnginePy::sendProbe,
                  py::arg("peer_server_name"),
                  "Send a JSON-RPC probe to peer to verify reachability. "

@@ -1486,6 +1486,16 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    return syncSegmentCacheImpl(segment_name, false);
+}
+
+int TransferMetadata::refreshCachedSegment(const std::string &segment_name) {
+    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
+    return syncSegmentCacheImpl(segment_name, true);
+}
+
+int TransferMetadata::syncSegmentCacheImpl(const std::string &segment_name,
+                                           bool strict) {
     const auto sync_start = std::chrono::steady_clock::now();
 
     // Collect segment names to sync first, then release lock before network I/O
@@ -1670,6 +1680,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
               << ", skipped=" << skipped_count
               << ", invalidated=" << invalidated_count
               << ", sync_duration_ms=" << sync_duration_ms;
+    if (strict && (updated_count + unchanged_count == 0 || failed_count != 0 ||
+                   unavailable_count != 0 || skipped_count != 0)) {
+        return ERR_METADATA;
+    }
     return 0;
 }
 
