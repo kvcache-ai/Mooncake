@@ -1503,8 +1503,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // Pins each record's extent and returns the value's address inside the
     // DAX mapping. Refuses (BUFFER_OVERFLOW) once the bytes held by
-    // outstanding pins would exceed local_buffer_size, the same in-flight
-    // bound the copy path gets from ClientBuffer.
+    // outstanding pins would exceed dax_zero_copy_pin_limit_bytes (default:
+    // the arena capacity).
     tl::expected<PinnedBatch, ErrorCode> BatchPin(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes) override;

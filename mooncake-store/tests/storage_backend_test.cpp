@@ -1811,7 +1811,9 @@ struct ZeroCopyDaxFixture {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
         config.total_size_limit = 4 * 1024 * 1024;
         config.total_keys_limit = 10000;
-        config.local_buffer_size = 1024 * 1024;
+        // Staging size, smaller than any value pinned below: it must not
+        // bound pins.
+        config.local_buffer_size = 4096;
         dax_cfg.dax_device_path = MakeFakeDaxDevice(dir, 8 * 1024 * 1024);
         dax_cfg.dax_zero_copy = true;
     }
@@ -1917,7 +1919,7 @@ TEST_F(StorageBackendTest,
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinCap) {
     ZeroCopyDaxFixture f(data_path);
-    f.config.local_buffer_size = 100 * 1024;
+    f.dax_cfg.dax_zero_copy_pin_limit_bytes = 100 * 1024;
     OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
     ASSERT_TRUE(backend.Init());
     const std::string v(64 * 1024, 'c');
@@ -1932,6 +1934,9 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinCap) {
 
     first->owner.reset();
     EXPECT_TRUE(backend.BatchPin({"k"}, {64 * 1024}).has_value());
+
+    f.dax_cfg.dax_zero_copy_pin_limit_bytes = -1;
+    EXPECT_FALSE(f.dax_cfg.Validate());
 }
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinRecovered) {

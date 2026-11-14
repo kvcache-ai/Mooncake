@@ -1601,18 +1601,21 @@ TEST_F(FileStorageTest, BatchGetServesDaxArenaZeroCopy) {
     fs::resize_file(dev, 16 * 1024 * 1024);
     SetEnv("MOONCAKE_OFFSET_DAX_DEVICE_PATH", dev);
     SetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY", "1");
+    // BatchOffloadUtil writes 100 values of 210 bytes (21000 in total), so
+    // one pinned batch fits under this pin limit and a second one does not.
+    SetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY_PIN_LIMIT_BYTES", "32768");
 
     auto config = FileStorageConfig::FromEnvironment();
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     config.storage_filepath = data_path;
     config.total_size_limit = 8 * 1024 * 1024;
-    // BatchOffloadUtil writes 100 values of 210 bytes (21000 in total), so
-    // one pinned batch fits under this cap and a second one does not.
+    // Staging buffer for the copy path; it does not bound pins.
     config.local_buffer_size = 32 * 1024;
     SsdMetric metric;
     FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
     UnsetEnv("MOONCAKE_OFFSET_DAX_DEVICE_PATH");
     UnsetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY");
+    UnsetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY_PIN_LIMIT_BYTES");
 
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;

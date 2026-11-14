@@ -91,6 +91,14 @@ struct OffsetAllocatorBackendConfig {
     // numa_node from sysfs (the closest CPU node; for a CXL expander this is
     // not its CPU-less target_node, which has no local NIC).
     int64_t dax_numa_node = -1;
+
+    // Upper bound on the bytes held by in-flight zero-copy reads: the sum of
+    // the requested value sizes, so a value read by several clients counts
+    // once per read. Reads over it are served by copy. 0 = the arena
+    // capacity. The extent of a key evicted while pinned only returns to the
+    // allocator on release, so a lower limit bounds how much space reads can
+    // withhold from new writes.
+    int64_t dax_zero_copy_pin_limit_bytes = 0;
 };
 
 }  // namespace mooncake

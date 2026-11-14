@@ -6639,7 +6639,11 @@ OffsetAllocatorStorageBackend::BatchPin(const std::vector<std::string>& keys,
         total += size;
     }
     // Reserve against the cap up front; the owner returns it on release.
-    const int64_t cap = file_storage_config_.local_buffer_size;
+    // Pins hold arena extents, not staging memory, so the cap is its own
+    // setting and defaults to the arena size.
+    const int64_t cap = cfg_.dax_zero_copy_pin_limit_bytes > 0
+                            ? cfg_.dax_zero_copy_pin_limit_bytes
+                            : static_cast<int64_t>(capacity_);
     if (pinned_bytes_->fetch_add(total) + total > cap) {
         pinned_bytes_->fetch_sub(total);
         return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);

@@ -65,6 +65,11 @@ bool OffsetAllocatorBackendConfig::Validate() const {
                       ">= 0, or -1 for auto";
         return false;
     }
+    if (dax_zero_copy_pin_limit_bytes < 0) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: "
+                      "dax_zero_copy_pin_limit_bytes must be >= 0";
+        return false;
+    }
     return true;
 }
 
@@ -155,6 +160,9 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFSET_DAX_ZERO_COPY, cfg.dax_zero_copy);
     cfg.dax_numa_node = Environ::ReadOr(
         Variables::MOONCAKE_OFFSET_DAX_NUMA_NODE, cfg.dax_numa_node);
+    cfg.dax_zero_copy_pin_limit_bytes = Environ::ReadOr(
+        Variables::MOONCAKE_OFFSET_DAX_ZERO_COPY_PIN_LIMIT_BYTES,
+        cfg.dax_zero_copy_pin_limit_bytes);
 
     return cfg;
 }
