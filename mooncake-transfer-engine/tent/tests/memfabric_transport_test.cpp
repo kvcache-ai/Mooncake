@@ -401,6 +401,7 @@ class MemFabricTransportTest : public ::testing::Test {
         if (transport_) {
             (void)transport_->uninstall();
         }
+        ResetQuarantine();
         ResetMockApi();
         g_state.reset();
         unsetenv("MF_PROTOCOL");
@@ -438,6 +439,30 @@ class MemFabricTransportTest : public ::testing::Test {
     int InflightCount() const { return transport_->inflight_.load(); }
 
     int InitRefCount() const { return MemFabricTransport::g_init_ref_.load(); }
+
+    smem_trans_t NativeHandle() const { return transport_->handle_; }
+
+    bool QuarantineOwns(smem_trans_t handle, MemFabricSubBatch* batch) const {
+        std::lock_guard<std::mutex> lock(
+            *MemFabricTransport::g_quarantine_mutex_);
+        for (const auto& quarantine : *MemFabricTransport::g_quarantine_) {
+            if (quarantine.handle != handle) continue;
+            auto it = quarantine.batches.find(batch);
+            return quarantine.inflight > 0 && quarantine.library &&
+                   !quarantine.registered_ranges.empty() &&
+                   it != quarantine.batches.end() &&
+                   it->second.get() == batch &&
+                   it->second->pending_batch_count > 0;
+        }
+        return false;
+    }
+
+    void ResetQuarantine() {
+        std::lock_guard<std::mutex> lock(
+            *MemFabricTransport::g_quarantine_mutex_);
+        MemFabricTransport::g_quarantine_->clear();
+        MemFabricTransport::g_init_ref_.store(0);
+    }
 
     void SetQueryResult(int32_t query_ret, int32_t result = SM_OK) {
         std::lock_guard<std::mutex> lock(state_->mu);
@@ -1256,6 +1281,56 @@ TEST_F(MemFabricTransportTest, QuiesceTimeoutWithPendingBatches) {
             .ok());
 }
 
+TEST_F(MemFabricTransportTest, TeardownTimeoutQuarantinesNativeState) {
+    ASSERT_TRUE(Install().ok());
+    SetTransferTimeout(20);
+    BufferDesc desc{};
+    desc.addr = 0x10000;
+    desc.length = 4096;
+    ASSERT_TRUE(transport_->addMemoryBuffer(desc, MemoryOptions{}).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    char src[32]{};
+    ASSERT_TRUE(
+        transport_->submitTransferTasks(batch_, {MakeWrite(src, 0x1000, 32)})
+            .ok());
+    auto* mf_batch = static_cast<MemFabricSubBatch*>(batch_);
+    auto handle = NativeHandle();
+    SetQueryResult(SM_NEED_RETRY);
+
+    // Match engine teardown: the Batch shell can go away after free fails.
+    EXPECT_FALSE(transport_->quiesce().ok());
+    EXPECT_FALSE(transport_->removeMemoryBuffer(desc).ok());
+    EXPECT_EQ(state_->deregister_mem_calls, 0);
+    EXPECT_FALSE(transport_->freeSubBatch(batch_).ok());
+    ASSERT_EQ(batch_, mf_batch);
+    batch_ = nullptr;
+    EXPECT_FALSE(transport_->uninstall().ok());
+    EXPECT_FALSE(transport_->removeMemoryBuffer(desc).ok());
+    EXPECT_FALSE(Configure().ok()) << "a quarantined instance is terminal";
+    transport_.reset();
+
+    EXPECT_EQ(state_->destroy_calls, 0);
+    EXPECT_EQ(state_->uninit_calls, 0);
+    EXPECT_EQ(InitRefCount(), 1);
+    EXPECT_TRUE(MemFabricUnderApi::IsLoaded());
+    EXPECT_TRUE(QuarantineOwns(handle, mf_batch));
+
+    MemFabricTransport replacement;
+    ASSERT_TRUE(
+        replacement
+            .install(name_, metadata_, nullptr, std::make_shared<Config>())
+            .ok());
+    ASSERT_TRUE(Initialize(replacement).ok());
+    EXPECT_EQ(state_->init_calls, 1);
+    EXPECT_EQ(InitRefCount(), 2);
+    ASSERT_TRUE(replacement.uninstall().ok());
+    EXPECT_EQ(state_->destroy_calls, 1);
+    EXPECT_EQ(state_->uninit_calls, 0);
+    EXPECT_EQ(InitRefCount(), 1);
+    EXPECT_TRUE(MemFabricUnderApi::IsLoaded());
+    EXPECT_TRUE(QuarantineOwns(handle, mf_batch));
+}
+
 TEST_F(MemFabricTransportTest, QuiesceRejectsNewWorkWhenIdle) {
     ASSERT_TRUE(Install().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
@@ -1526,6 +1601,28 @@ TEST_F(MemFabricTransportTest, AddRemoveMemoryBuffer) {
     }
     EXPECT_TRUE(found);
 
+    ASSERT_TRUE(transport_->removeMemoryBuffer(desc).ok());
+    EXPECT_EQ(state_->deregister_mem_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, RemoveMemoryBufferRejectsInflightUntilDrain) {
+    ASSERT_TRUE(Install().ok());
+    SetTransferTimeout(1000);
+    BufferDesc desc{};
+    desc.addr = 0x10000;
+    desc.length = 4096;
+    ASSERT_TRUE(transport_->addMemoryBuffer(desc, MemoryOptions{}).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    char src[32]{};
+    ASSERT_TRUE(
+        transport_->submitTransferTasks(batch_, {MakeWrite(src, 0x1000, 32)})
+            .ok());
+
+    EXPECT_FALSE(transport_->removeMemoryBuffer(desc).ok());
+    EXPECT_EQ(state_->deregister_mem_calls, 0);
+
+    SetQueryResult(SM_OK);
+    ASSERT_TRUE(transport_->freeSubBatch(batch_).ok());
     ASSERT_TRUE(transport_->removeMemoryBuffer(desc).ok());
     EXPECT_EQ(state_->deregister_mem_calls, 1);
 }

@@ -9,7 +9,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "memfabric_types.h"
@@ -95,6 +94,7 @@ class MemFabricTransport : public Transport {
         registered_ranges_;  // [begin, end), guarded by inflight_mu_
 
     bool installed_{false};
+    bool quarantined_{false};
     smem_trans_t handle_{nullptr};
     std::shared_ptr<ControlService> metadata_;
     std::string local_segment_name_;
@@ -102,11 +102,24 @@ class MemFabricTransport : public Transport {
 
     std::mutex inflight_mu_;
     std::condition_variable inflight_cv_;
-    // Non-owning batch index, protected together with submission and polling.
-    std::unordered_set<MemFabricSubBatch*> batches_;
+    using BatchMap = std::unordered_map<MemFabricSubBatch*,
+                                        std::unique_ptr<MemFabricSubBatch>>;
+    BatchMap batches_;
     bool stopping_ = false;
     std::atomic<int> inflight_{0};
     int32_t transfer_timeout_ms_{10000};
+
+    struct Quarantine {
+        smem_trans_t handle{nullptr};
+        std::shared_ptr<const void> library;
+        std::map<uint64_t, uint64_t> registered_ranges;
+        BatchMap batches;
+        int inflight{0};
+    };
+    // Native I/O can outlive the transport after a teardown timeout. These
+    // owners are intentionally retained until process exit.
+    static std::mutex* g_quarantine_mutex_;
+    static std::vector<Quarantine>* g_quarantine_;
 
     static std::atomic<int> g_init_ref_;
     static std::mutex g_init_mutex_;

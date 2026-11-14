@@ -133,6 +133,11 @@ void MemFabricUnderApi::CleanupLibrary() {
     }
 }
 
+std::shared_ptr<const void> MemFabricUnderApi::RetainLibrary() {
+    std::lock_guard<std::mutex> guard(gMutex);
+    return gMemoryApi;
+}
+
 void MemFabricUnderApi::ResetSymbols() {
     pSmemTransInit = nullptr;
     pSmemTransUninit = nullptr;
