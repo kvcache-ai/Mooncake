@@ -1275,7 +1275,6 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
-    TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto& batch_id : batch_ids) {
         int64_t total_length = 0;
@@ -1298,16 +1297,19 @@ int TransferEnginePy::getBatchTransferStatus(
         for (auto& entry : timeout_table) {
             auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
             auto start_timestamp = batch_desc->start_timestamp;
-            Status s = engine_->getBatchTransferStatus(entry.first, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED) {
+            const int result = pollBatch(entry.first);
+            if (result == 1) {
+                forgetBatch(entry.first);
                 engine_->freeBatchID(entry.first);
                 LOG(INFO) << "Batch Transfer completed!";
                 remove_ids.insert(entry.first);
-            } else if (status.s == TransferStatusEnum::FAILED) {
-                failed_or_timeout = true;
-            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+            } else if (result == -2 && engine_->isUsingTent()) {
+                // As before: TENT reports TIMEOUT itself, and this call keeps
+                // waiting until its own deadline below.
                 LOG(INFO) << "Sync data transfer timeout";
+            } else if (result < 0) {
+                // The classic engine has always failed a slice timeout here.
+                failed_or_timeout = true;
             }
             auto current_ts = getCurrentTimeInNano();
             if (current_ts - start_timestamp > entry.second) {
@@ -1326,6 +1328,7 @@ int TransferEnginePy::getBatchTransferStatus(
 
     if (failed_or_timeout) {
         for (auto& entry : timeout_table) {
+            forgetBatch(entry.first);
             engine_->freeBatchID(entry.first);
         }
     }
@@ -1371,23 +1374,53 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     return batch_id;
 }
 
-int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
-    pybind11::gil_scoped_release release;
-    TransferStatus status;
-    Status s = engine_->getTransferStatus(batch_id, 0, status);
-    LOG_ASSERT(s.ok());
-    if (status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(batch_id);
-        return 1;
-    } else if (status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(batch_id);
-        return -1;
-    } else if (status.s == TransferStatusEnum::TIMEOUT) {
-        engine_->freeBatchID(batch_id);
-        return -2;
-    } else {
+int TransferEnginePy::pollBatch(batch_id_t batch_id) {
+    // Each poll resumes at the first task not yet seen complete, so polling
+    // a large batch checks about one task per call instead of all of them.
+    size_t task_id = 0;
+    {
+        std::lock_guard<std::mutex> guard(poll_mutex_);
+        auto it = poll_next_task_.find(batch_id);
+        if (it != poll_next_task_.end()) task_id = it->second;
+    }
+    for (;; ++task_id) {
+        TransferStatus task_status;
+        // The engine rejects a task id past the last task.
+        if (!engine_->getTransferStatus(batch_id, task_id, task_status).ok())
+            break;
+        if (task_status.s == TransferStatusEnum::COMPLETED) continue;
+        if (task_status.s == TransferStatusEnum::FAILED) return -1;
+        if (task_status.s == TransferStatusEnum::TIMEOUT) return -2;
+        std::lock_guard<std::mutex> guard(poll_mutex_);
+        poll_next_task_[batch_id] = task_id;
         return 0;
     }
+    // Every task completed. One batch-level check marks the batch finished
+    // and sends its notifications.
+    TransferStatus status;
+    Status s = engine_->getBatchTransferStatus(batch_id, status);
+    LOG_ASSERT(s.ok());
+    if (status.s == TransferStatusEnum::COMPLETED) return 1;
+    if (status.s == TransferStatusEnum::TIMEOUT) return -2;
+    if (status.s == TransferStatusEnum::FAILED) return -1;
+    return 0;
+}
+
+void TransferEnginePy::forgetBatch(batch_id_t batch_id) {
+    std::lock_guard<std::mutex> guard(poll_mutex_);
+    poll_next_task_.erase(batch_id);
+}
+
+int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
+    pybind11::gil_scoped_release release;
+    // Checks every task, so a batch from batch_transfer_async_* is complete
+    // only when all of its buffers are.
+    const int result = pollBatch(batch_id);
+    if (result != 0) {
+        forgetBatch(batch_id);
+        engine_->freeBatchID(batch_id);
+    }
+    return result;
 }
 
 int TransferEnginePy::batchRegisterMemory(
