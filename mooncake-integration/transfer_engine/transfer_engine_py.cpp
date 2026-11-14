@@ -403,8 +403,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     // the RDMA transport, so the EFA wheel behaves like the default wheel on
     // IB/RoCE hosts.
     bool use_efa = (proto == "efa");
-    engine_ = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
-                                               device_filter);
+    engine_ = std::make_unique<TransferEngine>(
+        !use_efa && !use_flagcx && proto != "tcp", device_filter);
     if (use_efa) {
         engine_->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
@@ -422,7 +422,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+    engine_ = std::make_unique<TransferEngine>(!use_flagcx && proto != "tcp",
+                                               device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -435,6 +436,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         // the last two params are unused
         int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
         if (ret) return -1;
+    }
+
+    if (proto == "tcp") {
+        if (!engine_->installTransport("tcp", nullptr)) {
+            LOG(ERROR) << "Failed to install requested TCP transport";
+            return -1;
+        }
+        free_list_.resize(kSlabSizeKBTabLen);
+        return 0;
     }
 
 #ifdef USE_EFA
@@ -1834,10 +1844,24 @@ PYBIND11_MODULE(engine, m) {
                                    py::gil_scoped_release release;
                                    return ticket.drained();
                                })
-        .def("drain", [](ScatterTransferTicket& ticket, uint64_t timeout_ms) {
-            py::gil_scoped_release release;
-            return ticket.drain(timeout_ms);
-        });
+        .def("drain",
+             [](ScatterTransferTicket& ticket, uint64_t timeout_ms) {
+                 py::gil_scoped_release release;
+                 return ticket.drain(timeout_ms);
+             })
+        .def(
+            "poll",
+            [](ScatterTransferTicket& ticket) {
+                const auto status = ticket.drain(0);
+                return std::make_pair(
+                    status !=
+                        ScatterTransferCompletionStatus::COMPLETION_UNKNOWN,
+                    status == ScatterTransferCompletionStatus::FAILED_DRAINED
+                        ? std::string(
+                              "Transfer Engine scatter operation failed")
+                        : std::string());
+            },
+            py::call_guard<py::gil_scoped_release>());
 
     py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
         .def(py::init<>())
@@ -1871,6 +1895,41 @@ PYBIND11_MODULE(engine, m) {
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
+            .def("get_endpoint",
+                 [](const TransferEnginePy& adaptor) {
+                     if (!adaptor.getEngine())
+                         throw std::runtime_error(
+                             "Transfer Engine is not initialized");
+                     return adaptor.getEngine()->getLocalIpAndPort();
+                 })
+            .def(
+                "refresh_remote",
+                [](TransferEnginePy& adaptor, const std::string& endpoint) {
+                    if (!adaptor.getEngine() ||
+                        adaptor.getEngine()->syncSegmentCache(endpoint) != 0)
+                        throw std::runtime_error(
+                            "failed to refresh remote segment");
+                },
+                py::arg("target_hostname"),
+                py::call_guard<py::gil_scoped_release>())
+            .def(
+                "submit_transfer",
+                [](TransferEnginePy& adaptor, const std::string& endpoint,
+                   uintptr_t local, uintptr_t remote, size_t length,
+                   TransferEnginePy::TransferOpcode opcode) {
+                    if (!adaptor.getEngine())
+                        throw std::runtime_error(
+                            "Transfer Engine is not initialized");
+                    return submitScatterWithTicket(adaptor.getEngine(),
+                                                   endpoint, {local}, {length},
+                                                   {remote}, {length}, {{0}},
+                                                   {{0}}, {{length}}, opcode)
+                        .ticket;
+                },
+                py::arg("target_hostname"), py::arg("buffer"),
+                py::arg("peer_buffer_address"), py::arg("length"),
+                py::arg("opcode"), py::call_guard<py::gil_scoped_release>(),
+                py::keep_alive<0, 1>())
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
