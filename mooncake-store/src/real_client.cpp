@@ -58,6 +58,7 @@
 #include "default_config.h"
 #include "uds_transport.h"
 #include "device/cuda_ipc_buffer.h"
+#include "device/mlu_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #include "nof/nof_runtime.h"
@@ -6634,6 +6635,211 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
             request.key, mapping->ptr(), 0,
             static_cast<size_t>(request.source_offset),
             static_cast<size_t>(request.size), false, false);
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_mlu_ipc_dummy_helper(
+    const std::vector<MluIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    return batch_write_from_mlu_ipc_dummy_helper(requests, config, client_id,
+                                                 false);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_mlu_ipc_dummy_helper(
+    const std::vector<MluIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    return batch_write_from_mlu_ipc_dummy_helper(requests, config, client_id,
+                                                 true);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_write_from_mlu_ipc_dummy_helper(
+    const std::vector<MluIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id, bool is_upsert) {
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    // Neither the RPC-owned metadata nor the leased MLU imports borrow SHM.
+    // Do not hold its mutex across transfers and block other allocations.
+    const bool has_metadata =
+        !requests.empty() && !requests[0].metadata.empty();
+    for (const auto &request : requests) {
+        if (!request.metadata.empty() != has_metadata) {
+            LOG(ERROR) << "Mixed mlu ipc metadata batches are not supported";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<device::MluIpcBufferMapping> payload_mappings;
+    std::vector<std::string> keys;
+    std::vector<std::vector<void *>> all_buffers;
+    std::vector<std::vector<size_t>> all_sizes;
+    payload_mappings.reserve(requests.size());
+    keys.reserve(requests.size());
+    all_buffers.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+
+    for (const auto &request : requests) {
+        auto mapping = device::MluIpcBufferMapping::Open(request.payload);
+        if (!mapping) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(mapping.error()));
+        }
+        payload_mappings.push_back(std::move(*mapping));
+        void *payload_ptr = payload_mappings.back().ptr();
+        keys.push_back(request.key);
+        if (has_metadata) {
+            all_buffers.push_back(
+                {const_cast<char *>(request.metadata.data()), payload_ptr});
+            all_sizes.push_back({request.metadata.size(),
+                                 static_cast<size_t>(request.payload.size)});
+        } else {
+            all_buffers.push_back({payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.payload.size)});
+        }
+    }
+
+    if (is_upsert) {
+        return batch_upsert_from_multi_buffers_internal(
+            keys, all_buffers, all_sizes, config, true);
+    }
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 config, true);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_mlu_ipc_dummy_helper(
+    const std::vector<MluIpcReadRequest> &requests, const UUID &client_id) {
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!client_) return results;
+
+    // Keep all imports alive through the batch and its host-to-device copies.
+    std::vector<device::MluIpcBufferMapping> mappings;
+    std::vector<void *> destinations(requests.size(), nullptr);
+    std::vector<std::string> full_keys;
+    std::vector<size_t> full_indices;
+    mappings.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto &request = requests[i];
+        if (request.size > request.destination.size ||
+            request.source_offset >
+                std::numeric_limits<size_t>::max() - request.size) {
+            continue;
+        }
+        if (request.size == 0) {
+            results[i] = 0;
+            continue;
+        }
+        auto mapping = device::MluIpcBufferMapping::Open(request.destination);
+        if (!mapping) {
+            results[i] = tl::unexpected(mapping.error());
+            continue;
+        }
+        destinations[i] = mapping->ptr();
+        mappings.push_back(std::move(*mapping));
+        if (request.source_offset == 0 && request.size_is_buffer_capacity) {
+            full_keys.push_back(request.key);
+            full_indices.push_back(i);
+            continue;
+        }
+        // Tensor payload/range reads retain their exact offset semantics.
+        results[i] = get_into_range_internal(
+            request.key, destinations[i], 0,
+            static_cast<size_t>(request.source_offset),
+            static_cast<size_t>(request.size), request.size_is_buffer_capacity,
+            request.size_is_buffer_capacity);
+    }
+
+    if (full_keys.empty()) return results;
+    auto queries = client_->BatchQuery(full_keys);
+    std::vector<std::string> batch_keys;
+    std::vector<void *> batch_buffers;
+    std::vector<size_t> batch_sizes;
+    std::vector<size_t> batch_indices;
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_queries;
+    std::vector<BufferHandle> staging;
+    std::vector<size_t> deferred;
+    for (size_t j = 0; j < full_keys.size(); ++j) {
+        const size_t i = full_indices[j];
+        auto metadata = build_ranged_read_metadata_from_query_result(
+            full_keys[j], queries[j]);
+        if (!metadata) {
+            results[i] = tl::unexpected(metadata.error());
+            continue;
+        }
+        const size_t size = metadata->total_size;
+        if (size > requests[i].size) continue;
+
+        void *buffer = destinations[i];
+        // Imported MLU memory is not registered with TCP/remote transports.
+        // Batch those reads into registered host buffers, then copy only the
+        // successful values. Local memory replicas can copy directly to MLU.
+        if (size && (!metadata->replica.is_memory_replica() ||
+                     !client_->CanUseLocalMemcpy(metadata->replica) ||
+                     client_->IsHotCacheEnabled())) {
+            auto allocation = client_buffer_allocator_
+                                  ? client_buffer_allocator_->allocate(size)
+                                  : std::nullopt;
+            if (!allocation) {
+                // A large batch need not fit the staging pool simultaneously.
+                // Retry these items after the current batch releases its slots.
+                deferred.push_back(i);
+                continue;
+            }
+            buffer = allocation->ptr();
+            staging.push_back(std::move(*allocation));
+        }
+        batch_keys.push_back(full_keys[j]);
+        batch_buffers.push_back(buffer);
+        batch_sizes.push_back(size);
+        batch_indices.push_back(i);
+        batch_queries.push_back(std::move(queries[j]));
+    }
+    if (!batch_keys.empty()) {
+        auto batch_results = batch_get_into_internal(
+            batch_keys, batch_buffers, batch_sizes, batch_queries,
+            [this](const std::string &endpoint,
+                   LocalDiskOffloadObjects &objects) {
+                return batch_get_into_offload_object_internal(endpoint,
+                                                              objects);
+            });
+        for (size_t j = 0; j < batch_indices.size(); ++j) {
+            const size_t i = batch_indices[j];
+            results[i] = batch_results[j];
+            if (results[i] && batch_buffers[j] != destinations[i]) {
+                auto copied = scatter_host_to_maybe_device(
+                    destinations[i], batch_buffers[j], results[i].value(),
+                    "MLU IPC batch read, key: " + batch_keys[j]);
+                if (!copied) results[i] = tl::unexpected(copied.error());
+            }
+        }
+    }
+    staging.clear();
+    for (const size_t i : deferred) {
+        results[i] =
+            get_into_range_internal(requests[i].key, destinations[i], 0, 0,
+                                    requests[i].size, true, true);
     }
     return results;
 }
