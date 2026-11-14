@@ -402,16 +402,36 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsChunkInSlabTail) {
         pool, {{reinterpret_cast<void*>(kBase + kAllocSize), kAllocSize}}));
 }
 
-TEST_F(BufferAllocatorTest, CachelibImportRejectsNonMemoryReplicaType) {
+TEST_F(BufferAllocatorTest, CachelibImportRejectsUnsupportedReplicaType) {
     constexpr uintptr_t kBase = 0x1F0000000ULL;
     constexpr size_t kCapacity = 2 * facebook::cachelib::Slab::kSize;
     const std::string endpoint = "cachelib-memory-only";
     std::vector<LiveAllocation> allocations = {{0, 64}};
 
-    EXPECT_FALSE(ImportCachelibBufferAllocator(
-                     "cachelib-memory-only", kBase, kCapacity, endpoint, "tcp",
-                     allocations, ReplicaType::NOF_SSD)
+    EXPECT_FALSE(ImportCachelibBufferAllocator("cachelib-memory-only", kBase,
+                                               kCapacity, endpoint, "tcp",
+                                               allocations, ReplicaType::DISK)
                      .has_value());
+}
+
+TEST_F(BufferAllocatorTest, CachelibImportPreservesNoFTypeAndReleasesRange) {
+    constexpr uintptr_t kBase = 0x1F0000000ULL;
+    constexpr size_t kCapacity = 2 * facebook::cachelib::Slab::kSize;
+    auto restored = ImportCachelibBufferAllocator(
+        "cachelib-nof", kBase, kCapacity, "nof-endpoint", "nvmeof", {{0, 4096}},
+        ReplicaType::NOF_SSD);
+    ASSERT_TRUE(restored);
+    ASSERT_EQ(restored->buffers.size(), 1u);
+    const auto descriptor = restored->buffers.front()->get_descriptor();
+    EXPECT_EQ(descriptor.buffer_address_, kBase);
+    EXPECT_EQ(descriptor.transport_endpoint_, "nof-endpoint");
+    EXPECT_EQ(descriptor.protocol_, "nvmeof");
+    EXPECT_EQ(restored->allocator->size(), 4096u);
+    restored->buffers.clear();
+    EXPECT_EQ(restored->allocator->size(), 0u);
+    auto reused = restored->allocator->allocate(4096);
+    ASSERT_TRUE(reused);
+    EXPECT_EQ(reused->get_descriptor().buffer_address_, kBase);
 }
 
 // Test allocation request larger than available space

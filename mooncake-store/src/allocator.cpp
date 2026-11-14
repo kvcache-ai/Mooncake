@@ -356,7 +356,8 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
-    if (replica_type != ReplicaType::MEMORY ||
+    if ((replica_type != ReplicaType::MEMORY &&
+         replica_type != ReplicaType::NOF_SSD) ||
         !IsValidCachelibLayout(base, size)) {
         return std::nullopt;
     }
