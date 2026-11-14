@@ -458,6 +458,34 @@ if(USE_HIP)
   add_test(NAME tent_rocm_platform_test COMMAND tent_rocm_platform_test)
 endif()
 
+if(USE_HYLINK AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(tent_hylink_transport_test hylink_transport_test.cpp)
+  target_link_libraries(tent_hylink_transport_test
+                        PRIVATE gtest gtest_main tent_link_group hip::host)
+  target_include_directories(tent_hylink_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  set(hylink_wrapped_symbols
+      hipGetDeviceCount
+      hipGetDevice
+      hipSetDevice
+      hipStreamCreate
+      hipStreamDestroy
+      hipStreamSynchronize
+      hipMemcpyAsync
+      hipEventCreateWithFlags
+      hipEventRecord
+      hipEventSynchronize
+      hipEventQuery
+      hipEventDestroy
+      hipGetLastError
+      hipGetErrorString)
+  foreach(symbol IN LISTS hylink_wrapped_symbols)
+    target_link_options(tent_hylink_transport_test
+                        PRIVATE "-Wl,--wrap=${symbol}")
+  endforeach()
+  add_test(NAME tent_hylink_transport_test COMMAND tent_hylink_transport_test)
+endif()
+
 if(TARGET tent_xport_gds)
   add_executable(tent_gds_transport_status_test gds_transport_status_test.cpp)
   target_link_libraries(tent_gds_transport_status_test PRIVATE gtest gtest_main

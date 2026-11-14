@@ -20,6 +20,7 @@
 #include <exception>
 #include <vector>
 
+#include "hip_device_guard.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/slab.h"
 
@@ -440,21 +441,37 @@ Status HylinkTransport::submitTransferTasks(
 
     for (const auto& request : request_list) {
         hylink_batch->task_list.push_back(HylinkTask{});
-        auto status = startAsyncTransfer(request, local_segment,
-                                         hylink_batch->task_list.back());
+        auto status = prepareAsyncTransfer(request, local_segment,
+                                           hylink_batch->task_list.back());
         if (!status.ok()) {
-            LOG(ERROR) << "HylinkTransport: submit task failed: "
-                       << status.ToString();
             rollback_tasks();
             return status;
         }
     }
+
+    bool copy_accepted = false;
+    for (size_t i = original_task_count; i < hylink_batch->task_list.size();
+         ++i) {
+        auto& task = hylink_batch->task_list[i];
+        auto status = submitTaskCopy(task);
+        if (status.ok()) {
+            copy_accepted = true;
+            continue;
+        }
+        LOG(ERROR) << "HylinkTransport: submit task failed: "
+                   << status.ToString();
+        if (!copy_accepted) {
+            rollback_tasks();
+            return status;
+        }
+        task.status_word = TransferStatusEnum::FAILED;
+    }
     return Status::OK();
 }
 
-Status HylinkTransport::startAsyncTransfer(const Request& request,
-                                           const SegmentDescRef& local_segment,
-                                           HylinkTask& task) {
+Status HylinkTransport::prepareAsyncTransfer(
+    const Request& request, const SegmentDescRef& local_segment,
+    HylinkTask& task) {
     BufferDesc* buf = local_segment->findBuffer(
         reinterpret_cast<uint64_t>(request.source), request.length);
     if (!buf) {
@@ -489,7 +506,6 @@ Status HylinkTransport::startAsyncTransfer(const Request& request,
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        status = submitTaskCopy(task);
     }
     if (switch_device) (void)hipSetDevice(saved_device);
     return status;
@@ -523,10 +539,24 @@ hipStream_t HylinkTransport::acquireStream(int device_id) {
 }
 
 Status HylinkTransport::submitTaskCopy(HylinkTask& task) {
+    HipDeviceGuard device_guard(task.device_id);
+    if (!device_guard.set_ok()) {
+        return Status::InternalError(
+            "hylink failed to set the source buffer's device" LOC_MARK);
+    }
     hipStream_t stream = acquireStream(task.device_id);
     if (!stream) {
         return Status::InternalError(
             "hylink failed to create a copy stream" LOC_MARK);
+    }
+    hipEvent_t event = nullptr;
+    hipError_t err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
+    if (err != hipSuccess) {
+        std::string message = hipGetErrorString(err);
+        (void)hipGetLastError();
+        if (event) (void)hipEventDestroy(event);
+        return Status::InternalError(
+            std::string("hylink event create failed: ") + message + LOC_MARK);
     }
     void* src = nullptr;
     void* dst = nullptr;
@@ -537,23 +567,35 @@ Status HylinkTransport::submitTaskCopy(HylinkTask& task) {
         src = task.request.source;
         dst = reinterpret_cast<void*>(task.target_addr);
     }
-    hipError_t err =
+    err =
         hipMemcpyAsync(dst, src, task.request.length, hipMemcpyDefault, stream);
     if (err != hipSuccess) {
         std::string message = hipGetErrorString(err);
         (void)hipGetLastError();
+        (void)hipEventDestroy(event);
         return Status::InternalError(std::string("hylink async copy failed: ") +
                                      message + LOC_MARK);
     }
-    hipEvent_t event = nullptr;
-    err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
-    if (err == hipSuccess) err = hipEventRecord(event, stream);
+    err = hipEventRecord(event, stream);
     if (err != hipSuccess) {
         std::string message = hipGetErrorString(err);
         (void)hipGetLastError();
-        if (event) (void)hipEventDestroy(event);
-        return Status::InternalError(
-            std::string("hylink event record failed: ") + message + LOC_MARK);
+        hipError_t sync_err = hipStreamSynchronize(stream);
+        (void)hipEventDestroy(event);
+        if (sync_err != hipSuccess) {
+            LOG(ERROR) << "HylinkTransport: hipEventRecord failed (" << message
+                       << ") and stream synchronization failed: "
+                       << hipGetErrorString(sync_err);
+            (void)hipGetLastError();
+            task.status_word = TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+        LOG(WARNING) << "HylinkTransport: hipEventRecord failed after the "
+                        "copy was accepted; synchronized the stream instead: "
+                     << message;
+        task.transferred_bytes = task.request.length;
+        task.status_word = TransferStatusEnum::COMPLETED;
+        return Status::OK();
     }
     task.completion_event = event;
     return Status::OK();
