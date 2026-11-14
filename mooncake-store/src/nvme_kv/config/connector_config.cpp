@@ -1,4 +1,4 @@
-#include "connector_config.h"
+#include "nvme_kv/connector_config.h"
 
 #include <glog/logging.h>
 
@@ -21,11 +21,10 @@ uint32_t ReadNvmeKvU32Or(const EnvironmentVariable<std::string>& variable,
     return TryParseNvmeKvU32(value->c_str()).value_or(fallback);
 }
 
-tl::expected<NvmeKvTransport, ErrorCode> ReadTransport() {
-    const auto transport =
-        Environ::Read(
-            NvmeKvConnectorEnvironmentVariables::MOONCAKE_NVME_KV_TRANSPORT)
-            .value_or("");
+}  // namespace
+
+tl::expected<NvmeKvTransport, ErrorCode> ParseNvmeKvTransport(
+    std::string_view transport) {
     if (transport.empty() || transport == "auto") {
         return NvmeKvTransport::kAuto;
     }
@@ -35,11 +34,8 @@ tl::expected<NvmeKvTransport, ErrorCode> ReadTransport() {
     if (transport == "ioctl") {
         return NvmeKvTransport::kIoctl;
     }
-    LOG(ERROR) << "Unknown MOONCAKE_NVME_KV_TRANSPORT: " << transport;
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
-
-}  // namespace
 
 const char* NvmeKvTransportName(NvmeKvTransport transport) {
     switch (transport) {
@@ -75,8 +71,13 @@ NvmeKvConnectorConfig::FromEnvironment() {
         ReadNvmeKvU32Or(NvmeKvConnectorEnvironmentVariables::
                             MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT,
                         config.runtime_transfer_limit);
-    auto transport = ReadTransport();
+    const auto transport_name =
+        Environ::Read(
+            NvmeKvConnectorEnvironmentVariables::MOONCAKE_NVME_KV_TRANSPORT)
+            .value_or("");
+    auto transport = ParseNvmeKvTransport(transport_name);
     if (!transport.has_value()) {
+        LOG(ERROR) << "Unknown MOONCAKE_NVME_KV_TRANSPORT: " << transport_name;
         return tl::make_unexpected(transport.error());
     }
     config.transport = *transport;

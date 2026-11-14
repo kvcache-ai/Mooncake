@@ -2,11 +2,14 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "nvme_kv/key_codec.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -26,6 +29,8 @@ struct NvmeKvObjectHeader {
 
     static constexpr uint32_t kMagic = 0x4e564b56;
 };
+
+inline constexpr uint32_t kMinMaxValueSize = sizeof(NvmeKvObjectHeader) + 1;
 
 struct NvmeKvStoredIdentityMetadata {
     NvmeKvPhysicalKey resolved_physical_key{};
@@ -48,6 +53,31 @@ struct NvmeKvManifestChunkRecord {
     uint32_t payload_size;
     uint32_t payload_checksum;
 };
+
+struct NvmeKvWritePlan {
+    NvmeKvObjectIdentity identity;
+    NvmeKvPhysicalKey root_key{};
+    uint32_t slot = 0;
+    uint32_t payload_size = 0;
+    bool store_inline = false;
+    std::string root_blob;
+    std::vector<std::pair<NvmeKvPhysicalKey, std::string_view>> chunk_values;
+    std::vector<NvmeKvManifestChunkRecord> manifest_records;
+};
+
+struct NvmeKvWritePlacement {
+    NvmeKvPhysicalKey root_key;
+    uint32_t slot;
+    // Invoked synchronously only when the object needs chunks.
+    std::function<NvmeKvPhysicalKey(uint32_t)> chunk_key;
+};
+
+tl::expected<NvmeKvWritePlan, ErrorCode> BuildNvmeKvWritePlan(
+    const NvmeKvObjectIdentity& identity, std::string_view payload,
+    uint32_t max_value_size, const NvmeKvWritePlacement& placement);
+
+tl::expected<uint32_t, ErrorCode> ComputeNvmeKvInlineSize(
+    uint64_t logical_key_size, uint64_t payload_size, uint32_t value_limit);
 
 uint32_t ComputeNvmeKvPayloadChecksum(std::string_view payload);
 uint32_t ComputeNvmeKvHeaderChecksum(const NvmeKvObjectHeader& header);
