@@ -755,7 +755,7 @@ class RealClient : public PyClient {
     using LocalDiskOffloadObjects =
         std::unordered_map<std::string, std::vector<Slice>>;
     using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
-        const std::string &, LocalDiskOffloadObjects &)>;
+        const std::string &, const std::string &, LocalDiskOffloadObjects &)>;
 
     // Dependency-injected overload used to verify routing decisions without
     // requiring multiple live SSD offload servers.
@@ -983,6 +983,7 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const std::string &tenant_id,
         const OffloadReadRange *read_range = nullptr);
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
@@ -996,7 +997,7 @@ class RealClient : public PyClient {
     tl::expected<std::unique_ptr<OffloadRestoreLease>, ErrorCode>
     restore_offload_objects(
         const std::string &target_rpc_service_addr,
-        const std::vector<std::string> &keys,
+        const std::string &tenant_id, const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
         bool allow_pinned = true,

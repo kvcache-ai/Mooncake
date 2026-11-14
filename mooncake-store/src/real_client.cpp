@@ -512,6 +512,14 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
 
+inline const std::string &ReadTenant(const QueryResult &qr,
+                                     const std::string &requesting_tenant) {
+    // Old masters do not report the resolved scope; keep their legacy lookup.
+    return qr.resolved_tenant_id && !qr.resolved_tenant_id->empty()
+               ? *qr.resolved_tenant_id
+               : requesting_tenant;
+}
+
 // Preserve the selected medium and lease. Affinity-enabled memory reads retain
 // their candidates until the actual destination of each read is known.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
@@ -4100,8 +4108,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         std::unordered_map<std::string, std::vector<Slice>> objects;
         objects.emplace(
             key, std::vector<Slice>{{buffer_handle->ptr(), total_length}});
-        auto read_result =
-            batch_get_into_offload_object_internal(endpoint, objects);
+        auto read_result = batch_get_into_offload_object_internal(
+            endpoint, objects,
+            ReadTenant(query_result.value(), client_->tenant_id()));
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
@@ -4589,9 +4598,8 @@ RealClient::batch_get_buffer_internal(
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
     if (!disk_ops.empty()) {
-        // Group by transport endpoint
-        std::unordered_map<std::string,
-                           std::unordered_map<std::string, std::vector<Slice>>>
+        // Keep the master's resolved tenant with each owner batch.
+        std::map<std::pair<std::string, std::string>, LocalDiskOffloadObjects>
             offload_objects;
         // Build key -> first disk_ops index for result lookup. The maps are
         // keyed by string, so duplicate keys transfer once via the first
@@ -4620,18 +4628,19 @@ RealClient::batch_get_buffer_internal(
                 continue;
             }
             const auto &replica = *replica_ptr;
-            offload_objects[replica.get_local_disk_descriptor()
-                                .transport_endpoint]
+            offload_objects[{replica.get_local_disk_descriptor()
+                                 .transport_endpoint,
+                             ReadTenant(op.query_result, client_->tenant_id())}]
                 .emplace(op.key, std::vector<Slice>{
                                      {op.buffer_handle->ptr(), op.total_size}});
         }
 
         std::vector<tl::expected<int64_t, ErrorCode>> op_status(
             disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-        for (auto &[endpoint, objects] : offload_objects) {
+        for (auto &[target, objects] : offload_objects) {
             if (objects.empty()) continue;
-            auto read_result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            auto read_result = batch_get_into_offload_object_internal(
+                target.first, objects, target.second);
             for (auto &[key, slices] : objects) {
                 auto idx_it = disk_key_to_idx.find(key);
                 if (idx_it == disk_key_to_idx.end()) continue;
@@ -4679,7 +4688,7 @@ RealClient::batch_get_buffer_internal(
                         for (const auto &r : op.query_result.replicas) {
                             if (r.is_local_disk_replica() &&
                                 r.get_local_disk_descriptor()
-                                        .transport_endpoint == endpoint) {
+                                        .transport_endpoint == target.first) {
                                 failed_replica = &r;
                                 break;
                             }
@@ -5034,8 +5043,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             objects.emplace(
                 key, std::vector<Slice>{
                          {static_cast<char *>(buffer) + dst_offset, size}});
-            auto result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            auto result = batch_get_into_offload_object_internal(
+                endpoint, objects,
+                ReadTenant(query_result, client_->tenant_id()));
             if (!result) return tl::unexpected(result.error());
             if (verify_checksum) {
                 auto checksum_result = client_->VerifyObjectChecksum(
@@ -5191,7 +5201,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             {key, {{dst, size}}}};
         if (can_use_pinned_restore_arena(endpoint, objects)) {
             auto result = batch_get_into_offload_object_internal(
-                endpoint, objects, &read_range);
+                endpoint, objects,
+                ReadTenant(query_result, client_->tenant_id()), &read_range);
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
@@ -5201,8 +5212,10 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(key, std::vector<Slice>{
                                          {static_cast<char *>(tmp_buf), size}});
-                return batch_get_into_offload_object_internal(endpoint, objects,
-                                                              &read_range);
+                return batch_get_into_offload_object_internal(
+                    endpoint, objects,
+                    ReadTenant(query_result, client_->tenant_id()),
+                    &read_range);
             },
             size);
     }
@@ -6847,8 +6860,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     const auto query_results = client_->BatchQuery(keys);
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
+        [this](const std::string &endpoint, const std::string &tenant_id,
+               LocalDiskOffloadObjects &objects) {
+            return batch_get_into_offload_object_internal(endpoint, objects,
+                                                          tenant_id);
         });
 }
 
@@ -7188,14 +7203,14 @@ RealClient::batch_get_into_internal(
     }
 
     // Prepare batch transfer data structures
-    std::unordered_map<std::string,
-                       std::unordered_map<std::string, std::vector<Slice>>>
+    std::map<std::pair<std::string, std::string>, LocalDiskOffloadObjects>
         offload_objects;
 
     for (const auto &op_it : valid_local_disk_operations) {
         const auto &replica = op_it.second.replica;
-        auto [store_segment_it, _] = offload_objects.try_emplace(
-            replica.get_local_disk_descriptor().transport_endpoint);
+        auto [store_segment_it, _] = offload_objects.try_emplace(std::make_pair(
+            replica.get_local_disk_descriptor().transport_endpoint,
+            ReadTenant(op_it.second.query_result, client_->tenant_id())));
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
@@ -7205,7 +7220,8 @@ RealClient::batch_get_into_internal(
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = local_disk_reader(
-            offload_objects_it.first, offload_objects_it.second);
+            offload_objects_it.first.first, offload_objects_it.first.second,
+            offload_objects_it.second);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
@@ -7805,16 +7821,17 @@ void RealClient::execute_session_local_disk_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
-    // Group by owner endpoint. Restore the byte window this layer actually
-    // transfers, then scatter those bytes. The owner must not read the rest
-    // of the object.
+    // Group by owner and resolved tenant. Restore the byte window this layer
+    // actually transfers, then scatter those bytes. The owner must not read the
+    // rest of the object.
     struct KeyPlan {
         int64_t object_size{0};
         int64_t window_offset{0};
         int64_t window_length{0};
         std::vector<const SessionRangeReadRequest *> key_requests;
     };
-    std::unordered_map<std::string, std::unordered_map<std::string, KeyPlan>>
+    std::map<std::pair<std::string, std::string>,
+             std::unordered_map<std::string, KeyPlan>>
         endpoint_plans;
     for (const auto &request : requests) {
         const uint64_t total_size =
@@ -7827,14 +7844,16 @@ void RealClient::execute_session_local_disk_range_reads(
         const auto &endpoint =
             request.selected_replica.get_local_disk_descriptor()
                 .transport_endpoint;
-        auto &plan = endpoint_plans[endpoint][request.object_key];
+        auto &plan = endpoint_plans[{
+            endpoint, ReadTenant(request.cached_query_result,
+                                 client_->tenant_id())}][request.object_key];
         if (plan.key_requests.empty()) {
             plan.object_size = static_cast<int64_t>(total_size);
         }
         plan.key_requests.push_back(&request);
     }
 
-    for (const auto &[endpoint, keys] : endpoint_plans) {
+    for (const auto &[target, keys] : endpoint_plans) {
         std::vector<std::string> restore_keys;
         std::vector<int64_t> restore_sizes;
         std::vector<int64_t> restore_offsets;
@@ -7854,7 +7873,7 @@ void RealClient::execute_session_local_disk_range_reads(
                 }
             }
             auto window = BoundingValueWindow(ranges);
-            auto &mutable_plan = endpoint_plans[endpoint][key];
+            auto &mutable_plan = endpoint_plans[target][key];
             if (!window ||
                 window->offset >
                     static_cast<uint64_t>(mutable_plan.object_size) ||
@@ -7883,7 +7902,7 @@ void RealClient::execute_session_local_disk_range_reads(
         }
 
         auto restored = restore_offload_objects(
-            endpoint, restore_keys, restore_sizes, {},
+            target.first, target.second, restore_keys, restore_sizes, {},
             /*allow_pinned=*/false, &restore_offsets, &object_sizes);
         if (!restored) {
             for (const auto &key : restore_keys) {
@@ -8900,9 +8919,8 @@ RealClient::batch_get_into_multi_buffers_internal(
         // into non-contiguous per-layer GPU destinations natively — no temp
         // CPU buffer or H2D copy needed.
         {
-            std::unordered_map<
-                std::string,
-                std::unordered_map<std::string, std::vector<Slice>>>
+            std::map<std::pair<std::string, std::string>,
+                     LocalDiskOffloadObjects>
                 offload_objects;
 
             for (auto &[key, op] : valid_local_disk_ops) {
@@ -8930,15 +8948,16 @@ RealClient::batch_get_into_multi_buffers_internal(
                         tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
-                offload_objects[replica.get_local_disk_descriptor()
-                                    .transport_endpoint]
-                    .emplace(key, std::move(user_slices));
+                offload_objects
+                    [{replica.get_local_disk_descriptor().transport_endpoint,
+                      ReadTenant(op.query_result, client_->tenant_id())}]
+                        .emplace(key, std::move(user_slices));
             }
 
-            for (auto &[endpoint, objects] : offload_objects) {
+            for (auto &[target, objects] : offload_objects) {
                 if (objects.empty()) continue;
-                auto read_result =
-                    batch_get_into_offload_object_internal(endpoint, objects);
+                auto read_result = batch_get_into_offload_object_internal(
+                    target.first, objects, target.second);
                 // On success: results[original_index] was already pre-filled
                 // with total_size when valid_local_disk_ops was built; nothing
                 // to update. Only overwrite on failure.
@@ -9676,7 +9695,7 @@ bool RealClient::can_use_pinned_restore_arena(
 
 tl::expected<std::unique_ptr<RealClient::OffloadRestoreLease>, ErrorCode>
 RealClient::restore_offload_objects(
-    const std::string &target_rpc_service_addr,
+    const std::string &target_rpc_service_addr, const std::string &tenant,
     const std::vector<std::string> &keys,
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
@@ -9694,7 +9713,7 @@ RealClient::restore_offload_objects(
         allow_pinned &&
         can_use_pinned_restore_arena(target_rpc_service_addr, objects);
 
-    const TenantId tenant_id(client_->tenant_id());
+    const TenantId tenant_id(tenant);
     std::vector<std::string> storage_keys;
     storage_keys.reserve(keys.size());
     for (const auto &key : keys) {
@@ -9749,7 +9768,7 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
-    const OffloadReadRange *read_range) {
+    const std::string &tenant_id, const OffloadReadRange *read_range) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
@@ -9795,8 +9814,8 @@ RealClient::batch_get_into_offload_object_internal(
         object_sizes_arg = &object_sizes;
     }
     auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
-                                true, offsets_arg, object_sizes_arg);
+        restore_offload_objects(target_rpc_service_addr, tenant_id, keys, sizes,
+                                objects, true, offsets_arg, object_sizes_arg);
     if (!restored) {
         return tl::unexpected(restored.error());
     }
