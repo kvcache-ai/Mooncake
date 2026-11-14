@@ -150,6 +150,15 @@ service is unregistered and registered again. On a dropped connection the
 client reconnects after one second and, when replay is enabled, replays from
 the last applied sequence.
 
+A live sequence that moves backwards means the publisher restarted: counters
+are per process and start again from zero without a reset signal. The client
+retracts everything the source contributed, forgets its sequence state, and
+resubscribes from that message as a fresh registration would, so the restarted
+engine's cache is tracked again without operator action. Events the new
+publisher emitted before the subscriber reconnected are not replayed, and a
+restart whose counter has already passed the previous one looks like an
+ordinary gap.
+
 ## Query flow
 
 1. A router obtains prompt token IDs, usually from an engine tokenizer endpoint.

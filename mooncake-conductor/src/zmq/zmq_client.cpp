@@ -301,6 +301,15 @@ std::string ZMQClient::ProcessMessage() {
         return "";
     }
 
+    // The live stream is ordered and never repeats, so a sequence that moves
+    // backwards means the publisher restarted and began a new epoch. Its cache
+    // went with it: retract what this source contributed and resubscribe from
+    // this message, as a fresh registration would.
+    if (last_live_seq != -1 && seq <= last_live_seq) {
+        ResetSource(seq);
+        last_live_seq = -1;
+    }
+
     const bool new_gap = last_live_seq != -1 &&
                          last_live_seq != std::numeric_limits<int64_t>::max() &&
                          seq > last_live_seq + 1;
@@ -636,6 +645,38 @@ void ZMQClient::MarkStale(const std::string& reason) {
                << " reason=" << reason;
     if (event_handler_ != nullptr) {
         event_handler_->OnSourceStale(config_.cache_pool_key, metadata, reason);
+    }
+}
+
+void ZMQClient::ResetSource(int64_t restarted_seq) {
+    MessageMetadata metadata;
+    int64_t previous_live_seq = -1;
+    {
+        std::unique_lock lock(mu_);
+        previous_live_seq = last_live_seq_;
+        metadata = {
+            .publisher_kind = config_.publisher_kind,
+            .endpoint = config_.endpoint,
+            .topic = "",
+            .sequence = last_seq_,
+        };
+        last_seq_ = -1;
+        last_live_seq_ = -1;
+        recovery_in_progress_ = false;
+        buffered_messages_.clear();
+        buffered_message_bytes_ = 0;
+    }
+
+    const std::string reason = "live sequence regressed from " +
+                               std::to_string(previous_live_seq) + " to " +
+                               std::to_string(restarted_seq) +
+                               "; assuming the publisher restarted";
+    LOG(WARNING) << "ZMQ event source restarted service="
+                 << config_.cache_pool_key << " endpoint=" << config_.endpoint
+                 << " last_sequence=" << metadata.sequence
+                 << " reason=" << reason;
+    if (event_handler_ != nullptr) {
+        event_handler_->OnSourceReset(config_.cache_pool_key, metadata, reason);
     }
 }
 

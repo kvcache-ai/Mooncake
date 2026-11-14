@@ -56,6 +56,13 @@ class KVEventHandler : public zmq::EventHandler {
                        const zmq::MessageMetadata& metadata,
                        const std::string& reason) override;
 
+    // The publisher restarted, so nothing it reported before survives: its
+    // index entries are retracted, but the handler stays available because the
+    // client keeps consuming the new epoch.
+    void OnSourceReset(const std::string& cache_pool_key,
+                       const zmq::MessageMetadata& metadata,
+                       const std::string& reason) override;
+
     void MarkUnavailable();
 
     // Waits for callbacks admitted before MarkUnavailable() to finish. Must be
@@ -121,6 +128,8 @@ class KVEventHandler : public zmq::EventHandler {
     std::string ClearMooncakeBindings(
         const std::optional<std::string>& backend_id,
         const std::optional<std::string>& tenant_id);
+    // Drops every index entry this source contributed.
+    std::string RetractIndexEntries();
 
     bool BeginDispatch();
     void EndDispatch();
