@@ -353,6 +353,19 @@ jobs:
         df -h
       shell: bash
 
+    - name: Build and run classic Python sync characterization tests
+      run: |
+        cmake -S . -B build-classic-sync -G Ninja \
+          -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_EP=OFF \
+          -DUSE_TENT=OFF -DUSE_CUDA=OFF -DUSE_TCP=ON \
+          -DUSE_ETCD=OFF -DUSE_REDIS=OFF -DUSE_HTTP=OFF -DWITH_METRICS=OFF \
+          -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
+          -DENABLE_SCCACHE=ON
+        cmake --build build-classic-sync --target transfer_engine_py_sync_test --parallel 2
+        ctest --test-dir build-classic-sync -V \
+          -R '^transfer_engine_py_sync_test$' --timeout 60
+      shell: bash
+
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
