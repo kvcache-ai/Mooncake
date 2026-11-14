@@ -318,16 +318,19 @@ class Transport {
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
-            // Store the failure before the completion count becomes visible.
-            // A sibling slice can otherwise observe the count, publish
-            // COMPLETED, and leave getBatchTransferStatus returning FAILED.
-            if (t->batch_id) {
+            // An event batch publishes one snapshot from whichever slice
+            // drops the latch, and that snapshot only reads has_failure.
+            // The flag must be visible before completion_state. Legacy
+            // batches still record it in finishIfComplete, after the count.
+            const bool event_batch =
+                t->batch_id && toBatchDesc(t->batch_id).event_enabled;
+            if (event_batch) {
                 toBatchDesc(t->batch_id)
                     .has_failure.store(true, std::memory_order_release);
             }
             const uint64_t state =
                 __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
-            finishIfComplete(t, state);
+            finishIfComplete(t, state, /*record_failure=*/!event_batch);
         }
 
         static void unsealTaskSubmission(TransferTask *task) {
@@ -344,13 +347,16 @@ class Transport {
         volatile int64_t ts;
 
        private:
-        static inline void finishIfComplete(TransferTask *task,
-                                            uint64_t state) {
+        static inline void finishIfComplete(TransferTask *task, uint64_t state,
+                                            bool record_failure = false) {
             // Handshake / dummy slices are not attached to a BatchDesc.
             if (!task->batch_id) return;
             // Callers hold a pin on this BatchDesc across the publish and
             // this callback; see CompletionCallbackPin.
             auto &batch_desc = toBatchDesc(task->batch_id);
+            if (record_failure) {
+                batch_desc.has_failure.store(true, std::memory_order_relaxed);
+            }
 
             const uint64_t done = state & kCompletionDoneMask;
             const uint64_t slice_count =
