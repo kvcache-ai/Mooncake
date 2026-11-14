@@ -240,6 +240,10 @@ struct MemoryOptions {
     std::string shm_path = "";
     size_t shm_offset = 0;
     bool internal = false;
+    // Nonzero requests a CUDA VMM allocation at this exact global VA.
+    // Participants choose a common layout and map each published region at
+    // its owner's address. Zero lets the backend choose the local VA.
+    uint64_t global_address = 0;
 };
 
 const std::string kLocalFileSegmentPrefix = "file://";

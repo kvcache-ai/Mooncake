@@ -98,6 +98,16 @@ Status TransferEngine::freeLocalMemory(void* addr) {
     return impl_->freeLocalMemory(addr);
 }
 
+Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                                       TransportType type) {
+    return impl_->mapRemoteMemory(peer, gva, size, type);
+}
+
+Status TransferEngine::unmapRemoteMemory(SegmentID peer, void* gva,
+                                         TransportType type) {
+    return impl_->unmapRemoteMemory(peer, gva, type);
+}
+
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,
                                            Permission permission) {
     return impl_->registerLocalMemory({addr}, {size}, permission);

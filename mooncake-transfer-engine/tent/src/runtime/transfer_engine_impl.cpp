@@ -882,6 +882,17 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
 
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
+    if (options.global_address && options.type == UNSPEC) {
+        for (auto type : getSupportedTransports(UNSPEC)) {
+            if (transport_list_[type]->supportsGlobalAddressing()) {
+                options.type = type;
+                break;
+            }
+        }
+        if (options.type == UNSPEC)
+            return Status::NotImplemented(
+                "No global-address transport" LOC_MARK);
+    }
     if (options.type == UNSPEC) {
         auto location_type = LocationParser(options.location).type();
         bool host_location =
@@ -905,10 +916,16 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
+    if (options.type <= UNSPEC || options.type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid memory transport type" LOC_MARK);
     auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
             "Not supported type in memory options" LOC_MARK);
+    if (options.global_address && !transport->supportsGlobalAddressing())
+        return Status::NotImplemented(
+            "Transport has no global-address allocator" LOC_MARK);
     const bool default_shm =
         options.type == SHM && options.location == kWildcardLocation;
     if (default_shm) options.location = "cpu:0";
@@ -930,6 +947,20 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
     for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
          ++it) {
         if (it->addr == addr) {
+            if (it->options.global_address) {
+                auto segment = metadata_->segmentManager().getLocal();
+                if (segment) {
+                    const auto base = reinterpret_cast<uint64_t>(addr);
+                    for (const auto& buffer :
+                         std::get<MemorySegmentDesc>(segment->detail).buffers) {
+                        if (buffer.addr < base + it->size &&
+                            base < buffer.addr + buffer.length)
+                            return Status::InvalidArgument(
+                                "Unregister GVA memory before freeing "
+                                "it" LOC_MARK);
+                    }
+                }
+            }
             auto status = it->transport->freeLocalMemory(addr, it->size);
             if (!status.ok()) {
                 LOG(WARNING)
@@ -942,6 +973,54 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
         }
     }
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
+}
+
+Status TransferEngineImpl::mapRemoteMemory(SegmentID peer, void* gva,
+                                           size_t size, TransportType type) {
+    const auto address = reinterpret_cast<uint64_t>(gva);
+    if (peer == LOCAL_SEGMENT_ID || !address || !size ||
+        size > UINT64_MAX - address || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid global mapping range or transport" LOC_MARK);
+    std::vector<TransportType> exported;
+    if (type == UNSPEC) {
+        SegmentDescRef pin;
+        CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+            peer, pin, [&](SegmentDesc* segment) -> Status {
+                auto* buffer = segment->findBuffer(address, size);
+                if (!buffer)
+                    return Status::NeedsRefreshCache(
+                        "Memory range is not registered" LOC_MARK);
+                exported = buffer->transports;
+                return Status::OK();
+            }));
+    }
+    for (auto candidate : getSupportedTransports(type)) {
+        if (transport_list_[candidate]->supportsGlobalAddressing() &&
+            (type != UNSPEC || std::find(exported.begin(), exported.end(),
+                                         candidate) != exported.end()))
+            return transport_list_[candidate]->mapRemoteMemory(peer, gva, size);
+    }
+    return Status::NotImplemented("No global-address transport" LOC_MARK);
+}
+
+Status TransferEngineImpl::unmapRemoteMemory(SegmentID peer, void* gva,
+                                             TransportType type) {
+    if (peer == LOCAL_SEGMENT_ID || !gva || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid global mapping or transport" LOC_MARK);
+    Status status =
+        Status::NotImplemented("No global-address transport" LOC_MARK);
+    for (auto candidate : getSupportedTransports(type)) {
+        if (!transport_list_[candidate]->supportsGlobalAddressing()) continue;
+        status = transport_list_[candidate]->unmapRemoteMemory(peer, gva);
+        if (status.ok() ||
+            (!status.IsInvalidArgument() && !status.IsNotImplemented()))
+            return status;
+    }
+    return status;
 }
 
 // Forward declaration: getTypeEnum() is defined below but is needed by the

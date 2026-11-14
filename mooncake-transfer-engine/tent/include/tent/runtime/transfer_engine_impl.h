@@ -303,6 +303,11 @@ class TransferEngineImpl {
 
     Status freeLocalMemory(void* addr);
 
+    Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                           TransportType type);
+
+    Status unmapRemoteMemory(SegmentID peer, void* gva, TransportType type);
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
