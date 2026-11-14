@@ -1138,8 +1138,20 @@ class BenchmarkRunner:
                 args=(lane_id, session),
                 name=f"{phase_name}-lane{lane_id}",
             )
+            try:
+                thread.start()
+            except BaseException as exc:
+                for started in threads:
+                    started.join()
+                for started_id, error in enumerate(errors):
+                    if error is not None:
+                        LOG.error(
+                            "%s lane %d failed", phase_name, started_id, exc_info=error
+                        )
+                raise RuntimeError(
+                    f"{phase_name} lane {lane_id} failed to start"
+                ) from exc
             threads.append(thread)
-            thread.start()
 
         for thread in threads:
             thread.join()
