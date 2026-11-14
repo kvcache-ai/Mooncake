@@ -367,8 +367,10 @@ the task is already terminal. Continue polling `getTransferStatus` before
 calling `freeBatch`.
 
 Cancellation is idempotent. Merged public tasks share one physical transfer,
-so canceling any alias cancels the shared task. Direct cancellation of staging
-or non-RDMA transport work currently returns `Status::NotImplemented`.
+so canceling any alias cancels the shared task. A staged transfer stops issuing
+new chunks and reports `CANCELED` once the chunks already in flight have
+drained. Work on a transport that does not support cancellation returns
+`Status::NotImplemented`.
 
 #### TransferEngine::freeBatch
 

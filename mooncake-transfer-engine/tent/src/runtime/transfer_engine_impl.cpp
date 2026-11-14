@@ -3263,9 +3263,25 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
 
     auto& owner = batch->task_list[owner_task_id];
     if (owner.status != PENDING) return Status::OK();
+    // Merged public tasks share one physical transport task. Mark every alias
+    // so polling any of them cannot trigger failover after cancellation.
+    auto mark_aliases_canceled = [&]() {
+        for (size_t alias_id = 0; alias_id < batch->task_list.size();
+             ++alias_id) {
+            auto& task = batch->task_list[alias_id];
+            if (alias_id == owner_task_id ||
+                (task.derived &&
+                 task.physical_owner_task_id == owner_task_id)) {
+                task.cancel_requested = true;
+            }
+        }
+    };
     if (owner.staging) {
-        return Status::NotImplemented(
-            "staging transfer cancellation is not implemented" LOC_MARK);
+        // The staging worker stops issuing chunks and reports CANCELED once
+        // the chunks already in flight have drained.
+        owner.staging_cancel_requested.store(true, std::memory_order_release);
+        mark_aliases_canceled();
+        return Status::OK();
     }
     if (owner.type == UNSPEC) {
         owner.cancel_requested = true;
@@ -3284,15 +3300,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     }
 
     CHECK_STATUS(transport->cancelTransferTask(sub_batch, owner.sub_task_id));
-    // Merged public tasks share one physical transport task. Mark every alias
-    // so polling any of them cannot trigger failover after cancellation.
-    for (size_t alias_id = 0; alias_id < batch->task_list.size(); ++alias_id) {
-        auto& task = batch->task_list[alias_id];
-        if (alias_id == owner_task_id ||
-            (task.derived && task.physical_owner_task_id == owner_task_id)) {
-            task.cancel_requested = true;
-        }
-    }
+    mark_aliases_canceled();
     return Status::OK();
 }
 

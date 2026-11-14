@@ -1814,6 +1814,67 @@ TEST(EngineFailoverE2E, MergedStagingRequestsShareOneSubmission) {
     }
 }
 
+TEST(EngineFailoverE2E, CancelStagedTransferReportsCanceledAfterDrain) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("max_failover_attempts", 0);
+    cfg->set("use_legacy_transport_selection", false);
+    constexpr size_t kLength = 4096;
+    std::vector<uint8_t> local(kLength), remote(kLength);
+    std::atomic<bool> complete{false};
+    TransferEngineImpl target(cfg), initiator(cfg);
+    ASSERT_TRUE(target.available());
+    ASSERT_TRUE(initiator.available());
+    auto network = std::make_shared<FakeTransport>(
+        TCP, [](const Request&) { return TransferStatus{PENDING, 0}; },
+        [&](const Request& request, int) {
+            return complete.load() ? TransferStatus{COMPLETED, request.length}
+                                   : TransferStatus{PENDING, 0};
+        });
+    initiator.swapTransportForTest(TCP, network);
+    target.swapTransportForTest(TCP, std::make_shared<FakeTransport>(TCP));
+    ASSERT_TRUE(initiator.registerLocalMemory(local.data(), kLength).ok());
+    ASSERT_TRUE(target.registerLocalMemory(remote.data(), kLength).ok());
+    SegmentID peer;
+    ASSERT_TRUE(initiator.openSegment(peer, target.getSegmentName()).ok());
+    ASSERT_TRUE(
+        TransferEngineImplTestPeer::setCachedPeerBufferToMlu(
+            initiator, peer, reinterpret_cast<uint64_t>(remote.data()), kLength)
+            .ok());
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = local.data();
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(remote.data());
+    request.length = kLength;
+    const auto batch = initiator.allocateBatch(1);
+    ASSERT_NE(batch, static_cast<BatchID>(0));
+    ASSERT_TRUE(initiator.submitTransfer(batch, {request}).ok());
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (network->submit_calls.load() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_EQ(network->submit_calls.load(), 1);
+
+    EXPECT_TRUE(initiator.cancelTransfer(batch, 0).ok());
+    TransferStatus status{};
+    EXPECT_TRUE(initiator.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+
+    complete.store(true);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        ASSERT_TRUE(initiator.getTransferStatus(batch, 0, status).ok());
+    } while (status.s == PENDING &&
+             std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(status.s, CANCELED);
+    EXPECT_EQ(network->submit_calls.load(), 1);
+
+    EXPECT_TRUE(initiator.freeBatch(batch).ok());
+    EXPECT_TRUE(initiator.closeSegment(peer).ok());
+    EXPECT_TRUE(initiator.unregisterLocalMemory(local.data()).ok());
+    EXPECT_TRUE(target.unregisterLocalMemory(remote.data()).ok());
+}
+
 TEST(EngineFailoverE2E, PollStageFailoverWithDerivedTasksRunsOnce) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("merge_requests", true);
