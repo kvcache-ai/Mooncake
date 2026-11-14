@@ -390,6 +390,20 @@ class TransferEngineImpl {
         }
     }
 
+    // How many times getTransportType ran. Test hook; the relaxed add is
+    // negligible next to findBuffer.
+    uint64_t transportResolveCallsForTest() const {
+        return transport_resolve_calls_.load(std::memory_order_relaxed);
+    }
+    void resetTransportResolveCallsForTest() {
+        transport_resolve_calls_.store(0, std::memory_order_relaxed);
+    }
+
+    // Publish an empty local snapshot, or bump the remote-cache generation,
+    // without changing buffer contents. Route-cache tests use this from inside
+    // one submit to show a newer generation is not reused.
+    void publishSegmentSnapshotForTest(bool local);
+
     Status publishRuntimeConfigForTest(
         std::shared_ptr<const RuntimeConfigSnapshot> snapshot) {
         if (!snapshot) {
@@ -567,7 +581,8 @@ class TransferEngineImpl {
                           bool force_failover);
 
     SelectionResult resolveTransport(const Request& req, int transport_index,
-                                     bool invalidate_on_fail = true);
+                                     bool invalidate_on_fail = true,
+                                     bool* refreshed = nullptr);
 
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
@@ -690,6 +705,7 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
+    std::atomic<uint64_t> transport_resolve_calls_{0};
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};

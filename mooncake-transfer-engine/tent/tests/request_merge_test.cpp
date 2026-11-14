@@ -26,9 +26,12 @@ struct RequestBoundaryInfo {
     uint64_t max_merge_bytes{std::numeric_limits<uint64_t>::max()};
 };
 
+// Field order matches transfer_engine_impl.cpp. mergeRequests returns this
+// by value, so a shorter mirror writes the third vector past the caller.
 struct MergeResult {
     std::vector<Request> request_list;
     std::vector<size_t> task_lookup;
+    std::vector<size_t> first_public;
 };
 
 MergeResult mergeRequests(const std::vector<Request>& requests,
@@ -296,6 +299,7 @@ TEST(RequestMergeTest, EmptyInputHasNoTaskMapping) {
         auto result = mergeRequests({}, {}, merge);
         EXPECT_TRUE(result.request_list.empty());
         EXPECT_TRUE(result.task_lookup.empty());
+        EXPECT_TRUE(result.first_public.empty());
     }
 }
 
@@ -312,8 +316,10 @@ TEST(RequestMergeTest, PassThroughKeepsOriginalOrder) {
         auto result = mergeRequests(requests, {}, merge);
         ASSERT_EQ(result.task_lookup.size(), requests.size());
         ASSERT_EQ(result.request_list.size(), requests.size());
+        ASSERT_EQ(result.first_public.size(), requests.size());
         for (size_t i = 0; i < requests.size(); ++i) {
             EXPECT_EQ(result.task_lookup.at(i), i);
+            EXPECT_EQ(result.first_public.at(i), i);
             EXPECT_EQ(result.request_list[i].source, requests[i].source);
             EXPECT_EQ(result.request_list[i].length, requests[i].length);
         }
@@ -338,6 +344,9 @@ TEST(RequestMergeTest, ShuffledRequestsMapBackToOriginalIndices) {
     EXPECT_EQ(result.request_list[0].length, 64u);
     EXPECT_EQ(result.request_list[1].length, 48u);
     ASSERT_EQ(result.task_lookup.size(), requests.size());
+    ASSERT_EQ(result.first_public.size(), 2u);
+    EXPECT_EQ(result.first_public[0], 1u);
+    EXPECT_EQ(result.first_public[1], 2u);
     const std::array<size_t, 4> owners{1, 0, 1, 0};
     for (size_t i = 0; i < owners.size(); ++i)
         EXPECT_EQ(result.task_lookup.at(i), owners[i]);
