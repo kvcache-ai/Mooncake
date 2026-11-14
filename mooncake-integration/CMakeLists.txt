@@ -181,6 +181,10 @@ if(NOT SKBUILD)
   # python/mooncake/mooncake_config.py with their downstream business tasks.
   # Owner: F02-B05; retain this marker until all receiver obligations close.
   if(WITH_STORE)
+    set_target_properties(mooncake_master mooncake_client
+                          PROPERTIES INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
+    install(TARGETS mooncake_master mooncake_client
+            RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
     install(
       FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
