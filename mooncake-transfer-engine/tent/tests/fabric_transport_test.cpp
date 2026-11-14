@@ -505,40 +505,47 @@ TEST_F(FabricTransportTest, OverdueOpUnregisterRetryStillWaits) {
     for (size_t i = 0; i < length; ++i) buffer_[i] = pattern(i, 5);
     ASSERT_EQ(run({makeRequest(Request::WRITE, 0, 0, length)}), 1);
 
-    std::vector<uint8_t> scratch(1 << 20, 0);
-    ASSERT_TRUE(
-        client_->registerLocalMemory(scratch.data(), scratch.size()).ok());
-    Request read = makeRequest(Request::READ, 0, 0, length);
-    read.source = scratch.data();
+    for (auto permission : {kGlobalReadWrite, kLocalReadWrite}) {
+        SCOPED_TRACE(static_cast<int>(permission));
+        std::vector<uint8_t> scratch(1 << 20, 0);
+        auto register_scratch = [&] {
+            return client_->registerLocalMemory(scratch.data(), scratch.size(),
+                                                permission);
+        };
+        ASSERT_TRUE(register_scratch().ok());
+        Request read = makeRequest(Request::READ, 0, 0, length);
+        read.source = scratch.data();
 
-    // Keep a completed generation alive so the retry cannot just wait for
-    // the first retired entry at this address.
-    BatchID completed = submit({read});
-    ASSERT_EQ(settle(completed, 5000), TransferStatusEnum::COMPLETED);
-    ASSERT_TRUE(
-        client_->unregisterLocalMemory(scratch.data(), scratch.size()).ok());
-    ASSERT_TRUE(
-        client_->registerLocalMemory(scratch.data(), scratch.size()).ok());
-    std::memset(scratch.data(), 0, scratch.size());
+        // Keep a completed generation alive so the retry cannot just wait for
+        // the first retired entry at this address.
+        BatchID completed = submit({read});
+        ASSERT_EQ(settle(completed, 5000), TransferStatusEnum::COMPLETED);
+        ASSERT_TRUE(
+            client_->unregisterLocalMemory(scratch.data(), scratch.size())
+                .ok());
+        ASSERT_TRUE(register_scratch().ok());
+        std::memset(scratch.data(), 0, scratch.size());
 
-    server_.pause();
-    BatchID overdue = submit({read});
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    EXPECT_EQ(batchStatus(*client_, overdue), TransferStatusEnum::PENDING);
+        server_.pause();
+        BatchID overdue = submit({read});
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        EXPECT_EQ(batchStatus(*client_, overdue), TransferStatusEnum::PENDING);
 
-    auto status =
-        client_->unregisterLocalMemory(scratch.data(), scratch.size());
-    EXPECT_FALSE(status.ok()) << status.ToString();
-    status = client_->unregisterLocalMemory(scratch.data(), scratch.size());
-    EXPECT_FALSE(status.ok()) << status.ToString();
+        auto status =
+            client_->unregisterLocalMemory(scratch.data(), scratch.size());
+        EXPECT_FALSE(status.ok()) << status.ToString();
+        status = client_->unregisterLocalMemory(scratch.data(), scratch.size());
+        EXPECT_FALSE(status.ok()) << status.ToString();
 
-    server_.resume();
-    EXPECT_EQ(settle(overdue, 10000), TransferStatusEnum::COMPLETED);
-    ASSERT_TRUE(
-        client_->unregisterLocalMemory(scratch.data(), scratch.size()).ok());
-    EXPECT_EQ(std::memcmp(scratch.data(), buffer_.data(), length), 0);
-    (void)client_->freeBatch(completed);
-    (void)client_->freeBatch(overdue);
+        server_.resume();
+        EXPECT_EQ(settle(overdue, 10000), TransferStatusEnum::COMPLETED);
+        ASSERT_TRUE(
+            client_->unregisterLocalMemory(scratch.data(), scratch.size())
+                .ok());
+        EXPECT_EQ(std::memcmp(scratch.data(), buffer_.data(), length), 0);
+        (void)client_->freeBatch(completed);
+        (void)client_->freeBatch(overdue);
+    }
 }
 
 }  // namespace

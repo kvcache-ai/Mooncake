@@ -881,7 +881,16 @@ Status FabricTransport::removeMemoryBuffer(BufferDesc& desc) {
 bool FabricTransport::tracksLocalBuffer(const BufferDesc& desc) const {
     std::shared_lock<std::shared_mutex> guard(buffers_mutex_);
     auto it = buffers_.find(desc.addr);
-    return it != buffers_.end() && it->second->length == desc.length;
+    if (it != buffers_.end()) return it->second->length == desc.length;
+    // Local-only retries have no advertised transport tag to reach removal.
+    for (const auto& weak : retired_) {
+        auto buffer = weak.lock();
+        if (buffer && buffer->addr == desc.addr &&
+            buffer->length == desc.length) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace tent
