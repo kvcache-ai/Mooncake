@@ -726,6 +726,18 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     return ErrorCode::OK;
 }
 
+bool ScopedSegmentAccess::HasAllocatedMemory(
+    const std::string& segment_name) const {
+    const auto id = segment_manager_->segment_id_by_name_.find(segment_name);
+    if (id == segment_manager_->segment_id_by_name_.end()) {
+        return false;
+    }
+    const auto mounted = segment_manager_->mounted_segments_.find(id->second);
+    return mounted != segment_manager_->mounted_segments_.end() &&
+           mounted->second.buf_allocator &&
+           mounted->second.buf_allocator->size() != 0;
+}
+
 ErrorCode ScopedSegmentAccess::GetUnreadySegments(
     std::vector<std::pair<Segment, UUID>>& unready_segments) const {
     unready_segments.clear();

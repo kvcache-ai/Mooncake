@@ -1611,6 +1611,9 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    if (query_result.IsLeaseExpired()) {
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
     // Select a complete replica for this request's destination.
     Replica::Descriptor replica;
     ErrorCode err =
@@ -1692,6 +1695,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
+    if (query_result.IsLeaseExpired()) {
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
     Replica::Descriptor replica;
     ErrorCode err =
         MakeReadReplicaSelector()(query_result.replicas, slices, replica);
@@ -1813,7 +1819,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-
         // Select a complete replica for this key's destination.
         Replica::Descriptor replica;
         ErrorCode err =
@@ -1823,6 +1828,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
             }
             results[i] = tl::unexpected(err);
+            continue;
+        }
+
+        // Validate the requested length without accessing the replica's
+        // buffer. A malformed request keeps its transfer error even when the
+        // lease has expired.
+        if (replica.is_memory_replica() &&
+            CalculateSliceSize(slices_it->second) !=
+                replica.get_memory_descriptor().buffer_descriptor.size_) {
+            LOG(ERROR) << "Transfer length mismatch for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            continue;
+        }
+        if (query_result.IsLeaseExpired()) {
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
             continue;
         }
 
@@ -1863,12 +1883,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 replica, slices_it->second, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size,
                 TransferIntent::kForegroundGet);
-        } else if (group_by_target && replica.is_memory_replica() &&
-                   CalculateSliceSize(slices_it->second) ==
-                       replica.get_memory_descriptor()
-                           .buffer_descriptor.size_) {
-            // A size mismatch would fail the whole group in submit_batch, so
-            // such a key stays on the per-key path and fails alone.
+        } else if (group_by_target && replica.is_memory_replica()) {
             auto& group =
                 target_groups[replica.get_memory_descriptor()
                                   .buffer_descriptor.transport_endpoint_];
@@ -4763,6 +4778,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         // Target already exists, consider it success
         auto move_end_result = master_client_.MoveEnd(key, tenant_id);
         if (!move_end_result.has_value()) {
+            (void)master_client_.MoveRevoke(key, tenant_id);
             ErrorCode error = move_end_result.error();
             LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
                        << ", error=move_end_failed" << ", error_code=" << error;

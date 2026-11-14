@@ -4046,6 +4046,60 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_FALSE(segment_names.contains("segment_0"));
 }
 
+TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(10000).build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service, "move_source");
+    PrepareSimpleSegment(*service, "move_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto tenant = TenantId::Default();
+    const auto key =
+        PutObjectOnSegment(*service, source.client_id, "move_source");
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.preferred_segment = "move_source";
+
+    auto upsert =
+        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    ASSERT_TRUE(upsert);
+    auto premature_move = service->MoveStart(source.client_id, key, tenant,
+                                             "move_source", "move_target");
+    ASSERT_FALSE(premature_move);
+    EXPECT_EQ(premature_move.error(), ErrorCode::REPLICA_NOT_FOUND);
+    ASSERT_TRUE(
+        service->UpsertEnd(source.client_id, key, tenant, ReplicaType::MEMORY));
+
+    auto before = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->replicas.size(), 1u);
+    const auto source_id = before->replicas.front().id;
+    auto move = service->MoveStart(source.client_id, key, tenant, "move_source",
+                                   "move_target");
+    ASSERT_TRUE(move);
+    ASSERT_TRUE(move->target);
+
+    auto concurrent_upsert =
+        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    ASSERT_FALSE(concurrent_upsert);
+    EXPECT_EQ(concurrent_upsert.error(),
+              ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    auto during = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(during);
+    ASSERT_EQ(during->replicas.size(), 1u);
+    EXPECT_EQ(during->replicas.front().id, source_id);
+    ASSERT_TRUE(service->MoveRevoke(source.client_id, key, tenant));
+
+    auto after = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(after);
+    ASSERT_EQ(after->replicas.size(), 1u);
+    EXPECT_EQ(after->replicas.front().id, source_id);
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  "move_target"),
+              0);
+}
+
 // Drain plans and completes one tenant at a time: the segment counts as
 // drained only once every tenant's object under the same user key has left
 // it.
