@@ -44,11 +44,6 @@ BarexTransport::BarexTransport() {}
 BarexTransport::~BarexTransport() { shutdownResources(); }
 
 void BarexTransport::shutdownResources() {
-#ifdef CONFIG_USE_BATCH_DESC_SET
-    for (auto &entry : batch_desc_set_) delete entry.second;
-    batch_desc_set_.clear();
-#endif
-
     if (connector_) {
         for (const auto &ctx : client_context_list_) {
             for (auto *channel : ctx->getAllChannel()) {
