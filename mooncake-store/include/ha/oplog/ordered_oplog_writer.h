@@ -19,6 +19,9 @@ namespace mooncake {
 
 struct OrderedOpLogWriterConfig {
     size_t max_entries_per_batch{1024};
+    // Bounds the encoded record of a group that exceeds
+    // max_entries_per_batch. Normal batching is still capped by that count.
+    size_t max_batch_record_bytes{1024 * 1024};
     DurablePrefix initial_durable_prefix{};
     std::chrono::milliseconds retry_timeout{0};
 };
@@ -81,10 +84,11 @@ class OrderedOpLogWriter {
 
     tl::expected<Reservation, ErrorCode> Reserve();
     // Reserve slots for one indivisible group of entries, to be committed
-    // together via CommitBatch. The same admission cap applies, so a group
-    // larger than max_entries_per_batch is rejected up front instead of
-    // producing an oversized record the backend might refuse.
-    tl::expected<Reservation, ErrorCode> ReserveBatch(size_t entry_count);
+    // together via CommitBatch. A group larger than max_entries_per_batch is
+    // rejected unless allow_oversize is set; CommitBatch also rejects such a
+    // group when its encoded record exceeds max_batch_record_bytes.
+    tl::expected<Reservation, ErrorCode> ReserveBatch(
+        size_t entry_count, bool allow_oversize = false);
     virtual tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     // Commit all entries as one indivisible group: they are sealed into a

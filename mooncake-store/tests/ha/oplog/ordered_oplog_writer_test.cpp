@@ -147,6 +147,16 @@ class FakeBatchWriter {
     bool blocked_write_active_{false};
 };
 
+class UnblockWritesOnExit {
+   public:
+    explicit UnblockWritesOnExit(FakeBatchWriter& storage)
+        : storage_(storage) {}
+    ~UnblockWritesOnExit() { storage_.UnblockWrites(); }
+
+   private:
+    FakeBatchWriter& storage_;
+};
+
 OpLogEntry MakeEntry(std::string key = "key", std::string payload = "value") {
     OpLogEntry entry;
     entry.timestamp_ms = 1234567890;
@@ -1827,6 +1837,251 @@ TEST(OrderedOpLogWriterAdmissionTest, ReserveBatchEnforcesAdmissionCap) {
     auto zero = writer.ReserveBatch(0);
     ASSERT_FALSE(zero.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, zero.error());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     ReserveBatchAllowsOversizeIndivisibleGroup) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto reservation = writer.ReserveBatch(6, /*allow_oversize=*/true);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    for (int i = 0; i < 6; ++i) {
+        entries.push_back(MakeEntry("key" + std::to_string(i)));
+    }
+    ASSERT_TRUE(writer
+                    .CommitBatch(std::move(*reservation), std::move(entries),
+                                 [](const auto&) {})
+                    .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    writer.Stop();
+
+    const auto batches = storage.Batches();
+    ASSERT_EQ(1u, batches.size());
+    ASSERT_EQ(6u, batches[0].entries.size());
+    EXPECT_EQ(1u, batches[0].first_seq);
+    EXPECT_EQ(6u, batches[0].last_seq);
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     OversizeAdmissionKeepsNormalBackpressure) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 3},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    auto no_room = writer.ReserveBatch(3);
+    ASSERT_FALSE(no_room.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, no_room.error());
+
+    auto oversize = writer.ReserveBatch(4, /*allow_oversize=*/true);
+    ASSERT_TRUE(oversize.has_value());
+    writer.Abort(std::move(*first));
+    writer.Abort(std::move(*oversize));
+
+    auto zero = writer.ReserveBatch(0, /*allow_oversize=*/true);
+    ASSERT_FALSE(zero.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, zero.error());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     OversizeGroupOverRecordLimitIsRejectedWithoutTerminal) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2,
+                                 .max_batch_record_bytes = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto reservation = writer.ReserveBatch(3, /*allow_oversize=*/true);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    for (int i = 0; i < 3; ++i) {
+        entries.push_back(MakeEntry("over" + std::to_string(i)));
+    }
+    auto committed = writer.CommitBatch(std::move(*reservation),
+                                        std::move(entries), [](const auto&) {});
+    ASSERT_FALSE(committed.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, committed.error());
+    EXPECT_TRUE(writer.IsAccepting());
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
+
+    // The rejected reservation released its slots and consumed no sequence
+    // id; the next commit starts at sequence 1.
+    auto next = writer.Reserve();
+    ASSERT_TRUE(next.has_value());
+    auto next_handle =
+        writer.Commit(std::move(*next), MakeEntry("after"), [](const auto&) {});
+    ASSERT_TRUE(next_handle.has_value());
+    EXPECT_EQ(1u, next_handle->sequence_id());
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    const auto batches = storage.Batches();
+    ASSERT_EQ(1u, batches.size());
+    EXPECT_EQ(1u, batches[0].first_seq);
+    EXPECT_EQ(1u, batches[0].last_seq);
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     OversizeGroupSealsAfterInFlightBatchWithoutSplitting) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    storage.BlockWrites();
+    auto plain = writer.Reserve();
+    ASSERT_TRUE(plain.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*plain), MakeEntry("plain"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForBlockedWrite());
+
+    auto reservation = writer.ReserveBatch(5, /*allow_oversize=*/true);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    for (int i = 0; i < 5; ++i) {
+        entries.push_back(MakeEntry("group" + std::to_string(i)));
+    }
+    ASSERT_TRUE(writer
+                    .CommitBatch(std::move(*reservation), std::move(entries),
+                                 [](const auto&) {})
+                    .has_value());
+
+    storage.UnblockWrites();
+    ASSERT_TRUE(storage.WaitForWrites(2));
+    const auto batches = storage.Batches();
+    ASSERT_EQ(2u, batches.size());
+    EXPECT_EQ(1u, batches[0].entries.size());
+    ASSERT_EQ(5u, batches[1].entries.size());
+    EXPECT_EQ(2u, batches[1].first_seq);
+    EXPECT_EQ(6u, batches[1].last_seq);
+
+    // The oversized group released its waiting slots when it sealed.
+    auto after = writer.ReserveBatch(2);
+    ASSERT_TRUE(after.has_value());
+    writer.Abort(std::move(*after));
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     OversizeGroupStartsNewRecordInsteadOfMergingPendingEntries) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 3},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    storage.BlockWrites();
+    UnblockWritesOnExit unblock_on_exit(storage);
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*first), MakeEntry("first"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForBlockedWrite());
+
+    // The second normal entry stays queued behind the blocked write.
+    auto second = writer.Reserve();
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(
+        writer
+            .Commit(std::move(*second), MakeEntry("second"), [](const auto&) {})
+            .has_value());
+
+    // Reserve the trailing slot before the oversize group; the group
+    // consumes the remaining admission budget while it is pending.
+    auto after = writer.Reserve();
+    ASSERT_TRUE(after.has_value());
+
+    auto group = writer.ReserveBatch(5, /*allow_oversize=*/true);
+    ASSERT_TRUE(group.has_value());
+    std::vector<OpLogEntry> entries;
+    for (int i = 0; i < 5; ++i) {
+        entries.push_back(MakeEntry("group" + std::to_string(i)));
+    }
+    ASSERT_TRUE(writer
+                    .CommitBatch(std::move(*group), std::move(entries),
+                                 [](const auto&) {})
+                    .has_value());
+
+    // A trailing normal entry committed after the group must not be appended
+    // to the group's record.
+    ASSERT_TRUE(
+        writer.Commit(std::move(*after), MakeEntry("after"), [](const auto&) {})
+            .has_value());
+
+    storage.UnblockWrites();
+    ASSERT_TRUE(storage.WaitForWrites(4));
+    const auto batches = storage.Batches();
+    ASSERT_EQ(4u, batches.size());
+    EXPECT_EQ(1u, batches[0].entries.size());
+    EXPECT_EQ("first", batches[0].entries[0].object_key);
+    EXPECT_EQ(1u, batches[1].entries.size());
+    EXPECT_EQ("second", batches[1].entries[0].object_key);
+    ASSERT_EQ(5u, batches[2].entries.size());
+    EXPECT_EQ("group0", batches[2].entries[0].object_key);
+    EXPECT_EQ(3u, batches[2].first_seq);
+    EXPECT_EQ(7u, batches[2].last_seq);
+    EXPECT_EQ(1u, batches[3].entries.size());
+    EXPECT_EQ("after", batches[3].entries[0].object_key);
+    EXPECT_EQ(8u, batches[3].first_seq);
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     OversizeGroupAtDefaultCapSealsAsOneRecord) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(OrderedOpLogWriterConfig{},
+                              [&](const OpLogBatchRecord& batch,
+                                  const DurablePrefix& expected_prefix) {
+                                  return storage.Write(batch, expected_prefix);
+                              });
+    writer.Start();
+
+    auto reservation = writer.ReserveBatch(1025, /*allow_oversize=*/true);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    entries.reserve(1025);
+    for (int i = 0; i < 1025; ++i) {
+        entries.push_back(MakeEntry("key" + std::to_string(i)));
+    }
+    ASSERT_TRUE(writer
+                    .CommitBatch(std::move(*reservation), std::move(entries),
+                                 [](const auto&) {})
+                    .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    writer.Stop();
+
+    const auto batches = storage.Batches();
+    ASSERT_EQ(1u, batches.size());
+    ASSERT_EQ(1025u, batches[0].entries.size());
+    EXPECT_EQ(1u, batches[0].first_seq);
+    EXPECT_EQ(1025u, batches[0].last_seq);
 }
 
 TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
