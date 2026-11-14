@@ -2,13 +2,19 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
+#include <string>
 #include <vector>
 #include <sys/mman.h>  // For shm_open, mmap, munmap
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
-#include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <glog/logging.h>
+#include <unistd.h>  // For ftruncate, close, shm_unlink
 
+#include "bool_parser.h"
 #include "common/client_buffer_allocation.h"
+#include "environ.h"
+#include "environment_variables.h"
 
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -29,6 +35,25 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
         new ClientBufferAllocator(addr, size, protocol));
 }
 
+namespace {
+
+// MC_STORE_MADV_HUGEPAGE opts the owned RDMA client buffer into THP backing.
+// Off by default; an unparsable value is ignored with a warning.
+bool ClientBufferThpRequested() {
+    const std::string value = Environ::ReadOr(
+        HugepageEnvironmentVariables::MC_STORE_MADV_HUGEPAGE, std::string{});
+    if (value.empty()) return false;
+    const std::optional<bool> parsed = TryParseBool(value);
+    if (!parsed.has_value()) {
+        LOG(WARNING) << "Ignoring invalid MC_STORE_MADV_HUGEPAGE='" << value
+                     << "'; accepted values: 1/0, true/false, yes/no, on/off";
+        return false;
+    }
+    return *parsed;
+}
+
+}  // namespace
+
 ClientBufferAllocator::ClientBufferAllocator(
     size_t size, const std::string& protocol, bool use_hugepage,
     std::shared_ptr<DmaBufferAllocator> dma_allocator)
@@ -45,6 +70,19 @@ ClientBufferAllocator::ClientBufferAllocator(
     constexpr size_t alignment = 64;
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
+#ifndef USE_VRAM_SEGMENT
+    } else if (protocol == "rdma" && !dma_allocator_ &&
+               get_hugepage_size_from_env() == 0 &&
+               ClientBufferThpRequested()) {
+        // Opt-in (MC_STORE_MADV_HUGEPAGE): back the registered client buffer
+        // with THP, like the base-page RDMA global segment. A 4KB-backed
+        // buffer needs 512x more NIC translation entries, and ibv_reg_mr()
+        // fails with EINVAL on NICs that budget them per 4KB page (e.g.
+        // ionic).
+        thp_mapped_size_ = align_up(size, SZ_2MB);
+        buffer_ =
+            allocate_buffer_thp(thp_mapped_size_, ThpNumaPolicy::kInheritTask);
+#endif
     } else {
 #if defined(USE_SUNRISE)
         if (protocol == "sunrise_link") {
@@ -78,6 +116,8 @@ ClientBufferAllocator::~ClientBufferAllocator() {
     if (!is_external_memory_ && buffer_) {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
+        } else if (thp_mapped_size_ > 0) {
+            free_buffer_mmap_memory(buffer_, thp_mapped_size_);
         } else {
             free_memory(protocol, buffer_, dma_allocator_.get());
         }
