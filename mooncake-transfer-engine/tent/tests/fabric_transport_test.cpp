@@ -417,7 +417,8 @@ TEST_F(FabricTransportTest, PeerLossFails) {
 
 // Pins both sides to one NIC with the given op limits.
 ConfigTweak oneNic(size_t max_posted_ops, uint64_t op_timeout_ms,
-                   uint64_t post_timeout_ms) {
+                   uint64_t post_timeout_ms,
+                   uint64_t quiesce_timeout_ms = 20000) {
     const std::string domain = firstDomain();
     return [=](Config& config) {
         config.set("transports/fabric/devices",
@@ -425,7 +426,7 @@ ConfigTweak oneNic(size_t max_posted_ops, uint64_t op_timeout_ms,
         config.set("transports/fabric/max_posted_ops", max_posted_ops);
         config.set("transports/fabric/op_timeout_ms", op_timeout_ms);
         config.set("transports/fabric/post_timeout_ms", post_timeout_ms);
-        config.set("transports/fabric/quiesce_timeout_ms", 20000);
+        config.set("transports/fabric/quiesce_timeout_ms", quiesce_timeout_ms);
         // Nothing to fail over to; the engine would refetch the metadata
         // of the stopped server first and wait for the RPC to time out.
         config.set("max_failover_attempts", 0);
@@ -492,6 +493,52 @@ TEST_F(FabricTransportTest, OverdueOpHoldsTaskAndBuffer) {
     (void)client_->freeBatch(overdue);
     // The peer is usable again once its overdue op has returned.
     EXPECT_EQ(run({makeRequest(Request::WRITE, 0, 4096, 4096)}), 1);
+}
+
+// A timed-out unregister keeps the tracker registration for a retry. The
+// retry must find the retired buffer and wait for the same in-flight op.
+TEST_F(FabricTransportTest, OverdueOpUnregisterRetryStillWaits) {
+    if (!targetDrivenProgress())
+        GTEST_SKIP() << "needs a provider driven by target progress";
+    connect(0, 0, oneNic(0, 200, 5000, 100));
+    const size_t length = 64 * 1024;
+    for (size_t i = 0; i < length; ++i) buffer_[i] = pattern(i, 5);
+    ASSERT_EQ(run({makeRequest(Request::WRITE, 0, 0, length)}), 1);
+
+    std::vector<uint8_t> scratch(1 << 20, 0);
+    ASSERT_TRUE(
+        client_->registerLocalMemory(scratch.data(), scratch.size()).ok());
+    Request read = makeRequest(Request::READ, 0, 0, length);
+    read.source = scratch.data();
+
+    // Keep a completed generation alive so the retry cannot just wait for
+    // the first retired entry at this address.
+    BatchID completed = submit({read});
+    ASSERT_EQ(settle(completed, 5000), TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(
+        client_->unregisterLocalMemory(scratch.data(), scratch.size()).ok());
+    ASSERT_TRUE(
+        client_->registerLocalMemory(scratch.data(), scratch.size()).ok());
+    std::memset(scratch.data(), 0, scratch.size());
+
+    server_.pause();
+    BatchID overdue = submit({read});
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(batchStatus(*client_, overdue), TransferStatusEnum::PENDING);
+
+    auto status =
+        client_->unregisterLocalMemory(scratch.data(), scratch.size());
+    EXPECT_FALSE(status.ok()) << status.ToString();
+    status = client_->unregisterLocalMemory(scratch.data(), scratch.size());
+    EXPECT_FALSE(status.ok()) << status.ToString();
+
+    server_.resume();
+    EXPECT_EQ(settle(overdue, 10000), TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(
+        client_->unregisterLocalMemory(scratch.data(), scratch.size()).ok());
+    EXPECT_EQ(std::memcmp(scratch.data(), buffer_.data(), length), 0);
+    (void)client_->freeBatch(completed);
+    (void)client_->freeBatch(overdue);
 }
 
 }  // namespace

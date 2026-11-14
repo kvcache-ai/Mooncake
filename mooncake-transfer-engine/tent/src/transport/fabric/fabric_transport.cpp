@@ -820,27 +820,39 @@ Status FabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
 }
 
 Status FabricTransport::removeMemoryBuffer(BufferDesc& desc) {
-    std::shared_ptr<FabricLocalBuffer> buffer;
+    std::shared_ptr<FabricLocalBuffer> removed;
+    std::vector<std::shared_ptr<FabricLocalBuffer>> buffers;
     {
         std::unique_lock<std::shared_mutex> guard(buffers_mutex_);
         auto it = buffers_.find(desc.addr);
-        if (it == buffers_.end()) return Status::OK();
-        if (it->second->length != desc.length) {
-            return Status::InvalidArgument(
-                "Fabric buffer address registered with a different "
-                "length" LOC_MARK);
+        if (it != buffers_.end()) {
+            if (it->second->length != desc.length) {
+                return Status::InvalidArgument(
+                    "Fabric buffer address registered with a different "
+                    "length" LOC_MARK);
+            }
+            removed = std::move(it->second);
+            buffers_.erase(it);
+            // In-flight tasks may still hold the buffer; its MRs close when
+            // the last one finishes, or at uninstall.
+            retired_.push_back(removed);
         }
-        buffer = std::move(it->second);
-        buffers_.erase(it);
-        // In-flight tasks may still hold the buffer; its MRs close when the
-        // last one finishes, or at uninstall.
         retired_.erase(
             std::remove_if(retired_.begin(), retired_.end(),
                            [](const std::weak_ptr<FabricLocalBuffer>& weak) {
                                return weak.expired();
                            }),
             retired_.end());
-        retired_.push_back(buffer);
+        // A timed-out removal retries with the buffer already retired. Wait
+        // for every matching generation in case the address was reused.
+        for (const auto& weak : retired_) {
+            auto buffer = weak.lock();
+            if (buffer && buffer->addr == desc.addr &&
+                buffer->length == desc.length) {
+                buffers.push_back(std::move(buffer));
+            }
+        }
+        if (buffers.empty()) return Status::OK();
     }
     desc.transport_attrs.erase(TransportType::FABRIC);
     desc.transports.erase(
@@ -851,13 +863,17 @@ Status FabricTransport::removeMemoryBuffer(BufferDesc& desc) {
     // not completed, so the caller must not reuse it before they do.
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(params_.quiesce_timeout_ms);
-    while (uint64_t active = buffer->active.load(std::memory_order_acquire)) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return Status::InternalError("Fabric buffer unregistered with " +
-                                         std::to_string(active) +
-                                         " transfers still in flight" LOC_MARK);
+    for (const auto& buffer : buffers) {
+        while (uint64_t active =
+                   buffer->active.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Status::InternalError(
+                    "Fabric buffer unregistered with " +
+                    std::to_string(active) +
+                    " transfers still in flight" LOC_MARK);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return Status::OK();
 }
