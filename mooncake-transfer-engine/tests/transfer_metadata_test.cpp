@@ -20,7 +20,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <dirent.h>
+#endif
+#include <optional>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -37,6 +43,7 @@
 #include "common.h"
 #include "config.h"
 #include "transfer_metadata_plugin.h"
+#include "transfer_engine.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -221,6 +228,37 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
 
 namespace {
 
+uint64_t rpcSocketInode(uint16_t port) {
+#ifdef __linux__
+    DIR *fds = opendir("/proc/self/fd");
+    EXPECT_NE(fds, nullptr);
+    if (!fds) return 0;
+    uint64_t inode = 0;
+    while (auto *entry = readdir(fds)) {
+        if (entry->d_name[0] == '.') continue;
+        int fd = atoi(entry->d_name), type = 0;
+        sockaddr_storage addr{};
+        socklen_t size = sizeof(addr), type_size = sizeof(type);
+        if (getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &size) ||
+            getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_size) ||
+            type != SOCK_STREAM)
+            continue;
+        uint16_t bound =
+            addr.ss_family == AF_INET
+                ? ntohs(reinterpret_cast<sockaddr_in *>(&addr)->sin_port)
+            : addr.ss_family == AF_INET6
+                ? ntohs(reinterpret_cast<sockaddr_in6 *>(&addr)->sin6_port)
+                : 0;
+        struct stat info{};
+        if (port && bound == port && fstat(fd, &info) == 0) inode = info.st_ino;
+    }
+    closedir(fds);
+    return inode;
+#else
+    return 0;  // Keep HTTP/status assertions on platforms without /proc.
+#endif
+}
+
 #ifdef USE_HTTP
 class LocalHttpMetadataServer {
    public:
@@ -256,6 +294,21 @@ class LocalHttpMetadataServer {
         if (listen_fd_ >= 0) (void)shutdown(listen_fd_, SHUT_RDWR);
         if (thread_.joinable()) thread_.join();
         if (listen_fd_ >= 0) close(listen_fd_);
+    }
+
+    std::atomic<int> rpc_put_status{200};
+    std::atomic<int> rpc_puts{0};
+    std::atomic<int> rpc_deletes{0};
+    std::atomic<uint16_t> rpc_port{0};
+    std::atomic<uint64_t> rpc_inode{0};
+    void seed(const std::string &key, const std::string &value) {
+        std::lock_guard<std::mutex> lock(values_mutex_);
+        values_[key] = value;
+    }
+    std::string value(const std::string &key) {
+        std::lock_guard<std::mutex> lock(values_mutex_);
+        auto it = values_.find(key);
+        return it == values_.end() ? "" : it->second;
     }
 
     bool ok() const { return ok_; }
@@ -360,7 +413,18 @@ class LocalHttpMetadataServer {
             const size_t header_end = request.find("\r\n\r\n");
             const std::string value = request.substr(header_end + 4);
             std::lock_guard<std::mutex> lock(values_mutex_);
-            values_[key] = value;
+            if (key.find("/rpc_meta/") != std::string::npos) {
+                ++rpc_puts;
+                status = rpc_put_status;
+                rpc_port = 0;
+                rpc_inode = 0;
+                Json::Value rpc;
+                if (Json::Reader().parse(value, rpc)) {
+                    rpc_port = rpc["rpc_port"].asUInt();
+                    rpc_inode = rpcSocketInode(rpc_port);
+                }
+            }
+            if (status == 200) values_[key] = value;
         } else if (method == "GET") {
             std::lock_guard<std::mutex> lock(values_mutex_);
             auto it = values_.find(key);
@@ -370,6 +434,7 @@ class LocalHttpMetadataServer {
                 body = it->second;
             }
         } else if (method == "DELETE") {
+            if (key.find("/rpc_meta/") != std::string::npos) ++rpc_deletes;
             std::lock_guard<std::mutex> lock(values_mutex_);
             values_.erase(key);
         } else {
@@ -1245,6 +1310,363 @@ class TestableTransferMetadata : public TransferMetadata {
         std::shared_ptr<MetadataStoragePlugin> storage_plugin)
         : TransferMetadata(std::move(storage_plugin)) {}
 };
+
+class RpcOwnershipStoragePlugin : public FakeMetadataStoragePlugin {
+   public:
+    bool reject = true;
+    bool reject_remove = false;
+    int puts = 0, deletes = 0;
+    bool set(const std::string &key, const Json::Value &value) override {
+        ++puts;
+        return !reject && FakeMetadataStoragePlugin::set(key, value);
+    }
+    bool remove(const std::string &key) override {
+        ++deletes;
+        return !reject_remove && FakeMetadataStoragePlugin::remove(key);
+    }
+};
+
+int createRpcTestSocket(int type) {
+    int fd = socket(AF_INET, type, 0);
+    if (fd < 0) return -1;
+    // Isolate intentional reuse from low descriptors opened by runtime threads.
+    int reserved = fcntl(fd, F_DUPFD, 64);
+    close(fd);
+    return reserved;
+}
+
+int reuseRpcTestSocket(int fd) {
+    int replacement = socket(AF_INET, SOCK_STREAM, 0);
+    if (replacement < 0 || replacement == fd) return replacement;
+    int result = dup2(replacement, fd);
+    close(replacement);
+    return result;
+}
+
+class TransferMetadataRpcOwnershipTest : public ::testing::Test {
+   protected:
+    const std::string key = "mooncake/rpc_meta/127.0.0.1";
+    const std::string original =
+        R"({"ip_or_host_name":"127.0.0.1","rpc_port":12345,"metadata_version":1})";
+    std::map<std::string, std::optional<std::string>> environment;
+    void SetUp() override {
+        google::InitGoogleLogging("TransferMetadataRpcOwnershipTest");
+        FLAGS_logtostderr = 1;
+        for (const char *name :
+             {"MC_FORCE_TCP", "MC_LEGACY_RPC_PORT_BINDING",
+              "MC_METADATA_CLUSTER_ID", "MC_USE_TENT", "MC_USE_TEV1",
+              "MC_TCP_BIND_ADDRESS", "MC_NUM_TCP_IO_THREADS"}) {
+            const char *value = getenv(name);
+            environment[name] =
+                value ? std::optional<std::string>(value) : std::nullopt;
+            unsetenv(name);
+        }
+        setenv("MC_TCP_BIND_ADDRESS", "127.0.0.1", 1);
+        setenv("MC_NUM_TCP_IO_THREADS", "1", 1);
+    }
+    void TearDown() override {
+        for (const auto &[name, value] : environment) {
+            if (value)
+                setenv(name.c_str(), value->c_str(), 1);
+            else
+                unsetenv(name.c_str());
+        }
+        google::ShutdownGoogleLogging();
+    }
+};
+
+TEST_F(TransferMetadataRpcOwnershipTest, RejectedHttpPublicationAndRetry) {
+#ifdef USE_HTTP
+    std::vector<std::string> retries{""};
+#ifdef USE_TCP
+    retries.insert(retries.end(), {"http", "p2p"});
+#endif
+    for (int status : {400, 503})
+        for (const auto &retry : retries) {
+            SCOPED_TRACE(std::to_string(status) + retry);
+            LocalHttpMetadataServer server;
+            ASSERT_TRUE(server.ok());
+            server.seed(key, original);
+            server.rpc_put_status = status;
+            {
+                TransferEngine engine(false);
+                for (int attempt = 0; attempt < 8; ++attempt) {
+                    ASSERT_EQ(engine.init(server.uri(), "127.0.0.1"),
+                              ERR_METADATA);
+                    EXPECT_EQ(server.rpc_puts, attempt + 1);  // Must reach PUT.
+                    EXPECT_GT(server.rpc_port, 0);
+#ifdef __linux__
+                    EXPECT_NE(server.rpc_inode,
+                              0);  // Reservation existed during PUT.
+                    EXPECT_EQ(rpcSocketInode(server.rpc_port), 0);
+#endif
+                    EXPECT_EQ(engine.getMetadata()->localRpcMeta().sockfd, -1);
+                    EXPECT_EQ(engine.getRpcPort(), 0);
+                    EXPECT_EQ(server.value(key), original);
+                    EXPECT_EQ(server.rpc_deletes, 0);
+                }
+                if (!retry.empty()) {
+                    server.rpc_put_status = 200;
+                    ASSERT_EQ(engine.init(
+                                  retry == "http" ? server.uri() : P2PHANDSHAKE,
+                                  "127.0.0.1"),
+                              0);
+                    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+                    EXPECT_EQ(server.rpc_deletes, 0);
+                    EXPECT_EQ(server.rpc_puts, retry == "http" ? 9 : 8);
+                    if (retry == "http")
+                        EXPECT_NE(server.value(key), original);
+                    else
+                        EXPECT_EQ(server.value(key), original);
+                }
+            }
+            EXPECT_EQ(server.rpc_deletes, retry == "http" ? 1 : 0);
+            EXPECT_EQ(server.value(key), retry == "http" ? "" : original);
+            EXPECT_EQ(rpcSocketInode(server.rpc_port), 0);
+        }
+#else
+    GTEST_SKIP() << "requires HTTP";
+#endif
+}
+
+TEST_F(TransferMetadataRpcOwnershipTest,
+       PublicationOwnershipAndStoreRepublish) {
+    auto storage = std::make_shared<RpcOwnershipStoragePlugin>();
+    Json::Value previous;
+    ASSERT_TRUE(Json::Reader().parse(original, previous));
+    storage->FakeMetadataStoragePlugin::set(key, previous);
+    TestableTransferMetadata metadata(storage);
+    TransferMetadata::RpcMetaDesc desc;
+    desc.ip_or_host_name = "127.0.0.1";
+    desc.rpc_port = 23456;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        EXPECT_EQ(metadata.addRpcMetaEntry("127.0.0.1", desc), ERR_METADATA);
+        EXPECT_EQ(metadata.removeRpcMetaEntry("127.0.0.1"), 0);
+        EXPECT_EQ(metadata.rePublishRpcMetaEntry("127.0.0.1"), ERR_METADATA);
+        Json::Value value;
+        ASSERT_TRUE(storage->get(key, value));
+        EXPECT_EQ(value, previous);
+    }
+    EXPECT_EQ(storage->puts, 8);
+    EXPECT_EQ(storage->deletes, 0);
+    storage->reject = false;
+    ASSERT_EQ(metadata.addRpcMetaEntry("127.0.0.1", desc), 0);
+    storage->drop(key);  // Store heartbeat recovery after server-side loss.
+    storage->reject = true;
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("127.0.0.1"), ERR_METADATA);
+    EXPECT_EQ(storage->deletes, 0);
+    storage->reject = false;
+    ASSERT_EQ(metadata.rePublishRpcMetaEntry("127.0.0.1"), 0);
+    Json::Value value;
+    ASSERT_TRUE(storage->get(key, value));
+    EXPECT_EQ(value["ip_or_host_name"].asString(), desc.ip_or_host_name);
+    EXPECT_EQ(value["rpc_port"].asUInt(), desc.rpc_port);
+    EXPECT_GT(value["metadata_version"].asUInt64(), desc.metadata_version);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("other-owner"), 0);
+    EXPECT_EQ(storage->deletes, 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("127.0.0.1"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("127.0.0.1"), 0);
+    EXPECT_EQ(storage->deletes, 1);
+    storage->reject = true;
+    EXPECT_EQ(metadata.addRpcMetaEntry("127.0.0.1", desc), ERR_METADATA);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("127.0.0.1"), 0);
+    EXPECT_EQ(storage->deletes, 1);
+
+    // One metadata instance may acknowledge more than one RPC key. Removing
+    // an earlier key must not lose eligibility for the current publication.
+    storage->reject = false;
+    ASSERT_EQ(metadata.addRpcMetaEntry("first", desc), 0);
+    ASSERT_EQ(metadata.addRpcMetaEntry("second", desc), 0);
+    storage->reject = true;
+    EXPECT_EQ(metadata.addRpcMetaEntry("unpublished", desc), ERR_METADATA);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("unpublished"), 0);
+    EXPECT_EQ(storage->deletes, 1);
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("first"), ERR_METADATA);
+    storage->reject_remove = true;
+    EXPECT_EQ(metadata.removeRpcMetaEntry("first"), ERR_METADATA);
+    storage->reject_remove = false;
+    EXPECT_EQ(metadata.removeRpcMetaEntry("first"), 0);
+    EXPECT_FALSE(storage->get("mooncake/rpc_meta/first", value));
+    EXPECT_TRUE(storage->get("mooncake/rpc_meta/second", value));
+    storage->drop("mooncake/rpc_meta/second");
+    storage->reject = false;
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("second"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("second"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("first"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("second"), 0);
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("second"), ERR_METADATA);
+    EXPECT_EQ(storage->deletes, 4);
+}
+
+TEST_F(TransferMetadataRpcOwnershipTest, FailedHandshakeConsumesFdOnce) {
+    std::vector<std::string> connections{P2PHANDSHAKE};
+#ifdef USE_HTTP
+    LocalHttpMetadataServer server;
+    ASSERT_TRUE(server.ok());
+    connections.push_back(server.uri());
+#endif
+    for (const auto &connection : connections) {
+        int fd = createRpcTestSocket(SOCK_DGRAM), replacement = -1;
+        ASSERT_GE(fd, 0);
+        {
+            TransferMetadata metadata(connection);
+            TransferMetadata::RpcMetaDesc desc;
+            desc.ip_or_host_name = "127.0.0.1";
+            desc.rpc_port = 0;
+            desc.sockfd = fd;
+            // listen() fails only after the daemon consumes this datagram fd.
+            int rc = metadata.addRpcMetaEntry("owner", desc);
+            if (connection == P2PHANDSHAKE)
+                EXPECT_EQ(rc, ERR_SOCKET);
+            else {
+                ASSERT_EQ(rc, 0);
+                EXPECT_EQ(metadata.startHandshakeDaemon(nullptr, 0, fd),
+                          ERR_SOCKET);
+            }
+            EXPECT_EQ(desc.sockfd, -1);
+            EXPECT_EQ(metadata.localRpcMeta().sockfd, -1);
+            EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+            replacement = reuseRpcTestSocket(fd);
+            ASSERT_EQ(replacement, fd);
+        }
+        EXPECT_NE(fcntl(replacement, F_GETFD), -1);
+        close(replacement);
+    }
+}
+
+TEST_F(TransferMetadataRpcOwnershipTest, SuccessfulHttpP2pAndLegacyCleanup) {
+#if defined(USE_HTTP) && defined(USE_TCP)
+    for (const std::string mode : {"http", "p2p", "legacy"}) {
+        SCOPED_TRACE(mode);
+        LocalHttpMetadataServer server;
+        ASSERT_TRUE(server.ok());
+        server.seed(key, original);
+        std::string name = "127.0.0.1";
+        if (mode == "legacy") {
+            int fd = -1;
+            auto port = findAvailableTcpPort(fd);
+            ASSERT_NE(port, 0);
+            close(fd);
+            name += ":" + std::to_string(port);
+            setenv("MC_LEGACY_RPC_PORT_BINDING", "1", 1);
+        }
+        uint16_t rpc_port = 0, data_port = 0;
+        {
+            TransferEngine engine(false);
+            ASSERT_EQ(
+                engine.init(mode == "p2p" ? P2PHANDSHAKE : server.uri(), name),
+                0);
+            auto metadata = engine.getMetadata();
+            int reserved = metadata->localRpcMeta().sockfd;
+            rpc_port = engine.getRpcPort();
+            auto inode = rpcSocketInode(rpc_port);
+            if (mode == "http") {
+                EXPECT_GE(reserved, 0);
+            }
+            ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+            EXPECT_EQ(metadata->localRpcMeta().sockfd, -1);
+#ifdef __linux__
+            EXPECT_NE(rpcSocketInode(rpc_port), 0);
+            if (mode != "legacy") {
+                EXPECT_EQ(rpcSocketInode(rpc_port), inode);
+            }
+#endif
+            auto local = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+            ASSERT_NE(local, nullptr);
+            data_port = local->tcp_data_port;
+#ifdef __linux__
+            EXPECT_NE(rpcSocketInode(data_port), 0);
+#endif
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                // Exact Store-RS shim call sequence, using a borrowed cache
+                // copy.
+                auto cached = metadata->localRpcMeta();
+                ASSERT_EQ(metadata->addRpcMetaEntry(local->name, cached), 0);
+                ASSERT_EQ(metadata->updateLocalSegmentDesc(), 0);
+                EXPECT_EQ(cached.sockfd, -1);
+                EXPECT_EQ(metadata->localRpcMeta().sockfd, -1);
+                EXPECT_EQ(metadata->sendProbe(local->name), 0);
+            }
+            EXPECT_EQ(metadata->rePublishRpcMetaEntry(name), 0);
+            if (mode != "p2p") {
+                EXPECT_FALSE(server.value("mooncake/rpc_meta/" + name).empty());
+            }
+            if (mode == "legacy") {
+                EXPECT_EQ(server.value(key), original);
+            }
+            EXPECT_EQ(server.rpc_deletes, 0);
+        }
+        EXPECT_EQ(rpcSocketInode(rpc_port), 0);
+        EXPECT_EQ(rpcSocketInode(data_port), 0);
+        EXPECT_EQ(server.rpc_puts, mode == "p2p" ? 0 : 4);
+        EXPECT_EQ(server.rpc_deletes, mode == "p2p" ? 0 : 1);
+        EXPECT_EQ(server.value("mooncake/rpc_meta/" + name),
+                  mode == "p2p" ? original : "");
+        unsetenv("MC_LEGACY_RPC_PORT_BINDING");
+    }
+#else
+    GTEST_SKIP() << "requires HTTP and TCP";
+#endif
+}
+
+TEST_F(TransferMetadataRpcOwnershipTest,
+       RepeatedDaemonStartConsumesNewReservation) {
+    int listener = -1;
+    const uint16_t port = findAvailableTcpPort(listener);
+    ASSERT_NE(port, 0);
+    int replacement = -1;
+    {
+        TransferMetadata metadata(P2PHANDSHAKE);
+        TransferMetadata::RpcMetaDesc desc;
+        desc.ip_or_host_name = "127.0.0.1";
+        desc.rpc_port = port;
+        desc.sockfd = listener;
+        ASSERT_EQ(metadata.addRpcMetaEntry("owner", desc), 0);
+        EXPECT_EQ(desc.sockfd, -1);
+        EXPECT_EQ(metadata.localRpcMeta().sockfd, -1);
+        EXPECT_EQ(metadata.startHandshakeDaemon(nullptr, port, listener), 0);
+        EXPECT_NE(fcntl(listener, F_GETFD), -1);
+        int unused = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(unused, 0);
+        EXPECT_EQ(metadata.startHandshakeDaemon(nullptr, port, unused), 0);
+        EXPECT_EQ(fcntl(unused, F_GETFD), -1);
+        replacement = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(replacement, 0);
+    }
+    EXPECT_EQ(fcntl(listener, F_GETFD), -1);
+    EXPECT_NE(fcntl(replacement, F_GETFD), -1);
+    close(replacement);
+}
+
+TEST_F(TransferMetadataRpcOwnershipTest,
+       DeferredReservationRepublishAndDestruction) {
+    auto storage = std::make_shared<RpcOwnershipStoragePlugin>();
+    storage->reject = false;
+    int fd = createRpcTestSocket(SOCK_STREAM);
+    ASSERT_GE(fd, 0);
+    {
+        TestableTransferMetadata metadata(storage);
+        TransferMetadata::RpcMetaDesc desc;
+        desc.ip_or_host_name = "127.0.0.1";
+        desc.rpc_port = 23456;
+        desc.sockfd = fd;
+        ASSERT_EQ(metadata.addRpcMetaEntry("owner", desc), 0);
+        EXPECT_EQ(desc.sockfd, -1);
+        struct stat identity{}, current{};
+        ASSERT_EQ(fstat(fd, &identity), 0);
+        auto cached = metadata.localRpcMeta();
+        ASSERT_EQ(metadata.addRpcMetaEntry("owner", cached), 0);
+        EXPECT_EQ(cached.sockfd, -1);
+        EXPECT_EQ(metadata.localRpcMeta().sockfd, fd);
+        ASSERT_EQ(fstat(fd, &current), 0);
+        EXPECT_EQ(current.st_ino, identity.st_ino);
+        EXPECT_EQ(current.st_dev, identity.st_dev);
+        EXPECT_EQ(metadata.removeRpcMetaEntry("owner"), 0);
+        EXPECT_EQ(storage->deletes, 1);
+    }
+    EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+}
 
 }  // namespace
 

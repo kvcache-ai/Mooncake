@@ -43,6 +43,17 @@
 namespace mooncake {
 
 namespace {
+struct RpcSocketGuard {
+    explicit RpcSocketGuard(int& fd) : fd(fd) {}
+    RpcSocketGuard(const RpcSocketGuard&) = delete;
+    RpcSocketGuard& operator=(const RpcSocketGuard&) = delete;
+
+    int& fd;
+    ~RpcSocketGuard() {
+        if (fd >= 0) close(fd);
+    }
+};
+
 bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
                        uint64_t region_length) {
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
@@ -114,6 +125,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& ip_or_host_name,
                              uint64_t rpc_port) {
     TransferMetadata::RpcMetaDesc desc;
+    RpcSocketGuard rpc_socket_guard{desc.sockfd};
     std::string rpc_binding_method;
 
     if (!setFilesLimit()) {

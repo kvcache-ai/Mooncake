@@ -902,7 +902,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
         if (listener_running_) {
-            // LOG(INFO) << "SocketHandShakePlugin: listener already running";
+            // A supplied reservation is consumed even if no new daemon is
+            // needed.
+            if (sockfd >= 0 && sockfd != listen_fd_) close(sockfd);
             return 0;
         }
 

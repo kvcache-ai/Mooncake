@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 #include "common.h"
 #include "config.h"
@@ -366,6 +367,7 @@ TransferMetadata::TransferMetadata(
 TransferMetadata::~TransferMetadata() {
     stopMetadataRefreshPollingThread();
     handshake_plugin_.reset();
+    if (local_rpc_meta_.sockfd >= 0) close(local_rpc_meta_.sockfd);
     storage_plugin_.reset();
 }
 
@@ -1903,9 +1905,9 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
         desc.metadata_version = nextWallTimeMetadataVersion(
             desc.metadata_version, published_version);
     }
-    local_rpc_meta_ = desc;
-
     if (p2p_handshake_mode_) {
+        local_rpc_meta_ = desc;
+        local_rpc_meta_.sockfd = -1;  // The daemon owns the P2P reservation.
         handshake_plugin_->registerOnMetadataCallBack(
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerMetadata(peer, local);
@@ -1919,7 +1921,8 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
                 return receivePeerProbe(peer, local);
             });
 
-        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
+        int rc = handshake_plugin_->startDaemon(desc.rpc_port,
+                                                std::exchange(desc.sockfd, -1));
         if (rc != 0) {
             return rc;
         }
@@ -1932,21 +1935,32 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(desc.rpc_port);
     rpcMetaJSON["metadata_version"] =
         static_cast<Json::UInt64>(desc.metadata_version);
-    if (!storage_plugin_->set(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
+    const std::string key = rpc_meta_prefix_ + server_name;
+    if (!storage_plugin_->set(key, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to set location of " << server_name;
         return ERR_METADATA;
     }
+    published_rpc_meta_key_ = key;
+    published_rpc_meta_keys_.insert(key);
+    if (local_rpc_meta_.sockfd >= 0 && local_rpc_meta_.sockfd != desc.sockfd) {
+        close(std::exchange(local_rpc_meta_.sockfd, -1));
+    }
+    local_rpc_meta_ = desc;
+    desc.sockfd = -1;
     return 0;
 }
 
 int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
-    if (p2p_handshake_mode_) {
+    const std::string key = rpc_meta_prefix_ + server_name;
+    if (p2p_handshake_mode_ || !published_rpc_meta_keys_.count(key)) {
         return 0;
     }
-    if (!storage_plugin_->remove(rpc_meta_prefix_ + server_name)) {
+    if (!storage_plugin_->remove(key)) {
         LOG(ERROR) << "Failed to remove location of " << server_name;
         return ERR_METADATA;
     }
+    published_rpc_meta_keys_.erase(key);
+    if (published_rpc_meta_key_ == key) published_rpc_meta_key_.clear();
     return 0;
 }
 
@@ -1955,6 +1969,7 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
         return 0;
     }
     const std::string full_key = rpc_meta_prefix_ + server_name;
+    if (published_rpc_meta_key_ != full_key) return ERR_METADATA;
 
     Json::Value existing;
     uint64_t published_version = 0;
@@ -2078,6 +2093,11 @@ int TransferMetadata::startHandshakeDaemon(
             return receivePeerProbe(peer, local);
         });
 
+    // startDaemon consumes the descriptor, including on startup failure.
+    // Clear our ownership before the call so teardown cannot close a reused fd.
+    if (sockfd >= 0 && sockfd == local_rpc_meta_.sockfd) {
+        local_rpc_meta_.sockfd = -1;
+    }
     int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
     if (rc != 0) {
         return rc;
