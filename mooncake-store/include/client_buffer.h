@@ -72,6 +72,9 @@ class ClientBufferAllocator
     std::string protocol;
     bool is_external_memory_ = false;
     std::shared_ptr<DmaBufferAllocator> dma_allocator_;  // was use_spdk_dma_
+    // Size of the THP mapping backing an RDMA buffer (see
+    // allocate_buffer_thp()); 0 when the buffer is not THP backed.
+    size_t thp_mapped_size_ = 0;
 };
 
 /**
