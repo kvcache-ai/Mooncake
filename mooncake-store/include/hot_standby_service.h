@@ -52,6 +52,7 @@ struct HotStandbyConfig {
 
     int oplog_poll_interval_ms{1000};
     uint32_t batch_oplog_retry_timeout_sec{180};
+    uint32_t ha_redis_expected_replicas_per_shard{0};
 };
 
 /**

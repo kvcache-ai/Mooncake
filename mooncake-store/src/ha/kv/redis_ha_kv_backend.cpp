@@ -187,21 +187,6 @@ std::string ReplyBytes(const redisReply* reply) {
     return std::string(reply->str, static_cast<size_t>(reply->len));
 }
 
-RedisReplyPtr Exec(redisContext* context,
-                   const std::vector<std::string>& args) {
-    std::vector<const char*> argv;
-    std::vector<size_t> argvlen;
-    argv.reserve(args.size());
-    argvlen.reserve(args.size());
-    for (const auto& arg : args) {
-        argv.push_back(arg.data());
-        argvlen.push_back(arg.size());
-    }
-    auto* raw = static_cast<redisReply*>(redisCommandArgv(
-        context, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
-    return RedisReplyPtr(raw);
-}
-
 bool ScriptWasNotExecuted(std::string_view error) {
     // Only top-level routing/admission errors prove Lua did not execute.
     // Runtime errors, including errors after partial writes, remain unknown.
@@ -219,15 +204,7 @@ bool ScriptWasNotExecuted(std::string_view error) {
 uint16_t NamespaceSlot(std::string_view cluster_id) {
     // Validated cluster IDs are the hash tag, so CRC16/XMODEM hashes only
     // this component, regardless of the logical key's suffix.
-    uint16_t crc = 0;
-    for (unsigned char byte : cluster_id) {
-        crc ^= static_cast<uint16_t>(byte) << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = static_cast<uint16_t>((crc << 1) ^
-                                        ((crc & 0x8000) ? 0x1021 : 0));
-        }
-    }
-    return crc % 16384;
+    return ha::common::redis::Crc16Xmodem(cluster_id) % 16384;
 }
 
 #endif
@@ -237,7 +214,7 @@ uint16_t NamespaceSlot(std::string_view cluster_id) {
 ErrorCode RedisHaKvBackend::Connect(std::string connstring) {
     std::lock_guard<std::mutex> lock(mu_);
     connstring_ = std::move(connstring);
-    context_.reset();
+    client_.reset();
     const auto validation = ValidateRedisWriteDurabilityPolicy(write_policy_);
     if (validation != ErrorCode::OK) {
         return validation;
@@ -264,12 +241,18 @@ KvWriteResult RedisHaKvBackend::ExecuteWriteLocked(
         return result;
     }
 #ifdef STORE_USE_REDIS
+    auto lease = client_->Execute(command, command.at(3), true);
     const auto result = ExecuteRedisWriteWithAck(
         write_policy_,
         [&]() -> KvWriteResult {
-            auto reply = Exec(context_.get(), command);
+            auto& reply = lease.reply;
+            if (lease.error != ErrorCode::OK) {
+                return {.status = lease.may_have_executed
+                                      ? KvWriteStatus::kOutcomeUnknown
+                                      : KvWriteStatus::kFailedBeforeCommit,
+                        .error = lease.error};
+            }
             if (reply == nullptr) {
-                context_.reset();
                 return KvWriteResult::FromError(
                     ErrorCode::ETCD_OPERATION_ERROR);
             }
@@ -303,47 +286,18 @@ KvWriteResult RedisHaKvBackend::ExecuteWriteLocked(
         },
         [&](size_t replicas, std::chrono::milliseconds wait_timeout)
             -> tl::expected<size_t, ErrorCode> {
-            // mu_ holds this exact context from EVAL through WAIT. Never
-            // reconnect or route the confirmation to another connection.
-            // This private context is created by ConnectRedis, which installs
-            // the shared ordinary-command deadline. Avoid version-specific
-            // hiredis timeout fields when restoring it.
-            timeval command_timeout{};
-            command_timeout.tv_sec = static_cast<long>(
-                ha::common::redis::kRedisCommandTimeout.count());
-            // Only WAIT needs a deadline that covers its server-side timeout.
-            // Lua and subsequent commands retain the connection's own timeout.
-            const auto timeout_ms = wait_timeout.count() + 1000;
-            timeval timeout{};
-            timeout.tv_sec = static_cast<long>(timeout_ms / 1000);
-            timeout.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
-            if (redisSetTimeout(context_.get(), timeout) != REDIS_OK) {
-                context_.reset();
-                return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
-            }
-            auto reply =
-                Exec(context_.get(), {"WAIT", std::to_string(replicas),
-                                      std::to_string(wait_timeout.count())});
-            if (reply == nullptr) {
-                context_.reset();
-                return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
-            }
-            if (redisSetTimeout(context_.get(), command_timeout) != REDIS_OK) {
-                // The received acknowledgment remains valid, but this socket
-                // must not be reused with the confirmation timeout installed.
-                context_.reset();
-            }
-            if (reply->type != REDIS_REPLY_INTEGER || reply->integer < 0) {
-                return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
-            }
-            return static_cast<size_t>(reply->integer);
+            return client_->Wait(lease, replicas, wait_timeout);
         });
-    if (result.status == KvWriteStatus::kOutcomeUnknown) {
+    if (result.status == KvWriteStatus::kOutcomeUnknown ||
+        lease.routing_error !=
+            ha::common::redis::RedisClusterClient::RoutingError::None) {
         LOG(WARNING) << "Redis " << operation
-                     << " outcome unknown: cluster=" << cluster_id
+                     << " unconfirmed: cluster=" << cluster_id
                      << " slot=" << NamespaceSlot(cluster_id)
                      << " required=" << result.replicas_required
-                     << " acked=" << result.replicas_acked;
+                     << " acked=" << result.replicas_acked << " routing_error="
+                     << ha::common::redis::RedisClusterClient::RoutingErrorName(
+                            lease.routing_error);
     }
     return result;
 #else
@@ -361,16 +315,18 @@ ErrorCode RedisHaKvBackend::EnsureConnectedLocked() {
     if (connstring_.empty()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    if (context_ != nullptr && context_->err == 0) {
-        return ErrorCode::OK;
+    if (client_) return ErrorCode::OK;
+    auto client = std::make_unique<ha::common::redis::RedisClusterClient>();
+    const auto result =
+        client->ConnectDetailed(connstring_, write_policy_.replicas_required);
+    if (result.error != ErrorCode::OK) {
+        LOG(ERROR) << "Redis KV startup failed: error="
+                   << toString(result.error) << " routing_error="
+                   << ha::common::redis::RedisClusterClient::RoutingErrorName(
+                          result.routing_error);
+        return result.error;
     }
-    context_.reset();
-    auto connected = ha::common::redis::ConnectRedis(
-        connstring_, ErrorCode::ETCD_OPERATION_ERROR);
-    if (!connected) {
-        return connected.error();
-    }
-    context_ = std::move(connected.value());
+    client_ = std::move(client);
     return ErrorCode::OK;
 #endif
 }
@@ -388,10 +344,11 @@ ErrorCode RedisHaKvBackend::Get(std::string_view key, std::string& value) {
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply = Exec(context_.get(), {"GET", mapped->redis_key});
+    auto lease =
+        client_->Execute({"GET", mapped->redis_key}, mapped->redis_key, false);
+    auto& reply = lease.reply;
     if (reply == nullptr) {
         LOG(WARNING) << "Redis GET failed for OpLog key";
-        context_.reset();
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
@@ -454,15 +411,15 @@ ErrorCode RedisHaKvBackend::Range(std::string_view begin_key,
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply =
-        Exec(context_.get(),
-             {"EVAL", kRangeScript, "1", begin->index_key,
-              std::string("[") + std::string(begin_key),
-              std::string("(") + std::string(end_key), std::to_string(limit),
-              begin->logical_prefix, begin->redis_prefix});
+    auto lease = client_->Execute(
+        {"EVAL", kRangeScript, "1", begin->index_key,
+         std::string("[") + std::string(begin_key),
+         std::string("(") + std::string(end_key), std::to_string(limit),
+         begin->logical_prefix, begin->redis_prefix},
+        begin->index_key, false);
+    auto& reply = lease.reply;
     if (reply == nullptr) {
         LOG(WARNING) << "Redis RANGE failed for OpLog keys";
-        context_.reset();
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     if (reply->type == REDIS_REPLY_ERROR) {

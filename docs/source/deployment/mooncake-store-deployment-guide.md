@@ -228,31 +228,87 @@ mooncake_master \
 
 **Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. The build must include `STORE_USE_REDIS`.
 
-**Redis OpLog replica acknowledgments:** with `--enable_oplog=true`, the HA KV
-backend factory uses a fixed policy requiring exactly one replica acknowledgment.
-This changes the earlier behavior that accepted a successful Lua reply without
-waiting for replicas. It applies to `Put`, `Txn`, and `DeleteRange`, including
-their legacy `ErrorCode` interfaces. The supported deployment for this factory
-path is one primary with exactly one replica; Redis leadership without OpLog is
-unaffected by this KV policy.
+**Redis replica acknowledgments:** configure
+`--ha_redis_expected_replicas_per_shard=N` explicitly (must be positive;
+the default 0 means unconfigured and is rejected for Redis HA writes).
+This applies to KV writes and leader acquire, renew, and release operations.
+Confirmation uses `WAIT N` on the same connection as the write. Missing or
+excess acknowledgments return an unknown outcome; the backend never replays an
+uncertain write. Unconfirmed leadership writes cannot acquire or renew service,
+even if reading back the owner token shows that the write took effect.
 
-The count is neither discovered automatically nor interpreted as a minimum.
-With no replica, a write can execute but remains unknown after the confirmation
-timeout. With two or more replicas, `WAIT 1` can return `2` or more, which is a
-valid Redis response but does not match the fixed policy. Such a write returns
-unknown (`ETCD_OPERATION_ERROR` through the legacy interface), even if every
-replica received it. It can instead succeed when only one ACK has arrived, so
-multi-replica deployments through this factory are unsupported and their results
-can depend on ACK timing. An unknown result does not prove that no write occurred;
-the backend does not automatically replay it.
+**Redis Cluster routing:** use
+`--ha_backend_connstring="redis+cluster://host1:6379,host2:6379"`.
+Any known node can be a seed; IPv6 addresses use `[address]:port`.
+Clients use the same `redis+cluster://host1:6379,host2:6379` master address.
+Discovery uses a read-only coordinator and does not impose the Master's write
+replica policy.
+Alternatively, set `MC_REDIS_CLUSTER_ENABLED=1` with the existing endpoint
+format. Cluster mode requires DB 0 (`MC_REDIS_DB_INDEX`); credentials continue
+to use `MC_REDIS_USERNAME` and `MC_REDIS_PASSWORD`, never URI userinfo.
+Plain `redis://host:port` keeps standalone behavior; operators must ensure its
+replica membership matches N.
 
-Master configuration cannot yet change this count, and the factory does not
-validate replica membership. Component callers can construct `RedisHaKvBackend`
-with an explicit policy matching their deployment, but this does not configure
-the Master factory path. Explicit replica-count configuration and topology
-validation remain follow-up work. These backend acknowledgments also do not
-establish end-to-end OpLog durability: existing readback reconciliation can still
-report success for a visible batch without proving the replica policy was met.
+The client prefers `CLUSTER SHARDS` (Redis 7 or newer), requires all 16384 slots
+and complete node identities, and checks that every shard has exactly N replicas.
+SHARDS snapshots include primaries without slots and validate node identity and
+address uniqueness across shards. Only an explicit unknown-subcommand response
+enables the `CLUSTER SLOTS` compatibility path (Redis 4 or newer) for that endpoint.
+Permission errors, malformed SHARDS replies, and connection failures do not
+trigger that fallback.
+The SLOTS path checks node IDs, addresses, primary/replica roles and replica
+ownership across all slot ranges. Repeated ranges for the same primary must
+describe identical membership; conflicting metadata is rejected. SLOTS itself
+does not report node health, so it does not provide SHARDS health metadata.
+Unreachable replicas still count toward N and must satisfy the same WAIT policy.
+
+Redis KV and leadership startup logs include a `routing_error` classification:
+`invalid-configuration`, `transport`, `server-error`, `invalid-topology`, or
+`replica-count-mismatch`.
+The internal `ConnectDetailed` result preserves that classification alongside
+the existing error code and returns `unsupported` when Redis support is not
+compiled in. Later unreachable seeds do not overwrite a previously
+observed topology or replica-count failure. Connection strings and credentials
+are not included in these startup diagnostics.
+For three primaries with two replicas each, configure N=2, not 6.
+Topology is cached for `MC_REDIS_TOPOLOGY_REFRESH_MS` milliseconds (default
+1000; 0 refreshes before every operation). Redirects, transport failures, and
+expired caches trigger refresh; write confirmation always forces a refresh.
+ASK targets with no owned slots use the same SHARDS snapshot and confirmation
+refresh. Only in the SLOTS compatibility path does `CLUSTER NODES` verify such
+a target's primary identity and replica membership before and after the write.
+Missing membership, unavailable topology, or a detected membership change fails
+closed. Commands follow bounded `MOVED`/`ASK` redirects; `ASKING`, the
+command, and confirmation retain exclusive ownership of the target connection.
+`MC_REDIS_CONNECT_TIMEOUT_MS` and `MC_REDIS_COMMAND_TIMEOUT_MS` default to
+3000 (accepted range 1–60000). `MC_REDIS_MAX_REDIRECTS` defaults to 5
+(range 0–64, in addition to the initial attempt). The topology refresh interval
+accepts 0–60000. Invalid values fail configuration parsing.
+Leadership confirmation waits one second; routing and reconciliation socket
+timeouts are additionally bounded by a shared two-second deadline within the
+five-second lease. DNS resolution and waiting for the client mutex are not
+bounded by hiredis socket timeouts. Ownership reconciliation distinguishes
+matching-but-unconfirmed, lost, and unknown; none grants leadership without
+replica confirmation.
+
+These checks do not make Redis a consensus system or detect every transient
+topology change. They provide neither AOF fsync confirmation nor protection
+against arbitrary failover data loss. End-to-end OpLog durability remains
+follow-up work: existing readback reconciliation can still report success for a
+visible batch without proving the replica policy was met.
+
+To validate routing locally, build the Redis-enabled `redis_ha_kv_backend_test`,
+`high_availability_test`, `mooncake_master`, and `oplog_ha_client` targets, then run
+`bash mooncake-store/tests/e2e/run_oplog_batch_cluster_test.sh --redis-cluster <build-dir>`.
+The script starts three primaries with two replicas each and a standalone pair,
+checks shard routes, real slot migration, replica pause, controlled failover,
+and two Masters with OpLog enabled. It verifies put/get and serving shutdown
+when renewal acknowledgments are missing, and stops its processes on exit.
+It requires Python 3 and a `redis-cli` supporting `--json`;
+it was validated with Redis 8.0.5. Use `REDIS_SERVER`, `REDIS_CLI`, and
+`REDIS_TEST_BASE_PORT` to select binaries and unused local ports.
+Without `--redis-cluster`, the entry point runs its existing offline OpLog script
+tests instead of starting Redis or Master processes.
 
 
 ---

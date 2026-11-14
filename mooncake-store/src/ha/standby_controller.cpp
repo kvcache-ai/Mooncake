@@ -38,6 +38,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
+        .ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard,
     });
 }
 

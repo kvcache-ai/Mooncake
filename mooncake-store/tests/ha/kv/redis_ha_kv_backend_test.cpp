@@ -117,6 +117,7 @@ class RedisOpLogBackendTest : public ::testing::Test {
             .type = ha::HABackendType::REDIS,
             .connstring = FLAGS_redis_endpoint,
             .cluster_namespace = cluster_id_,
+            .ha_redis_expected_replicas_per_shard = 1,
         });
         ASSERT_TRUE(backend.has_value()) << toString(backend.error());
         backend_ = std::move(backend.value());
