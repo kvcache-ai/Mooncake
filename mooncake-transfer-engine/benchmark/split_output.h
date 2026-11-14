@@ -27,6 +27,8 @@ struct SplitXferSample {
     uint64_t submit_us;
     uint64_t wait_us;
     uint64_t polls;
+    uint64_t completed = 0;
+    uint64_t dropped = 0;
 };
 
 // False when --split_output_jsonl is unset. Check this in the transfer hot

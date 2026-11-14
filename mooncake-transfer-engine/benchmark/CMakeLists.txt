@@ -91,6 +91,20 @@ if(BUILD_UNIT_TESTS)
                                PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME tebench_tent_teardown_test COMMAND tebench_tent_teardown_test)
     set_tests_properties(tebench_tent_teardown_test PROPERTIES TIMEOUT 30)
+
+    # Compile the application with a renamed entry point so tests call the
+    # actual measurement loop while gtest_main supplies the test entry point.
+    add_executable(tebench_tent_transfer_test tests/tent_transfer_test.cpp
+                                              ${TEBENCH_SOURCES})
+    target_compile_definitions(tebench_tent_transfer_test
+                               PRIVATE USE_TENT main=tebenchMain)
+    target_link_libraries(
+      tebench_tent_transfer_test
+      PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
+    target_include_directories(tebench_tent_transfer_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_transfer_test COMMAND tebench_tent_transfer_test)
+    set_tests_properties(tebench_tent_transfer_test PROPERTIES TIMEOUT 60)
   endif()
 
   if(USE_MLU)

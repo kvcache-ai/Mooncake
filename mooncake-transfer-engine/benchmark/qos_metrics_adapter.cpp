@@ -42,8 +42,10 @@ QosMetricsReport calculateQosMetricsFromBenchStats(
     std::vector<XferBenchStats>* stats, double link_capacity_gbps,
     const std::vector<uint64_t>& bytes_per_operation) {
     auto samples = makeQosClassSamples(classes, stats);
-    if (bytes_per_operation.size() == samples.size()) {
-        for (size_t i = 0; i < samples.size(); ++i) {
+    for (size_t i = 0; i < samples.size(); ++i) {
+        if ((*stats)[i].transferred_bytes) {
+            samples[i].transferred_bytes = (*stats)[i].transferred_bytes;
+        } else if (bytes_per_operation.size() == samples.size()) {
             samples[i].transferred_bytes =
                 bytes_per_operation[i] * samples[i].operations;
         }

@@ -206,11 +206,10 @@ int processBatchSizes(
 
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
-            if (runner.runSingleTransfer(
-                    local_addr, target_id, nextTargetAddr(), thread_block_size,
-                    thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
-                return failTask();
-            }
+            const double val = runner.runSingleTransfer(
+                local_addr, target_id, nextTargetAddr(), thread_block_size,
+                thread_batch_size, opcode, deadlineNs(), intent_type);
+            if (val < 0 && val != kTransferDropped) return failTask();
         }
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
@@ -223,76 +222,82 @@ int processBatchSizes(
         timer.reset();
         std::vector<double> transfer_duration;
         std::vector<double> thread_instant_bandwidth;
+        uint64_t thread_dropped = 0;
+        uint64_t thread_completed = 0;
+        uint64_t transferred_bytes = 0;
+        auto record = [&](const TransferResult& result) {
+            if (result.duration_us < 0 &&
+                result.duration_us != kTransferDropped)
+                return false;
+            thread_dropped += result.dropped;
+            thread_completed += result.completed;
+            transferred_bytes =
+                checkedAdd(transferred_bytes, result.transferred_bytes,
+                           "thread transferred bytes");
+            if (result.completed != 0) {
+                transfer_duration.push_back(result.duration_us);
+                thread_instant_bandwidth.push_back(
+                    gbPerSecond(result.transferred_bytes, result.duration_us));
+            }
+            return true;
+        };
+        auto verifyCompleted = [&](const TransferResult& result, uint8_t seed) {
+            if (result.completed == 0) return;
+            if (result.dropped == 0) {
+                verifyData((void*)local_addr, op_bytes, seed);
+            } else {
+                for (const auto index : result.completed_indices)
+                    verifyData((void*)(local_addr + index * thread_block_size),
+                               thread_block_size, seed);
+            }
+        };
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                const size_t bytes =
-                    checkedMul(thread_block_size, thread_batch_size,
-                               "consistency payload size");
-                const uint64_t batch_bytes = bytes;
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
-                    pattern = fillData((void*)local_addr, bytes);
-                // Read back from where this iteration wrote.
+                    pattern = fillData((void*)local_addr, op_bytes);
                 const uint64_t op_target_addr = nextTargetAddr();
                 paceRequest();
-                auto val = runner.runSingleTransfer(
+                auto result = runner.runTransfer(
                     local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
-                if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
-                transfer_duration.push_back(val);
-                fillData((void*)local_addr, bytes);
+                if (!record(result)) return failTask();
+                // A partial write is measured, but cannot seed a full readback.
+                if (result.dropped != 0) continue;
+                fillData((void*)local_addr, op_bytes);
                 paceRequest();
-                val = runner.runSingleTransfer(
+                result = runner.runTransfer(
                     local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
-                if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                if (!record(result)) return failTask();
                 if (XferBenchConfig::check_consistency)
-                    verifyData((void*)local_addr,
-                               checkedMul(thread_block_size, thread_batch_size,
-                                          "consistency payload size"),
-                               pattern);
-                transfer_duration.push_back(val);
+                    verifyCompleted(result, pattern);
             }
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                const size_t bytes =
-                    checkedMul(thread_block_size, thread_batch_size,
-                               "operation payload size");
-                const uint64_t batch_bytes = bytes;
-                if (write_seed) {
-                    fillData((void*)local_addr, bytes,
+                if (write_seed)
+                    fillData((void*)local_addr, op_bytes,
                              stableDataSeed(target_addr));
-                }
                 paceRequest();
-                auto val = runner.runSingleTransfer(
+                auto result = runner.runTransfer(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
-                if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
-                if (read_verify) {
-                    verifyData((void*)local_addr, bytes,
-                               stableDataSeed(target_addr));
-                }
-                transfer_duration.push_back(val);
+                if (!record(result)) return failTask();
+                if (read_verify)
+                    verifyCompleted(result, stableDataSeed(target_addr));
             }
         }
         auto total_duration = timer.lap_us();
-        const uint64_t bytes_per_operation = checkedMul(
-            thread_block_size, thread_batch_size, "operation payload size");
-        const uint64_t transferred_bytes =
-            checkedMul(bytes_per_operation, transfer_duration.size(),
-                       "thread transferred bytes");
         std::lock_guard<std::mutex> lock(mutex);
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
         stats.instant_bandwidth.add(thread_instant_bandwidth);
+        stats.dropped += thread_dropped;
+        stats.completed_tasks += thread_completed;
+        stats.transferred_bytes =
+            stats.transferred_bytes.value_or(0) + transferred_bytes;
         auto& target = target_stats[target_index];
         ++target.threads;
         target.transferred_bytes =
@@ -301,15 +306,23 @@ int processBatchSizes(
         target.stats.total_duration.add(total_duration);
         target.stats.transfer_duration.add(transfer_duration);
         target.stats.instant_bandwidth.add(thread_instant_bandwidth);
+        target.stats.transferred_bytes = target.transferred_bytes;
         if (qos_enabled) {
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
+            qos_stats[qos_class].transferred_bytes =
+                qos_stats[qos_class].transferred_bytes.value_or(0) +
+                transferred_bytes;
             qos_stats[qos_class].instant_bandwidth.add(
                 thread_instant_bandwidth);
         }
         auto& group_stats = tight ? tight_stats : loose_stats;
         group_stats.total_duration.add(total_duration);
         group_stats.transfer_duration.add(transfer_duration);
+        group_stats.dropped += thread_dropped;
+        group_stats.completed_tasks += thread_completed;
+        group_stats.transferred_bytes =
+            group_stats.transferred_bytes.value_or(0) + transferred_bytes;
         return 0;
     });
 
@@ -347,13 +360,18 @@ int processBatchSizes(
             }
         }
     }
+    const double theta = runner.deadlineDropThreshold();
+    if (theta > 0.0) {
+        printDeadlineDropStats(theta, stats);
+    }
     if (XferBenchConfig::deadline_us > 0 && workload_classes.empty()) {
         const int tight_threads =
             std::min(num_threads, XferBenchConfig::deadline_tight_threads);
         printDeadlineGroupStats("tight", block_size, batch_size, tight_stats,
-                                tight_threads, XferBenchConfig::deadline_us);
+                                tight_threads, XferBenchConfig::deadline_us,
+                                theta > 0.0);
         printDeadlineGroupStats("loose", block_size, batch_size, loose_stats,
-                                num_threads - tight_threads, 0);
+                                num_threads - tight_threads, 0, theta > 0.0);
     }
     return 0;
 }
@@ -470,6 +488,23 @@ int main(int argc, char* argv[]) {
     if (XferBenchConfig::deadline_us > 0 &&
         XferBenchConfig::backend != "tent") {
         LOG(ERROR) << "deadline tagging is supported only by the tent backend";
+        return EXIT_FAILURE;
+    }
+    if ((XferBenchConfig::deadline_aware ||
+         XferBenchConfig::mlu_local_threshold != 0.0) &&
+        XferBenchConfig::backend != "tent") {
+        LOG(ERROR) << "--deadline_aware and --mlu_local_threshold are "
+                      "supported only by the tent backend";
+        return EXIT_FAILURE;
+    }
+    if (!std::isfinite(XferBenchConfig::mlu_local_threshold) ||
+        XferBenchConfig::mlu_local_threshold < 0.0) {
+        LOG(ERROR) << "mlu_local_threshold must be finite and non-negative";
+        return EXIT_FAILURE;
+    }
+    if (XferBenchConfig::mlu_local_threshold > 0.0 &&
+        !XferBenchConfig::deadline_aware) {
+        LOG(ERROR) << "--mlu_local_threshold requires --deadline_aware";
         return EXIT_FAILURE;
     }
     if (!workload_classes.empty() &&

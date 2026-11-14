@@ -16,6 +16,8 @@
 #include "utils.h"
 #include "split_output.h"
 #include "char_util.h"
+#include "tent_transfer_result.h"
+#include <cmath>
 
 #include <atomic>
 #include "tent/common/types.h"
@@ -54,12 +56,37 @@ static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
 
 std::shared_ptr<Config> loadConfig() {
     auto config = std::make_shared<Config>();
+    const auto status = ConfigHelper().loadFromEnv(*config);
+    LOG_ASSERT(status.ok()) << status.ToString();
     config->set("local_segment_name", XferBenchConfig::seg_name);
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
-    config->set("transports/rdma/deadline_bw_arbitration",
-                XferBenchConfig::deadline_bw_arbitration);
+    if (XferBenchConfig::deadline_bw_arbitration ||
+        !gflags::GetCommandLineFlagInfoOrDie("deadline_bw_arbitration")
+             .is_default) {
+        config->set("transports/rdma/deadline_bw_arbitration",
+                    XferBenchConfig::deadline_bw_arbitration);
+    }
+    // Admission-queue knobs are written only when asked for, so a config
+    // file given through MC_TENT_CONF keeps its own runtime_queue settings
+    // otherwise. The drop (mlu_local_threshold) needs the queue to be on
+    // and deadline-ordered; both are implied here.
+    if (XferBenchConfig::deadline_aware ||
+        !gflags::GetCommandLineFlagInfoOrDie("deadline_aware").is_default) {
+        if (XferBenchConfig::deadline_aware)
+            config->set("enable_runtime_queue", true);
+        config->set("runtime_queue/deadline_aware",
+                    XferBenchConfig::deadline_aware);
+    }
+    if (XferBenchConfig::deadline_aware) {
+        if (XferBenchConfig::mlu_local_threshold > 0.0 ||
+            !gflags::GetCommandLineFlagInfoOrDie("mlu_local_threshold")
+                 .is_default) {
+            config->set("runtime_queue/mlu_local_threshold",
+                        XferBenchConfig::mlu_local_threshold);
+        }
+    }
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
@@ -347,7 +374,14 @@ int TENTBenchRunner::freeBuffers() {
 }
 
 TENTBenchRunner::TENTBenchRunner() {
-    engine_ = std::make_unique<TransferEngine>(loadConfig());
+    auto config = loadConfig();
+    engine_ = std::make_unique<TransferEngine>(config);
+    const double theta = config->get("runtime_queue/mlu_local_threshold", 0.0);
+    if (config->get("enable_runtime_queue", false) &&
+        config->get("runtime_queue/deadline_aware", false) && theta > 0.0 &&
+        std::isfinite(theta)) {
+        drop_threshold_ = theta;
+    }
     transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
     intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
     LOG_ASSERT(allocateBuffers() == 0)
@@ -507,12 +541,21 @@ double TENTBenchRunner::runSingleTransfer(
     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
     uint64_t block_size, uint64_t batch_size, OpCode opcode,
     uint64_t deadline_ns, IntentType intent_type) {
-    if (!running()) return -1.0;
+    return runTransfer(local_addr, target_id, target_addr, block_size,
+                       batch_size, opcode, deadline_ns, intent_type)
+        .duration_us;
+}
+
+TransferResult TENTBenchRunner::runTransfer(
+    uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
+    uint64_t block_size, uint64_t batch_size, OpCode opcode,
+    uint64_t deadline_ns, IntentType intent_type) {
+    if (!running()) return {};
 
     auto abortTransfer = [&](const char* why) {
         LOG(ERROR) << why;
         noteTransferFailed();
-        return -1.0;
+        return TransferResult{};
     };
 
     auto batch_id = engine_->allocateBatch(batch_size);
@@ -520,7 +563,22 @@ double TENTBenchRunner::runSingleTransfer(
 
     auto finish = [&](double duration) {
         (void)engine_->freeBatch(batch_id);
-        return duration;
+        return TransferResult{duration,
+                              duration >= 0 ? block_size * batch_size : 0,
+                              duration >= 0 ? batch_size : 0,
+                              0,
+                              {}};
+    };
+    auto finishCanceled = [&](double duration) {
+        auto result = summarizeCanceledTransfer(
+            batch_size, block_size, duration,
+            [&](size_t index, TransferStatus& status) {
+                return engine_->getTransferStatus(batch_id, index, status).ok();
+            });
+        if (result.duration_us < 0 && result.duration_us != kTransferDropped)
+            noteTransferFailed();
+        (void)engine_->freeBatch(batch_id);
+        return result;
     };
 
     std::vector<Request> requests;
@@ -563,6 +621,10 @@ double TENTBenchRunner::runSingleTransfer(
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
             return finish(timer.lap_us());
         }
+        if (overall_status.s == TransferStatusEnum::CANCELED &&
+            deadlineDropThreshold() > 0.0) {
+            return finishCanceled(timer.lap_us());
+        }
         if (overall_status.s == TransferStatusEnum::PENDING) {
             return finish(-1.0);  // stopped and abandoned
         }
@@ -598,6 +660,15 @@ double TENTBenchRunner::runSingleTransfer(
         const uint64_t wait_us = wait_timer.lap_us();
         logSplitXfer({batch_size, submit_us, wait_us, polls});
         return finish(static_cast<double>(submit_us + wait_us));
+    }
+    if (overall_status.s == TransferStatusEnum::CANCELED &&
+        deadlineDropThreshold() > 0.0) {
+        const uint64_t wait_us = wait_timer.lap_us();
+        auto result = finishCanceled(static_cast<double>(submit_us + wait_us));
+        if (result.completed != 0 || result.dropped != 0)
+            logSplitXfer({batch_size, submit_us, wait_us, polls,
+                          result.completed, result.dropped});
+        return result;
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         return finish(-1.0);  // stopped and abandoned
