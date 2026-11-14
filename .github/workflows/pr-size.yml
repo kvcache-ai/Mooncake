@@ -1,0 +1,79 @@
+name: PR Size
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  pull-requests: write
+
+# Finish each label update before starting another for the same PR.
+concurrency:
+  group: pr-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      # Do not check out or execute code from the PR: this also runs for forks.
+      - name: Update size label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            // Fetch current stats instead of relying on an older event payload.
+            const { data: pr } = await github.rest.pulls.get({
+              ...repo, pull_number: issue_number
+            });
+            if (pr.state !== 'open') return;
+
+            const changes = pr.additions + pr.deletions;
+            const sizes = [
+              { name: 'size/S', max: 100, color: '5D9801', range: '0-99' },
+              { name: 'size/M', max: 1001, color: '7F7203', range: '100-1000' },
+              { name: 'size/L', max: Infinity, color: 'E50009', range: '1001+' }
+            ];
+            const size = sizes.find(({ max }) => changes < max);
+
+            // Provision missing labels so no manual repository setup is needed.
+            try {
+              await github.rest.issues.getLabel({ ...repo, name: size.name });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...repo,
+                  name: size.name,
+                  color: size.color,
+                  description: `${size.range} changed lines (additions + deletions)`
+                });
+              } catch (createError) {
+                // Another PR can create the same repository label concurrently.
+                const alreadyExists = createError.status === 422 &&
+                  createError.response?.data?.errors?.some(
+                    ({ code }) => code === 'already_exists'
+                  );
+                if (!alreadyExists) throw createError;
+              }
+            }
+
+            const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              ...repo, issue_number, per_page: 100
+            });
+            if (!labels.some(({ name }) => name === size.name)) {
+              await github.rest.issues.addLabels({
+                ...repo, issue_number, labels: [size.name]
+              });
+            }
+            for (const { name } of labels) {
+              if (name !== size.name && sizes.some((entry) => entry.name === name)) {
+                try {
+                  await github.rest.issues.removeLabel({ ...repo, issue_number, name });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+            }
+            core.info(`${size.name}: ${changes} changed lines`);

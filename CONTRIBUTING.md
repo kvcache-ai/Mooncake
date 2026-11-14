@@ -12,6 +12,60 @@ Thank you for your interest in contributing to Mooncake! Our community warmly we
 
 # Contribution Guidelines
 
+## Developer Certificate of Origin (DCO)
+
+Contributions must comply with the [Developer Certificate of Origin 1.1](DCO).
+By adding a `Signed-off-by` trailer to a commit, you certify that you have the
+right to submit the contribution under the project's open source license.
+Read the DCO before signing off, and sign off every commit you contribute,
+including documentation-only changes.
+
+Use your name and email address matching the commit author. Configure your Git
+identity before committing:
+
+```bash
+git config user.name "Your Name"
+git config user.email "you@example.com"
+git commit -s -m "[Doc] Describe the change"
+```
+
+The `-s` option appends this trailer to the commit message:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+A DCO sign-off is separate from cryptographic commit signing (`git commit -S`);
+a cryptographic signature does not replace the trailer. Only sign off work you
+can certify under the DCO; do not add another person's sign-off for them.
+
+If your most recent, unpushed commit is missing your sign-off, add it with:
+
+```bash
+git commit --amend --no-edit -s
+```
+
+Check the commits in your pull request with `git log origin/main..HEAD`.
+For already-pushed commits, coordinate with collaborators before rewriting
+history to repair missing sign-offs. When squashing or rebasing, preserve the
+applicable sign-off trailers in the resulting commits.
+
+### Maintainer setup
+
+The [DCO Check workflow](.github/workflows/dco-check.yml) checks every non-merge
+commit in a pull request for a `Signed-off-by` trailer matching the commit
+author's name and email. It runs when a PR is opened, updated, reopened, or
+edited (including a base-branch change). Organization members and bot-authored
+commits are checked as well; merge commits are skipped.
+
+A repository administrator must make the `Developer Certificate of Origin`
+check required in the branch protection rule or ruleset for the target branch.
+Adding the workflow alone does not enable a required check.
+
+The workflow does not require the [DCO GitHub App](https://github.com/apps/dco).
+If the App is also enabled, [`.github/dco.yml`](.github/dco.yml) requires
+sign-offs from organization members for that separate check.
+
 ## Pull Requests & Code Reviews
 
 ### PR Title and Classification
@@ -34,6 +88,22 @@ The project history also contains common aliases and module prefixes. Use these
 when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
 ``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
 ``[TENT]``, and ``[Wheel]``.
+
+### Automatic PR Size Labels
+
+PRs receive one size label based on GitHub's total added and deleted lines:
+
+| Label | Changed lines (additions + deletions) |
+|-------|-------------------------------------|
+| `size/S` | 0–99 |
+| `size/M` | 100–1,000 |
+| `size/L` | More than 1,000 |
+
+The label is recalculated when a PR is opened, updated with new commits,
+reopened, or edited (including a base-branch change). The workflow creates
+missing size labels and replaces outdated size labels while preserving other
+labels. All files count toward this size, including tests, documentation, and
+generated files; the label is a review aid, not an RFC requirement.
 
 ### Notes for Large Changes
 
@@ -98,7 +168,7 @@ Update hook versions occasionally:
 ```bash
 pre-commit autoupdate
 git add .pre-commit-config.yaml
-git commit -m "chore: pre-commit autoupdate"
+git commit -s -m "chore: pre-commit autoupdate"
 ```
 
 If clang-format or its `git-clang-format` helper is missing, install the LLVM
@@ -109,7 +179,7 @@ sudo apt-get update && sudo apt-get install -y clang-format-20
 
 You can temporarily skip hooks:
 ```bash
-git commit -m "wip: skipping hooks" --no-verify
+git commit -s -m "wip: skipping hooks" --no-verify
 ```
 But please avoid using `--no-verify` for routine commits to keep code quality high.
 

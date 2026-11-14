@@ -2,6 +2,7 @@
 #include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
 #include <algorithm>
+#include <atomic>
 #include <iomanip>
 #include <limits>
 #include <random>
@@ -113,6 +114,41 @@ HighPerformanceTcpTransport::~HighPerformanceTcpTransport() {
                    << status.ToString();
     }
 }
+
+namespace {
+
+// One outstanding operation on a peer's lane. The count is taken when the
+// operation is planned. It is given back as soon as the operation completes or
+// is cancelled, so the next submission already sees the lane as free, and in
+// any case when the last holder lets go: the planned command, the operation
+// queued on its lane and its completion callback all share the slot. A planned
+// command dropped without running (a rejected admission, a later request of
+// the same batch failing to plan, a rejected retry) therefore releases it too,
+// exactly once, and a lane is never avoided because of a leaked count.
+class LaneSlot {
+   public:
+    LaneSlot(std::shared_ptr<std::vector<std::atomic<int32_t>>> load,
+             uint32_t lane)
+        : load_(std::move(load)), lane_(lane) {
+        (*load_)[lane_].fetch_add(1, std::memory_order_relaxed);
+    }
+    ~LaneSlot() { release(); }
+    LaneSlot(const LaneSlot&) = delete;
+    LaneSlot& operator=(const LaneSlot&) = delete;
+
+    void release() noexcept {
+        if (!released_.exchange(true, std::memory_order_relaxed)) {
+            (*load_)[lane_].fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+   private:
+    std::shared_ptr<std::vector<std::atomic<int32_t>>> load_;
+    uint32_t lane_;
+    std::atomic<bool> released_{false};
+};
+
+}  // namespace
 
 Status HighPerformanceTcpTransport::validateParams() const {
     if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
@@ -565,12 +601,19 @@ Status HighPerformanceTcpTransport::planTask(
     planned_task = task;
 
     uint64_t lane_sequence;
+    std::shared_ptr<std::vector<std::atomic<int32_t>>> lane_load;
     {
         std::lock_guard<std::mutex> lock(lane_sequence_mutex_);
         // Preserve the first lane choice, then advance independently.
         auto it = next_lane_sequence_.try_emplace(request.target_id, request_id)
                       .first;
         lane_sequence = it->second++;
+        auto& load = lane_load_[request.target_id];
+        if (!load || load->size() != params_.connections_per_peer) {
+            load = std::make_shared<std::vector<std::atomic<int32_t>>>(
+                params_.connections_per_peer);
+        }
+        lane_load = load;
     }
     uint64_t slice_offset = 0;
     for (size_t slice = 0; slice < slice_count; ++slice) {
@@ -579,10 +622,26 @@ Status HighPerformanceTcpTransport::planTask(
             (slice < request.length % slice_count ? 1 : 0);
         uint32_t lane_id = 0;
         uint32_t endpoint_id = 0;
+        std::shared_ptr<LaneSlot> slot;  // single-slice operations only
         if (slice_count == 1) {
-            lane_id = static_cast<uint32_t>(
-                lane_sequence %
-                static_cast<uint64_t>(params_.connections_per_peer));
+            // Least-loaded lane, ties broken from the round-robin position: a
+            // lane that just went idle takes the next operation instead of
+            // waiting for the sequence to come back around (which left lanes
+            // idle ~half the time under a fixed in-flight window).
+            const size_t n = params_.connections_per_peer;
+            const size_t start = static_cast<size_t>(lane_sequence % n);
+            lane_id = static_cast<uint32_t>(start);
+            int32_t best = (*lane_load)[start].load(std::memory_order_relaxed);
+            for (size_t k = 1; k < n && best > 0; ++k) {
+                const size_t cand = (start + k) % n;
+                const int32_t v =
+                    (*lane_load)[cand].load(std::memory_order_relaxed);
+                if (v < best) {
+                    best = v;
+                    lane_id = static_cast<uint32_t>(cand);
+                }
+            }
+            slot = std::make_shared<LaneSlot>(lane_load, lane_id);
             endpoint_id = static_cast<uint32_t>(lane_id % endpoint_count);
         } else {
             endpoint_id = static_cast<uint32_t>(slice);
@@ -617,8 +676,10 @@ Status HighPerformanceTcpTransport::planTask(
         operation.request_id = request_id;
         if (slice_count == 1) {
             operation.complete =
-                [task](TransferStatusEnum terminal, size_t bytes,
-                       std::optional<HighPerformanceTcpStatus> remote_status) {
+                [task, slot](
+                    TransferStatusEnum terminal, size_t bytes,
+                    std::optional<HighPerformanceTcpStatus> remote_status) {
+                    slot->release();
                     (void)task->completeOnce(terminal, bytes, remote_status);
                 };
         } else {
@@ -639,12 +700,13 @@ Status HighPerformanceTcpTransport::planTask(
 
         HighPerformanceTcpWorkers::Command command;
         command.worker_id = owner_worker;
-        command.run = [this, task, slice_count,
+        command.run = [this, task, slice_count, slot,
                        operation =
                            std::move(operation)](size_t worker_id) mutable {
             if (task->cancelRequested() ||
                 stopping_.load(std::memory_order_acquire)) {
                 if (slice_count == 1) {
+                    slot->release();
                     (void)task->completeOnce(CANCELED, 0);
                 } else {
                     (void)task->completeSlice(CANCELED);
@@ -653,8 +715,9 @@ Status HighPerformanceTcpTransport::planTask(
             }
             client_->enqueueOnOwner(worker_id, std::move(operation));
         };
-        command.cancel = [task, slice_count] {
+        command.cancel = [task, slice_count, slot] {
             if (slice_count == 1) {
+                slot->release();
                 (void)task->completeOnce(CANCELED, 0);
             } else {
                 (void)task->completeSlice(CANCELED);

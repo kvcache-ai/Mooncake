@@ -41,6 +41,20 @@ const _: () = {
         [::std::mem::offset_of!(mooncake_replicate_config, soft_pin_ttl_ms) - 40usize];
 };
 pub type mooncake_replicate_config_t = mooncake_replicate_config;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mooncake_exist_options {
+    pub prefetch_to_memory: ::std::os::raw::c_int,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of mooncake_exist_options"][::std::mem::size_of::<mooncake_exist_options>() - 4usize];
+    ["Alignment of mooncake_exist_options"]
+        [::std::mem::align_of::<mooncake_exist_options>() - 4usize];
+    ["Offset of field: mooncake_exist_options::prefetch_to_memory"]
+        [::std::mem::offset_of!(mooncake_exist_options, prefetch_to_memory) - 0usize];
+};
+pub type mooncake_exist_options_t = mooncake_exist_options;
 pub struct MooncakeStoreLib {
     __library: ::libloading::Library,
     pub mooncake_store_create: unsafe extern "C" fn() -> mooncake_store_t,
@@ -100,6 +114,28 @@ pub struct MooncakeStoreLib {
         count: usize,
         results_out: *mut i64,
     ) -> ::std::os::raw::c_int,
+    pub mooncake_store_batch_put_from_multi_buffers: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        keys: *mut *const ::std::os::raw::c_char,
+        buffers: *mut *mut ::std::os::raw::c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        config: *const mooncake_replicate_config_t,
+        results_out: *mut ::std::os::raw::c_int,
+    )
+        -> ::std::os::raw::c_int,
+    pub mooncake_store_batch_get_into_multi_buffers: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        keys: *mut *const ::std::os::raw::c_char,
+        buffers: *mut *mut ::std::os::raw::c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        prefer_alloc_in_same_node: ::std::os::raw::c_int,
+        results_out: *mut i64,
+    )
+        -> ::std::os::raw::c_int,
     pub mooncake_store_is_exist: unsafe extern "C" fn(
         store: mooncake_store_t,
         key: *const ::std::os::raw::c_char,
@@ -110,6 +146,19 @@ pub struct MooncakeStoreLib {
         count: usize,
         results_out: *mut ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int,
+    pub mooncake_store_is_exist_with_options: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+        options: *const mooncake_exist_options_t,
+    ) -> ::std::os::raw::c_int,
+    pub mooncake_store_batch_is_exist_with_options: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        keys: *mut *const ::std::os::raw::c_char,
+        count: usize,
+        results_out: *mut ::std::os::raw::c_int,
+        options: *const mooncake_exist_options_t,
+    )
+        -> ::std::os::raw::c_int,
     pub mooncake_store_get_size:
         unsafe extern "C" fn(store: mooncake_store_t, key: *const ::std::os::raw::c_char) -> i64,
     pub mooncake_store_get_hostname: unsafe extern "C" fn(
@@ -174,11 +223,23 @@ impl MooncakeStoreLib {
         let mooncake_store_batch_get_into = __library
             .get(b"mooncake_store_batch_get_into\0")
             .map(|sym| *sym)?;
+        let mooncake_store_batch_put_from_multi_buffers = __library
+            .get(b"mooncake_store_batch_put_from_multi_buffers\0")
+            .map(|sym| *sym)?;
+        let mooncake_store_batch_get_into_multi_buffers = __library
+            .get(b"mooncake_store_batch_get_into_multi_buffers\0")
+            .map(|sym| *sym)?;
         let mooncake_store_is_exist = __library
             .get(b"mooncake_store_is_exist\0")
             .map(|sym| *sym)?;
         let mooncake_store_batch_is_exist = __library
             .get(b"mooncake_store_batch_is_exist\0")
+            .map(|sym| *sym)?;
+        let mooncake_store_is_exist_with_options = __library
+            .get(b"mooncake_store_is_exist_with_options\0")
+            .map(|sym| *sym)?;
+        let mooncake_store_batch_is_exist_with_options = __library
+            .get(b"mooncake_store_batch_is_exist_with_options\0")
             .map(|sym| *sym)?;
         let mooncake_store_get_size = __library
             .get(b"mooncake_store_get_size\0")
@@ -211,8 +272,12 @@ impl MooncakeStoreLib {
             mooncake_store_batch_put_from,
             mooncake_store_get_into,
             mooncake_store_batch_get_into,
+            mooncake_store_batch_put_from_multi_buffers,
+            mooncake_store_batch_get_into_multi_buffers,
             mooncake_store_is_exist,
             mooncake_store_batch_is_exist,
+            mooncake_store_is_exist_with_options,
+            mooncake_store_batch_is_exist_with_options,
             mooncake_store_get_size,
             mooncake_store_get_hostname,
             mooncake_store_remove,
@@ -325,6 +390,50 @@ impl MooncakeStoreLib {
     ) -> ::std::os::raw::c_int {
         (self.mooncake_store_batch_get_into)(store, keys, buffers, sizes, count, results_out)
     }
+    pub unsafe fn mooncake_store_batch_put_from_multi_buffers(
+        &self,
+        store: mooncake_store_t,
+        keys: *mut *const ::std::os::raw::c_char,
+        buffers: *mut *mut ::std::os::raw::c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        config: *const mooncake_replicate_config_t,
+        results_out: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_batch_put_from_multi_buffers)(
+            store,
+            keys,
+            buffers,
+            sizes,
+            counts,
+            count,
+            config,
+            results_out,
+        )
+    }
+    pub unsafe fn mooncake_store_batch_get_into_multi_buffers(
+        &self,
+        store: mooncake_store_t,
+        keys: *mut *const ::std::os::raw::c_char,
+        buffers: *mut *mut ::std::os::raw::c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        prefer_alloc_in_same_node: ::std::os::raw::c_int,
+        results_out: *mut i64,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_batch_get_into_multi_buffers)(
+            store,
+            keys,
+            buffers,
+            sizes,
+            counts,
+            count,
+            prefer_alloc_in_same_node,
+            results_out,
+        )
+    }
     pub unsafe fn mooncake_store_is_exist(
         &self,
         store: mooncake_store_t,
@@ -340,6 +449,24 @@ impl MooncakeStoreLib {
         results_out: *mut ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int {
         (self.mooncake_store_batch_is_exist)(store, keys, count, results_out)
+    }
+    pub unsafe fn mooncake_store_is_exist_with_options(
+        &self,
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+        options: *const mooncake_exist_options_t,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_is_exist_with_options)(store, key, options)
+    }
+    pub unsafe fn mooncake_store_batch_is_exist_with_options(
+        &self,
+        store: mooncake_store_t,
+        keys: *mut *const ::std::os::raw::c_char,
+        count: usize,
+        results_out: *mut ::std::os::raw::c_int,
+        options: *const mooncake_exist_options_t,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_batch_is_exist_with_options)(store, keys, count, results_out, options)
     }
     pub unsafe fn mooncake_store_get_size(
         &self,

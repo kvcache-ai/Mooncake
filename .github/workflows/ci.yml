@@ -32,6 +32,30 @@ env:
   SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
+  engram-cpu-contracts:
+    name: Engram CPU contracts (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Run CPU table, facade and range-plan contracts without a native build
+      env:
+        # mooncake-wheel holds the pure-Python modules the installed wheel
+        # merges into the package, such as mooncake._partial_read.
+        PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}/mooncake-wheel
+      run: |
+        python -m pip install --disable-pip-version-check numpy pytest msgpack hypothesis==6.141.0
+        python -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py
+
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
@@ -131,7 +155,19 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run all PG CPU tests with supported PyTorch
+    - name: Run session and HCA write metadata regressions
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m pip install pyzmq msgpack
+        export MOONCAKE_TEST_MASTER_BINARY="$(command -v mooncake_master)"
+        for affinity in 0 1; do
+          MC_STORE_HCA_AFFINITY="$affinity" \
+            python -m pytest -q mooncake-wheel/tests/test_session_kv_events.py
+        done
+      shell: bash
+
+    - name: Run all PG CPU tests with installed PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
@@ -139,7 +175,6 @@ jobs:
         TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
-        python -m pip install torch==2.14.0
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
         python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
@@ -224,6 +259,7 @@ jobs:
           -DUSE_CXL=ON \
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
+          -DUSE_REDIS=ON \
           -DUSE_CUDA=ON \
           -DUSE_MNNVL=ON \
           -DWITH_P2P_STORE=ON \
@@ -231,6 +267,7 @@ jobs:
           -DSTORE_USE_ETCD=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_DEBUG_SYMBOLS=OFF \
           -DENABLE_SCCACHE=ON
       shell: bash
 
@@ -239,7 +276,7 @@ jobs:
 
     - name: Build project and unit tests
       run: |
-        cmake --build build --parallel 128
+        cmake --build build --parallel 2
         sudo -E cmake --install build
       shell: bash
 
@@ -540,6 +577,7 @@ jobs:
     outputs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -577,6 +615,19 @@ jobs:
               - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
               - '.github/actions/**'
               - '.github/workflows/ci.yml'
+            store_rs:
+              - 'mooncake-store-rs/**'
+              - 'python/mooncake/store/__init__.py'
+              - 'python/mooncake/store/rs/**'
+              - 'python/tests/store/rs/**'
+              - 'mooncake-common/include/**'
+              - 'mooncake-common/FindYLT.cmake'
+              - 'mooncake-transfer-engine/include/**'
+              - 'mooncake-transfer-engine/tent/include/**'
+              - 'scripts/ci/run_store_rs_smoke.sh'
+              - 'CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
@@ -590,6 +641,11 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
+      # This artifact feeds the T-One e2e pipeline (integration-test.yml picks
+      # the py312/cu130 wheel), which exercises the TENT runtime. Default
+      # engine behavior stays classic; TENT activates via MC_USE_TENT=1 set
+      # by tone_tests/scripts/common.sh.
+      use-tent: true
 
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
@@ -604,11 +660,87 @@ jobs:
       artifact-prefix: mooncake-wheel-cu130-arm64
       version-override: 0.0.0.dev0
 
-  build-wheel-efa:
-    needs: [spell-check, clang-format, check-paths]
+  # Every default wheel carries the EFA transport (USE_EFA=ON), but the EFA
+  # unit tests only build with USE_EFA=ON and BUILD_UNIT_TESTS=ON, which no
+  # wheel build sets. Build them here so a break shows up in PR CI instead of
+  # at the release tag (#5260), and run the ones that need no EFA hardware.
+  efa-unit-tests:
+    name: EFA unit tests (build, no-hardware run)
+    needs: [check-paths]
     if: *run-ci-for-source-changes
-    uses: ./.github/workflows/ci_efa.yml
-    secrets: inherit
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
+    - name: Install build utilities and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      shell: bash
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    - name: Fetch libfabric headers
+      # Same pin as the wheel build: the oldest libfabric API the transport
+      # accepts. Only headers are needed; libfabric is dlopen'ed at runtime.
+      env:
+        LIBFABRIC_HEADERS_VERSION: "1.18.3"
+      run: |
+        dest="$RUNNER_TEMP/libfabric-headers"
+        mkdir -p "$dest"
+        curl --retry 3 --retry-delay 2 -fsSL \
+          "https://github.com/ofiwg/libfabric/archive/refs/tags/v${LIBFABRIC_HEADERS_VERSION}.tar.gz" |
+          tar xz -C "$dest" --strip-components=1 "libfabric-${LIBFABRIC_HEADERS_VERSION}/include/rdma"
+        test -f "$dest/include/rdma/fabric.h"
+      shell: bash
+
+    - name: Build the EFA unit tests
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR="$RUNNER_TEMP/libfabric-headers/include" \
+          -DUSE_CUDA=ON -DUSE_HTTP=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+          -DBUILD_UNIT_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_SCCACHE=ON
+        targets=$(cmake --build build --target help | sed -n 's/^\(efa_[a-z_]*test\):.*/\1/p' | sort -u)
+        test -n "$targets"
+        echo "EFA test targets: $targets"
+        cmake --build build --parallel 128 --target $targets
+      shell: bash
+
+    - name: Configure CUDA driver runtime
+      # The runner has no NVIDIA driver; expose the stub libcuda the tests load.
+      uses: ./.github/actions/setup-cuda-runtime
+
+    - name: Run the EFA unit tests that need no EFA hardware
+      # The rest need an EFA device; they are only compiled here.
+      run: |
+        cd build
+        ctest --output-on-failure --timeout 300 --no-tests=error \
+          -R '^efa_(endpoint_handshake|select_device|discovery|stale_segment_desc|remote_accessible)_test$'
+      shell: bash
 
   build-wheel-rocm:
     needs: [spell-check, clang-format, check-paths]
@@ -616,32 +748,52 @@ jobs:
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
+  build-wheel-xpu:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/ci_xpu.yml
+
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
     if: needs.check-paths.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
+      # The Store library and its tests are about 70% of a full build, and
+      # the unit-tests job already builds and runs them. Only cuda-off runs
+      # Store tests here, so it builds just the TE tree plus those two test
+      # executables; the other legs configure with WITH_STORE=OFF. An empty
+      # build_targets builds and installs everything that was configured.
       matrix:
         include:
           - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
+            cmake_flags: >-
+              -DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: true
             metrics_flags: ''
+            build_targets: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
+            build_targets: >-
+              mooncake-transfer-engine/all
+              transfer_task_test standalone_client_test
           - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+            build_targets: ''
           # Exercise the native UB target with its injected mock adapter. A
           # Debug build also catches ODR/link errors hidden by optimization.
           - name: ub-mock
-            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: false
             metrics_flags: ''
+            build_targets: ''
           # Compile against stub ACL headers and embed host-only ACL stubs in
           # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
           - name: memfabric-mock
@@ -651,6 +803,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
+            build_targets: tent_memfabric_transport_test transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -702,8 +855,8 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
-          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        if [ -n "${{ matrix.build_targets }}" ]; then
+          cmake --build . --target ${{ matrix.build_targets }}
         else
           cmake --build .
           sudo cmake --install .
@@ -744,6 +897,13 @@ jobs:
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
           -R '^tent_compat_notify_test$'
+      shell: bash
+
+    - name: Test Store scatter shared-segment ownership with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^transfer_task_tent_shared_segment_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
@@ -800,6 +960,130 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
+  store-rs-ci:
+    name: Store-RS Classic TE smoke
+    needs: [spell-check, clang-format, check-paths]
+    if: needs.check-paths.outputs.store_rs == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      MOONCAKE_ROOT_DIR: ${{ github.workspace }}
+      MOONCAKE_STORE_RS_DIR: ${{ github.workspace }}/mooncake-store-rs
+      MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build/store-rs-ci
+      MOONCAKE_PYTHON_PREFIX: ${{ github.workspace }}/build/store-rs-python-prefix
+      MOONCAKE_CLASSIC_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_classic_shim.so
+      MOONCAKE_TENT_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_tent_shim.so
+      MOONCAKE_PYTHON_BIN: python3
+      MC_STORE_RS_CHECK_CPP_FACADE: "false"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Show Rust toolchain versions
+      run: |
+        rustc --version --verbose
+        cargo --version
+        cargo clippy --version
+        rustfmt --version
+
+    - name: Check Store-RS Rust formatting
+      run: cargo fmt --all --manifest-path mooncake-store-rs/Cargo.toml -- --check
+
+    - name: Cache Store-RS Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-cli
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-python
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-tests
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build redis-server redis-tools
+        sudo bash -x dependencies.sh -y
+        python -m pip install --disable-pip-version-check numpy pybind11
+      shell: bash
+
+    - name: Configure Store-RS
+      run: |
+        # Store-RS's current CMake integration requires both native shims, even
+        # though this PR gate exercises only the Classic TE data path.
+        cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" -G Ninja \
+          -DSKBUILD=ON \
+          -DPython3_EXECUTABLE="$(command -v python3)" \
+          -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+          -DWITH_STORE=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DWITH_STORE_RS=ON \
+          -DWITH_TE=ON \
+          -DUSE_TENT=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_CUDA=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_SHARED_LIBS=ON \
+          -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release
+      shell: bash
+
+    - name: Build Store-RS and native shims
+      run: |
+        cmake --build "$MOONCAKE_BUILD_DIR" \
+          --target _fast_copy engine build_store_rs \
+          --parallel "$(nproc)"
+      shell: bash
+
+    - name: Lint Store-RS Rust crates
+      run: |
+        PYO3_PYTHON="$(command -v python3)"
+        CARGO_TARGET_DIR="$MOONCAKE_BUILD_DIR/mooncake-store-rs/cargo-tests"
+        export PYO3_PYTHON CARGO_TARGET_DIR
+        source "$MOONCAKE_STORE_RS_DIR/scripts/lib/common.sh"
+        mc_scripts_setup_upstream_runtime_env none
+        cargo clippy \
+          --manifest-path "$MOONCAKE_STORE_RS_DIR/Cargo.toml" \
+          --workspace --lib --bins --release -- -D warnings
+      shell: bash
+
+    - name: Install Store-RS Python component
+      run: |
+        cmake --install "$MOONCAKE_BUILD_DIR" --component python \
+          --prefix "$MOONCAKE_PYTHON_PREFIX"
+        mkdir -p "$MOONCAKE_PYTHON_PREFIX/mooncake"
+        cp -a "$MOONCAKE_ROOT_DIR/python/mooncake/." \
+          "$MOONCAKE_PYTHON_PREFIX/mooncake/"
+      shell: bash
+
+    - name: Run Store-RS Classic TE smoke
+      run: ./scripts/ci/run_store_rs_smoke.sh
+      shell: bash
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
   ci-gate:
     name: CI Gate
     # A cancelled branch push run reports no result rather than a failed gate.
@@ -821,9 +1105,11 @@ jobs:
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-cu13-arm64
-      - build-wheel-efa
+      - efa-unit-tests
       - build-wheel-rocm
+      - build-wheel-xpu
       - tent-ci
+      - store-rs-ci
     runs-on: ubuntu-latest
     steps:
       # Each path-gated group must succeed when selected and be skipped otherwise.
@@ -853,8 +1139,9 @@ jobs:
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
             ${{ needs.build-wheel-cu13-arm64.result }}
-            ${{ needs.build-wheel-efa.result }}
+            ${{ needs.efa-unit-tests.result }}
             ${{ needs.build-wheel-rocm.result }}
+            ${{ needs.build-wheel-xpu.result }}
         run: |
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
@@ -864,6 +1151,12 @@ jobs:
         env:
           EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
           RESULT: ${{ needs.tent-ci.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Check Store-RS job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.store_rs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.store-rs-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check documentation job

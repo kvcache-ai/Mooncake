@@ -27,7 +27,7 @@ TEST(MasterServiceGroupScenarioTest,
     const std::string key = "grouped_route_key";
     MasterScenario("grouped object routes key-level lookup and remove")
         .Given(MemoryNode("memory"))
-        .When(PutStart(key, 1_KB).InGroup(GroupOnDifferentShard(key)))
+        .When(PutStart(key, 1_KB).InGroup(key + "_group"))
         .When(PutEnd(key))
         .Then(KeyExists(key))
         .Then(Object(key).IsReadable())
@@ -37,7 +37,7 @@ TEST(MasterServiceGroupScenarioTest,
 
 TEST(MasterServiceGroupScenarioTest, GroupRoutingIsTenantScopedForSameUserKey) {
     const std::string key = "tenant_grouped_shared_user_key";
-    const std::string group_a = GroupOnDifferentShard(key);
+    const std::string group_a = key + "_group";
     std::string group_b;
     for (int i = 0; i < 10000; ++i) {
         group_b = key + "_tenant_b_group_" + std::to_string(i);
@@ -78,7 +78,7 @@ TEST(MasterServiceGroupScenarioTest,
     MasterScenario("expired grouped put can be replaced by an ungrouped put",
                    std::move(config))
         .Given(MemoryNode("memory"))
-        .When(PutStart(key, 1_KB).InGroup(GroupOnDifferentShard(key)))
+        .When(PutStart(key, 1_KB).InGroup(key + "_group"))
         .When(WaitFor(std::chrono::milliseconds(2)))
         .When(PutStart(key, 1_KB))
         .When(PutEnd(key))
@@ -89,7 +89,7 @@ TEST(MasterServiceGroupScenarioTest, BatchRemoveUnregistersGroupedRoute) {
     const std::string key = "batch_remove_grouped_route";
     MasterScenario("batch remove unregisters the grouped route")
         .Given(MemoryNode("memory"))
-        .When(PutStart(key, 1_KB).InGroup(GroupOnDifferentShard(key)))
+        .When(PutStart(key, 1_KB).InGroup(key + "_group"))
         .When(PutEnd(key))
         .When(BatchRemove({key}).Force())
         .When(PutStart(key, 1_KB))
@@ -101,7 +101,7 @@ TEST(MasterServiceGroupScenarioTest, RemoveByRegexUnregistersGroupedRoute) {
     const std::string key = "regex_remove_grouped_route";
     MasterScenario("remove by regex unregisters the grouped route")
         .Given(MemoryNode("memory"))
-        .When(PutStart(key, 1_KB).InGroup(GroupOnDifferentShard(key)))
+        .When(PutStart(key, 1_KB).InGroup(key + "_group"))
         .When(PutEnd(key))
         .When(RemoveByRegex("^regex_remove_grouped_route$")
                   .Force()
@@ -114,7 +114,7 @@ TEST(MasterServiceGroupScenarioTest, RemoveByRegexUnregistersGroupedRoute) {
 TEST(MasterServiceGroupScenarioTest, RemoveGroupedMemberPreservesOtherMembers) {
     const std::string key_a = "remove_group_key_a";
     const std::string key_b = "remove_group_key_b";
-    const std::string group = GroupOnDifferentShard(key_a);
+    const std::string group = key_a + "_group";
     MasterScenario("removing one grouped member preserves the others")
         .Given(MemoryNode("memory"))
         .When(PutStart(key_a, 1_KB).InGroup(group))
@@ -132,13 +132,13 @@ TEST(MasterServiceGroupScenarioTest, UpsertPreservesGroupMembership) {
     const std::string key = "upsert_group_key";
     MasterScenario("upsert preserves existing group membership")
         .Given(MemoryNode("memory"))
-        .When(PutStart(key, 1_KB).InGroup(GroupOnDifferentShard(key)))
+        .When(PutStart(key, 1_KB).InGroup(key + "_group"))
         .When(PutEnd(key))
         .When(UpsertStart(key, 1_KB))
         .When(UpsertEnd(key))
         .Then(Object(key).IsReadable())
         .When(UpsertStart(key, 1_KB)
-                  .InGroup(GroupOnDifferentShard(key + "_other"))
+                  .InGroup(key + "_other_group")
                   .ExpectError(ErrorCode::INVALID_PARAMS))
         .When(UpsertStart(key, 1_KB).InGroup("").ExpectError(
             ErrorCode::INVALID_PARAMS));
@@ -154,7 +154,7 @@ TEST(MasterServiceGroupScenarioTest,
     MasterScenario("incomplete grouped upsert can become ungrouped",
                    std::move(config))
         .Given(MemoryNode("memory"))
-        .When(PutStart(key, 1_KB).InGroup(GroupOnDifferentShard(key)))
+        .When(PutStart(key, 1_KB).InGroup(key + "_group"))
         .When(WaitFor(std::chrono::milliseconds(2)))
         .When(UpsertStart(key, 1_KB))
         .When(UpsertEnd(key))
@@ -168,15 +168,15 @@ TEST(MasterServiceGroupScenarioTest, UpsertRejectsExistingUngroupedToGrouped) {
         .When(PutStart(key, 1_KB))
         .When(PutEnd(key))
         .When(UpsertStart(key, 2_KB)
-                  .InGroup(GroupOnDifferentShard(key))
+                  .InGroup(key + "_group")
                   .ExpectError(ErrorCode::INVALID_PARAMS))
         .Then(Object(key).IsReadable());
 }
 
 TEST(MasterServiceGroupScenarioTest,
      BatchUpsertStartMixedGroupIdsPreservesOrder) {
-    const std::string group_a = GroupOnDifferentShard("batch_grouped_a");
-    const std::string group_b = GroupOnDifferentShard("batch_grouped_b");
+    const std::string group_a = "batch_grouped_a_group";
+    const std::string group_b = "batch_grouped_b_group";
     MasterScenario("batch upsert start preserves order with mixed group ids")
         .Given(MemoryNode("memory"))
         .When(BatchUpsertStart({{"batch_grouped_a", 1_KB},
@@ -199,7 +199,7 @@ TEST(MasterServiceGroupScenarioTest,
      BatchExistKeyGroupedAndIncompletePreservesOrder) {
     const std::string grouped_key_a = "batch_grouped_key_a";
     const std::string grouped_key_b = "batch_grouped_key_b";
-    const std::string group = GroupOnDifferentShard(grouped_key_a);
+    const std::string group = grouped_key_a + "_group";
     MasterScenario("batch exist key preserves order with grouped keys")
         .Given(MemoryNode("memory"))
         .When(PutStart(grouped_key_a, 1_KB).InGroup(group))
@@ -221,13 +221,11 @@ TEST(MasterServiceGroupScenarioTest,
     const std::string grouped_key_b = "batch_get_grouped_b";
     MasterScenario("batch get replica list preserves order with grouped keys")
         .Given(MemoryNode("memory"))
-        .When(PutStart(grouped_key_a, 1_KB)
-                  .InGroup(GroupOnDifferentShard(grouped_key_a)))
+        .When(PutStart(grouped_key_a, 1_KB).InGroup(grouped_key_a + "_group"))
         .When(PutEnd(grouped_key_a))
         .When(PutStart("batch_get_ungrouped", 1_KB))
         .When(PutEnd("batch_get_ungrouped"))
-        .When(PutStart(grouped_key_b, 1_KB)
-                  .InGroup(GroupOnDifferentShard(grouped_key_b)))
+        .When(PutStart(grouped_key_b, 1_KB).InGroup(grouped_key_b + "_group"))
         .When(PutEnd(grouped_key_b))
         .When(PutStart("batch_get_pending", 1_KB))
         .Then(BatchReplicaLists({grouped_key_a, "batch_get_missing",

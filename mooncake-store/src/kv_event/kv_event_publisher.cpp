@@ -54,7 +54,7 @@ size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
         map_size += 1;  // object_key
     }
     if (is_stored) {
-        map_size += 3;  // base_block_idx, parent_hash, token_ids
+        map_size += 4;  // base_block_idx, parent_hash, token_ids, session_id
         if (emit_legacy) {
             map_size += 1;  // parent_block_hash
         }
@@ -174,7 +174,8 @@ KvEventPublisher::~KvEventPublisher() {
 void KvEventPublisher::PublishStored(const std::string& object_key,
                                      const std::string& medium,
                                      const std::string& tenant_id,
-                                     const std::string& group_id) {
+                                     const std::string& group_id,
+                                     const std::string& session_id) {
     if (!config_.enabled) {
         return;
     }
@@ -185,7 +186,8 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
     }
     std::vector<PendingEvent> events;
     events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                  NormalizeTenant(tenant_id), group_id});
+                                  NormalizeTenant(tenant_id), group_id,
+                                  session_id});
     EnqueueBatch(std::move(events));
 }
 
@@ -220,7 +222,7 @@ void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
 void KvEventPublisher::PublishCommitted(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id) {
+    const std::string& group_id, const std::string& session_id) {
     if (!config_.enabled) {
         return;
     }
@@ -232,7 +234,7 @@ void KvEventPublisher::PublishCommitted(
     // the previous contents.
     for (const auto& medium : SortedMedia(NormalizeMedia(current_media))) {
         events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                      normalized_tenant, group_id});
+                                      normalized_tenant, group_id, session_id});
     }
     EnqueueBatch(std::move(events));
 }
@@ -256,8 +258,8 @@ void KvEventPublisher::PublishObjectRemoved(
 void KvEventPublisher::SyncObjectState(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id,
-    const std::vector<std::string>& previous_media) {
+    const std::string& group_id, const std::vector<std::string>& previous_media,
+    const std::string& session_id) {
     if (!config_.enabled) {
         return;
     }
@@ -275,7 +277,8 @@ void KvEventPublisher::SyncObjectState(
     for (const auto& medium : SortedMedia(new_set)) {
         if (!previous_set.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kStored, object_key,
-                                          medium, normalized_tenant, group_id});
+                                          medium, normalized_tenant, group_id,
+                                          session_id});
         }
     }
     EnqueueBatch(std::move(events));
@@ -294,9 +297,13 @@ void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
     if (events.empty()) {
         return;
     }
+    bool notify = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        const size_t previous_size = queue_.size();
+        notify = previous_size == 0;
         for (auto& event : events) {
+            notify = notify || event.kind != EventKind::kRemoved;
             if (config_.queue_capacity > 0 &&
                 queue_.size() >= config_.queue_capacity) {
                 queue_.pop_front();
@@ -306,8 +313,12 @@ void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
             }
             queue_.push_back(std::move(event));
         }
+        notify = notify || (previous_size < kMaxBatchSize &&
+                            queue_.size() >= kMaxBatchSize);
     }
-    queue_cv_.notify_one();
+    if (notify) {
+        queue_cv_.notify_one();
+    }
 }
 
 void KvEventPublisher::DrainRemainingQueue(std::vector<PendingEvent>& batch) {
@@ -335,6 +346,25 @@ void KvEventPublisher::WorkerLoop() {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cv_.wait(lock,
                            [this] { return stop_.load() || !queue_.empty(); });
+            if (!queue_.empty() && queue_.front().kind == EventKind::kRemoved &&
+                config_.removal_batch_timeout_us > 0) {
+                // Keep one FIFO for all mutations: delaying removals outside
+                // this queue could retract a later same-key Stored event.
+                // The deadline is fixed for this batch, not reset on arrivals.
+                const auto deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(config_.removal_batch_timeout_us);
+                queue_cv_.wait_until(lock, deadline, [this] {
+                    // The scan is bounded by kMaxBatchSize. Control events
+                    // bypass the delay even when followed by more removals.
+                    return stop_.load() || queue_.size() >= kMaxBatchSize ||
+                           std::any_of(queue_.begin(), queue_.end(),
+                                       [](const PendingEvent& event) {
+                                           return event.kind !=
+                                                  EventKind::kRemoved;
+                                       });
+                });
+            }
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();
@@ -446,6 +476,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         }
 
         if (is_stored) {
+            packer.pack("session_id");
+            PackOptionalString(packer, item.pending.session_id);
             packer.pack("base_block_idx");
             packer.pack_nil();
             packer.pack("parent_hash");

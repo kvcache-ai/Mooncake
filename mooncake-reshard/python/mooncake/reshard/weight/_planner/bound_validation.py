@@ -33,6 +33,11 @@ def _validate_bound_target_coverage(plan: TransferPlan) -> None:
         for part in target_placement.parts
         for fragment in part.fragments
     }
+    target_by_id = {
+        fragment.placement_fragment_id: fragment
+        for part in target_parts.values()
+        for fragment in part.fragments
+    }
     operations_by_fragment: dict[
         PlacementFragmentId, list[ExecutableTransferOperation]
     ] = {}
@@ -47,9 +52,9 @@ def _validate_bound_target_coverage(plan: TransferPlan) -> None:
         ):
             raise ValueError("bound target fragment differs from target placement")
         participant_id = participant_by_fragment.get(target.placement_fragment_id)
-        if participant_id is None or not any(
-            fragment == target.placement
-            for fragment in target_parts[participant_id].fragments
+        if (
+            participant_id is None
+            or target_by_id.get(target.placement_fragment_id) != target.placement
         ):
             raise ValueError("bound target fragment differs from target placement")
         operations_by_fragment.setdefault(target.placement_fragment_id, []).append(
@@ -82,12 +87,13 @@ def _validate_bound_target_coverage(plan: TransferPlan) -> None:
             or attestation.evidence.lease_id != executor.runtime_lease_id
         ):
             raise ValueError("bound target executor differs from target placement")
+        executor_fragment_ids = set(executor.fragment_ids)
         selected_pairs = tuple(
             (fragment, runtime)
             for fragment, runtime in attestation.worker_fragment_pairs(
                 executor.worker_id
             )
-            if runtime.fragment_id in executor.fragment_ids
+            if runtime.fragment_id in executor_fragment_ids
         )
         expected_fragment_ids = tuple(
             sorted(runtime.fragment_id for _, runtime in selected_pairs)

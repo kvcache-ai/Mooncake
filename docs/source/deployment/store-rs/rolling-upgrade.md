@@ -8,7 +8,7 @@ This document describes how to perform a rolling upgrade on a Mooncake Store clu
 
 - The new version only increments `store_api_minor_version` (minor version) and does **not** change `store_api_version` (major version)
 - The changes in the new version are backward-compatible (e.g., adding fields, adding RPCs) and do not alter existing API semantics
-- Both versions were built from their own root CMake build trees using the [Store-RS source-checkout quickstart](../../getting_started/store-rs.md)
+- Both versions were built from their own root CMake build trees using {ref}`Build with Store-RS <build-with-store-rs>`
 
 ### Compatibility Guarantees
 

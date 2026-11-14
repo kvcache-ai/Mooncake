@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
+MOONCAKE_ROOT=${MOONCAKE_ROOT_DIR:-}
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../lib/common.sh"
 MODE="${1:-all}"
@@ -44,7 +45,8 @@ Environment:
   MC_STORE_RS_KEEP_TEMP                  Keep temp dir on failure when set to 1
   MOONCAKE_PYTHON_BIN                    Interpreter from a virtualenv with
                                          the root wheel installed
-  MOONCAKE_STORE_RS_DIR              Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR                      Absolute Mooncake source directory
+  MOONCAKE_STORE_RS_DIR                  Absolute Store-RS source directory
 EOF
 }
 
@@ -62,6 +64,11 @@ fi
 REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
 [[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
   echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
+MOONCAKE_ROOT=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit Mooncake source directory}
+[[ "${MOONCAKE_ROOT}" == /* && -f "${MOONCAKE_ROOT}/python/tests/store/rs/clients/real_client_rw.py" ]] || {
+  echo "MOONCAKE_ROOT_DIR must contain the Store-RS Python test clients: ${MOONCAKE_ROOT}" >&2
   exit 1
 }
 
@@ -169,9 +176,28 @@ wait_for_key() {
   exit 1
 }
 
+wait_for_segment_field() {
+  local key=$1
+  local timeout_seconds=$2
+  local deadline=$((SECONDS + timeout_seconds))
+  local field
+
+  while (( SECONDS < deadline )); do
+    while IFS= read -r field; do
+      if [[ "${field}" == segment:* ]]; then
+        return 0
+      fi
+    done < <(redis-cli --raw -u "${REDIS_URL}" HKEYS "${key}")
+    sleep 0.2
+  done
+
+  echo "segment metadata field did not appear in client hash: ${key}" >&2
+  exit 1
+}
+
 wait_for_route_policy() {
   local deadline=$((SECONDS + 20))
-  local key="{${KEYSPACE}}/system/route-policy/default"
+  local key="{${TENANT_KEYSPACE}}/system/route-policy/default"
   while (( SECONDS < deadline )); do
     if [[ "$(redis-cli -u "${REDIS_URL}" EXISTS "${key}" | tr -d '[:space:]')" == "1" ]]; then
       return 0
@@ -183,10 +209,13 @@ wait_for_route_policy() {
 }
 
 wait_for_storage_metadata() {
-  wait_for_key "{${KEYSPACE}}/clients/${STORAGE_A_STABLE}:1" 25
-  wait_for_key "{${KEYSPACE}}/clients/${STORAGE_B_STABLE}:1" 25
-  wait_for_key "{${KEYSPACE}}/indexes/segments/${STORAGE_A_STABLE}:1" 25
-  wait_for_key "{${KEYSPACE}}/indexes/segments/${STORAGE_B_STABLE}:1" 25
+  local storage_a_key="{${TENANT_KEYSPACE}}/clients/${STORAGE_A_STABLE}:1"
+  local storage_b_key="{${TENANT_KEYSPACE}}/clients/${STORAGE_B_STABLE}:1"
+
+  wait_for_key "${storage_a_key}" 25
+  wait_for_key "${storage_b_key}" 25
+  wait_for_segment_field "${storage_a_key}" 25
+  wait_for_segment_field "${storage_b_key}" 25
   wait_for_route_policy
 }
 
@@ -203,7 +232,7 @@ run_real_client() {
   local -a args=(
     "${PYTHON_BIN}"
     -u
-    "${REPO_ROOT}/python/tests/store/rs/clients/real_client_rw.py"
+    "${MOONCAKE_ROOT}/python/tests/store/rs/clients/real_client_rw.py"
     --local_host "${local_host}"
     --metadata_url "${REDIS_URL}"
     --storage-bytes "${storage_bytes}"
@@ -243,7 +272,7 @@ start_storage_client() {
 
   MC_STORE_RS_EXPIRES_AT_MS="${expires_at_ms}" \
     PYTHONUNBUFFERED=1 \
-    "${PYTHON_BIN}" -u "${REPO_ROOT}/python/tests/store/rs/clients/real_client_rw.py" \
+    "${PYTHON_BIN}" -u "${MOONCAKE_ROOT}/python/tests/store/rs/clients/real_client_rw.py" \
       --local_host "${local_host}" \
       --metadata_url "${REDIS_URL}" \
       --storage-bytes "${STORAGE_BYTES}" \
@@ -342,6 +371,7 @@ REDIS_PORT="${MC_STORE_RS_TTL_RECOVERY_REDIS_PORT:-$(allocate_port)}"
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 RUN_ID=$(date +%s%N)
 KEYSPACE="mc/store-rs/e2e/redis-ttl-recovery/${RUN_ID}"
+TENANT_KEYSPACE="${KEYSPACE}/tenants/default"
 REDIS_PERSIST_DIR="${TEMP_DIR}/redis-persist"
 REDIS_FRESH_DIR="${TEMP_DIR}/redis-fresh"
 STORAGE_A_STABLE="redis-ttl-storage-a-${RUN_ID}"

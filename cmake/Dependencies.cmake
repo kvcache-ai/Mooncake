@@ -14,6 +14,17 @@ function(mooncake_provide_zstd)
                INTERFACE_INCLUDE_DIRECTORIES "${MOONCAKE_ZSTD_INCLUDE_DIR}")
 endfunction()
 
+function(mooncake_provide_cli11)
+  find_path(MOONCAKE_CLI11_INCLUDE_DIR CLI/CLI.hpp)
+  if(NOT MOONCAKE_CLI11_INCLUDE_DIR)
+    message(FATAL_ERROR "CLI11 development files not found (libcli11-dev)")
+  endif()
+  add_library(Mooncake::cli11 INTERFACE IMPORTED)
+  set_target_properties(
+    Mooncake::cli11 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                               "${MOONCAKE_CLI11_INCLUDE_DIR}")
+endfunction()
+
 function(mooncake_provide_xxhash)
   find_path(MOONCAKE_XXHASH_INCLUDE_DIR xxhash.h)
   find_library(MOONCAKE_XXHASH_LIBRARY NAMES xxhash libxxhash)

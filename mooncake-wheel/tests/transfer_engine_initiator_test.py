@@ -243,6 +243,58 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
                 payload,
             )
 
+    def test_scatter_submit_write_read(self):
+        """Submit scatter transfers without draining them in the binding."""
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        payload = b"scatter-submit"
+        self.assertEqual(
+            adaptor.write_bytes_to_buffer(base_src_addr, payload, len(payload)),
+            0,
+        )
+
+        write_ticket = adaptor.submit_scatter_write(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[0]],
+            [[256]],
+            [[len(payload)]],
+        )
+        self.assertFalse(write_ticket.drained)
+        self.assertIn("COMPLETED", str(write_ticket.drain(30_000)))
+        self.assertTrue(write_ticket.drained)
+
+        self.assertEqual(
+            adaptor.write_bytes_to_buffer(
+                base_src_addr + 512, bytes(len(payload)), len(payload)
+            ),
+            0,
+        )
+        read_ticket = adaptor.submit_scatter_read(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[512]],
+            [[256]],
+            [[len(payload)]],
+        )
+        self.assertFalse(read_ticket.drained)
+        self.assertIn("COMPLETED", str(read_ticket.drain(30_000)))
+        self.assertTrue(read_ticket.drained)
+        self.assertEqual(
+            adaptor.read_bytes_from_buffer(base_src_addr + 512, len(payload)),
+            payload,
+        )
+
     def test_scatter_rejects_mismatched_fragment_vectors(self):
         adaptor = self.adaptor
         base_src_addr = self._ensure_buffer_available()

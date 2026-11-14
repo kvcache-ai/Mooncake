@@ -84,6 +84,12 @@ class Topology {
 
     int parse(const std::string &topology_json);
 
+    // Parses a local topology, keeping only HCAs whose names appear in
+    // device_filter. Each entry keeps its preferred/avail order. An empty
+    // filter keeps every HCA, the same as parse(topology_json).
+    int parse(const std::string &topology_json,
+              const std::vector<std::string> &device_filter);
+
     int disableDevice(const std::string &device_name);
 
     std::string toString() const;
@@ -93,11 +99,23 @@ class Topology {
     bool operator==(const Topology &other) const;
     bool operator!=(const Topology &other) const { return !(*this == other); }
 
-    int selectDevice(const std::string storage_type, int retry_count = 0);
+    // If `device_filter` is set, only the devices it accepts are selectable;
+    // the selection rule then applies to them. With every device accepted, or
+    // without `device_filter`, the result is unchanged. Returns
+    // ERR_DEVICE_NOT_FOUND when the entry is absent or empty, and
+    // ERR_ADDRESS_NOT_REGISTERED when it exists but `device_filter` rejects
+    // all of its devices, so callers can tell the two apart before falling
+    // back to another entry.
+    int selectDevice(const std::string storage_type, int retry_count = 0,
+                     const std::function<bool(int)> &device_filter = {});
     int selectDevice(const std::string storage_type, std::string_view hint,
                      int retry_count = 0);
-    int selectDeviceByLocalHca(const std::string storage_type,
-                               std::string_view local_hca, int retry_count = 0);
+    // With a peer-affinity mapping for local_hca, `device_filter` applies to
+    // the mapped devices only and never falls back to the whole entry.
+    int selectDeviceByLocalHca(
+        const std::string storage_type, std::string_view local_hca,
+        int retry_count = 0,
+        const std::function<bool(int)> &device_filter = {});
 
     // Resolve a named HCA in one topology entry without applying fallback
     // selection. Returns ERR_DEVICE_NOT_FOUND when either the entry or HCA is

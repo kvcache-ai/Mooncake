@@ -208,14 +208,63 @@ TEST_F(BatchCounterWait, AppendLegacyDisablesCounterShortcut) {
     EXPECT_EQ(query(b).s, Transport::COMPLETED);
 }
 TEST_F(BatchCounterWait, PublicationWaitsForAllSlicesToBeSubmitted) {
-    rdma->complete_while_submitting = true;
-    auto b = batch(1);
-    ASSERT_TRUE(submit(b, {1}).ok());
-    EXPECT_EQ(rdma->published_before_seal, 0u);
-    EXPECT_EQ(query(b).s, Transport::WAITING);
-    rdma->finish(0);
-    EXPECT_EQ(query(b).s, Transport::COMPLETED);
-    EXPECT_EQ(query(b).transferred_bytes, 40u);
+    const bool explicit_protocols[] = {
+        false,
+#ifdef ENABLE_MULTI_PROTOCOL
+        true,
+#endif
+    };
+    for (bool explicit_protocol : explicit_protocols) {
+        for (bool reject : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "explicit_protocol=" << explicit_protocol
+                         << " reject=" << reject);
+            rdma->tasks.clear();
+            rdma->complete_while_submitting = true;
+            rdma->reject_submit = reject;
+            auto b = batch(1);
+            requests.assign(1, {});
+            requests[0].target_id = 1;
+            requests[0].length = 17;
+            Status status;
+#ifdef ENABLE_MULTI_PROTOCOL
+            if (explicit_protocol) {
+                std::string proto = "rdma";
+                status = multi.mp_submitTransfer(b, requests, proto);
+            } else
+#endif
+            {
+                status = multi.submitTransfer(b, requests);
+            }
+            EXPECT_EQ(status.ok(), !reject);
+            auto& desc = Transport::toBatchDesc(b);
+            auto& task = desc.task_list.at(0);
+            // The probe completes the prefix before constructing the tail.
+            EXPECT_EQ(rdma->published_before_seal, 0u);
+            EXPECT_EQ(task.slice_count, 2u);
+            EXPECT_EQ(task.completion_state,
+                      Transport::Slice::kCompletionSealBit | 1u);
+            EXPECT_FALSE(task.completion_published);
+            EXPECT_FALSE(task.is_finished);
+            EXPECT_EQ(desc.finished_task_count.load(), 0u);
+            EXPECT_FALSE(desc.is_finished.load());
+            EXPECT_EQ(query(b).s, Transport::WAITING);
+            rdma->finish(0, reject);
+            EXPECT_EQ(task.completion_state,
+                      Transport::Slice::kCompletionSealBit | 2u);
+            EXPECT_TRUE(task.completion_published);
+            EXPECT_EQ(query(b).s,
+                      reject ? Transport::FAILED : Transport::COMPLETED);
+            if (!reject) {
+                EXPECT_EQ(query(b).transferred_bytes, 40u);
+            }
+            EXPECT_EQ(desc.finished_task_count.load(), 1u);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            EXPECT_TRUE(task.is_finished);
+            EXPECT_TRUE(desc.is_finished.load());
+#endif
+        }
+    }
 }
 TEST_F(BatchCounterWait, TimeoutChecksKeepPolling) {
     auto b = batch();

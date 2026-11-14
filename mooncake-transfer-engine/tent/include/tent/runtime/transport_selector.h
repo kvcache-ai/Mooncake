@@ -89,6 +89,13 @@ struct SelectionContext {
     // Match policy against the original memory types, but select a network
     // transport for the host-to-host leg of a staged request.
     bool host_staging{false};
+    // The peer's XPU buffer may be mapped into this process (Level Zero IPC),
+    // so XpuTransport can address it, unstaged, although the segment is not
+    // local. Other transports still follow host_staging.
+    bool xpu_ipc{false};
+    // Only XpuTransport may carry the request: the device memory has neither
+    // a dma-buf RDMA registration nor a host staging route.
+    bool xpu_ipc_only{false};
 };
 
 /**
@@ -208,6 +215,7 @@ class TransportSelector {
     bool isLegacyMode() const { return legacy_mode_; }
 
     bool isForceTcp() const { return force_tcp_; }
+    bool isForceFabric() const { return force_fabric_; }
 
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
@@ -233,6 +241,7 @@ class TransportSelector {
     std::shared_ptr<Topology> topology_;
     std::vector<SelectionPolicy> policies_;
     bool force_tcp_{false};
+    bool force_fabric_{false};
     bool legacy_mode_{false};  // If true, skip selector and return empty result
 };
 

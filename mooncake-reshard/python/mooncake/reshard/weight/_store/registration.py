@@ -165,6 +165,10 @@ class StoreBufferRegistration:
     ) -> Generator[None, None, None]:
         self._require_submission_allowed()
         if pre_registered_lease is not None:
+            if pre_registered_lease._owner is not self:
+                raise WeightStoreError(
+                    "registration lease belongs to a different Store"
+                )
             pre_registered_lease.validate(pre_registered_lease.binding, fragments)
             yield
             return

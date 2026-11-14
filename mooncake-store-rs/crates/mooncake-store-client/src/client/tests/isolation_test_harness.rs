@@ -3,9 +3,9 @@
 // namespace-isolation and namespace-adversarial test modules.
 //
 // Goals:
-//   * Spin up N independent `StoreClient` instances backed by the same
-//     `InMemoryMetadataBackend` so cross-tenant / cross-scope isolation can be
-//     exercised in a single process.
+//   * Spin up N independent `StoreClient` instances backed by the same legacy
+//     unbound `InMemoryMetadataBackend` so logical namespace encoding can be
+//     exercised independently from hard control-plane tenant binding.
 //   * Each client owns its own segment (`<stable_id>-segment`) and its own
 //     transport peer derived from a shared in-process hub, mirroring how the
 //     existing integration tests publish multiple storage nodes.
@@ -46,9 +46,9 @@ pub(super) struct IsolationCluster {
 
 impl IsolationCluster {
     /// Build `n` clients named `<prefix>-0`, `<prefix>-1`, ... .  Every
-    /// client is configured with the **same default tenant** so the test can
-    /// exercise true cross-tenant calls via `*_in_tenant` APIs without the
-    /// builder's default-tenant value getting in the way.
+    /// client is configured with the **same default tenant**. These fixtures
+    /// test logical namespace separation on an intentionally unbound backend;
+    /// hard-isolated backends reject cross-tenant requests at the client edge.
     pub fn with_clients(prefix: &str, n: usize) -> Self {
         Self::with_clients_setup(prefix, n, |_metadata| {})
     }
@@ -63,7 +63,7 @@ impl IsolationCluster {
     where
         F: FnOnce(&Arc<InMemoryMetadataBackend>),
     {
-        let metadata = Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
         let hub = Arc::new(TestTransport::new(&format!("{prefix}-hub")));
         setup(&metadata);
         let mut clients = Vec::with_capacity(n);

@@ -1,5 +1,9 @@
 add_executable(default_config_test default_config_test.cpp)
 target_link_libraries(default_config_test PUBLIC mooncake_common gtest pthread)
+# Fixture files are read from the source tree, wherever the build tree is.
+target_compile_definitions(
+  default_config_test
+  PRIVATE MOONCAKE_COMMON_TESTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME default_config_test COMMAND default_config_test)
 
 add_executable(environ_test environ_test.cpp)

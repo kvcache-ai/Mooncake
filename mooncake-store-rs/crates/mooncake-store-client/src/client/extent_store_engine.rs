@@ -1149,6 +1149,8 @@ struct ExtentStoreRead<'a> {
     locator: &'a str,
     expected_len: u64,
     dst: &'a mut [u8],
+    allow_intermediate_buffer: bool,
+    allow_padded_direct_read: bool,
 }
 
 struct ReservedExtentStoreRead<'a> {
@@ -1156,6 +1158,8 @@ struct ReservedExtentStoreRead<'a> {
     file: Arc<ExtentStoreFile>,
     direct_file: Option<Arc<ExtentStoreFile>>,
     dst: &'a mut [u8],
+    allow_intermediate_buffer: bool,
+    allow_padded_direct_read: bool,
 }
 
 struct ReservedExtentStorePinnedRead {
@@ -1166,12 +1170,13 @@ struct ReservedExtentStorePinnedRead {
     packed: bool,
 }
 
-type ExtentStoreReadFiles = (Arc<ExtentStoreFile>, Option<Arc<ExtentStoreFile>>);
+type ExtentStoreReadFiles = (Arc<ExtentStoreFile>, Option<Arc<ExtentStoreFile>>, bool);
 type ReservedExtentStoreReadWithFiles = (
     usize,
     ExtentStoreLocator,
     Arc<ExtentStoreFile>,
     Option<Arc<ExtentStoreFile>>,
+    bool,
 );
 
 impl ExtentStoreEngine {
@@ -1529,6 +1534,8 @@ impl ExtentStoreEngine {
             locator,
             expected_len,
             dst,
+            allow_intermediate_buffer: false,
+            allow_padded_direct_read: false,
         };
         self.get_batch_into(&mut [read])
             .into_iter()
@@ -1618,14 +1625,14 @@ impl ExtentStoreEngine {
         let reserved_results = self.reserve_reads(&ordered);
         let mut reserved = Vec::new();
         for ((index, locator), reserve_result) in ordered.iter().copied().zip(reserved_results) {
-            let (file, direct_file) = match reserve_result {
+            let (file, direct_file, packed) = match reserve_result {
                 Ok(files) => files,
                 Err(error) => {
                     results[index] = Err(error);
                     continue;
                 }
             };
-            reserved.push((index, locator, file, direct_file));
+            reserved.push((index, locator, file, direct_file, packed));
         }
         record_stage("engine_reserve_reads", reserve_started.elapsed());
 
@@ -1901,30 +1908,26 @@ impl ExtentStoreEngine {
             (segment.file.clone(), segment.direct_file.clone())
         };
         let value_len = locator.value_len as usize;
-        let (file, fixed_file_key) = direct_file
+        let direct_len = direct_file
             .as_ref()
-            .filter(|_| {
-                direct_reads_enabled()
-                    && direct_payload_io_compatible(
-                        locator.offset + locator.value_offset,
-                        &dst[..value_len],
-                    )
-            })
-            .map(|file| {
-                (
-                    file,
-                    ExtentStoreFixedFileKey::for_direct(locator.segment_id),
-                )
-            })
-            .unwrap_or((
+            .and_then(|_| direct_read_len(locator, dst, false));
+        let (file, fixed_file_key, read_len) = match (direct_file.as_ref(), direct_len) {
+            (Some(file), Some(direct_len)) => (
+                file,
+                ExtentStoreFixedFileKey::for_direct(locator.segment_id),
+                direct_len,
+            ),
+            _ => (
                 &file,
                 ExtentStoreFixedFileKey::for_buffered(locator.segment_id),
-            ));
+                value_len,
+            ),
+        };
         self.read_exact_at(
             file,
             fixed_file_key,
             locator.offset + locator.value_offset,
-            &mut dst[..value_len],
+            &mut dst[..read_len],
         )?;
         Ok(())
     }
@@ -1934,7 +1937,8 @@ impl ExtentStoreEngine {
         reads: &[(usize, ExtentStoreLocator)],
     ) -> Vec<Result<ExtentStoreReadFiles>> {
         let inner = self.inner.lock();
-        let mut files = BTreeMap::<u64, Result<ExtentStoreReadFiles>>::new();
+        let mut files =
+            BTreeMap::<u64, Result<(Arc<ExtentStoreFile>, Option<Arc<ExtentStoreFile>>)>>::new();
         reads
             .iter()
             .map(|(_, locator)| -> Result<ExtentStoreReadFiles> {
@@ -1945,12 +1949,14 @@ impl ExtentStoreEngine {
                     ))
                 })?;
                 validate_extent_store_locator(segment, locator)?;
-                if let Some(files) = files.get(&locator.segment_id) {
-                    return files.clone();
-                }
-                let files_for_segment = Ok((segment.file.clone(), segment.direct_file.clone()));
-                files.insert(locator.segment_id, files_for_segment.clone());
-                files_for_segment
+                let files_for_segment = files
+                    .entry(locator.segment_id)
+                    .or_insert_with(|| Ok((segment.file.clone(), segment.direct_file.clone())))
+                    .clone()?;
+                let packed = segment
+                    .packed_blocks
+                    .contains_key(&(locator.offset, locator.record_len));
+                Ok((files_for_segment.0, files_for_segment.1, packed))
             })
             .collect()
     }
@@ -1961,13 +1967,21 @@ impl ExtentStoreEngine {
         reserved: Vec<ReservedExtentStoreReadWithFiles>,
         f: impl FnOnce(&mut [(usize, ReservedExtentStoreRead<'_>)]) -> Vec<Result<()>>,
     ) -> Vec<((usize, ExtentStoreLocator), Result<()>)> {
+        let allow_intermediate_buffers = reads
+            .iter()
+            .map(|read| read.allow_intermediate_buffer)
+            .collect::<Vec<_>>();
+        let allow_padded_direct_reads = reads
+            .iter()
+            .map(|read| read.allow_padded_direct_read)
+            .collect::<Vec<_>>();
         let mut slots = reads
             .iter_mut()
             .map(|read| Some(&mut *read.dst))
             .collect::<Vec<_>>();
         let mut reserved_reads = reserved
             .into_iter()
-            .map(|(index, locator, file, direct_file)| {
+            .map(|(index, locator, file, direct_file, packed)| {
                 let dst = slots[index]
                     .take()
                     .expect("each extent store batch read index should be unique");
@@ -1978,6 +1992,8 @@ impl ExtentStoreEngine {
                         file,
                         direct_file,
                         dst,
+                        allow_intermediate_buffer: allow_intermediate_buffers[index],
+                        allow_padded_direct_read: allow_padded_direct_reads[index] && !packed,
                     },
                 )
             })
@@ -2152,65 +2168,11 @@ impl ExtentStoreEngine {
     ) -> Vec<Result<()>> {
         match &self.io {
             ExtentStoreIo::WorkerPair(pair) => {
-                // Keep buffered writes separate without splitting Direct and
-                // DirectScratch into separate synchronous submissions. Bound
-                // the materialized records in each direct-family run so the
-                // producer cannot stage an arbitrarily large batch before the
-                // worker's own inflight limit takes effect.
-                let mut results = Vec::with_capacity(writes.len());
-                let mut cursor = 0;
-                while cursor < writes.len() {
-                    let lane = write_lane(&writes[cursor].1);
-                    let direct_family = !matches!(lane, ExtentStoreWriteLane::Buffered);
-                    let mut staged_bytes = if matches!(lane, ExtentStoreWriteLane::DirectScratch) {
-                        writes[cursor].1.record.record_len as usize
-                    } else {
-                        0
-                    };
-                    let mut end = cursor + 1;
-                    while end < writes.len() {
-                        let next_lane = write_lane(&writes[end].1);
-                        if (!matches!(next_lane, ExtentStoreWriteLane::Buffered)) != direct_family {
-                            break;
-                        }
-                        if !direct_family {
-                            end += 1;
-                            continue;
-                        }
-                        let next_staged =
-                            if matches!(next_lane, ExtentStoreWriteLane::DirectScratch) {
-                                writes[end].1.record.record_len as usize
-                            } else {
-                                0
-                            };
-                        if staged_bytes != 0
-                            && staged_bytes.saturating_add(next_staged)
-                                > EXTENT_STORE_IO_WORKER_WRITE_PIPELINE_MAX_INFLIGHT_BYTES
-                        {
-                            break;
-                        }
-                        staged_bytes = staged_bytes.saturating_add(next_staged);
-                        end += 1;
-                    }
-                    let lane_results = if !direct_family {
-                        let run = &mut writes[cursor..end];
-                        let bytes = run
-                            .iter()
-                            .map(|(_, write)| write.record.record_len as usize)
-                            .sum::<usize>();
-                        self.io_counters
-                            .buffered_write_ops
-                            .fetch_add(run.len() as u64, AtomicOrdering::Relaxed);
-                        self.io_counters
-                            .record_buffered_write_blocking_batch(run.len(), bytes);
-                        write_buffered_batch_blocking(run)
-                    } else {
-                        submit_write_batch_io_worker(&pair.write_worker, &mut writes[cursor..end])
-                    };
-                    results.extend(lane_results);
-                    cursor = end;
-                }
-                results
+                // The worker owns both direct and buffered Writev submissions.
+                // Keep borrowed iovecs on the async path so unaligned records
+                // avoid payload staging without sacrificing queue depth or
+                // worker backpressure.
+                submit_write_batch_io_worker(&pair.write_worker, writes)
             }
             ExtentStoreIo::Blocking(lock) => {
                 let _blocking = lock.lock();
@@ -2281,7 +2243,12 @@ impl ExtentStoreEngine {
             .iter()
             .enumerate()
             .filter(|(_, (_, read))| {
-                read.locator.value_len <= EXTENT_STORE_PACKED_BLOCK_READ_MAX_ENTRY_BYTES
+                let value_len = read.locator.value_len as usize;
+                read.allow_intermediate_buffer
+                    && read.locator.value_len <= EXTENT_STORE_PACKED_BLOCK_READ_MAX_ENTRY_BYTES
+                    && direct_read_len(&read.locator, read.dst, read.allow_padded_direct_read)
+                        .is_none()
+                    && value_len <= read.dst.len()
             })
             .fold(
                 BTreeMap::<(u64, u64, u64), Vec<PackedExtentStoreReadEntry>>::new(),
@@ -2334,27 +2301,26 @@ impl ExtentStoreEngine {
                 continue;
             }
             let value_len = read.locator.value_len as usize;
-            let (file, fixed_file_key) = match read.direct_file.as_ref().filter(|_| {
-                direct_reads_enabled()
-                    && direct_payload_io_compatible(
-                        read.locator.offset + read.locator.value_offset,
-                        &read.dst[..value_len],
-                    )
-            }) {
-                Some(file) => (
+            let direct_len = read.direct_file.as_ref().and_then(|_| {
+                direct_read_len(&read.locator, read.dst, read.allow_padded_direct_read)
+            });
+            let (file, fixed_file_key, read_len) = match (read.direct_file.as_ref(), direct_len) {
+                (Some(file), Some(direct_len)) => (
                     file,
                     ExtentStoreFixedFileKey::for_direct(read.locator.segment_id),
+                    direct_len,
                 ),
-                None => (
+                _ => (
                     &read.file,
                     ExtentStoreFixedFileKey::for_buffered(read.locator.segment_id),
+                    value_len,
                 ),
             };
             results[index] = self.read_exact_at(
                 file,
                 fixed_file_key,
                 read.locator.offset + read.locator.value_offset,
-                &mut read.dst[..value_len],
+                &mut read.dst[..read_len],
             );
         }
         record_stage("engine_read_fallback_values", fallback_started.elapsed());
@@ -2635,10 +2601,16 @@ impl ExtentStoreEngine {
                                     .direct_file
                                     .as_ref()
                                     .expect("direct read lane requires direct file");
+                                let direct_len = direct_read_len(
+                                    &read.locator,
+                                    read.dst,
+                                    read.allow_padded_direct_read,
+                                )
+                                .expect("direct read lane requires compatible destination");
                                 read_exact_direct_at_blocking(
                                     file,
                                     read.locator.offset + read.locator.value_offset,
-                                    &mut read.dst[..value_len],
+                                    &mut read.dst[..direct_len],
                                 )
                             }
                             ExtentStoreLocalReadLane::IoUringDirectScratch => {
@@ -3121,6 +3093,8 @@ fn with_disjoint_cold_read_buffers(
                 *index,
                 reads[*index].cold_backing.object_locator.clone(),
                 reads[*index].cold_backing.length,
+                reads[*index].allow_intermediate_buffer,
+                reads[*index].allow_padded_direct_read,
             )
         })
         .collect::<Vec<_>>();
@@ -3130,26 +3104,36 @@ fn with_disjoint_cold_read_buffers(
         .collect::<Vec<_>>();
     let mut read_requests = metadata
         .iter()
-        .map(|(index, locator, expected_len)| {
-            let dst = slots[*index]
-                .take()
-                .expect("each cold backend batch read index should be unique");
-            ExtentStoreRead {
+        .map(
+            |(
+                index,
                 locator,
-                expected_len: *expected_len,
-                dst,
-            }
-        })
+                expected_len,
+                allow_intermediate_buffer,
+                allow_padded_direct_read,
+            )| {
+                let dst = slots[*index]
+                    .take()
+                    .expect("each cold backend batch read index should be unique");
+                ExtentStoreRead {
+                    locator,
+                    expected_len: *expected_len,
+                    dst,
+                    allow_intermediate_buffer: *allow_intermediate_buffer,
+                    allow_padded_direct_read: *allow_padded_direct_read,
+                }
+            },
+        )
         .collect::<Vec<_>>();
     let results = f(&mut read_requests);
     metadata
         .into_iter()
         .zip(results)
-        .map(|((index, _, _), result)| (index, result))
+        .map(|((index, _, _, _, _), result)| (index, result))
         .collect()
 }
 
-struct AlignedExtentStoreBuffer {
+pub(super) struct AlignedExtentStoreBuffer {
     ptr: *mut u8,
     len: usize,
 }
@@ -3165,7 +3149,7 @@ impl AlignedExtentStoreBuffer {
         Ok(buffer)
     }
 
-    fn uninitialized(len: usize) -> Result<Self> {
+    pub(super) fn uninitialized(len: usize) -> Result<Self> {
         if len == 0 {
             return Ok(Self {
                 ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(),
@@ -3276,8 +3260,6 @@ fn direct_file_for_write<'a>(
 fn write_lane(write: &ReservedExtentStoreWrite<'_>) -> ExtentStoreWriteLane {
     if direct_record_io_compatible(write.locator.offset, &write.record) {
         ExtentStoreWriteLane::Direct
-    } else if direct_file_for_write(write).is_some() {
-        ExtentStoreWriteLane::DirectScratch
     } else {
         ExtentStoreWriteLane::Buffered
     }
@@ -3294,6 +3276,33 @@ fn direct_record_io_compatible(offset: u64, record: &EncodedExtentStoreRecord<'_
 
 fn direct_payload_io_compatible(offset: u64, payload: &[u8]) -> bool {
     is_aligned_u64(offset) && direct_iovec_compatible(payload)
+}
+
+fn direct_read_len(
+    locator: &ExtentStoreLocator,
+    dst: &[u8],
+    allow_padded_direct_read: bool,
+) -> Option<usize> {
+    if !direct_reads_enabled() || !is_aligned_usize(dst.as_ptr() as usize) {
+        return None;
+    }
+    let payload_start = locator.offset.checked_add(locator.value_offset)?;
+    if !is_aligned_u64(payload_start) {
+        return None;
+    }
+    let aligned_len = align_up(locator.value_len, EXTENT_STORE_ALIGNMENT);
+    let aligned_len = usize::try_from(aligned_len).ok()?;
+    if locator.value_len as usize != aligned_len && !allow_padded_direct_read {
+        return None;
+    }
+    if dst.len() < aligned_len {
+        return None;
+    }
+    let physical_available = locator.record_len.checked_sub(locator.value_offset)?;
+    if aligned_len as u64 > physical_available {
+        return None;
+    }
+    Some(aligned_len)
 }
 
 fn direct_iovec_compatible(buffer: &[u8]) -> bool {
@@ -4403,6 +4412,8 @@ mod extent_store_engine_tests {
                 locator,
                 expected_len: case.payload.len() as u64,
                 dst: buffer.as_mut_slice(),
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             })
             .collect::<Vec<_>>();
 
@@ -4489,6 +4500,8 @@ mod extent_store_engine_tests {
                 locator,
                 expected_len: payload.len() as u64,
                 dst: buffer.as_mut_slice(),
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             })
             .collect::<Vec<_>>();
         let before_coalesced_read = engine.io_stats();
@@ -4571,6 +4584,8 @@ mod extent_store_engine_tests {
                 locator,
                 expected_len: payload.len() as u64,
                 dst: buffer.as_mut_slice(),
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             })
             .collect::<Vec<_>>();
         let packed_results = engine.get_batch_into(&mut packed_reads);
@@ -4678,6 +4693,8 @@ mod extent_store_engine_tests {
             .map(|(cold_backing, buffer)| ColdObjectRead {
                 cold_backing,
                 dst: buffer,
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             })
             .collect::<Vec<_>>();
         let read_results = backend.get_objects_into_batch(&mut reads);
@@ -5242,7 +5259,7 @@ mod extent_store_engine_tests {
     }
 
     #[test]
-    fn packed_unaligned_payloads_use_one_direct_scratch_write() {
+    fn packed_unaligned_payloads_use_buffered_write_without_staging() {
         let root = test_extent_store_root("packed-direct-scratch-write");
         let engine =
             ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
@@ -5275,11 +5292,11 @@ mod extent_store_engine_tests {
         let locators = engine
             .put_batch(&writes)
             .into_iter()
-            .map(|result| result.expect("packed direct scratch write should succeed"))
+            .map(|result| result.expect("packed buffered write should succeed"))
             .collect::<Vec<_>>();
         let delta = engine.io_stats().delta_since(before);
-        assert_eq!(delta.direct_scratch_write_ops, 1);
-        assert_eq!(delta.buffered_write_ops, 0);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 1);
         for ((locator, write), expected) in
             locators.iter().zip(writes.iter()).zip([&first, &second])
         {
@@ -5365,7 +5382,7 @@ mod extent_store_engine_tests {
     }
 
     #[test]
-    fn direct_and_direct_scratch_share_one_worker_batch() {
+    fn unaligned_record_does_not_stage_or_downgrade_aligned_records() {
         let root = test_extent_store_root("direct-family-single-batch");
         let engine =
             ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 512)
@@ -5408,14 +5425,13 @@ mod extent_store_engine_tests {
         }
         let delta = engine.io_stats().delta_since(before);
         assert_eq!(delta.direct_write_ops, 2);
-        assert_eq!(delta.direct_scratch_write_ops, 1);
-        assert_eq!(delta.buffered_write_ops, 0);
-        assert_eq!(delta.worker_write_batches, 1);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 1);
         assert_eq!(delta.worker_write_batch_ops, 3);
     }
 
     #[test]
-    fn unaligned_payload_uses_direct_scratch_write() {
+    fn unaligned_payload_uses_buffered_io_without_staging() {
         let root = test_extent_store_root("direct-scratch-write");
         let engine =
             ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 512)
@@ -5436,16 +5452,16 @@ mod extent_store_engine_tests {
             .put("direct/scratch/unaligned", &payload)
             .expect("unaligned payload should write");
         let delta = engine.io_stats().delta_since(before);
-        assert_eq!(delta.direct_scratch_write_ops, 1);
-        assert_eq!(delta.buffered_write_ops, 0);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 1);
         let mut destination = vec![0u8; payload.len()];
         let before_read = engine.io_stats();
         engine
             .get_into(&locator, payload.len() as u64, &mut destination)
             .expect("unaligned payload should read");
         let read_delta = engine.io_stats().delta_since(before_read);
-        assert_eq!(read_delta.direct_scratch_read_ops, 1);
-        assert_eq!(read_delta.buffered_read_ops, 0);
+        assert_eq!(read_delta.direct_scratch_read_ops, 0);
+        assert_eq!(read_delta.buffered_read_ops, 1);
         assert_eq!(destination, payload);
         assert_eq!(
             engine
@@ -5457,8 +5473,8 @@ mod extent_store_engine_tests {
     }
 
     #[test]
-    fn blocking_direct_scratch_reads_unaligned_lengths() {
-        let root = test_extent_store_root("blocking-direct-scratch-read");
+    fn blocking_unaligned_reads_use_final_buffer_without_staging() {
+        let root = test_extent_store_root("blocking-unaligned-final-buffer");
         let mut engine =
             ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
                 .expect("engine should start");
@@ -5472,6 +5488,7 @@ mod extent_store_engine_tests {
             return;
         }
         engine.io = ExtentStoreIo::Blocking(Mutex::new(ExtentStoreBlockingIo));
+        let before = engine.io_stats();
 
         for value_len in [1usize, 4095, 4097] {
             let payload = vec![(value_len % 251) as u8; value_len];
@@ -5487,6 +5504,160 @@ mod extent_store_engine_tests {
             );
             assert_eq!(destination, payload);
         }
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_scratch_write_ops, 0);
+        assert_eq!(delta.direct_scratch_read_ops, 0);
+        assert_eq!(delta.buffered_write_ops, 3);
+        assert_eq!(delta.buffered_read_ops, 3);
+    }
+
+    #[test]
+    fn padded_final_buffer_reads_unaligned_logical_length_with_direct_io() {
+        let root = test_extent_store_root("direct-padded-final-buffer");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let payload = vec![0x6du8; EXTENT_STORE_ALIGNMENT as usize + 17];
+        let locator = engine
+            .put("direct/padded-final-buffer", &payload)
+            .expect("payload should write");
+        let io_len = align_up(payload.len() as u64, EXTENT_STORE_ALIGNMENT) as usize;
+        let mut destination =
+            AlignedExtentStoreBuffer::uninitialized(io_len).expect("destination should allocate");
+        destination.fill(0xcd);
+        let before = engine.io_stats();
+
+        assert_eq!(
+            engine
+                .get_batch_into(&mut [ExtentStoreRead {
+                    locator: &locator,
+                    expected_len: payload.len() as u64,
+                    dst: &mut destination,
+                    allow_intermediate_buffer: false,
+                    allow_padded_direct_read: true,
+                }])
+                .pop()
+                .expect("padded direct read should return a result")
+                .expect("padded direct read should succeed"),
+            Some(payload.len())
+        );
+
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(&destination[..payload.len()], payload.as_slice());
+        assert_eq!(delta.direct_read_ops, 1);
+        assert_eq!(delta.direct_scratch_read_ops, 0);
+        assert_eq!(delta.buffered_read_ops, 0);
+    }
+
+    #[test]
+    fn get_into_preserves_oversized_aligned_destination_tail() {
+        let root = test_extent_store_root("direct-read-tail");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        let payload = vec![0x4au8; EXTENT_STORE_ALIGNMENT as usize + 17];
+        let locator = engine
+            .put("direct/read-tail", &payload)
+            .expect("payload should write");
+        let io_len = align_up(payload.len() as u64, EXTENT_STORE_ALIGNMENT) as usize;
+        let mut destination =
+            AlignedExtentStoreBuffer::uninitialized(io_len).expect("destination should allocate");
+        destination.fill(0xcd);
+
+        assert_eq!(
+            engine
+                .get_into(&locator, payload.len() as u64, &mut destination)
+                .expect("logical get should succeed"),
+            Some(payload.len())
+        );
+        assert_eq!(&destination[..payload.len()], payload.as_slice());
+        assert!(destination[payload.len()..]
+            .iter()
+            .all(|byte| *byte == 0xcd));
+    }
+
+    #[test]
+    fn packed_restore_reads_each_final_buffer_without_coalescing_copy() {
+        let root = test_extent_store_root("packed-final-buffers");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
+                .expect("engine should start");
+        if !matches!(&engine.io, ExtentStoreIo::WorkerPair(_))
+            || engine
+                .inner
+                .lock()
+                .segments
+                .values()
+                .any(|segment| segment.direct_file.is_none())
+        {
+            return;
+        }
+        let first = vec![0x31u8; 1536];
+        let second = vec![0x72u8; 2049];
+        let writes = [
+            ExtentStoreWrite {
+                logical_locator: "packed/final/a",
+                payload: &first,
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "packed/final/b",
+                payload: &second,
+                checksum: None,
+            },
+        ];
+        let locators = engine
+            .put_batch(&writes)
+            .into_iter()
+            .map(|result| result.expect("packed payload should write"))
+            .collect::<Vec<_>>();
+        let mut first_dst =
+            AlignedExtentStoreBuffer::uninitialized(EXTENT_STORE_ALIGNMENT as usize)
+                .expect("first destination should allocate");
+        let mut second_dst =
+            AlignedExtentStoreBuffer::uninitialized(EXTENT_STORE_ALIGNMENT as usize)
+                .expect("second destination should allocate");
+        first_dst.fill(0xcd);
+        second_dst.fill(0xcd);
+        let mut reads = [
+            ExtentStoreRead {
+                locator: &locators[0],
+                expected_len: first.len() as u64,
+                dst: &mut first_dst,
+                allow_intermediate_buffer: false,
+                allow_padded_direct_read: false,
+            },
+            ExtentStoreRead {
+                locator: &locators[1],
+                expected_len: second.len() as u64,
+                dst: &mut second_dst,
+                allow_intermediate_buffer: false,
+                allow_padded_direct_read: false,
+            },
+        ];
+        let before = engine.io_stats();
+
+        let results = engine.get_batch_into(&mut reads);
+
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert_eq!(&first_dst[..first.len()], first.as_slice());
+        assert_eq!(&second_dst[..second.len()], second.as_slice());
+        assert!(first_dst[first.len()..].iter().all(|byte| *byte == 0xcd));
+        assert!(second_dst[second.len()..].iter().all(|byte| *byte == 0xcd));
+        let delta = engine.io_stats().delta_since(before);
+        assert_eq!(delta.direct_scratch_read_ops, 0);
+        assert_eq!(delta.coalesced_read_groups, 0);
+        assert_eq!(delta.direct_read_ops + delta.buffered_read_ops, 2);
     }
 
     #[test]
@@ -5558,9 +5729,18 @@ mod extent_store_engine_tests {
             .expect("small scratch payload should write");
 
         let mut large_dst = vec![0u8; large.len()];
+        let mut large_reads = [ExtentStoreRead {
+            locator: &large_locator,
+            expected_len: large.len() as u64,
+            dst: &mut large_dst,
+            allow_intermediate_buffer: true,
+            allow_padded_direct_read: false,
+        }];
         assert_eq!(
             engine
-                .get_into(&large_locator, large.len() as u64, &mut large_dst)
+                .get_batch_into(&mut large_reads)
+                .pop()
+                .expect("large scratch read should return a result")
                 .expect("large scratch payload should read"),
             Some(large.len())
         );
@@ -5568,9 +5748,18 @@ mod extent_store_engine_tests {
 
         let before = engine.io_stats();
         let mut small_dst = vec![0u8; small.len()];
+        let mut small_reads = [ExtentStoreRead {
+            locator: &small_locator,
+            expected_len: small.len() as u64,
+            dst: &mut small_dst,
+            allow_intermediate_buffer: true,
+            allow_padded_direct_read: false,
+        }];
         assert_eq!(
             engine
-                .get_into(&small_locator, small.len() as u64, &mut small_dst)
+                .get_batch_into(&mut small_reads)
+                .pop()
+                .expect("small scratch read should return a result")
                 .expect("small scratch payload should read"),
             Some(small.len())
         );
@@ -5742,8 +5931,8 @@ mod extent_store_engine_tests {
     }
 
     #[test]
-    fn fatal_ring_error_closes_worker_before_releasing_direct_scratch() {
-        let root = test_extent_store_root("direct-scratch-fatal-ring-error");
+    fn fatal_ring_error_closes_worker_after_direct_write_failure() {
+        let root = test_extent_store_root("direct-fatal-ring-error");
         let engine =
             ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 64)
                 .expect("engine should start");
@@ -5755,16 +5944,16 @@ mod extent_store_engine_tests {
             .queue
             .fail_after_submit
             .store(true, AtomicOrdering::SeqCst);
-        let payload = vec![0x5au8; EXTENT_STORE_ALIGNMENT as usize + 17];
+        let payload = aligned_kvcache_payload(EXTENT_STORE_ALIGNMENT as usize, 0x5a);
 
         assert!(matches!(
-            engine.put("fatal-ring/first", &payload),
+            engine.put("fatal-ring/first", payload.as_slice()),
             Err(StoreError::Transport(_))
         ));
         assert!(worker.queue.state.lock().shutdown);
         assert_eq!(worker.scratch_arena.state.lock().leased_bytes, 0);
         assert!(matches!(
-            engine.put("fatal-ring/second", &payload),
+            engine.put("fatal-ring/second", payload.as_slice()),
             Err(StoreError::Transport(_))
         ));
     }
@@ -5815,7 +6004,7 @@ mod extent_store_engine_tests {
         let delta = engine.io_stats().delta_since(before);
         assert_eq!(delta.direct_write_ops, 2);
         assert_eq!(delta.buffered_write_ops, 1);
-        assert_eq!(delta.buffered_write_blocking_batches, 1);
+        assert_eq!(delta.buffered_write_blocking_batches, 0);
         for (locator, write) in locators.iter().zip(writes.iter()) {
             let decoded = ExtentStoreLocator::decode(locator).expect("mixed locator should decode");
             assert_eq!(decoded.value_len, write.payload.len() as u64);
@@ -5900,11 +6089,15 @@ mod extent_store_engine_tests {
                 locator: &valid,
                 expected_len: payload.len() as u64,
                 dst: &mut valid_dst,
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             },
             ExtentStoreRead {
                 locator: &invalid,
                 expected_len: 1,
                 dst: &mut invalid_dst,
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             },
         ];
 

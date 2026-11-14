@@ -47,13 +47,20 @@ constexpr char kMetadataKeyPrefix[] = "mooncake/tent/";
 
 class EnvVarGuard {
    public:
-    EnvVarGuard(const char* name, const std::string& value) : name_(name) {
+    EnvVarGuard(const char* name, const std::string& value)
+        : EnvVarGuard(name, value.c_str()) {}
+
+    EnvVarGuard(const char* name, const char* value) : name_(name) {
         const char* old = std::getenv(name);
         if (old) {
             old_value_ = old;
             had_value_ = true;
         }
-        setenv(name, value.c_str(), 1);
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
     }
 
     ~EnvVarGuard() {
@@ -262,6 +269,17 @@ class TestHttpMetadataServer {
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
+     NullSharedConfigPreventsExplicitConstruction) {
+    std::shared_ptr<Config> config;
+
+    TransferEngine engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      InvalidInlineConfigPreventsDefaultConstruction) {
     EnvVarGuard conf_guard("MC_TENT_CONF", "{");
     EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
@@ -373,6 +391,86 @@ TEST(TransferEngineConfigOverrideTest,
     }
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitForceFabricSurvivesMcTentConfAndRequiresInstall) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":true},"rdma":{"enable":true},"hp_tcp":{"enable":true},"shm":{"enable":true},"fabric":{"enable":false,"provider":"tcp","devices":["tcp0"]}},"metrics":{"enabled":false}})");
+    EnvVarGuard force_tcp_guard("MC_FORCE_TCP", nullptr);
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "force-fabric-explicit");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    ConfigHelper::forceFabric(*config, "invalid-test-provider");
+    const std::vector<std::string> devices{"efa0", "efa1"};
+    config->set("transports/fabric/devices", devices);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_FALSE(config->get("transports/force_tcp", true));
+    EXPECT_TRUE(config->get("transports/force_fabric", false));
+    EXPECT_FALSE(config->get("transports/tcp/enable", true));
+    EXPECT_FALSE(config->get("transports/rdma/enable", true));
+    EXPECT_FALSE(config->get("transports/hp_tcp/enable", true));
+    EXPECT_FALSE(config->get("transports/shm/enable", true));
+    EXPECT_TRUE(config->get("transports/fabric/enable", false));
+    EXPECT_EQ(config->get("transports/fabric/provider", ""),
+              "invalid-test-provider");
+    EXPECT_EQ(config->getArray<std::string>("transports/fabric/devices"),
+              devices);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ForceTcpEnvOverridesExplicitForceFabric) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true}},"metrics":{"enabled":false}})");
+    EnvVarGuard force_tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "force-fabric-tcp-override");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    ConfigHelper::forceFabric(*config, "invalid-test-provider");
+
+    TransferEngineImpl engine(config);
+
+    ASSERT_TRUE(engine.available());
+    EXPECT_TRUE(config->get("transports/force_tcp", false));
+    EXPECT_FALSE(config->get("transports/force_fabric", true));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ForceFabricWithoutProviderInheritsTentConfig) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"fabric":{"enable":false,"provider":"invalid-test-provider","devices":["tcp0"]}},"metrics":{"enabled":false}})");
+    EnvVarGuard force_tcp_guard("MC_FORCE_TCP", nullptr);
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "force-fabric-inherited-provider");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    config->set("transports/force_fabric", true);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_TRUE(config->get("transports/force_fabric", false));
+    EXPECT_EQ(config->get("transports/fabric/provider", ""),
+              "invalid-test-provider");
+    EXPECT_EQ(config->getArray<std::string>("transports/fabric/devices"),
+              (std::vector<std::string>{"tcp0"}));
+}
+
 // MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
 // names the local host for RPC binding and segment identity. TENT must honor
 // the same env so a single MOONCAKE_LOCAL_HOSTNAME works across both engines;
@@ -409,6 +507,31 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
+}
+
+// "1" is how most MC_* switches are set; setFromString() would store it as an
+// integer, which get(..., false) cannot read as a bool.
+TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
+    const std::pair<const char*, const char*> cases[] = {
+        {"MC_DISABLE_GPU_DIRECT_RDMA",
+         "transports/rdma/disable_gpu_direct_rdma"},
+        {"MC_LOG_RDMA_SLICE_AFFINITY", "transports/rdma/log_slice_affinity"},
+    };
+    for (const auto& [env, key] : cases) {
+        SCOPED_TRACE(env);
+        {
+            EnvVarGuard guard(env, "1");
+            Config config;
+            ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+            EXPECT_TRUE(config.get(key, false));
+        }
+        {
+            EnvVarGuard guard(env, "0");
+            Config config;
+            ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+            EXPECT_FALSE(config.get(key, true));
+        }
+    }
 }
 
 TEST(TransferEngineConfigOverrideTest, InvalidConstructorFilePreventsStartup) {

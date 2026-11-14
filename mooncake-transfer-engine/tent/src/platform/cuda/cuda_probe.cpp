@@ -264,24 +264,9 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
 }
 
 namespace {
-bool cudaDevicePresent() {
-    static const bool present = [] {
-        int device_count = 0;
-        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
-            device_count == 0) {
-            LOG(WARNING) << "No CUDA device detected; treating buffers as "
-                            "host memory";
-            return false;
-        }
-        return true;
-    }();
-    return present;
-}
-
 bool cudaAbiMatches() {
     static const bool matches = [] {
         int runtime_version = 0;
-        // Major version only: struct layout changes across CUDA majors.
         if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
             runtime_version / 1000 != CUDART_VERSION / 1000) {
             LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
@@ -295,22 +280,63 @@ bool cudaAbiMatches() {
     }();
     return matches;
 }
+
+struct TransferPointerProbe {
+    CudaPointerInfo info;
+    CUresult result;
+    bool abi_matches;
+
+    bool supported() const {
+        return result == CUDA_SUCCESS && abi_matches &&
+               info.kind != CudaMemoryKind::Managed;
+    }
+};
+
+TransferPointerProbe probeTransferPointer(void* addr) {
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(addr, info);
+    if (result == CUDA_ERROR_NO_DEVICE &&
+        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE) {
+        info.kind = CudaMemoryKind::Host;
+        return {info, CUDA_SUCCESS, true};
+    }
+    return {info, result, result == CUDA_SUCCESS && cudaAbiMatches()};
+}
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaDevicePresent()) return MTYPE_CPU;
-    if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
+    const auto probe = probeTransferPointer(addr);
+    if (!probe.supported()) return MTYPE_UNKNOWN;
+    return probe.info.kind == CudaMemoryKind::Device ? MTYPE_CUDA : MTYPE_CPU;
 }
 
-int CudaPlatform::getPointerDeviceId(void* addr) {
-    // Same guards as getMemoryType().
-    if (!cudaDevicePresent() || !cudaAbiMatches()) {
-        return CUDAStreamPool::kCurrentDevice;
-    }
-    int device = getCudaDeviceForPtr(addr);
-    if (device < 0) return CUDAStreamPool::kCurrentDevice;
-    return device;
+Status CudaPlatform::validateMemoryRegistration(void* addr,
+                                                CudaPointerInfo& info) {
+    const auto probe = probeTransferPointer(addr);
+    if (probe.result != CUDA_SUCCESS)
+        return Status::InvalidArgument(
+            "CUDA pointer classification failed (CUresult " +
+            std::to_string(probe.result) + ")" LOC_MARK);
+    if (!probe.abi_matches)
+        return Status::InvalidArgument("CUDA Runtime ABI mismatch" LOC_MARK);
+    if (probe.info.kind == CudaMemoryKind::Managed)
+        return Status::InvalidArgument(
+            "CUDA Managed memory is not supported for transfer "
+            "registration" LOC_MARK);
+    info = probe.info;
+    return Status::OK();
+}
+
+Status CudaPlatform::getPointerDeviceId(void* addr, int& device) {
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(addr, info);
+    if (!(result == CUDA_ERROR_NO_DEVICE &&
+          cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE))
+        CHECK_CU(result);
+    if (result == CUDA_SUCCESS && !cudaAbiMatches())
+        return Status::InvalidArgument("CUDA Runtime ABI mismatch");
+    device = info.isCuda() ? info.device : CUDAStreamPool::kCurrentDevice;
+    return Status::OK();
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -331,21 +357,18 @@ static inline std::string genCudaNodeName(int node) {
 const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
                                                            size_t len,
                                                            bool skip_prefault) {
+    const auto probe = probeTransferPointer(start);
+    if (!probe.supported()) return {};
+    return getLocation(start, len, skip_prefault, probe.info);
+}
+
+std::vector<RangeLocation> CudaPlatform::getLocation(
+    void* start, size_t len, bool skip_prefault, const CudaPointerInfo& info) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
-
-    if (cudaDevicePresent() && !cudaAbiMatches()) {
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+    if (info.kind == CudaMemoryKind::Device) {
+        entries.push_back({(uint64_t)start, len, genCudaNodeName(info.device)});
         return entries;
-    }
-    if (cudaDevicePresent()) {
-        // Unregistered pointers fall through to the NUMA probe below.
-        int cuda_dev = getCudaDeviceForPtr(start);
-        if (cuda_dev >= 0) {
-            entries.push_back(
-                {(uint64_t)start, len, genCudaNodeName(cuda_dev)});
-            return entries;
-        }
     }
 
     // start and end address may not be page aligned.

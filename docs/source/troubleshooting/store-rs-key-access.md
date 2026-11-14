@@ -1,4 +1,4 @@
-# Key Access Path Debugging
+# Store-RS Troubleshooting
 
 This guide explains how to trace a single key through Mooncake Store RS: where a
 `put` writes the object, how a `get` resolves and reads it, which route layer is

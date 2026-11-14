@@ -33,6 +33,11 @@
 //
 // Lifetime: guards and cursors point into the route, so its owner keeps it
 // alive for as long as any of them exists; a route destroyed under one aborts.
+//
+// Owner state: every slot also carries a few words and two list hooks for the
+// route's owner (see SlotOwnerState), which the route stores and never reads.
+// The owner keeps them in step with each write through the RouteObserver, so
+// they describe the key as of the last write guard released on it.
 
 #include <array>
 #include <atomic>
@@ -51,8 +56,10 @@
 #include <utility>
 #include <vector>
 
+#include <boost/intrusive/list.hpp>
 #include <glog/logging.h>
 
+#include "common/shrink_buckets.h"
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
 #include "metadata/object_state.h"
@@ -80,6 +87,57 @@ struct ObjectRef {
     Generation generation{0};
 };
 
+// Per-slot filing record owned by the namespace's EvictionIndex. Stored inline
+// on KeySlot so filing a key allocates no node of its own.
+struct SlotEvictionState {
+    bool filed{false};
+    uint16_t shard{0};
+    int64_t rank{0};
+    uint64_t identity{0};
+    uint64_t born_seq{0};
+    uint64_t refile_seq{0};
+    void* group{nullptr};
+
+    bool operator==(const SlotEvictionState&) const noexcept = default;
+
+    void FileStandalone(uint16_t chosen_shard, int64_t at_rank,
+                        uint64_t entry_identity, uint64_t born) noexcept {
+        *this = SlotEvictionState{
+            .filed = true,
+            .shard = chosen_shard,
+            .rank = at_rank,
+            .identity = entry_identity,
+            .born_seq = born,
+        };
+    }
+
+    void FileGroup(uint16_t group_shard, int64_t at_rank,
+                   uint64_t entry_identity, void* group_ptr) noexcept {
+        *this = SlotEvictionState{
+            .filed = true,
+            .shard = group_shard,
+            .rank = at_rank,
+            .identity = entry_identity,
+            .group = group_ptr,
+        };
+    }
+
+    void Clear() noexcept { *this = SlotEvictionState{}; }
+};
+
+// What the route's owner keeps on every slot, guarded by the slot lock. The
+// route stores it and never reads it; it survives the objects published in the
+// slot, so the owner returns it to its initial value once the key holds none,
+// before the slot can be dropped.
+struct SlotOwnerState {
+    // Whether the owner's in-flight list holds the slot.
+    bool in_flight_listed{false};
+    // Where the owner's eviction index has filed the slot, if at all.
+    SlotEvictionState eviction{};
+    // Two words for the owner's namespace policy.
+    std::array<uint64_t, 2> policy_words{};
+};
+
 // A slot's lock as a guard or cursor holds it in `kMode`.
 template <LockMode kMode>
 using SlotLock = std::conditional_t<kMode == LockMode::kWrite,
@@ -102,6 +160,7 @@ class KeySlot {
     KeySlot& operator=(const KeySlot&) = delete;
 
     const std::string& key() const noexcept { return *key_; }
+    const SlotOwnerState& owner_state() const noexcept { return owner_; }
 
    private:
     friend class ObjectRoute;
@@ -112,6 +171,13 @@ class KeySlot {
 
     // Set in state_ while the slot holds an object.
     static constexpr uint32_t kOccupied = uint32_t{1} << 31;
+
+    // Links the slot into one of its owner's lists. Neither the hook nor the
+    // list synchronizes: whatever guards a list guards every hook in it. A
+    // safe-link hook asserts it is unlinked when destroyed, and a list unlinks
+    // whatever it still holds when it is cleared or destroyed.
+    using ListHook = boost::intrusive::list_member_hook<
+        boost::intrusive::link_mode<boost::intrusive::safe_link>>;
 
     // One publication. The metadata is built in place, since it can be
     // neither copied nor moved.
@@ -134,6 +200,22 @@ class KeySlot {
     std::atomic<uint32_t> state_{0};
     mutable std::shared_mutex mutex_;
     std::optional<Record> record_;
+    SlotOwnerState owner_;
+    // Hook into the owner's in-flight list.
+    ListHook in_flight_hook_;
+    // Hook into the owner's eviction index.
+    ListHook eviction_hook_;
+
+   public:
+    // The owner's lists of slots. Each names its hook here, where the hook is
+    // accessible, so the slot needs no friend for them. The owner links a slot
+    // only while it holds an object, so a slot is never dropped linked.
+    using InFlightList = boost::intrusive::list<
+        KeySlot, boost::intrusive::member_hook<KeySlot, ListHook,
+                                               &KeySlot::in_flight_hook_>>;
+    using EvictionList = boost::intrusive::list<
+        KeySlot, boost::intrusive::member_hook<KeySlot, ListHook,
+                                               &KeySlot::eviction_hook_>>;
 };
 
 // Each slot is built in its map node and stays there while the map grows, so a
@@ -208,6 +290,12 @@ inline void SlotHandle::reset() noexcept {
     std::unique_lock<std::shared_mutex> lock(stripe->lock);
     if (slot->state_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         stripe->slots.erase(stripe->slots.find(slot->key()));
+        // erase() never gives bucket memory back, so a stripe that once held
+        // far more slots than it does now would keep its high-water buckets
+        // for good. Rehashing moves no node, so the slots guards point at stay
+        // put; only map iterators, which a cursor holds under the shared
+        // stripe lock, are invalidated.
+        ShrinkBucketsIfSparse(stripe->slots);
     }
 }
 
@@ -287,6 +375,15 @@ class Guard {
     void TearDown() const
         requires kWrite;
 
+    // The owner's per-slot state and the slot its lists link, for the
+    // route's owner only.
+    SlotOwnerState& owner_state() const
+        requires kWrite
+    {
+        return slot_->owner_;
+    }
+    KeySlot& slot() const { return *slot_; }
+
    private:
     friend class ObjectRoute;
 
@@ -294,6 +391,12 @@ class Guard {
         : route_(route),
           slot_(std::move(slot)),
           lock_(slot_->mutex_) {}
+
+    Guard(Route* route, SlotHandle slot,
+          std::try_to_lock_t) NO_THREAD_SAFETY_ANALYSIS
+        : route_(route),
+          slot_(std::move(slot)),
+          lock_(slot_->mutex_, std::try_to_lock) {}
 
     // Marks the guard as handed to a caller, so its release is reported to
     // the observer; one the route takes and drops itself, finding the key
@@ -350,6 +453,16 @@ class ObjectRoute {
     [[nodiscard]] std::optional<WriteGuard> Write(std::string_view key) {
         return Acquire<LockMode::kWrite>(*this, key, std::nullopt);
     }
+    // Nonblocking key-lock admission for background range eviction. Finding
+    // the slot still takes its stripe lock; no key lock is waited on.
+    [[nodiscard]] std::optional<WriteGuard> TryWrite(std::string_view key) {
+        SlotHandle slot = FindSlot(key);
+        if (!slot) return std::nullopt;
+        WriteGuard guard(this, std::move(slot), std::try_to_lock);
+        if (!guard.lock_.owns_lock() || !guard.has_object())
+            return std::nullopt;
+        return std::optional<WriteGuard>(std::move(guard).HandOut());
+    }
     // The same, only while `ref` is still the key's current publication.
     [[nodiscard]] std::optional<WriteGuard> Write(const ObjectRef& ref) {
         return Acquire<LockMode::kWrite>(*this, ref.key, ref.generation);
@@ -385,7 +498,8 @@ class ObjectRoute {
     // a time rather than reading one point in time: an object published or
     // torn down meanwhile may or may not be seen. A write cursor may change an
     // object's metadata and state but not publish or tear down, and it does
-    // not run the observer, so it must not start or finish in-flight work.
+    // not run the observer, so it must not start or finish in-flight work,
+    // and the owner hears of nothing else it changes either.
     //
     // The cursor holds a stripe lock across the loop body, so the body must
     // not reach this route or another one (debug builds assert it), nor block
@@ -527,6 +641,12 @@ class ObjectRoute::Cursor {
         ObjectRef ref() const { return {key(), generation()}; }
         Metadata& metadata() const { return slot_.record_->metadata; }
         State& state() const { return slot_.record_->state; }
+        // The owner's per-slot state, for the route's owner only.
+        SlotOwnerState& owner_state() const
+            requires kWrite
+        {
+            return slot_.owner_;
+        }
 
        private:
         friend class Cursor;

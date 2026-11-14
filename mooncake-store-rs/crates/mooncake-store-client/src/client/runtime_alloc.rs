@@ -70,6 +70,179 @@ impl StoreClient {
         ))
     }
 
+    fn resolve_reserved_replica_write_target(
+        &self,
+        storage_runtime: &ClientRuntimeId,
+        reservation: mooncake_store_core::SegmentReservation,
+    ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        match self.replica_write_target(storage_runtime, &reservation.segment_name) {
+            Ok(target) => Ok((target, reservation)),
+            Err(error) => {
+                self.release_unresolved_reservation(&reservation);
+                Err(error)
+            }
+        }
+    }
+
+    fn release_unresolved_reservation(
+        &self,
+        reservation: &mooncake_store_core::SegmentReservation,
+    ) {
+        self.release_reservation_or_enqueue(reservation, "replica_target_lookup_failed");
+    }
+
+    fn release_reservations_or_enqueue(
+        &self,
+        reservations: &[mooncake_store_core::SegmentReservation],
+        reason: &str,
+    ) {
+        let mut releases_by_owner = BTreeMap::<ClientRuntimeId, Vec<AllocationReleaseRequest>>::new();
+        for reservation in reservations {
+            releases_by_owner
+                .entry(reservation.owner.clone())
+                .or_default()
+                .push(AllocationReleaseRequest {
+                    storage_runtime: reservation.owner.clone(),
+                    segment_name: reservation.segment_name.clone(),
+                    offset_bytes: reservation.offset_bytes,
+                    length_bytes: reservation.length_bytes,
+                    allocation_id: reservation.allocation_id,
+                });
+        }
+        for releases in releases_by_owner.into_values() {
+            self.release_allocation_requests_or_enqueue(&releases, reason);
+        }
+    }
+
+    fn release_only_legacy_reservations_after_unknown_route_publish(
+        &self,
+        reservations: &[mooncake_store_core::SegmentReservation],
+        reason: &str,
+    ) {
+        let mut legacy = Vec::new();
+        for reservation in reservations {
+            match self.allocation_lifecycle_owner_mode(&reservation.owner) {
+                AllocationLifecycleOwnerMode::Legacy => legacy.push(reservation.clone()),
+                AllocationLifecycleOwnerMode::Lifecycle
+                | AllocationLifecycleOwnerMode::Unknown => {
+                    // Route CAS may already have committed although its reply was lost.
+                    // The allocation owner holds the exact PendingPublish token and will
+                    // resolve it against the authority instead of risking a stale release.
+                    crate::observability::registry::record_eviction_guard_event(
+                        "pending_publication",
+                        "retained_unknown_route_publish",
+                    );
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        storage_runtime = %reservation.owner,
+                        segment = %reservation.segment_name.0,
+                        offset_bytes = reservation.offset_bytes,
+                        length_bytes = reservation.length_bytes,
+                        allocation_id = reservation.allocation_id,
+                        reason,
+                        "retaining lifecycle reservation after unknown route publish outcome"
+                    );
+                }
+            }
+        }
+        self.release_reservations_or_enqueue(&legacy, reason);
+    }
+
+    fn release_reservation_or_enqueue(
+        &self,
+        reservation: &mooncake_store_core::SegmentReservation,
+        reason: &str,
+    ) {
+        self.release_allocation_requests_or_enqueue(
+            &[AllocationReleaseRequest {
+                storage_runtime: reservation.owner.clone(),
+                segment_name: reservation.segment_name.clone(),
+                offset_bytes: reservation.offset_bytes,
+                length_bytes: reservation.length_bytes,
+                allocation_id: reservation.allocation_id,
+            }],
+            reason,
+        );
+    }
+
+    fn release_allocation_requests_or_enqueue(
+        &self,
+        releases: &[AllocationReleaseRequest],
+        reason: &str,
+    ) {
+        if releases.is_empty() {
+            return;
+        }
+        let (failed_indices, first_error) = self.release_reclaim_allocations_best_effort(
+            releases,
+            true,
+            "reservation_rollback",
+        );
+        let failed = failed_indices.iter().copied().collect::<BTreeSet<_>>();
+        for (index, release) in releases.iter().enumerate() {
+            if failed.contains(&index) {
+                crate::observability::registry::record_eviction_guard_event(
+                    "reservation_rollback",
+                    "queued",
+                );
+                debug!(
+                    storage_runtime = %release.storage_runtime,
+                    segment = %release.segment_name.0,
+                    offset_bytes = release.offset_bytes,
+                    length_bytes = release.length_bytes,
+                    allocation_id = release.allocation_id,
+                    reason,
+                    "reservation rollback release is pending retry"
+                );
+                self.enqueue_unresolved_reservation_reclaim(release.clone());
+                continue;
+            }
+            crate::observability::registry::record_eviction_guard_event(
+                "reservation_rollback",
+                "released",
+            );
+            debug!(
+                storage_runtime = %release.storage_runtime,
+                segment = %release.segment_name.0,
+                offset_bytes = release.offset_bytes,
+                length_bytes = release.length_bytes,
+                allocation_id = release.allocation_id,
+                reason,
+                "released reserved allocation during rollback"
+            );
+        }
+        if !failed_indices.is_empty() {
+            warn!(
+                storage_runtime = %releases[failed_indices[0]].storage_runtime,
+                reservations = releases.len(),
+                failed_reservations = failed_indices.len(),
+                error = %first_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown release failure".to_string()),
+                reason,
+                "queueing failed reservation rollbacks"
+            );
+        }
+    }
+
+    fn enqueue_unresolved_reservation_reclaim(&self, release: AllocationReleaseRequest) {
+        let qos_tier = mooncake_store_core::DEFAULT_QOS_TIER.to_string();
+        self.state.lock().enqueue_pending_reclaim(PendingReclaim {
+            due_at_ms: now_ms(),
+            policy_rank: Self::reclaim_policy_rank(&qos_tier),
+            tenant: self.default_tenant.clone(),
+            qos_tier,
+            storage_runtime: release.storage_runtime,
+            segment_name: release.segment_name,
+            offset_bytes: release.offset_bytes,
+            length_bytes: release.length_bytes,
+            allocation_id: release.allocation_id,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
+        });
+    }
+
     fn reserve_specific_segment(
         &self,
         storage_runtime: &ClientRuntimeId,
@@ -83,8 +256,7 @@ impl StoreClient {
             length_bytes as u64,
             require_local_memory,
         )?;
-        let target = self.replica_write_target(storage_runtime, &reservation.segment_name)?;
-        Ok((target, reservation))
+        self.resolve_reserved_replica_write_target(storage_runtime, reservation)
     }
 
     fn reserve_storage_runtime_segments_batch(
@@ -116,6 +288,7 @@ impl StoreClient {
             .collect::<Vec<_>>();
         struct RemoteReservationGroup {
             lease: ClientLease,
+            pending_publication: bool,
             any_indices: Vec<usize>,
             specific_indices: Vec<usize>,
         }
@@ -123,6 +296,7 @@ impl StoreClient {
         struct RemoteReservationJob {
             storage_runtime: ClientRuntimeId,
             lease: ClientLease,
+            pending_publication: bool,
             any_indices: Vec<usize>,
             any_lengths: Vec<u64>,
             specific_indices: Vec<usize>,
@@ -148,11 +322,10 @@ impl StoreClient {
                         request.require_local_memory,
                     )
                     .and_then(|reservation| {
-                        let target = self.replica_write_target(
+                        self.resolve_reserved_replica_write_target(
                             &request.storage_runtime,
-                            &reservation.segment_name,
-                        )?;
-                        Ok((target, reservation))
+                            reservation,
+                        )
                     }),
                 );
                 continue;
@@ -171,6 +344,9 @@ impl StoreClient {
             remote_groups
                 .entry(request.storage_runtime.clone())
                 .or_insert_with(|| RemoteReservationGroup {
+                    pending_publication: lease
+                        .compatibility
+                        .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY),
                     lease,
                     any_indices: Vec::new(),
                     specific_indices: Vec::new(),
@@ -201,13 +377,14 @@ impl StoreClient {
                         segment_name: requests[*index]
                             .segment_name
                             .clone()
-                            .expect("specific reservation batch item must carry a segment name"),
+                        .expect("specific reservation batch item must carry a segment name"),
                         length_bytes: requests[*index].length_bytes,
                     })
                     .collect::<Vec<_>>();
                 RemoteReservationJob {
                     storage_runtime,
                     lease: group.lease,
+                    pending_publication: group.pending_publication,
                     any_indices: group.any_indices,
                     any_lengths,
                     specific_indices: group.specific_indices,
@@ -218,6 +395,12 @@ impl StoreClient {
         let remote_results = run_bounded_parallel_jobs(remote_jobs, 8, move |job| {
             let any_results = if job.any_lengths.is_empty() {
                 None
+            } else if job.pending_publication {
+                Some(control_client.batch_reserve_any_with_pending_publication(
+                    &job.lease,
+                    &job.storage_runtime,
+                    &job.any_lengths,
+                ))
             } else {
                 Some(control_client.batch_reserve_any(
                     &job.lease,
@@ -227,6 +410,12 @@ impl StoreClient {
             };
             let specific_results = if job.specific_ops.is_empty() {
                 None
+            } else if job.pending_publication {
+                Some(control_client.batch_reserve_specific_with_pending_publication(
+                    &job.lease,
+                    &job.storage_runtime,
+                    &job.specific_ops,
+                ))
             } else {
                 Some(control_client.batch_reserve_specific(
                     &job.lease,
@@ -261,13 +450,10 @@ impl StoreClient {
                                     continue;
                                 }
                             };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &job.storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
+                            resolved[index] = Some(self.resolve_reserved_replica_write_target(
+                                &job.storage_runtime,
+                                reservation,
+                            ));
                         }
                     }
                     Err(error) => {
@@ -301,13 +487,10 @@ impl StoreClient {
                                     continue;
                                 }
                             };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &job.storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
+                            resolved[index] = Some(self.resolve_reserved_replica_write_target(
+                                &job.storage_runtime,
+                                reservation,
+                            ));
                         }
                     }
                     Err(error) => {
@@ -359,6 +542,7 @@ impl StoreClient {
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )?;
                 continue;
             }
@@ -385,6 +569,7 @@ impl StoreClient {
                     segment_name: requests[*index].segment_name.clone(),
                     offset_bytes: requests[*index].offset_bytes,
                     length_bytes: requests[*index].length_bytes,
+                    allocation_id: requests[*index].allocation_id,
                 })
                 .collect::<Vec<_>>();
             match self
@@ -445,6 +630,7 @@ impl StoreClient {
             error,
             StoreError::Allocator(message)
                 if message.contains("segment release missing live allocation")
+                    || message.contains("segment release stale allocation generation")
         )
     }
 
@@ -453,10 +639,19 @@ impl StoreClient {
         requests: &[AllocationReleaseRequest],
         allow_duplicate_local_release: bool,
         context: &'static str,
-    ) -> Result<()> {
+    ) -> (Vec<usize>, Option<StoreError>) {
         if requests.is_empty() {
-            return Ok(());
+            return (Vec::new(), None);
         }
+
+        let mut failed_indices = Vec::new();
+        let mut first_error = None;
+        let mut record_failure = |index: usize, error: StoreError| {
+            failed_indices.push(index);
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        };
 
         let mut remote_leases = BTreeMap::new();
         let mut remote_errors = BTreeMap::new();
@@ -466,7 +661,7 @@ impl StoreClient {
             .map(|request| request.storage_runtime.clone())
             .collect::<BTreeSet<_>>()
         {
-            match self.lookup_runtime_lease(&runtime) {
+            match self.lookup_runtime_lease_for_release(&runtime) {
                 Ok(lease) => {
                     remote_leases.insert(runtime, lease);
                 }
@@ -484,6 +679,7 @@ impl StoreClient {
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 ) {
                     if allow_duplicate_local_release
                         && Self::duplicate_reclaim_release_is_skippable(&error)
@@ -504,7 +700,8 @@ impl StoreClient {
                         );
                         continue;
                     }
-                    return Err(error);
+                    crate::observability::registry::record_reclaim_release(context, "error");
+                    record_failure(index, error);
                 }
                 continue;
             }
@@ -527,7 +724,9 @@ impl StoreClient {
                     );
                     continue;
                 }
-                return Err(error.clone());
+                crate::observability::registry::record_reclaim_release(context, "error");
+                record_failure(index, error.clone());
+                continue;
             }
 
             let Some(lease) = remote_leases.get(&request.storage_runtime).cloned() else {
@@ -560,6 +759,7 @@ impl StoreClient {
                     segment_name: requests[*index].segment_name.clone(),
                     offset_bytes: requests[*index].offset_bytes,
                     length_bytes: requests[*index].length_bytes,
+                    allocation_id: requests[*index].allocation_id,
                 })
                 .collect::<Vec<_>>();
             match self
@@ -622,7 +822,7 @@ impl StoreClient {
                                 context,
                                 "error",
                             );
-                            return Err(error);
+                            record_failure(index, error);
                         }
                     }
                 }
@@ -671,34 +871,13 @@ impl StoreClient {
                         "allocator batch reclaim release rpc failed"
                     );
                     crate::observability::registry::record_reclaim_release(context, "error");
-                    return Err(error);
+                    for index in indices {
+                        record_failure(index, error.clone());
+                    }
                 }
             }
         }
-        Ok(())
-    }
-
-    fn release_reserved_allocations(
-        &self,
-        targets: &[ReplicaWriteTarget],
-        reservations: &[mooncake_store_core::SegmentReservation],
-    ) -> Result<()> {
-        if targets.len() != reservations.len() {
-            return Err(StoreError::InvalidState(
-                "targets and reservations length mismatch".to_string(),
-            ));
-        }
-        let releases = targets
-            .iter()
-            .zip(reservations.iter())
-            .map(|(target, reservation)| AllocationReleaseRequest {
-                storage_runtime: target.storage_runtime.clone(),
-                segment_name: target.segment_name.clone(),
-                offset_bytes: reservation.offset_bytes,
-                length_bytes: reservation.length_bytes,
-            })
-            .collect::<Vec<_>>();
-        self.release_segment_allocations_batch(&releases)
+        (failed_indices, first_error)
     }
 
     pub fn flush_due_reclaims(&self) -> Result<()> {
@@ -706,16 +885,39 @@ impl StoreClient {
             let mut state = self.state.lock();
             state.take_due_reclaims(now_ms())
         };
-        if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
+        let due = if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
             && self.lifecycle_state() != ClientLifecycleState::Active
         {
-            let hot = due
-                .into_iter()
+            due.into_iter()
                 .filter(|reclaim| reclaim.cold_backing.is_none())
-                .collect::<Vec<_>>();
-            return self.execute_pending_reclaims(hot, "flush_due_reclaims");
+                .collect::<Vec<_>>()
+        } else {
+            due
+        };
+        let (failed, result) = self.execute_pending_reclaims(due, "flush_due_reclaims");
+        if !failed.is_empty() {
+            self.retry_failed_reclaims(&failed);
         }
-        self.execute_pending_reclaims(due, "flush_due_reclaims")
+        result
+    }
+
+    fn flush_due_reclaims_best_effort(&self) {
+        if let Err(error) = self.flush_due_reclaims() {
+            debug!(
+                runtime = %self.lease.runtime,
+                error = %error,
+                "deferred reclaim flush failed; continuing foreground operation"
+            );
+        }
+    }
+
+    fn retry_failed_reclaims(&self, pending: &[PendingReclaim]) {
+        let retry_at_ms = now_ms();
+        let mut state = self.state.lock();
+        for mut reclaim in pending.iter().cloned() {
+            reclaim.due_at_ms = retry_at_ms;
+            state.enqueue_pending_reclaim(reclaim);
+        }
     }
 
     fn flush_all_reclaims(&self) -> Result<()> {
@@ -723,7 +925,12 @@ impl StoreClient {
             let mut state = self.state.lock();
             std::mem::take(&mut state.pending_reclaims)
         };
-        self.execute_pending_reclaims(pending.into(), "flush_all_reclaims")
+        let (failed, result) =
+            self.execute_pending_reclaims(pending.into(), "flush_all_reclaims");
+        if !failed.is_empty() {
+            self.retry_failed_reclaims(&failed);
+        }
+        result
     }
 
     fn flush_all_reclaims_preserve_cold_tier(&self) -> Result<()> {
@@ -735,7 +942,12 @@ impl StoreClient {
             .into_iter()
             .filter(|reclaim| reclaim.cold_backing.is_none())
             .collect::<Vec<_>>();
-        self.execute_pending_reclaims(hot, "flush_all_reclaims_preserve_cold_tier")
+        let (failed, result) =
+            self.execute_pending_reclaims(hot, "flush_all_reclaims_preserve_cold_tier");
+        if !failed.is_empty() {
+            self.retry_failed_reclaims(&failed);
+        }
+        result
     }
 
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
@@ -774,6 +986,7 @@ impl StoreClient {
                 segment_name: replica.segment_name.clone(),
                 offset_bytes: replica.segment_offset,
                 length_bytes: replica.length,
+                allocation_id: replica.allocation_id.unwrap_or(0),
                 cold_backing: None,
             })
             .collect::<Vec<_>>();
@@ -788,6 +1001,7 @@ impl StoreClient {
                 segment_name: SegmentName::new("__cold_backing_cleanup__"),
                 offset_bytes: 0,
                 length_bytes: cold_backing.length,
+                allocation_id: 0,
                 cold_backing: Some(cold_backing.clone()),
             });
         }
@@ -798,42 +1012,70 @@ impl StoreClient {
         &self,
         pending: Vec<PendingReclaim>,
         context: &'static str,
-    ) -> Result<()> {
-        let mut releases = Vec::new();
+    ) -> (Vec<PendingReclaim>, Result<()>) {
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        let mut hot = Vec::new();
         for reclaim in pending {
             if let Some(cold_backing) = reclaim.cold_backing.as_ref() {
-                if !self.cold_reclaim_still_targets_route(&reclaim, cold_backing)? {
-                    registry::record_cold_tier_operation(
-                        "reclaim",
-                        "skipped",
-                        "still_referenced",
-                    );
-                    continue;
+                let result = match self.cold_reclaim_still_targets_route(&reclaim, cold_backing) {
+                    Ok(false) => {
+                        registry::record_cold_tier_operation(
+                            "reclaim",
+                            "skipped",
+                            "still_referenced",
+                        );
+                        Ok(())
+                    }
+                    Ok(true) => {
+                        self.reclaim_cold_backings_by_owner(&reclaim.route_key, cold_backing)
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    failed.push(reclaim);
                 }
-                self.reclaim_cold_backings_by_owner(&reclaim.route_key, cold_backing)?;
                 continue;
             }
-            releases.push(AllocationReleaseRequest {
-                storage_runtime: reclaim.storage_runtime,
-                segment_name: reclaim.segment_name,
+            let release = AllocationReleaseRequest {
+                storage_runtime: reclaim.storage_runtime.clone(),
+                segment_name: reclaim.segment_name.clone(),
                 offset_bytes: reclaim.offset_bytes,
                 length_bytes: reclaim.length_bytes,
-            });
+                allocation_id: reclaim.allocation_id,
+            };
+            hot.push((reclaim, release));
         }
-        let hot_reclaims = releases.len() as u64;
-        let result = self.release_reclaim_allocations_best_effort(&releases, true, context);
-        if result.is_ok() {
-            for _ in 0..hot_reclaims {
+
+        let releases = hot
+            .iter()
+            .map(|(_, release)| release.clone())
+            .collect::<Vec<_>>();
+        let (failed_indices, hot_error) =
+            self.release_reclaim_allocations_best_effort(&releases, true, context);
+        let failed_hot = failed_indices.iter().copied().collect::<BTreeSet<_>>();
+        for (index, (reclaim, _)) in hot.into_iter().enumerate() {
+            if failed_hot.contains(&index) {
+                failed.push(reclaim);
+            } else {
                 registry::record_cold_tier_operation("reclaim", "hot", "none");
             }
-        } else if let Err(error) = &result {
+        }
+        if first_error.is_none() {
+            first_error = hot_error;
+        }
+        if let Some(error) = first_error.as_ref() {
             registry::record_cold_tier_operation(
                 "reclaim",
                 "error",
                 registry::cold_tier_error_kind(error),
             );
         }
-        result
+        let result = first_error.map_or(Ok(()), Err);
+        (failed, result)
     }
 
 
@@ -940,8 +1182,10 @@ impl StoreClient {
 
     fn reclaim_route(&self, route: &ObjectRoute, mode: ReclaimMode) -> Result<()> {
         match mode {
-            ReclaimMode::Scheduled => self.schedule_route_reclaim(route),
-            ReclaimMode::Immediate => self.release_route_allocations(route),
+            ReclaimMode::Scheduled | ReclaimMode::Immediate => {
+                self.schedule_reclaim_after_logical_remove(route);
+                Ok(())
+            }
             ReclaimMode::Deferred => Ok(()),
         }
     }
@@ -1210,7 +1454,7 @@ impl StoreClient {
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
         let reservation = self.reserve_segment_allocation(
             storage_runtime,
             None,
@@ -1224,14 +1468,18 @@ impl StoreClient {
             length_bytes = reservation.length_bytes,
             "reserved segment space"
         );
-        let target = self.replica_write_target(storage_runtime, &reservation.segment_name)?;
-        Ok((target, reservation))
+        self.resolve_reserved_replica_write_target(storage_runtime, reservation)
     }
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {
         self.storage_owner.untrack_route(route);
         let pending = self.pending_reclaims_for_route(route, now_ms())?;
-        self.execute_pending_reclaims(pending, "release_route_allocations")
+        let (failed, result) =
+            self.execute_pending_reclaims(pending, "release_route_allocations");
+        if !failed.is_empty() {
+            self.retry_failed_reclaims(&failed);
+        }
+        result
     }
 }
 

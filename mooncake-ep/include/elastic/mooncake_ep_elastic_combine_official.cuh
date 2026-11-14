@@ -3,6 +3,8 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_transport.cuh>
 
 #include <elastic/mooncake_ep_elastic_comm.cuh>
@@ -13,6 +15,19 @@
 #include <elastic/mooncake_ep_elastic_combine_utils.cuh>
 
 namespace mooncake::elastic {
+
+template <typename Ops>
+struct CombineKernelArgs {
+    nv_bfloat16* x;
+    float* topk_weights;
+    int* src_metadata;
+    int* psum_num_recv_tokens_per_scaleup_rank;
+    typename Ops::Context comm_ctx;
+    void* buffer;
+    void* workspace;
+    int rank_idx;
+    int num_reduced_tokens;
+};
 
 template <typename Ops, bool kIsScaleupNVLink, bool kUseExpandedLayout,
           bool kAllowMultipleReduction, int kNumSMs, int kNumWarps,
@@ -26,11 +41,22 @@ template <typename Ops, bool kIsScaleupNVLink, bool kUseExpandedLayout,
               kAllowMultipleReduction, kNumRanks, kNumTopk>(),
           typename team_t = std::conditional_t<
               kIsScaleupNVLink, transport::ScaleupTeam, transport::WorldTeam>>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    combine_impl(nv_bfloat16* x, float* topk_weights, int* src_metadata,
-                 int* psum_num_recv_tokens_per_scaleup_rank,
-                 const typename Ops::Context comm_ctx, void* buffer,
-                 void* workspace, const int rank_idx, int num_reduced_tokens) {
+__device__ __forceinline__ void combine_kernel_impl(
+    const CombineKernelArgs<Ops>& args) {
+    static_assert(std::is_trivially_copyable<CombineKernelArgs<Ops>>::value,
+                  "CombineKernelArgs must be trivially copyable");
+
+    nv_bfloat16* x = args.x;
+    float* topk_weights = args.topk_weights;
+    int* src_metadata = args.src_metadata;
+    int* psum_num_recv_tokens_per_scaleup_rank =
+        args.psum_num_recv_tokens_per_scaleup_rank;
+    const typename Ops::Context& comm_ctx = args.comm_ctx;
+    void* buffer = args.buffer;
+    void* workspace = args.workspace;
+    const int rank_idx = args.rank_idx;
+    int num_reduced_tokens = args.num_reduced_tokens;
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -362,6 +388,19 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                       kNumQPs, kNumTimeoutCycles, comm::kCombineTag1, true,
                       true, false>(gin, workspace_layout, 0, rank_idx, sm_idx,
                                    thread_idx);
+}
+
+template <typename Ops, bool kIsScaleupNVLink, bool kUseExpandedLayout,
+          bool kAllowMultipleReduction, int kNumSMs, int kNumWarps,
+          int kNumRanks, int kHidden, int kNumMaxTokensPerRank, int kNumExperts,
+          int kNumTopk, int kNumQPs, int64_t kNumTimeoutCycles,
+          int kNumThreads = kNumWarps * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    combine(const CombineKernelArgs<Ops> args) {
+    combine_kernel_impl<Ops, kIsScaleupNVLink, kUseExpandedLayout,
+                        kAllowMultipleReduction, kNumSMs, kNumWarps, kNumRanks,
+                        kHidden, kNumMaxTokensPerRank, kNumExperts, kNumTopk,
+                        kNumQPs, kNumTimeoutCycles>(args);
 }
 
 }  // namespace mooncake::elastic

@@ -16,6 +16,7 @@
 #define URMA_ENDPOINT_H
 #include <atomic>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -146,6 +147,10 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
+    // retrieveRemoteSeg() is called from every submitting thread; without
+    // this lock two threads can both miss the cache and push into
+    // remote_seg_list_, racing on the vector reallocation.
+    mutable std::shared_mutex remote_seg_mutex_;
 };
 
 // define the UrmaEndpoint class

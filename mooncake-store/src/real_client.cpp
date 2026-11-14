@@ -13,8 +13,10 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -37,6 +39,7 @@
 #include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
+#include "config/distributed_storage_config.h"
 #include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
@@ -57,11 +60,9 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "nof/nof_runtime.h"
 #include "version.h"
 #include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "acl/acl_rt.h"
 #endif
@@ -264,9 +265,17 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     return staged_slices;
 }
 
+// prefer_alloc_in_same_node on the multi-buffer APIs selects group-by-target.
+// Ascend protocols group by default when the caller leaves that flag false.
+bool GroupMultiBufferTransfers(const std::string &protocol,
+                               bool prefer_alloc_in_same_node) {
+    return prefer_alloc_in_same_node || protocol == "ascend" ||
+           protocol == "ascend_direct";
+}
+
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -295,7 +304,23 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
             return StageWriteSlices(allocator, slices, staging_handles);
         };
     }
-    return ((*client).*write)(keys, batched_slices.value(), config, stager);
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client->GetProtocol(), config.prefer_alloc_in_same_node);
+    return ((*client).*write)(keys, batched_slices.value(), config, stager,
+                              group_by_target);
+}
+
+// Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
+std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
+    static std::function<NofRuntime()> factory;
+    return factory;
+}
+
+// Backing slot for RealClient::SetTeUnregisterHookForTesting.
+std::function<tl::expected<void, ErrorCode>(void *)> &
+TeUnregisterHookForTestingSlot() {
+    static std::function<tl::expected<void, ErrorCode>(void *)> hook;
+    return hook;
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -355,7 +380,7 @@ void *AllocateMemFabricStoreSegment(size_t segment_size,
     MemFabricHostAllocFn host_alloc = nullptr;
     size_t host_align = 0;
     size_t alloc_size = segment_size;
-    if (use_hugepage) {
+    if (use_hugepage && !memfabric_use_fabric_mem(protocol)) {
         host_align = get_hugepage_size_from_env();
         alloc_size = align_up(segment_size, host_align);
         host_alloc =
@@ -487,14 +512,15 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
 
-// Build a QueryResult containing only the chosen replica so that
-// Client::Get / Client::BatchGet (which internally call
-// FindFirstCompleteReplica) cannot pick a different replica type.
+// Preserve the selected medium and lease. Affinity-enabled memory reads retain
+// their candidates until the actual destination of each read is known.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
     return QueryResult(
-        {replica}, qr.lease_timeout,
+        RetainMemoryReadCandidates(qr.replicas, replica,
+                                   StoreHcaAffinityEnabled()),
+        qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt,
         qr.resolved_tenant_id);
 }
@@ -906,7 +932,7 @@ void ResourceTracker::startSignalThread() {
     });
 }
 
-RealClient::RealClient() {
+RealClient::RealClient() : prefetcher_(std::make_unique<SsdPrefetcher>()) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
@@ -919,7 +945,12 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    // A destructor cannot propagate errors, but a teardown failure (e.g.
+    // unconfirmed NoF cleanup) must still leave a trace.
+    if (!tearDownAll_internal()) {
+        LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
+                      "some buffers must stay mapped until process exit";
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -967,6 +998,16 @@ tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
     return embedded_master_->master_address();
 }
 
+void RealClient::SetNofRuntimeFactoryForTesting(
+    std::function<NofRuntime()> factory) {
+    NofRuntimeFactoryForTestingSlot() = std::move(factory);
+}
+
+void RealClient::SetTeUnregisterHookForTesting(
+    std::function<tl::expected<void, ErrorCode>(void *)> hook) {
+    TeUnregisterHookForTestingSlot() = std::move(hook);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -998,6 +1039,43 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
+    // Re-entry guard (mirrors initAll_internal): a second setup would
+    // overwrite client_ and skip the first instance's ordered cleanup.
+    if (client_) {
+        LOG(ERROR) << "Client is already initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // A previous teardown that could not release NoF registrations leaves
+    // caller-owned buffers whose DMA translation may still be live under the
+    // OLD initiator's owner token. Re-init installs a fresh initiator whose
+    // UnregisterMemory no-ops on them, so a later teardown would erase the
+    // records and falsely report success. nof_buffer_cleanup_failed_ is the
+    // precise signal: it is set only when CleanupNofRegisteredBuffers fails
+    // to release a record, and stays false when NoF is unavailable — a clean
+    // non-NoF teardown that leaves register_buffer() records behind is NOT
+    // refused. Refuse to re-init this object; create a new client instead.
+    if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                      "un-released NoF registrations; create a new client "
+                      "instead";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // Likewise refuse when a previous teardown quarantined a mapping (a
+    // failed TE or NoF unregister): it stays pinned because its registration
+    // state is uncertain, and a re-initialized client's teardown could
+    // munmap it while an old registration is still live.
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (!quarantine_shms_.empty()) {
+            LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                          "quarantined shared mappings that must stay pinned; "
+                          "create a new client instead";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    // Reset the teardown latch so this instance can be torn down again.
+    closed_.store(false, std::memory_order_release);
+
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
@@ -1019,12 +1097,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-#ifdef USE_NOF
-    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
-        LOG(ERROR) << "spdk env init fail";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-#endif
+    // The SPDK env initializes lazily on first use, so setup no longer
+    // fail-fasts.
+    auto &nof_factory = NofRuntimeFactoryForTestingSlot();
+    nof_runtime_ = nof_factory ? nof_factory() : CreateNofRuntime();
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -1067,7 +1143,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id);
+            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1098,7 +1174,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id);
+                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1134,20 +1210,34 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    bool use_spdk_dma_for_client_buffer = false;
-#ifdef USE_NOF
-    use_spdk_dma_for_client_buffer = true;
+    bool use_hugepage_for_client_buffer =
+        use_hugepage_ && !globalConfig().ascend_use_fabric_mem;
+#ifdef USE_MEMFABRIC
+    use_hugepage_for_client_buffer &= !memfabric_use_fabric_mem(this->protocol);
 #endif
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol,
-        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
-        use_spdk_dma_for_client_buffer);
+    // Inject the SPDK DMA allocator only when NoF is actually available;
+    // otherwise pass nullptr so allocate_buffer_allocator_memory falls
+    // through to exactly the same path as use_spdk_dma=false today
+    // (protocol-specific allocation -> VRAM -> aligned_alloc).
+    try {
+        client_buffer_allocator_ = ClientBufferAllocator::create(
+            local_buffer_size, this->protocol, use_hugepage_for_client_buffer,
+            nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
+    } catch (const std::bad_alloc &) {
+        // The NoF DMA allocator yields nullptr when the SPDK env is
+        // unavailable; report an error instead of a silent generic-allocation
+        // fallback that would surface later as NoF registration failures.
+        LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
+                      "allocator unavailable or out of memory; check the "
+                      "hugepage/SPDK environment)";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
+            kWildcardLocation, client_->SupportsGatherRead(), true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
                        << toString(result.error());
@@ -1239,20 +1329,28 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 if (!split_limit.has_value() || cap < *split_limit) {
                     split_limit = cap;
                 }
-                LOG(INFO) << "Agent-mode store chunk cap: " << cap
-                          << " bytes across "
+                LOG(INFO) << "Agent mode splits the store segment of "
+                          << global_segment_size << " bytes across "
                           << ContextManager::getInstance().getDeviceCount()
-                          << " device(s)";
+                          << " devices, at most " << cap
+                          << " bytes on each device";
             }
         }
 #endif
 
-        // For RDMA, auto-discover NUMA nodes with NICs and distribute
-        // global_segment across them for full NIC utilization.
+        // NUMA partitioning changes the largest contiguous allocation domain.
+        // Keep the original layout unless explicitly requested on storage
+        // hosts.
+        const bool partition_numa =
+            ReplicaSelectionConfig::FromEnvironment().hca_numa_segments_enabled;
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
-            seg_numa_nodes = client_->GetNicNumaNodes();
-            if (seg_numa_nodes.size() > 1) {
+            // Only the NIC nodes this process may allocate from: binding a
+            // region to a node outside its cpuset fails setup with EINVAL.
+            seg_numa_nodes =
+                FilterNumaNodesToAllowed(client_->GetNicNumaNodes());
+            if (seg_numa_nodes.size() > 1 ||
+                (partition_numa && !seg_numa_nodes.empty())) {
                 std::string nodes_str;
                 for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
                     if (i) nodes_str += ",";
@@ -1265,8 +1363,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        if (partition_numa && !seg_numa_nodes.empty()) {
+            const auto numa_limit = align_up(
+                DivideRoundUp(global_segment_size, seg_numa_nodes.size()),
+                alignment);
+            if (!split_limit || numa_limit < *split_limit) {
+                split_limit = numa_limit;
+            }
+        }
+        size_t next_numa_node = 0;
+
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && use_hugepage_;
+            (protocol == "rdma" || protocol == "efa") && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(
@@ -1285,6 +1393,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
+            std::vector<int> segment_numa_nodes;
 
             if (egm_config.enabled) {
                 auto status = NvlinkHostNumaAllocation::Create(
@@ -1307,14 +1416,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 mapped_size = egm_owner->length();
             } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
+                segment_numa_nodes =
+                    partition_numa
+                        ? std::vector<
+                              int>{seg_numa_nodes[next_numa_node++ %
+                                                  seg_numa_nodes.size()]}
+                        : seg_numa_nodes;
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * seg_numa_nodes.size());
-                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
-                                                    page_sz);
-                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+                // Base pages are THP-advised: keep every region and the tail
+                // on 2MB boundaries, so no huge page straddles two bindings.
+                const size_t region_align = use_hugepage_ ? page_sz : SZ_2MB;
+                mapped_size = align_up(
+                    segment_size, region_align * segment_numa_nodes.size());
+                ptr = allocate_buffer_numa_segments(
+                    mapped_size, segment_numa_nodes, page_sz);
+                seg_location =
+                    partition_numa
+                        ? "cpu:" + std::to_string(segment_numa_nodes[0])
+                        : buildSegmentsLocation(page_sz, segment_numa_nodes);
 #ifdef USE_ASCEND_DIRECT
             } else if (protocol == "ascend" || protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
@@ -1335,9 +1456,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifndef USE_VRAM_SEGMENT
             } else if (protocol == "efa") {
                 // EFA host segments must be THP backed and must not pile up
-                // on one NUMA node; see allocate_buffer_thp_interleaved().
+                // on one NUMA node; see allocate_buffer_thp().
                 mapped_size = align_up(segment_size, SZ_2MB);
-                ptr = allocate_buffer_thp_interleaved(mapped_size);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInterleaveIfDefault);
+                use_mmap_segment = true;
+            } else if (protocol == "rdma") {
+                // At most one usable NIC NUMA node: THP backed like the
+                // NUMA-segmented path, under the task's own NUMA policy.
+                mapped_size = align_up(segment_size, SZ_2MB);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInheritTask);
                 use_mmap_segment = true;
 #endif
             } else {
@@ -1361,7 +1490,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
 #ifdef USE_MEMFABRIC
-                if (use_hugepage_) {
+                if (use_hugepage_ &&
+                    !memfabric_use_fabric_mem(this->protocol)) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
                 } else {
@@ -1390,7 +1520,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
             } else if (use_mmap_segment) {
-                // NUMA-segmented, hugepage or EFA THP: track as mmap
+                // NUMA-segmented, hugepage or EFA/RDMA THP: track as mmap
                 // allocation for munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
@@ -1408,7 +1538,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (parallel_hugetlb_population) {
                 if (!seg_numa_nodes.empty()) {
                     populate_hugetlb_numa_mapping(ptr, mapped_size,
-                                                  seg_numa_nodes);
+                                                  segment_numa_nodes);
                 } else if (!is_mmap_arena_allocation(ptr)) {
                     populate_hugetlb_mapping(ptr, mapped_size);
                 }
@@ -1463,9 +1593,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object_ranges>(
+                this);
+        offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
         offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
             this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::prefetch_offload_object>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -1481,8 +1616,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
-    if (enable_ssd_offload) {
+    const auto distributed_config = DistributedStorageConfig::FromEnvironment();
+    const bool enable_kvcs = distributed_config.UsesKvcs();
+    if (enable_ssd_offload || enable_kvcs) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (enable_kvcs) {
+            file_storage_config.storage_backend_type =
+                StorageBackendType::kDistributed;
+        }
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
@@ -1495,6 +1636,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+    }
+    if (enable_ssd_offload) {
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.
@@ -1518,6 +1661,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             });
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (enable_ssd_prefetch_) {
+        // Prefetch needs the master-facing client for metadata and task
+        // registration; local promotion additionally needs file_storage_.
+        // A read-only client (no local SSD offload) can still trigger remote
+        // holders.
+        prefetcher_->throttle()->configure(ssd_prefetch_cooldown_sec_,
+                                           ssd_prefetch_dedup_ttl_sec_);
+        prefetcher_->Init(client_, file_storage_, client_requester_,
+                          local_rpc_addr);
+        LOG(INFO) << "SSD prefetch enabled: "
+                  << CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC << "="
+                  << ssd_prefetch_cooldown_sec_ << "s, "
+                  << CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC << "="
+                  << ssd_prefetch_dedup_ttl_sec_ << "s";
+    }
     const bool should_start_http_server =
         enable_client_http_server || FLAGS_enable_http_server;
     const int selected_http_port =
@@ -1707,8 +1865,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    auto egm_config = ParseEgmStorePoolConfig(
-        config, protocol, global_segment_size, local_buffer_size);
+    // SSD prefetch knobs (all default off; see
+    // docs/source/design/store/ssd-prefetch.md).
+    enable_ssd_prefetch_ =
+        get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
+    auto prefetch_cooldown_opt =
+        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
+                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC);
+    auto prefetch_dedup_ttl_opt =
+        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC,
+                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
+    if (!prefetch_cooldown_opt.has_value() ||
+        !prefetch_dedup_ttl_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    ssd_prefetch_cooldown_sec_ =
+        static_cast<int64_t>(prefetch_cooldown_opt.value());
+    ssd_prefetch_dedup_ttl_sec_ =
+        static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
+
+    auto egm_config =
+        ParseEgmStorePoolConfig(config, protocol, global_segment_size);
     if (!egm_config) return tl::unexpected(egm_config.error());
     try {
         auto result = setup_internal(
@@ -1753,7 +1930,33 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
+        // A previous teardown's cleanup failure must not decay into success
+        // on repeat calls: retry the idempotent cleanups and keep reporting
+        // failure until they heal.
+        if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+            const ErrorCode rc = CleanupNofRegisteredBuffers();
+            if (rc != ErrorCode::OK) {
+                return tl::unexpected(rc);
+            }
+        }
+        ErrorCode shm_rc;
+        {
+            std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+            shm_rc = RetryQuarantinedShmsLocked();
+        }
+        if (shm_rc != ErrorCode::OK) {
+            return tl::unexpected(shm_rc);
+        }
         return {};
+    }
+
+    // Drain the prefetch pool before any resource release below. Pool jobs
+    // capture shared_ptrs locked at submission, so a job blocked on its
+    // metadata RPC keeps Client alive past client_.reset(); segment memory
+    // must not be released (and must not stay registered with TE / published
+    // on the master) while such a job is still running.
+    if (prefetcher_) {
+        prefetcher_->Shutdown();
     }
 
     stop_ipc_server();
@@ -1813,6 +2016,15 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         embedded_master_->Stop();
         embedded_master_.reset();
     }
+    // NoF I/O is drained by now (client_.reset() joined the worker pool).
+    // Release this client's NoF registrations; on failure the caller-owned
+    // buffers may still be DMA-translated and must not be freed or remapped.
+    {
+        const ErrorCode nof_rc = CleanupNofRegisteredBuffers();
+        if (nof_rc != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
+            cleanup_error = nof_rc;
+        }
+    }
     for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
          ++it) {
         auto &owner = *it;
@@ -1868,16 +2080,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 continue;
             }
 #ifdef USE_NOF
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
-            // translation is gone; if unregister fails, retain the mapping
-            // (quarantine) so the VA cannot be reused while SPDK still holds a
-            // translation to it.
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the translation is
+            // gone; if unregister fails, retain the mapping (quarantine) so the
+            // VA cannot be reused while the translation to it is live.
             if (seg.spdk_registered) {
-                if (SpdkWrapper::GetInstance().UnregisterMemory(
-                        seg.shm_buffer, seg.shm_size) != 0) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during teardown: "
+                if (!nof_runtime_.initiator ||
+                    nof_runtime_.initiator->UnregisterMemory(seg.shm_buffer) !=
+                        ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during teardown: "
                                << seg.shm_buffer
                                << "; quarantining mapping (never munmap)";
                     quarantine_shms_.push_back(std::move(seg));
@@ -1900,15 +2112,46 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         shm_it = shm_contexts_.erase(shm_it);
     }
     // Re-attempt quarantined segments (unregister failed during this teardown
-    // or an earlier one). Any that still fail are retained until process exit,
-    // which is safe: they are never munmapped, so SPDK's translations never
-    // point at freed/reused virtual addresses.
-    RetryQuarantinedShmsLocked();
+    // or an earlier one). Failures stay pinned (never munmapped) until process
+    // exit, and are reported so teardown does not claim success while
+    // translations stay live.
+    if (RetryQuarantinedShmsLocked() != ErrorCode::OK &&
+        cleanup_error == ErrorCode::OK) {
+        cleanup_error = ErrorCode::INTERNAL_ERROR;
+    }
     if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
 
-void RealClient::RetryQuarantinedShmsLocked() {
+ErrorCode RealClient::CleanupNofRegisteredBuffers() {
+    if (!nof_runtime_.initiator) {
+        nof_buffer_cleanup_failed_.store(false, std::memory_order_release);
+        return ErrorCode::OK;
+    }
+    bool failed = false;
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    for (auto it = registered_buffer_sizes_.begin();
+         it != registered_buffer_sizes_.end();) {
+        const ErrorCode rc =
+            nof_runtime_.initiator->UnregisterMemory(it->first);
+        if (rc != ErrorCode::OK) {
+            // Keep the record: the DMA translation state is unconfirmed,
+            // so the buffer must stay mapped.
+            LOG(ERROR) << "NoF registration for buffer " << it->first
+                       << " could not be released; its NoF pages stay "
+                          "quarantined — do NOT free or remap this buffer "
+                          "before process exit";
+            failed = true;
+            ++it;
+        } else {
+            it = registered_buffer_sizes_.erase(it);
+        }
+    }
+    nof_buffer_cleanup_failed_.store(failed, std::memory_order_release);
+    return failed ? ErrorCode::INTERNAL_ERROR : ErrorCode::OK;
+}
+
+ErrorCode RealClient::RetryQuarantinedShmsLocked() {
     auto it = quarantine_shms_.begin();
     while (it != quarantine_shms_.end()) {
         // The transfer engine may still hold this region (unregisterLocalMemory
@@ -1930,11 +2173,12 @@ void RealClient::RetryQuarantinedShmsLocked() {
             it->te_unregister_pending = false;
         }
 #ifdef USE_NOF
-        // A quarantined segment may still have a live SPDK registration: only
+        // A quarantined segment may still have a live NoF registration: only
         // munmap once the translation is actually released.
         if (it->spdk_registered) {
-            if (SpdkWrapper::GetInstance().UnregisterMemory(
-                    it->shm_buffer, it->shm_size) != 0) {
+            if (!nof_runtime_.initiator ||
+                nof_runtime_.initiator->UnregisterMemory(it->shm_buffer) !=
+                    ErrorCode::OK) {
                 ++it;
                 continue;
             }
@@ -1951,6 +2195,7 @@ void RealClient::RetryQuarantinedShmsLocked() {
                   << ", size: " << it->shm_size;
         it = quarantine_shms_.erase(it);
     }
+    return quarantine_shms_.empty() ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
@@ -2848,9 +3093,19 @@ tl::expected<bool, ErrorCode> RealClient::isExist_internal(
 }
 
 int RealClient::isExist(const std::string &key) {
+    return isExist(key, ExistOptions{});
+}
+
+int RealClient::isExist(const std::string &key, const ExistOptions &options) {
     auto result = isExist_internal(key);
 
     if (result.has_value()) {
+        // Best-effort SSD prefetch: synchronous part is a throttle dedup plus
+        // a pool enqueue; no RPC is added to the exist path.
+        if (options.prefetch_to_memory && *result && enable_ssd_prefetch_ &&
+            prefetcher_) {
+            prefetcher_->TriggerPrefetch({key});
+        }
         return *result ? 1 : 0;  // 1 if exists, 0 if not
     } else {
         return toInt(result.error());
@@ -2859,16 +3114,32 @@ int RealClient::isExist(const std::string &key) {
 
 std::vector<int> RealClient::batchIsExist(
     const std::vector<std::string> &keys) {
+    return batchIsExist(keys, ExistOptions{});
+}
+
+std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
     auto internal_results = batchIsExist_internal(keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    const bool maybe_prefetch =
+        options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_;
+    std::vector<std::string> prefetch_candidates;
+    for (size_t i = 0; i < internal_results.size(); ++i) {
+        const auto &result = internal_results[i];
         if (result.has_value()) {
             results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
+            if (maybe_prefetch && result.value()) {
+                prefetch_candidates.push_back(keys[i]);
+            }
         } else {
             results.push_back(toInt(result.error()));
         }
+    }
+
+    if (!prefetch_candidates.empty()) {
+        prefetcher_->TriggerPrefetch(prefetch_candidates);
     }
 
     return results;
@@ -2899,6 +3170,52 @@ std::vector<int> RealClient::batchProbeKey(const std::vector<std::string> &keys,
     }
 
     return results;
+}
+
+#define DEFINE_REAL_WEIGHT_METHOD(method, client_method, request_type, \
+                                  result_type)                         \
+    WeightRpcResult<result_type> RealClient::method(                   \
+        const request_type &request) {                                 \
+        if (!client_) {                                                \
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);     \
+        }                                                              \
+        return client_->client_method(request);                        \
+    }
+
+DEFINE_REAL_WEIGHT_METHOD(begin_weight_import, BeginWeightImport,
+                          BeginWeightImportRequest, WeightRevisionMetadata)
+DEFINE_REAL_WEIGHT_METHOD(commit_weight_import, CommitWeightImport,
+                          CommitWeightImportRequest, WeightRevisionMetadata)
+DEFINE_REAL_WEIGHT_METHOD(abort_weight_import, AbortWeightImport,
+                          AbortWeightImportRequest, WeightRevisionMetadata)
+DEFINE_REAL_WEIGHT_METHOD(get_weight_revision, GetWeightRevision,
+                          GetWeightRevisionRequest, WeightRevisionView)
+DEFINE_REAL_WEIGHT_METHOD(list_weight_revisions, ListWeightRevisions,
+                          ListWeightRevisionsRequest,
+                          ListWeightRevisionsResponse)
+DEFINE_REAL_WEIGHT_METHOD(acquire_weight_revision_lease,
+                          AcquireWeightRevisionLease,
+                          AcquireWeightRevisionLeaseRequest,
+                          WeightRevisionLease)
+DEFINE_REAL_WEIGHT_METHOD(renew_weight_revision_lease, RenewWeightRevisionLease,
+                          RenewWeightRevisionLeaseRequest, WeightRevisionLease)
+DEFINE_REAL_WEIGHT_METHOD(start_weight_residency_operation,
+                          StartWeightResidencyOperation,
+                          StartWeightResidencyOperationRequest,
+                          WeightResidencyOperation)
+DEFINE_REAL_WEIGHT_METHOD(query_weight_operation, QueryWeightOperation,
+                          QueryWeightOperationRequest, WeightResidencyOperation)
+DEFINE_REAL_WEIGHT_METHOD(delete_weight_revision, DeleteWeightRevision,
+                          DeleteWeightRevisionRequest, WeightRevisionMetadata)
+
+#undef DEFINE_REAL_WEIGHT_METHOD
+
+WeightRpcResult<void> RealClient::release_weight_revision_lease(
+    const ReleaseWeightRevisionLeaseRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->ReleaseWeightRevisionLease(request);
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
@@ -2969,6 +3286,16 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     if (fd < 0) {
         LOG(ERROR) << "Invalid file descriptor: " << fd;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Reject a second local buffer before mapping or registering its memory.
+    // The exclusive lock also keeps this check valid through installation.
+    if (is_local_buffer && context_it != shm_contexts_.end() &&
+        context_it->second.client_buffer_allocator) {
+        LOG(ERROR) << "A local buffer is already mapped for this "
+                      "client shared memory.";
+        close(fd);
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
 #ifdef USE_ASCEND_DIRECT
@@ -3045,81 +3372,52 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 
     if (is_local_buffer) {
-        if (context.client_buffer_allocator) {
-            LOG(ERROR) << "A local buffer is already mapped for this "
-                          "client shared memory.";
-            munmap(shm_buffer, shm_size);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
         context.client_buffer_allocator =
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
 
     // Ensure push_back below cannot reallocate and throw bad_alloc after the
-    // SPDK registration succeeded (which would leak the registration and the
+    // NoF registration succeeded (which would leak the registration and the
     // mapping). If reserve itself throws it happens before registration.
     context.mapped_shms.reserve(context.mapped_shms.size() + 1);
 
 #ifdef USE_NOF
-    // Register this mapping with SPDK for NoF zero-copy. Non-fatal on failure:
-    // the buffer stays usable for all non-NoF paths. Placed after the
-    // error-returning paths above so no failure path leaves a dangling SPDK
+    // Register this mapping with the NoF initiator for zero-copy. Non-fatal on
+    // failure: the buffer stays usable for all non-NoF paths. Placed after the
+    // error-returning paths above so no failure path leaves a dangling NoF
     // registration (the unregister below is symmetric on every teardown path).
-    if (register_spdk) {
-        if (!SpdkWrapper::IsRegistrableRange(shm.shm_buffer, shm.shm_size)) {
+    if (register_spdk && nof_runtime_.initiator) {
+        if (!NofRangeIsRegistrable(shm.shm_buffer, shm.shm_size)) {
             // Reached by the fallback mmap above when it cannot place the
-            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). SPDK
-            // rejects such a range before marking anything (memory.c:344), so
-            // skipping the attempt keeps the teardown below able to munmap.
+            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). A range
+            // rejected here is never touched by RegisterMemory, so the teardown
+            // below stays able to munmap without a pairing unregister.
             LOG(WARNING) << "Received shm is not 2MB-aligned; not registering "
-                            "with SPDK: "
-                         << shm.shm_buffer << ", size=" << shm.shm_size
-                         << "; NoF zero-copy transfers to this buffer will be "
-                            "unavailable";
+                            "for NoF zero-copy transfers: "
+                         << shm.shm_buffer << ", size=" << shm.shm_size;
         } else {
-            const int register_rc = SpdkWrapper::GetInstance().RegisterMemory(
-                shm.shm_buffer, shm.shm_size);
-            if (register_rc == 0) {
+            // Only NOF_REGISTRATION_STUCK (cleanup unconfirmed) must be
+            // treated as registered; a plain failure owns no registration.
+            const ErrorCode register_rc =
+                nof_runtime_.initiator->RegisterMemory(shm.shm_buffer,
+                                                       shm.shm_size);
+            if (register_rc == ErrorCode::OK) {
                 shm.spdk_registered = true;
-            } else if (register_rc == -EBUSY) {
-                // Already registered, so SPDK marked nothing new for us. Do NOT
-                // roll back: the unregister below would clear the existing
-                // registration (memory.c:358-366 detects it, 445-466 clears
-                // it). Retain the mapping and let teardown retry.
-                LOG(ERROR) << "Received shm is already registered with SPDK: "
+            } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // Treat as registered so teardown retries the unregister and
+                // quarantines the mapping instead of munmapping.
+                LOG(ERROR) << "NoF registration of received shm left "
+                              "unconfirmed translation state: "
                            << shm.shm_buffer << ", size=" << shm.shm_size
-                           << "; retaining mapping";
+                           << "; treating as registered so teardown retries "
+                              "the unregister and quarantines the mapping";
                 shm.spdk_registered = true;
             } else {
-                LOG(WARNING) << "Failed to register received shm with SPDK: "
+                LOG(WARNING) << "Failed to register received shm with the NoF "
+                                "initiator: "
                              << shm.shm_buffer << ", size=" << shm.shm_size
                              << "; NoF zero-copy transfers to this buffer will "
                                 "be unavailable";
-                // spdk_mem_register() marks the range in g_mem_reg_map before
-                // running its notify callbacks and does NOT roll back on
-                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
-                // can already have installed the IOMMU mapping when a later
-                // step fails (memory.c:1092-1107). This unregister is the only
-                // chance to undo that, and only a 0 return proves it worked:
-                // -EINVAL is also returned for a half-marked range
-                // (memory.c:426) and, in iova=va, for an incomplete translation
-                // before the IOMMU is unmapped (memory.c:1216-1224); it covers
-                // a failure before anything was mapped as well, and the two
-                // cannot be told apart, so retaining a clean mapping is the
-                // accepted cost. Mirrors ShmHelper::allocate.
-                const int rollback_rc =
-                    SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
-                                                                shm.shm_size);
-                if (rollback_rc != 0) {
-                    LOG(ERROR)
-                        << "Failed to roll back incomplete SPDK registration: "
-                        << shm.shm_buffer << ", size: " << shm.shm_size
-                        << ", rc: " << rollback_rc
-                        << "; treating the range as registered so teardown "
-                           "retries the unregister and quarantines the mapping "
-                           "instead of munmapping";
-                    shm.spdk_registered = true;
-                }
             }
         }
     }
@@ -3145,8 +3443,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     bool failed = false;
     // Keep the quarantine push_back below from reallocating (and throwing
@@ -3166,13 +3464,14 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         const bool te_ok = static_cast<bool>(
             client_->unregisterLocalMemory(shm.shm_buffer, true));
 #ifdef USE_NOF
-        // Unregister the SPDK registration BEFORE munmap, mirroring
-        // ShmHelper::free()/cleanup(). munmap is only safe once the SPDK
+        // Unregister the NoF registration BEFORE munmap, mirroring
+        // ShmHelper::free()/cleanup(). munmap is only safe once the DMA
         // translation is gone.
         bool spdk_ok = true;
         if (shm.spdk_registered) {
-            spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                          shm.shm_buffer, shm.shm_size) == 0;
+            spdk_ok = !nof_runtime_.initiator ||
+                      nof_runtime_.initiator->UnregisterMemory(
+                          shm.shm_buffer) == ErrorCode::OK;
         }
 #else
         const bool spdk_ok = true;
@@ -3182,22 +3481,24 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
             shm.spdk_registered = false;
 #endif
             // Both unregisters succeeded, so the VA is no longer referenced by
-            // TE or SPDK and can be released. Siblings that fail are handled by
-            // their own iterations, so a single failure does not leak the rest.
+            // TE or the NoF translation table and can be released. Siblings
+            // that fail are handled by their own iterations, so a single
+            // failure does not leak the rest.
             munmap(shm.shm_buffer, shm.shm_size);
             shm.shm_buffer = nullptr;
             continue;
         }
         // Unregister failed: retain the mapping (never munmap) so neither TE
-        // nor SPDK keeps a registration to a freed/reused VA, and quarantine it
-        // for a retry on a later teardown entry point.
+        // nor the NoF translation table keeps a registration to a freed/reused
+        // VA, and quarantine it for a retry on a later teardown entry point.
         if (!te_ok) {
             LOG(ERROR) << "Failed to unregister memory: " << shm.shm_name
                        << "; quarantining mapping (never munmap)";
         }
 #ifdef USE_NOF
         if (!spdk_ok) {
-            LOG(ERROR) << "Failed to unregister received shm from SPDK: "
+            LOG(ERROR) << "Failed to unregister received shm from the NoF "
+                          "initiator: "
                        << shm.shm_buffer
                        << "; quarantining mapping (never munmap)";
         }
@@ -3205,12 +3506,10 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         shm.te_unregister_pending = !te_ok;
 #ifdef USE_NOF
         // Record only the side that is still registered. Clear spdk_registered
-        // when the SPDK unregister above succeeded even though the mapping
-        // stays quarantined: a later RetryQuarantinedShmsLocked() would
-        // otherwise call spdk_mem_unregister() a second time, get the benign
-        // -EINVAL no-op for an already released range (SPDK memory.c: no
-        // segment is marked REGISTERED), treat it as a failure, and keep the
-        // mapping quarantined (never munmapped) forever.
+        // when the NoF unregister above succeeded even though the mapping stays
+        // quarantined, so a later RetryQuarantinedShmsLocked() does not redo
+        // the unregister (idempotent under the interface contract, but pure
+        // noise).
         shm.spdk_registered = !spdk_ok;
 #endif
         quarantine_shms_.push_back(std::move(shm));
@@ -3435,8 +3734,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
@@ -3479,33 +3778,35 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
                                    << "; quarantining mapping (never munmap)";
                     }
                 }
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the DMA
             // translation is gone.
             bool spdk_ok = true;
 #ifdef USE_NOF
             if (shm.spdk_registered) {
-                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                              shm.shm_buffer, shm.shm_size) == 0;
+                spdk_ok = !nof_runtime_.initiator ||
+                          nof_runtime_.initiator->UnregisterMemory(
+                              shm.shm_buffer) == ErrorCode::OK;
             }
 #endif
             if (!te_ok || !spdk_ok) {
                 // Unregister failed: retain the mapping (never munmap) so
-                // neither TE nor SPDK keeps a registration to a freed/reused
-                // VA, and quarantine it for a retry on a later teardown entry
-                // point.
+                // neither TE nor the NoF translation table keeps a registration
+                // to a freed/reused VA, and quarantine it for a retry on a
+                // later teardown entry point.
                 if (!spdk_ok) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during unmap: "
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during unmap: "
                                << shm.shm_buffer
                                << "; quarantining mapping (never munmap)";
                 }
                 shm.te_unregister_pending = !te_ok;
 #ifdef USE_NOF
-                // Clear spdk_registered when the SPDK unregister above
+                // Clear spdk_registered when the NoF unregister above
                 // succeeded: see unmap_shm_internal (a stale flag makes the
-                // retry re-unregister an already released range, get -EINVAL,
-                // and keep the mapping quarantined forever).
+                // retry redo an already released unregister, which the
+                // interface defines as a benign no-op, but keeps the
+                // bookkeeping honest).
                 shm.spdk_registered = !spdk_ok;
 #endif
                 quarantine_shms_.push_back(std::move(shm));
@@ -3564,8 +3865,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     bool unregister_failed = false;
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // handling this buffer.
-    RetryQuarantinedShmsLocked();
+    // handling this buffer. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
@@ -3621,33 +3922,35 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                            << shm_it->shm_name
                            << "; quarantining mapping (never munmap)";
             }
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the DMA
             // translation is gone.
             bool spdk_ok = true;
 #ifdef USE_NOF
             if (shm_it->spdk_registered) {
-                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                              shm_it->shm_buffer, shm_it->shm_size) == 0;
+                spdk_ok = !nof_runtime_.initiator ||
+                          nof_runtime_.initiator->UnregisterMemory(
+                              shm_it->shm_buffer) == ErrorCode::OK;
             }
 #endif
             if (!te_ok || !spdk_ok) {
                 // Unregister failed: retain the mapping (never munmap) so
-                // neither TE nor SPDK keeps a registration to a freed/reused
-                // VA, and quarantine it for a retry on a later teardown entry
-                // point.
+                // neither TE nor the NoF translation table keeps a registration
+                // to a freed/reused VA, and quarantine it for a retry on a
+                // later teardown entry point.
                 if (!spdk_ok) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during unregister: "
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during unregister: "
                                << shm_it->shm_buffer
                                << "; quarantining mapping (never munmap)";
                 }
                 shm_it->te_unregister_pending = !te_ok;
 #ifdef USE_NOF
-                // Clear spdk_registered when the SPDK unregister above
+                // Clear spdk_registered when the NoF unregister above
                 // succeeded: see unmap_shm_internal (a stale flag makes the
-                // retry re-unregister an already released range, get -EINVAL,
-                // and keep the mapping quarantined forever).
+                // retry redo an already released unregister, which the
+                // interface defines as a benign no-op, but keeps the
+                // bookkeeping honest).
                 shm_it->spdk_registered = !spdk_ok;
 #endif
                 quarantine_shms_.push_back(std::move(*shm_it));
@@ -3769,6 +4072,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
     }
+    // Same demand-side kick as the batch path: a plain get headed for SSD is
+    // the strongest hotness signal there is.
+    KickPrefetchForDiskHeadedKeys({key}, {query_result}, local_endpoints);
 
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
@@ -3825,9 +4131,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return buffer_handle;
     }
 
-    // MEMORY / DISK / DFS: use client_->Get. FilterQueryResult ensures
-    // Client::Get internal FindFirstCompleteReplica can only see
-    // the replica we selected, preventing accidental LOCAL_DISK picks.
+    // MEMORY / DISK / DFS: use client_->Get. FilterQueryResult preserves the
+    // selected medium while allowing memory affinity to follow the destination.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
@@ -4453,7 +4758,7 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
         [&]() { return batch_get_buffer_internal(keys); },
-        [](const auto &) { return true; },
+        [this](const auto &) { return client_ != nullptr; },
         [&](uint64_t latency_us, const auto &buffers) {
             client_->ObserveTransferOperation(
                 TransferOperationKind::kRead, "batch_get_buffer",
@@ -4488,14 +4793,43 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
-    auto result = client_->RegisterLocalMemory(buffer, registration_size,
-                                               kWildcardLocation, false, true);
+    // Gather reads are owner-initiated WRITEs. Publish Store output buffers
+    // on supported classic transports; TE's registration defaults stay intact.
+    auto result = client_->RegisterLocalMemory(
+        buffer, registration_size, kWildcardLocation,
+        client_->SupportsGatherRead(), true);
     if (!result) {
         return result;
     }
+    // #3131: SPDK's RDMA transport keeps its own translation table, which TE
+    // registration does not cover. Register the same (possibly widened) range
+    // as TE; failure is non-fatal (same policy as the shm paths).
+    if (nof_runtime_.initiator) {
+        auto rc =
+            nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
+        if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+            // The failed page is terminally quarantined (never unregistered,
+            // never munmapped): the buffer must not be freed or remapped.
+            LOG(ERROR) << "NoF memory registration left unconfirmed "
+                          "translation state for buffer "
+                       << buffer << ", size " << registration_size
+                       << "; the affected NoF page is quarantined. Do not "
+                          "free or remap this buffer.";
+        } else if (rc != ErrorCode::OK) {
+            LOG(WARNING) << "NoF memory registration failed for buffer "
+                         << buffer << ", size " << registration_size << ": "
+                         << toString(rc)
+                         << "; buffer stays registered with the transfer "
+                            "engine, but NoF I/O to it will fail. Use "
+                            "hugepage-backed memory for NoF, or set "
+                            "MC_NOF_BACKEND=none if NoF is not intended.";
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
+        // The record keeps the logical size: writable-region resolution must
+        // not expose the physical segment beyond what the caller registered.
+        registered_buffer_sizes_[buffer] = {size};
     }
     return result;
 }
@@ -4510,15 +4844,52 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+    auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        auto &hook = TeUnregisterHookForTestingSlot();
+        if (hook) {
+            return hook(buffer);
+        }
+        return client_->unregisterLocalMemory(buffer, true);
+    }();
+
+    // Record check, NoF cleanup and record erase stay in one critical
+    // section (teardown's unregister walk takes the same lock).
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
-        LOG(ERROR) << "Unregister buffer failed with error: "
-                   << toString(unregister_result.error());
-        return tl::unexpected(unregister_result.error());
+        // Fall through to the NoF cleanup only when TE reports the buffer as
+        // not registered and the record is still present. NOT_REGISTERED is
+        // truthful: RdmaTransport retries any stuck MR deregistration before
+        // reporting it. Any other TE failure may leave the TE registration
+        // alive: keep the record and propagate.
+        if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
+            rec_it == registered_buffer_sizes_.end()) {
+            LOG(ERROR) << "Unregister buffer failed with error: "
+                       << toString(unregister_result.error());
+            return tl::unexpected(unregister_result.error());
+        }
+        LOG(WARNING) << "TE reports buffer " << buffer
+                     << " as already unregistered; retrying the NoF cleanup";
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_.erase(buffer);
+    // TENT may successfully unregister an unknown address. Without a Store
+    // record there is no pending NoF cleanup to retry.
+    if (rec_it == registered_buffer_sizes_.end()) {
+        return tl::unexpected(ErrorCode::NOT_REGISTERED);
+    }
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+        if (rc != ErrorCode::OK) {
+            // The backend may still hold a translation for this buffer:
+            // propagate and keep the record so the NoF pages stay pinned.
+            LOG(ERROR) << "NoF memory unregistration failed for buffer "
+                       << buffer << ": " << toString(rc)
+                       << "; buffer stays recorded and the NoF pages stay "
+                          "quarantined. Do not free or remap this buffer.";
+            return tl::unexpected(rc);
+        }
+    }
+    if (rec_it != registered_buffer_sizes_.end()) {
+        registered_buffer_sizes_.erase(rec_it);
     }
     return {};
 }
@@ -4531,17 +4902,16 @@ std::optional<RealClient::WritableBufferRegion>
 RealClient::resolve_writable_buffer_region(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
-    for (const auto &[registered_buffer, registered_size] :
-         registered_buffer_sizes_) {
+    for (const auto &[registered_buffer, record] : registered_buffer_sizes_) {
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;
         }
         const auto offset = target - base;
-        if (offset < registered_size) {
+        if (offset < record.size) {
             return WritableBufferRegion{
                 .base = registered_buffer,
-                .size = registered_size,
+                .size = record.size,
                 .offset = static_cast<size_t>(offset),
             };
         }
@@ -4583,6 +4953,23 @@ bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
     }
     auto region = resolve_writable_buffer_region(buffer);
     return region.has_value() && size <= region->size - region->offset;
+}
+
+bool RealClient::can_use_direct_dfs_read(
+    const Replica::Descriptor &replica,
+    const std::vector<void *> &buffers) const {
+    if (!client_ || !client_->CanReadDfsReplicaIntoHostMemory(replica)) {
+        return false;
+    }
+    // Each destination becomes one iovec, and preadv() rejects more than
+    // IOV_MAX of them; the contiguous staging buffer has no such limit.
+    if (buffers.size() > static_cast<size_t>(IOV_MAX)) return false;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (void *buffer : buffers) {
+        if (runtime_accelerator.FindDeviceForPointer(buffer)) return false;
+    }
+    return true;
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
@@ -4657,6 +5044,24 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 if (!checksum_result) {
                     return tl::unexpected(checksum_result.error());
                 }
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(
+                replica, {static_cast<char *>(buffer) + dst_offset})) {
+            // DFS into host memory: the adapter reads into the destination.
+            std::vector<mooncake::Slice> slices;
+            allocateSlices(slices, replica,
+                           static_cast<char *>(buffer) + dst_offset);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
+            auto get_result = client_->Get(key, filtered_qr, slices);
+            if (!get_result) {
+                LOG(ERROR) << "DFS Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
             }
             return static_cast<int64_t>(total_size);
         }
@@ -4747,13 +5152,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return static_cast<int64_t>(total_size);
     }
 
-    // Partial file-backed read: allocate temp buffer, invoke read_op to
-    // fill it, then scatter [src_offset, src_offset+size) to dst.
-    //
-    // buf_size controls how much to allocate / read. DISK/DFS must use
-    // total_size (allocateSlices requires full-object slices).
-    // LOCAL_DISK can use src_offset + size (offload RPC transfers
-    // sequentially from remote offset 0).
+    // Partial file-backed read. read_op fills [0, size) of the temp buffer
+    // with the object bytes at src_offset. The disk read is that window, not
+    // the rest of the object.
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
@@ -4768,10 +5169,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto read_result = read_op(tmp_handle.ptr());
         if (!read_result) return tl::unexpected(read_result.error());
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        const void *src =
-            static_cast<const char *>(tmp_handle.ptr()) + src_offset;
         if (auto r = scatter_host_to_maybe_device(
-                dst, src, size, "ranged file-backed read, key: " + key);
+                dst, tmp_handle.ptr(), size,
+                "ranged file-backed read, key: " + key);
             !r) {
             return tl::unexpected(r.error());
         }
@@ -4781,55 +5181,70 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     if (replica.is_local_disk_replica()) {
         const auto &endpoint =
             replica.get_local_disk_descriptor().transport_endpoint;
+        if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const OffloadReadRange read_range{src_offset,
+                                          static_cast<int64_t>(total_size)};
         void *dst = static_cast<char *>(buffer) + dst_offset;
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
         if (can_use_pinned_restore_arena(endpoint, objects)) {
-            if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            const OffloadReadRange read_range{src_offset,
-                                              static_cast<int64_t>(total_size)};
             auto result = batch_get_into_offload_object_internal(
                 endpoint, objects, &read_range);
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
 
-        // LOCAL_DISK: offload RPC transfers sequentially from remote offset
-        // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::unordered_map<std::string, std::vector<Slice>> objects;
-                objects.emplace(
-                    key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
-                                             src_offset + size}});
-                return batch_get_into_offload_object_internal(endpoint,
-                                                              objects);
+                objects.emplace(key, std::vector<Slice>{
+                                         {static_cast<char *>(tmp_buf), size}});
+                return batch_get_into_offload_object_internal(endpoint, objects,
+                                                              &read_range);
             },
-            src_offset + size);
+            size);
     }
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-        // DISK/DFS: client_->Get + allocateSlices requires full-object slices,
-        // so we must allocate total_size.
         const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
-        return partial_disk_read(
-            [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
-                std::vector<mooncake::Slice> tmp_slices;
-                allocateSlices(tmp_slices, replica, tmp_buf);
-                auto filtered_qr =
-                    FilterQueryResult(query_result, replica, false);
-                auto get_result = client_->Get(key, filtered_qr, tmp_slices);
-                if (!get_result) {
-                    LOG(ERROR)
-                        << replica_type << " Get failed for key: " << key
-                        << " with error: " << toString(get_result.error());
-                    return tl::unexpected(get_result.error());
-                }
-                return {};
-            },
-            total_size);
+        auto read_window =
+            [&](void *read_buf) -> tl::expected<void, ErrorCode> {
+            auto read_results = client_->BatchReadFileReplicaRanges(
+                {key}, {replica}, {Slice{read_buf, size}}, {src_offset});
+            if (read_results.size() != 1) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (!read_results[0]) {
+                LOG(ERROR) << replica_type
+                           << " range read failed for key: " << key
+                           << " with error: "
+                           << toString(read_results[0].error());
+                return tl::unexpected(read_results[0].error());
+            }
+            return {};
+        };
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        tl::expected<int64_t, ErrorCode> result;
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(replica, {dst})) {
+            auto read_result = read_window(dst);
+            if (!read_result) return tl::unexpected(read_result.error());
+            result = static_cast<int64_t>(size);
+        } else {
+            result = partial_disk_read(read_window, size);
+        }
+        if (!result) return result;
+        // Same contract as Client::Get: the window may finish transferring
+        // after the QueryResult lease deadline. Reject after the successful
+        // read so a DFS/DISK allocation is not treated as still leased.
+        if (query_result.IsLeaseExpired()) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << key;
+            return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+        return result;
     }
 
     if (!replica.is_memory_replica()) {
@@ -4930,6 +5345,7 @@ RealClient::get_into_ranges_internal(
         return results;
     }
 
+    auto select_replica = client_->MakeReadReplicaSelector();
     const size_t buffer_count = buffers.size();
     if (buffer_count != all_keys.size() ||
         buffer_count != all_dst_offsets.size() ||
@@ -4969,6 +5385,16 @@ RealClient::get_into_ranges_internal(
     };
     std::unordered_map<std::string, ScatterLease> scatter_leases;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
+    std::vector<std::string> gather_endpoints;
+    auto append_memory_transfer =
+        [&](TransferEngine::ScatterTransferRange transfer,
+            const Replica::Descriptor &replica) {
+            gather_endpoints.push_back(
+                buffer_capacities || client_->CanUseLocalMemcpy(replica)
+                    ? ""
+                    : transfer.remote_segment);
+            memory_transfers.push_back(std::move(transfer));
+        };
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
             continue;
@@ -5086,7 +5512,7 @@ RealClient::get_into_ranges_internal(
                 if (inserted)
                     lease_it->second.expires_at =
                         metadata.query_result.lease_timeout;
-                memory_transfers.push_back(TransferEngine::ScatterTransferRange{
+                auto transfer = TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
                     .remote_base_offset = handle.buffer_address_,
@@ -5112,7 +5538,56 @@ RealClient::get_into_ranges_internal(
                                             : scatter_transfer_error(status));
                             (*results)[k] = tl::unexpected(error);
                         },
-                });
+                };
+                if (!StoreHcaAffinityEnabled() ||
+                    metadata.query_result.replicas.size() == 1) {
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica);
+                    continue;
+                }
+                auto candidates = FilterQueryResult(metadata.query_result,
+                                                    metadata.replica, false);
+                if (candidates.replicas.size() == 1) {
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica);
+                    continue;
+                }
+                Replica::Descriptor selected;
+                for (size_t k = 0; k < sizes.size(); ++k) {
+                    if (dst_offsets[k] > capacities[i] ||
+                        sizes[k] > capacities[i] - dst_offsets[k])
+                        continue;
+                    const Slice destination{
+                        static_cast<char *>(buffers[i]) + dst_offsets[k],
+                        sizes[k]};
+                    if (select_replica(candidates.replicas,
+                                       std::span<const Slice>(&destination, 1),
+                                       selected) != ErrorCode::OK ||
+                        !selected.is_memory_replica()) {
+                        range_results[k] =
+                            tl::unexpected(ErrorCode::INVALID_REPLICA);
+                        continue;
+                    }
+                    const auto &selected_handle =
+                        selected.get_memory_descriptor().buffer_descriptor;
+                    auto fragment = transfer;
+                    fragment.remote_segment =
+                        selected_handle.transport_endpoint_;
+                    fragment.remote_base_offset =
+                        selected_handle.buffer_address_;
+                    fragment.remote_size = selected_handle.size_;
+                    fragment.local_offsets =
+                        transfer.local_offsets.subspan(k, 1);
+                    fragment.remote_offsets =
+                        transfer.remote_offsets.subspan(k, 1);
+                    fragment.lengths = transfer.lengths.subspan(k, 1);
+                    fragment.on_fragment_complete =
+                        [complete = transfer.on_fragment_complete, k](
+                            size_t, const Status &status) {
+                            complete(k, status);
+                        };
+                    append_memory_transfer(std::move(fragment), selected);
+                }
                 continue;
             }
 
@@ -5166,6 +5641,79 @@ RealClient::get_into_ranges_internal(
 
     // Planning may consume most of a short lease; renew before submission.
     if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
+    // Choose only compatible contiguous-output groups. Both ordinary and
+    // snapshot reads share this planner and preserve their lease semantics.
+    auto plans =
+        client_->SupportsGatherRead()
+            ? store::PlanGatherReads(memory_transfers, gather_endpoints)
+            : std::vector<store::GatherReadPlan>{};
+    std::vector<std::pair<size_t, store::GatherReadOperation>> gathered;
+    if (!plans.empty()) {
+        // Discovery, pool contention and session negotiation can all block.
+        // Keep renewing every source lease, including earlier submissions,
+        // while one worker prepares and submits the plans.
+        auto submitting = std::async(std::launch::async, [&] {
+            for (size_t i = 0; i < plans.size(); ++i) {
+                const auto &plan = plans[i];
+                auto operation = client_->SubmitGatherRead(
+                    plan.endpoint, plan.ranges, plan.destination, plan.bytes);
+                if (operation) gathered.emplace_back(i, std::move(*operation));
+            }
+        });
+        if (allow_query_refresh) {
+            while (true) {
+                const auto delay = next_refresh_delay();
+                if (delay == std::chrono::nanoseconds::max() ||
+                    submitting.wait_for(delay) == std::future_status::ready)
+                    break;
+                refresh_leases();
+            }
+        }
+        submitting.get();
+    }
+    std::vector<bool> handled(memory_transfers.size(), false);
+    for (auto &[index, operation] : gathered) {
+        store::GatherReadResult result;
+        do {
+            auto delay = allow_query_refresh ? next_refresh_delay()
+                                             : std::chrono::nanoseconds::max();
+            result =
+                delay == std::chrono::nanoseconds::max()
+                    ? operation.wait()
+                    : operation.waitFor(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              delay));
+            if (result.completion == store::GatherReadCompletion::Pending)
+                refresh_leases();
+        } while (result.completion == store::GatherReadCompletion::Pending);
+        // Rejection guarantees no writes: unsupported/busy owners safely use
+        // scatter. A submitted, drained failure must not silently retry.
+        if (result.rejected()) continue;
+        for (size_t i : plans[index].transfers) {
+            handled[i] = true;
+            const auto &transfer = memory_transfers[i];
+            const auto failure = Status::Socket(result.error);
+            for (size_t k = 0; k < transfer.lengths.size(); ++k) {
+                const auto offset =
+                    reinterpret_cast<uintptr_t>(transfer.local_buffer) +
+                    transfer.local_offsets[k] -
+                    reinterpret_cast<uintptr_t>(plans[index].destination);
+                transfer.on_fragment_complete(
+                    k, result.completedRange(offset, transfer.lengths[k])
+                           ? Status::OK()
+                           : failure);
+            }
+        }
+    }
+    size_t retained = 0;
+    for (size_t i = 0; i < memory_transfers.size(); ++i)
+        if (!handled[i]) {
+            if (retained != i)
+                memory_transfers[retained] = std::move(memory_transfers[i]);
+            ++retained;
+        }
+    memory_transfers.resize(retained);
+    if (memory_transfers.empty()) return results;
     auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -5217,7 +5765,7 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
                     all_sizes, nullptr, query_result_cache));
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 client_->ObserveTransferOperation(
                     TransferOperationKind::kRead, "get_into_ranges",
@@ -5279,7 +5827,7 @@ std::vector<int> RealClient::batch_put_from(
             [&]() {
                 return batch_put_from_internal(keys, buffers, sizes, config);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -5570,7 +6118,7 @@ std::vector<int> RealClient::batch_upsert_from(
             [&]() {
                 return batch_upsert_from_internal(keys, buffers, sizes, config);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -5849,7 +6397,7 @@ std::vector<int64_t> RealClient::batch_get_into(
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() { return batch_get_into_internal(keys, buffers, sizes); },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
                 py_results.reserve(ret.size());
@@ -6452,9 +7000,11 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+        if (replica.is_disk_replica() ||
+            (replica.is_dfs_replica() &&
+             !can_use_direct_dfs_read(replica, {buffers[i]}))) {
+            // DISK replicas, and DFS replicas that cannot be read directly
+            // into the destination, use a contiguous temp buffer, then scatter.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6465,7 +7015,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer.
+        // MEMORY / NOF: RDMA directly to user buffer. DFS into host memory:
+        // the fs adapter reads directly to user buffer.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -6800,7 +7351,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                 return batch_put_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -6878,6 +7429,26 @@ bool SessionBackendResultCountMatches(const char *operation, size_t expected,
     return false;
 }
 
+struct ValueWindow {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
+tl::expected<ValueWindow, ErrorCode> BoundingValueWindow(
+    const std::vector<std::pair<size_t, size_t>> &ranges) {
+    if (ranges.empty()) return ValueWindow{};
+    uint64_t begin = std::numeric_limits<uint64_t>::max();
+    uint64_t end = 0;
+    for (const auto &[offset, length] : ranges) {
+        if (length > std::numeric_limits<uint64_t>::max() - offset) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        begin = std::min(begin, static_cast<uint64_t>(offset));
+        end = std::max(end, static_cast<uint64_t>(offset) + length);
+    }
+    return ValueWindow{begin, end - begin};
+}
+
 }  // namespace
 
 bool RealClient::validate_session_range_batch_arguments(
@@ -6924,7 +7495,9 @@ RealClient::prepare_session_range_read_requests(
                 static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             continue;
         }
-        if (session->second.replicas.size() != 1) {
+        if (session->second.replicas.empty() ||
+            (!StoreHcaAffinityEnabled() &&
+             session->second.replicas.size() != 1)) {
             results[request_index] =
                 static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             continue;
@@ -7004,12 +7577,19 @@ void RealClient::execute_session_memory_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
+    const bool select_by_destination =
+        StoreHcaAffinityEnabled() && client_->GetProtocol() == "rdma" &&
+        std::any_of(requests.begin(), requests.end(), [](const auto &request) {
+            return request.cached_query_result.replicas.size() > 1;
+        });
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> destination_slices;
     std::vector<std::vector<uint64_t>> source_offsets;
+    std::vector<const QueryResult *> query_results;
     replicas.reserve(requests.size());
     destination_slices.reserve(requests.size());
     source_offsets.reserve(requests.size());
+    if (select_by_destination) query_results.reserve(requests.size());
     for (const auto &request : requests) {
         std::vector<Slice> request_slices;
         std::vector<uint64_t> request_offsets;
@@ -7024,12 +7604,15 @@ void RealClient::execute_session_memory_range_reads(
                 static_cast<uint64_t>(request.source_offsets[range_index]));
         }
         replicas.push_back(request.selected_replica);
+        if (select_by_destination)
+            query_results.push_back(&request.cached_query_result);
         destination_slices.push_back(std::move(request_slices));
         source_offsets.push_back(std::move(request_offsets));
     }
 
     auto transfer_results = client_->BatchTransferReadRanges(
-        replicas, destination_slices, source_offsets);
+        replicas, destination_slices, source_offsets,
+        TransferIntent::kUnspecified, query_results);
     if (!SessionBackendResultCountMatches(
             "Session memory range", requests.size(), transfer_results.size())) {
         for (const auto &request : requests) {
@@ -7062,31 +7645,52 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
     constexpr size_t kObjectAlignment = 64;
     DfsSessionStagingArena staging_arena;
     size_t arena_size = 0;
+    std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>>
+        ranges_by_key;
+    std::unordered_map<std::string, const SessionRangeReadRequest *>
+        first_request;
     for (const auto &request : requests) {
-        if (staging_arena.object_offsets.count(request.object_key) != 0) {
+        auto &ranges = ranges_by_key[request.object_key];
+        for (size_t range_index = 0;
+             range_index < request.source_offsets.size(); ++range_index) {
+            ranges.emplace_back(request.source_offsets[range_index],
+                                request.range_sizes[range_index]);
+        }
+        first_request.emplace(request.object_key, &request);
+    }
+    for (const auto &[object_key, ranges] : ranges_by_key) {
+        auto window = BoundingValueWindow(ranges);
+        const auto *request = first_request.at(object_key);
+        const uint64_t object_size =
+            calculate_total_size(request->selected_replica);
+        if (!window || window->offset > object_size ||
+            window->length > object_size - window->offset ||
+            window->length >
+                static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::INVALID_PARAMS, results);
             continue;
         }
-
-        const size_t object_size =
-            static_cast<size_t>(calculate_total_size(request.selected_replica));
+        const size_t window_length = static_cast<size_t>(window->length);
         const size_t padding =
             (kObjectAlignment - arena_size % kObjectAlignment) %
             kObjectAlignment;
         if (padding > std::numeric_limits<size_t>::max() - arena_size ||
-            object_size >
+            window_length >
                 std::numeric_limits<size_t>::max() - arena_size - padding) {
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::BUFFER_OVERFLOW,
-                                              results);
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::BUFFER_OVERFLOW, results);
             continue;
         }
 
         arena_size += padding;
-        staging_arena.object_offsets.emplace(request.object_key, arena_size);
-        arena_size += object_size;
-        staging_arena.object_keys.push_back(request.object_key);
+        staging_arena.object_offsets.emplace(object_key, arena_size);
+        staging_arena.window_offsets.emplace(object_key, window->offset);
+        staging_arena.window_lengths.emplace(object_key, window->length);
+        arena_size += window_length;
+        staging_arena.object_keys.push_back(object_key);
         staging_arena.cached_query_results.push_back(FilterQueryResult(
-            request.cached_query_result, request.selected_replica));
+            request->cached_query_result, request->selected_replica));
     }
 
     staging_arena.staging_buffer = AcquireSessionStaging(
@@ -7107,13 +7711,14 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
             continue;
         }
 
-        std::vector<Slice> slices;
-        allocateSlices(
-            slices, request.selected_replica,
-            static_cast<char *>(staging_arena.staging_buffer->ptr()) +
-                staging_arena.object_offsets.at(request.object_key));
-        staging_arena.object_slices.emplace(request.object_key,
-                                            std::move(slices));
+        const uint64_t window_length =
+            staging_arena.window_lengths.at(request.object_key);
+        staging_arena.object_slices.emplace(
+            request.object_key,
+            std::vector<Slice>{
+                Slice{static_cast<char *>(staging_arena.staging_buffer->ptr()) +
+                          staging_arena.object_offsets.at(request.object_key),
+                      static_cast<size_t>(window_length)}});
     }
     return staging_arena;
 }
@@ -7140,10 +7745,28 @@ void RealClient::execute_session_dfs_range_reads(
     auto staging_arena = build_dfs_session_staging_arena(requests, results);
     if (!staging_arena.staging_buffer) return;
 
-    auto read_results = client_->BatchGet(staging_arena.object_keys,
-                                          staging_arena.cached_query_results,
-                                          staging_arena.object_slices);
-    if (!SessionBackendResultCountMatches("Session DFS BatchGet",
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<Slice> windows;
+    std::vector<uint64_t> offsets;
+    replicas.reserve(staging_arena.object_keys.size());
+    windows.reserve(staging_arena.object_keys.size());
+    offsets.reserve(staging_arena.object_keys.size());
+    for (const auto &object_key : staging_arena.object_keys) {
+        const SessionRangeReadRequest *request = nullptr;
+        for (const auto &candidate : requests) {
+            if (candidate.object_key == object_key) {
+                request = &candidate;
+                break;
+            }
+        }
+        if (request == nullptr) continue;
+        replicas.push_back(request->selected_replica);
+        windows.push_back(staging_arena.object_slices.at(object_key).front());
+        offsets.push_back(staging_arena.window_offsets.at(object_key));
+    }
+    auto read_results = client_->BatchReadFileReplicaRanges(
+        staging_arena.object_keys, replicas, windows, offsets);
+    if (!SessionBackendResultCountMatches("Session DFS range read",
                                           staging_arena.object_keys.size(),
                                           read_results.size())) {
         for (const auto &object_key : staging_arena.object_keys) {
@@ -7166,10 +7789,12 @@ void RealClient::execute_session_dfs_range_reads(
         const void *staging_buffer =
             static_cast<const char *>(staging_arena.staging_buffer->ptr()) +
             staging_arena.object_offsets.at(object_key);
+        const uint64_t window_offset =
+            staging_arena.window_offsets.at(object_key);
         for (const auto &request : requests) {
             if (request.object_key == object_key) {
                 complete_staged_session_range_read(request, staging_buffer,
-                                                   results);
+                                                   window_offset, results);
             }
         }
     }
@@ -7180,10 +7805,13 @@ void RealClient::execute_session_local_disk_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
-    // Group by owner endpoint; restore each unique key once, then scatter
-    // object-byte ranges from the restored pointer into the destinations.
+    // Group by owner endpoint. Restore the byte window this layer actually
+    // transfers, then scatter those bytes. The owner must not read the rest
+    // of the object.
     struct KeyPlan {
-        int64_t restore_size{0};
+        int64_t object_size{0};
+        int64_t window_offset{0};
+        int64_t window_length{0};
         std::vector<const SessionRangeReadRequest *> key_requests;
     };
     std::unordered_map<std::string, std::unordered_map<std::string, KeyPlan>>
@@ -7200,27 +7828,66 @@ void RealClient::execute_session_local_disk_range_reads(
             request.selected_replica.get_local_disk_descriptor()
                 .transport_endpoint;
         auto &plan = endpoint_plans[endpoint][request.object_key];
-        plan.restore_size = static_cast<int64_t>(total_size);
+        if (plan.key_requests.empty()) {
+            plan.object_size = static_cast<int64_t>(total_size);
+        }
         plan.key_requests.push_back(&request);
     }
 
     for (const auto &[endpoint, keys] : endpoint_plans) {
         std::vector<std::string> restore_keys;
         std::vector<int64_t> restore_sizes;
+        std::vector<int64_t> restore_offsets;
+        std::vector<int64_t> object_sizes;
         restore_keys.reserve(keys.size());
         restore_sizes.reserve(keys.size());
+        restore_offsets.reserve(keys.size());
+        object_sizes.reserve(keys.size());
         for (const auto &[key, plan] : keys) {
+            std::vector<std::pair<size_t, size_t>> ranges;
+            for (const auto *request : plan.key_requests) {
+                for (size_t range_index = 0;
+                     range_index < request->source_offsets.size();
+                     ++range_index) {
+                    ranges.emplace_back(request->source_offsets[range_index],
+                                        request->range_sizes[range_index]);
+                }
+            }
+            auto window = BoundingValueWindow(ranges);
+            auto &mutable_plan = endpoint_plans[endpoint][key];
+            if (!window ||
+                window->offset >
+                    static_cast<uint64_t>(mutable_plan.object_size) ||
+                window->length >
+                    static_cast<uint64_t>(mutable_plan.object_size) -
+                        window->offset ||
+                window->offset > static_cast<uint64_t>(
+                                     std::numeric_limits<int64_t>::max()) ||
+                window->length > static_cast<uint64_t>(
+                                     std::numeric_limits<int64_t>::max())) {
+                for (const auto *request : plan.key_requests) {
+                    results[request->result_index] =
+                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                }
+                continue;
+            }
+            mutable_plan.window_offset = static_cast<int64_t>(window->offset);
+            mutable_plan.window_length = static_cast<int64_t>(window->length);
             restore_keys.push_back(key);
-            restore_sizes.push_back(plan.restore_size);
+            restore_sizes.push_back(mutable_plan.window_length);
+            restore_offsets.push_back(mutable_plan.window_offset);
+            object_sizes.push_back(mutable_plan.object_size);
+        }
+        if (restore_keys.empty()) {
+            continue;
         }
 
-        auto restored =
-            restore_offload_objects(endpoint, restore_keys, restore_sizes, {},
-                                    /*allow_pinned=*/false);
+        auto restored = restore_offload_objects(
+            endpoint, restore_keys, restore_sizes, {},
+            /*allow_pinned=*/false, &restore_offsets, &object_sizes);
         if (!restored) {
-            for (const auto &[key, plan] : keys) {
-                (void)key;
-                for (const auto *request : plan.key_requests) {
+            for (const auto &key : restore_keys) {
+                for (const auto *request : keys.at(key).key_requests) {
                     results[request->result_index] =
                         static_cast<int>(toInt(restored.error()));
                 }
@@ -7245,7 +7912,7 @@ void RealClient::execute_session_local_disk_range_reads(
                     entry_requests.push_back(request);
                     remote_bases.push_back(lease.response().pointers[i]);
                     remote_sizes.push_back(
-                        static_cast<size_t>(plan.restore_size));
+                        static_cast<size_t>(plan.window_length));
                     range_slices.emplace_back();
                     range_offsets.emplace_back();
                 }
@@ -7258,7 +7925,8 @@ void RealClient::execute_session_local_disk_range_reads(
                         Slice{request->destination_buffers[range_index],
                               request->range_sizes[range_index]});
                     offsets.push_back(static_cast<uint64_t>(
-                        request->source_offsets[range_index]));
+                        request->source_offsets[range_index] -
+                        static_cast<size_t>(plan.window_offset)));
                 }
             }
         }
@@ -7306,44 +7974,69 @@ void RealClient::execute_session_disk_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
-    std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    std::unordered_map<std::string, std::unique_ptr<BufferHandle>> handles;
+    struct DiskPlan {
+        uint64_t window_offset{0};
+        std::unique_ptr<BufferHandle> handle;
+    };
+    std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>>
+        ranges_by_key;
+    std::unordered_map<std::string, const SessionRangeReadRequest *>
+        first_request;
     for (const auto &request : requests) {
-        if (batch_slices.count(request.object_key) != 0) continue;
-        const uint64_t total_size =
-            calculate_total_size(request.selected_replica);
-        if (!client_buffer_allocator_) {
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::NO_AVAILABLE_HANDLE,
-                                              results);
+        auto &ranges = ranges_by_key[request.object_key];
+        for (size_t range_index = 0;
+             range_index < request.source_offsets.size(); ++range_index) {
+            ranges.emplace_back(request.source_offsets[range_index],
+                                request.range_sizes[range_index]);
+        }
+        first_request.emplace(request.object_key, &request);
+    }
+
+    std::vector<std::string> batch_keys;
+    std::vector<Slice> windows;
+    std::vector<uint64_t> offsets;
+    std::vector<Replica::Descriptor> replicas;
+    std::unordered_map<std::string, DiskPlan> plans;
+    for (const auto &[object_key, ranges] : ranges_by_key) {
+        const auto *request = first_request.at(object_key);
+        auto window = BoundingValueWindow(ranges);
+        const uint64_t object_size =
+            calculate_total_size(request->selected_replica);
+        if (!window || window->offset > object_size ||
+            window->length > object_size - window->offset ||
+            window->length > std::numeric_limits<size_t>::max()) {
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::INVALID_PARAMS, results);
             continue;
         }
-        auto allocated = client_buffer_allocator_->allocate(total_size);
+        if (!client_buffer_allocator_) {
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::NO_AVAILABLE_HANDLE, results);
+            continue;
+        }
+        auto allocated = client_buffer_allocator_->allocate(
+            static_cast<size_t>(window->length));
         if (!allocated) {
             LOG(ERROR) << "Failed to allocate temp buffer for DISK read, key: "
-                       << request.object_key << ", size: " << total_size;
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::NO_AVAILABLE_HANDLE,
-                                              results);
+                       << object_key << ", size: " << window->length;
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::NO_AVAILABLE_HANDLE, results);
             continue;
         }
         auto handle = std::make_unique<BufferHandle>(std::move(*allocated));
-        std::vector<Slice> disk_slices;
-        allocateSlices(disk_slices, request.selected_replica, handle->ptr());
-        batch_keys.push_back(request.object_key);
-        batch_query_results.push_back(FilterQueryResult(
-            request.cached_query_result, request.selected_replica));
-        batch_slices.emplace(request.object_key, std::move(disk_slices));
-        handles.emplace(request.object_key, std::move(handle));
+        batch_keys.push_back(object_key);
+        windows.push_back(Slice{handle->ptr(), window->length});
+        offsets.push_back(window->offset);
+        replicas.push_back(request->selected_replica);
+        plans.emplace(object_key, DiskPlan{window->offset, std::move(handle)});
     }
 
     if (batch_keys.empty()) return;
-    auto disk_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
-    if (!SessionBackendResultCountMatches(
-            "Session DISK BatchGet", batch_keys.size(), disk_results.size())) {
+    auto disk_results = client_->BatchReadFileReplicaRanges(
+        batch_keys, replicas, windows, offsets);
+    if (!SessionBackendResultCountMatches("Session DISK range read",
+                                          batch_keys.size(),
+                                          disk_results.size())) {
         for (const auto &object_key : batch_keys) {
             fail_file_backed_requests_for_key(
                 requests, object_key, ErrorCode::INTERNAL_ERROR, results);
@@ -7359,22 +8052,27 @@ void RealClient::execute_session_disk_range_reads(
                 results);
             continue;
         }
-        const void *staging_buffer = handles.at(object_key)->ptr();
+        const auto &plan = plans.at(object_key);
         for (const auto &request : requests) {
             if (request.object_key == object_key) {
-                complete_staged_session_range_read(request, staging_buffer,
-                                                   results);
+                complete_staged_session_range_read(request, plan.handle->ptr(),
+                                                   plan.window_offset, results);
             }
         }
     }
 }
 
 tl::expected<void, ErrorCode> RealClient::scatter_session_range_read(
-    const SessionRangeReadRequest &request, const void *staging_buffer) const {
+    const SessionRangeReadRequest &request, const void *staging_buffer,
+    uint64_t window_offset) const {
     for (size_t range_index = 0;
          range_index < request.destination_buffers.size(); ++range_index) {
+        if (request.source_offsets[range_index] < window_offset) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
         const void *source = static_cast<const char *>(staging_buffer) +
-                             request.source_offsets[range_index];
+                             (request.source_offsets[range_index] -
+                              static_cast<size_t>(window_offset));
         if (auto copy = scatter_host_to_maybe_device(
                 request.destination_buffers[range_index], source,
                 request.range_sizes[range_index],
@@ -7388,10 +8086,11 @@ tl::expected<void, ErrorCode> RealClient::scatter_session_range_read(
 
 void RealClient::complete_staged_session_range_read(
     const SessionRangeReadRequest &request, const void *staging_buffer,
-    std::vector<int> &results) {
+    uint64_t window_offset, std::vector<int> &results) {
     if (invalidate_expired_get_session(request, results)) return;
 
-    auto scatter_result = scatter_session_range_read(request, staging_buffer);
+    auto scatter_result =
+        scatter_session_range_read(request, staging_buffer, window_offset);
     if (!scatter_result) {
         results[request.result_index] =
             static_cast<int>(toInt(scatter_result.error()));
@@ -7490,12 +8189,24 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
-    if (config.group_ids.has_value() &&
-        config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "batch_put_session_start: group_ids.size()="
-                   << config.group_ids->size()
-                   << ", keys.size()=" << keys.size()
-                   << ", error=invalid_group_ids";
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR) << "batch_put_session_start: invalid group, affinity or HCA "
+                      "per-key hint count";
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    // Ranged session writes never reach DFS and session end finalizes MEMORY
+    // only, so a DFS reservation would stay PROCESSING until the put-start
+    // discard timeout while the object looks complete.
+    if (config.dfs_replica_num > 0) {
+        LOG(ERROR) << "batch_put_session_start rejects DFS configs: "
+                   << "session path never writes DFS "
+                   << "(dfs_replica_num=" << config.dfs_replica_num
+                   << ", replica_num=" << config.replica_num << ")";
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
@@ -7531,15 +8242,7 @@ std::vector<int> RealClient::batch_put_session_start(
         return results;
     }
 
-    ReplicateConfig start_config = config;
-    if (start_config.group_ids.has_value()) {
-        std::vector<std::string> filtered_group_ids;
-        filtered_group_ids.reserve(start_indices.size());
-        for (size_t idx : start_indices) {
-            filtered_group_ids.push_back(start_config.group_ids->at(idx));
-        }
-        start_config.group_ids = std::move(filtered_group_ids);
-    }
+    ReplicateConfig start_config = config.ForKeySubset(start_indices);
 
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
@@ -7873,7 +8576,7 @@ std::vector<int> RealClient::batch_upsert_from_multi_buffers(
                 return batch_upsert_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 auto py_results = ToPyResults(ret);
                 client_->ObserveTransferOperation(
@@ -7917,7 +8620,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
                 return batch_get_into_multi_buffers_internal(
                     keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -7938,6 +8641,35 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     return results;
 }
 
+void RealClient::KickPrefetchForDiskHeadedKeys(
+    const std::vector<std::string> &keys,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+    const std::unordered_set<std::string> &local_endpoints) {
+    if (!enable_ssd_prefetch_ || !prefetcher_) {
+        return;
+    }
+    std::vector<std::string> disk_keys;
+    disk_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!query_results[i] || query_results[i].value().replicas.empty()) {
+            continue;
+        }
+        const auto *best = SelectBestReplica(query_results[i].value().replicas,
+                                             local_endpoints);
+        if (best != nullptr && best->is_local_disk_replica()) {
+            disk_keys.push_back(keys[i]);
+        }
+    }
+    if (disk_keys.empty()) {
+        return;
+    }
+    // Without this kick, a request whose exist-triggered promotion was
+    // dropped by a saturated backoff window pays the SSD read with no retry.
+    VLOG(1) << "SSD prefetch: get-side kick, disk_keys=" << disk_keys.size()
+            << ", in_cooldown=" << prefetcher_->throttle()->inCooldown();
+    prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
@@ -7950,6 +8682,8 @@ RealClient::batch_get_into_multi_buffers_internal(
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client_->GetProtocol(), prefer_alloc_in_same_node);
 
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
@@ -8003,6 +8737,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
     auto local_endpoints = client_->GetLocalEndpoints();
+    KickPrefetchForDiskHeadedKeys(keys, query_results, local_endpoints);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
         // Handle query failures
@@ -8050,8 +8785,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // MEMORY / NOF: RDMA directly to the user buffers.
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            (replica.is_dfs_replica() &&
+             can_use_direct_dfs_read(replica, buffers))) {
+            // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
+            // memory: the fs adapter reads directly to the user buffers.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
@@ -8122,9 +8860,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+        auto batch_get_results = client_->BatchGet(
+            batch_keys, batch_query_results, batch_slices, group_by_target);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
@@ -8319,9 +9056,9 @@ RealClient::batch_get_into_multi_buffers_internal(
             }
 
             if (!disk_batch_keys.empty()) {
-                auto disk_results = client_->BatchGet(
-                    disk_batch_keys, disk_batch_qrs, disk_batch_slices,
-                    prefer_alloc_in_same_node);
+                auto disk_results =
+                    client_->BatchGet(disk_batch_keys, disk_batch_qrs,
+                                      disk_batch_slices, group_by_target);
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];
@@ -8709,6 +9446,41 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
+async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+RealClient::batch_get_offload_object_ranges(
+    const std::vector<std::string> &keys, const std::vector<int64_t> &offsets,
+    const std::vector<int64_t> &sizes,
+    const std::vector<int64_t> &object_sizes) {
+    struct CallState {
+        std::vector<std::string> keys;
+        std::vector<int64_t> offsets;
+        std::vector<int64_t> sizes;
+        std::vector<int64_t> object_sizes;
+        std::shared_ptr<FileStorage> file_storage;
+    };
+    auto state = std::make_unique<CallState>();
+    state->keys = keys;
+    state->offsets = offsets;
+    state->sizes = sizes;
+    state->object_sizes = object_sizes;
+    state->file_storage = file_storage_;
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([s]() {
+        return s->file_storage->BatchGetRanges(s->keys, s->offsets, s->sizes,
+                                               s->object_sizes);
+    });
+    auto result = try_result.value();
+    if (!result) {
+        LOG(ERROR) << "Batch get offload object range failed, err_code = "
+                   << result.error();
+        co_return tl::make_unexpected(result.error());
+    }
+    co_return BatchGetOffloadObjectResponse(
+        result.value().batch_id, std::move(result.value().pointers),
+        client_->GetSegmentEndpoint(),
+        file_storage_->config_.client_buffer_gc_ttl_ms);
+}
+
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
     if (!file_storage_) {
         LOG(WARNING)
@@ -8716,6 +9488,30 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
         return false;
     }
     return file_storage_->ReleaseBuffer(batch_id);
+}
+
+bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
+                                         const std::vector<int64_t> &sizes,
+                                         const std::string &tenant_id) {
+    if (!enable_ssd_prefetch_ || !prefetcher_ || !file_storage_) {
+        VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
+                   "disabled or SSD offload is not set up";
+        return false;
+    }
+    if (keys.empty()) {
+        return true;
+    }
+    if (keys.size() != sizes.size()) {
+        LOG(WARNING) << "prefetch_offload_object keys/sizes size mismatch: "
+                     << keys.size() << " vs " << sizes.size();
+        return false;
+    }
+    // Best-effort and asynchronous: dedup + pool enqueue, never blocks the
+    // RPC thread on SSD reads. The requester's tenant travels with the keys:
+    // a shared SSD holder stores objects from other tenants and must look
+    // up / register / promote under the object's own tenant.
+    prefetcher_->RunLocalPrefetch(keys, sizes, tenant_id);
+    return true;
 }
 
 async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
@@ -8884,8 +9680,12 @@ RealClient::restore_offload_objects(
     const std::vector<std::string> &keys,
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
-    bool allow_pinned) {
-    if (keys.size() != restore_sizes.size()) {
+    bool allow_pinned, const std::vector<int64_t> *value_offsets,
+    const std::vector<int64_t> *object_sizes) {
+    if (keys.size() != restore_sizes.size() ||
+        (value_offsets != nullptr && value_offsets->size() != keys.size()) ||
+        (object_sizes != nullptr && object_sizes->size() != keys.size()) ||
+        ((value_offsets == nullptr) != (object_sizes == nullptr))) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
@@ -8905,10 +9705,20 @@ RealClient::restore_offload_objects(
     auto response =
         [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {
         if (!local_batch) {
+            if (value_offsets != nullptr) {
+                return client_requester_->batch_get_offload_object_ranges(
+                    target_rpc_service_addr, storage_keys, *value_offsets,
+                    restore_sizes, *object_sizes);
+            }
             return client_requester_->batch_get_offload_object(
                 target_rpc_service_addr, storage_keys, restore_sizes);
         }
-        auto result = file_storage_->BatchGetLocal(storage_keys, restore_sizes);
+        auto result =
+            value_offsets != nullptr
+                ? file_storage_->BatchGetLocalRanges(
+                      storage_keys, *value_offsets, restore_sizes,
+                      *object_sizes)
+                : file_storage_->BatchGetLocal(storage_keys, restore_sizes);
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -8959,29 +9769,38 @@ RealClient::batch_get_into_offload_object_internal(
         }
         int64_t storage_size = static_cast<int64_t>(total);
         if (read_range) {
-            storage_size = read_range->restore_size;
-            if (storage_size < 0 ||
-                read_range->source_offset > uint64_t(storage_size) ||
-                total > uint64_t(storage_size) - read_range->source_offset) {
+            if (read_range->object_size < 0 ||
+                read_range->source_offset >
+                    static_cast<uint64_t>(read_range->object_size) ||
+                total > static_cast<uint64_t>(read_range->object_size) -
+                            read_range->source_offset ||
+                read_range->source_offset >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int64_t>::max())) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
         sizes.emplace_back(storage_size);
     }
 
+    std::vector<int64_t> value_offsets;
+    std::vector<int64_t> object_sizes;
+    const std::vector<int64_t> *offsets_arg = nullptr;
+    const std::vector<int64_t> *object_sizes_arg = nullptr;
+    if (read_range) {
+        value_offsets.push_back(
+            static_cast<int64_t>(read_range->source_offset));
+        object_sizes.push_back(read_range->object_size);
+        offsets_arg = &value_offsets;
+        object_sizes_arg = &object_sizes;
+    }
     auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects);
+        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
+                                true, offsets_arg, object_sizes_arg);
     if (!restored) {
         return tl::unexpected(restored.error());
     }
     auto &lease = **restored;
-    if (read_range) {
-        if (lease.response().pointers[0] >
-            std::numeric_limits<uint64_t>::max() - read_range->source_offset) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        lease.response().pointers[0] += read_range->source_offset;
-    }
     auto result = client_->BatchGetOffloadObject(
         lease.response().transfer_engine_addr, keys, lease.response().pointers,
         objects,
@@ -9067,6 +9886,22 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
     return result;
 }
 
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+ClientRequester::batch_get_offload_object_ranges(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &offsets, const std::vector<int64_t> &sizes,
+    const std::vector<int64_t> &object_sizes) {
+    auto result = invoke_rpc<&RealClient::batch_get_offload_object_ranges,
+                             BatchGetOffloadObjectResponse>(
+        client_addr, keys, offsets, sizes, object_sizes);
+    if (!result) {
+        LOG(ERROR) << "Failed to invoke batch_get_offload_object_ranges, "
+                      "client_addr = "
+                   << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
 tl::expected<VerifyDiskReplicaResponse, ErrorCode>
 ClientRequester::verify_disk_replica(const std::string &client_addr,
                                      const VerifyDiskReplicaRequest &request) {
@@ -9094,6 +9929,19 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
     } else {
         VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
                 << " at " << client_addr;
+    }
+}
+
+void ClientRequester::prefetch_offload_object(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &sizes, const std::string &tenant_id) {
+    // Best-effort: old peers reject the unknown handler and network errors
+    // are logged, never propagated. The keys simply stay SSD-only.
+    auto result = invoke_rpc<&RealClient::prefetch_offload_object, bool>(
+        client_addr, keys, sizes, tenant_id);
+    if (!result) {
+        VLOG(1) << "Failed to invoke prefetch_offload_object, client_addr = "
+                << client_addr << ", error is: " << result.error();
     }
 }
 

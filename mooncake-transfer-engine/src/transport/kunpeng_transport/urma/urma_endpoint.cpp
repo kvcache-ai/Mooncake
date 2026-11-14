@@ -54,7 +54,12 @@ std::string UrmaContext::toString() {
     return ss.str();
 }
 
-int UrmaContext::getAsyncFd() { return urma_context_->async_fd; }
+int UrmaContext::getAsyncFd() {
+    // doConstruct() logs toString() on the failure path, and toString()
+    // reads this fd: opening a device can fail, so the context may be
+    // null. Dereferencing it there turns a clean error into a SIGSEGV.
+    return urma_context_ ? urma_context_->async_fd : -1;
+}
 
 int UrmaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
@@ -231,7 +236,10 @@ int UrmaContext::deconstruct() {
         urma_context_ = nullptr;
     }
 
-    urma_uninit();
+    // urma_init()/urma_uninit() are process-global and owned by
+    // UbTransport, which pairs them once per transport. Releasing the
+    // module per context tears it down while sibling contexts still hold
+    // jetties, so the next urma_unbind_jetty() faults.
     return 0;
 }
 
@@ -346,14 +354,16 @@ int UrmaContext::doProcessContextEvents() {
 }
 
 void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
-    auto ret = import_tseg_map.find(remoteSegmentStr);
-    if (ret != import_tseg_map.end()) return ret->second;
+    {
+        std::shared_lock<std::shared_mutex> lock(remote_seg_mutex_);
+        auto ret = import_tseg_map.find(remoteSegmentStr);
+        if (ret != import_tseg_map.end()) return ret->second;
+    }
     std::vector<unsigned char> output_buffer;
     deserializeBinaryData(remoteSegmentStr, output_buffer);
-    urma_seg_t* handle;
-    handle = (urma_seg_t*)malloc(sizeof(urma_seg_t));
+    urma_seg_t* handle = (urma_seg_t*)malloc(sizeof(urma_seg_t));
+    if (!handle) return nullptr;
     memcpy(handle, output_buffer.data(), sizeof(urma_seg_t));
-    remote_seg_list_.push_back(handle);
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
     if (import_tseg == NULL) {
@@ -361,6 +371,21 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
         free(handle);
         return nullptr;
     }
+    std::unique_lock<std::shared_mutex> lock(remote_seg_mutex_);
+    // Another thread may have imported the same segment while this one was
+    // outside the lock; keep the first result and drop this one.
+    auto ret = import_tseg_map.find(remoteSegmentStr);
+    if (ret != import_tseg_map.end()) {
+        urma_target_seg_t* existing = ret->second;
+        lock.unlock();
+        urma_unimport_seg(import_tseg);
+        free(handle);
+        return existing;
+    }
+    // Publish only after a successful import: pushing the handle first meant a
+    // failed import left it in remote_seg_list_ for deconstruct() to free a
+    // second time.
+    remote_seg_list_.push_back(handle);
     imported_seg_list_.push_back(import_tseg);
     import_tseg_map[remoteSegmentStr] = import_tseg;
     return import_tseg;

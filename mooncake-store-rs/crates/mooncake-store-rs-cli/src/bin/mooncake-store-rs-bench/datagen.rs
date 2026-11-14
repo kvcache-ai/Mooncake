@@ -31,8 +31,23 @@ pub fn ensure_payload(label: &str, expected: &[u8], actual: &[u8]) -> Result<(),
     Ok(())
 }
 
+/// Optional per-process key namespace for multi-process benchmarks
+/// (e.g. the 16-rank run): without it every bench process would generate the
+/// same keys and fight over the same route entries.
 pub fn make_key(prefix: &str, worker_id: usize, key_index: usize) -> String {
-    format!("{prefix}-w{worker_id}-k{key_index}")
+    static KEY_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let tag = KEY_TAG.get_or_init(|| {
+        std::env::var("MC_BENCH_KEY_PREFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+    });
+    if tag.is_empty() {
+        format!("{prefix}-w{worker_id}-k{key_index}")
+    } else {
+        format!("{tag}-{prefix}-w{worker_id}-k{key_index}")
+    }
 }
 
 pub fn make_seed(global_seed: u64, key: &str, generation: u64) -> String {

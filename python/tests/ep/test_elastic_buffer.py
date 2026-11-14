@@ -45,6 +45,14 @@ def import_torchada_if_needed() -> None:
     import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
 
 
+# Intel GPUs run the same checks through torch.xpu and the xccl backend.
+DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
+
+
+def synchronize() -> None:
+    getattr(torch, DEVICE).synchronize()
+
+
 def distributed_barrier() -> None:
     if using_musa_backend():
         dist.barrier(device_ids=[torch.cuda.current_device()])
@@ -68,16 +76,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-topk", type=int, default=8)
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument(
+        "--expert-alignment",
+        type=int,
+        default=1,
+        help="expert_alignment for the expanded dispatch stage.",
+    )
+    parser.add_argument(
         "--transport",
-        choices=("auto", "ibgda", "nccl"),
+        choices=("auto", "ibgda", "nccl", "ipc"),
         default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
-        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA.",
+        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA. "
+        "XPU supports only auto/ipc.",
     )
     parser.add_argument(
         "--route",
-        choices=("alltoall", "local", "cross"),
+        choices=("alltoall", "local", "cross", "empty"),
         default="alltoall",
-        help="Expert routing pattern to generate.",
+        help="Expert routing pattern to generate; 'empty' leaves rank 0 with "
+        "no received tokens.",
     )
     parser.add_argument(
         "--allow-hybrid-mode",
@@ -95,19 +111,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use smaller defaults suitable for reviewer smoke tests.",
     )
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        help="Also check FP8 (x, sf) dispatch: exact codes and scales, "
+        "compact, cached and expanded.",
+    )
     return parser.parse_args()
 
 
 def init_distributed(seed: int) -> tuple[int, int, int]:
     import_torchada_if_needed()
     if not dist.is_initialized():
-        dist.init_process_group("nccl")
+        dist.init_process_group("xccl" if DEVICE == "xpu" else "nccl")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-    torch.cuda.set_device(local_rank)
-    torch.set_default_device("cuda")
+    accelerator = getattr(torch, DEVICE)
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % accelerator.device_count()))
+    accelerator.set_device(local_rank)
+    torch.set_default_device(DEVICE)
     torch.set_default_dtype(torch.bfloat16)
     torch.manual_seed(seed + rank)
     return rank, local_rank, world_size
@@ -128,7 +151,7 @@ def make_route_plan(
         raise ValueError("num_experts must be at least world_size")
 
     expert_offsets = (
-        torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+        torch.arange(num_topk, device=DEVICE, dtype=torch.long) % local_experts
     )
 
     if route == "cross" and buffer.num_scaleout_ranks > 1:
@@ -141,6 +164,20 @@ def make_route_plan(
             1,
         )
 
+    if route == "empty":
+        # Rank 0 receives nothing: it routes to rank 1, every other rank to
+        # itself.
+        if world_size < 2:
+            raise ValueError("route 'empty' needs at least 2 ranks")
+        dst_rank = 1 if rank == 0 else rank
+        choices = dst_rank * local_experts + expert_offsets
+        expected_recv_tokens = {0: 0, 1: 2 * num_tokens}.get(rank, num_tokens)
+        return RoutePlan(
+            choices.view(1, num_topk).repeat(num_tokens, 1).contiguous(),
+            expected_recv_tokens,
+            1,
+        )
+
     if route == "local" or (route == "cross" and buffer.num_scaleout_ranks == 1):
         choices = rank * local_experts + expert_offsets
         return RoutePlan(
@@ -150,7 +187,7 @@ def make_route_plan(
         )
 
     dst_ranks = (
-        rank + torch.arange(num_topk, device="cuda", dtype=torch.long)
+        rank + torch.arange(num_topk, device=DEVICE, dtype=torch.long)
     ) % world_size
     choices = dst_ranks * local_experts + expert_offsets
     unique_dst_ranks = int(torch.unique(dst_ranks).numel())
@@ -164,7 +201,7 @@ def make_route_plan(
 def make_input(
     *, rank: int, num_tokens: int, hidden: int, multiplier: int, addend: int = 0
 ) -> torch.Tensor:
-    base = torch.arange(num_tokens * hidden, device="cuda", dtype=torch.float32)
+    base = torch.arange(num_tokens * hidden, device=DEVICE, dtype=torch.float32)
     base = base.view(num_tokens, hidden)
     return (base + rank * multiplier + addend).to(torch.bfloat16).contiguous()
 
@@ -194,7 +231,7 @@ def check_dispatch_payload(
     if not bool((src_token < num_tokens).all()):
         raise AssertionError(f"rank={rank}: invalid source token index in metadata")
 
-    base = torch.arange(num_tokens * hidden, device="cuda", dtype=torch.float32)
+    base = torch.arange(num_tokens * hidden, device=DEVICE, dtype=torch.float32)
     base = base.view(num_tokens, hidden)
     expected = base[src_token] + src_rank.view(-1, 1).float() * multiplier + addend
     expected = expected.to(torch.bfloat16)
@@ -214,6 +251,210 @@ def check_combined(
         atol=1e-3,
         msg=lambda msg: f"rank={rank}: {label} combine mismatch: {msg}",
     )
+
+
+def fp8_codes(
+    src_rank: torch.Tensor, src_token: torch.Tensor, hidden: int, addend: int
+) -> torch.Tensor:
+    # Any byte pattern will do: dispatch only copies the codes.
+    cols = torch.arange(hidden, device=DEVICE, dtype=torch.int64)
+    codes = src_rank.view(-1, 1) * 37 + src_token.view(-1, 1) * 11 + cols + addend
+    return (codes % 251).to(torch.uint8)
+
+
+def fp8_scales(
+    src_rank: torch.Tensor, src_token: torch.Tensor, num_packs: int
+) -> torch.Tensor:
+    # Exact in float32 and unique per (rank, token, pack); see run_fp8_checks.
+    packs = torch.arange(num_packs, device=DEVICE, dtype=torch.int64)
+    keys = src_rank.view(-1, 1) * 1_000_000 + src_token.view(-1, 1) * 1_000 + packs
+    return keys.to(torch.float32)
+
+
+def make_fp8_input(
+    *, rank: int, num_tokens: int, hidden: int, addend: int, column_major_sf: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    ranks = torch.full_like(tokens, rank)
+    codes = fp8_codes(ranks, tokens, hidden, addend).view(torch.float8_e4m3fn)
+    sf = fp8_scales(ranks, tokens, (hidden + 127) // 128)
+    if column_major_sf:
+        sf = sf.t().contiguous().t()
+    return codes, sf
+
+
+def check_fp8_rows(
+    *,
+    rank: int,
+    label: str,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    src_rank: torch.Tensor,
+    src_token: torch.Tensor,
+    hidden: int,
+    addend: int,
+) -> None:
+    expected_codes = fp8_codes(src_rank, src_token, hidden, addend)
+    if not torch.equal(codes.view(torch.uint8), expected_codes):
+        raise AssertionError(f"rank={rank}: {label} FP8 codes mismatch")
+    if not torch.equal(scales, fp8_scales(src_rank, src_token, scales.shape[1])):
+        raise AssertionError(f"rank={rank}: {label} FP8 scales mismatch")
+
+
+def run_fp8_checks(
+    *,
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    max_tokens: int,
+    num_experts: int,
+    expert_alignment: int,
+    transport_kwargs: dict,
+) -> None:
+    # Scales encode (rank, token, pack) as rank * 1e6 + token * 1e3 + pack,
+    # which float32 holds exactly below 2**24.
+    if world_size > 16 or args.num_tokens >= 1000 or args.hidden >= 128 * 1000:
+        raise ValueError("--fp8 needs <= 16 ranks, < 1000 tokens, hidden < 128000")
+    buffer = ElasticBuffer(
+        dist.group.WORLD,
+        num_max_tokens_per_rank=max_tokens,
+        hidden=args.hidden,
+        num_topk=args.num_topk,
+        use_fp8_dispatch=True,
+        deterministic=False,
+        allow_hybrid_mode=args.allow_hybrid_mode,
+        allow_multiple_reduction=True,
+        num_gpu_timeout_secs=10,
+        **transport_kwargs,
+    )
+    route_plan = make_route_plan(
+        rank=rank,
+        world_size=world_size,
+        buffer=buffer,
+        num_tokens=args.num_tokens,
+        num_topk=args.num_topk,
+        num_experts=num_experts,
+        route=args.route,
+    )
+    weights = torch.ones(
+        (args.num_tokens, args.num_topk), device=DEVICE, dtype=torch.float32
+    )
+    # Every rank's routing, to know which tokens this rank must receive.
+    gathered = [torch.empty_like(route_plan.topk_idx) for _ in range(world_size)]
+    dist.all_gather(gathered, route_plan.topk_idx)
+    all_topk = torch.stack(gathered)
+    num_local = num_experts // world_size
+    first_local = rank * num_local
+    is_local = (all_topk >= first_local) & (all_topk < first_local + num_local)
+    exp_rank, exp_token = is_local.any(-1).nonzero(as_tuple=True)
+    expected_src = exp_rank * max_tokens + exp_token
+
+    def check_compact(label, recv, handle, addend):
+        recv_x, recv_sf = recv
+        actual = int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
+        src = handle.recv_src_metadata[:actual, 0].long()
+        if not torch.equal(torch.sort(src).values, expected_src):
+            raise AssertionError(f"rank={rank}: {label} FP8 received-token mismatch")
+        check_fp8_rows(
+            rank=rank,
+            label=label,
+            codes=recv_x[:actual],
+            scales=recv_sf[:actual],
+            src_rank=src // max_tokens,
+            src_token=src % max_tokens,
+            hidden=args.hidden,
+            addend=addend,
+        )
+
+    # Compact, CPU sync, column-major scales (sf_hidden_stride != 1).
+    x = make_fp8_input(
+        rank=rank,
+        num_tokens=args.num_tokens,
+        hidden=args.hidden,
+        addend=0,
+        column_major_sf=True,
+    )
+    recv, _, _, handle, _ = buffer.dispatch(
+        x,
+        topk_idx=route_plan.topk_idx,
+        topk_weights=weights,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=max_tokens,
+        expert_alignment=1,
+        do_cpu_sync=True,
+        num_sms=args.num_sms,
+        async_with_compute_stream=False,
+    )
+    synchronize()
+    check_compact("sync", recv, handle, 0)
+
+    # Cached handle, row-major scales.
+    x = make_fp8_input(
+        rank=rank,
+        num_tokens=args.num_tokens,
+        hidden=args.hidden,
+        addend=5,
+        column_major_sf=False,
+    )
+    recv, _, _, _, _ = buffer.dispatch(
+        x,
+        handle=handle,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=max_tokens,
+        num_sms=args.num_sms,
+        async_with_compute_stream=False,
+    )
+    synchronize()
+    check_compact("cached", recv, handle, 5)
+
+    # Expanded: each local expert's block, starting at an expert_alignment
+    # boundary, holds exactly the tokens that picked that expert.
+    x = make_fp8_input(
+        rank=rank,
+        num_tokens=args.num_tokens,
+        hidden=args.hidden,
+        addend=9,
+        column_major_sf=True,
+    )
+    (recv_x, recv_sf), _, _, handle, _ = buffer.dispatch(
+        x,
+        topk_idx=route_plan.topk_idx,
+        topk_weights=weights,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=max_tokens,
+        expert_alignment=expert_alignment,
+        do_expand=True,
+        do_cpu_sync=True,
+        num_sms=args.num_sms,
+        async_with_compute_stream=False,
+    )
+    synchronize()
+    start = 0
+    for e, count in enumerate(handle.num_recv_tokens_per_expert_list):
+        picked = (all_topk == first_local + e).any(-1)
+        exp_rank, exp_token = picked.nonzero(as_tuple=True)
+        rows = slice(start, start + count)
+        key = recv_sf[rows, 0].long()
+        src_rank = key // 1_000_000
+        src_token = key % 1_000_000 // 1_000
+        src = torch.sort(src_rank * max_tokens + src_token).values
+        if not torch.equal(src, exp_rank * max_tokens + exp_token):
+            raise AssertionError(
+                f"rank={rank}: expanded FP8 rows of local expert {e} mismatch"
+            )
+        check_fp8_rows(
+            rank=rank,
+            label=f"expanded expert {e}",
+            codes=recv_x[rows],
+            scales=recv_sf[rows],
+            src_rank=src_rank,
+            src_token=src_token,
+            hidden=args.hidden,
+            addend=9,
+        )
+        start = (start + count + expert_alignment - 1) // expert_alignment
+        start *= expert_alignment
+    buffer.destroy()
 
 
 def main() -> None:
@@ -252,7 +493,7 @@ def main() -> None:
         route=args.route,
     )
     weights = torch.ones(
-        (args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32
+        (args.num_tokens, args.num_topk), device=DEVICE, dtype=torch.float32
     )
 
     # CPU-sync dispatch: exact output extent and CPU-side expert counts.
@@ -273,7 +514,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     actual0 = check_dispatch_payload(
         rank=rank,
         recv_x=recv0,
@@ -296,7 +537,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     expected0 = (x0.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined0, expected=expected0, label="sync")
 
@@ -316,7 +557,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     actual1 = check_dispatch_payload(
         rank=rank,
         recv_x=recv1,
@@ -337,7 +578,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     expected1 = (x1.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined1, expected=expected1, label="cached")
 
@@ -361,7 +602,7 @@ def main() -> None:
         async_with_compute_stream=True,
     )
     event2.current_stream_wait()
-    torch.cuda.synchronize()
+    synchronize()
     actual2 = check_dispatch_payload(
         rank=rank,
         recv_x=recv2,
@@ -385,36 +626,52 @@ def main() -> None:
         async_with_compute_stream=True,
     )
     event3.current_stream_wait()
-    torch.cuda.synchronize()
+    synchronize()
     expected2 = (x2.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined2, expected=expected2, label="async")
 
-    # Expanded dispatch layout: check output extent and metadata shape.
+    # Expanded dispatch layout: check output extent, metadata shape, and that
+    # combine sums every pick.
     expanded_recv, expanded_idx, expanded_w, expanded_handle, _ = buffer.dispatch(
         x0,
         topk_idx=route_plan.topk_idx,
         topk_weights=weights,
         num_experts=num_experts,
         num_max_tokens_per_rank=max_tokens,
-        expert_alignment=1,
+        expert_alignment=args.expert_alignment,
         do_expand=True,
         do_cpu_sync=True,
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     expanded_actual = int(
         expanded_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
     )
     if expanded_actual != route_plan.expected_recv_tokens:
         raise AssertionError(f"rank={rank}: expanded dispatch received-token mismatch")
-    expanded_output = int(expanded_handle.psum_num_recv_tokens_per_expert[-1].item())
+    # The expanded psum holds each expert's end, then the aligned total; the
+    # output ends at the last expert's end.
+    expanded_output = int(expanded_handle.psum_num_recv_tokens_per_expert[-2].item())
     if expanded_recv.shape[0] != expanded_output:
         raise AssertionError(f"rank={rank}: expanded output extent mismatch")
     if expanded_w is not None and expanded_w.shape[0] != expanded_output:
         raise AssertionError(f"rank={rank}: expanded weights extent mismatch")
     if expanded_idx.shape[0] != expanded_actual:
         raise AssertionError(f"rank={rank}: expanded metadata extent mismatch")
+    expanded_combined, _, _ = buffer.combine(
+        expanded_recv.contiguous(),
+        expanded_handle,
+        num_sms=args.num_sms,
+        async_with_compute_stream=False,
+    )
+    synchronize()
+    check_combined(
+        rank=rank,
+        combined=expanded_combined,
+        expected=(x0.float() * args.num_topk).to(torch.bfloat16),
+        label="expanded",
+    )
 
     if args.reconfigure:
         if buffer.transport != "nccl":
@@ -460,7 +717,7 @@ def main() -> None:
             num_sms=args.num_sms,
             async_with_compute_stream=False,
         )
-        torch.cuda.synchronize()
+        synchronize()
         actual3 = check_dispatch_payload(
             rank=rank,
             recv_x=recv3,
@@ -479,13 +736,24 @@ def main() -> None:
             num_sms=args.num_sms,
             async_with_compute_stream=False,
         )
-        torch.cuda.synchronize()
+        synchronize()
         expected3 = (x3.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
         check_combined(
             rank=rank,
             combined=combined3,
             expected=expected3,
             label="post-reconfiguration",
+        )
+
+    if args.fp8:
+        run_fp8_checks(
+            args=args,
+            rank=rank,
+            world_size=world_size,
+            max_tokens=max_tokens,
+            num_experts=num_experts,
+            expert_alignment=args.expert_alignment,
+            transport_kwargs=transport_kwargs,
         )
 
     distributed_barrier()
@@ -500,6 +768,7 @@ def main() -> None:
             f"scaleout={buffer.num_scaleout_ranks}",
             f"scaleup={buffer.num_scaleup_ranks}",
             f"reconfigured={args.reconfigure}",
+            f"fp8={args.fp8}",
             flush=True,
         )
     buffer.destroy()

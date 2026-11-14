@@ -16,9 +16,21 @@
 
 #include <glog/logging.h>
 #include <tent/thirdparty/nlohmann/json.h>
+
+#include <array>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
+
+#ifndef TENT_BUILD_VERSION
+#define TENT_BUILD_VERSION "unknown"
+#endif
+
+#ifndef TENT_GIT_COMMIT
+#define TENT_GIT_COMMIT "unknown"
+#endif
 
 namespace mooncake::tent {
 
@@ -32,8 +44,62 @@ TentMetrics::~TentMetrics() { shutdown(); }
 #if TENT_METRICS_ENABLED
 
 namespace {
+constexpr std::array<std::string_view, 2> kSerializationFormatNames{
+    "prometheus", "json"};
+
+bool equivalentMetricsConfig(const MetricsConfig& lhs,
+                             const MetricsConfig& rhs) {
+    return lhs.enabled == rhs.enabled && lhs.http_host == rhs.http_host &&
+           lhs.http_port == rhs.http_port &&
+           lhs.http_server_threads == rhs.http_server_threads &&
+           lhs.report_interval_seconds == rhs.report_interval_seconds;
+}
+
+uint64_t unixTimestampSeconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+std::string escapePrometheusLabelValue(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+            case '\\':
+                escaped.append("\\\\");
+                break;
+            case '"':
+                escaped.append("\\\"");
+                break;
+            case '\n':
+                escaped.append("\\n");
+                break;
+            default:
+                escaped.push_back(c);
+                break;
+        }
+    }
+    return escaped;
+}
+
 const char* operationName(Request::OpCode operation) {
     return operation == Request::READ ? "read" : "write";
+}
+
+const char* outcomeName(TransferStatusEnum status) noexcept {
+    switch (status) {
+        case COMPLETED:
+            return "success";
+        case TIMEOUT:
+            return "timeout";
+        case CANCELED:
+            return "canceled";
+        case FAILED:
+        default:
+            return "failed";
+    }
 }
 
 const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
@@ -55,8 +121,7 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
     // (e.g. port 0, zero HTTP threads) would otherwise cause confusing
     // failures inside initHttpServer(); fail fast with a clear error instead.
-    // Validating before the compare_exchange avoids a window where
-    // initialized_ is set to true and then rolled back on failure.
+    // Validate before taking the lifecycle lock to keep invalid calls cheap.
     std::string error_msg;
     if (!MetricsConfigLoader::validateConfig(config, &error_msg)) {
         LOG(ERROR) << "Invalid TENT metrics config: " << error_msg
@@ -65,10 +130,15 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
             "Invalid TENT metrics config: " + error_msg + LOC_MARK);
     }
 
-    // Use compare_exchange to prevent race condition during initialization
-    bool expected = false;
-    if (!initialized_.compare_exchange_strong(expected, true)) {
-        return Status::OK();  // Already initialized by another thread
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    if (initialized_.load(std::memory_order_acquire)) {
+        if (equivalentMetricsConfig(config_, config)) return Status::OK();
+
+        LOG(WARNING) << "TENT metrics already initialized with a different "
+                        "configuration";
+        return Status::InvalidArgument(
+            "TENT metrics already initialized with a different "
+            "configuration" LOC_MARK);
     }
 
     config_ = config;
@@ -76,8 +146,10 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Set runtime enabled state from config
     runtime_enabled_.store(config_.enabled, std::memory_order_relaxed);
 
-    // Register all metrics to vectors for unified serialization
-    registerMetrics();
+    // The metric objects and pointer registries live for the process lifetime.
+    // Build them once so a late serializer from the previous lifecycle cannot
+    // race with vector reassignment during re-initialization.
+    if (counters_.empty()) registerMetrics();
 
     // Initialize and start HTTP server on the configured port. If the port is
     // busy (e.g. another rank was given the same port), degrade to log-only
@@ -85,11 +157,18 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     Status http_status = initHttpServer();
     const bool http_ok = http_status.ok();
     if (!http_ok) {
+        http_start_failures_.fetch_add(1, std::memory_order_relaxed);
         LOG(WARNING) << "TENT metrics HTTP endpoint unavailable on "
                      << config_.http_host << ":" << config_.http_port << " ("
                      << http_status.ToString()
                      << "); continuing with log-only metrics";
     }
+
+    // Publish initialized only after config, runtime state, metric registries,
+    // and HTTP state are ready. Accounting starts are released last so every
+    // successful start can safely reach its matching finish path.
+    initialized_.store(true, std::memory_order_release);
+    accounting_ready_.store(true, std::memory_order_release);
 
     // Start periodic metric reporting thread if interval > 0
     if (config_.report_interval_seconds > 0) {
@@ -159,9 +238,16 @@ void TentMetrics::registerHttpHandlers() {
     // Register /metrics endpoint for Prometheus
     http_server_->set_http_handler<GET>(
         "/metrics", [this](coro_http_request& req, coro_http_response& resp) {
-            std::string metrics = getPrometheusMetrics();
+            std::string metrics;
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(metrics));
+            if (tryGetPrometheusMetrics(metrics)) {
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(metrics));
+            } else {
+                resp.set_status_and_content(
+                    status_type::internal_server_error,
+                    "Failed to serialize Prometheus metrics\n");
+            }
         });
 
     // Register /metrics/summary endpoint for human-readable summary
@@ -177,9 +263,15 @@ void TentMetrics::registerHttpHandlers() {
     http_server_->set_http_handler<GET>(
         "/metrics/json",
         [this](coro_http_request& req, coro_http_response& resp) {
-            std::string json = getJsonMetrics();
+            std::string json;
             resp.add_header("Content-Type", "application/json");
-            resp.set_status_and_content(status_type::ok, std::move(json));
+            if (tryGetJsonMetrics(json)) {
+                resp.set_status_and_content(status_type::ok, std::move(json));
+            } else {
+                resp.set_status_and_content(
+                    status_type::internal_server_error,
+                    R"({"error":"Failed to serialize metrics"})");
+            }
         });
 
     // Register /health endpoint for health check
@@ -191,7 +283,12 @@ void TentMetrics::registerHttpHandlers() {
 }
 
 void TentMetrics::shutdown() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     if (!initialized_) return;
+
+    // Reject new accounting starts before teardown. Already-started pairs can
+    // still close through their TaskInfo token while initialized_ remains set.
+    accounting_ready_.store(false, std::memory_order_release);
 
     // Stop metric reporting thread
     metric_report_running_ = false;
@@ -206,10 +303,10 @@ void TentMetrics::shutdown() {
         http_server_.reset();
     }
 
-    // Clear metric vectors
-    counters_.clear();
-    histograms_.clear();
-    gauges_.clear();
+    // Keep the process-lifetime metric pointer registries intact. Public
+    // serializers that observed initialized_ before shutdown may still be
+    // finishing, and the metric objects themselves remain valid. A later
+    // initialize() reuses these immutable registries.
 
     // Reset bound port so httpPort() returns 0 after shutdown, not a stale
     // port from a previous initialization. Without this, a re-initialize
@@ -236,6 +333,9 @@ void TentMetrics::registerMetrics() {
         &failover_total_,
         &transport_attempts_total_,
         &transport_attempt_failures_total_,
+        &logical_requests_started_total_,
+        &logical_request_outcomes_total_,
+        &transport_attempt_outcomes_total_,
         &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
@@ -243,6 +343,7 @@ void TentMetrics::registerMetrics() {
 
     gauges_ = {
         &inflight_attempts_,
+        &logical_requests_inflight_,
         &registered_buffer_bytes_,
     };
 
@@ -254,6 +355,68 @@ void TentMetrics::registerMetrics() {
         &read_latency_, &write_latency_,    &read_size_,      &write_size_,
         &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
     };
+
+    preResolveAccountingMetrics();
+}
+
+size_t TentMetrics::outcomeIndex(TransferStatusEnum status) noexcept {
+    switch (status) {
+        case COMPLETED:
+            return 0;
+        case FAILED:
+            return 1;
+        case TIMEOUT:
+            return 2;
+        case CANCELED:
+            return 3;
+        default:
+            return 1;
+    }
+}
+
+void TentMetrics::preResolveAccountingMetrics() {
+    constexpr std::array<Request::OpCode, kOperationDomain> operations{
+        Request::READ, Request::WRITE};
+    constexpr std::array<TransferStatusEnum, kOutcomeValueDomain> outcomes{
+        COMPLETED, FAILED, TIMEOUT, CANCELED};
+
+    for (Request::OpCode operation : operations) {
+        const size_t operation_slot = operationSlot(operation);
+        const std::array<std::string, 1> operation_label{
+            operationName(operation)};
+        logical_requests_started_total_.preResolve(operation_slot,
+                                                   operation_label);
+        logical_requests_inflight_.preResolve(operation_slot, operation_label);
+        for (TransferStatusEnum outcome : outcomes) {
+            logical_request_outcomes_total_.preResolve(
+                logicalOutcomeSlot(operation, outcome),
+                std::array<std::string, 2>{operationName(operation),
+                                           outcomeName(outcome)});
+        }
+    }
+
+    for (size_t transport = 0; transport < kTransportDomain; ++transport) {
+        const auto tp = static_cast<TransportType>(transport);
+        inflight_attempts_.preResolve(
+            transportSlot(tp),
+            std::array<std::string, 1>{transportTypeName(tp)});
+        for (Request::OpCode operation : operations) {
+            const size_t attempt_slot = attemptSlot(tp, operation);
+            const std::array<std::string, 2> attempt_label{
+                transportTypeName(tp), operationName(operation)};
+            transport_attempts_total_.preResolve(attempt_slot, attempt_label);
+            transport_attempt_failures_total_.preResolve(attempt_slot,
+                                                         attempt_label);
+            transport_attempt_latency_.preResolve(attempt_slot, attempt_label);
+            for (TransferStatusEnum outcome : outcomes) {
+                transport_attempt_outcomes_total_.preResolve(
+                    attemptOutcomeSlot(tp, operation, outcome),
+                    std::array<std::string, 3>{transportTypeName(tp),
+                                               operationName(operation),
+                                               outcomeName(outcome)});
+            }
+        }
+    }
 }
 
 void TentMetrics::recordReadCompleted(TransportType tp, size_t bytes,
@@ -332,6 +495,26 @@ void TentMetrics::recordTaskFailure(TransportType tp,
     });
 }
 
+bool TentMetrics::recordLogicalRequestStarted(
+    Request::OpCode operation) noexcept {
+    if (!accounting_ready_.load(std::memory_order_acquire) ||
+        !runtime_enabled_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const size_t slot = operationSlot(operation);
+    logical_requests_started_total_.incResolved(slot);
+    logical_requests_inflight_.incResolved(slot);
+    return true;
+}
+
+void TentMetrics::recordLogicalRequestFinished(
+    Request::OpCode operation, TransferStatusEnum status) noexcept {
+    if (!initialized_.load(std::memory_order_relaxed)) return;
+    logical_request_outcomes_total_.incResolved(
+        logicalOutcomeSlot(operation, status));
+    logical_requests_inflight_.incResolved(operationSlot(operation), -1);
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -339,16 +522,12 @@ void TentMetrics::recordTaskFailure(TransportType tp,
 // histograms are samples and may be dropped while disabled; gauges are not.
 void TentMetrics::recordInflightAttemptStarted(TransportType tp) {
     if (!initialized_) return;
-    inflight_attempts_.incCached(transportSlot(tp), [tp] {
-        return std::array<std::string, 1>{transportTypeName(tp)};
-    });
+    inflight_attempts_.incResolved(transportSlot(tp));
 }
 
 void TentMetrics::recordInflightAttemptFinished(TransportType tp) {
     if (!initialized_) return;
-    inflight_attempts_.incCached(
-        transportSlot(tp),
-        [tp] { return std::array<std::string, 1>{transportTypeName(tp)}; }, -1);
+    inflight_attempts_.incResolved(transportSlot(tp), -1);
 }
 
 void TentMetrics::recordRegisteredBufferBytes(TransportType tp, int64_t delta) {
@@ -414,79 +593,103 @@ void TentMetrics::recordTransportFailover(TransportType from,
                                                    transportTypeName(to)});
 }
 
-void TentMetrics::recordTransportAttemptStarted(TransportType tp,
-                                                Request::OpCode operation) {
-    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
-        return;
+bool TentMetrics::recordTransportAttemptStarted(
+    TransportType tp, Request::OpCode operation) noexcept {
+    if (!accounting_ready_.load(std::memory_order_acquire) ||
+        !runtime_enabled_.load(std::memory_order_relaxed)) {
+        return false;
+    }
     const size_t slot = attemptSlot(tp, operation);
-    transport_attempts_total_.incCached(slot, [tp, operation] {
-        return std::array<std::string, 2>{transportTypeName(tp),
-                                          operationName(operation)};
-    });
+    transport_attempts_total_.incResolved(slot);
+    inflight_attempts_.incResolved(transportSlot(tp));
+    return true;
 }
 
 void TentMetrics::recordTransportAttemptFinished(TransportType tp,
                                                  Request::OpCode operation,
                                                  TransferStatusEnum status,
-                                                 double latency_us) {
-    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
-        return;
+                                                 double latency_us) noexcept {
+    if (!initialized_.load(std::memory_order_relaxed)) return;
     const size_t slot = attemptSlot(tp, operation);
-    auto label = [tp, operation] {
-        return std::array<std::string, 2>{transportTypeName(tp),
-                                          operationName(operation)};
-    };
     if (status == FAILED) {
-        transport_attempt_failures_total_.incCached(slot, label);
+        transport_attempt_failures_total_.incResolved(slot);
     }
+    transport_attempt_outcomes_total_.incResolved(
+        attemptOutcomeSlot(tp, operation, status));
     if (latency_us >= 0.0) {
         auto latency_val = static_cast<int64_t>(latency_us);
-        transport_attempt_latency_.observeCached(slot, label, latency_val);
+        transport_attempt_latency_.observeResolved(slot, latency_val);
+    }
+    inflight_attempts_.incResolved(transportSlot(tp), -1);
+}
+
+bool TentMetrics::serializeWithAccounting(
+    size_t format, std::string& result,
+    const std::function<void(std::string&, uint64_t)>& serializer) {
+    serialization_attempts_[format].fetch_add(1, std::memory_order_relaxed);
+    try {
+        result.clear();
+        const uint64_t success_timestamp = unixTimestampSeconds();
+        serializer(result, success_timestamp);
+        last_serialization_success_timestamp_seconds_[format].store(
+            success_timestamp, std::memory_order_relaxed);
+        return true;
+    } catch (const std::exception& e) {
+        serialization_failures_[format].fetch_add(1, std::memory_order_relaxed);
+        result.clear();
+        LOG(ERROR) << "Failed to serialize "
+                   << kSerializationFormatNames[format]
+                   << " metrics: " << e.what();
+        return false;
+    } catch (...) {
+        serialization_failures_[format].fetch_add(1, std::memory_order_relaxed);
+        result.clear();
+        LOG(ERROR) << "Failed to serialize "
+                   << kSerializationFormatNames[format]
+                   << " metrics: unknown exception";
+        return false;
     }
 }
 
-std::string TentMetrics::getPrometheusMetrics() {
-    if (!initialized_) return "";
-
-    try {
-        std::string result;
-        result.reserve(kPrometheusBufferSize);
-
-        // Counters: ylt's counter_t::serialize() is reliable — no evidence of
-        // silent drops in practice. Kept as-is.
-        for (auto* counter : counters_) {
-            std::string tmp;
-            counter->serialize(tmp);
-            result += tmp;
-        }
-
-        // Histograms: do NOT use ylt's basic_dynamic_histogram::serialize().
-        // It silently drops the entire metric (including the # HELP / # TYPE
-        // header it already wrote) whenever every label combo has sum_==0 —
-        // via `if (value == 0) continue; ... if (value_str.empty())
-        // str.clear();`. That condition is reachable in production: e.g.
-        // stage_queue_wait_us with sub-microsecond latencies that truncate to
-        // 0 under int64_t observation. The JSON endpoint's custom serializer
-        // walks get_bucket_counts() directly and is unaffected, which is why
-        // /metrics/json reported count=4846 while /metrics omitted the metric
-        // entirely. Using the same bucket-walk here closes that drift.
-        for (const auto& hist : histograms_) {
-            serializeHistogramPrometheus(*hist, result);
-        }
-        // N=2 transport-attempt latency histogram (labels: transport,
-        // operation) goes through the same helper, instantiated for N=2.
-        serializeHistogramPrometheus(transport_attempt_latency_, result);
-
-        // Gauges: current value per label.
-        for (auto* gauge : gauges_) {
-            serializeGaugePrometheus(*gauge, result);
-        }
-
-        return result;
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to serialize Prometheus metrics: " << e.what();
-        return "";
+bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
+    if (!initialized_) {
+        result.clear();
+        return false;
     }
+
+    return serializeWithAccounting(
+        kPrometheusFormat, result,
+        [this](std::string& output, uint64_t success_timestamp) {
+            output.reserve(kPrometheusBufferSize);
+
+            // Counters: ylt's counter_t::serialize() is reliable — no evidence
+            // of silent drops in practice. Kept as-is.
+            for (auto* counter : counters_) {
+                std::string tmp;
+                counter->serialize(tmp);
+                output += tmp;
+            }
+
+            for (const auto& hist : histograms_) {
+                serializeHistogramPrometheus(*hist, output);
+            }
+            // N=2 transport-attempt latency histogram (labels: transport,
+            // operation) goes through the same helper, instantiated for N=2.
+            serializeHistogramPrometheus(transport_attempt_latency_, output);
+
+            // Gauges: current value per label.
+            for (auto* gauge : gauges_) {
+                serializeGaugePrometheus(*gauge, output);
+            }
+
+            appendSelfMetricsPrometheus(output, success_timestamp);
+        });
+}
+
+std::string TentMetrics::getPrometheusMetrics() {
+    std::string result;
+    tryGetPrometheusMetrics(result);
+    return result;
 }
 
 namespace {
@@ -534,11 +737,7 @@ template <uint8_t N>
 void TentMetrics::serializeHistogramPrometheus(
     metrics::CachedDynamicHistogram<N>& hist, std::string& out) const {
     // Walk the same bucket-counter / sum-counter data the JSON path uses, so
-    // the two endpoints cannot drift. Unlike ylt's serialize() this never
-    // silently drops a histogram that has observed >=1 sample: ylt clears its
-    // output string (taking the # HELP / # TYPE header with it) whenever
-    // every label combo has sum_==0, which is reachable in production when
-    // sub-microsecond latencies truncate to 0 under int64_t observation.
+    // the two endpoints cannot drift.
     //
     // Templated over label arity N: the per-transport histograms are N=1 and
     // the transport-attempt latency histogram is N=2. For N=1 the emitted
@@ -673,64 +872,201 @@ void TentMetrics::serializeGaugePrometheus(
     }
 }
 
+void TentMetrics::appendSelfMetricsPrometheus(
+    std::string& out, uint64_t prometheus_success_timestamp) const {
+    const auto append_scalar = [&out](std::string_view name,
+                                      std::string_view help,
+                                      std::string_view type, uint64_t value) {
+        out.append("# HELP ")
+            .append(name)
+            .append(" ")
+            .append(help)
+            .append("\n# TYPE ")
+            .append(name)
+            .append(" ")
+            .append(type)
+            .append("\n")
+            .append(name)
+            .append(" ")
+            .append(std::to_string(value))
+            .append("\n");
+    };
+
+    out.append(
+           "# HELP tent_metrics_build_info TENT metrics build information\n")
+        .append("# TYPE tent_metrics_build_info gauge\n")
+        .append("tent_metrics_build_info{version=\"")
+        .append(escapePrometheusLabelValue(TENT_BUILD_VERSION))
+        .append("\",commit=\"")
+        .append(escapePrometheusLabelValue(TENT_GIT_COMMIT))
+        .append("\"} 1\n");
+
+    append_scalar("tent_metrics_runtime_enabled",
+                  "Whether runtime transfer metric recording is enabled",
+                  "gauge", isEnabled() ? 1 : 0);
+    append_scalar(
+        "tent_metrics_http_server_up",
+        "Whether the TENT metrics HTTP server is listening", "gauge",
+        bound_http_port_.load(std::memory_order_relaxed) != 0 ? 1 : 0);
+    append_scalar("tent_metrics_http_start_failures_total",
+                  "Total failed TENT metrics HTTP server start attempts",
+                  "counter",
+                  http_start_failures_.load(std::memory_order_relaxed));
+
+    const auto append_by_format =
+        [&out, prometheus_success_timestamp](
+            std::string_view name, std::string_view help, std::string_view type,
+            const std::array<std::atomic<uint64_t>, kSerializationFormatCount>&
+                values,
+            bool include_current_prometheus_success) {
+            out.append("# HELP ")
+                .append(name)
+                .append(" ")
+                .append(help)
+                .append("\n# TYPE ")
+                .append(name)
+                .append(" ")
+                .append(type)
+                .append("\n");
+            for (size_t i = 0; i < kSerializationFormatCount; ++i) {
+                const uint64_t value =
+                    i == kPrometheusFormat && include_current_prometheus_success
+                        ? prometheus_success_timestamp
+                        : values[i].load(std::memory_order_relaxed);
+                out.append(name)
+                    .append("{format=\"")
+                    .append(kSerializationFormatNames[i])
+                    .append("\"} ")
+                    .append(std::to_string(value))
+                    .append("\n");
+            }
+        };
+
+    append_by_format("tent_metrics_serialization_attempts_total",
+                     "Total TENT metrics serialization attempts by format",
+                     "counter", serialization_attempts_, false);
+    append_by_format("tent_metrics_serialization_failures_total",
+                     "Total failed TENT metrics serializations by format",
+                     "counter", serialization_failures_, false);
+    append_by_format(
+        "tent_metrics_last_success_timestamp_seconds",
+        "Unix timestamp of the last successful TENT metrics serialization",
+        "gauge", last_serialization_success_timestamp_seconds_, true);
+}
+
+bool TentMetrics::tryGetJsonMetrics(std::string& result) {
+    if (!initialized_) {
+        result.clear();
+        return false;
+    }
+
+    return serializeWithAccounting(
+        kJsonFormat, result,
+        [this](std::string& output, uint64_t success_timestamp) {
+            nlohmann::json root;
+
+            // Counters: aggregate (sum) across all transport label values so
+            // the JSON endpoint stays a simple flat {name: total} view.
+            // Per-transport breakdown is available via the Prometheus endpoint.
+            root[read_bytes_total_.str_name()] =
+                sumCounterValues(&read_bytes_total_);
+            root[write_bytes_total_.str_name()] =
+                sumCounterValues(&write_bytes_total_);
+            root[read_requests_total_.str_name()] =
+                sumCounterValues(&read_requests_total_);
+            root[write_requests_total_.str_name()] =
+                sumCounterValues(&write_requests_total_);
+            root[read_failures_total_.str_name()] =
+                sumCounterValues(&read_failures_total_);
+            root[write_failures_total_.str_name()] =
+                sumCounterValues(&write_failures_total_);
+            root[failover_total_.str_name()] =
+                sumCounterValues(&failover_total_);
+            root[transport_attempts_total_.str_name()] =
+                sumCounterValues(&transport_attempts_total_);
+            root[transport_attempt_failures_total_.str_name()] =
+                sumCounterValues(&transport_attempt_failures_total_);
+            root[logical_requests_started_total_.str_name()] =
+                sumCounterValues(&logical_requests_started_total_);
+            root[logical_request_outcomes_total_.str_name()] =
+                sumCounterValues(&logical_request_outcomes_total_);
+            root[transport_attempt_outcomes_total_.str_name()] =
+                sumCounterValues(&transport_attempt_outcomes_total_);
+            root[task_failures_total_.str_name()] =
+                sumCounterValues(&task_failures_total_);
+            root[deadline_infeasible_total_.str_name()] =
+                sumCounterValues(&deadline_infeasible_total_);
+            root[quarantined_batches_total_.str_name()] =
+                static_cast<int64_t>(quarantined_batches_total_.value());
+
+            // Gauges: aggregate across transport labels (total in-flight
+            // attempts / total registered bytes). Per-transport breakdown is
+            // via the Prometheus endpoint.
+            root[inflight_attempts_.str_name()] =
+                sumCounterValues(&inflight_attempts_);
+            root[logical_requests_inflight_.str_name()] =
+                sumCounterValues(&logical_requests_inflight_);
+            root[registered_buffer_bytes_.str_name()] =
+                sumCounterValues(&registered_buffer_bytes_);
+
+            // Histograms: sum bucket counts across all transport labels. The
+            // templated helper also reads back the histogram's sum counter so
+            // the JSON endpoint emits "sum" alongside "count" (and stays in
+            // sync with the Prometheus endpoint).
+            serializeHistogramToJson(root, read_latency_);
+            serializeHistogramToJson(root, write_latency_);
+            serializeHistogramToJson(root, read_size_);
+            serializeHistogramToJson(root, write_size_);
+            serializeHistogramToJson(root, deadline_mlu_);
+            serializeHistogramToJson(root, stage_queue_wait_);
+            serializeHistogramToJson(root, stage_dispatch_);
+            serializeHistogramToJson(root, stage_transport_);
+            serializeHistogramToJson(root, transport_attempt_latency_);
+
+            root["tent_metrics_build_info"] = {
+                {"version", TENT_BUILD_VERSION},
+                {"commit", TENT_GIT_COMMIT},
+            };
+            root["tent_metrics_runtime_enabled"] = isEnabled() ? 1 : 0;
+            root["tent_metrics_http_server_up"] =
+                bound_http_port_.load(std::memory_order_relaxed) != 0 ? 1 : 0;
+            root["tent_metrics_http_start_failures_total"] =
+                http_start_failures_.load(std::memory_order_relaxed);
+
+            nlohmann::json serialization_attempts;
+            nlohmann::json serialization_failures;
+            nlohmann::json last_success;
+            for (size_t i = 0; i < kSerializationFormatCount; ++i) {
+                const auto format = std::string(kSerializationFormatNames[i]);
+                serialization_attempts[format] =
+                    serialization_attempts_[i].load(std::memory_order_relaxed);
+                serialization_failures[format] =
+                    serialization_failures_[i].load(std::memory_order_relaxed);
+                last_success[format] =
+                    i == kJsonFormat
+                        ? success_timestamp
+                        : last_serialization_success_timestamp_seconds_[i].load(
+                              std::memory_order_relaxed);
+            }
+            root["tent_metrics_serialization_attempts_total"] =
+                std::move(serialization_attempts);
+            root["tent_metrics_serialization_failures_total"] =
+                std::move(serialization_failures);
+            root["tent_metrics_last_success_timestamp_seconds"] =
+                std::move(last_success);
+
+            output = root.dump(2);  // Pretty print with 2-space indent
+        });
+}
+
 std::string TentMetrics::getJsonMetrics() {
     if (!initialized_) return "{}";
 
-    try {
-        nlohmann::json root;
-
-        // Counters: aggregate (sum) across all transport label values so the
-        // JSON endpoint stays a simple flat {name: total} view. Per-transport
-        // breakdown is available via the Prometheus endpoint.
-        root[read_bytes_total_.str_name()] =
-            sumCounterValues(&read_bytes_total_);
-        root[write_bytes_total_.str_name()] =
-            sumCounterValues(&write_bytes_total_);
-        root[read_requests_total_.str_name()] =
-            sumCounterValues(&read_requests_total_);
-        root[write_requests_total_.str_name()] =
-            sumCounterValues(&write_requests_total_);
-        root[read_failures_total_.str_name()] =
-            sumCounterValues(&read_failures_total_);
-        root[write_failures_total_.str_name()] =
-            sumCounterValues(&write_failures_total_);
-        root[failover_total_.str_name()] = sumCounterValues(&failover_total_);
-        root[transport_attempts_total_.str_name()] =
-            sumCounterValues(&transport_attempts_total_);
-        root[transport_attempt_failures_total_.str_name()] =
-            sumCounterValues(&transport_attempt_failures_total_);
-        root[deadline_infeasible_total_.str_name()] =
-            sumCounterValues(&deadline_infeasible_total_);
-        root[quarantined_batches_total_.str_name()] =
-            static_cast<int64_t>(quarantined_batches_total_.value());
-
-        // Gauges: aggregate across transport labels (total in-flight attempts
-        // / total registered bytes). Per-transport breakdown is via the
-        // Prometheus endpoint.
-        root[inflight_attempts_.str_name()] =
-            sumCounterValues(&inflight_attempts_);
-        root[registered_buffer_bytes_.str_name()] =
-            sumCounterValues(&registered_buffer_bytes_);
-
-        // Histograms: sum bucket counts across all transport labels. The
-        // templated helper also reads back the histogram's sum counter so the
-        // JSON endpoint emits "sum" alongside "count" (and stays in sync with
-        // the Prometheus endpoint).
-        serializeHistogramToJson(root, read_latency_);
-        serializeHistogramToJson(root, write_latency_);
-        serializeHistogramToJson(root, read_size_);
-        serializeHistogramToJson(root, write_size_);
-        serializeHistogramToJson(root, deadline_mlu_);
-        serializeHistogramToJson(root, stage_queue_wait_);
-        serializeHistogramToJson(root, stage_dispatch_);
-        serializeHistogramToJson(root, stage_transport_);
-        serializeHistogramToJson(root, transport_attempt_latency_);
-
-        return root.dump(2);  // Pretty print with 2-space indent
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to serialize JSON metrics: " << e.what();
+    std::string result;
+    if (!tryGetJsonMetrics(result)) {
         return R"({"error": "Failed to serialize metrics"})";
     }
+    return result;
 }
 
 std::string TentMetrics::getSummaryString() {
@@ -767,7 +1103,12 @@ std::string TentMetrics::getSummaryString() {
         return s.str();
     };
 
-    oss << "Read: " << formatBytes(read_bytes) << " ("
+    oss << "Metrics HTTP: "
+        << (bound_http_port_.load(std::memory_order_relaxed) != 0 ? "up"
+                                                                  : "down")
+        << " (start failures: "
+        << http_start_failures_.load(std::memory_order_relaxed) << ") | "
+        << "Read: " << formatBytes(read_bytes) << " ("
         << static_cast<uint64_t>(read_reqs) << " reqs, "
         << static_cast<uint64_t>(read_fails) << " fails) | "
         << "Write: " << formatBytes(write_bytes) << " ("
@@ -784,24 +1125,38 @@ std::string TentMetrics::getSummaryString() {
 
 // Stub implementations when metrics are disabled at compile time
 Status TentMetrics::initialize(const MetricsConfig& config) {
+    // No backend exists in this build, so every configuration remains a
+    // successful no-op; the mutex only preserves lifecycle thread safety.
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     config_ = config;
-    initialized_ = true;
+    initialized_.store(true, std::memory_order_release);
     LOG(INFO)
         << "TENT metrics disabled at compile time (TENT_METRICS_ENABLED=0)";
     return Status::OK();
 }
 
-void TentMetrics::shutdown() { initialized_ = false; }
+void TentMetrics::shutdown() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    initialized_.store(false, std::memory_order_release);
+}
 
 void TentMetrics::recordReadCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordWriteCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordReadFailed(TransportType) {}
 void TentMetrics::recordWriteFailed(TransportType) {}
+bool TentMetrics::recordLogicalRequestStarted(Request::OpCode) noexcept {
+    return false;
+}
+void TentMetrics::recordLogicalRequestFinished(Request::OpCode,
+                                               TransferStatusEnum) noexcept {}
 void TentMetrics::recordTransportFailover(TransportType, TransportType) {}
-void TentMetrics::recordTransportAttemptStarted(TransportType,
-                                                Request::OpCode) {}
+bool TentMetrics::recordTransportAttemptStarted(TransportType,
+                                                Request::OpCode) noexcept {
+    return false;
+}
 void TentMetrics::recordTransportAttemptFinished(TransportType, Request::OpCode,
-                                                 TransferStatusEnum, double) {}
+                                                 TransferStatusEnum,
+                                                 double) noexcept {}
 void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}

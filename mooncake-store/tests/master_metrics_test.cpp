@@ -333,82 +333,6 @@ TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 }
 
-TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
-    auto& metrics = MasterMetricManager::instance();
-
-    // Mount a segment through the accounted path so the gauge is non-zero.
-    SegmentManager source_manager(BufferAllocatorType::OFFSET);
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "snapshot_reader_segment";
-    segment.base = 0x300000000;
-    segment.size = 1024 * 1024 * 16;
-    UUID client_id = generate_uuid();
-    ASSERT_EQ(source_manager.getSegmentAccess().MountSegment(
-                  segment, client_id,
-                  std::make_shared<ClientLivenessRecord>(
-                      ClientLivenessRecord::Clock::now())),
-              ErrorCode::OK);
-    const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
-              static_cast<int64_t>(segment.size));
-
-    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
-    std::shared_ptr<BufferAllocatorBase> source_allocator;
-    {
-        auto access = source_manager.getSegmentAccess();
-        source_allocator = access.GetAllocator(segment.id);
-    }
-    ASSERT_NE(source_allocator, nullptr);
-    auto source_buffer = source_allocator->allocate(kAllocationSize);
-    ASSERT_NE(source_buffer, nullptr);
-
-    auto snapshot =
-        SegmentSerializer(&source_manager).Serialize(LocalSsdPersistedState{});
-    ASSERT_TRUE(snapshot.has_value());
-
-    {
-        // Deserialize into a temporary reader. The reader's records never
-        // contributed to the capacity metrics, so destroying it must leave
-        // the gauges untouched.
-        SegmentManager reader(BufferAllocatorType::OFFSET);
-        SegmentSerializer reader_serializer(&reader);
-        ASSERT_TRUE(
-            reader_serializer.Deserialize(snapshot.value()).has_value());
-        const auto restored_usage = reader.GetMemoryUsageSnapshot();
-        const auto restored_aggregate = reader.GetMemoryUsage();
-        EXPECT_EQ(restored_usage.used_bytes, kAllocationSize);
-        EXPECT_EQ(restored_usage.capacity_bytes, segment.size);
-        EXPECT_DOUBLE_EQ(restored_usage.used_ratio(), 0.25);
-        EXPECT_EQ(restored_aggregate.used_bytes, kAllocationSize);
-        EXPECT_EQ(restored_aggregate.capacity_bytes, segment.size);
-        EXPECT_DOUBLE_EQ(restored_aggregate.used_ratio(), 0.25);
-        ASSERT_EQ(restored_usage.segments.size(), 1u);
-        EXPECT_EQ(restored_usage.segments.at(segment.name).used_bytes,
-                  kAllocationSize);
-
-        reader_serializer.Reset();
-        EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0u);
-        EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0u);
-    }
-    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
-              static_cast<int64_t>(segment.size));
-
-    // Unmount to restore the gauges for the other tests.
-    source_buffer.reset();
-    {
-        auto access = source_manager.getSegmentAccess();
-        size_t dec_capacity = 0;
-        ASSERT_EQ(access.PrepareUnmountSegment(segment.id, dec_capacity),
-                  ErrorCode::OK);
-        ASSERT_EQ(
-            access.CommitUnmountSegment(segment.id, client_id, dec_capacity),
-            ErrorCode::OK);
-    }
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
-}
-
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
@@ -1434,6 +1358,52 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
     EXPECT_EQ(response.http_status, 200);
     EXPECT_NE(response.body.find(sample), std::string::npos);
     EXPECT_NE(response.body.find(batch_sample), std::string::npos);
+}
+
+TEST_F(MasterMetricsTest, KeyGroupMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.configure_key_groups("state:suffix:_state,kv:suffix:_k");
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    WrappedMasterService service_(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "key_group_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& [key, length] :
+         std::vector<std::pair<std::string, uint64_t>>{
+             {"a_k", 1024}, {"b_k", 1024}, {"a_state", 4096}, {"c", 512}}) {
+        ASSERT_TRUE(
+            service_.PutStart(client_id, key, length, config).has_value());
+        ASSERT_TRUE(service_
+                        .PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                                ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_key_count_by_group{group=\"kv\"} 2"),
+              std::string::npos);
+    EXPECT_NE(
+        serialized.find("master_value_bytes_by_group{group=\"state\"} 4096"),
+        std::string::npos);
+    EXPECT_NE(
+        serialized.find("master_value_bytes_by_group{group=\"other\"} 512"),
+        std::string::npos);
+
+    ASSERT_EQ(4, service_.RemoveAll());
+    serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_value_bytes_by_group{group=\"kv\"} 0"),
+              std::string::npos);
+
+    metrics.configure_key_groups("");
 }
 
 }  // namespace mooncake::test

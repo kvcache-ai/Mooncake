@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <memory>
 #include <stack>
+#include <string>
 #include <vector>
 
 #include "common/base/status.h"
@@ -31,6 +32,14 @@
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+#ifdef USE_CUDA
+// NVLink submits call CUDA APIs synchronously, which a CUDA host function
+// cannot do safely on the driver's callback thread.
+inline bool isCudaHostFuncUnsupportedProtocol(const std::string &protocol) {
+    return protocol == "nvlink_intra";
+}
+#endif
 
 class ScatterTransferTicket;
 
@@ -136,6 +145,66 @@ class TransferEnginePy {
         const std::vector<size_t> &lengths,
         const std::string &transport_hint = "",
         const std::string &nic_hint = "");
+
+    // Buffer-protocol variants of the batch APIs. Each argument is a
+    // contiguous 1-D array of 8-byte integers (a NumPy uint64/int64 array,
+    // an array.array('Q'), ...). Large batches skip building three Python
+    // lists of ints and converting them one element at a time.
+    int batchTransferSyncWriteArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    int batchTransferSyncReadArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    batch_id_t batchTransferAsyncWriteArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    batch_id_t batchTransferAsyncReadArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    // Page-gathered batch transfer: `fields` is a C-contiguous [F, 5] array
+    // of 8-byte integers, one row (src_base, src_stride, dst_base,
+    // dst_stride, length) per field; `src_pages` / `dst_pages` are 1-D
+    // arrays of P page ids. Descriptor (f, i) copies `length` bytes from
+    // src_base + src_pages[i] * src_stride to dst_base + dst_pages[i] *
+    // dst_stride. The F x P descriptors are expanded here, field-major, and
+    // submitted in batches of at most `max_batch_size` (0: one batch).
+    // Returns 0, or the first batch's nonzero status.
+    int batchTransferSyncWritePages(const char *target_hostname,
+                                    const pybind11::buffer &src_pages,
+                                    const pybind11::buffer &dst_pages,
+                                    const pybind11::buffer &fields,
+                                    size_t max_batch_size = 0,
+                                    const std::string &transport_hint = "",
+                                    const std::string &nic_hint = "");
+
+    int batchTransferSyncReadPages(const char *target_hostname,
+                                   const pybind11::buffer &src_pages,
+                                   const pybind11::buffer &dst_pages,
+                                   const pybind11::buffer &fields,
+                                   size_t max_batch_size = 0,
+                                   const std::string &transport_hint = "",
+                                   const std::string &nic_hint = "");
+
+    int batchTransferSyncPages(const char *target_hostname,
+                               const pybind11::buffer &src_pages,
+                               const pybind11::buffer &dst_pages,
+                               const pybind11::buffer &fields,
+                               size_t max_batch_size, TransferOpcode opcode,
+                               const std::string &transport_hint,
+                               const std::string &nic_hint);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,

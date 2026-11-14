@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -26,13 +28,29 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         return "weights/production/llama-70b/step-100/7/manifest";
     }
 
-    WeightRevisionMetadata Begin(MasterService& service, uint64_t payload_count,
+    WeightRevisionMetadata Begin(MasterService& service,
+                                 const std::vector<std::string>& payload_keys,
                                  uint64_t logical_bytes) {
+        std::vector<WeightAffinityMappingEntry> mapping;
+        for (const auto& key : payload_keys) {
+            mapping.push_back({key, 1024, key});
+        }
         auto result = service.BeginWeightImport(BeginWeightImportRequest{
             .identity = Identity(),
             .payload_group_id = {},
-            .expected_payload_count = payload_count,
+            .expected_payload_count = payload_keys.size(),
             .expected_logical_bytes = logical_bytes,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL,
+                },
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = payload_keys.size(),
+                    .affinity_digest =
+                        ComputeWeightAffinityMappingSha256(mapping),
+                },
         });
         EXPECT_TRUE(result.has_value());
         return *result;
@@ -46,6 +64,9 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         config.with_hard_pin = true;
         config.data_type = data_type;
         config.group_ids = std::vector<std::string>{group_id};
+        if (data_type == ObjectDataType::WEIGHT) {
+            config.residency_affinity_ids = std::vector<std::string>{key};
+        }
         PutCompletedObject(service, client_id, key, config, size);
     }
 
@@ -70,11 +91,28 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
 };
 
 TEST_F(MasterServiceWeightManagementTest,
+       RejectsUnsatisfiableSingleAffinityMixedImport) {
+    MasterService service;
+    BeginWeightImportRequest request{
+        .identity = Identity(),
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+        .affinity_summary = {.affinity_count = 1,
+                             .affinity_digest = std::string(64, 'c')},
+    };
+
+    auto importing = service.BeginWeightImport(request);
+
+    ASSERT_FALSE(importing.has_value());
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, importing.error());
+}
+
+TEST_F(MasterServiceWeightManagementTest,
        PublishesReadyAndRetriesAfterResponseLoss) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 2, 2048);
+    auto importing = Begin(service, {"payload-a", "payload-b"}, 2048);
     const std::vector<std::string> payload_keys{"payload-b", "payload-a"};
     for (const auto& key : payload_keys) {
         PutObject(service, client_id, key, importing.manifest.payload_group_id,
@@ -105,7 +143,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsMissingManifest) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 1, 1024);
+    auto importing = Begin(service, {"payload-a"}, 1024);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -128,6 +166,17 @@ TEST_F(MasterServiceWeightManagementTest, CommitsPercentEncodedIdentity) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = ComputeWeightAffinityMappingSha256(
+                    {{"encoded-payload", 1024, "encoded-payload"}}),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     const auto manifest_key = MakeWeightManifestKey(identity);
@@ -158,6 +207,16 @@ TEST_F(MasterServiceWeightManagementTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_FALSE(importing.has_value());
     EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, importing.error());
@@ -177,6 +236,16 @@ TEST_F(MasterServiceWeightManagementTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     EXPECT_EQ(identity, importing->identity);
@@ -194,7 +263,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsWrongManifestType) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 1, 1024);
+    auto importing = Begin(service, {"payload-a"}, 1024);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -211,7 +280,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsManifestInWrongGroup) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 1, 1024);
+    auto importing = Begin(service, {"payload-a"}, 1024);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -227,7 +296,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsIncompletePayloadGroup) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 2, 2048);
+    auto importing = Begin(service, {"payload-a", "payload-b"}, 2048);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -244,7 +313,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsExtraOrphanPayload) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 2, 2048);
+    auto importing = Begin(service, {"payload-a", "payload-b"}, 2048);
     for (const auto& key : {"payload-a", "payload-b", "payload-orphan"}) {
         PutObject(service, client_id, key, importing.manifest.payload_group_id,
                   ObjectDataType::WEIGHT, 1024);
@@ -262,7 +331,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsMismatchedSummaryAndDigest) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 1, 1024);
+    auto importing = Begin(service, {"payload-a"}, 1024);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -286,7 +355,7 @@ TEST_F(MasterServiceWeightManagementTest, RejectsStaleGeneration) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 1, 1024);
+    auto importing = Begin(service, {"payload-a"}, 1024);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -306,7 +375,7 @@ TEST_F(MasterServiceWeightManagementTest,
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
-    auto importing = Begin(service, 1, 1024);
+    auto importing = Begin(service, {"payload-a"}, 1024);
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
@@ -349,6 +418,100 @@ TEST_F(MasterServiceWeightManagementTest,
         GetWeightRevisionRequest{.identity = ready->identity});
     ASSERT_TRUE(view.has_value());
     EXPECT_EQ(0u, view->active_lease_count);
+}
+
+TEST_F(MasterServiceWeightManagementTest,
+       LeaseMutationsSerializeWithWeightGroupLifecycle) {
+    MasterService service;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    auto importing = Begin(service, {"payload-a"}, 1024);
+    PutObject(service, client_id, "payload-a",
+              importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
+              1024);
+    PutObject(service, client_id, ManifestKey(),
+              importing.manifest.payload_group_id, ObjectDataType::METADATA,
+              128);
+    auto ready = service.CommitWeightImport(
+        CommitRequest(importing, {"payload-a"}, 1024));
+    ASSERT_TRUE(ready.has_value());
+    auto acquired =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
+            .identity = ready->identity,
+            .expected_metadata_generation = ready->metadata_generation,
+            .holder = "worker-0",
+            .ttl_ms = 60'000,
+        });
+    ASSERT_TRUE(acquired.has_value());
+
+    auto group_lock = AcquireWeightGroupOperationLockForTest(
+        service, TenantId(ready->identity.tenant_id),
+        ready->manifest.payload_group_id);
+    auto renewing = std::async(std::launch::async, [&] {
+        return service.RenewWeightRevisionLease(RenewWeightRevisionLeaseRequest{
+            .lease_id = acquired->lease_id,
+            .ttl_ms = 120'000,
+        });
+    });
+    EXPECT_EQ(std::future_status::timeout,
+              renewing.wait_for(std::chrono::milliseconds(250)));
+    group_lock.unlock();
+    ASSERT_TRUE(renewing.get().has_value());
+
+    group_lock = AcquireWeightGroupOperationLockForTest(
+        service, TenantId(ready->identity.tenant_id),
+        ready->manifest.payload_group_id);
+    auto releasing = std::async(std::launch::async, [&] {
+        return service.ReleaseWeightRevisionLease(
+            ReleaseWeightRevisionLeaseRequest{
+                .lease_id = acquired->lease_id,
+            });
+    });
+    EXPECT_EQ(std::future_status::timeout,
+              releasing.wait_for(std::chrono::milliseconds(250)));
+    group_lock.unlock();
+    EXPECT_TRUE(releasing.get().has_value());
+}
+
+TEST_F(MasterServiceWeightManagementTest,
+       ResidencyOperationSerializesWithWeightGroupLifecycle) {
+    MasterService service;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    auto importing = Begin(service, {"payload-a"}, 1024);
+    PutObject(service, client_id, "payload-a",
+              importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
+              1024);
+    PutObject(service, client_id, ManifestKey(),
+              importing.manifest.payload_group_id, ObjectDataType::METADATA,
+              128);
+    auto ready = service.CommitWeightImport(
+        CommitRequest(importing, {"payload-a"}, 1024));
+    ASSERT_TRUE(ready.has_value());
+
+    auto group_lock = AcquireWeightGroupOperationLockForTest(
+        service, TenantId(ready->identity.tenant_id),
+        ready->manifest.payload_group_id);
+    std::promise<void> started_call;
+    auto entered = started_call.get_future();
+    auto operation = std::async(std::launch::async, [&] {
+        started_call.set_value();
+        return service.StartWeightResidencyOperation(
+            StartWeightResidencyOperationRequest{
+                .identity = ready->identity,
+                .expected_metadata_generation = ready->metadata_generation,
+                .target_residency = WeightResidencyState::HOT,
+            });
+    });
+    entered.wait();
+
+    EXPECT_EQ(std::future_status::timeout,
+              operation.wait_for(std::chrono::milliseconds(250)));
+    group_lock.unlock();
+
+    auto result = operation.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(WeightOperationKind::MIGRATING, result->kind);
 }
 
 }  // namespace

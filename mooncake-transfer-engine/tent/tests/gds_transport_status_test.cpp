@@ -33,6 +33,8 @@ size_t handle_register_call_count = 0;
 size_t handle_deregister_call_count = 0;
 size_t failed_handle_register_count = 0;
 size_t batch_submit_call_count = 0;
+size_t buf_register_call_count = 0;
+size_t buf_deregister_call_count = 0;
 
 }  // namespace
 
@@ -89,6 +91,20 @@ extern "C" CUfileError_t __wrap_cuFileHandleRegister(CUfileHandle_t* handle,
 
 extern "C" CUfileError_t __wrap_cuFileHandleDeregister(CUfileHandle_t) {
     ++handle_deregister_call_count;
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
+extern "C" CUfileError_t __wrap_cuFileBufRegister(const void*, size_t, int) {
+    ++buf_register_call_count;
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
+extern "C" CUfileError_t __wrap_cuFileBufDeregister(const void*) {
+    ++buf_deregister_call_count;
     CUfileError_t result{};
     result.err = CU_FILE_SUCCESS;
     return result;
@@ -380,6 +396,63 @@ TEST(GdsTransportStatusTest, FailurePrecedenceIsCompletionOrderIndependent) {
         {makeEvent(CUFILE_FAILED), makeEvent(CUFILE_CANCELED)}, all_terminal);
     EXPECT_EQ(second.s, FAILED);
     EXPECT_TRUE(all_terminal);
+}
+
+#ifdef USE_XPU_GDS
+constexpr const char* kGdsDeviceLocation = "xpu:0";
+constexpr const char* kOtherDeviceLocation = "cuda:0";
+#else
+constexpr const char* kGdsDeviceLocation = "cuda:0";
+constexpr const char* kOtherDeviceLocation = "xpu:0";
+#endif
+
+TEST(GdsTransportStatusTest, RegistersOnlyGdsDeviceBuffers) {
+    GdsTransport transport;
+    buf_register_call_count = 0;
+    buf_deregister_call_count = 0;
+
+    for (const char* location : {"cpu:0", kOtherDeviceLocation}) {
+        BufferDesc desc{};
+        desc.addr = 0x1000;
+        desc.length = 4096;
+        desc.location = location;
+        MemoryOptions options;
+        options.location = location;
+        ASSERT_TRUE(transport.addMemoryBuffer(desc, options).ok()) << location;
+        EXPECT_TRUE(desc.transports.empty()) << location;
+        ASSERT_TRUE(transport.removeMemoryBuffer(desc).ok()) << location;
+    }
+    EXPECT_EQ(buf_register_call_count, 0);
+    EXPECT_EQ(buf_deregister_call_count, 0);
+
+    BufferDesc desc{};
+    desc.addr = 0x1000;
+    desc.length = 4096;
+    desc.location = kGdsDeviceLocation;
+    MemoryOptions options;
+    options.location = kGdsDeviceLocation;
+    ASSERT_TRUE(transport.addMemoryBuffer(desc, options).ok());
+    EXPECT_EQ(buf_register_call_count, 1);
+    ASSERT_EQ(desc.transports.size(), 1u);
+    EXPECT_EQ(desc.transports.front(), GDS);
+    ASSERT_TRUE(transport.removeMemoryBuffer(desc).ok());
+    EXPECT_EQ(buf_deregister_call_count, 1);
+}
+
+TEST(GdsTransportStatusTest, FileCapabilitiesMatchCuFileLibrary) {
+    GdsTransport transport;
+    std::string local_segment_name = "gds-capabilities";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, nullptr, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+    EXPECT_TRUE(transport.capabilities().gpu_to_file);
+#ifdef USE_XPU_GDS
+    EXPECT_FALSE(transport.capabilities().dram_to_file);
+#else
+    EXPECT_TRUE(transport.capabilities().dram_to_file);
+#endif
+    ASSERT_TRUE(transport.uninstall().ok());
 }
 
 }  // namespace

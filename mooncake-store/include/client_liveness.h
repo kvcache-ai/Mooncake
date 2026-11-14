@@ -5,6 +5,9 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <memory>
+
+#include "types.h"
 
 namespace mooncake {
 
@@ -34,8 +37,10 @@ class ClientLivenessRecord {
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
-    explicit ClientLivenessRecord(TimePoint initial_observation)
-        : last_liveness_at_(initial_observation) {}
+    ClientLivenessRecord(const UUID& client_id, TimePoint initial_observation)
+        : client_id_(client_id), last_liveness_at_(initial_observation) {}
+
+    [[nodiscard]] const UUID& ClientId() const { return client_id_; }
 
     class ServingGuard {
        public:
@@ -79,7 +84,7 @@ class ClientLivenessRecord {
         return state() != ClientLivenessState::OFFLINE;
     }
 
-    [[nodiscard]] std::optional<ServingGuard> TryAcquireServingGuard() {
+    [[nodiscard]] std::optional<ServingGuard> TryAcquireServingGuard() const {
         std::unique_lock<std::mutex> lock(transition_mutex_);
         if (state_.load(std::memory_order_relaxed) !=
             ClientLivenessState::ACTIVE) {
@@ -88,7 +93,8 @@ class ClientLivenessRecord {
         return ServingGuard(std::move(lock));
     }
 
-    [[nodiscard]] std::optional<RetainingGuard> TryAcquireRetainingGuard() {
+    [[nodiscard]] std::optional<RetainingGuard> TryAcquireRetainingGuard()
+        const {
         std::unique_lock<std::mutex> lock(transition_mutex_);
         if (state_.load(std::memory_order_relaxed) ==
             ClientLivenessState::OFFLINE) {
@@ -185,10 +191,14 @@ class ClientLivenessRecord {
         return ClientLivenessObservation::REFRESHED_ACTIVE;
     }
 
+    const UUID client_id_;
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
-    std::mutex transition_mutex_;
+    mutable std::mutex transition_mutex_;
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };
+
+// Resources retain the exact incarnation without permission to mutate it.
+using ClientSessionSharedPtr = std::shared_ptr<const ClientLivenessRecord>;
 
 }  // namespace mooncake

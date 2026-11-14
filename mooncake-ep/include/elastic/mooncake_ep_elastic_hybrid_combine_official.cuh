@@ -3,6 +3,8 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_transport.cuh>
 
 #include <elastic/mooncake_ep_elastic_comm.cuh>
@@ -12,6 +14,22 @@
 #include <elastic/mooncake_ep_elastic_combine_utils.cuh>
 
 namespace mooncake::elastic {
+
+template <typename Ops>
+struct HybridCombineKernelArgs {
+    nv_bfloat16* x;
+    float* topk_weights;
+    int* src_metadata;
+    int* psum_num_recv_tokens_per_scaleup_rank;
+    int* token_metadata_at_forward;
+    int* channel_linked_list;
+    typename Ops::Context comm_ctx;
+    void* buffer;
+    void* workspace;
+    int scaleout_rank_idx;
+    int scaleup_rank_idx;
+    int num_reduced_tokens;
+};
 
 template <
     typename Ops, bool kUseExpandedLayout, bool kAllowMultipleReduction,
@@ -37,14 +55,26 @@ template <
         kAllowMultipleReduction, kNumScaleoutRanks, kNumTopk>(),
     int kNumTokensInScaleupLayout = get_num_tokens_in_layout<
         kAllowMultipleReduction, kNumScaleupRanks, kNumTopk>()>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    hybrid_combine_impl(nv_bfloat16* x, float* topk_weights, int* src_metadata,
-                        int* psum_num_recv_tokens_per_scaleup_rank,
-                        int* token_metadata_at_forward,
-                        int* channel_linked_list,
-                        const typename Ops::Context comm_ctx, void* buffer,
-                        void* workspace, const int scaleout_rank_idx,
-                        const int scaleup_rank_idx, int num_reduced_tokens) {
+__device__ __forceinline__ void hybrid_combine_kernel_impl(
+    const HybridCombineKernelArgs<Ops>& args) {
+    static_assert(
+        std::is_trivially_copyable<HybridCombineKernelArgs<Ops>>::value,
+        "HybridCombineKernelArgs must be trivially copyable");
+
+    nv_bfloat16* x = args.x;
+    float* topk_weights = args.topk_weights;
+    int* src_metadata = args.src_metadata;
+    int* psum_num_recv_tokens_per_scaleup_rank =
+        args.psum_num_recv_tokens_per_scaleup_rank;
+    int* token_metadata_at_forward = args.token_metadata_at_forward;
+    int* channel_linked_list = args.channel_linked_list;
+    const typename Ops::Context& comm_ctx = args.comm_ctx;
+    void* buffer = args.buffer;
+    void* workspace = args.workspace;
+    const int scaleout_rank_idx = args.scaleout_rank_idx;
+    const int scaleup_rank_idx = args.scaleup_rank_idx;
+    int num_reduced_tokens = args.num_reduced_tokens;
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -819,6 +849,21 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         }
         __syncwarp();
     }
+}
+
+template <typename Ops, bool kUseExpandedLayout, bool kAllowMultipleReduction,
+          int kNumSMs, int kNumScaleupWarps, int kNumForwardWarps,
+          int kNumScaleoutRanks, int kNumScaleupRanks, int kHidden,
+          int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk, int kNumQPs,
+          int64_t kNumTimeoutCycles,
+          int kNumThreads = (kNumScaleupWarps + kNumForwardWarps) * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    hybrid_combine(const HybridCombineKernelArgs<Ops> args) {
+    hybrid_combine_kernel_impl<Ops, kUseExpandedLayout, kAllowMultipleReduction,
+                               kNumSMs, kNumScaleupWarps, kNumForwardWarps,
+                               kNumScaleoutRanks, kNumScaleupRanks, kHidden,
+                               kNumMaxTokensPerRank, kNumExperts, kNumTopk,
+                               kNumQPs, kNumTimeoutCycles>(args);
 }
 
 }  // namespace mooncake::elastic

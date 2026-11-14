@@ -14,6 +14,7 @@ pub use mesh::{
 };
 pub use metrics::{set_route_metrics_sink, RouteMetricsSink};
 pub use shim::{
-    build_route_directory, RouteAuthorityService, RouteHitReporter, RouteMembershipProvider,
-    RouteOperations, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+    build_route_directory, RouteAuthorityRecord, RouteAuthorityService, RouteHitReporter,
+    RouteMembershipProvider, RouteOperations, RouteOwnerPage, RouteOwnerPageQuery,
+    DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };

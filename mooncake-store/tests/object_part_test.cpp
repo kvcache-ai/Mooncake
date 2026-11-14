@@ -145,6 +145,19 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
     EXPECT_TRUE(part.replicas().empty());
 }
 
+// The first replica lives in the part itself, so the common one-replica part
+// needs no allocation of its own.
+TEST(ObjectPartTest, OneReplicaStaysInsideThePart) {
+    ObjectPart part(kObjectLength, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+    ASSERT_EQ(part.replicas().size(), 1u);
+
+    const auto replica =
+        reinterpret_cast<std::uintptr_t>(part.replicas().data());
+    const auto part_begin = reinterpret_cast<std::uintptr_t>(&part);
+    EXPECT_GE(replica, part_begin);
+    EXPECT_LT(replica, part_begin + sizeof(ObjectPart));
+}
+
 TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
@@ -161,6 +174,19 @@ TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     EXPECT_EQ(metadata->GetAllReplicas().data(), part.replicas().data());
     EXPECT_EQ(metadata->GetAllReplicas().size(), part.replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
+}
+
+// The first part lives in the envelope itself, so the common one-part object
+// needs no separate part array.
+TEST(EnvelopePartTest, TheFirstPartStaysInsideTheEnvelope) {
+    auto metadata = MakeEnvelope(kObjectLength,
+                                 MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+
+    const auto part = reinterpret_cast<std::uintptr_t>(&metadata->GetPart(0));
+    const auto envelope_begin =
+        reinterpret_cast<std::uintptr_t>(metadata.get());
+    EXPECT_GE(part, envelope_begin);
+    EXPECT_LT(part, envelope_begin + sizeof(ObjectMetadata));
 }
 
 TEST(EnvelopePartTest, VisitsAndErasesThroughTheEnvelope) {
@@ -203,26 +229,34 @@ TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
     EXPECT_FALSE(without_content->IsValid());
 }
 
-// The OpLog payload carries the envelope's own fields and no checksum, so this
-// case pins the length the part holds and the fields beside it.
-TEST_F(OplogPayloadTest, TheOplogPayloadCarriesTheEnvelopeFields) {
+// The OpLog payload must carry the part checksum along with the envelope's
+// other fields.
+TEST_F(OplogPayloadTest, EveryOplogMetadataSerializerCarriesTheChecksum) {
     MasterService service{MasterServiceConfig{}};
     auto metadata = MakeEnvelope(kObjectLength, {});
+    metadata->MutablePart(0).SetChecksum(kChecksum);
 
-    const std::string bytes =
+    const auto& object_metadata = *metadata;
+    const std::vector<std::string> serialized_payloads{
         test::MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
-            service, *metadata);
+            service, object_metadata),
+        test::MasterServiceTestPeer::
+            SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+                service, object_metadata, {})};
 
-    MetadataPayload payload;
-    ASSERT_EQ(struct_pack::deserialize_to(payload, bytes),
-              struct_pack::errc::ok);
-    EXPECT_EQ(payload.client_id, (UUID{1, 2}));
-    EXPECT_EQ(payload.size, metadata->TotalLength());
-    EXPECT_TRUE(payload.replicas.empty());
-    EXPECT_EQ(payload.group_id.value_or(""), kGroupId);
-    EXPECT_EQ(payload.data_type.value_or(ObjectDataType::UNKNOWN),
-              ObjectDataType::UNKNOWN);
-    EXPECT_FALSE(payload.hard_pinned.value_or(true));
+    for (const auto& bytes : serialized_payloads) {
+        MetadataPayload payload;
+        ASSERT_EQ(struct_pack::deserialize_to(payload, bytes),
+                  struct_pack::errc::ok);
+        EXPECT_EQ(payload.client_id, (UUID{1, 2}));
+        EXPECT_EQ(payload.size, metadata->TotalLength());
+        EXPECT_EQ(payload.group_id.value_or(""), kGroupId);
+        EXPECT_EQ(payload.data_type.value_or(ObjectDataType::UNKNOWN),
+                  ObjectDataType::UNKNOWN);
+        EXPECT_FALSE(payload.hard_pinned.value_or(true));
+        ASSERT_TRUE(payload.object_checksum.has_value());
+        EXPECT_EQ(payload.object_checksum.value(), kChecksum);
+    }
 }
 
 }  // namespace mooncake

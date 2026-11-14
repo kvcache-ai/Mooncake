@@ -718,8 +718,10 @@ std::string MakeServiceKey(const std::string& instance_id,
 }
 
 EventManager::EventManager(std::vector<common::ServiceConfig> services,
-                           int http_server_port, int rpc_server_port)
-    : services_(std::move(services)),
+                           int http_server_port, int rpc_server_port,
+                           size_t max_blocks_per_context)
+    : indexer_(max_blocks_per_context),
+      services_(std::move(services)),
       http_server_port_(http_server_port),
       rpc_server_port_(rpc_server_port),
       service_(std::make_unique<ConductorService>(*this)) {}

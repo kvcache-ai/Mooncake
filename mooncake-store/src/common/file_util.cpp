@@ -1,10 +1,16 @@
 #include "common/file_util.h"
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <string_view>
+#include <tuple>
+#include <utility>
+
+#include <fcntl.h>
+#include <sys/stat.h>
 
 namespace mooncake {
 namespace {
@@ -64,6 +70,49 @@ tl::expected<void, std::string> WriteChunks(std::ofstream &file,
 }
 
 }  // namespace
+
+void FileUtil::SortByCreationTime(std::vector<fs::directory_entry> &files) {
+    using TimeKey = std::tuple<bool, int64_t, uint32_t>;
+    std::vector<std::pair<TimeKey, fs::directory_entry>> timed_files;
+    timed_files.reserve(files.size());
+    for (const auto &entry : files) {
+        bool has_birth_time = false;
+        int64_t seconds = 0;
+        uint32_t nanoseconds = 0;
+#if defined(__linux__)
+        struct statx info{};
+        has_birth_time =
+            statx(AT_FDCWD, entry.path().c_str(), 0, STATX_BTIME, &info) == 0 &&
+            (info.stx_mask & STATX_BTIME) != 0;
+        if (has_birth_time) {
+            seconds = info.stx_btime.tv_sec;
+            nanoseconds = info.stx_btime.tv_nsec;
+        }
+#elif defined(__APPLE__)
+        struct stat info{};
+        has_birth_time = stat(entry.path().c_str(), &info) == 0;
+        if (has_birth_time) {
+            seconds = info.st_birthtimespec.tv_sec;
+            nanoseconds = info.st_birthtimespec.tv_nsec;
+        }
+#endif
+        timed_files.emplace_back(TimeKey{!has_birth_time, seconds, nanoseconds},
+                                 entry);
+    }
+
+    // No filesystem operations in the comparator: a disappearing file must
+    // not become equivalent to every other entry or change a comparison key.
+    std::sort(timed_files.begin(), timed_files.end(),
+              [](const auto &a, const auto &b) {
+                  if (a.first != b.first) {
+                      return a.first < b.first;
+                  }
+                  return a.second.path() < b.second.path();
+              });
+    for (size_t i = 0; i < files.size(); ++i) {
+        files[i] = std::move(timed_files[i].second);
+    }
+}
 
 std::string FileUtil::ResolvePathFromKey(const std::string &key,
                                          const std::string &root_dir,

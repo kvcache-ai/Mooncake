@@ -81,6 +81,35 @@ class FakeScatterTransferEngine(FakeTransferEngine):
         return FakeBatchTransferTicket(["COMPLETED"])
 
 
+class FakeAsyncScatterTransferEngine(FakeScatterTransferEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_tickets = 0
+        self.peak_active_tickets = 0
+
+    def _submit(self, direction: str, arguments):
+        self.scatter_calls.append((direction, arguments))
+        self.active_tickets += 1
+        self.peak_active_tickets = max(
+            self.peak_active_tickets,
+            self.active_tickets,
+        )
+
+        def complete() -> None:
+            self.active_tickets -= 1
+
+        return FakeBatchTransferTicket(
+            ["COMPLETION_UNKNOWN", "COMPLETED"],
+            on_drain=complete,
+        )
+
+    def submit_scatter_write(self, *arguments):
+        return self._submit("write", arguments)
+
+    def submit_scatter_read(self, *arguments):
+        return self._submit("read", arguments)
+
+
 class FakeAllocationLifetimeToken:
     def __init__(self, fence) -> None:
         self._fence = fence

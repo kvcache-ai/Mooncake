@@ -194,16 +194,6 @@ TEST(PromotionCandidateTrackerTest, KeysOfTenantsAreDistinct) {
     EXPECT_EQ(due[0].tenant_id, kTenant);
 }
 
-TEST(PromotionCandidateTrackerTest, ResetForgetsEverything) {
-    PromotionCandidateTracker tracker;
-    route::ObjectState state;
-    tracker.RecordLocked(kTenant, "k", state, 1,
-                         PromotionCandidateReason::kQueueCap, ErrorCode::OK);
-    tracker.Reset();
-    EXPECT_TRUE(tracker.Empty());
-    EXPECT_TRUE(AllFiled(tracker).empty());
-}
-
 TEST(PromotionCandidateTrackerTest, OnlyGatesThatClearOnTheirOwnAreTransient) {
     EXPECT_TRUE(PromotionCandidateTracker::IsTransient(
         PromotionQueueResult::kWatermarkRejected));

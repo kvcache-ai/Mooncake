@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
+MOONCAKE_ROOT=${MOONCAKE_ROOT_DIR:-}
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../lib/common.sh"
 MODE="${1:-all}"
@@ -36,7 +37,8 @@ Environment:
                                               to 1
   MOONCAKE_PYTHON_BIN                         Interpreter from a virtualenv
                                               with the root wheel installed
-  MOONCAKE_STORE_RS_DIR                    Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR                           Absolute Mooncake source directory
+  MOONCAKE_STORE_RS_DIR                       Absolute Store-RS source directory
 USAGE
 }
 
@@ -54,6 +56,11 @@ fi
 REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
 [[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
   echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
+MOONCAKE_ROOT=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit Mooncake source directory}
+[[ "${MOONCAKE_ROOT}" == /* && -d "${MOONCAKE_ROOT}/python/tests/store/rs" ]] || {
+  echo "MOONCAKE_ROOT_DIR must contain python/tests/store/rs: ${MOONCAKE_ROOT}" >&2
   exit 1
 }
 
@@ -208,7 +215,7 @@ mc_scripts_require_command redis-cli
 
 mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
-cd "${REPO_ROOT}"
+cd "${MOONCAKE_ROOT}"
 
 if [[ -z "${REDIS_PORT}" ]]; then
   REDIS_PORT=$(allocate_port)

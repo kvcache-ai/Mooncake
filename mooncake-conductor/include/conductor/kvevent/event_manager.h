@@ -151,8 +151,12 @@ std::string MakeServiceKey(const std::string& instance_id,
 
 class EventManager {
    public:
-    EventManager(std::vector<common::ServiceConfig> services,
-                 int http_server_port, int rpc_server_port = 0);
+    // max_blocks_per_context caps the prefix entries kept per index context;
+    // zero disables capacity eviction.
+    EventManager(
+        std::vector<common::ServiceConfig> services, int http_server_port,
+        int rpc_server_port = 0,
+        size_t max_blocks_per_context = prefixindex::kDefaultMaxBlocks);
     ~EventManager();
     EventManager(const EventManager&) = delete;
     EventManager& operator=(const EventManager&) = delete;

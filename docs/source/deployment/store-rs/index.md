@@ -2,7 +2,7 @@
 
 Use these guides to build the optional Store-RS component, configure a runtime,
 operate tenant policy and routes, and validate deployment scenarios. The
-[source-checkout quickstart](../../getting_started/store-rs.md) starts with a
+{ref}`Build with Store-RS <build-with-store-rs>` section starts with a
 root CMake build and the unified Python wheel.
 
 | Guide | Use it to |

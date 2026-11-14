@@ -376,7 +376,19 @@ wait_for_log \
   "${STARTUP_TIMEOUT_SECONDS}" \
   "${STORAGE_PID}"
 
-METRICS_ADDR=$(sed -n 's/.*metrics_addr=\([^ ]*\).*/\1/p' "${STORAGE_LOG}" | tail -n 1)
+METRICS_ADDR=$(
+  awk '
+    /mooncake-store-rs-client started / {
+      for (field = 1; field <= NF; field += 1) {
+        if ($field ~ /^metrics_addr=/) {
+          sub(/^metrics_addr=/, "", $field)
+          print $field
+          exit
+        }
+      }
+    }
+  ' "${STORAGE_LOG}"
+)
 if [[ -z "${METRICS_ADDR}" || "${METRICS_ADDR}" == "disabled" ]]; then
   echo "failed to resolve metrics address from ${STORAGE_LOG}" >&2
   cat "${STORAGE_LOG}" >&2
@@ -410,7 +422,7 @@ try:
         1 * 1024 * 1024,
         "tcp",
         "",
-        "",
+        os.environ["REDIS_URL"],
         stable_id=os.environ["DRIVER_ID"],
         keyspace=os.environ["KEYSPACE"],
         labels={"pool": "pool-a", "storage": "false", "route": "false"},
@@ -426,7 +438,7 @@ try:
         1 * 1024 * 1024,
         "tcp",
         "",
-        "",
+        os.environ["REDIS_URL"],
         stable_id=os.environ["READER_ID"],
         keyspace=os.environ["KEYSPACE"],
         labels={"pool": "pool-a", "storage": "false", "route": "false"},

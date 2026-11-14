@@ -3,12 +3,35 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
 #include <elastic/mooncake_ep_elastic_layout.cuh>
 #include <elastic/mooncake_ep_elastic_math.cuh>
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
 
 namespace mooncake::elastic {
+
+struct DispatchCopyEpilogueKernelArgs {
+    void* buffer;
+    void* workspace;
+    int* psum_num_recv_tokens_per_scaleup_rank;
+    int* psum_num_recv_tokens_per_expert;
+    void* recv_x;
+    sf_pack_t* recv_sf;
+    topk_idx_t* recv_topk_idx;
+    float* recv_topk_weights;
+    int* recv_src_metadata;
+    int* channel_linked_list;
+    int num_recv_tokens;
+    int recv_sf_token_stride;
+    int recv_sf_hidden_stride;
+    int scaleout_rank_idx;
+    int scaleup_rank_idx;
+};
+
+static_assert(std::is_trivially_copyable<DispatchCopyEpilogueKernelArgs>::value,
+              "DispatchCopyEpilogueKernelArgs must be trivially copyable");
 
 template <
     bool kDoExpand, bool kCachedMode,
@@ -21,13 +44,25 @@ template <
     int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank,
                                                            kNumChannels),
     bool kDoCreateLinkedList = (kNumScaleoutRanks > 1 and not kCachedMode)>
-__global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
-    void* buffer, void* workspace, int* psum_num_recv_tokens_per_scaleup_rank,
-    int* psum_num_recv_tokens_per_expert, void* recv_x, sf_pack_t* recv_sf,
-    topk_idx_t* recv_topk_idx, float* recv_topk_weights, int* recv_src_metadata,
-    int* channel_linked_list, int num_recv_tokens,
-    const int recv_sf_token_stride, const int recv_sf_hidden_stride,
-    const int scaleout_rank_idx, const int scaleup_rank_idx) {
+__device__ __forceinline__ void dispatch_copy_epilogue_kernel_impl(
+    const DispatchCopyEpilogueKernelArgs& args) {
+    void* buffer = args.buffer;
+    void* workspace = args.workspace;
+    int* psum_num_recv_tokens_per_scaleup_rank =
+        args.psum_num_recv_tokens_per_scaleup_rank;
+    int* psum_num_recv_tokens_per_expert = args.psum_num_recv_tokens_per_expert;
+    void* recv_x = args.recv_x;
+    sf_pack_t* recv_sf = args.recv_sf;
+    topk_idx_t* recv_topk_idx = args.recv_topk_idx;
+    float* recv_topk_weights = args.recv_topk_weights;
+    int* recv_src_metadata = args.recv_src_metadata;
+    int* channel_linked_list = args.channel_linked_list;
+    int num_recv_tokens = args.num_recv_tokens;
+    const int recv_sf_token_stride = args.recv_sf_token_stride;
+    const int recv_sf_hidden_stride = args.recv_sf_hidden_stride;
+    const int scaleout_rank_idx = args.scaleout_rank_idx;
+    const int scaleup_rank_idx = args.scaleup_rank_idx;
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x),
                thread_idx = static_cast<int>(threadIdx.x);
@@ -273,6 +308,18 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
             __syncwarp();
         }
     }
+}
+
+template <bool kDoExpand, bool kCachedMode, int kNumSMs, int kNumChannels,
+          int kNumWarps, int kNumScaleoutRanks, int kNumScaleupRanks,
+          int kNumHiddenBytes, int kNumSFPacks, int kNumMaxTokensPerRank,
+          int kNumExperts, int kNumTopk, int kNumThreads = kNumWarps * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    dispatch_copy_epilogue(const DispatchCopyEpilogueKernelArgs args) {
+    dispatch_copy_epilogue_kernel_impl<
+        kDoExpand, kCachedMode, kNumSMs, kNumChannels, kNumWarps,
+        kNumScaleoutRanks, kNumScaleupRanks, kNumHiddenBytes, kNumSFPacks,
+        kNumMaxTokensPerRank, kNumExperts, kNumTopk>(args);
 }
 
 }  // namespace mooncake::elastic

@@ -57,6 +57,9 @@ struct FabricChunkAttr {
     uint64_t length = 0;
     std::vector<int> nics;
     std::vector<uint64_t> keys;
+    // Subset of nics closest to the memory (same PCIe switch or NUMA node),
+    // which peers should target. Empty means no preference.
+    std::vector<int> near;
 
     // Returns false if the chunk is not registered on `nic`.
     bool keyFor(int nic, uint64_t& key) const;

@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <tuple>
 
@@ -228,26 +229,80 @@ Status NVMeoFTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
+    // Validate the entire submission before changing the batch or preparing
+    // any I/O. Otherwise a request past the segment end is silently clipped
+    // to its overlapping buffers and can be reported as COMPLETED.
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
+    std::unordered_map<SegmentID, uint64_t> segment_sizes;
+    const auto existing_slices = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
+    const auto slice_capacity = desc_pool_->getSliceCapacity();
+    if (existing_slices < 0 ||
+        static_cast<size_t>(existing_slices) > slice_capacity) {
+        return Status::InvalidArgument(
+            "NVMeoFTransport: Invalid descriptor capacity");
+    }
+    size_t remaining_slices =
+        slice_capacity - static_cast<size_t>(existing_slices);
+    for (const auto &request : entries) {
+        const auto target_id = request.target_id;
+        if (!segment_desc_map.count(target_id)) {
+            auto desc = metadata_->getSegmentDescByID(target_id);
+            if (!desc || desc->protocol != "nvmeof") {
+                return Status::InvalidArgument(
+                    "NVMeoFTransport: Missing or non-NVMe-oF segment");
+            }
+            uint64_t segment_size = 0;
+            for (const auto &buffer : desc->nvmeof_buffers) {
+                if (buffer.length >
+                    std::numeric_limits<uint64_t>::max() - segment_size) {
+                    return Status::InvalidArgument(
+                        "NVMeoFTransport: Segment length overflow");
+                }
+                segment_size += buffer.length;
+            }
+            segment_sizes[target_id] = segment_size;
+            segment_desc_map[target_id] = std::move(desc);
+        }
+
+        const auto segment_size = segment_sizes.at(target_id);
+        if (request.length == 0 || request.target_offset > segment_size ||
+            request.length > segment_size - request.target_offset) {
+            return Status::InvalidArgument(
+                "NVMeoFTransport: Request must be nonempty and within segment");
+        }
+        uint64_t buffer_start = 0;
+        const uint64_t request_end = request.target_offset + request.length;
+        for (const auto &buffer :
+             segment_desc_map.at(target_id)->nvmeof_buffers) {
+            const uint64_t buffer_end = buffer_start + buffer.length;
+            if (buffer.length != 0 && request.target_offset < buffer_end &&
+                buffer_start < request_end) {
+                if (remaining_slices == 0) {
+                    return Status::InvalidArgument(
+                        "NVMeoFTransport: Exceed descriptor slice capacity");
+                }
+                --remaining_slices;
+                const auto path =
+                    buffer.local_path_map.find(local_server_name_);
+                if (path == buffer.local_path_map.end() ||
+                    path->second.empty()) {
+                    return Status::InvalidArgument(
+                        "NVMeoFTransport: Missing or empty local buffer path");
+                }
+            }
+            buffer_start = buffer_end;
+        }
+    }
+
     size_t task_id = batch_desc.task_list.size();
     size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
     batch_desc.task_list.resize(task_id + entries.size());
-    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
-        segment_desc_map;
-    // segment_desc_map[LOCAL_SEGMENT_ID] =
-    // getSegmentDescByID(LOCAL_SEGMENT_ID);
-    for (auto &request : entries) {
+    for (const auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         auto target_id = request.target_id;
-
-        if (!segment_desc_map.count(target_id)) {
-            segment_desc_map[target_id] =
-                metadata_->getSegmentDescByID(target_id);
-            assert(segment_desc_map[target_id] != nullptr);
-        }
-
+        // Reuse the descriptors checked above rather than fetching them again.
         auto &desc = segment_desc_map.at(target_id);
-        // LOG(INFO) << "desc " << desc->name << " " << desc->protocol;
-        assert(desc->protocol == "nvmeof");
         // TODO: solving iterator invalidation due to vector resize
         // Handle File Offset
         uint32_t buffer_id = 0;
@@ -255,19 +310,20 @@ Status NVMeoFTransport::submitTransfer(
         uint64_t segment_end = request.target_offset + request.length;
         uint64_t current_offset = 0;
         for (auto &buffer_desc : desc->nvmeof_buffers) {
-            bool is_overlap = overlap(
-                (void *)segment_start, request.length, (void *)current_offset,
-                buffer_desc
-                    .length);  // this buffer intersects with user's target
+            // These are file offsets, not addresses. All additions are safe
+            // after validating the request and the cumulative buffer lengths.
+            const uint64_t buffer_end = current_offset + buffer_desc.length;
+            bool is_overlap = buffer_desc.length != 0 &&
+                              segment_start < buffer_end &&
+                              current_offset < segment_end;
             if (is_overlap) {
                 // 1. get_slice_start
                 uint64_t slice_start = std::max(segment_start, current_offset);
                 // 2. slice_end
-                uint64_t slice_end =
-                    std::min(segment_end, current_offset + buffer_desc.length);
+                uint64_t slice_end = std::min(segment_end, buffer_end);
                 // 3. init slice and put into TransferTask
                 const char *file_path =
-                    buffer_desc.local_path_map[local_server_name_].c_str();
+                    buffer_desc.local_path_map.at(local_server_name_).c_str();
                 void *source_addr =
                     (char *)request.source + slice_start - segment_start;
                 uint64_t file_offset = slice_start - current_offset;

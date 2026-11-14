@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -68,6 +69,20 @@ class MooncakeElasticBuffer {
                           const std::string& transport,
                           const std::vector<int32_t>& nccl_unique_id);
 
+    // Capacity-aware construction keeps IBGDA peer slots stable while the
+    // logical EP group is compacted to its current member list.
+    MooncakeElasticBuffer(
+        int transport_rank, int capacity_ranks, int logical_rank,
+        int logical_num_ranks, int64_t num_buffer_bytes,
+        int64_t num_max_tokens_per_rank, int64_t hidden, int64_t num_topk,
+        bool use_fp8_dispatch, bool deterministic, bool allow_hybrid_mode,
+        bool allow_multiple_reduction, bool prefer_overlap_with_compute,
+        int sl_idx, int num_allocated_qps, int num_cpu_timeout_secs,
+        int num_gpu_timeout_secs, const std::string& transport,
+        const std::vector<int32_t>& nccl_unique_id,
+        const std::vector<int32_t>& logical_to_transport_slots,
+        std::function<bool(bool)> init_status_callback = {});
+
     ~MooncakeElasticBuffer();
 
     // For NCCL, the caller must first quiesce CUDA work and coordinate every
@@ -80,6 +95,13 @@ class MooncakeElasticBuffer {
     // matching NCCL setup sequence at a quiescent EP boundary with the same
     // fresh unique ID; replacement ranks enter it through construction.
     void reconfigure_nccl(const std::vector<int32_t>& nccl_unique_id);
+    void reconfigure_nccl_membership(
+        const std::vector<int32_t>& nccl_unique_id, int logical_rank,
+        int logical_num_ranks,
+        const std::vector<int32_t>& logical_to_transport_slots);
+    void set_ibgda_membership(
+        int logical_rank, int logical_num_ranks,
+        const std::vector<int32_t>& logical_to_transport_slots);
 
     static int64_t calculate_buffer_size(int num_ranks,
                                          int64_t num_max_tokens_per_rank,
@@ -139,6 +161,13 @@ class MooncakeElasticBuffer {
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask);
+    void connect_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                      int64_t subnet_prefix, int64_t interface_id,
+                      const std::vector<int32_t>& qpns,
+                      const std::vector<int32_t>& lids,
+                      const std::vector<int32_t>& ipc_handle);
+    void disconnect_peer(int peer_rank);
+    void drain_queue_pairs();
 
    private:
     ElasticConfig config_;
@@ -154,6 +183,12 @@ class MooncakeElasticBuffer {
     int device_id_ = -1;
     int physical_num_sms_ = 0;
     int device_smem_bytes_ = 0;
+    int transport_rank_ = 0;
+    int capacity_ranks_ = 1;
+    int qps_per_rank_ = 1;
+    int32_t* logical_to_transport_slots_ = nullptr;
+    std::shared_ptr<void> logical_to_transport_slots_owner_;
+    std::vector<int32_t> logical_to_transport_slots_host_;
     bool destroyed_ = false;
 
     ElasticLaunchContext make_launch_context(int64_t timeout_cycles) const;

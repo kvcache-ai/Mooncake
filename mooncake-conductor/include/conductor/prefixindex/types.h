@@ -58,6 +58,7 @@ struct EngineRegistration {
     int64_t dp_rank = 0;
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
+    common::PublisherKind publisher_kind = common::PublisherKind::kVllm;
 };
 
 struct EngineMutation {

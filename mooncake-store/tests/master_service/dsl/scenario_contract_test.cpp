@@ -414,6 +414,15 @@ TEST(MasterScenarioContractTest, ReportsUnexpectedBatchProbeResult) {
         "BatchProbe returned an unexpected result for key missing");
 }
 
+TEST(MasterScenarioContractTest, ReportsBatchProbePolicyRejection) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("batch probe policy rejection")
+            .Given(MemoryNode("memory"))
+            .Given(Objects({"key"}).Size(1_KB).CompleteOn("memory"))
+            .Then(BatchProbe({"key"}).LastHitOnly(0).Returns({true})),
+        "BatchProbe failed for key key: INVALID_PARAMS");
+}
+
 TEST(MasterScenarioContractTest, ReportsUnexpectedMountLocalDiskError) {
     EXPECT_NONFATAL_FAILURE(
         MasterScenario("mount local disk without offload mode")

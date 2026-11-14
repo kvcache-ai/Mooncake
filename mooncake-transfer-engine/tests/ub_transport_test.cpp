@@ -103,8 +103,8 @@ class UBTransportTest : public ::testing::Test {
     std::pair<std::string, uint16_t> hostname_port;
     std::unique_ptr<mooncake::TransferEngine> engine;
     const size_t ram_buffer_size = 1ull << 30;
-    Transport *xport;
-    void **args;
+    Transport *xport = nullptr;
+    void **args = nullptr;
     mooncake::Transport::SegmentID segment_id;
     std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
     uint64_t remote_base;
@@ -121,6 +121,17 @@ class UBTransportTest : public ::testing::Test {
                      hostname_port.first.c_str(),
                      hostname_port.second + offset++);
         xport = nullptr;
+        // UbTransport takes its device list from Topology::getHcaList(). With
+        // an empty list it falls back to mock_urma_device, which cannot be
+        // opened on a host with real URMA devices, so discover here.
+        std::vector<std::string> ub_filter;
+        {
+            std::stringstream ss(FLAGS_device_name);
+            std::string item;
+            while (std::getline(ss, item, ','))
+                if (!item.empty()) ub_filter.push_back(item);
+        }
+        engine->getLocalTopology()->discover(ub_filter);
         std::string nic_priority_matrix = loadNicPriorityMatrix();
         args = (void **)malloc(2 * sizeof(void *));
         args[0] = (void *)nic_priority_matrix.c_str();
@@ -138,10 +149,16 @@ class UBTransportTest : public ::testing::Test {
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
-        engine->unregisterLocalMemory(addr);
-        freeMemoryPool(addr, ram_buffer_size);
+        // SetUp() can bail out on an ASSERT_* before the pool is allocated,
+        // and TearDown() still runs. Freeing a null pool segfaults.
+        if (addr) {
+            engine->unregisterLocalMemory(addr);
+            freeMemoryPool(addr, ram_buffer_size);
+            addr = nullptr;
+        }
         if (args) {
             free(args);
+            args = nullptr;
         }
     }
 };
@@ -175,7 +192,9 @@ TEST_F(UBTransportTest, MultiWrite) {
             }
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        // Both OK and BatchCleanupDeferred invalidate batch_id; the latter only
+        // means completion callbacks are still unwinding.
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
     }
 }
 
@@ -209,7 +228,9 @@ TEST_F(UBTransportTest, MultipleRead) {
             }
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        // Both OK and BatchCleanupDeferred invalidate batch_id; the latter only
+        // means completion callbacks are still unwinding.
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
     }
     times = 10;
     while (times--) {
@@ -236,7 +257,9 @@ TEST_F(UBTransportTest, MultipleRead) {
             }
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        // Both OK and BatchCleanupDeferred invalidate batch_id; the latter only
+        // means completion callbacks are still unwinding.
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
     }
 }
 

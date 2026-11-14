@@ -4,7 +4,7 @@ The Python Store facade selects its implementation when mooncake.store is
 first imported. The shared API and default C++ backend are documented in
 [Mooncake Store Python API](mooncake-store.md). This page describes Store-RS
 runtime and API behavior. See the
-[source-checkout quickstart](../../getting_started/store-rs.md) to build and
+{ref}`Build with Store-RS <build-with-store-rs>` section to build and
 install the unified root wheel.
 
 ## What the Python Layer Provides

@@ -15,7 +15,7 @@ use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, MetadataBackend,
     ObjectKey, Result, SegmentLifecycleState, SegmentName, StoreError, TenantObjectAccountingState,
     TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
-    TenantQuotaReservationState,
+    TenantQuotaReservationState, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
 };
 use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_rs_transport::{TentEngine, TentEngineConfig};
@@ -72,6 +72,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "multi-tenant".to_string(),
             "dynamic-membership".to_string(),
         ]);
+
+    if lifecycle_only_e2e() && lifecycle_disabled_e2e() {
+        return Err(StoreError::InvalidState(
+            "lifecycle-only E2E requires allocation lifecycle capability".to_string(),
+        )
+        .into());
+    }
+    if lifecycle_only_e2e() {
+        run_minimal_lifecycle_delete_reclaim(metadata, redis_port, rdma_mode.enabled, value_size)?;
+        println!("e2e ok: remote allocation lifecycle delete reclaim (lifecycle-only mode)");
+        return Ok(());
+    }
+    if lifecycle_write_bench_only() {
+        run_minimal_lifecycle_write_benchmark(
+            metadata,
+            redis_port,
+            rdma_mode.enabled,
+            value_size,
+            batch_bench_iters,
+        )?;
+        println!("e2e ok: TCP/TENT routed write benchmark (benchmark-only mode)");
+        return Ok(());
+    }
 
     let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment", rdma_mode.enabled)?;
     let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment", rdma_mode.enabled)?;
@@ -253,15 +276,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     elastic_target.register_local_memory()?;
     elastic_router.register_local_memory()?;
 
+    if matches!(
+        env::var("MC_STORE_RS_E2E_TENT_ABI_ONLY").as_deref(),
+        Ok("1")
+    ) {
+        verify_batch_put_get(&target_a, &reader, value_size)?;
+        println!("TENT ABI batch Put/Get E2E passed");
+        return Ok(());
+    }
+
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
-    verify_strict_tenant_quota(
-        metadata.clone(),
-        redis_port,
-        &reader,
-        value_size,
-        rdma_mode.enabled,
-    )?;
+    verify_strict_tenant_quota(metadata.clone(), redis_port, value_size, rdma_mode.enabled)?;
     verify_batch_put_get(&target_a, &reader, value_size)?;
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
     verify_multi_buffer_batch_ops(&target_a, &reader, value_size)?;
@@ -284,11 +310,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &reader,
         value_size,
     )?;
+    target_c.register_local_memory()?;
     verify_rdma_bandwidth_isolation(
         metadata.clone(),
         planner.clone(),
         redis_port,
-        &reader,
         value_size,
         &rdma_mode,
     )?;
@@ -427,7 +453,7 @@ fn build_client(
         .state(state)
         .activate_on_local_memory_registration()
         .tenant(tenant)
-        .compatibility(CompatibilityDescriptor::default())
+        .compatibility(e2e_compatibility())
         .local_memory(memory)
         .with_tent(transport.engine)
         .transport_factory(transport.factory);
@@ -454,7 +480,7 @@ fn build_routed_client(
         .state(state)
         .activate_on_local_memory_registration()
         .tenant(tenant)
-        .compatibility(CompatibilityDescriptor::default())
+        .compatibility(e2e_compatibility())
         .local_memory(memory)
         .with_tent(transport.engine)
         .transport_factory(transport.factory)
@@ -497,22 +523,31 @@ fn verify_multi_tenant_isolation(
     value_size: usize,
 ) -> Result<()> {
     let tenant_a = payload("tenant-a-value", value_size);
-    let tenant_b = payload("tenant-b-value", value_size);
     writer.put_in_tenant("tenant-a", "shared-key", &tenant_a)?;
-    writer.put_in_tenant("tenant-b", "shared-key", &tenant_b)?;
+    let round_trip = reader.get_in_tenant("tenant-a", "shared-key")?;
+    ensure_payload("tenant-a isolation", &tenant_a, &round_trip)?;
 
-    let keys = [
-        ObjectRef::new("shared-key").tenant("tenant-a"),
-        ObjectRef::new("shared-key").tenant("tenant-b"),
-    ];
-    let results = reader.batch_get(&keys)?;
-    ensure_payload("tenant-a isolation", &tenant_a, &results[0])?;
-    ensure_payload("tenant-b isolation", &tenant_b, &results[1])?;
+    if !matches!(
+        writer.put_in_tenant("tenant-b", "shared-key", b"tenant-b-value"),
+        Err(StoreError::InvalidState(_))
+    ) {
+        return Err(StoreError::InvalidState(
+            "tenant-bound writer accepted a cross-tenant write".to_string(),
+        ));
+    }
+    if !matches!(
+        reader.get_in_tenant("tenant-b", "shared-key"),
+        Err(StoreError::InvalidState(_))
+    ) {
+        return Err(StoreError::InvalidState(
+            "tenant-bound reader accepted a cross-tenant read".to_string(),
+        ));
+    }
     Ok(())
 }
 
 fn put_tenant_quota_policy(
-    metadata: &RedisMetadataBackend,
+    metadata: &dyn MetadataBackend,
     tenant: &str,
     max_bytes: u64,
     max_objects: usize,
@@ -539,7 +574,6 @@ fn put_tenant_quota_policy(
 fn verify_strict_tenant_quota(
     metadata: Arc<RedisMetadataBackend>,
     redis_port: u16,
-    reader: &StoreClient,
     value_size: usize,
     rdma_enabled: bool,
 ) -> Result<()> {
@@ -547,6 +581,13 @@ fn verify_strict_tenant_quota(
     let key_ok = "quota-ok";
     let key_over = "quota-over";
     let key_reuse = "quota-reuse";
+    let quota_metadata = metadata.for_tenant(tenant).ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "metadata backend does not support tenant keyspace for {tenant}"
+        ))
+    })?;
+    // Policy APIs derive the tenant control-plane keyspace from the scope.
+    // Keep this tenant view for quota state and accounting inspection below.
     put_tenant_quota_policy(metadata.as_ref(), tenant, value_size as u64, 1)?;
 
     let bundle = build_tent_bundle(redis_port, "quota-e2e-segment", rdma_enabled)?;
@@ -571,11 +612,11 @@ fn verify_strict_tenant_quota(
 
     let first = payload("strict-quota-ok", value_size);
     writer.put(key_ok, &first)?;
-    let round_trip = reader.get_in_tenant(tenant, key_ok)?;
+    let round_trip = writer.get(key_ok)?;
     ensure_payload("strict quota first put", &first, &round_trip)?;
 
     let scope = TenantPolicyScope::new(tenant, None::<String>, None::<String>);
-    let quota_after_put = metadata
+    let quota_after_put = quota_metadata
         .get_tenant_quota_state(&scope)?
         .ok_or_else(|| StoreError::NotFound(format!("quota state missing for {tenant}")))?;
     if quota_after_put.used_bytes != value_size as u64
@@ -593,7 +634,7 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let accounting_after_put = metadata
+    let accounting_after_put = quota_metadata
         .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_ok}")))?
         .ok_or_else(|| {
             StoreError::NotFound(format!("quota accounting missing for {tenant}::{key_ok}"))
@@ -609,7 +650,7 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let reservations_after_put = metadata.list_tenant_quota_reservations(&scope)?;
+    let reservations_after_put = quota_metadata.list_tenant_quota_reservations(&scope)?;
     let first_reservation = reservations_after_put
         .iter()
         .find(|reservation| reservation.key == ObjectKey::new(format!("{tenant}::{key_ok}")))
@@ -645,16 +686,18 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let quota_after_reject = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
-        StoreError::NotFound(format!("quota state missing for {tenant} after reject"))
-    })?;
+    let quota_after_reject = quota_metadata
+        .get_tenant_quota_state(&scope)?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("quota state missing for {tenant} after reject"))
+        })?;
     if quota_after_reject != quota_after_put {
         return Err(StoreError::InvalidState(format!(
             "strict quota reject changed quota state: before={:?} after={:?}",
             quota_after_put, quota_after_reject
         )));
     }
-    let reservations_after_reject = metadata.list_tenant_quota_reservations(&scope)?;
+    let reservations_after_reject = quota_metadata.list_tenant_quota_reservations(&scope)?;
     if reservations_after_reject.len() != reservations_after_put.len() {
         return Err(StoreError::InvalidState(format!(
             "strict quota reject changed reservation count: before={} after={}",
@@ -665,13 +708,13 @@ fn verify_strict_tenant_quota(
 
     let second = payload("strict-quota-evicted", value_size);
     writer.put(key_over, &second)?;
-    let round_trip_after_evict = reader.get_in_tenant(tenant, key_over)?;
+    let round_trip_after_evict = writer.get(key_over)?;
     ensure_payload(
         "strict quota eviction admitted replacement",
         &second,
         &round_trip_after_evict,
     )?;
-    if metadata
+    if quota_metadata
         .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_ok}")))?
         .is_some()
     {
@@ -679,9 +722,11 @@ fn verify_strict_tenant_quota(
             "strict quota original accounting still exists after tenant-local eviction".to_string(),
         ));
     }
-    let quota_after_evict = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
-        StoreError::NotFound(format!("quota state missing for {tenant} after eviction"))
-    })?;
+    let quota_after_evict = quota_metadata
+        .get_tenant_quota_state(&scope)?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("quota state missing for {tenant} after eviction"))
+        })?;
     if quota_after_evict.used_bytes != value_size as u64
         || quota_after_evict.used_objects != 1
         || quota_after_evict.pending_reserved_bytes != 0
@@ -698,9 +743,11 @@ fn verify_strict_tenant_quota(
     }
 
     writer.remove(key_over, true)?;
-    let quota_after_delete = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
-        StoreError::NotFound(format!("quota state missing for {tenant} after delete"))
-    })?;
+    let quota_after_delete = quota_metadata
+        .get_tenant_quota_state(&scope)?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("quota state missing for {tenant} after delete"))
+        })?;
     if quota_after_delete.used_bytes != 0
         || quota_after_delete.used_objects != 0
         || quota_after_delete.pending_reserved_bytes != 0
@@ -714,7 +761,7 @@ fn verify_strict_tenant_quota(
             quota_after_delete.pending_reserved_objects,
         )));
     }
-    if metadata
+    if quota_metadata
         .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_over}")))?
         .is_some()
     {
@@ -722,7 +769,7 @@ fn verify_strict_tenant_quota(
             "strict quota accounting still exists after authoritative delete".to_string(),
         ));
     }
-    let reservations_after_delete = metadata.list_tenant_quota_reservations(&scope)?;
+    let reservations_after_delete = quota_metadata.list_tenant_quota_reservations(&scope)?;
     let delete_reservation = reservations_after_delete
         .iter()
         .find(|reservation| {
@@ -744,7 +791,7 @@ fn verify_strict_tenant_quota(
 
     let third = payload("strict-quota-reuse", value_size);
     writer.put(key_reuse, &third)?;
-    let reused = reader.get_in_tenant(tenant, key_reuse)?;
+    let reused = writer.get(key_reuse)?;
     ensure_payload("strict quota delete refund reuse", &third, &reused)?;
     Ok(())
 }
@@ -1461,7 +1508,6 @@ fn verify_rdma_bandwidth_isolation(
     metadata: Arc<RedisMetadataBackend>,
     planner: PlacementPlanner,
     redis_port: u16,
-    reader: &StoreClient,
     value_size: usize,
     rdma_mode: &RdmaMode,
 ) -> Result<()> {
@@ -1611,13 +1657,13 @@ fn verify_rdma_bandwidth_isolation(
             ensure_payload(
                 "rdma high tenant readback",
                 &payload(&high_key, value_size),
-                &reader.get_in_tenant("tenant-high", &high_key)?,
+                &high.get(&high_key)?,
             )?;
             let low_key = format!("{low_prefix}-{index}");
             ensure_payload(
                 "rdma low tenant readback",
                 &payload(&low_key, value_size),
-                &reader.get_in_tenant("tenant-low", &low_key)?,
+                &low.get(&low_key)?,
             )?;
         }
 
@@ -1693,12 +1739,13 @@ fn run_batch_put_benchmark(
     iterations: usize,
     other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
+    let tenant = writer.default_tenant().to_string();
     for batch_size in [1usize, 8, 64] {
         let start = Instant::now();
         let mut total_bytes = 0usize;
         for iteration in 0..iterations {
             let items = build_items(
-                "bench-put",
+                &tenant,
                 &format!("put-{batch_size}-{iteration}"),
                 batch_size,
                 value_size,
@@ -1736,7 +1783,15 @@ fn run_batch_get_benchmark(
     iterations: usize,
     other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
-    let items = build_items("bench-get", "get", 64, value_size);
+    let tenant = writer.default_tenant().to_string();
+    if reader.default_tenant() != tenant {
+        return Err(StoreError::InvalidState(format!(
+            "batch get benchmark requires matching writer and reader tenants: writer={} reader={}",
+            tenant,
+            reader.default_tenant()
+        )));
+    }
+    let items = build_items(&tenant, "get", 64, value_size);
     let puts = items
         .iter()
         .map(|item| {
@@ -1948,4 +2003,219 @@ struct OwnedItem {
     tenant: String,
     key: String,
     value: Vec<u8>,
+}
+
+fn run_minimal_lifecycle_write_benchmark(
+    metadata: Arc<RedisMetadataBackend>,
+    redis_port: u16,
+    rdma_enable: bool,
+    value_size: usize,
+    iterations: usize,
+) -> Result<()> {
+    let owner_bundle = build_tent_bundle(redis_port, "lifecycle-bench-owner", rdma_enable)?;
+    let router_bundle = build_tent_bundle(redis_port, "lifecycle-bench-router", rdma_enable)?;
+    let tenant = "tenant-lifecycle-write-bench";
+    let owner_memory = LocalMemoryConfig::new()
+        .storage_bytes(MEMORY_BYTES)
+        .scratch_bytes(SCRATCH_BYTES)
+        .location("cpu:0")
+        .numa_aware(false);
+    let router_memory = LocalMemoryConfig::new()
+        .storage_bytes(32 * 1024)
+        .scratch_bytes(SCRATCH_BYTES)
+        .location("cpu:0")
+        .numa_aware(false);
+    let mut owner = build_client(
+        metadata.clone(),
+        "lifecycle-bench-owner",
+        ClientLifecycleState::Active,
+        owner_bundle,
+        owner_memory,
+        tenant,
+        &[("storage", "true"), ("role", "owner")],
+    )?;
+    let mut router = build_routed_client(
+        metadata.clone(),
+        "lifecycle-bench-router",
+        ClientLifecycleState::Active,
+        router_bundle,
+        router_memory,
+        tenant,
+        &[("storage", "false"), ("role", "router")],
+        PlacementPlanner::new(metadata).require_label("storage", "true"),
+        1,
+        None,
+    )?;
+    owner.register_local_memory()?;
+    router.register_local_memory()?;
+    heartbeat_clients(&mut [&mut owner, &mut router])?;
+    // Batch sizes share this owner/router and retain prior runtime state.
+    // This is a sequence measurement, not an independent performance comparison.
+    run_batch_put_benchmark(&mut router, value_size, iterations, &mut [&mut owner])
+}
+
+fn run_minimal_lifecycle_delete_reclaim(
+    metadata: Arc<RedisMetadataBackend>,
+    redis_port: u16,
+    rdma_enable: bool,
+    value_size: usize,
+) -> Result<()> {
+    let owner_bundle = build_tent_bundle(redis_port, "lifecycle-delete-owner", rdma_enable)?;
+    let router_bundle = build_tent_bundle(redis_port, "lifecycle-delete-router", rdma_enable)?;
+    let reader_bundle = build_tent_bundle(redis_port, "lifecycle-delete-reader", rdma_enable)?;
+    let tenant = "tenant-lifecycle-delete";
+    let owner_memory = LocalMemoryConfig::new()
+        .storage_bytes(value_size.saturating_mul(2))
+        .scratch_bytes(value_size.saturating_mul(2))
+        .location("cpu:0")
+        .reclaim_grace_ms(0)
+        .numa_aware(false);
+    let client_memory = LocalMemoryConfig::new()
+        .storage_bytes(32 * 1024)
+        .scratch_bytes(value_size.saturating_mul(2))
+        .location("cpu:0")
+        .numa_aware(false);
+    let mut owner = build_client(
+        metadata.clone(),
+        "lifecycle-delete-owner",
+        ClientLifecycleState::Active,
+        owner_bundle,
+        owner_memory,
+        tenant,
+        &[("storage", "true"), ("role", "owner")],
+    )?;
+    let mut router = build_routed_client(
+        metadata.clone(),
+        "lifecycle-delete-router",
+        ClientLifecycleState::Active,
+        router_bundle,
+        client_memory.clone(),
+        tenant,
+        &[("storage", "false"), ("role", "router")],
+        PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+        1,
+        None,
+    )?;
+    let mut reader = build_client(
+        metadata,
+        "lifecycle-delete-reader",
+        ClientLifecycleState::Active,
+        reader_bundle,
+        client_memory,
+        tenant,
+        &[("storage", "false"), ("role", "reader")],
+    )?;
+    owner.register_local_memory()?;
+    router.register_local_memory()?;
+    reader.register_local_memory()?;
+    heartbeat_clients(&mut [&mut owner, &mut router, &mut reader])?;
+    verify_remote_lifecycle_delete_reclaim(&router, &owner, &reader, value_size)
+}
+
+fn verify_remote_lifecycle_delete_reclaim(
+    router: &StoreClient,
+    owner: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(owner.runtime_id().storage_key());
+    let first_value = payload("remote-lifecycle-delete-a", value_size);
+    let first_route = router.put_with_policy("remote-lifecycle-delete-a", &first_value, &policy)?;
+    let first_replica = first_route.replicas.first().ok_or_else(|| {
+        StoreError::InvalidState("remote lifecycle route has no replica".to_string())
+    })?;
+    if first_replica.owner != *owner.runtime_id() {
+        return Err(StoreError::InvalidState(format!(
+            "remote lifecycle write selected {} instead of {}",
+            first_replica.owner,
+            owner.runtime_id()
+        )));
+    }
+    let first_offset = first_replica.segment_offset;
+    ensure_payload(
+        "remote lifecycle initial read",
+        &first_value,
+        &reader.get("remote-lifecycle-delete-a")?,
+    )?;
+
+    router.remove("remote-lifecycle-delete-a", true)?;
+    let visibility_deadline = Instant::now() + Duration::from_secs(10);
+    while router.is_exist("remote-lifecycle-delete-a")? {
+        if Instant::now() >= visibility_deadline {
+            return Err(StoreError::InvalidState(
+                "remote lifecycle route remains visible after mirror convergence".to_string(),
+            ));
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let used_bytes = owner
+            .list_segments()?
+            .iter()
+            .map(|segment| segment.used_bytes)
+            .sum::<u64>();
+        if used_bytes == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(StoreError::InvalidState(format!(
+                "remote lifecycle owner did not reclaim deleted allocation within 10s: used_bytes={used_bytes}"
+            )));
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    let replacement = payload("remote-lifecycle-delete-b", value_size);
+    let second_route =
+        router.put_with_policy("remote-lifecycle-delete-b", &replacement, &policy)?;
+    let second_replica = second_route.replicas.first().ok_or_else(|| {
+        StoreError::InvalidState("remote lifecycle replacement has no replica".to_string())
+    })?;
+    if second_replica.owner != *owner.runtime_id() || second_replica.segment_offset != first_offset
+    {
+        return Err(StoreError::InvalidState(format!(
+            "remote lifecycle did not reuse owner allocation: owner={} offset={} expected_owner={} expected_offset={first_offset}",
+            second_replica.owner,
+            second_replica.segment_offset,
+            owner.runtime_id(),
+        )));
+    }
+    ensure_payload(
+        "remote lifecycle replacement read",
+        &replacement,
+        &reader.get("remote-lifecycle-delete-b")?,
+    )?;
+    Ok(())
+}
+
+fn e2e_env_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn lifecycle_only_e2e() -> bool {
+    e2e_env_enabled("MC_STORE_RS_E2E_LIFECYCLE_ONLY")
+}
+
+fn lifecycle_write_bench_only() -> bool {
+    e2e_env_enabled("MC_STORE_RS_E2E_WRITE_BENCH_ONLY")
+}
+
+fn e2e_compatibility() -> CompatibilityDescriptor {
+    let mut compatibility = CompatibilityDescriptor::default();
+    if lifecycle_disabled_e2e() {
+        compatibility
+            .capabilities
+            .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    }
+    compatibility
+}
+
+fn lifecycle_disabled_e2e() -> bool {
+    e2e_env_enabled("MC_STORE_RS_E2E_DISABLE_ALLOCATION_LIFECYCLE")
 }

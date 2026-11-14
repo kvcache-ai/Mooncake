@@ -132,6 +132,7 @@ pub struct StoreClientBuilder {
     namespace_quota: Option<NamespaceQuota>,
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
+    allocation_lifecycle: AllocationLifecycleConfig,
     cold_tier_targets: Vec<ColdTierTargetConfig>,
     nof_targets: Vec<cold_tier::nof::NofTargetConfig>,
     nof_replica_count: usize,
@@ -168,6 +169,7 @@ impl StoreClientBuilder {
             namespace_quota: None,
             execution_fairness: None,
             bandwidth_shaping: None,
+            allocation_lifecycle: AllocationLifecycleConfig::default(),
             cold_tier_targets: Vec::new(),
             nof_targets: Vec::new(),
             nof_replica_count: 1,
@@ -373,6 +375,11 @@ impl StoreClientBuilder {
         self
     }
 
+    pub fn allocation_lifecycle(mut self, allocation_lifecycle: AllocationLifecycleConfig) -> Self {
+        self.allocation_lifecycle = allocation_lifecycle;
+        self
+    }
+
     pub fn cold_tier_shutdown_mode(mut self, mode: ColdTierShutdownMode) -> Self {
         self.cold_tier_shutdown_mode = mode;
         self
@@ -442,8 +449,18 @@ impl StoreClientBuilder {
             && self.initial_state == ClientLifecycleState::Active
             && published_initial_state != self.initial_state;
 
+        if let Some(bound_tenant) = self.metadata.bound_tenant() {
+            if bound_tenant != self.default_tenant {
+                return Err(StoreError::InvalidState(format!(
+                    "metadata backend is bound to tenant {bound_tenant}, but StoreClient is configured for tenant {}",
+                    self.default_tenant
+                )));
+            }
+        }
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
-        let runtime_metadata = if self.metadata_is_tenant_scoped {
+        let runtime_metadata = if self.metadata_is_tenant_scoped
+            || self.metadata.bound_tenant() == Some(self.default_tenant.as_str())
+        {
             self.metadata.clone()
         } else {
             self.metadata
@@ -455,8 +472,19 @@ impl StoreClientBuilder {
         let effective_namespace_quota =
             resolved_namespace_quota(&effective_tenant_policy).or(self.namespace_quota.clone());
         let effective_route_control = self.route_control;
-        let effective_route_topk = route_topk_from_tenant_spec(&effective_tenant_policy)
-            .unwrap_or(self.route_topk);
+        let mut effective_compatibility = self.compatibility;
+        if effective_route_control == RouteControlMode::MetadataOnly {
+            // MetadataOnly has no exact allocation-reference query. Advertising
+            // this capability there would create PendingPublish tokens that the
+            // owner cannot safely resolve after a route RPC reply is lost.
+            effective_compatibility
+                .capabilities
+                .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+        }
+        let allocation_lifecycle_enabled =
+            effective_compatibility.supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+        let effective_route_topk =
+            route_topk_from_tenant_spec(&effective_tenant_policy).unwrap_or(self.route_topk);
         let state = Arc::new(Mutex::new(StoreState::default()));
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
         let lifecycle_state = Arc::new(AtomicU8::new(encode_lifecycle_state(
@@ -475,11 +503,15 @@ impl StoreClientBuilder {
                 epoch: ClientEpoch::default(),
             },
             state: published_initial_state,
-            compatibility: self.compatibility,
+            compatibility: effective_compatibility,
             endpoints: endpoints.clone(),
             expires_at_ms,
         };
-        validate_startup_conflicts(runtime_metadata.as_ref(), control_client.as_ref(), &template)?;
+        validate_startup_conflicts(
+            runtime_metadata.as_ref(),
+            control_client.as_ref(),
+            &template,
+        )?;
         let runtime = runtime_metadata.allocate_client_lease(&template)?;
         let provisional_lease = ClientLease {
             runtime: runtime.clone(),
@@ -515,8 +547,13 @@ impl StoreClientBuilder {
             Vec::new()
         };
         let route_directory = build_route_directory(
-            effective_route_control,
-            effective_route_topk,
+            crate::route_directory::RouteDirectoryBuildConfig {
+                mode: effective_route_control,
+                route_topk: effective_route_topk,
+                delete_marker_budget_bytes: delete_marker_budget_bytes(
+                    self.local_memory.storage_bytes,
+                ),
+            },
             runtime_metadata.clone(),
             &provisional_lease,
             control_client.clone(),
@@ -658,6 +695,7 @@ impl StoreClientBuilder {
             lifecycle_state: lifecycle_state.clone(),
             transfer_stall_timeout: self.transfer_stall_timeout,
             request_timeout_override: self.request_timeout_override,
+            allocation_lifecycle: self.allocation_lifecycle,
         });
         let migration_adapter =
             Arc::new(LocalMigrationAdapter::new(LocalMigrationExecutionContext {
@@ -758,7 +796,11 @@ impl StoreClientBuilder {
             &runtime,
             runtime_metadata.clone(),
             live_client_cache.clone(),
-            if refresh_cold_tier_devices { Some(cold_tier_device_cache.clone()) } else { None },
+            if refresh_cold_tier_devices {
+                Some(cold_tier_device_cache.clone())
+            } else {
+                None
+            },
             self.live_client_sync_interval,
             route_namespace.clone(),
             suspect_runtime_cache.clone(),
@@ -770,6 +812,12 @@ impl StoreClientBuilder {
             storage_owner.clone(),
         )?;
         let async_replica_tracking = AsyncReplicaTrackHandle::spawn(
+            &runtime,
+            runtime_metadata.clone(),
+            control_client.clone(),
+            live_client_cache.clone(),
+        )?;
+        let async_delete_pending = AsyncDeletePendingHandle::spawn(
             &runtime,
             runtime_metadata.clone(),
             control_client.clone(),
@@ -810,6 +858,7 @@ impl StoreClientBuilder {
             membership_sync,
             _async_eviction: async_eviction,
             async_replica_tracking,
+            async_delete_pending,
             async_route_hit_reporting,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
@@ -830,6 +879,8 @@ impl StoreClientBuilder {
                 .or(self.execution_fairness),
             bandwidth_shaping: resolved_bandwidth_shaping(&effective_tenant_policy)
                 .or(self.bandwidth_shaping),
+            allocation_lifecycle: self.allocation_lifecycle,
+            allocation_lifecycle_enabled,
             placement_policy: resolved_placement_policy(&effective_tenant_policy),
             state,
             owns_local_state_lifecycle: true,
@@ -841,6 +892,17 @@ impl StoreClientBuilder {
             deferred_cold_tier_reconciles: Mutex::new(deferred_reconciles),
         })
     }
+}
+
+fn delete_marker_budget_bytes(storage_bytes: usize) -> usize {
+    const MIN_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    const DEFAULT_RATIO: f64 = 0.01;
+    let ratio = std::env::var("MC_STORE_RS_DELETE_MARKER_MEMORY_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+        .unwrap_or(DEFAULT_RATIO);
+    ((storage_bytes as f64 * ratio) as usize).max(MIN_BUDGET_BYTES)
 }
 
 fn bootstrap_route_policy(

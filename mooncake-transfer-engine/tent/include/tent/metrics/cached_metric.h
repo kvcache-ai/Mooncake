@@ -87,6 +87,21 @@ class CachedDynamicCounter
         return &cell->value;
     }
 
+    // Resolve a bounded label during initialization. Hot-path users that need
+    // a strict no-allocation/no-lock side channel can then use incResolved().
+    void preResolve(size_t label_index, const Label& label) {
+        slots_[label_index].store(resolve(label));
+    }
+
+    // Increment only an already-resolved cell. Missing initialization drops
+    // the observation instead of allocating, locking, throwing, or changing
+    // the caller's control flow.
+    void incResolved(size_t label_index, int64_t value = 1) noexcept {
+        if (auto* cell = slots_[label_index].load(); cell != nullptr) {
+            cell->fetch_add(value, std::memory_order_relaxed);
+        }
+    }
+
     // Increment via the cached cell; make_label runs only on first use.
     template <typename LabelFn>
     void incCached(size_t label_index, LabelFn&& make_label,
@@ -148,6 +163,27 @@ class CachedDynamicHistogram {
             sum_cell = sum_->resolve(make_label());
             sum_slots_[label_index].store(sum_cell);
         }
+        sum_cell->fetch_add(value, std::memory_order_relaxed);
+    }
+
+    // Pre-resolve every bucket and the sum cell for one bounded label value.
+    void preResolve(size_t label_index, const Label& label) {
+        for (size_t bucket = 0; bucket < buckets_.size(); ++bucket) {
+            const size_t slot = label_index * buckets_.size() + bucket;
+            bucket_slots_[slot].store(buckets_[bucket]->resolve(label));
+        }
+        sum_slots_[label_index].store(sum_->resolve(label));
+    }
+
+    // Observe only pre-resolved cells. If initialization was incomplete, drop
+    // the sample without affecting the transfer that produced it.
+    void observeResolved(size_t label_index, int64_t value) noexcept {
+        const size_t bucket = bucketIndex(value);
+        const size_t slot = label_index * buckets_.size() + bucket;
+        auto* cell = bucket_slots_[slot].load();
+        auto* sum_cell = sum_slots_[label_index].load();
+        if (cell == nullptr || sum_cell == nullptr) return;
+        cell->fetch_add(1, std::memory_order_relaxed);
         sum_cell->fetch_add(value, std::memory_order_relaxed);
     }
 

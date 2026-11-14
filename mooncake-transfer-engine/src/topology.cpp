@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -39,6 +40,10 @@
 #endif
 #include "topology.h"
 #include "char_util.h"
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_discovery.h"
+#include "transport/efa_transport/efa_neuron.h"
+#endif
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
@@ -322,6 +327,83 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
 #endif
 }
 
+#if defined(USE_EFA) && !defined(USE_CXI)
+// Replaces the EFA NICs in `devices` with the ones libfabric reports. Those
+// are exactly the devices the EFA transport can open (EfaContext uses the same
+// fi_getinfo() hints), so EFA discovery does not depend on how a device looks
+// through libibverbs and sysfs. Existing entries keep their position, which
+// keeps NIC indices unchanged; NICs only libfabric reports are appended.
+//
+// Hosts whose verbs devices are all non-EFA (e.g. Mellanox) are left alone,
+// so RDMA-only processes never initialize libfabric.
+static void useLibfabricEfaNics(std::vector<InfinibandDevice> &devices,
+                                const std::vector<std::string> &filter) {
+    bool verbs_has_efa = false;
+    for (const auto &device : devices) {
+        if (isEfaDevice(device.name)) {
+            verbs_has_efa = true;
+            break;
+        }
+    }
+    if (!devices.empty() && !verbs_has_efa) return;
+
+    std::vector<EfaNic> nics;
+    std::string error;
+    if (!listEfaNics(nics, &error)) {
+        if (verbs_has_efa) {
+            LOG(INFO) << "Using the EFA devices found through libibverbs: "
+                         "cannot list them through libfabric ("
+                      << error << ")";
+        }
+        return;
+    }
+
+    const auto whitelist = getIbvDeviceWhitelist();
+    std::map<std::string, const EfaNic *> wanted;
+    for (const auto &nic : nics) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), nic.name) == filter.end())
+            continue;
+        if (!whitelist.empty() && !whitelist.count(nic.name)) continue;
+        wanted[nic.name] = &nic;
+    }
+
+    auto to_device = [](const EfaNic &nic, const InfinibandDevice *verbs) {
+        InfinibandDevice device{.name = nic.name,
+                                .pci_bus_id = nic.pci_bus_id,
+                                .numa_node = nic.numa_node};
+        if (device.pci_bus_id.empty() && verbs) {
+            device.pci_bus_id = verbs->pci_bus_id;
+            device.numa_node = verbs->numa_node;
+        }
+        return device;
+    };
+
+    std::vector<InfinibandDevice> merged;
+    std::set<std::string> placed;
+    for (const auto &device : devices) {
+        if (!isEfaDevice(device.name)) {
+            merged.push_back(device);
+            continue;
+        }
+        auto it = wanted.find(device.name);
+        if (it == wanted.end()) {
+            LOG(INFO) << "Skipping EFA device " << device.name
+                      << ": libfabric does not offer it";
+            continue;
+        }
+        merged.push_back(to_device(*it->second, &device));
+        placed.insert(device.name);
+    }
+    for (const auto &entry : wanted) {
+        if (placed.count(entry.first)) continue;
+        merged.push_back(to_device(*entry.second, nullptr));
+        LOG(INFO) << "EFA device " << entry.first << " found through libfabric";
+    }
+    devices = std::move(merged);
+}
+#endif
+
 static void precomputeResolvedHcaPeerAffinity(
     const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
     std::unordered_map<std::string,
@@ -510,7 +592,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -673,6 +755,45 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 }
 #endif
 
+#ifdef USE_EFA
+// Neuron (Trainium / Inferentia) devices cannot go through the PCI-distance
+// heuristic above: the driver presents them as *virtual* class devices with no
+// link back to their PCI function, so /sys offers nothing to measure.  The
+// runtime does know the mapping, and neuronNicAffinity() asks it -- see
+// efa_neuron.h for why that is safe to do this early.
+//
+// The distinction matters more here than it does for GPUs.  On trn2.48xlarge a
+// NIC one switch away from the device it is serving measured 2.5 GB/s against
+// 19.2 GB/s for a switch-local one, so getting this wrong does not shave a few
+// percent, it costs 7.7x and lands below plain host DRAM.
+static std::vector<TopologyEntry> discoverNeuronTopology(
+    const std::vector<InfinibandDevice> &all_hca) {
+    std::vector<TopologyEntry> topology;
+    for (const auto &entry : neuronNicAffinity()) {
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // Filtered against all_hca rather than trusted directly, so that a NIC
+        // the caller excluded stays excluded.  Everything else becomes
+        // avail_hca: a distant NIC is slow, not unusable, and it is the only
+        // thing left if the switch-local ones are down.
+        for (const auto &hca : all_hca) {
+            if (std::find(entry.second.begin(), entry.second.end(), hca.name) !=
+                entry.second.end()) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        if (preferred_hca.empty()) continue;
+        topology.push_back(
+            TopologyEntry{.name = neuronLocationName(entry.first),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    return topology;
+}
+#endif
+
 Topology::Topology() {
     auto str = getenv("MC_PATH_ROUNDROBIN");
     if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
@@ -706,17 +827,25 @@ int Topology::discover(const std::vector<std::string> &filter,
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
     auto all_hca = listInfiniBandDevices(filter, exclude_efa);
+#if defined(USE_EFA) && !defined(USE_CXI)
+    if (!exclude_efa) useLibfabricEfaNics(all_hca, filter);
+#endif
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
     int cuda_rc = 0;
     for (auto &ent : discoverCudaTopology(all_hca, &cuda_rc)) {
         matrix_[ent.name] = ent;
     }
     if (cuda_rc) return cuda_rc;
+#endif
+#ifdef USE_EFA
+    for (auto &ent : discoverNeuronTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
 #endif
 #ifdef USE_UB
     auto ub_all_hca = listUBDevices(filter);
@@ -728,6 +857,11 @@ int Topology::discover(const std::vector<std::string> &filter,
 }
 
 int Topology::parse(const std::string &topology_json) {
+    return parse(topology_json, {});
+}
+
+int Topology::parse(const std::string &topology_json,
+                    const std::vector<std::string> &device_filter) {
     std::set<std::string> rnic_set;
     Json::Value root;
 
@@ -749,6 +883,11 @@ int Topology::parse(const std::string &topology_json) {
 
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
+    auto allowed = [&device_filter](const std::string &device_name) {
+        return device_filter.empty() ||
+               std::find(device_filter.begin(), device_filter.end(),
+                         device_name) != device_filter.end();
+    };
     for (const auto &key : root.getMemberNames()) {
         const Json::Value &value = root[key];
         if (value.isArray() && value.size() == 2) {
@@ -756,11 +895,13 @@ int Topology::parse(const std::string &topology_json) {
             topo_entry.name = key;
             for (const auto &array : value[0]) {
                 auto device_name = array.asString();
-                topo_entry.preferred_hca.push_back(device_name);
+                if (allowed(device_name))
+                    topo_entry.preferred_hca.push_back(device_name);
             }
             for (const auto &array : value[1]) {
                 auto device_name = array.asString();
-                topo_entry.avail_hca.push_back(device_name);
+                if (allowed(device_name))
+                    topo_entry.avail_hca.push_back(device_name);
             }
             matrix_[key] = topo_entry;
         } else {
@@ -820,9 +961,27 @@ int Topology::selectDevice(const std::string storage_type,
     return selectDevice(storage_type, retry_count);
 }
 
-int Topology::selectDeviceByLocalHca(const std::string storage_type,
-                                     std::string_view local_hca,
-                                     int retry_count) {
+namespace {
+// The devices in `device_ids` that `device_filter` accepts, in order. Returns
+// `device_ids` itself when there is no filter or it accepts all of them;
+// otherwise fills `kept` with the accepted ones and returns it.
+const std::vector<int> &filterDevices(
+    const std::vector<int> &device_ids,
+    const std::function<bool(int)> &device_filter, std::vector<int> &kept) {
+    if (!device_filter) return device_ids;
+    auto it = std::find_if_not(device_ids.begin(), device_ids.end(),
+                               std::ref(device_filter));
+    if (it == device_ids.end()) return device_ids;
+    kept.assign(device_ids.begin(), it);
+    std::copy_if(it + 1, device_ids.end(), std::back_inserter(kept),
+                 std::ref(device_filter));
+    return kept;
+}
+}  // namespace
+
+int Topology::selectDeviceByLocalHca(
+    const std::string storage_type, std::string_view local_hca, int retry_count,
+    const std::function<bool(int)> &device_filter) {
     if (!local_hca.empty()) {
         auto local_it =
             resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
@@ -830,7 +989,10 @@ int Topology::selectDeviceByLocalHca(const std::string storage_type,
             auto hints_it = local_it->second.find(std::string(storage_type));
             if (hints_it != local_it->second.end() &&
                 !hints_it->second.empty()) {
-                const auto &candidates = hints_it->second;
+                std::vector<int> kept_candidates;
+                const auto &candidates = filterDevices(
+                    hints_it->second, device_filter, kept_candidates);
+                if (candidates.empty()) return ERR_ADDRESS_NOT_REGISTERED;
                 if (retry_count == 0) {
                     int rand_value;
                     if (use_round_robin_) {
@@ -847,18 +1009,27 @@ int Topology::selectDeviceByLocalHca(const std::string storage_type,
         }
     }
 
-    return selectDevice(storage_type, retry_count);
+    return selectDevice(storage_type, retry_count, device_filter);
 }
 
-int Topology::selectDevice(const std::string storage_type, int retry_count) {
+int Topology::selectDevice(const std::string storage_type, int retry_count,
+                           const std::function<bool(int)> &device_filter) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
     auto &entry = resolved_matrix_[storage_type];
     if (entry.preferred_hca.empty() && entry.avail_hca.empty()) {
         return ERR_DEVICE_NOT_FOUND;
     }
+    std::vector<int> kept_preferred_hca, kept_avail_hca;
+    const auto &preferred_hca =
+        filterDevices(entry.preferred_hca, device_filter, kept_preferred_hca);
 
     if (retry_count == 0) {
+        const auto &candidates =
+            !preferred_hca.empty()
+                ? preferred_hca
+                : filterDevices(entry.avail_hca, device_filter, kept_avail_hca);
+        if (candidates.empty()) return ERR_ADDRESS_NOT_REGISTERED;
         int rand_value;
         if (use_round_robin_) {
             thread_local int tl_counter = 0;
@@ -866,18 +1037,18 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
             tl_counter = (tl_counter + 1) % 10000;
         } else
             rand_value = SimpleRandom::Get().next();
-        if (!entry.preferred_hca.empty())
-            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
-        else
-            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+        return candidates[rand_value % candidates.size()];
     } else {
-        size_t index = (retry_count - 1) %
-                       (entry.preferred_hca.size() + entry.avail_hca.size());
-        if (index < entry.preferred_hca.size())
-            return entry.preferred_hca[index];
+        const auto &avail_hca =
+            filterDevices(entry.avail_hca, device_filter, kept_avail_hca);
+        const size_t total = preferred_hca.size() + avail_hca.size();
+        if (total == 0) return ERR_ADDRESS_NOT_REGISTERED;
+        size_t index = (retry_count - 1) % total;
+        if (index < preferred_hca.size())
+            return preferred_hca[index];
         else {
-            index -= entry.preferred_hca.size();
-            return entry.avail_hca[index];
+            index -= preferred_hca.size();
+            return avail_hca[index];
         }
     }
     return ERR_DEVICE_NOT_FOUND;
@@ -889,8 +1060,23 @@ int Topology::resolve() {
     hca_list_.clear();
     std::map<std::string, int> hca_id_map;
     int next_hca_map_index = 0;
-    for (auto &entry : matrix_) {
-        for (auto &hca : entry.second.preferred_hca) {
+
+    // Sorted, not matrix_ order.  A device index is not private to this object:
+    // a peer rebuilds our matrix with parse() and then indexes the device and
+    // rkey arrays we published with the numbers *its* resolve() produced.
+    // matrix_ is an unordered_map, so its iteration order depends on insertion
+    // order, and the peer inserts in a different one (JSON member order, not
+    // discovery order) -- which silently hands transfers to a NIC other than
+    // the preferred one.  Sorting by storage type makes the numbering a
+    // function of the matrix contents alone, so both ends agree.
+    std::vector<std::string> storage_types;
+    storage_types.reserve(matrix_.size());
+    for (const auto &entry : matrix_) storage_types.push_back(entry.first);
+    std::sort(storage_types.begin(), storage_types.end());
+
+    for (const auto &storage_type : storage_types) {
+        const auto &topo_entry = matrix_[storage_type];
+        for (auto &hca : topo_entry.preferred_hca) {
             if (!hca_id_map.count(hca)) {
                 hca_list_.push_back(hca);
                 hca_id_map[hca] = next_hca_map_index++;
@@ -900,12 +1086,12 @@ int Topology::resolve() {
                 resolved_matrix_[kWildcardLocation]
                     .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
             }
-            resolved_matrix_[entry.first].preferred_hca.push_back(
+            resolved_matrix_[storage_type].preferred_hca.push_back(
                 hca_id_map[hca]);
-            resolved_matrix_[entry.first]
+            resolved_matrix_[storage_type]
                 .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
         }
-        for (auto &hca : entry.second.avail_hca) {
+        for (auto &hca : topo_entry.avail_hca) {
             if (!hca_id_map.count(hca)) {
                 hca_list_.push_back(hca);
                 hca_id_map[hca] = next_hca_map_index++;
@@ -915,8 +1101,8 @@ int Topology::resolve() {
                 resolved_matrix_[kWildcardLocation]
                     .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
             }
-            resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
-            resolved_matrix_[entry.first].avail_hca_name_to_index_map_[hca] =
+            resolved_matrix_[storage_type].avail_hca.push_back(hca_id_map[hca]);
+            resolved_matrix_[storage_type].avail_hca_name_to_index_map_[hca] =
                 hca_id_map[hca];
         }
     }

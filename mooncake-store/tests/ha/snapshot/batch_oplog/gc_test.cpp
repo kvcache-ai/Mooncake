@@ -134,13 +134,13 @@ TEST(BatchOpLogSnapshotGcTest, PointerMismatchSkipsDeletion) {
     EXPECT_TRUE(object_store.deleted.empty());
 }
 
-TEST(BatchOpLogSnapshotGcTest, MissingWeightArtifactSkipsDeletion) {
+TEST(BatchOpLogSnapshotGcTest, MissingRecoveryArtifactSkipsDeletion) {
     FakeBackend backend;
     RecordingObjectStore object_store;
     auto lease = SnapshotMaintenanceLease::MakeForTesting("c", "1");
     auto descriptor = MakeDescriptor("snapshots", 2);
-    descriptor.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
-    descriptor.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+    descriptor.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
+    descriptor.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.schema_version = descriptor.schema_version;
     manifest.snapshot_format = descriptor.snapshot_format;
@@ -155,6 +155,10 @@ TEST(BatchOpLogSnapshotGcTest, MissingWeightArtifactSkipsDeletion) {
         ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots",
                                                      descriptor.snapshot_id),
         1, Crc32cValue("w", 1)};
+    manifest.object_storage = ha::BatchOpLogSnapshotObjectDescriptor{
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots",
+                                                    descriptor.snapshot_id),
+        1, Crc32cValue("o", 1)};
     const auto manifest_json = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     descriptor.manifest_size = manifest_json.size();
     descriptor.manifest_crc32c =
@@ -168,11 +172,16 @@ TEST(BatchOpLogSnapshotGcTest, MissingWeightArtifactSkipsDeletion) {
     const auto stale_prefix =
         ha::BuildBatchOpLogSnapshotArtifactPrefix("snapshots", "1-1");
     object_store.objects[stale_prefix + "marker"] = {1};
-    object_store.objects.erase(manifest.weight_metadata->key);
+    object_store.objects[manifest.object_storage->key] = {'o'};
     BatchOpLogSnapshotGc gc(backend, object_store, "c", "snapshots");
-    EXPECT_NE(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
-    EXPECT_TRUE(object_store.deleted.empty());
-    object_store.objects[manifest.weight_metadata->key] = {'w'};
+    for (const auto& key :
+         {manifest.weight_metadata->key, manifest.object_storage->key}) {
+        const auto bytes = object_store.objects.at(key);
+        object_store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
+        EXPECT_TRUE(object_store.deleted.empty());
+        object_store.objects[key] = bytes;
+    }
     EXPECT_EQ(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
     ASSERT_EQ(1u, object_store.deleted.size());
     EXPECT_EQ(stale_prefix, object_store.deleted.front());

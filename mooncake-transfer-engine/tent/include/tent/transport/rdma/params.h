@@ -56,6 +56,9 @@ struct EndPointParams {
     int qp_mul_factor = 6;  // Derived from RdmaParams::num_lanes.
     int max_sge = 4;
     int max_qp_wr = 256;
+    // Generate a CQE for every Nth data WR and for the tail of
+    // each post chain. One preserves the historical per-WR signaling.
+    int signal_interval = 1;
     int max_inline_bytes = 64;
     ibv_mtu path_mtu = IBV_MTU_4096;
 

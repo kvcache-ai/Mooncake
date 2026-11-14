@@ -1,5 +1,21 @@
 """Public contracts for framework-neutral model-weight resharding."""
 
+from .tiled_coo import (
+    BoundTiledCOOReadPlan,
+    TiledCOODenseFragment,
+    TiledCOOIndexRange,
+    TiledCOOLayout,
+    TiledCOOPayloadRange,
+    TiledCOOReadPlan,
+    TiledCOORecord,
+    TiledCOOTileRun,
+    plan_tiled_coo_read,
+)
+from .tiled_coo_structured import (
+    TiledCOOStructuredMembers,
+    tiled_coo_directory_ranges,
+    tiled_coo_payload_ranges,
+)
 from .manifest import (
     OwnershipAxis,
     ParallelRank,
@@ -69,6 +85,18 @@ from .te import (
 )
 
 __all__ = [
+    "BoundTiledCOOReadPlan",
+    "TiledCOODenseFragment",
+    "TiledCOOIndexRange",
+    "TiledCOOLayout",
+    "TiledCOOPayloadRange",
+    "TiledCOOReadPlan",
+    "TiledCOORecord",
+    "TiledCOOTileRun",
+    "plan_tiled_coo_read",
+    "TiledCOOStructuredMembers",
+    "tiled_coo_directory_ranges",
+    "tiled_coo_payload_ranges",
     "ParallelRank",
     "ParallelTopology",
     "PlacementFragment",

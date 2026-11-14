@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result,
-    RouteCasRequest, StoreError,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, Result, RouteCasRequest, StoreError,
 };
 
-use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage};
+use crate::shim::{
+    RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteOwnerPage,
+    RouteOwnerPageQuery,
+};
 
 #[derive(Clone, Debug)]
 pub enum RouteControlRequest {
@@ -34,7 +37,14 @@ pub enum RouteControlRequest {
         authority: ClientStableId,
         owner: ClientRuntimeId,
         cursor: Option<String>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
+    },
+    GetAllocationReferences {
+        namespace: String,
+        authority: ClientStableId,
+        identities: Vec<AllocationRouteIdentity>,
+        include_route_key: bool,
     },
 }
 
@@ -46,6 +56,11 @@ impl RouteControlRequest {
             Self::BatchCompareAndSwap { .. } => "control_route_batch_cas",
             Self::BatchReplace { .. } => "control_route_batch_replace",
             Self::ListByReplicaOwner { .. } => "control_route_list_by_replica_owner",
+            Self::GetAllocationReferences {
+                include_route_key: true,
+                ..
+            } => "control_route_get_allocation_reference_keys",
+            Self::GetAllocationReferences { .. } => "control_route_get_allocation_references",
         }
     }
 
@@ -56,6 +71,7 @@ impl RouteControlRequest {
                 requests.len()
             }
             Self::ListByReplicaOwner { .. } => 1,
+            Self::GetAllocationReferences { identities, .. } => identities.len(),
         }
     }
 
@@ -73,6 +89,15 @@ impl RouteControlRequest {
             Self::BatchReplace { requests, .. } if requests.is_empty() => {
                 Some(RouteControlResponse::BatchReplace(Vec::new()))
             }
+            Self::GetAllocationReferences {
+                identities,
+                include_route_key,
+                ..
+            } if identities.is_empty() => Some(if *include_route_key {
+                RouteControlResponse::AllocationReferenceKeys(Vec::new())
+            } else {
+                RouteControlResponse::AllocationReferences(Vec::new())
+            }),
             _ => None,
         }
     }
@@ -80,11 +105,13 @@ impl RouteControlRequest {
 
 #[derive(Clone, Debug)]
 pub enum RouteControlResponse {
-    BatchGet(Vec<Result<Option<ObjectRoute>>>),
+    BatchGet(Vec<Result<RouteAuthorityRecord>>),
     BatchContains(Vec<Result<bool>>),
     BatchCompareAndSwap(Vec<Result<CasResult>>),
     BatchReplace(Vec<Result<()>>),
     ListByReplicaOwner(RouteOwnerPage),
+    AllocationReferences(Vec<AllocationRouteReferenceState>),
+    AllocationReferenceKeys(Vec<AllocationRouteReference>),
 }
 
 pub trait RouteControlTransport: Send + Sync {
@@ -105,7 +132,7 @@ pub fn serve_route_control_request(
             authority,
             keys,
         } => Ok(RouteControlResponse::BatchGet(
-            service.batch_get_routes(&namespace, &authority, &keys),
+            service.batch_get_route_records(&namespace, &authority, &keys),
         )),
         RouteControlRequest::BatchContains {
             namespace,
@@ -133,6 +160,7 @@ pub fn serve_route_control_request(
             authority,
             owner,
             cursor,
+            snapshot_epoch,
             limit,
         } => service
             .list_routes_by_replica_owner_page(
@@ -140,9 +168,26 @@ pub fn serve_route_control_request(
                 &authority,
                 &owner,
                 cursor.as_deref(),
+                snapshot_epoch,
                 limit,
             )
             .map(RouteControlResponse::ListByReplicaOwner),
+        RouteControlRequest::GetAllocationReferences {
+            namespace,
+            authority,
+            identities,
+            include_route_key,
+        } => {
+            if include_route_key {
+                service
+                    .get_allocation_route_reference_keys(&namespace, &authority, &identities)
+                    .map(RouteControlResponse::AllocationReferenceKeys)
+            } else {
+                service
+                    .get_allocation_route_references(&namespace, &authority, &identities)
+                    .map(RouteControlResponse::AllocationReferences)
+            }
+        }
     }
 }
 
@@ -157,6 +202,66 @@ impl RouteControlAuthorityClient {
 }
 
 impl RouteAuthorityClient for RouteControlAuthorityClient {
+    fn get_allocation_route_references(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::GetAllocationReferences {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                identities: identities.to_vec(),
+                include_route_key: false,
+            },
+        )?;
+        let RouteControlResponse::AllocationReferences(references) = response else {
+            return unexpected_response("get_allocation_route_references");
+        };
+        ensure_batch_len(
+            "get_allocation_route_references",
+            identities.len(),
+            references.len(),
+        )?;
+        Ok(references)
+    }
+
+    fn get_allocation_route_reference_keys(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::GetAllocationReferences {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                identities: identities.to_vec(),
+                include_route_key: true,
+            },
+        )?;
+        let RouteControlResponse::AllocationReferenceKeys(references) = response else {
+            return unexpected_response("get_allocation_route_reference_keys");
+        };
+        ensure_batch_len(
+            "get_allocation_route_reference_keys",
+            identities.len(),
+            references.len(),
+        )?;
+        Ok(references)
+    }
+
     fn batch_contains_routes(
         &self,
         lease: &ClientLease,
@@ -188,7 +293,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         namespace: &str,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+    ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -266,18 +371,17 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         lease: &ClientLease,
         namespace: &str,
         authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-        cursor: Option<&str>,
-        limit: usize,
+        query: &RouteOwnerPageQuery,
     ) -> Result<RouteOwnerPage> {
         let response = self.transport.send_route_control(
             lease,
             RouteControlRequest::ListByReplicaOwner {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
-                owner: owner.clone(),
-                cursor: cursor.map(ToOwned::to_owned),
-                limit,
+                owner: query.owner.clone(),
+                cursor: query.cursor.clone(),
+                snapshot_epoch: query.snapshot_epoch,
+                limit: query.limit,
             },
         )?;
         let RouteControlResponse::ListByReplicaOwner(page) = response else {

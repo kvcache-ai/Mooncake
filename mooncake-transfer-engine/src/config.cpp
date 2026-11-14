@@ -105,7 +105,19 @@ void parseNicPeerAffinity(
 
 }  // namespace
 
+// Whether a GPU peer-memory kernel module is loaded: nvidia-peermem, or
+// nv_peer_mem from MLNX_OFED. ibv_reg_mr() on device memory needs one.
+static bool peerMemoryModuleLoaded() {
+    return std::filesystem::exists("/sys/module/nvidia_peermem") ||
+           std::filesystem::exists("/sys/module/nv_peer_mem");
+}
+
 void loadGlobalConfig(GlobalConfig& config) {
+    // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
+    // first GPU buffer, so the dma_buf export is the default there;
+    // WITH_NVIDIA_PEERMEM below still decides when set.
+    config.with_nvidia_peermem = peerMemoryModuleLoaded();
+
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);
@@ -183,9 +195,15 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
     if (max_ep_per_ctx_env) {
-        size_t val = atoi(max_ep_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_ep_per_ctx = val;
+        // Ceiling is INT32_MAX, not UINT16_MAX: the field is an int whose
+        // default is already 65536, so a UINT16_MAX bound made the default
+        // value impossible to set explicitly.  The real RDMA constraint is
+        // enforced later against device_attr.max_qp; on EFA (SRD) this only
+        // sizes the AV table and the peer_map_ eviction cap, neither of which
+        // is 16-bit.
+        long long val = atoll(max_ep_per_ctx_env);
+        if (val > 0 && val <= INT32_MAX)
+            config.max_ep_per_ctx = static_cast<int>(val);
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
@@ -592,6 +610,25 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.track_rdma_posted_slices);
     }
 
+    const char* efa_homogeneous_peers_env =
+        std::getenv("MC_EFA_HOMOGENEOUS_PEERS");
+    if (efa_homogeneous_peers_env) {
+        parseBoolConfigEnv(efa_homogeneous_peers_env,
+                           "MC_EFA_HOMOGENEOUS_PEERS",
+                           config.efa_homogeneous_peers);
+    }
+
+    const char* efa_cq_drain_timeout_env =
+        std::getenv("MC_EFA_CQ_DRAIN_TIMEOUT_MS");
+    if (efa_cq_drain_timeout_env) {
+        config.efa_cq_drain_timeout_ms = atoll(efa_cq_drain_timeout_env);
+    }
+
+    const char* efa_stall_min_env = std::getenv("MC_EFA_STALL_MIN_MS");
+    if (efa_stall_min_env) {
+        config.efa_stall_min_ms = atoll(efa_stall_min_env);
+    }
+
     const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
     if (use_rdma_twosided_env) {
         parseBoolConfigEnv(use_rdma_twosided_env, "MC_USE_RDMA_TWOSIDED",
@@ -692,6 +729,19 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
                          << efa_nic_selection
                          << ", expected all|local, keeping default";
+        }
+    }
+
+    if (const char* value = std::getenv("MC_HIP_KFD_PIN_FIX")) {
+        const auto parsed = TryParseBool(value);
+        if (strcasecmp(value, "force") == 0) {
+            config.hip_kfd_pin_fix = HipKfdPinFix::FORCE;
+        } else if (parsed.has_value()) {
+            config.hip_kfd_pin_fix =
+                *parsed ? HipKfdPinFix::PROBE : HipKfdPinFix::OFF;
+        } else {
+            LOG(WARNING) << "Invalid MC_HIP_KFD_PIN_FIX environment value: "
+                         << value << ", expected 0|1|force, keeping default";
         }
     }
 
@@ -891,6 +941,9 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
+    LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
+    LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
+    LOG(INFO) << "efa_stall_min_ms = " << config.efa_stall_min_ms;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");

@@ -12,13 +12,16 @@ namespace {
 bool SameImmutableWeightReference(const WeightRevisionMetadata& lhs,
                                   const WeightRevisionMetadata& rhs) {
     if (lhs.identity != rhs.identity ||
-        lhs.created_at_ms != rhs.created_at_ms) {
+        lhs.created_at_ms != rhs.created_at_ms ||
+        lhs.affinity_count != rhs.affinity_count ||
+        lhs.affinity_digest != rhs.affinity_digest) {
         return false;
     }
     if (lhs.availability == WeightAvailabilityState::IMPORTING) {
         return lhs.manifest.payload_group_id == rhs.manifest.payload_group_id &&
                lhs.manifest.payload_count == rhs.manifest.payload_count &&
-               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes;
+               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes &&
+               lhs.policy == rhs.policy;
     }
     return lhs.manifest == rhs.manifest;
 }
@@ -84,6 +87,16 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
 
     bool applied = true;
     switch (entry.op_type) {
+        case OpType::OBJECT_STORAGE_MUTATION: {
+            ObjectReplicaMutation mutation;
+            if (struct_pack::deserialize_to(mutation, entry.payload) !=
+                struct_pack::errc::ok) {
+                return false;
+            }
+            applied = metadata_store_->ApplyObjectReplicaMutation(
+                entry.tenant_id, entry.object_key, mutation);
+            break;
+        }
         case OpType::PUT_END:
             ApplyPutEnd(entry);
             break;
@@ -237,17 +250,43 @@ void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
 }
 
 bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
-    WeightRevisionMetadata next;
-    if (struct_pack::deserialize_to(next, entry.payload) !=
-            struct_pack::errc::ok ||
-        !ValidateWeightRevisionMetadata(next).ok() ||
-        next.operation != WeightOperationState::NONE ||
-        !MatchesWeightTenantAndKey(entry, next.identity)) {
+    static_assert(struct_pack::get_type_code<WeightMetadataUpsertOp>() !=
+                  struct_pack::get_type_code<WeightRevisionMetadata>());
+    WeightMetadataUpsertOp upsert;
+    const bool decoded = struct_pack::deserialize_to(upsert, entry.payload) ==
+                         struct_pack::errc::ok;
+    if (!decoded || !ValidateWeightRevisionMetadata(upsert.metadata).ok() ||
+        !MatchesWeightTenantAndKey(entry, upsert.metadata.identity)) {
         LOG(ERROR) << "OpLogApplier: invalid weight metadata upsert, key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id;
         return false;
     }
-
+    const auto& next = upsert.metadata;
+    if ((next.operation_id.has_value() &&
+         (!upsert.operation.has_value() ||
+          upsert.operation->identity != next.identity ||
+          upsert.operation->operation_id != *next.operation_id ||
+          upsert.operation->fenced_metadata_generation !=
+              next.metadata_generation ||
+          !IsValidWeightOperationShape(*upsert.operation))) ||
+        (!next.operation_id.has_value() && upsert.operation.has_value() &&
+         (upsert.operation->identity != next.identity ||
+          !IsWeightOperationTerminal(upsert.operation->message) ||
+          upsert.operation->fenced_metadata_generation >=
+              next.metadata_generation ||
+          (upsert.operation->message == kWeightOperationCompletedMessage &&
+           upsert.operation->target_residency != next.residency) ||
+          (upsert.operation->message == kWeightOperationCancelledMessage &&
+           next.availability != WeightAvailabilityState::DELETING)))) {
+        LOG(ERROR) << "OpLogApplier: inconsistent weight operation payload, "
+                      "key="
+                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    auto publish = [&]() {
+        return metadata_store_->PutWeightMetadataAndOperation(next,
+                                                              upsert.operation);
+    };
     const auto tombstone =
         metadata_store_->GetWeightMetadataTombstoneGeneration(next.identity);
     if (tombstone.has_value()) {
@@ -259,6 +298,14 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
 
     const auto current = metadata_store_->GetWeightMetadata(next.identity);
     if (!current.has_value()) {
+        if (upsert.operation.has_value() &&
+            upsert.operation->message == kWeightOperationCancelledMessage) {
+            LOG(ERROR) << "OpLogApplier: cancellation has no current metadata, "
+                       << "key=" << entry.object_key
+                       << ", sequence_id=" << entry.sequence_id
+                       << ", operation_id=" << upsert.operation->operation_id;
+            return false;
+        }
         if (next.metadata_generation != 1) {
             LOG(ERROR) << "OpLogApplier: initial weight metadata generation "
                           "must be one, key="
@@ -266,10 +313,57 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
                        << ", generation=" << next.metadata_generation;
             return false;
         }
-        return metadata_store_->PutWeightMetadata(next);
+        return publish();
     }
     if (*current == next) {
-        return true;
+        if (upsert.operation.has_value() &&
+            upsert.operation->message == kWeightOperationCancelledMessage) {
+            if (metadata_store_->GetWeightOperation(
+                    upsert.operation->operation_id) != upsert.operation) {
+                LOG(ERROR) << "OpLogApplier: cancellation duplicate operation "
+                              "mismatch, "
+                           << "key=" << entry.object_key
+                           << ", sequence_id=" << entry.sequence_id
+                           << ", operation_id="
+                           << upsert.operation->operation_id;
+                return false;
+            }
+            return true;
+        }
+        return !upsert.operation.has_value() ||
+               metadata_store_->GetWeightOperation(
+                   upsert.operation->operation_id) == upsert.operation ||
+               publish();
+    }
+    if (upsert.operation.has_value() &&
+        upsert.operation->message == kWeightOperationCancelledMessage) {
+        const auto previous =
+            metadata_store_->GetWeightOperation(upsert.operation->operation_id);
+        if (!previous ||
+            current->operation_id != upsert.operation->operation_id ||
+            current->metadata_generation !=
+                previous->fenced_metadata_generation ||
+            IsWeightOperationTerminal(previous->message) ||
+            upsert.operation->updated_at_ms < previous->updated_at_ms) {
+            LOG(ERROR) << "OpLogApplier: cancellation prior lineage mismatch, "
+                       << "key=" << entry.object_key
+                       << ", sequence_id=" << entry.sequence_id
+                       << ", operation_id=" << upsert.operation->operation_id;
+            return false;
+        }
+        // Cancellation changes only the terminal message and update time.
+        // Preserve the exact operation lineage, target and progress on replay.
+        auto unchanged = *upsert.operation;
+        unchanged.message = previous->message;
+        unchanged.updated_at_ms = previous->updated_at_ms;
+        if (unchanged != *previous) {
+            LOG(ERROR)
+                << "OpLogApplier: cancellation changes operation fields, "
+                << "key=" << entry.object_key
+                << ", sequence_id=" << entry.sequence_id
+                << ", operation_id=" << upsert.operation->operation_id;
+            return false;
+        }
     }
     if (!CanAdvanceWeightMetadataGeneration(current->metadata_generation) ||
         next.metadata_generation != current->metadata_generation + 1 ||
@@ -284,7 +378,7 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
                    << ", incoming_generation=" << next.metadata_generation;
         return false;
     }
-    return metadata_store_->PutWeightMetadata(next);
+    return publish();
 }
 
 bool OpLogApplier::ApplyWeightMetadataDelete(const OpLogEntry& entry) {
@@ -432,7 +526,6 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentMount(info);
-    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
@@ -444,7 +537,6 @@ void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
         return;
     }
     segment_registry_.OnSegmentUnmount(op.transport_endpoint);
-    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
@@ -462,7 +554,6 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentUpdate(info);
-    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 }  // namespace mooncake

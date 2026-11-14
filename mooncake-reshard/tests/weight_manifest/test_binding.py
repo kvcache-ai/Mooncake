@@ -370,6 +370,100 @@ def test_binding_allows_disjoint_views_of_same_storage_allocation() -> None:
     assert validate_runtime_binding(placement, binding) is None
 
 
+def test_shared_storage_aliases_do_not_hide_partial_allocation_overlap() -> None:
+    placement = placement_manifest(
+        tensors=tuple(
+            descriptor(tensor_id=f"{name}.weight") for name in ("a", "b", "c")
+        ),
+        fragments=tuple(
+            placement_fragment(
+                placement_fragment_id=name,
+                tensor_id=f"{name}.weight",
+            )
+            for name in ("a", "b", "c")
+        ),
+    )
+    binding = binding_manifest(
+        placement=placement,
+        fragments=(
+            binding_fragment(
+                placement_fragment_id="a",
+                fragment_id="runtime-a",
+                address=0x1000,
+                storage_address=0x1000,
+                storage_nbytes=0x1000,
+                storage_offset_bytes=0,
+            ),
+            binding_fragment(
+                placement_fragment_id="b",
+                fragment_id="runtime-b",
+                address=0x1100,
+                storage_address=0x1000,
+                storage_nbytes=0x1000,
+                storage_offset_bytes=0x100,
+            ),
+            binding_fragment(
+                placement_fragment_id="c",
+                fragment_id="runtime-c",
+                address=0x2100,
+                storage_address=0x1800,
+                storage_nbytes=0x1000,
+                storage_offset_bytes=0x900,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="storage allocation ranges overlap"):
+        validate_runtime_binding(placement, binding)
+
+
+def test_shared_arena_validation_does_not_compare_every_pair_of_views(monkeypatch):
+    from mooncake.reshard.weight.validation import (
+        _validate_runtime_binding_address_ranges,
+    )
+
+    count = 512
+    tensors = tuple(descriptor(tensor_id=f"tensor-{index}") for index in range(count))
+    placements = tuple(
+        placement_fragment(
+            placement_fragment_id=f"p-{index}",
+            tensor_id=tensor.tensor_id,
+        )
+        for index, tensor in enumerate(tensors)
+    )
+    bindings = tuple(
+        binding_fragment(
+            placement_fragment_id=f"p-{index}",
+            fragment_id=f"r-{index}",
+            address=0x1000 + 32 * index,
+            storage_address=0x1000,
+            storage_nbytes=32 * count,
+            storage_offset_bytes=32 * index,
+        )
+        for index in range(count)
+    )
+    fragment_type = type(bindings[0])
+    original = fragment_type.__getattribute__
+    storage_field_reads = 0
+
+    def tracked(fragment, name):
+        nonlocal storage_field_reads
+        if name in {"storage_address", "storage_nbytes"}:
+            storage_field_reads += 1
+        return original(fragment, name)
+
+    monkeypatch.setattr(fragment_type, "__getattribute__", tracked)
+    _validate_runtime_binding_address_ranges(
+        instance_id="validation-test",
+        tensors=tensors,
+        placements=placements,
+        bindings=bindings,
+    )
+    # Count work rather than asserting a noisy wall-clock duration. Per-view
+    # geometry checks remain; identical allocation bounds should be read O(n).
+    assert storage_field_reads < count * 10
+
+
 def test_binding_treats_endpoint_as_routing_not_address_space() -> None:
     placement = placement_manifest(
         tensors=(

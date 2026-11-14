@@ -67,6 +67,9 @@ class StandbyMetadataStore final : public MetadataStore {
     void Clear();
 
     bool PutWeightMetadata(const WeightRevisionMetadata& metadata) override;
+    bool PutWeightMetadataAndOperation(
+        const WeightRevisionMetadata& metadata,
+        const std::optional<WeightResidencyOperation>& operation) override;
     std::optional<WeightRevisionMetadata> GetWeightMetadata(
         const WeightRevisionIdentity& identity) const override;
     std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
@@ -81,8 +84,17 @@ class StandbyMetadataStore final : public MetadataStore {
     bool RemoveWeightLease(uint64_t lease_id,
                            const WeightRevisionIdentity& identity,
                            uint64_t fenced_metadata_generation) override;
+    bool PutWeightOperation(const WeightResidencyOperation& operation) override;
+    std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const override;
     bool RestoreWeightMetadata(const WeightMetadataSnapshot& snapshot);
     WeightMetadataSnapshot SnapshotWeightMetadata() const;
+    bool ApplyObjectReplicaMutation(
+        const std::string& tenant_id, const std::string& key,
+        const ObjectReplicaMutation& mutation) override;
+    bool RestoreObjectReplicas(const ObjectReplicaSnapshot& snapshot);
+    ObjectReplicaSnapshot SnapshotObjectReplicas() const;
+    bool HasObjectReplicaState() const;
 
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
     bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
@@ -95,6 +107,9 @@ class StandbyMetadataStore final : public MetadataStore {
    private:
     mutable std::mutex mutex_;
     TenantStore store_;
+    std::optional<ObjectReplicaTarget> object_storage_target_;
+    std::map<std::string, ObjectUploadRecord> object_uploads_;
+    std::unordered_map<ReplicaID, std::string> object_upload_names_;
     std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;
     std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
     std::unordered_map<uint64_t, WeightRevisionLease> weight_leases_;

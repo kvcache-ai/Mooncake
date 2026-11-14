@@ -159,6 +159,7 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
                   [](const TransferMetadata::HandShakeDesc& peer,
                      TransferMetadata::HandShakeDesc& local) {
                       local.payload = "reply:" + peer.payload;
+                      local.auto_gid_reprobe_from = peer.auto_gid_reprobe_from;
                       return 0;
                   },
                   port, sockfd),
@@ -187,9 +188,19 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 
     TransferMetadata::HandShakeDesc request;
     request.payload = "bootstrap";
+    request.auto_gid_reprobe_from = "gid-before-reprobe";
     TransferMetadata::HandShakeDesc response;
     ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
     EXPECT_EQ(response.payload, "reply:bootstrap");
+    EXPECT_EQ(response.auto_gid_reprobe_from, "gid-before-reprobe");
+
+    TransferMetadata::HandShakeDesc legacy_request;
+    legacy_request.payload = "legacy";
+    TransferMetadata::HandShakeDesc legacy_response;
+    ASSERT_EQ(
+        client.sendHandshake(server_name, legacy_request, legacy_response), 0);
+    EXPECT_EQ(legacy_response.payload, "reply:legacy");
+    EXPECT_TRUE(legacy_response.auto_gid_reprobe_from.empty());
 }
 
 // add, get and remove RPCMetaEntryMeta

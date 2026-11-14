@@ -37,7 +37,11 @@ constexpr int kRedAddReleaseLowWordLast = 1 << 0;
 // Team tags are kept as types so official DeepEP template code can remain close
 // to the source while the actual routing is decided by Mooncake CommCtx.
 struct IbgdaOps {
-    using Context = device::CommCtx;
+    struct Context {
+        device::CommCtx comm;
+        const int32_t* logical_to_transport_slots = nullptr;
+        int qps_per_rank = 1;
+    };
     static constexpr bool kIsNccl = false;
     static constexpr int kNumQPs = MAX_QP_COUNT;
     static constexpr int kAggregateRequests = 0;
@@ -57,7 +61,7 @@ struct IbgdaOps {
     static constexpr int kNumHybridScaleoutWarps = 4;
     static constexpr int kNumHybridForwardWarps = 4;
     static constexpr int kNumHybridScaleupWarps = 4;
-    device::CommCtx ctx;
+    Context ctx;
     int qp_idx = 0;
     int sharing_mode = 0;
     int qps_per_rank = 1;
@@ -65,7 +69,7 @@ struct IbgdaOps {
     int scaleup_rank_idx = 0;
     int num_scaleup_ranks = 0;
 
-    __device__ __forceinline__ IbgdaOps(const device::CommCtx& ctx, int qp_idx,
+    __device__ __forceinline__ IbgdaOps(const Context& ctx, int qp_idx,
                                         int sharing_mode, int num_qps,
                                         int scaleout_rank_idx = 0,
                                         int scaleup_rank_idx = 0,
@@ -74,10 +78,13 @@ struct IbgdaOps {
         : ctx(ctx),
           qp_idx(qp_idx),
           sharing_mode(sharing_mode),
-          qps_per_rank(max(1, num_qps / max(1, num_ranks))),
+          qps_per_rank(max(1, ctx.qps_per_rank)),
           scaleout_rank_idx(scaleout_rank_idx),
           scaleup_rank_idx(scaleup_rank_idx),
-          num_scaleup_ranks(num_scaleup_ranks) {}
+          num_scaleup_ranks(num_scaleup_ranks) {
+        (void)num_qps;
+        (void)num_ranks;
+    }
 
     template <typename team_t>
     __device__ __forceinline__ int world_rank(int dst_rank) const {
@@ -91,33 +98,39 @@ struct IbgdaOps {
         }
     }
 
+    __device__ __forceinline__ int transport_rank(int logical_rank) const {
+        return ctx.logical_to_transport_slots == nullptr
+                   ? logical_rank
+                   : ctx.logical_to_transport_slots[logical_rank];
+    }
+
     template <typename team_t>
     __device__ __forceinline__ bool is_nvlink_accessible(int dst_rank) const {
-        dst_rank = world_rank<team_t>(dst_rank);
-        return dst_rank == ctx.rank ||
-               device::mc_comm_p2p_available(ctx, dst_rank);
+        dst_rank = transport_rank(world_rank<team_t>(dst_rank));
+        return dst_rank == ctx.comm.rank ||
+               device::mc_comm_p2p_available(ctx.comm, dst_rank);
     }
 
     template <typename team_t>
     __device__ __forceinline__ void* get_sym_ptr(void* ptr,
                                                  int dst_rank) const {
-        dst_rank = world_rank<team_t>(dst_rank);
-        return device::mc_route_put(ctx, dst_rank, ptr);
+        dst_rank = transport_rank(world_rank<team_t>(dst_rank));
+        return device::mc_route_put(ctx.comm, dst_rank, ptr);
     }
 
     template <typename team_t>
     __device__ __forceinline__ const void* get_sym_ptr(const void* ptr,
                                                        int dst_rank) const {
-        dst_rank = world_rank<team_t>(dst_rank);
-        return device::mc_route_put(ctx, dst_rank, const_cast<void*>(ptr));
+        dst_rank = transport_rank(world_rank<team_t>(dst_rank));
+        return device::mc_route_put(ctx.comm, dst_rank, const_cast<void*>(ptr));
     }
 
     template <typename team_t>
     __device__ __forceinline__ void put(void* dst_ptr, const void* src_ptr,
                                         int num_bytes, int dst_rank,
                                         int /*flags*/ = 0) const {
-        dst_rank = world_rank<team_t>(dst_rank);
-        auto routed = device::mc_route_put(ctx, dst_rank, dst_ptr);
+        dst_rank = transport_rank(world_rank<team_t>(dst_rank));
+        auto routed = device::mc_route_put(ctx.comm, dst_rank, dst_ptr);
         if (routed != nullptr) {
             const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
             const auto dst_addr = reinterpret_cast<uintptr_t>(routed);
@@ -153,8 +166,9 @@ struct IbgdaOps {
             // so a system fence is sufficient to publish the writes.
             __threadfence_system();
         } else {
-            device::mc_rdma_put(ctx, qp_idx, dst_rank, qps_per_rank, src_ptr,
-                                dst_ptr, static_cast<uint32_t>(num_bytes), 0);
+            device::mc_rdma_put(ctx.comm, qp_idx, dst_rank, qps_per_rank,
+                                src_ptr, dst_ptr,
+                                static_cast<uint32_t>(num_bytes), 0);
         }
     }
 
@@ -162,9 +176,9 @@ struct IbgdaOps {
     __device__ __forceinline__ void put_value(value_t* dst_ptr, value_t value,
                                               int dst_rank,
                                               int flags = 0) const {
-        dst_rank = world_rank<team_t>(dst_rank);
-        auto* routed =
-            static_cast<value_t*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
+        dst_rank = transport_rank(world_rank<team_t>(dst_rank));
+        auto* routed = static_cast<value_t*>(
+            device::mc_route_put(ctx.comm, dst_rank, dst_ptr));
         if (routed != nullptr) {
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
                 device::mc_st_release(reinterpret_cast<int*>(routed),
@@ -175,7 +189,7 @@ struct IbgdaOps {
             }
         } else {
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
-                device::mc_signal(ctx, dst_rank, qp_idx, qps_per_rank,
+                device::mc_signal(ctx.comm, dst_rank, qp_idx, qps_per_rank,
                                   reinterpret_cast<int*>(dst_ptr),
                                   static_cast<int32_t>(value));
             } else {
@@ -192,21 +206,21 @@ struct IbgdaOps {
                 const auto high = static_cast<int32_t>(signed_value >> 32);
                 if ((flags & kRedAddReleaseLowWordLast) == 0) {
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words, low);
                     }
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words + 1, high);
                     }
                 } else {
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words + 1, high);
                     }
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words, low);
                     }
                 }
             }
@@ -218,21 +232,21 @@ struct IbgdaOps {
                                                 int dst_rank,
                                                 int flags = 0) const {
         if constexpr (sizeof(value_t) == sizeof(int32_t)) {
-            dst_rank = world_rank<team_t>(dst_rank);
-            auto* routed =
-                static_cast<int*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
+            dst_rank = transport_rank(world_rank<team_t>(dst_rank));
+            auto* routed = static_cast<int*>(
+                device::mc_route_put(ctx.comm, dst_rank, dst_ptr));
             if (routed != nullptr) {
                 device::mc_atomic_add_release(routed, static_cast<int>(value));
             } else {
-                device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                device::mc_red_add(ctx.comm, dst_rank, qp_idx, qps_per_rank,
                                    reinterpret_cast<int*>(dst_ptr),
                                    static_cast<int32_t>(value));
             }
         } else if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
                              sizeof(value_t) == sizeof(int64_t)) {
-            dst_rank = world_rank<team_t>(dst_rank);
+            dst_rank = transport_rank(world_rank<team_t>(dst_rank));
             auto* routed = static_cast<int64_t*>(
-                device::mc_route_put(ctx, dst_rank, dst_ptr));
+                device::mc_route_put(ctx.comm, dst_rank, dst_ptr));
             if (routed != nullptr) {
                 // Some official elastic paths use the high 32 bits as the
                 // readiness word (notify counters), while others use the low 32
@@ -259,21 +273,21 @@ struct IbgdaOps {
                 const auto high = static_cast<int32_t>(signed_value >> 32);
                 if ((flags & kRedAddReleaseLowWordLast) == 0) {
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words, low);
                     }
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words + 1, high);
                     }
                 } else {
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words + 1, high);
                     }
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx.comm, dst_rank, qp_idx,
+                                           qps_per_rank, words, low);
                     }
                 }
             }

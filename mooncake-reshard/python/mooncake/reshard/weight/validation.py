@@ -477,27 +477,30 @@ def _validate_runtime_binding_address_ranges(
                 )
             active.append((current_placement, current_binding))
 
+        # Many tensor views can share one backing arena. Collapse those exact
+        # allocation aliases before the overlap sweep; retaining every view in
+        # the active set makes validation quadratic for MoE models.
+        unique_allocations: dict[tuple[int, int], RuntimeBindingFragment] = {}
+        for _, binding in fragments:
+            unique_allocations.setdefault(
+                (binding.storage_address, binding.storage_nbytes),
+                binding,
+            )
         allocation_order = sorted(
-            (binding for _, binding in fragments),
+            unique_allocations.values(),
             key=lambda binding: binding.storage_address,
         )
-        active_allocations: list[RuntimeBindingFragment] = []
+        previous_with_furthest_end: RuntimeBindingFragment | None = None
+        furthest_end = -1
         for current in allocation_order:
-            active_allocations = [
-                previous
-                for previous in active_allocations
-                if previous.storage_address + previous.storage_nbytes
-                > current.storage_address
-            ]
-            for previous in active_allocations:
-                if (
-                    previous.storage_address == current.storage_address
-                    and previous.storage_nbytes == current.storage_nbytes
-                ):
-                    continue
+            if current.storage_address < furthest_end:
+                assert previous_with_furthest_end is not None
                 raise ValueError(
                     "runtime binding storage allocation ranges overlap: "
-                    f"{previous.fragment_id} and {current.fragment_id} "
-                    f"in {address_space}"
+                    f"{previous_with_furthest_end.fragment_id} and "
+                    f"{current.fragment_id} in {address_space}"
                 )
-            active_allocations.append(current)
+            current_end = current.storage_address + current.storage_nbytes
+            if current_end > furthest_end:
+                previous_with_furthest_end = current
+                furthest_end = current_end

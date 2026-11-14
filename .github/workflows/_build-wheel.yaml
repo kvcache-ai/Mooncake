@@ -17,7 +17,7 @@ on:
         default: x86_64
       python-versions:
         type: string
-        default: '["3.10", "3.11", "3.12", "3.13"]'
+        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
       artifact-prefix:
         type: string
         required: true
@@ -26,6 +26,20 @@ on:
         # Used by nightly builds to stamp date-based dev versions.
         type: string
         default: ''
+      use-tent:
+        # Build the TENT runtime into the wheel. Runtime behavior is unchanged
+        # unless a process opts in via MC_USE_TENT=1 (classic engine is the
+        # default facade path), so callers can enable this purely to ship the
+        # capability. Currently opted in by the PR CI cuda13 build and the
+        # nightly cuda13 x86 wheel that feed T-One; release callers stay
+        # false until TENT is validated on arm64.
+        type: boolean
+        default: false
+      use-store-rs:
+        # Test-only combined wheel used by the T-One Store-RS lane. Release
+        # callers keep the default false and continue through build_wheel.sh.
+        type: boolean
+        default: false
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -60,46 +74,45 @@ jobs:
       - name: Configure build profile
         shell: bash
         run: |
+          # These wheels are published to PyPI: compile without -g
+          # (ENABLE_DEBUG_SYMBOLS defaults to ON). The post-hoc strip in
+          # build_wheel.sh stays as a safety net for callers that build with -g.
           case "$BUILD_VARIANT:$BUILD_ARCHITECTURE" in
             cuda:x86_64)
               variant_flag=''
               arch_list='8.0;9.0'
               build_nvlink=true
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda13:x86_64)
               variant_flag=CU13_BUILD
               arch_list='8.0;9.0;10.3'
               build_nvlink=true
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             non-cuda:x86_64)
               variant_flag=NON_CUDA_BUILD
               arch_list=''
-              ep_versions=''
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda:arm64)
               variant_flag=''
               arch_list='9.0'
-              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0;2.14.0'
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda13:arm64)
               variant_flag=CU13_BUILD
               arch_list='9.0;10.3'
-              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0;2.14.0'
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             non-cuda:arm64)
               variant_flag=NON_CUDA_BUILD
               arch_list=''
-              ep_versions=''
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             *)
               echo "::error::Unsupported wheel profile: $BUILD_VARIANT/$BUILD_ARCHITECTURE"
@@ -111,6 +124,19 @@ jobs:
           # so the wheel only needs the headers (fetched below) and still
           # imports on hosts without libfabric.
           cmake_args="$cmake_args -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR=$RUNNER_TEMP/libfabric-headers/include"
+
+          # TENT runtime (off unless activated via MC_USE_TENT=1 at runtime).
+          # liburing is provided by dependencies.sh / mooncake_provide_liburing().
+          if [ "${{ inputs.use-tent }}" = "true" ]; then
+            cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON"
+          fi
+
+          # Store-RS links both the classic TE and TENT shims. This opt-in is
+          # reserved for the T-One test artifact; normal/release wheels keep
+          # their existing CMake profile.
+          if [ "${{ inputs.use-store-rs }}" = "true" ]; then
+            cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON -DUSE_REDIS=ON -DWITH_STORE_RS=ON -DWITH_STORE_RUST=OFF -DBUILD_SHARED_LIBS=ON"
+          fi
 
           {
             echo "VARIANT_FLAG=$variant_flag"
@@ -154,6 +180,10 @@ jobs:
           PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
           echo "$PYBIN" >> "$GITHUB_PATH"
           "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Install Rust toolchain for Store-RS
+        if: ${{ inputs.use-store-rs }}
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -232,10 +262,14 @@ jobs:
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
           variant=()
           [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          wheel_builder=./scripts/build_wheel.sh
+          if [ "${{ inputs.use-store-rs }}" = "true" ]; then
+            wheel_builder=./scripts/build_store_rs_wheel.sh
+          fi
           env "${variant[@]}" \
             PYTHON_VERSION="${{ matrix.python-version }}" \
             OUTPUT_DIR="dist-py${{ steps.pytag.outputs.tag }}" \
-            ./scripts/build_wheel.sh
+            "$wheel_builder"
         env:
           VERSION: ${{ env.VERSION }}
 
@@ -296,6 +330,29 @@ jobs:
 
           "$smoke_venv/bin/mooncake_master" --version
 
+          if [ "${{ inputs.use-store-rs }}" = "true" ]; then
+            MOONCAKE_STORE_BACKEND=rs "$smoke_venv/bin/python" - <<'PY'
+          import ctypes
+          from pathlib import Path
+
+          import mooncake
+          import mooncake._store_rs
+          import mooncake.store
+
+          package_dir = Path(mooncake.__file__).resolve().parent
+          transfer_engine = package_dir / "libtransfer_engine.so"
+          classic_shim = package_dir / "libmooncake_classic_shim.so"
+          assert transfer_engine.is_file(), transfer_engine
+          assert classic_shim.is_file(), classic_shim
+          ctypes.CDLL(str(transfer_engine), mode=ctypes.RTLD_GLOBAL)
+          ctypes.CDLL(str(classic_shim), mode=ctypes.RTLD_GLOBAL)
+          assert mooncake.store._BACKEND == "rs"
+          PY
+            for command in mooncake-store-rs-client mooncake-store-rs-admin mooncake-store-rs-bench; do
+              test -x "$smoke_venv/bin/$command"
+            done
+          fi
+
           # EFA support must not add a link-time libfabric dependency: the
           # builder image has no libfabric, so importing the engine here also
           # proves the wheel works on hosts without it.
@@ -308,6 +365,8 @@ jobs:
           fi
           "$smoke_venv/bin/python" -c \
             'from mooncake import engine; assert engine.SUPPORT_EFA, "EFA support missing"'
+
+          bash scripts/ci/check_wheel_typing.sh "$smoke_venv/bin/python"
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4

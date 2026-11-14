@@ -178,22 +178,39 @@ TEST_F(XpuTransportTest, FailsWhenNeitherSideIsDeviceMemory) {
     EXPECT_EQ(host_b[0], 2);
 }
 
-// Both sides device: VRAM<->VRAM is not a staging hop and must be rejected.
-TEST_F(XpuTransportTest, FailsWhenBothSidesAreDeviceMemory) {
+// Both sides device: a process-local VRAM->VRAM request is executed as one
+// device copy (same XPU here) rather than staged.
+TEST_F(XpuTransportTest, CopiesDeviceToDevice) {
     uint8_t *a = nullptr;
     uint8_t *b = nullptr;
-    ASSERT_NO_FATAL_FAILURE(allocDevice(&a, kChunk));
-    ASSERT_NO_FATAL_FAILURE(allocDevice(&b, kChunk));
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&a, kBufSize));
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&b, kBufSize));
+    std::vector<uint8_t> seed(kBufSize), zero(kBufSize, 0);
+    for (size_t i = 0; i < kBufSize; ++i) seed[i] = (uint8_t)(i % 239);
+    ASSERT_TRUE(loader_->copy(a, seed.data(), kBufSize).ok());
+    ASSERT_TRUE(loader_->copy(b, zero.data(), kBufSize).ok());
 
-    auto status = run(makeRequest(Request::WRITE, a, (uint64_t)b, kChunk));
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    // WRITE a + 64 KiB -> b + 128 KiB: both sides interior device addresses.
+    auto status = run(makeRequest(Request::WRITE, a + kChunk,
+                                  (uint64_t)(b + 2 * kChunk), kChunk));
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kChunk);
 
-    loader_->free(a, kChunk);
-    loader_->free(b, kChunk);
+    std::vector<uint8_t> readback(kBufSize, 0);
+    ASSERT_TRUE(loader_->copy(readback.data(), b, kBufSize).ok());
+    EXPECT_EQ(0, std::memcmp(readback.data() + 2 * kChunk, seed.data() + kChunk,
+                             kChunk));
+    // Outside the copied chunk b is untouched.
+    EXPECT_EQ(0, std::memcmp(readback.data(), zero.data(), 2 * kChunk));
+
+    loader_->free(a, kBufSize);
+    loader_->free(b, kBufSize);
 }
 
-// XPU VRAM can never be a remote peer; a non-local target is a routing bug.
-TEST_F(XpuTransportTest, FailsOnNonLocalTarget) {
+// A non-local target the transport has not mapped in (no prepareRemoteBuffer
+// succeeded for that segment) is rejected synchronously, before any task is
+// appended, so the engine can fail the request over to another transport.
+TEST_F(XpuTransportTest, RejectsUnmappedNonLocalTarget) {
     uint8_t *dev = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kChunk));
     std::vector<uint8_t> staging(kChunk, 0);
@@ -201,8 +218,38 @@ TEST_F(XpuTransportTest, FailsOnNonLocalTarget) {
     auto request =
         makeRequest(Request::WRITE, dev, (uint64_t)staging.data(), kChunk);
     request.target_id = LOCAL_SEGMENT_ID + 1;
-    auto status = run(request);
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    EXPECT_FALSE(transport_.submitTransferTasks(batch, {request}).ok());
+    EXPECT_EQ(batch->size(), 0u);
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+
+    loader_->free(dev, kChunk);
+}
+
+// A peer keys its mapping on the published attribute, so two registrations
+// of one allocation must not publish the same text: a freed and reallocated
+// buffer can come back with the same address, size and descriptor number.
+TEST_F(XpuTransportTest, ReRegistrationPublishesDistinctIpcAttribute) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kChunk));
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(dev);
+    desc.length = kChunk;
+    desc.location = "xpu:0";
+    MemoryOptions options;
+    ASSERT_TRUE(transport_.addMemoryBuffer(desc, options).ok());
+    auto first = desc.transport_attrs.find(TransportType::XPU);
+    if (first == desc.transport_attrs.end()) {
+        loader_->free(dev, kChunk);
+        GTEST_SKIP() << "buffer is not shareable (no Level Zero IPC)";
+    }
+    const std::string attr = first->second;
+    ASSERT_TRUE(transport_.removeMemoryBuffer(desc).ok());
+    ASSERT_TRUE(transport_.addMemoryBuffer(desc, options).ok());
+    ASSERT_TRUE(desc.transport_attrs.count(TransportType::XPU));
+    EXPECT_NE(desc.transport_attrs[TransportType::XPU], attr);
+    ASSERT_TRUE(transport_.removeMemoryBuffer(desc).ok());
 
     loader_->free(dev, kChunk);
 }

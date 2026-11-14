@@ -138,6 +138,20 @@ def _cached_extension_path(build_dir: Path, is_musa: bool) -> Path | None:
     return matches[0] if matches else None
 
 
+def _cached_so_looks_complete(path: Path) -> bool:
+    # A SIGKILL mid-compile leaves a truncated .so. dlopen then reports
+    # "file too short" and the caller used to treat that as a fatal JIT
+    # failure instead of rebuilding. ELF magic plus a non-header-sized
+    # length is enough to skip those leftovers without unlinking a file
+    # another process may still be writing.
+    try:
+        with path.open("rb") as fh:
+            magic = fh.read(4)
+        return magic == b"\x7fELF" and path.stat().st_size > 64
+    except OSError:
+        return False
+
+
 def _musa_source_paths(ported_dir: Path) -> list[Path]:
     paths = []
     for name in _SOURCE_NAMES:
@@ -158,23 +172,40 @@ def _musa_source_paths(ported_dir: Path) -> list[Path]:
     return paths
 
 
-def _load_cached_extension(build_dir: Path, is_musa: bool):
+def _load_cached_extension(
+    build_dir: Path, is_musa: bool, *, discard_corrupt: bool = False
+):
     extension_path = _cached_extension_path(build_dir, is_musa)
     if extension_path is None:
+        return None
+    if not _cached_so_looks_complete(extension_path):
+        if discard_corrupt:
+            try:
+                extension_path.unlink()
+            except OSError:
+                pass
         return None
     module_name = _adapter_module_name(is_musa)
     spec = importlib.util.spec_from_file_location(module_name, extension_path)
     if spec is None or spec.loader is None:
-        raise ImportError(
-            f"Unable to load cached Mooncake PG adapter: {extension_path}"
-        )
+        if discard_corrupt:
+            try:
+                extension_path.unlink()
+            except OSError:
+                pass
+        return None
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
     except Exception:
         sys.modules.pop(module_name, None)
-        raise
+        if discard_corrupt:
+            try:
+                extension_path.unlink()
+            except OSError:
+                pass
+        return None
     return module
 
 
@@ -332,7 +363,7 @@ def _load_jit_adapter():
             return cached
         with _build_lock(lock_path):
             build_dir.mkdir(parents=True, exist_ok=True)
-            cached = _load_cached_extension(build_dir, is_musa)
+            cached = _load_cached_extension(build_dir, is_musa, discard_corrupt=True)
             if cached is not None:
                 return cached
 

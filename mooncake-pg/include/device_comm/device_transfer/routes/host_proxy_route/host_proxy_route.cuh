@@ -7,7 +7,7 @@
 #include <transport/device/device_ops.cuh>
 
 #include "device_comm/device_utils/d2h_request_slot.cuh"
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_types.cuh"
 
@@ -59,8 +59,8 @@ static __device__ __noinline__ HostProxyTransferTicket hostProxyPut(
     // ticket state to the CTA.
     if (block.thread_rank() != 0) return {};
 
-    PG_DEVICE_ASSERT(context.command_slots && lane < kTransferLaneCount &&
-                     route.remote_region_address != 0);
+    PG_ASSERT(context.command_slots && lane < kTransferLaneCount &&
+              route.remote_region_address != 0);
     auto* const slot = context.command_slots + lane;
     const uint64_t start_ticks = clock64();
 
@@ -99,15 +99,16 @@ HostProxyTransferTicket::waitLeader() const {
         case HostProxyCommandResult::Failed:
             return TransferResult::Failed;
         case HostProxyCommandResult::Pending:
-            PG_DEVICE_UNREACHABLE();
+            PG_UNREACHABLE();
             return TransferResult::Failed;
     }
-    PG_DEVICE_UNREACHABLE();
+    PG_UNREACHABLE();
     return TransferResult::Failed;
 }
 
 __device__ __forceinline__ void drainHostProxyTransfers(
-    const DeviceHostProxyContext& context, uint64_t timeout_ticks) {
+    const DeviceTransferHandle& handle) {
+    const auto& context = handle.route_context.host_proxy;
     if (!context.command_slots) return;
 
     // Producers have stopped. The worker publishes completion after finishing
@@ -115,7 +116,7 @@ __device__ __forceinline__ void drainHostProxyTransfers(
     const uint64_t start_ticks = clock64();
     for (uint32_t lane = 0; lane < kTransferLaneCount; ++lane) {
         const auto& slot = context.command_slots[lane];
-        if (!slot.waitUntilIdle(start_ticks, timeout_ticks)) {
+        if (!slot.waitUntilIdle(start_ticks, handle.drain_timeout_ticks)) {
             printf("[PG] Host-proxy drain timed out at lane %u; continuing\n",
                    lane);
             return;
