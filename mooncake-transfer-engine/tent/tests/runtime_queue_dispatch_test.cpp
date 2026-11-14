@@ -598,13 +598,14 @@ TEST(RuntimeQueueDispatch, TimeoutDoesNotDispatchQueuedRequestsOfBatch) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    // The first poll blocks past the timeout, so waitTransfer() enters its
-    // timeout path. The status poll that follows then completes the dispatched
-    // owner and frees its dispatch window slot; a refill would submit the
-    // queued owner of the same batch unless it has already been canceled.
+    // Only the waiting thread may advance the scripted poll sequence.
+    const auto waiter_id = std::this_thread::get_id();
     std::atomic<int> polls{0};
     auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, [&polls](const Request& request, int) {
+        RDMA, [waiter_id, &polls](const Request& request, int) {
+            if (std::this_thread::get_id() != waiter_id) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
             if (++polls == 1) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 return TransferStatus{TransferStatusEnum::PENDING, 0};
