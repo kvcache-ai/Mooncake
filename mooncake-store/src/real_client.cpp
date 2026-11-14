@@ -4029,18 +4029,18 @@ RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
     return DiskReadHealResult::kEvicted;
 }
 
-// Implementation of get_buffer_internal method
-std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
+tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
+RealClient::get_buffer_internal(
     const std::string &key,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
     bool heal_dangling_disk_replica) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        return nullptr;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
-        return nullptr;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Query the object info
@@ -4048,18 +4048,18 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return nullptr;
+            return tl::make_unexpected(query_result.error());
         }
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(query_result.error());
-        return nullptr;
+        return tl::make_unexpected(query_result.error());
     }
 
     const std::vector<Replica::Descriptor> &replica_list =
         query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
-        return nullptr;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     // Select best replica: prefer local MEMORY, any MEMORY, local NOF, any NOF,
@@ -4070,7 +4070,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
-        return nullptr;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     // Same demand-side kick as the batch path: a plain get headed for SSD is
     // the strongest hotness signal there is.
@@ -4080,14 +4080,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
-        return nullptr;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     // Allocate buffer
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
-        return nullptr;
+        return tl::make_unexpected(ErrorCode::CLIENT_BUFFER_EXHAUSTED);
     }
 
     auto buffer_handle =
@@ -4118,7 +4118,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                                                false);
                 }
             }
-            return nullptr;
+            return tl::make_unexpected(read_result.error());
         }
         auto checksum_result =
             client_->VerifyObjectChecksum(key, objects.at(key), total_length,
@@ -4126,7 +4126,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!checksum_result) {
             LOG(ERROR) << "SSD checksum verification failed for key '" << key
                        << "': " << toString(checksum_result.error());
-            return nullptr;
+            return tl::make_unexpected(checksum_result.error());
         }
         return buffer_handle;
     }
@@ -4151,22 +4151,30 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
-        return nullptr;
+        return tl::make_unexpected(get_result.error());
     }
 
     return buffer_handle;
 }
 
+// Implementation of get_buffer_with_error method
+tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
+RealClient::get_buffer_with_error(const std::string &key) {
+    return execute_timed_operation<
+        tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>(
+        [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
+        [](const auto &result) { return result.has_value(); },
+        [&](uint64_t latency_us, const auto &result) {
+            client_->ObserveTransferOperation(
+                TransferOperationKind::kRead, "get_buffer",
+                result.value()->size(), latency_us);
+        });
+}
+
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
-    return execute_timed_operation<std::shared_ptr<BufferHandle>>(
-        [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
-        [](const auto &buffer) { return buffer != nullptr; },
-        [&](uint64_t latency_us, const auto &buffer) {
-            client_->ObserveTransferOperation(TransferOperationKind::kRead,
-                                              "get_buffer", buffer->size(),
-                                              latency_us);
-        });
+    auto result = get_buffer_with_error(key);
+    return result ? result.value() : nullptr;
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
@@ -4217,11 +4225,12 @@ RealClient::acquire_buffer_dummy(const std::string &key,
     }
 #endif
 
-    auto buffer_handle =
+    auto buffer_result =
         get_buffer_internal(key, context.client_buffer_allocator);
-    if (!buffer_handle) {
+    if (!buffer_result) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
+    auto buffer_handle = buffer_result.value();
 
     uint64_t real_addr = reinterpret_cast<uint64_t>(buffer_handle->ptr());
     size_t buf_size = buffer_handle->size();

@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -693,7 +694,19 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            auto buffer_handle = store_->get_buffer(key);
+            std::shared_ptr<BufferHandle> buffer_handle;
+            if (real_client_) {
+                auto result = real_client_->get_buffer_with_error(key);
+                if (!result &&
+                    result.error() == ErrorCode::CLIENT_BUFFER_EXHAUSTED) {
+                    throw std::bad_alloc();
+                }
+                if (result) {
+                    buffer_handle = result.value();
+                }
+            } else {
+                buffer_handle = store_->get_buffer(key);
+            }
             if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
                 return kNullString;
