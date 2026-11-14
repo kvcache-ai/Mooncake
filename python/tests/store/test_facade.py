@@ -33,6 +33,7 @@ def _run_python(
 
 
 _CPP_PUBLIC_NAMES = {
+    "NOF_ENABLED",
     "RangedReadSnapshot",
     "ObjectDataType",
     "SoftPinAction",

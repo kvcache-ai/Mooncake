@@ -8,6 +8,7 @@ from types import ModuleType
 
 _CPP_EXPORTS = frozenset(
     {
+        "NOF_ENABLED",
         "RangedReadSnapshot",
         "ObjectDataType",
         "SoftPinAction",

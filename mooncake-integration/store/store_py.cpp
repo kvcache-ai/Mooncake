@@ -2152,6 +2152,12 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(_store, m) {
+#ifdef USE_NOF
+    m.attr("NOF_ENABLED") = py::bool_(true);
+#else
+    m.attr("NOF_ENABLED") = py::bool_(false);
+#endif
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
