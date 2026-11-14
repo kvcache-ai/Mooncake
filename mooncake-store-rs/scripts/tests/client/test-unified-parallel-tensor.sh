@@ -107,6 +107,11 @@ PIDS+=($!)
 wait_for_healthz "127.0.0.1:${METRICS_PORT}"
 
 echo "==> running unified parallel tensor E2E tests"
+"${PYTHON_BIN}" ./python/tests/store/rs/client/test_tensor_read_destinations.py \
+  --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
+  --tenant default \
+  --keyspace "${KEYSPACE}"
+
 "${PYTHON_BIN}" ./python/tests/store/rs/client/test_unified_parallel_tensor.py \
   --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
   --tenant default \

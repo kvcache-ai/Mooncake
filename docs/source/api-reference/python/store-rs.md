@@ -98,6 +98,26 @@ Compatibility note:
 - dummy mode also supports high-level `batch_put(...)` and `batch_get(...)` compatibility calls for legacy black-box tests
 - registered-buffer and multi-buffer batch APIs are still the preferred throughput path for dummy-mode validation
 
+## Parallel Tensor Read Destinations
+
+`get_tensor_with_parallelism(..., tensor=destination)` fills and returns the
+same tensor object. The destination must be a contiguous CPU tensor whose dtype,
+shape and byte size exactly match the read result. For a shard read, this means
+the result's local shard shape, rather than the global tensor shape. Pinned CPU
+memory and matching contiguous views into larger allocations are supported.
+
+Invalid destinations raise `ValueError` before any bytes are copied into that
+destination. Non-CPU tensors (including CUDA and meta tensors), noncontiguous
+views, and mismatched dtype, shape or byte size are rejected. A larger backing
+allocation does not make an undersized view valid. To reuse a larger buffer,
+pass a contiguous view with the required shape and dtype. This tightens the
+previous unchecked destination behavior; it does not reshape or cast tensors.
+
+The same requirements apply to each supplied destination in
+`batch_get_tensor_with_parallelism`. Items are processed in order, and an error
+stops the batch. Earlier successful writes are not rolled back. Omitting the
+destination continues to return a newly constructed tensor.
+
 ## Local Hot Cache
 
 The Python compatibility layer can enable a daemon-local hot read cache for both real-mode clients and standalone dummy daemons.
