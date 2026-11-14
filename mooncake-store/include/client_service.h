@@ -1062,10 +1062,13 @@ class Client {
         TransferIntent intent = TransferIntent::kUnspecified);
     // Writes the slices to every memory and NoF replica in the list. All
     // transfers are submitted before any is waited on. Returns the type and
-    // result of each such replica, in order.
+    // result of each such replica, in order. When unreachable_nof_endpoints
+    // is set, the endpoint of every replica whose write failed with
+    // TRANSFER_FAIL is appended to it (empty for memory replicas).
     std::vector<std::pair<ReplicaType, ErrorCode>> WriteMemoryAndNofReplicas(
         const std::vector<Replica::Descriptor>& replicas,
-        std::vector<Slice>& slices);
+        std::vector<Slice>& slices,
+        std::vector<std::string>* unreachable_nof_endpoints = nullptr);
     ErrorCode TransferRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
@@ -1076,6 +1079,16 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
+
+    /**
+     * @brief Tell the master that writes to these NoF targets failed from this
+     * client, so it stops allocating on them for us until the report expires.
+     * Master-to-target heartbeats cannot see a client-to-target partition, so
+     * without this the master keeps handing back unusable NoF handles.
+     * Best effort: failures are logged and swallowed. Duplicate and empty
+     * endpoints are dropped, and an empty list issues no RPC.
+     */
+    void ReportUnreachableNoFTargets(std::vector<std::string> te_endpoints);
     void ReconcileMissingKvcsReplica(
         const std::string& key, const QueryResult& query_result,
         const Replica::Descriptor& replica_descriptor);
