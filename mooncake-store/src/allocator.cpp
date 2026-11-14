@@ -30,6 +30,12 @@ bool IsValidAllocation(const LiveAllocation& allocation,
            allocation.requested_size <= capacity - allocation.offset_from_base;
 }
 
+std::string GetAllocatorTransportProtocol(
+    const std::weak_ptr<BufferAllocatorBase>& allocator) {
+    auto shared = allocator.lock();
+    return shared ? shared->getTransportProtocol() : std::string();
+}
+
 }  // namespace
 
 struct SegmentLifetime::State {
@@ -109,16 +115,18 @@ AllocatedBuffer::~AllocatedBuffer() {
 }
 
 AllocatedBuffer::AllocatedBuffer(
-    std::shared_ptr<BufferAllocatorBase> allocator, void* buffer_ptr,
+    std::weak_ptr<BufferAllocatorBase> allocator, void* buffer_ptr,
     std::size_t size,
-    std::optional<offset_allocator::OffsetAllocationHandle>&& offset_handle)
+    std::optional<offset_allocator::OffsetAllocationHandle>&& offset_handle,
+    std::optional<std::string> protocol)
     : allocator_(allocator),
       buffer_ptr_(buffer_ptr),
       size_(size),
-      protocol(allocator ? allocator->getTransportProtocol() : std::string()),
+      protocol(protocol ? std::move(*protocol)
+                        : GetAllocatorTransportProtocol(allocator)),
       offset_handle_(std::move(offset_handle)) {}
 
-AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+AllocatedBuffer::AllocatedBuffer(std::weak_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
@@ -307,7 +315,8 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    return std::make_unique<AllocatedBuffer>(
+        weak_from_this(), buffer, size, std::nullopt, getTransportProtocol());
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -347,9 +356,9 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
             segment_name_, allocation.requested_size);
     }
     return std::make_unique<AllocatedBuffer>(
-        shared_from_this(),
+        weak_from_this(),
         reinterpret_cast<void*>(base_ + allocation.offset_from_base),
-        allocation.requested_size);
+        allocation.requested_size, std::nullopt, getTransportProtocol());
 }
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
@@ -455,6 +464,11 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         LOG(ERROR) << "allocator_status=not_initialized";
         return nullptr;
     }
+    auto allocator = weak_from_this();
+    if (allocator.expired()) {
+        LOG(ERROR) << "allocator_status=not_shared";
+        return nullptr;
+    }
 
     std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
@@ -473,7 +487,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
+            std::move(allocator), buffer_ptr, size,
+            std::move(allocation_handle), getTransportProtocol());
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {

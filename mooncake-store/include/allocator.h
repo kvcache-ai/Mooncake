@@ -83,12 +83,13 @@ class AllocatedBuffer {
 
     // A buffer carved from an allocator advertises the allocator's transport
     // protocol.
-    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+    AllocatedBuffer(std::weak_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt);
+                        offset_handle = std::nullopt,
+                    std::optional<std::string> protocol = std::nullopt);
 
-    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+    AllocatedBuffer(std::weak_ptr<BufferAllocatorBase> allocator,
                     const Descriptor& descriptor);
 
     ~AllocatedBuffer();
@@ -178,7 +179,8 @@ class AllocatedBuffer {
  * Virtual base class for buffer allocators.
  * Defines the interface that all buffer allocators must implement.
  */
-class BufferAllocatorBase {
+class BufferAllocatorBase
+    : public std::enable_shared_from_this<BufferAllocatorBase> {
    public:
     virtual ~BufferAllocatorBase() = default;
 
@@ -302,9 +304,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
  * const size_t base = 0x100000001;  // Not 4MB aligned
  * ```
  */
-class CachelibBufferAllocator
-    : public BufferAllocatorBase,
-      public std::enable_shared_from_this<CachelibBufferAllocator> {
+class CachelibBufferAllocator : public BufferAllocatorBase {
    public:
     static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
     Create(std::string segment_name, size_t base, size_t size,
@@ -384,11 +384,9 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
- * optimization.
+ * optimization. Instances require shared ownership before allocate() is used.
  */
-class OffsetBufferAllocator
-    : public BufferAllocatorBase,
-      public std::enable_shared_from_this<OffsetBufferAllocator> {
+class OffsetBufferAllocator : public BufferAllocatorBase {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
