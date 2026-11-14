@@ -25,7 +25,10 @@
 
 #include <unistd.h>
 
+#include "../../src/config/master_metadata_config.h"
+#include "common/network.h"
 #include "hot_standby_service.h"
+#include "http_metadata_server.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/mock_metadata_store.h"
 #include "ha/oplog/oplog_batch_codec.h"
@@ -35,6 +38,8 @@
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
+
+#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake::test {
 
@@ -167,6 +172,66 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
     std::condition_variable cv_;
     ErrorCode txn_error_{ErrorCode::OK};
     size_t txn_calls_{0};
+};
+
+class PausingSegmentOpLogWriter : public OrderedOpLogWriter {
+   public:
+    using OrderedOpLogWriter::OrderedOpLogWriter;
+    ~PausingSegmentOpLogWriter() override { Stop(); }
+
+    void PauseNext(OpType type) {
+        std::lock_guard lock(mutex_);
+        next_ = type;
+        paused_ = false;
+        resumed_ = false;
+    }
+    bool WaitPaused() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2),
+                            [&] { return paused_; });
+    }
+    void Resume() {
+        std::lock_guard lock(mutex_);
+        resumed_ = true;
+        cv_.notify_all();
+    }
+    uint64_t LastSequence() {
+        std::lock_guard lock(mutex_);
+        return last_sequence_;
+    }
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        const auto type = entry.op_type;
+        {
+            std::unique_lock lock(mutex_);
+            if (next_ == type) {
+                next_.reset();
+                paused_ = true;
+                cv_.notify_all();
+                cv_.wait(lock, [&] { return resumed_; });
+            }
+        }
+        auto result = OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+        if (result) {
+            std::lock_guard lock(mutex_);
+            last_sequence_ = std::max(last_sequence_, result->sequence_id());
+        }
+        return result;
+    }
+    void Stop() override {
+        Resume();
+        OrderedOpLogWriter::Stop();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::optional<OpType> next_;
+    bool paused_{false};
+    bool resumed_{false};
+    uint64_t last_sequence_{0};
 };
 
 class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
@@ -671,6 +736,21 @@ class MasterServiceHATest : public ::testing::Test {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         ASSERT_EQ(ErrorCode::OK, read_err);
+    }
+
+    static PausingSegmentOpLogWriter* InstallPausingSegmentWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<PausingSegmentOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
+        return static_cast<PausingSegmentOpLogWriter*>(
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
     }
 
     static GatedOrderedOpLogWriter* InstallGatedWriter(
@@ -3645,6 +3725,376 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesCxlBufferDescriptor) {
     EXPECT_EQ(batch_after[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
+TEST_F(MasterServiceHATest,
+       FreshMountedRemountCompletesWhileEvictionAndStateReadersContinue) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_default_kv_lease_ttl(60000)
+                              .build());
+    const auto segment = MakeSegment("fresh_readiness");
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    ASSERT_EQ(service.Ping(owner)->client_status, ClientStatus::NEED_REMOUNT);
+    const auto online =
+        PrepareSimpleSegment(service, "online_readiness", 0x400000000);
+    Segment online_segment;
+    std::shared_ptr<BufferAllocatorBase> allocator_before;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        ASSERT_TRUE(access.GetSegment(online.segment_id, online_segment));
+        allocator_before = access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(allocator_before, nullptr);
+    ASSERT_TRUE(service.ReMountSegment({online_segment}, online.client_id));
+    const auto fresh_key =
+        PutObjectOnSegment(service, owner, "fresh_key", segment.name);
+    ASSERT_TRUE(service.GetReplicaList(fresh_key, kDefaultTenant));
+    const auto before =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, fresh_key);
+    ASSERT_EQ(before.size(), 1u);
+    const auto key = PutObjectOnSegment(service, online.client_id, "online_key",
+                                        online_segment.name);
+    ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant));
+    const auto evictable = PutObjectOnSegment(
+        service, online.client_id, "evictable_key", online_segment.name);
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, evictable,
+                               std::chrono::system_clock::time_point{});
+
+    // Keep at least one state reader active for the entire assertion window.
+    // This deterministically excludes an exclusive state acquisition, without
+    // relying on the platform's reader/writer fairness or a large dataset.
+    std::promise<void> first_eviction;
+    auto first_eviction_done = first_eviction.get_future();
+    std::exception_ptr eviction_error;
+    // On unwinding release the reader, stop/join eviction, then wait on the
+    // request futures, in that order.
+    std::future<tl::expected<void, ErrorCode>> remount;
+    std::future<void> requests;
+    std::jthread eviction;
+    std::shared_lock state_reader(
+        MasterServiceTestPeer::MasterStateMutex(service));
+    eviction = std::jthread([&](std::stop_token stop) {
+        bool announced = false;
+        try {
+            MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+            first_eviction.set_value();
+            announced = true;
+            while (!stop.stop_requested()) {
+                const auto pressure_key = PutObjectOnSegment(
+                    service, online.client_id, "eviction_pressure",
+                    online_segment.name);
+                SetLeaseDeadlineForTesting(
+                    service, kDefaultTenant, pressure_key,
+                    std::chrono::system_clock::time_point{});
+                MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0,
+                                                                       1.0);
+            }
+        } catch (...) {
+            eviction_error = std::current_exception();
+            if (!announced) {
+                first_eviction.set_exception(eviction_error);
+            }
+        }
+    });
+    ASSERT_EQ(first_eviction_done.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    first_eviction_done.get();
+    remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({segment}, owner);
+    });
+    const auto remount_status = remount.wait_for(std::chrono::seconds(2));
+    requests = std::async(std::launch::async, [&] {
+        const auto ping = service.Ping(online.client_id);
+        ASSERT_TRUE(ping);
+        EXPECT_EQ(ping->client_status, ClientStatus::OK);
+        EXPECT_TRUE(service.GetReplicaList(key, kDefaultTenant));
+        PutObjectOnSegment(service, online.client_id,
+                           "online_write_during_remount", online_segment.name);
+    });
+    const auto request_status = requests.wait_for(std::chrono::seconds(2));
+
+    // Release every blocker even when the old implementation times out, so a
+    // regression reports a failure instead of hanging in future destruction.
+    eviction.request_stop();
+    state_reader.unlock();
+    eviction.join();
+    EXPECT_EQ(eviction_error, nullptr);
+    EXPECT_EQ(remount_status, std::future_status::ready);
+    EXPECT_EQ(request_status, std::future_status::ready);
+    EXPECT_TRUE(remount.get());
+    requests.get();
+    EXPECT_EQ(service.Ping(owner)->client_status, ClientStatus::OK);
+    EXPECT_FALSE(service.ExistKey(evictable, kDefaultTenant).value_or(true));
+    const auto after =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, fresh_key);
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after.front().id, before.front().id);
+    EXPECT_EQ(
+        after.front().get_memory_descriptor().buffer_descriptor.buffer_address_,
+        before.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_);
+    auto access =
+        MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+    EXPECT_EQ(access.GetAllocator(segment.id), allocator_before);
+}
+
+TEST_F(MasterServiceHATest,
+       DuplicateMountedRemountCompletesWhileStateReadersContinue) {
+    MasterService service;
+    const auto segment = MakeSegment("duplicate_readiness");
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    ASSERT_TRUE(service.ReMountSegment({segment}, owner));
+
+    std::shared_lock state_reader(
+        MasterServiceTestPeer::MasterStateMutex(service));
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({segment}, owner);
+    });
+    const auto status = remount.wait_for(std::chrono::seconds(2));
+    state_reader.unlock();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_TRUE(remount.get());
+}
+
+TEST_F(MasterServiceHATest, MountedReadinessRechecksNameAfterUnmount) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(false)
+                              .build());
+    const auto fresh = MakeSegment("readiness_shared_name");
+    const auto retired = MakeSegment(fresh.name, 0x400000000);
+    const UUID owner = generate_uuid();
+    const UUID retired_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(fresh, owner));
+    ASSERT_TRUE(service.MountSegment(retired, retired_owner));
+    const auto key = PutObjectOnSegment(service, retired_owner,
+                                        "readiness_retiring_key", retired.name);
+
+    std::future<tl::expected<void, ErrorCode>> unmount, remount;
+    std::optional<route::WriteGuard> key_lock(
+        LockKeyForTesting(service, kDefaultTenant, key));
+    unmount = std::async(std::launch::async, [&] {
+        return service.UnmountSegment(retired.id, retired_owner);
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto status = service.QuerySegmentStatusById(retired.id);
+    while (status && *status != SegmentStatus::UNMOUNTING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+        status = service.QuerySegmentStatusById(retired.id);
+    }
+    ASSERT_TRUE(status);
+    ASSERT_EQ(*status, SegmentStatus::UNMOUNTING);
+
+    remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({fresh}, owner);
+    });
+    const auto while_unmounting =
+        remount.wait_for(std::chrono::milliseconds(100));
+    key_lock.reset();
+    EXPECT_EQ(while_unmounting, std::future_status::timeout);
+    ASSERT_TRUE(unmount.get());
+    ASSERT_TRUE(remount.get());
+    EXPECT_EQ(service.Ping(owner)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceHATest,
+       MountedReadinessDefersUntilUnmountLogSubmissionCompletes) {
+    const std::string cluster_id = "readiness_unmount_order";
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build());
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto* writer = InstallPausingSegmentWriter(service, backend);
+    ASSERT_NE(writer, nullptr);
+    auto retired = MakeSegment("retiring_readiness_segment");
+    auto fresh = MakeSegment("fresh_readiness_segment", 0x400000000);
+    retired.te_endpoint = fresh.te_endpoint = "reused_readiness_endpoint";
+    const UUID old_owner = generate_uuid();
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(retired, old_owner));
+    ASSERT_TRUE(service.MountSegment(fresh, owner));
+    const auto online = MakeSegment("live_readiness_segment", 0x500000000);
+    const UUID online_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(online, online_owner));
+    ASSERT_TRUE(service.ReMountSegment({online}, online_owner));
+    std::future<tl::expected<void, ErrorCode>> unmount, remount, duplicate;
+    std::future<void> requests;
+    std::future<bool> retired_removed;
+    std::shared_lock state_reader(
+        MasterServiceTestPeer::MasterStateMutex(service));
+    struct ResumeOnExit {
+        PausingSegmentOpLogWriter* writer;
+        ~ResumeOnExit() { writer->Resume(); }
+    } resume{writer};
+    writer->PauseNext(OpType::SEGMENT_UNMOUNT);
+    unmount = std::async(std::launch::async, [&] {
+        return service.UnmountSegment(retired.id, old_owner);
+    });
+    ASSERT_TRUE(writer->WaitPaused());
+    retired_removed = std::async(std::launch::async, [&] {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        return access.GetAllocator(retired.id) == nullptr;
+    });
+    const auto removed_status =
+        retired_removed.wait_for(std::chrono::seconds(1));
+    // The retiring segment has left the registry, but its UNMOUNT has not
+    // entered the log yet. A mounted-only predicate cannot see this window.
+    remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({fresh}, owner);
+    });
+    duplicate = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({online}, online_owner);
+    });
+    EXPECT_EQ(remount.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_EQ(duplicate.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    requests = std::async(std::launch::async, [&] {
+        const auto ping = service.Ping(online_owner);
+        ASSERT_TRUE(ping);
+        EXPECT_EQ(ping->client_status, ClientStatus::OK);
+        const auto key = PutObjectOnSegment(service, online_owner,
+                                            "readiness_live_key", online.name);
+        EXPECT_TRUE(service.GetReplicaList(key, kDefaultTenant));
+    });
+    const auto request_status = requests.wait_for(std::chrono::seconds(1));
+    writer->Resume();
+    const auto remount_status = remount.wait_for(std::chrono::seconds(2));
+    state_reader.unlock();
+    EXPECT_EQ(removed_status, std::future_status::ready);
+    EXPECT_TRUE(retired_removed.get());
+    EXPECT_EQ(request_status, std::future_status::ready);
+    EXPECT_EQ(remount_status, std::future_status::ready);
+    ASSERT_TRUE(unmount.get());
+    ASSERT_TRUE(remount.get());
+    EXPECT_TRUE(duplicate.get());
+    requests.get();
+    EXPECT_EQ(service.Ping(owner)->client_status, ClientStatus::OK);
+
+    auto promise = std::make_shared<std::promise<ErrorCode>>();
+    auto durable = promise->get_future();
+    [[maybe_unused]] auto notification =
+        writer->AwaitDurable(writer->LastSequence())
+            .thenValue(
+                [promise](ErrorCode error) { promise->set_value(error); });
+    ASSERT_EQ(durable.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    ASSERT_EQ(durable.get(), ErrorCode::OK);
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    ASSERT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    const auto restored =
+        applier.GetSegmentRegistry().GetSegment(fresh.te_endpoint);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->segment_name, fresh.name);
+}
+
+TEST_F(MasterServiceHATest, MountedReadinessWaitsForActiveHttpCleanup) {
+    HttpMetadataServer metadata_server(0, "127.0.0.1");
+    ASSERT_TRUE(metadata_server.start());
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("readiness_http_cleanup")
+                              .build());
+    service.setHttpMetadataServer(&metadata_server);
+    auto* writer = InstallPausingSegmentWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    const auto retired = MakeSegment("readiness_http_retired");
+    const auto fresh = MakeSegment("readiness_http_fresh", 0x400000000);
+    const auto ready = MakeSegment("readiness_http_ready", 0x500000000);
+    const UUID retired_owner = generate_uuid();
+    const UUID fresh_owner = generate_uuid();
+    const UUID ready_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(retired, retired_owner));
+    ASSERT_TRUE(service.MountSegment(fresh, fresh_owner));
+    ASSERT_TRUE(service.MountSegment(ready, ready_owner));
+    ASSERT_TRUE(service.ReMountSegment({ready}, ready_owner));
+    PutObjectOnSegment(service, retired_owner, "readiness_http_stale_key",
+                       retired.name);
+
+    const auto url =
+        "http://127.0.0.1:" + std::to_string(metadata_server.port()) +
+        "/metadata?key=" +
+        MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix() + "ram/" +
+        retired.name;
+    coro_http::coro_http_client http_client;
+    const auto put = async_simple::coro::syncAwait(
+        http_client.async_put(url, "{}", coro_http::req_content_type::json));
+    ASSERT_EQ(put.status, 200);
+
+    const auto liveness = ClientRecordForTesting(service, retired_owner);
+    ASSERT_TRUE(liveness);
+    ClientOffboardingJob job;
+    job.client_id = retired_owner;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {retired.id, retired.name, retired.te_endpoint});
+
+    std::future<bool> offboard;
+    std::future<void> first, duplicate, requests;
+    std::shared_lock state_reader(
+        MasterServiceTestPeer::MasterStateMutex(service));
+    struct ResumeOnExit {
+        PausingSegmentOpLogWriter* writer;
+        ~ResumeOnExit() { writer->Resume(); }
+    } resume{writer};
+
+    // Pause before final segment locking and before synchronous HTTP removal.
+    writer->PauseNext(OpType::REMOVE);
+    offboard = std::async(std::launch::async, [&] {
+        return ProcessClientOffboardingForTesting(service, job);
+    });
+    ASSERT_TRUE(writer->WaitPaused());
+    ASSERT_TRUE(httpGet(url));
+
+    const auto remount_and_check = [&](const Segment& segment, const UUID& id) {
+        EXPECT_TRUE(service.ReMountSegment({segment}, id));
+        const auto metadata = httpGet(url);
+        ASSERT_FALSE(metadata);
+        EXPECT_EQ(metadata.error(), 404);
+    };
+    first =
+        std::async(std::launch::async, remount_and_check, fresh, fresh_owner);
+    duplicate =
+        std::async(std::launch::async, remount_and_check, ready, ready_owner);
+    EXPECT_EQ(first.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    requests = std::async(std::launch::async, [&] {
+        const auto ping = service.Ping(ready_owner);
+        ASSERT_TRUE(ping);
+        EXPECT_EQ(ping->client_status, ClientStatus::OK);
+        const auto key = PutObjectOnSegment(
+            service, ready_owner, "readiness_http_live_key", ready.name);
+        EXPECT_TRUE(service.GetReplicaList(key, kDefaultTenant));
+    });
+    const auto requests_status = requests.wait_for(std::chrono::seconds(2));
+    writer->Resume();
+    const auto first_status = first.wait_for(std::chrono::seconds(2));
+    const auto duplicate_status = duplicate.wait_for(std::chrono::seconds(2));
+    state_reader.unlock();
+    EXPECT_EQ(requests_status, std::future_status::ready);
+    EXPECT_EQ(first_status, std::future_status::ready);
+    EXPECT_EQ(duplicate_status, std::future_status::ready);
+    EXPECT_TRUE(offboard.get());
+    first.get();
+    duplicate.get();
+    requests.get();
+}
+
 TEST_F(MasterServiceHATest, RemountRejectsExistingSegmentFromDifferentClient) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -3656,6 +4106,119 @@ TEST_F(MasterServiceHATest, RemountRejectsExistingSegmentFromDifferentClient) {
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(SegmentAllocatedSizeForTesting(service, segment.name), 0);
+}
+
+TEST_F(MasterServiceHATest,
+       MountedRemountValidatesWholeRequestBeforeReadiness) {
+    MasterService service;
+    const auto segment = MakeSegment("readiness_validated_batch");
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    auto conflicting = segment;
+    conflicting.size += 4096;
+    auto result = service.ReMountSegment({segment, conflicting}, owner);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(service.Ping(owner)->client_status, ClientStatus::NEED_REMOUNT);
+
+    const auto missing = MakeSegment("readiness_missing", 0x400000000);
+    ASSERT_TRUE(service.ReMountSegment({segment, missing}, owner));
+    auto access =
+        MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+    EXPECT_NE(access.GetAllocator(missing.id), nullptr);
+}
+
+TEST_F(MasterServiceHATest,
+       MountedRemountPreservesLocalityAndPublishesReadinessOnce) {
+    MasterService service;
+    auto segment = MakeSegment("readiness_locality");
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    const auto active_before =
+        MasterMetricManager::instance().get_active_clients();
+    segment.locality = SegmentLocality{.numa_node = 1, .hca_names = {"mlx5_0"}};
+    ASSERT_TRUE(service.ReMountSegment({segment}, owner));
+    ASSERT_TRUE(service.ReMountSegment({segment}, owner));
+    EXPECT_EQ(MasterMetricManager::instance().get_active_clients(),
+              active_before + 1);
+    EXPECT_EQ(service.Ping(owner)->client_status, ClientStatus::OK);
+    Segment authoritative;
+    auto access =
+        MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+    ASSERT_TRUE(access.GetSegment(segment.id, authoritative));
+    EXPECT_EQ(authoritative.locality, segment.locality);
+    EXPECT_EQ(access.GetAllocator(segment.id)->GetLocality(), segment.locality);
+}
+
+TEST_F(MasterServiceHATest,
+       MountedRemountDoesNotSkipStandbyOccupiedRangeImport) {
+    MasterService service;
+    const std::string endpoint = "mounted_standby_readiness";
+    auto object = MakeStandbyObject("mounted_standby_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {object}, 7, {MakeStandbyMemorySegment(endpoint)}));
+    const auto segment = MakeSegment(endpoint);
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    std::shared_ptr<BufferAllocatorBase> before;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        before = access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(before, nullptr);
+    const auto pending = service.GetReplicaList(object.key, kDefaultTenant);
+    ASSERT_FALSE(pending);
+    EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.ReMountSegment({segment}, owner));
+    EXPECT_TRUE(service.GetReplicaList(object.key, kDefaultTenant));
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, segment.name), 1024u);
+    auto access =
+        MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+    EXPECT_NE(access.GetAllocator(segment.id), before);
+    auto next = access.GetAllocator(segment.id)->allocate(1024);
+    ASSERT_TRUE(next);
+    EXPECT_NE(next->get_descriptor().buffer_address_, kDefaultSegmentBase);
+}
+
+TEST_F(MasterServiceHATest,
+       PartialMountedRemountStillRebindsOmittedOldSession) {
+    MasterService service;
+    const UUID owner = generate_uuid();
+    const auto first = MakeSegment("omitted_old_session");
+    ASSERT_TRUE(service.MountSegment(first, owner));
+    auto& manager = MasterServiceTestPeer::SegmentManager(service);
+    AllocatorManager allocators;
+    {
+        auto access = manager.getAllocatorAccess();
+        allocators = access.SnapshotAllocatorManager();
+    }
+    auto old_buffer =
+        allocators.getAllocators(first.name)->front()->Allocate(1024);
+    ASSERT_TRUE(old_buffer);
+    ASSERT_TRUE(old_buffer->isAvailable());
+    const auto replacement = std::make_shared<ClientLivenessRecord>(
+        owner, ClientLivenessRecord::Clock::now());
+    {
+        std::unique_lock lock(MasterServiceTestPeer::ClientMutex(service));
+        MasterServiceTestPeer::ClientLivenessRecords(service).at(owner) =
+            replacement;
+    }
+    const auto second = MakeSegment("current_session", 0x400000000);
+    ASSERT_TRUE(service.MountSegment(second, owner));
+    ASSERT_TRUE(service.ReMountSegment({second}, owner));
+    EXPECT_FALSE(old_buffer->isAllocatorValid());
+    {
+        auto access = manager.getAllocatorAccess();
+        allocators = access.SnapshotAllocatorManager();
+    }
+    auto new_buffer =
+        allocators.getAllocators(first.name)->front()->Allocate(1024);
+    ASSERT_TRUE(new_buffer);
+    EXPECT_EQ(new_buffer->getClientSession(), replacement);
 }
 
 TEST_F(MasterServiceHATest, RemountRejectsMismatchedExistingSegmentIdentity) {

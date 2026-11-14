@@ -1176,11 +1176,65 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
     return ErrorCode::OK;
 }
 
+bool MasterService::CanCompleteMountedRemount(
+    const std::vector<Segment>& segments,
+    const ClientSessionSharedPtr& owner_session,
+    const ScopedSegmentAccess& segment_access) const {
+    if (segments.empty()) {
+        return false;
+    }
+    const auto mounted_without_restore = [&](const Segment& segment) {
+        // Restore keeps an allocator for each invalid alias. Accounting is
+        // keyed by segment name and can outlive the keepalive entries.
+        return segment.protocol != "cxl" &&
+               !standby_allocator_keepalive_.contains(segment.name) &&
+               !standby_allocator_keepalive_.contains(segment.te_endpoint) &&
+               !standby_accounted_memory_bytes_.contains(segment.name) &&
+               segment_access.IsSegmentMountedForSession(segment.id,
+                                                         owner_session);
+    };
+    for (const auto& segment : segments) {
+        if (!mounted_without_restore(segment)) {
+            return false;
+        }
+        // MountSegment checks the name index before the UUID. A same-name
+        // segment can be unmounting even when this UUID is still mounted.
+        SegmentStatus named_status;
+        if (segment_access.GetSegmentStatusByName(segment.name, named_status) ==
+                ErrorCode::OK &&
+            named_status == SegmentStatus::UNMOUNTING) {
+            return false;
+        }
+    }
+    // The recovery path binds all of the client's segments, including those
+    // omitted from the request.
+    std::vector<Segment> mounted;
+    return segment_access.GetClientSegments(owner_session->ClientId(),
+                                            mounted) == ErrorCode::OK &&
+           std::all_of(mounted.begin(), mounted.end(), mounted_without_restore);
+}
+
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    {
+    std::unique_lock readiness_lock(remount_readiness_mutex_, std::defer_lock);
+    if (http_metadata_server_ || !http_metadata_remote_url_.empty()) {
+        // Even a duplicate remount response can trigger HTTP republication.
+        readiness_lock.lock();
+    }
+    // Return whether this request first published readiness. Both paths share
+    // the existing post-lock logging, while duplicates remain idempotent.
+    const auto remounted = [&]() -> tl::expected<bool, ErrorCode> {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        if (enable_oplog_ && ordered_oplog_writer_ &&
+            !readiness_lock.owns_lock() && !ok_client_.contains(client_id)) {
+            // Only first readiness submits MOUNT. Wait for active UNMOUNT
+            // submission without holding client or state locks, then check
+            // the current liveness record and readiness under client_mutex_.
+            client_lock.unlock();
+            readiness_lock.lock();
+            client_lock.lock();
+        }
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
                 client_id, std::make_shared<ClientLivenessRecord>(
@@ -1194,43 +1248,55 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-        const auto discard_provisional_record = [&] {
-            if (!record_inserted) {
-                return;
+        const auto reject = [&](ErrorCode error) {
+            if (record_inserted) {
+                client_liveness_records_.erase(client_id);
+                MasterMetricManager::instance()
+                    .on_client_liveness_record_removed(
+                        ClientLivenessState::ACTIVE);
             }
-            client_liveness_records_.erase(client_id);
-            MasterMetricManager::instance().on_client_liveness_record_removed(
-                ClientLivenessState::ACTIVE);
+            return tl::make_unexpected(error);
         };
-        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-        for (const auto& segment : segments) {
-            if (!segment.host_id.empty()) {
-                client_host_id_[client_id] = segment.host_id;
-                break;
-            }
-        }
-        {
-            auto segment_access = segment_manager_.getSegmentAccess();
+        const auto validate_segments = [&](const ScopedSegmentAccess& access) {
             for (const auto& segment : segments) {
-                auto standby_validation =
-                    ValidateStandbyRemountSegment(segment);
-                if (standby_validation != ErrorCode::OK) {
-                    discard_provisional_record();
-                    return tl::make_unexpected(standby_validation);
-                }
-                auto validation =
-                    segment_access.ValidateRemountSegment(segment, client_id);
-                if (validation != ErrorCode::OK) {
-                    discard_provisional_record();
-                    return tl::make_unexpected(validation);
+                auto error = ValidateStandbyRemountSegment(segment);
+                if (error != ErrorCode::OK) return error;
+                error = access.ValidateRemountSegment(segment, client_id);
+                if (error != ErrorCode::OK) return error;
+            }
+            return ErrorCode::OK;
+        };
+        const bool already_ready = ok_client_.contains(client_id);
+        {
+            std::shared_lock snapshot_lock(master_state_mutex_);
+            for (const auto& segment : segments) {
+                if (!segment.host_id.empty()) {
+                    client_host_id_[client_id] = segment.host_id;
+                    break;
                 }
             }
+            auto segment_access = segment_manager_.getSegmentAccess();
+            const auto validation = validate_segments(segment_access);
+            if (validation != ErrorCode::OK) return reject(validation);
+            if (already_ready) return false;
+            if (CanCompleteMountedRemount(segments, record, segment_access)) {
+                const auto error =
+                    segment_access.ReMountSegment(segments, record);
+                if (error != ErrorCode::OK) return reject(error);
+                // Unmount uses state shared too: retain segment_access until
+                // readiness is published so validation cannot go stale.
+                ok_client_.insert(client_id);
+                MasterMetricManager::instance().inc_active_clients();
+                return true;
+            }
+            if (readiness_lock.owns_lock()) readiness_lock.unlock();
         }
-        if (ok_client_.contains(client_id)) {
-            LOG(WARNING) << "client_id=" << client_id
-                         << ", warn=client_already_remounted";
-            // Return OK because this is an idempotent operation
-            return {};
+        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        {
+            // The registry can change while switching to exclusive access.
+            auto segment_access = segment_manager_.getSegmentAccess();
+            const auto validation = validate_segments(segment_access);
+            if (validation != ErrorCode::OK) return reject(validation);
         }
 
         struct SegmentRestore {
@@ -1268,10 +1334,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             }
         };
         auto fail_remount =
-            [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+            [&](ErrorCode error) -> tl::expected<bool, ErrorCode> {
             rollback_new_segments();
-            discard_provisional_record();
-            return tl::make_unexpected(error);
+            return reject(error);
         };
 
         ErrorCode remount_error = ErrorCode::OK;
@@ -1499,7 +1564,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // Change the client status to OK
         ok_client_.insert(client_id);
         MasterMetricManager::instance().inc_active_clients();
+        return true;
+    }();
+    if (readiness_lock.owns_lock()) readiness_lock.unlock();
+    if (!remounted) {
+        return tl::make_unexpected(remounted.error());
     }
+    if (!*remounted) return {};
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         for (const auto& seg : segments) {
@@ -2593,6 +2664,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     bool quota_recompute_needed = false;
     {
+        std::shared_lock readiness_lock(remount_readiness_mutex_);
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
         if (!job.pending_prepare_segments.empty()) {
@@ -2820,6 +2892,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
+    std::shared_lock readiness_lock(remount_readiness_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
