@@ -116,6 +116,34 @@ def test_run_master_and_client():
         return False
 
 
+def test_client_rejects_invalid_size_flags():
+    """Test that mooncake_client refuses to start on an invalid size flag.
+
+    Such values used to become 0, and a global segment size of 0 starts a
+    pure client that contributes no memory (#5429). IEC suffixes like
+    "MiB" are not accepted by the size parser, so they must be rejected.
+    """
+    for flag in ("global_segment_size", "local_buffer_size"):
+        try:
+            result = subprocess.run(
+                ["mooncake_client", f"--{flag}=256MiB"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"❌ mooncake_client kept running with --{flag}=256MiB")
+            return False
+
+        if result.returncode == 0 or f"Invalid value for --{flag}" not in result.stderr:
+            print(f"❌ mooncake_client did not reject --{flag}=256MiB")
+            print(f"returncode: {result.returncode}")
+            print(f"stderr: {result.stderr}")
+            return False
+        print(f"✅ mooncake_client rejected --{flag}=256MiB")
+    return True
+
+
 if __name__ == "__main__":
     print("Testing mooncake_master entry point...")
 
@@ -124,16 +152,23 @@ if __name__ == "__main__":
 
     if entry_point_installed:
         run_master_and_client_success = test_run_master_and_client()
+        invalid_size_rejected = test_client_rejects_invalid_size_flags()
     else:
         run_master_and_client_success = False
+        invalid_size_rejected = False
 
     # Print summary
     print("\nTest Summary:")
     print(f"Entry point installed: {'✅' if entry_point_installed else '❌'}")
     print(f"Run master successful: {'✅' if run_master_and_client_success else '❌'}")
+    print(f"Invalid size rejected: {'✅' if invalid_size_rejected else '❌'}")
 
     # Exit with appropriate status code
-    if entry_point_installed and run_master_and_client_success:
+    if (
+        entry_point_installed
+        and run_master_and_client_success
+        and invalid_size_rejected
+    ):
         print("\nAll tests passed! 🎉")
         sys.exit(0)
     else:
