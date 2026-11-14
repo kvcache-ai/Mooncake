@@ -62,7 +62,10 @@ struct ObjectMetadata {
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
-        MasterMetricManager::instance().dec_key_group(key_group, TotalLength());
+        if (key_group_accounted) {
+            MasterMetricManager::instance().dec_key_group(key_group,
+                                                          TotalLength());
+        }
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
         }
@@ -77,23 +80,17 @@ struct ObjectMetadata {
                        committed_soft_pin_timeout = std::nullopt,
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-                   std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {},
+                   std::string group_id_ = "",
                    std::string residency_affinity_id_ = "")
         : client_id(client_id_),
           put_start_time(put_start_time_),
           data_type(data_type_),
           group_id(std::move(group_id_)),
           residency_affinity_id(std::move(residency_affinity_id_)),
-          tenant_id(std::move(tenant_id_)),
-          user_key(std::move(user_key_)),
-          key_group(
-              MasterMetricManager::instance().classify_key_group(user_key)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin) {
         parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
-        MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
@@ -112,9 +109,11 @@ struct ObjectMetadata {
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const std::string residency_affinity_id;
-    const TenantId tenant_id;
-    const std::string user_key;
-    const uint8_t key_group;
+    // The key group this object's key classifies into. The route fills it in
+    // from the key it publishes under, the one place the key is known, and
+    // accounts for it until the object is destroyed.
+    uint8_t key_group{0};
+    bool key_group_accounted{false};
 
     // Committed attribution only; protected by the key's lock.
     std::string session_id;

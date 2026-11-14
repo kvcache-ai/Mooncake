@@ -256,7 +256,7 @@ class DynamicReplicationTest : public ::testing::Test {
         std::vector<ReplicaID> erased_replica_ids;
         return MasterServiceTestPeer(service)
             .EraseReplicasWithCacheTotalAccounting(
-                accessor.Get(),
+                accessor.Get(), key,
                 [&target_segment](const Replica& replica) {
                     if (!replica.is_memory_replica()) {
                         return false;
