@@ -49,6 +49,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -477,6 +478,22 @@ class ObjectRoute {
         return Read(key).has_value();
     }
 
+    class BatchReadCursor;
+
+    // A cursor over each `keys[i]` that holds an object, in request order and
+    // under that key's read lock, as a read guard holds it:
+    //
+    //     for (auto object : route.ReadBatch(keys)) { ... object.index() ... }
+    //
+    // The slots are found first, stripe by stripe with each stripe locked once
+    // for all of its keys, and held by handle; each key is then locked as the
+    // cursor reaches it, with no stripe lock held. Visiting in request order
+    // keeps what the loop body allocates in the order the caller frees it. A
+    // route that reports reads takes each key through Read() instead. `keys`
+    // must outlive the cursor.
+    [[nodiscard]] BatchReadCursor ReadBatch(
+        std::span<const std::string> keys) const;
+
     [[nodiscard]] size_t ObjectCount() const {
         return object_count_.load(std::memory_order_relaxed);
     }
@@ -786,6 +803,142 @@ class ObjectRoute::Cursor {
     bool visited_in_flight_ = false;
 };
 
+// --- ObjectRoute::BatchReadCursor -------------------------------------------
+
+// The cursor behind ReadBatch(). It owns the guard of the key it stands on, so
+// it neither copies nor moves.
+class ObjectRoute::BatchReadCursor {
+   public:
+    // The object a position stands on, valid until the cursor advances.
+    class Object {
+       public:
+        size_t index() const { return index_; }
+        const ObjectMetadata& metadata() const { return guard_.metadata(); }
+
+       private:
+        friend class BatchReadCursor;
+        Object(size_t index, const ReadGuard& guard)
+            : index_(index), guard_(guard) {}
+        size_t index_;
+        const ReadGuard& guard_;
+    };
+
+    struct Sentinel {};
+
+    class Iterator {
+       public:
+        Object operator*() const {
+            return Object(cursor_->index_, *cursor_->guard_);
+        }
+        Iterator& operator++() {
+            cursor_->Settle();
+            return *this;
+        }
+        bool operator!=(Sentinel) const { return cursor_->guard_.has_value(); }
+
+       private:
+        friend class BatchReadCursor;
+        explicit Iterator(BatchReadCursor* cursor) : cursor_(cursor) {}
+        BatchReadCursor* cursor_;
+    };
+
+    BatchReadCursor(const BatchReadCursor&) = delete;
+    BatchReadCursor& operator=(const BatchReadCursor&) = delete;
+    ~BatchReadCursor() {
+        // Done with the route before the count says so.
+        guard_.reset();
+        slots_.clear();
+#ifndef NDEBUG
+        route_.live_cursors_.fetch_sub(1, std::memory_order_relaxed);
+#endif
+    }
+
+    Iterator begin() { return Iterator(this); }
+    Sentinel end() const { return {}; }
+
+   private:
+    friend class ObjectRoute;
+
+    BatchReadCursor(const ObjectRoute& route, std::span<const std::string> keys)
+        : route_(route), keys_(keys) {
+#ifndef NDEBUG
+        route_.live_cursors_.fetch_add(1, std::memory_order_relaxed);
+#endif
+        if (!route_.report_reads_) {
+            FindSlots();
+        }
+        Settle();
+    }
+
+    // A counting sort of the key indexes by stripe, then one pass per stripe.
+    void FindSlots() {
+        AssertNotInCursor();
+        std::vector<uint32_t> starts(kStripeCount + 1, 0);
+        std::vector<uint32_t> stripe_of(keys_.size());
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            stripe_of[i] = static_cast<uint32_t>(StripeIndex(keys_[i]));
+            ++starts[stripe_of[i] + 1];
+        }
+        for (size_t s = 0; s < kStripeCount; ++s) {
+            starts[s + 1] += starts[s];
+        }
+        std::vector<uint32_t> order(keys_.size());
+        std::vector<uint32_t> next(starts.begin(), starts.end() - 1);
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            order[next[stripe_of[i]]++] = static_cast<uint32_t>(i);
+        }
+
+        slots_.resize(keys_.size());
+        for (size_t s = 0; s < kStripeCount; ++s) {
+            if (starts[s] == starts[s + 1]) {
+                continue;
+            }
+            Stripe& stripe = route_.stripes_[s];
+            std::shared_lock<std::shared_mutex> stripe_lock(stripe.lock);
+            for (uint32_t pos = starts[s]; pos < starts[s + 1]; ++pos) {
+                const uint32_t i = order[pos];
+                const auto it = stripe.slots.find(keys_[i]);
+                if (it != stripe.slots.end()) {
+                    slots_[i].emplace(stripe, it->second);
+                }
+            }
+        }
+    }
+
+    // Moves to the next key that holds an object, or to the end.
+    void Settle() {
+        guard_.reset();
+        for (; next_ < keys_.size(); ++next_) {
+            if (route_.report_reads_) {
+                if (auto guard = route_.Read(keys_[next_])) {
+                    guard_.emplace(std::move(*guard));
+                }
+            } else if (slots_[next_].has_value()) {
+                guard_.emplace(ReadGuard(&route_, std::move(*slots_[next_])));
+                slots_[next_].reset();
+                if (!guard_->has_object()) {
+                    guard_.reset();
+                }
+            }
+            if (guard_.has_value()) {
+                index_ = next_++;
+                return;
+            }
+        }
+    }
+
+    const ObjectRoute& route_;
+    const std::span<const std::string> keys_;
+    // A handle on each key's slot not reached yet; empty for a key with no
+    // slot, and for every key of a route that reports reads.
+    std::vector<std::optional<SlotHandle>> slots_;
+    size_t next_ = 0;
+    size_t index_ = 0;
+    // The key stood on. Let go before the handles, as letting go of a handle
+    // may drop its slot.
+    std::optional<ReadGuard> guard_;
+};
+
 // --- ObjectRoute ------------------------------------------------------------
 
 inline ObjectRoute::~ObjectRoute() {
@@ -884,6 +1037,11 @@ inline void ObjectRoute::TearDownLocked(KeySlot& slot) {
     slot.record_.reset();
     slot.state_.fetch_and(~KeySlot::kOccupied, std::memory_order_relaxed);
     object_count_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+inline ObjectRoute::BatchReadCursor ObjectRoute::ReadBatch(
+    std::span<const std::string> keys) const {
+    return BatchReadCursor(*this, keys);
 }
 
 inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {

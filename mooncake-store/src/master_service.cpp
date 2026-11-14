@@ -3067,15 +3067,15 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
-        if (!accessor.Exists()) {
-            VLOG(1) << "key=" << keys[i] << ", tenant_id=" << normalized_tenant
-                    << ", info=object_not_found";
-            results[i] = false;
-            continue;
+    const metadata::Namespace* ns = namespaces_.Lookup(normalized_tenant);
+    if (ns == nullptr) {
+        return results;
+    }
+    for (auto object : ns->objects.ReadBatch(keys)) {
+        if (object.metadata().IsValid()) {
+            results[object.index()] =
+                ReadExistence(object.metadata(), grant_lease);
         }
-        results[i] = ReadExistence(accessor.Get(), grant_lease);
     }
     return results;
 }
@@ -4879,16 +4879,18 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     ReadFollowUps follow_ups;
+    MasterMetricManager::instance().inc_total_get_nums(
+        static_cast<int64_t>(keys.size()));
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        MasterMetricManager::instance().inc_total_get_nums();
-        MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
-        if (!accessor.Exists()) {
-            VLOG(1) << "key=" << keys[i] << ", info=object_not_found";
-            continue;
+    const metadata::Namespace* ns = namespaces_.Lookup(normalized_tenant);
+    if (ns != nullptr) {
+        for (auto object : ns->objects.ReadBatch(keys)) {
+            if (object.metadata().IsValid()) {
+                results[object.index()] =
+                    ReadReplicaList(normalized_tenant, keys[object.index()],
+                                    object.metadata(), follow_ups);
+            }
         }
-        results[i] = ReadReplicaList(normalized_tenant, keys[i], accessor.Get(),
-                                     follow_ups);
     }
     follow_ups.Run(*this);
     return results;
@@ -4908,10 +4910,14 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        MetadataAccessorRO accessor(this, tenant_id, keys[i]);
-        if (accessor.Exists()) {
-            results[i] = ReadReplicaListForAdmin(accessor.Get());
+    const metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
+        return results;
+    }
+    for (auto object : ns->objects.ReadBatch(keys)) {
+        if (object.metadata().IsValid()) {
+            results[object.index()] =
+                ReadReplicaListForAdmin(object.metadata());
         }
     }
     return results;
