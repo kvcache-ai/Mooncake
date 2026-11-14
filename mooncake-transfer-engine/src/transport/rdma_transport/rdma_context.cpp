@@ -47,6 +47,8 @@
 
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+
+#include "transport/hip_gem_lookup.h"
 #endif
 #include "transport/rdma_transport/data_direct_topology.h"
 #include "transport/rdma_transport/endpoint_store.h"
@@ -109,15 +111,8 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
 // CONFIG_DMABUF_MOVE_NOTIFY enabled, which are required for ibv_reg_dmabuf_mr
 // to produce working RDMA transfers (not just successful registration).
 // Result is cached after the first call.
-bool isKernelDmabufSupported() {
+static bool kernelHasDmabufP2p() {
     static const bool supported = []() {
-        if (const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF")) {
-            if (std::string(env) != "0") {
-                LOG(INFO)
-                    << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
-                return false;
-            }
-        }
         struct utsname uts{};
         std::string release;
         if (uname(&uts) == 0) release = uts.release;
@@ -230,6 +225,18 @@ bool isKernelDmabufSupported() {
         return ok;
     }();
     return supported;
+}
+
+// kernelHasDmabufP2p(), unless MOONCAKE_DISABLE_HIP_DMABUF opts out of the
+// dma-buf path for ordinary HIP memory.
+bool isKernelDmabufSupported() {
+    static const bool disabled = []() {
+        const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF");
+        if (!env || std::string(env) == "0") return false;
+        LOG(INFO) << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
+        return true;
+    }();
+    return !disabled && kernelHasDmabufP2p();
 }
 #endif  // USE_HIP_DMABUF
 
@@ -715,6 +722,37 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     hipPointerAttribute_t hipAttr{};
     hipError_t hipRes = hipPointerGetAttributes(&hipAttr, addr);
 
+    // A hip_gem_allocator.so buffer has no other safe path: HIP reports no
+    // address range for it, ROCr cannot export it, and ibv_reg_mr would reach
+    // the amdgpu peer-memory client, which dereferences the NULL kfd_bo of a
+    // GEM BO. Register it with the BO's own dma-buf whatever
+    // MOONCAKE_DISABLE_HIP_DMABUF says, and fail if the kernel cannot.
+    HipGemBuffer gem;
+    if (hipRes == hipSuccess && hipAttr.type == hipMemoryTypeDevice &&
+        lookupHipGemBuffer(addr, gem, true)) {
+        if ((uintptr_t)addr + length > (uintptr_t)gem.base + gem.size) {
+            LOG(ERROR) << "Buffer " << addr << " length " << length
+                       << " runs past its amdgpu GEM allocation " << gem.base
+                       << " size " << gem.size;
+            close(gem.fd);
+            return ERR_INVALID_ARGUMENT;
+        }
+        if (!kernelHasDmabufP2p()) {
+            LOG(ERROR) << "amdgpu GEM buffer " << addr
+                       << " can only be registered through dma-buf, which "
+                          "this kernel does not support";
+            close(gem.fd);
+            return ERR_CONTEXT;
+        }
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = gem.fd;
+        out.offset = (uintptr_t)addr - (uintptr_t)gem.base;
+        out.alloc_base = gem.base;
+        out.device = gem.device;
+        out.amdgpu_gem = true;
+        return 0;
+    }
+
     if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
         hipAttr.type == hipMemoryTypeUnregistered) {
         // Host memory — standard ibv_reg_mr() path.
@@ -823,6 +861,11 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                    << " exceeds device max_mr_size "
                    << globalConfig().max_mr_size
                    << " (should have been chunked before registration, #2017)";
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (exp.amdgpu_gem && exp.method != DmabufExport::Method::kDmabufReg) {
+        LOG(ERROR) << "amdgpu GEM buffer " << addr
+                   << " must be registered through its dma-buf";
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;

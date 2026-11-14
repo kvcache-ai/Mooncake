@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -31,6 +32,7 @@
 #include "config.h"
 #include "hip_device_guard.h"
 #include "transfer_metadata.h"
+#include "transport/hip_gem_lookup.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -210,7 +212,7 @@ static int getDeviceFromPointer(void* ptr) {
 
     if (attributes.type == hipMemoryTypeDevice) {
         // GPU memory - return device ID
-        return attributes.device;
+        return hipDeviceOfPointer(ptr, attributes.device);
     } else if (attributes.type == hipMemoryTypeHost ||
                attributes.type == hipMemoryTypeUnregistered) {
         // Host memory - return -1 to indicate CPU memory
@@ -756,6 +758,19 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                 LOG(INFO) << "HipTransport: skipping non-device memory " << addr
                           << ", leaving it to other transports";
             }
+            skipped_addrs_.insert((uint64_t)addr);
+            return 0;
+        }
+        // HIP has no IPC handle for a hip_gem_allocator.so buffer (imported
+        // memory), so leave it to RDMA as well: with no hip buffer published
+        // for its range, same-host transfers to it are routed over RDMA.
+        HipGemBuffer gem;
+        if (lookupHipGemBuffer(addr, gem, false)) {
+            static std::once_flag logged;
+            std::call_once(logged, [addr] {
+                LOG(INFO) << "HipTransport: amdgpu GEM buffer " << addr
+                          << " has no HIP IPC handle, leaving it to RDMA";
+            });
             skipped_addrs_.insert((uint64_t)addr);
             return 0;
         }

@@ -122,6 +122,9 @@ struct DmabufExport {
     // HIP: the exported allocation and the GPU that owns it.
     void *alloc_base = nullptr;
     int device = -1;
+    // HIP: a hip_gem_allocator.so buffer (see hip_gem_lookup.h). It may only
+    // be registered through its dma-buf, never with ibv_reg_mr.
+    bool amdgpu_gem = false;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
