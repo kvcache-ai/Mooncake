@@ -9,6 +9,7 @@
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 
 #include "common/client_buffer_allocation.h"
+#include "device/accelerator_registry.h"
 
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -43,7 +44,23 @@ ClientBufferAllocator::ClientBufferAllocator(
     }
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
-    if (use_hugepage_) {
+#if defined(USE_MLU) && !defined(USE_VRAM_SEGMENT)
+    // MLU transfers stage through this pool. Pin it once so large
+    // device copies do not repeatedly stage through pageable host memory.
+    if (protocol == "tcp" && !use_hugepage_ && !dma_allocator_) {
+        auto accelerators =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        for (auto* accelerator : accelerators.Devices()) {
+            if (accelerator->Vendor() == device::AcceleratorVendor::kMlu) {
+                pinned_host_ = accelerator->AllocatePinnedHost(size);
+                break;
+            }
+        }
+    }
+#endif
+    if (pinned_host_.addr) {
+        buffer_ = pinned_host_.addr;
+    } else if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
 #if defined(USE_SUNRISE)
@@ -75,7 +92,7 @@ ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
 
 ClientBufferAllocator::~ClientBufferAllocator() {
     // Free the aligned allocated memory or unmap shared memory
-    if (!is_external_memory_ && buffer_) {
+    if (!is_external_memory_ && buffer_ && !pinned_host_.addr) {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {

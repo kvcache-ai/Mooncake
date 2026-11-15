@@ -390,7 +390,7 @@ struct MemcpyTask {
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a single worker thread that executes memcpy operations
+ * This class manages worker threads that execute memcpy operations
  * asynchronously.
  */
 class MemcpyWorkerPool {

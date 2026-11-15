@@ -678,8 +678,14 @@ void NofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
+#ifdef USE_MLU
+// Synchronous MLU copies need overlap to saturate DMA bandwidth. A single
+// worker serializes concurrent device copies even with disjoint buffers.
+constexpr int kDefaultMemcpyWorkers = 4;
+#else
+// Host memcpy is bound by memory bandwidth.
 constexpr int kDefaultMemcpyWorkers = 1;
+#endif
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers

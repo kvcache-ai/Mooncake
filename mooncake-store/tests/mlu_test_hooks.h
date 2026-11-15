@@ -13,6 +13,19 @@ extern std::atomic<size_t> mlu_injected_copy_failures;
 extern std::atomic<size_t> mlu_pinned_allocations;
 extern std::atomic<size_t> mlu_pinned_frees;
 extern std::atomic<size_t> mlu_pinned_free_errors;
+extern std::atomic<bool> pause_mlu_h2d;
+extern std::atomic<size_t> mlu_h2d_inflight;
+
+class ScopedMluH2dPause {
+   public:
+    ScopedMluH2dPause() { pause_mlu_h2d.store(true); }
+    ~ScopedMluH2dPause() {
+        pause_mlu_h2d.store(false);
+        pause_mlu_h2d.notify_all();
+    }
+    ScopedMluH2dPause(const ScopedMluH2dPause&) = delete;
+    ScopedMluH2dPause& operator=(const ScopedMluH2dPause&) = delete;
+};
 
 class ScopedMluFailure {
    public:
