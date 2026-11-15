@@ -1,8 +1,10 @@
 #include "master_admin_service.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <sstream>
@@ -11,6 +13,7 @@
 #include <vector>
 
 #include <asio/executor_work_guard.hpp>
+#include <asio/ip/address.hpp>
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
 #include <jsoncpp/json/json.h>
@@ -35,6 +38,39 @@ namespace mooncake {
 const uint64_t kMetricReportIntervalSeconds = 10;
 
 namespace {
+
+constexpr const char* kAdminTokenEnv = "MC_MASTER_ADMIN_TOKEN";
+constexpr const char* kAdminAllowInsecureEnv = "MC_MASTER_ADMIN_ALLOW_INSECURE";
+
+std::string ReadEnvString(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? std::string(value) : std::string();
+}
+
+bool ReadEnvFlag(const char* name) {
+    std::string value = ReadEnvString(name);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value == "1" || value == "true" || value == "yes";
+}
+
+bool ConstantTimeEquals(std::string_view a, std::string_view b) {
+    // Iterate over the expected secret (b) regardless of the presented length
+    // so timing does not reveal a matching prefix.
+    unsigned char diff = a.size() == b.size() ? 0 : 1;
+    for (size_t i = 0; i < b.size(); ++i) {
+        const unsigned char lhs =
+            i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        diff |= lhs ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
+
+bool IsLoopbackHost(const std::string& host) {
+    std::error_code ec;
+    auto address = asio::ip::make_address(host, ec);
+    return !ec && address.is_loopback();
+}
 
 std::string AppendMetricSections(std::string primary, std::string secondary) {
     if (!primary.empty() && primary.back() != '\n') {
@@ -267,6 +303,8 @@ MasterAdminServer::MasterAdminServer(uint16_t http_port,
     : http_port_(http_port),
       http_host_(std::move(http_host)),
       enable_metric_reporting_(enable_metric_reporting),
+      admin_token_(ReadEnvString(kAdminTokenEnv)),
+      allow_insecure_key_inspection_(ReadEnvFlag(kAdminAllowInsecureEnv)),
       http_server_(4, http_port, http_host_) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
@@ -322,7 +360,86 @@ bool MasterAdminServer::Start() {
     }
 
     LOG(INFO) << "Master admin server started on port " << http_server_.port();
+    if (admin_token_.empty() && !IsLoopbackHost(http_host_)) {
+        if (allow_insecure_key_inspection_) {
+            LOG(WARNING) << "Master admin server is bound to " << http_host_
+                         << " with " << kAdminAllowInsecureEnv
+                         << " set: /get_all_keys, /query_key and "
+                            "/batch_query_keys are served without "
+                            "authentication to any peer. Set "
+                         << kAdminTokenEnv << " to require a bearer token.";
+        } else {
+            LOG(WARNING) << "Master admin server is bound to " << http_host_
+                         << " with no " << kAdminTokenEnv
+                         << ": /get_all_keys, /query_key and "
+                            "/batch_query_keys only answer loopback clients. "
+                            "Set "
+                         << kAdminTokenEnv
+                         << " to allow authenticated remote access.";
+        }
+    }
     return true;
+}
+
+bool MasterAdminServer::IsLoopbackRemoteAddress(
+    std::string_view remote_address) {
+    // coro_http formats the peer as "<ip>:<port>" without IPv6 brackets.
+    const auto colon = remote_address.rfind(':');
+    if (colon == std::string_view::npos || colon == 0) {
+        return false;
+    }
+    std::error_code ec;
+    auto address = asio::ip::make_address(
+        std::string(remote_address.substr(0, colon)), ec);
+    if (ec) {
+        return false;
+    }
+    if (address.is_v6() && address.to_v6().is_v4_mapped()) {
+        return asio::ip::make_address_v4(asio::ip::v4_mapped, address.to_v6())
+            .is_loopback();
+    }
+    return address.is_loopback();
+}
+
+bool MasterAdminServer::AuthorizeKeyInspection(
+    coro_http::coro_http_request& req,
+    coro_http::coro_http_response& resp) const {
+    if (!admin_token_.empty()) {
+        std::string_view header = req.get_header_value("Authorization");
+        constexpr std::string_view kBearer = "bearer ";
+        bool ok = false;
+        if (header.size() > kBearer.size()) {
+            bool scheme_matches = true;
+            for (size_t i = 0; i < kBearer.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(header[i])) !=
+                    kBearer[i]) {
+                    scheme_matches = false;
+                    break;
+                }
+            }
+            ok =
+                scheme_matches &&
+                ConstantTimeEquals(header.substr(kBearer.size()), admin_token_);
+        }
+        if (!ok) {
+            resp.add_header("WWW-Authenticate", "Bearer");
+            WriteSimpleErrorResponse(resp, coro_http::status_type::unauthorized,
+                                     "missing or invalid admin bearer token");
+        }
+        return ok;
+    }
+    if (allow_insecure_key_inspection_) {
+        return true;
+    }
+    auto* conn = req.get_conn();
+    if (conn != nullptr && IsLoopbackRemoteAddress(conn->remote_address())) {
+        return true;
+    }
+    WriteSimpleErrorResponse(
+        resp, coro_http::status_type::forbidden,
+        std::string("key inspection is restricted to loopback clients; set ") +
+            kAdminTokenEnv + " on the master and send it as a bearer token");
+    return false;
 }
 
 void MasterAdminServer::Stop() {
@@ -1479,11 +1596,13 @@ void MasterAdminServer::RegisterHandler() {
         });
     http_server_.set_http_handler<GET>(
         "/query_key", [this](coro_http_request& req, coro_http_response& resp) {
+            if (!AuthorizeKeyInspection(req, resp)) return;
             HandleQueryKey(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/get_all_keys",
         [this](coro_http_request& req, coro_http_response& resp) {
+            if (!AuthorizeKeyInspection(req, resp)) return;
             HandleGetAllKeys(req, resp);
         });
     http_server_.set_http_handler<GET>(
@@ -1555,6 +1674,7 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/batch_query_keys",
         [this](coro_http_request& req, coro_http_response& resp) {
+            if (!AuthorizeKeyInspection(req, resp)) return;
             HandleBatchQueryKeys(req, resp);
         });
     http_server_.set_http_handler<POST>(

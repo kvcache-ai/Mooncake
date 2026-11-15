@@ -40,6 +40,27 @@ The gating does not apply to `/metrics`, `/metrics/summary`, `/health`,
 `/version`, `/role`, `/ha_status`, and `/leader`, which remain available in
 every HA role.
 
+### Key inspection access control
+
+`/get_all_keys`, `/query_key` and `/batch_query_keys` return raw object keys
+and replica locations. Keys written by integrations such as LMCache can embed
+tenant secrets (for example a `cache_salt`), so these routes are protected:
+
+- If `MC_MASTER_ADMIN_TOKEN` is set in the master's environment, these routes
+  require `Authorization: Bearer <token>` and otherwise return HTTP `401`.
+- If it is unset, these routes only answer loopback clients and return HTTP
+  `403` to everyone else. Export `MC_MASTER_ADMIN_ALLOW_INSECURE=1` to keep the
+  legacy open behavior on a trusted network.
+
+```bash
+export MC_MASTER_ADMIN_TOKEN="replace-with-a-long-random-token"
+curl -H "Authorization: Bearer $MC_MASTER_ADMIN_TOKEN" \
+  http://master-host:9003/get_all_keys
+```
+
+Metrics, health and HA endpoints are not affected, so remote Prometheus
+scraping keeps working without a token.
+
 ### Error responses
 
 Most JSON endpoints report failures with a common structure:
