@@ -137,7 +137,14 @@ std::string AllocatedBuffer::getTransportEndpoint(
         endpoint = alloc->getTransportEndpoint();
         if (locality) *locality = alloc->GetLocality();
     } else {
-        LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
+        // The owning segment was unmounted while this allocation still
+        // exists (e.g. its client went offline and metadata cleanup is
+        // still pending). Producing an empty endpoint is a defect signal:
+        // callers that serialize or use this descriptor get an unusable
+        // replica descriptor. Rate-limit: a stale-metadata sweep can hit
+        // this once per leftover replica, which floods the log otherwise.
+        LOG_EVERY_N(ERROR, 10000)
+            << "allocator=expired_or_null in getTransportEndpoint";
     }
 
     if (this->protocol == "cxl") {

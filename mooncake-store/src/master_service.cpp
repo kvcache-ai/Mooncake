@@ -2116,10 +2116,29 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     if (!plan.would_invalidate) {
         std::vector<Replica::Descriptor> remaining;
         for (const auto& replica : metadata.GetAllReplicas()) {
-            if (!ids.contains(replica.id()) &&
-                replica.status() == ReplicaStatus::COMPLETE) {
-                remaining.push_back(replica.get_descriptor());
+            if (ids.contains(replica.id()) ||
+                replica.status() != ReplicaStatus::COMPLETE) {
+                continue;
             }
+            // Mirror the valid-after-cleanup check in
+            // BuildStaleHandleCleanupPlan: a completed memory replica
+            // whose allocator is gone (the owning client went offline
+            // and its segments were already unmounted) has no valid
+            // transport endpoint. Serializing its descriptor would
+            // publish an unusable replica in the oplog payload and, on
+            // the way, hit the expired-allocator ERROR path in
+            // getTransportEndpoint. Skip it; the stale-handle sweep
+            // (default predicate) removes it in a later pass and
+            // republishes the object.
+            if (replica.is_memory_replica() &&
+                replica.has_invalid_mem_handle()) {
+                LOG_EVERY_N(WARNING, 100)
+                    << "StaleHandleCleanupForHA: skip dead-allocator "
+                       "replica, key="
+                    << key << ", replica_id=" << replica.id();
+                continue;
+            }
+            remaining.push_back(replica.get_descriptor());
         }
         payload = SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                   remaining);
