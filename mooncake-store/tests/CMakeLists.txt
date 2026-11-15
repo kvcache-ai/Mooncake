@@ -55,6 +55,8 @@ if(USE_CUDA)
   set_tests_properties(cuda_ipc_buffer_test PROPERTIES SKIP_RETURN_CODE 77
                                                        TIMEOUT 60)
 endif()
+add_store_test(mlu_ipc_buffer_test mlu_ipc_buffer_test.cpp)
+set_tests_properties(mlu_ipc_buffer_test PROPERTIES TIMEOUT 90)
 if(USE_MLU)
   foreach(mlu_test mlu_accelerator_test mlu_store_test)
     # These tests do not use master_service_test_peer, which would pull the

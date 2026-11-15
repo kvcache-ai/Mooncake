@@ -79,6 +79,13 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
     server.register_handler<&RealClient::batch_get_into_cuda_ipc_dummy_helper>(
         &real_client);
+    server.register_handler<&RealClient::batch_put_from_mlu_ipc_dummy_helper>(
+        &real_client);
+    server
+        .register_handler<&RealClient::batch_upsert_from_mlu_ipc_dummy_helper>(
+            &real_client);
+    server.register_handler<&RealClient::batch_get_into_mlu_ipc_dummy_helper>(
+        &real_client);
     server.register_handler<&RealClient::get_into_range_shm_helper>(
         &real_client);
     server.register_handler<&RealClient::get_into_ranges_shm_helper>(

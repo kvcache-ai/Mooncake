@@ -11,6 +11,7 @@
 
 #include "client_metric.h"
 #include "device/cuda_ipc_buffer_handle.h"
+#include "device/mlu_ipc_buffer_handle.h"
 #include "pyclient.h"
 #include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
@@ -90,6 +91,9 @@ class DummyClient : public PyClient {
     std::vector<int64_t> batch_get_into_cuda_ipc(
         const std::vector<CudaIpcReadRequest> &requests);
 
+    std::vector<int64_t> batch_get_into_mlu_ipc(
+        const std::vector<MluIpcReadRequest> &requests);
+
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
@@ -119,8 +123,16 @@ class DummyClient : public PyClient {
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_put_from_mlu_ipc(
+        const std::vector<MluIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
     std::vector<int> batch_upsert_from_cuda_ipc(
         const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_mlu_ipc(
+        const std::vector<MluIpcWriteRequest> &requests,
         const ReplicateConfig &config = ReplicateConfig{});
 
     std::vector<int> batch_upsert_from_multi_buffers(
