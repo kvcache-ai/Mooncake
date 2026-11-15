@@ -4986,8 +4986,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             (allocation_result &&
              allocation_result->size() != config.replica_num)) {
             has_enough_memory_segments =
-                allocator_snapshot.getServingNames().size() >=
-                config.replica_num;
+                allocator_snapshot.hasEnoughServingNames(config.replica_num);
         }
 
         if (!allocation_result.has_value()) {

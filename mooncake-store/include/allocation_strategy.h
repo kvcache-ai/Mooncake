@@ -191,6 +191,21 @@ class AllocatorManager {
         return serving_names;
     }
 
+    // Like getServingNames().size() >= min_count, without materializing names.
+    // Registration serving state is still observed on the retained snapshot.
+    [[nodiscard]] bool hasEnoughServingNames(size_t min_count) const {
+        if (min_count == 0) {
+            return true;
+        }
+        size_t count = 0;
+        for (const auto& name : names_) {
+            if (isServing(name) && ++count == min_count) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * @brief Get allocator registrations belonging to the given segment name.
      * @return a vector of registrations belonging to the segment name
