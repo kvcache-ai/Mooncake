@@ -1,113 +1,107 @@
-# Completion eventfd wait (RFC #5164 v1)
+# Completion notification
 
-Classic Transfer Engine only. TENT returns `completionFd() == -1`. One
-engine-owned fd is shared by every opted-in batch, so a readable fd may
-belong to some other batch. `drainCompletions` does not free the batch
-handle. Full contract text lives on `TransferEngine` in
-`transfer_engine.h`.
+Classic Transfer Engine can publish one terminal record per opted-in batch
+on an engine-owned eventfd (RFC #5164 v1). The facility is a wake for
+asynchronous batch completion. It does not replace `getBatchTransferStatus`,
+and it does not change batches that never opt in.
 
-```text
-fd = engine.completionFd()
-if fd < 0:
-    # Stay on getBatchTransferStatus.
-    ...
+The callable contract is on `TransferEngine` in `transfer_engine.h`. This
+page records the design choices behind that contract.
 
-batch = engine.allocateBatchID(n)
-status = engine.enableBatchCompletionNotification(batch)
-if not status.ok():
-    # Unsupported path (poll-driven transport, slice_timeout, …).
-    # Submit and poll getBatchTransferStatus as today.
-    ...
+## Scope
 
-status = engine.submitTransfer(batch, entries)  # one submit
-if not status.ok():
-    # Nothing was accepted, or the completion record was dropped.
-    # Keep the buffers until freeBatchID returns OK. A deferred free
-    # means in-flight work may still own them.
-    freeBatchID(batch)
-    ...
+TENT does not implement the facility: `completionFd()` is `-1`, and
+`drainCompletions` returns `CompletionNotificationUnsupported`. On classic
+TE the fd is created once per engine. A non-negative fd means the engine
+can notify. It does not mean every batch can finish without polling.
 
-# Wait until this batch, not merely the fd, is fully settled.
-settled = false
-while not settled:
-    wait until fd is readable, or until the application deadline
-    if readable:
-        engine.drainCompletions(out)    # does not free the handle
-        for record in out:
-            if record.batch_id == batch:
-                settled = true           # every submitted task finished
-    else:
-        # A deadline only ends the wait. One FAILED query is not enough
-        # while another task in this batch is still running.
-        poll getBatchTransferStatus until this batch is fully settled
-        settled = true
+A batch opts in with `enableBatchCompletionNotification` after
+`allocateBatchID` and before its only `submitTransfer`. The opt-in is
+rejected when the fd is unavailable, when `slice_timeout` is enabled, or
+when the batch already has tasks. A second submit on an opted-in batch is
+rejected. Transports that complete only by foreground polling are not
+eligible; those batches stay on today's submit and status-query path.
 
-# Both branches retain buffers until `batch` itself is fully settled.
-engine.freeBatchID(batch)
-```
+Poll-driven transports, a disabled facility, and an application deadline
+all fall back to `getBatchTransferStatus`. An application deadline ends
+the wait. It does not by itself settle a batch that still has a running
+task.
 
-Python asyncio should use one dispatcher per engine that routes drained
-rows to per-batch futures. Register the future before submit so a fast
-completion cannot be drained and discarded before `wait()` runs:
+## One fd for every opted-in batch
 
-```python
-import asyncio
+Each engine has one counter-mode eventfd. Every opted-in batch on that
+engine shares it. A readable fd means at least one terminal record is
+queued. It does not name the batch.
 
-class CompletionDispatcher:
-    def __init__(self, engine, loop):
-        self._engine = engine
-        self._pending = {}  # batch_id -> Future
-        self._early = {}    # batch_id -> row, if drained before wait()
-        loop.add_reader(engine.completion_fd(), self._on_readable)
+`drainCompletions` is the only way to learn which batches reached a
+terminal snapshot. It removes the records it returns and does not free
+batch handles. A dispatcher therefore matches `batch_id` itself. Reading
+the fd and ignoring the records drops completions that belonged to other
+batches.
 
-    def _on_readable(self):
-        for row in self._engine.drain_completions():
-            batch_id = row["batch_id"]
-            fut = self._pending.pop(batch_id, None)
-            if fut is not None and not fut.done():
-                fut.set_result(row)
-            else:
-                self._early[batch_id] = row
+The counter is level-triggered. The engine writes it when the queue goes
+from empty to non-empty. Further records that arrive before the next drain
+stay in the queue and do not each produce another write. A waiter that is
+already awake observes them on the drain it is about to run, or on the
+next one.
 
-    def wait(self, batch_id):
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        if batch_id in self._early:
-            fut.set_result(self._early.pop(batch_id))
-            return fut
-        self._pending[batch_id] = fut
-        return fut
+`close` on the original fd does not reliably wake a thread blocked on a
+dup. Engine destruction writes the counter before closing it. That write
+is the shutdown wake.
 
-async def run(engine):
-    loop = asyncio.get_running_loop()
-    dispatcher = CompletionDispatcher(engine, loop)
-    try:
-        # Prefer registering before submit when the batch id is known in
-        # advance (C++ allocate + enable + submit). The Python helper
-        # allocates inside batch_transfer_async, so register immediately
-        # after it returns and keep early rows in `_early`.
-        batch_id = engine.batch_transfer_async(
-            target_hostname, buffers, peer_addrs, lengths, opcode,
-            enable_completion_notification=True)
-    except CompletionNotificationFallback:
-        # Poll-driven transport. Use the ordinary submit/poll path.
-        return
-    if batch_id == 0:
-        # openSegment, a length mismatch, or a failed submit.
-        return
-    target = await dispatcher.wait(batch_id)
-    engine.free_batch_id(batch_id)
-    return target
-```
+## One publication per batch
 
-Notes:
+Publication is a latch, separate from `finished_task_count` and from the
+status-query walk.
 
-- Local completion only. Peer notify still goes through
-  `getBatchTransferStatus` → `sendNotifyByID`, so
-  `submitTransferWithNotify` rejects an event-enabled batch with
-  `InvalidArgument`. Send the notify after draining instead.
-- v1 does not publish `TIMEOUT` / `CANCELED` onto the fd.
-- Closing the fd does not by itself wake a poller blocked on a dup.
-  Engine destruction writes the counter first; that write is the wake.
-- Unit coverage is in `tests/batch_counter_wait_test.cpp`. Real RDMA
-  coverage is `tests/rdma_completion_fd_test.cpp` (`ctest -L rdma`).
+After the submit path has accepted the tasks, the latch is armed to one
+more than the number of submitted tasks. Each task that reaches
+`finishIfComplete` releases one token. The submit call releases the extra
+token only when it returns success. The call that drops the counter to
+zero publishes a single snapshot. A failed submit never releases the extra
+token, so the latch does not reach zero and no record is queued for a
+batch the caller did not accept.
+
+The snapshot is `COMPLETED` or `FAILED`, plus a byte count. A failed task
+contributes no bytes, matching a settled `getBatchTransferStatus` walk.
+The failure flag is stored before that snapshot is taken, so a failed
+event batch is not published as `COMPLETED`. Batches that did not opt in
+still record the flag after the completion count, and their status
+sequence is unchanged.
+
+Tasks in the same batch are not signaled one by one. The record appears
+when the last submitted task finishes. Notification latency for an earlier
+task therefore waits on the slowest task in that batch. The RDMA or TCP
+completion of that earlier task is not delayed.
+
+`TIMEOUT` and `CANCELED` are not published in v1. A path that finishes a
+task without going through `finishIfComplete` would also skip the latch.
+Foreground timeout handling stays on the status query.
+
+## Notify stays on the status query
+
+The eventfd reports local completion only. Peer notify is still sent from
+`getBatchTransferStatus` through `sendNotifyByID`. The completion callback
+does not send it and must not call `getBatchTransferStatus`.
+
+`submitTransferWithNotify` on an event-enabled batch returns
+`InvalidArgument`. Storing the notify after submit would race a drain and
+`freeBatchID` that reuse the batch id. The caller sends the notify after
+it has observed the terminal record.
+
+## Drain and free are different lifetimes
+
+A terminal record names a batch. It does not own the batch. `drainCompletions`
+copies the record out. `freeBatchID` invalidates the handle and releases
+the descriptor once no completion callback is still inside it.
+
+If `freeBatchID` runs before the record is published, the publication is
+suppressed and nothing is queued. If it runs after publication but before
+drain, the queued record is marked skipped and a later drain does not
+return that id. `freeBatchID` may return before the transport has finished
+touching buffers. A deferred free means in-flight work may still own those
+buffers. The caller keeps them until `freeBatchID` returns success.
+
+Buffers also stay allocated until the batch itself is fully settled.
+Draining some other batch, or observing one failed task while a sibling
+task is still running, is not that point.
