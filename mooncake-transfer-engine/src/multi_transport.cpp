@@ -281,7 +281,13 @@ void MultiTransport::suppressCompletion(BatchDesc* batch) {
             return;
         }
     }
-    record->skip.store(true, std::memory_order_release);
+    // Open means drain has not copied the id. Suppressed makes that copy
+    // lose the claim. Delivered means the id is already out; deleting the
+    // descriptor does not change the record the queue still owns.
+    uint32_t expected_claim = CompletionRecord::kOpen;
+    record->claim.compare_exchange_strong(
+        expected_claim, CompletionRecord::kSuppressed,
+        std::memory_order_acq_rel, std::memory_order_acquire);
     batch->completion_queue_state.store(BatchDesc::kCompletionSuppressed,
                                         std::memory_order_release);
     releaseCompletionRecord(record);
@@ -304,11 +310,19 @@ bool MultiTransport::popCompletion(BatchCompletion& out) {
     CompletionRecord* next =
         completion_tail_->next.load(std::memory_order_acquire);
     if (next == nullptr) return false;
-    if (next->skip.load(std::memory_order_acquire)) {
-        out.batch_id = 0;
+    uint32_t claim = next->claim.load(std::memory_order_acquire);
+    if (claim == CompletionRecord::kOpen) {
+        uint32_t expected = CompletionRecord::kOpen;
+        if (next->claim.compare_exchange_strong(
+                expected, CompletionRecord::kDelivered,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            out.batch_id = next->batch_id;
+            out.status = next->status;
+        } else {
+            out.batch_id = 0;
+        }
     } else {
-        out.batch_id = next->batch_id;
-        out.status = next->status;
+        out.batch_id = 0;
     }
     CompletionRecord* old = completion_tail_;
     completion_tail_ = next;

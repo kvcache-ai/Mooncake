@@ -989,7 +989,7 @@ TEST_F(BatchCounterWait, FreeRacesPublishAndIsAbsentFromLaterDrain) {
 }
 
 // Records are already queued. Drain and free run together, so one side
-// sets the skip flag while the other pops the node.
+// claims the record while the other pops the node.
 TEST_F(BatchCounterWait, DrainRacesFreeAfterPublish) {
 #ifndef __linux__
     GTEST_SKIP();
@@ -1048,5 +1048,6 @@ TEST_F(BatchCounterWait, DrainRacesFreeAfterPublish) {
     for (auto id : ids) forget(batches, id);
 #endif
 }
+
 }  // namespace
 }  // namespace mooncake

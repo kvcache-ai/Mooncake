@@ -606,9 +606,12 @@ class Transport {
         std::atomic<CompletionRecord *> next{nullptr};
         BatchID batch_id = 0;
         TransferStatus status{};
-        // freeBatchID sets this after the record is published. Drain
-        // drops the id and does not touch the BatchDesc.
-        std::atomic<bool> skip{false};
+        // Drain and freeBatchID claim this once. Delivered copies the id
+        // out. Suppressed drops it. The loser does not touch the id.
+        static constexpr uint32_t kOpen = 0;
+        static constexpr uint32_t kDelivered = 1;
+        static constexpr uint32_t kSuppressed = 2;
+        std::atomic<uint32_t> claim{kOpen};
         // One ref for the queue, one for the batch. free releases the
         // batch ref; pop releases the queue ref.
         std::atomic<uint32_t> refs{2};
@@ -658,8 +661,8 @@ class Transport {
 
         // Event-batch publish state. The queue node is not stored here.
         // Suppressed means freeBatchID won before publish, so the callback
-        // must not enqueue. After publish, free only sets the node's skip
-        // flag; drain reads that flag and does not need this object.
+        // must not enqueue. After publish, free and drain claim the node's
+        // record. Drain does not need this object to drop a lost claim.
         static constexpr uint32_t kCompletionIdle = 0;
         static constexpr uint32_t kCompletionQueued = 1;
         static constexpr uint32_t kCompletionSuppressed = 2;
