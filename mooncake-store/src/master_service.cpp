@@ -5692,6 +5692,15 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
+    return AddReplicaInAccessor(accessor, object_id, client_id, replica);
+}
+
+auto MasterService::AddReplicaInAccessor(MetadataAccessorRW& accessor,
+                                         const ObjectIdentity& object_id,
+                                         const UUID& client_id,
+                                         Replica& replica)
+    -> tl::expected<bool, ErrorCode> {
+    const std::string& key = object_id.user_key;
     if (!accessor.IsPublished()) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
@@ -8389,6 +8398,11 @@ auto MasterService::NotifyOffloadSuccess(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // Without a namespace policy no per-key write admission is taken, so the
+    // batch can be applied under a single master_state_mutex_ section.
+    if (policy_ == nullptr) {
+        return NotifyOffloadSuccessBatched(client_id, record, tasks, metadatas);
+    }
     // Set when an entry's replica registration is refused because the client
     // no longer has a LOCAL_DISK segment entry (see the per-entry checks
     // below). NACK cleanups still run for the rest of the batch; the caller
@@ -8411,17 +8425,7 @@ auto MasterService::NotifyOffloadSuccess(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
-                auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
-                    MasterMetricManager::instance().inc_offload_failed(
-                        UuidToString(client_id));
-                }
+                ReleaseOffloadingTask(accessor, client_id);
             }
             continue;
         }
@@ -8453,68 +8457,19 @@ auto MasterService::NotifyOffloadSuccess(
                 !enable_offload_ || HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
-                auto& obj_metadata = accessor.Get();
-                const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
-                auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task &&
-                    replica.type() != ReplicaType::LOCAL_DISK) {
-                    LOG(ERROR) << "Invalid replica type: " << replica.type()
-                               << ". Expected ReplicaType::LOCAL_DISK.";
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                auto outcome =
+                    CompleteOffloadTask(accessor, request_object_id, client_id,
+                                        segment_mounted, replica);
+                if (!outcome) {
+                    return tl::make_unexpected(outcome.error());
                 }
-
-                // Existing orphan objects can only bypass tenant registration
-                // for a master-admitted offload completion. Without this task
-                // marker, fall through to the regular registration check.
-                if (offloading_task) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
-
-                    if (!segment_mounted) {
-                        // The offload bookkeeping above still ran; only the
-                        // registration is refused.
-                        refused_unmounted = true;
-                    } else if (!obj_metadata.HasReplica(
-                                   &Replica::fn_is_local_disk_replica)) {
-                        std::vector<Replica> replicas;
-                        replicas.emplace_back(std::move(replica));
-                        obj_metadata.AddReplicas(std::move(replicas));
-                        SyncCacheTotalAccounting(obj_metadata);
-                        MasterMetricManager::instance().inc_offload_completed(
-                            UuidToString(client_id));
-                        added_new_local_disk_replica = true;
-                    } else {
-                        obj_metadata.VisitReplicas(
-                            [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
-                            },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
-                            });
-                    }
-                    handled_existing_object = true;
-                    SyncKvObjectState(request_object_id.user_key, obj_metadata,
-                                      request_object_id.tenant_id,
-                                      previous_kv_media);
+                handled_existing_object =
+                    outcome.value() != OffloadTaskOutcome::kNoTask;
+                if (outcome.value() == OffloadTaskOutcome::kRefused) {
+                    refused_unmounted = true;
                 }
+                added_new_local_disk_replica =
+                    outcome.value() == OffloadTaskOutcome::kAdded;
             }
         }
 
@@ -8561,6 +8516,181 @@ auto MasterService::NotifyOffloadSuccess(
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     return {};
+}
+
+auto MasterService::NotifyOffloadSuccessBatched(
+    const UUID& client_id, const std::shared_ptr<ClientLivenessRecord>& record,
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas)
+    -> tl::expected<void, ErrorCode> {
+    // One shared master_state_mutex_ section covers the whole batch.
+    // UnmountLocalDiskSegment drops the LOCAL_DISK registration under the
+    // exclusive lock, so the mount state cannot change while this section is
+    // held and checking it once gives the same guarantee as the per-key check
+    // in NotifyOffloadSuccess. The !enable_offload_ case is admitted for the
+    // same reason as there.
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    const bool segment_mounted =
+        !enable_offload_ || HasMountedLocalDiskSegment(client_id);
+
+    bool refused_unmounted = false;
+    int64_t added_bytes = 0;
+    tl::expected<void, ErrorCode> result{};
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        const auto& task = tasks[i];
+        const auto& metadata = metadatas[i];
+        const TenantId task_tenant = enable_multi_tenants_
+                                         ? TenantId(task.tenant_id)
+                                         : TenantId::Default();
+        const auto object_id =
+            MakeObjectIdentityForRequest(task.key, task_tenant);
+
+        // NACK sentinel: offload failed on worker.
+        if (metadata.data_size < 0) {
+            MetadataAccessorRW accessor(this, object_id);
+            if (accessor.Exists()) {
+                ReleaseOffloadingTask(accessor, client_id);
+            }
+            continue;
+        }
+
+        Replica replica(client_id, metadata.data_size,
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        record);
+        // Unmounted: every entry is refused; an existing object's offload
+        // task is still settled. The key is not created for a refused entry.
+        if (!segment_mounted) {
+            MetadataAccessorRW accessor(this, object_id);
+            if (accessor.Exists()) {
+                auto completed = CompleteOffloadTask(accessor, object_id,
+                                                     client_id, false, replica);
+                if (!completed) {
+                    result = tl::make_unexpected(completed.error());
+                    break;
+                }
+            }
+            refused_unmounted = true;
+            continue;
+        }
+
+        MetadataAccessorRW accessor(this, object_id,
+                                    MetadataAccessorRW::CreateKey{});
+        auto outcome = OffloadTaskOutcome::kNoTask;
+        if (accessor.Exists()) {
+            auto completed = CompleteOffloadTask(accessor, object_id, client_id,
+                                                 true, replica);
+            if (!completed) {
+                result = tl::make_unexpected(completed.error());
+                break;
+            }
+            outcome = completed.value();
+        }
+        // No offload task on the object (or no object): register the replica
+        // in the accessor already held, as AddReplicaForRetainedClient would.
+        if (outcome == OffloadTaskOutcome::kNoTask) {
+            auto res =
+                AddReplicaInAccessor(accessor, object_id, client_id, replica);
+            if (!res) {
+                LOG(ERROR) << "Failed to add replica: error=" << res.error()
+                           << ", client_id=" << client_id
+                           << ", key=" << object_id.user_key;
+                result = tl::make_unexpected(res.error());
+                break;
+            }
+            outcome = res.value() ? OffloadTaskOutcome::kAdded
+                                  : OffloadTaskOutcome::kUpdated;
+        }
+        if (outcome == OffloadTaskOutcome::kAdded && metadata.data_size > 0) {
+            added_bytes += metadata.data_size;
+        }
+    }
+
+    // Account what was added even when the batch stops on an error.
+    if (added_bytes != 0) {
+        local_ssd_manager_.AdjustUsedBytes(client_id, added_bytes);
+    }
+    if (!result) {
+        return result;
+    }
+    if (refused_unmounted) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", action=notify_offload_success_refused"
+                     << ", error=no_local_disk_segment";
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    return {};
+}
+
+void MasterService::ReleaseOffloadingTask(MetadataAccessorRW& accessor,
+                                          const UUID& client_id) {
+    auto& offloading_task = accessor.GetState().offloading_task;
+    if (!offloading_task) {
+        return;
+    }
+    auto source = accessor.Get().GetReplicaByID(offloading_task->source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    offloading_task.reset();
+    MasterMetricManager::instance().inc_offload_failed(UuidToString(client_id));
+}
+auto MasterService::CompleteOffloadTask(MetadataAccessorRW& accessor,
+                                        const ObjectIdentity& object_id,
+                                        const UUID& client_id,
+                                        bool segment_mounted, Replica& replica)
+    -> tl::expected<OffloadTaskOutcome, ErrorCode> {
+    auto& obj_metadata = accessor.Get();
+    auto& offloading_task = accessor.GetState().offloading_task;
+    // Existing orphan objects can only bypass tenant registration for a
+    // master-admitted offload completion. Without this task marker, fall
+    // through to the regular registration check.
+    if (!offloading_task) {
+        return OffloadTaskOutcome::kNoTask;
+    }
+    if (replica.type() != ReplicaType::LOCAL_DISK) {
+        LOG(ERROR) << "Invalid replica type: " << replica.type()
+                   << ". Expected ReplicaType::LOCAL_DISK.";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
+    auto source = obj_metadata.GetReplicaByID(offloading_task->source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    offloading_task.reset();
+
+    auto outcome = OffloadTaskOutcome::kUpdated;
+    if (!segment_mounted) {
+        // The offload bookkeeping above still ran; only the registration is
+        // refused.
+        outcome = OffloadTaskOutcome::kRefused;
+    } else if (!obj_metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        obj_metadata.AddReplicas(std::move(replicas));
+        SyncCacheTotalAccounting(obj_metadata);
+        MasterMetricManager::instance().inc_offload_completed(
+            UuidToString(client_id));
+        outcome = OffloadTaskOutcome::kAdded;
+    } else {
+        obj_metadata.VisitReplicas(
+            [client_id](const Replica& rep) {
+                return rep.type() == ReplicaType::LOCAL_DISK &&
+                       rep.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            },
+            [&replica](Replica& rep) {
+                auto& desc = rep.get_descriptor().get_local_disk_descriptor();
+                const auto& reported =
+                    replica.get_descriptor().get_local_disk_descriptor();
+                desc.transport_endpoint = reported.transport_endpoint;
+                desc.object_size = reported.object_size;
+            });
+    }
+    SyncKvObjectState(object_id.user_key, obj_metadata, object_id.tenant_id,
+                      previous_kv_media);
+    return outcome;
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
