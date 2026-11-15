@@ -35,6 +35,7 @@ runs them.
 """
 
 import os
+import time
 import unittest
 
 import torch
@@ -68,6 +69,10 @@ ADMITTED_RANK = 2
 # The READ failure case fails this rank's links to rank 0, as the elastic fault
 # rounds do. The Coordinator then removes it, the higher rank of the pair.
 REPORTER = 1
+# How long rank 0 waits, after rank 1 has given up on it, before it issues the
+# same collective: long enough for rank 1 to end its run, far shorter than the
+# reconciliation window before the Coordinator removes rank 1.
+LATE_FLAG_GAP_S = 0.2
 # Longer than the slow rank lives in the dead reader case.
 DEATH_FLAG_HOLD_S = 60.0
 # Lowered in the dead reader case, so that rank 0 gives up on its peer soon.
@@ -408,13 +413,25 @@ def _admission_worker(
     ctx.record_result({"errors": errors, "held": held, "reads": fault.count_reads})
 
 
-def _failed_count_read_worker(ctx: MooncakePGWorkerContext, fault_library: str) -> None:
+def _failed_count_read_worker(
+    ctx: MooncakePGWorkerContext,
+    fault_library: str,
+    rank_one_gave_up: mp.Event,
+    rank_one_issued_after: mp.Event,
+) -> None:
     """Rank 1's READ of rank 0's read counts lands and reports failure. Rank 1
     must give up on rank 0 as for a failed write, and rank 1 then rejoins.
 
     This is the eager collective after a capture, without a hold: rank 1 has had
     no flag of rank 0 since the first collective, so it reads rank 0's counts for
-    the second one however the ranks are timed."""
+    the second one however the ranks are timed.
+
+    Rank 0 issues the second collective only after rank 1 has ended its run of
+    it, so rank 0's flag of that run lands late and stays in rank 1's flag set.
+    The admission restarts the run counts, so the collective after the rejoin
+    uses that half and flag set again and must not take the old flag. Rank 1
+    issues that collective first and rank 0 later, so rank 1 waits for rank 0's
+    flag with the old one in place every time."""
     fault = _start(ctx, fault_library)
     backend = ctx.get_backend()
     device = ctx.device
@@ -429,11 +446,20 @@ def _failed_count_read_worker(ctx: MooncakePGWorkerContext, fault_library: str) 
         dist.all_reduce(captured)
     epoch_before_failure = pg.get_current_epoch(backend)
 
-    # Rank 0 cannot finish the second collective before rank 1 issues it, so
-    # rank 1's fault is in place without an event.
+    # Rank 1's fault is in place before it issues. Rank 0 issues only after
+    # rank 1 has given up on it, plus LATE_FLAG_GAP_S, so rank 0's flag of this
+    # run lands after rank 1's run has ended.
     with fault.failing_link(REPORTER, 0):
         fault.reset_transfer_counts()
+        if ctx.rank != REPORTER:
+            if not rank_one_gave_up.wait(timeout=60.0):
+                raise TimeoutError("rank 1 did not give up on rank 0")
+            time.sleep(LATE_FLAG_GAP_S)
+        # An eager issue returns once the worker has submitted this rank's data
+        # writes, which rank 1 does only after it has given up on rank 0.
         work = dist.all_reduce(second, async_op=True)
+        if ctx.rank == REPORTER:
+            rank_one_gave_up.set()
         work.wait()
         result = {
             "success": pg.get_local_success(work),
@@ -464,7 +490,14 @@ def _failed_count_read_worker(ctx: MooncakePGWorkerContext, fault_library: str) 
             f"got {response.status}: {response.reject_reason}"
         )
     after = _small_tensor(ctx, 1000)
-    dist.all_reduce(after)
+    if ctx.rank != REPORTER:
+        if not rank_one_issued_after.wait(timeout=60.0):
+            raise TimeoutError("rank 1 did not issue the collective after rejoining")
+        time.sleep(LATE_FLAG_GAP_S)
+    work = dist.all_reduce(after, async_op=True)
+    if ctx.rank == REPORTER:
+        rank_one_issued_after.set()
+    work.wait()
     result["errors"] = _errors_in_sums(ctx, {"after": (after, 1000)})
     ctx.record_result(result)
 
@@ -673,7 +706,13 @@ class TestPGHalfReuseCUDA(MooncakePGCUDABackendTestCase):
                 self._assert_counts(rows, reuse=False)
 
     def test_failed_read_of_read_counts_fails_the_link(self) -> None:
-        rows = {row["rank"]: row for row in self._spawn(_failed_count_read_worker)}
+        spawn_ctx = mp.get_context("spawn")
+        rows = {
+            row["rank"]: row
+            for row in self._spawn(
+                _failed_count_read_worker, spawn_ctx.Event(), spawn_ctx.Event()
+            )
+        }
         # What the elastic fault rounds expect of rank 1 when its link to rank 0
         # fails. Its automatic sync applies the view that removes it before the
         # collective ends.
