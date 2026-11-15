@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -135,6 +137,11 @@ static inline std::vector<void*> U64VectorToPtrVector(
     ptrs.reserve(addr_list.size());
     for (auto a : addr_list) ptrs.push_back(U64ToPtr(a));
     return ptrs;
+}
+
+static inline bool IsUint64Vector(const py::array& array) {
+    return array.ndim() == 1 && array.dtype().is(py::dtype::of<uint64_t>()) &&
+           array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
 }
 
 // =============================================================================
@@ -760,6 +767,71 @@ PYBIND11_MODULE(tent, m) {
                 return status_list;
             },
             py::arg("batch_id"), py::arg("timeout_ms") = 0)
+
+        // ---------------------------------------------------------------------
+        // array submit and blocking wait
+        // ---------------------------------------------------------------------
+        .def(
+            "transfer_sync_arrays",
+            [](TransferEngine& self, py::array src, py::array dst,
+               py::array lengths, uint64_t target_id,
+               Request::OpCode opcode) -> py::array_t<uint8_t> {
+                const auto count = static_cast<size_t>(src.size());
+                const bool well_formed =
+                    IsUint64Vector(src) && IsUint64Vector(dst) &&
+                    IsUint64Vector(lengths) && src.size() == dst.size() &&
+                    src.size() == lengths.size();
+                py::array_t<uint8_t> result(static_cast<py::ssize_t>(count));
+                if (count == 0) {
+                    return result;
+                }
+                auto* states = result.mutable_data();
+                std::fill(states, states + count,
+                          static_cast<uint8_t>(TransferStatusEnum::INVALID));
+                if (!well_formed) {
+                    return result;
+                }
+                const auto* src_ptr = static_cast<const uint64_t*>(src.data());
+                const auto* dst_ptr = static_cast<const uint64_t*>(dst.data());
+                const auto* len_ptr =
+                    static_cast<const uint64_t*>(lengths.data());
+                {
+                    py::gil_scoped_release release;
+                    std::vector<Request> request_list(count);
+                    for (size_t i = 0; i < count; ++i) {
+                        auto& request = request_list[i];
+                        request.opcode = opcode;
+                        request.source = U64ToPtr(src_ptr[i]);
+                        request.target_id = static_cast<SegmentID>(target_id);
+                        request.target_offset = dst_ptr[i];
+                        request.length = static_cast<size_t>(len_ptr[i]);
+                    }
+                    const auto batch_id = self.allocateBatch(count);
+                    if (batch_id) {
+                        BatchGuard guard(&self,
+                                         static_cast<uint64_t>(batch_id));
+                        if (self.submitTransfer(batch_id, request_list).ok()) {
+                            std::vector<TransferStatus> status_list;
+                            (void)self.waitTransfer(batch_id, &status_list, 0);
+                            const auto status_count =
+                                std::min(count, status_list.size());
+                            for (size_t i = 0; i < status_count; ++i) {
+                                states[i] =
+                                    static_cast<uint8_t>(status_list[i].s);
+                            }
+                        }
+                    }
+                }
+                return result;
+            },
+            "Submit src to dst descriptors in one batch and wait until every "
+            "descriptor reaches a terminal state. src, dst and lengths are "
+            "one-dimensional uint64 arrays of equal length and must not be "
+            "modified until the call returns; malformed input and failures "
+            "are reported as INVALID for every entry. This call has no "
+            "timeout.",
+            py::arg("src"), py::arg("dst"), py::arg("lengths"),
+            py::arg("target_id"), py::arg("opcode"))
 
         // ---------------------------------------------------------------------
         // notification send/receive
