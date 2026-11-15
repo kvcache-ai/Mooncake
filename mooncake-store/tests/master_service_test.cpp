@@ -2174,6 +2174,158 @@ TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
               AllocationStrategyType::LOCAL_FIRST);
 }
 
+namespace {
+class PreferredSequenceRecorder final : public RandomAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& manager, size_t length, size_t replicas,
+        const std::vector<std::string>& preferred,
+        const std::set<std::string>& excluded, ReplicaType type) override {
+        names = preferred;
+        return RandomAllocationStrategy::Allocate(manager, length, replicas,
+                                                  preferred, excluded, type);
+    }
+
+    std::vector<std::string> names;
+};
+}  // namespace
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitPriorityAndFirstOccurrence) {
+    for (bool use_hint : {false, true}) {
+        SCOPED_TRACE(use_hint);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            use_hint ? AllocationStrategyType::RANDOM
+                     : AllocationStrategyType::LOCAL_FIRST;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        size_t index = 0;
+        for (const auto& [name, host] :
+             std::vector<std::pair<std::string, std::string>>{
+                 {"A", "host-a"},
+                 {"B", "host-b"},
+                 {"A", "host-c"},
+                 {"C", "host-c"}}) {
+            auto segment =
+                MakeSegment(name, kDefaultSegmentBase + index++ * 65536, 65536);
+            segment.host_id = host;
+            ASSERT_TRUE(service.MountSegment(segment, owner));
+        }
+        ReplicateConfig incoming;
+        incoming.host_id = "host-b";
+        incoming.prefer_alloc_in_same_node = use_hint;
+        incoming.preferred_segments = {"", "C", "C", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "array", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "array", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        // The singular preference takes precedence over the array, and its
+        // remote host stays ahead of the automatically preferred local host.
+        incoming.preferred_segment = "C";
+        ASSERT_TRUE(service.PutStart(owner, "single", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "B", "A"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "single", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        incoming.preferred_segment.clear();
+        incoming.preferred_segments.clear();
+        const std::string key = "cross-host-duplicate";
+        ASSERT_TRUE(
+            service.PutStart(owner, key, TenantId::Default(), 4096, incoming));
+        // host-b comes first, then host-c's rotated A/C, then host-a's A.
+        // The final A must not be appended again.
+        const bool c_first = std::hash<std::string>{}(key) % 2 != 0;
+        EXPECT_EQ(recorder->names,
+                  (c_first ? std::vector<std::string>{"B", "C", "A"}
+                           : std::vector<std::string>{"B", "A", "C"}));
+        ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                      ReplicaType::MEMORY));
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesUnknownHostAndUnavailableSegmentFallback) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+    MasterService service(config);
+    auto recorder = std::make_shared<PreferredSequenceRecorder>();
+    MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+    const UUID owner{1, 1};
+    std::vector<Segment> segments;
+    for (size_t i = 0; i < 3; ++i) {
+        auto segment = MakeSegment(std::string(1, 'A' + i),
+                                   kDefaultSegmentBase + i * 65536, 65536);
+        segment.host_id = "host-" + std::string(1, 'a' + i);
+        ASSERT_TRUE(service.MountSegment(segment, owner));
+        segments.push_back(segment);
+    }
+    ReplicateConfig incoming;
+    incoming.host_id = "host-bb";
+    ASSERT_TRUE(service.PutStart(owner, "unknown", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "unknown", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    incoming.host_id = "host-z";
+    ASSERT_TRUE(
+        service.PutStart(owner, "wrap", TenantId::Default(), 4096, incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A", "B", "C"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "wrap", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName("B", SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    incoming.host_id = "host-b";
+    ASSERT_TRUE(service.PutStart(owner, "draining", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "draining", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    ASSERT_TRUE(service.UnmountSegment(segments[2].id, owner));
+    ASSERT_TRUE(service.PutStart(owner, "unmounted", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesPreferencesWithoutAutomaticCandidates) {
+    for (bool local_first : {false, true}) {
+        SCOPED_TRACE(local_first);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            local_first ? AllocationStrategyType::LOCAL_FIRST
+                        : AllocationStrategyType::RANDOM;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        // No host identity is registered, so local-first has no automatic
+        // candidates; ordinary placement must not add any either.
+        ASSERT_TRUE(service.MountSegment(MakeSegment("A"), owner));
+        ReplicateConfig incoming;
+        incoming.host_id = "unknown";
+        incoming.preferred_segments = {"", "A", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "no-host", TenantId::Default(),
+                                     4096, incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+    }
+}
+
 TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     const uint64_t kv_lease_ttl = 100;
     const uint64_t client_live_ttl = 600;
