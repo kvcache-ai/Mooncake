@@ -829,6 +829,100 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     EXPECT_TRUE(HasAllocatorForSegment(segment_manager, segment.id));
 }
 
+TEST_F(SegmentTest, SnapshotMetadataPreservesRegistrationsAndLifetimeGates) {
+    for (const auto metadata : {AllocatorSnapshotMetadata::ALLOCATORS_ONLY,
+                                AllocatorSnapshotMetadata::INCLUDE_OWNERS}) {
+        SCOPED_TRACE(static_cast<int>(metadata));
+        SegmentManager manager(BufferAllocatorType::OFFSET);
+        const UUID owner = generate_uuid();
+        Segment first;
+        first.id = generate_uuid();
+        first.name = "snapshot-shared-name";
+        first.base = DEFAULT_CXL_BASE;
+        first.size = 64 * 1024 * 1024;
+        first.te_endpoint = "snapshot-first";
+        Segment second = first;
+        second.id = generate_uuid();
+        second.base += first.size;
+        second.te_endpoint = "snapshot-second";
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(access.MountSegment(first, SessionFor(owner)),
+                      ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(second, SessionFor(owner)),
+                      ErrorCode::OK);
+        }
+        AllocatorManager snapshot;
+        {
+            auto access = manager.getAllocatorAccess();
+            snapshot = access.SnapshotAllocatorManager(metadata);
+            const auto* live =
+                access.getAllocatorManager().getAllocators(first.name);
+            const auto* copied = snapshot.getAllocators(first.name);
+            ASSERT_NE(live, nullptr);
+            ASSERT_NE(copied, nullptr);
+            EXPECT_EQ(*live, *copied);
+        }
+        EXPECT_EQ(snapshot.GetOwnerClientId(first.name).has_value(),
+                  metadata == AllocatorSnapshotMetadata::INCLUDE_OWNERS);
+        const auto* registrations = snapshot.getAllocators(first.name);
+        ASSERT_NE(registrations, nullptr);
+        ASSERT_EQ(registrations->size(), 2u);
+        auto old_first = registrations->front()->Allocate(1024);
+        auto old_second = registrations->back()->Allocate(1024);
+        ASSERT_TRUE(old_first);
+        ASSERT_TRUE(old_second);
+        EXPECT_EQ(old_first->getClientSession(), SessionFor(owner));
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(access.PrepareGracefulUnmountSegment(first.id),
+                      ErrorCode::OK);
+        }
+        EXPECT_FALSE(registrations->front()->Allocate(1024));
+        EXPECT_TRUE(old_first->isAvailable());
+        size_t capacity = 0;
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(access.PrepareUnmountSegment(first.id, capacity),
+                      ErrorCode::OK);
+            ASSERT_EQ(access.CommitUnmountSegment(first.id, owner, capacity),
+                      ErrorCode::OK);
+        }
+        EXPECT_FALSE(old_first->isAllocatorValid());
+        EXPECT_TRUE(old_first->getAllocator());
+        EXPECT_TRUE(old_second->isAvailable());
+        auto replacement = std::make_shared<ClientLivenessRecord>(
+            owner, ClientLivenessRecord::Clock::now());
+        {
+            auto access = manager.getSegmentAccess();
+            access.BindClientSession(replacement);
+        }
+        EXPECT_FALSE(old_second->isAllocatorValid());
+        EXPECT_FALSE(registrations->back()->Allocate(1024));
+        EXPECT_EQ(old_second->getClientSession(), SessionFor(owner));
+        AllocatorManager next;
+        {
+            auto access = manager.getAllocatorAccess();
+            next = access.SnapshotAllocatorManager(metadata);
+        }
+        const auto* next_registrations = next.getAllocators(first.name);
+        ASSERT_NE(next_registrations, nullptr);
+        ASSERT_EQ(next_registrations->size(), 1u);
+        auto fresh = next_registrations->front()->Allocate(1024);
+        ASSERT_TRUE(fresh);
+        EXPECT_EQ(fresh->getClientSession(), replacement);
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(access.PrepareUnmountSegment(second.id, capacity),
+                      ErrorCode::OK);
+            ASSERT_EQ(access.CommitUnmountSegment(second.id, owner, capacity),
+                      ErrorCode::OK);
+        }
+        EXPECT_FALSE(fresh->isAvailable());
+        EXPECT_FALSE(next_registrations->front()->Allocate(1024));
+    }
+}
+
 TEST_F(SegmentTest,
        GracefulUnmountStopsDetachedAllocationButKeepsExistingBuffers) {
     SegmentManager segment_manager;

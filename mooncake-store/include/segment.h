@@ -312,8 +312,13 @@ class ScopedAllocatorAccess {
         return allocator_manager_;
     }
 
-    AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
+    AllocatorManager SnapshotAllocatorManager(
+        AllocatorSnapshotMetadata metadata =
+            AllocatorSnapshotMetadata::INCLUDE_OWNERS) const {
+        return allocator_manager_.Snapshot(
+            metadata == AllocatorSnapshotMetadata::INCLUDE_OWNERS
+                ? client_by_name_
+                : nullptr);
     }
 
     std::vector<std::string> GetHostOrderedSegments(

@@ -23,6 +23,8 @@ class LocalSsdManager;
 class ScopedAllocatorAccess;
 class ScopedSegmentAccess;
 
+enum class AllocatorSnapshotMetadata { ALLOCATORS_ONLY, INCLUDE_OWNERS };
+
 /**
  * @brief A container for managing valid allocators.
  *
@@ -240,6 +242,12 @@ class AllocationStrategy {
    public:
     virtual ~AllocationStrategy() = default;
 
+    // A strategy that adds owner lookups must also declare that dependency.
+    // Preserve complete snapshots for strategies that do not opt out.
+    virtual AllocatorSnapshotMetadata GetSnapshotMetadata() const noexcept {
+        return AllocatorSnapshotMetadata::INCLUDE_OWNERS;
+    }
+
     /**
      * @brief Allocates a slice across the requested number of replicas
      *        using best-effort semantics.
@@ -318,6 +326,10 @@ class AllocationStrategy {
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() = default;
+
+    AllocatorSnapshotMetadata GetSnapshotMetadata() const noexcept override {
+        return AllocatorSnapshotMetadata::ALLOCATORS_ONLY;
+    }
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
@@ -683,6 +695,10 @@ class SsdFreeRatioFirstAllocationStrategy final
         const LocalSsdManager& local_ssd)
         : local_ssd_(local_ssd) {}
 
+    AllocatorSnapshotMetadata GetSnapshotMetadata() const noexcept override {
+        return AllocatorSnapshotMetadata::INCLUDE_OWNERS;
+    }
+
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const ScopedAllocatorAccess& placement, const size_t slice_length,
         const size_t replica_num = 1,
@@ -708,6 +724,10 @@ class SsdFreeRatioFirstAllocationStrategy final
 class CxlAllocationStrategy : public AllocationStrategy {
    public:
     CxlAllocationStrategy() = default;
+
+    AllocatorSnapshotMetadata GetSnapshotMetadata() const noexcept override {
+        return AllocatorSnapshotMetadata::ALLOCATORS_ONLY;
+    }
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
