@@ -239,6 +239,7 @@ class TcpTransport : public Transport {
         CONNECT_FAILED,
         SESSION_FAILED,
         SHUTDOWN,
+        ABANDONED,
     };
 
     struct FailureCounters {
@@ -248,6 +249,7 @@ class TcpTransport : public Transport {
         std::atomic<uint64_t> runtime_unavailable{0};
         std::atomic<uint64_t> session_failed{0};
         std::atomic<uint64_t> shutdown{0};
+        std::atomic<uint64_t> abandoned{0};
     };
 
     struct TcpWorkItem {
@@ -510,6 +512,9 @@ class TcpTransport : public Transport {
     static void removeQueuedBytesLocked(PeerConnectionGroup &group,
                                         uint64_t length);
     static void clearQueuedBytesLocked(PeerConnectionGroup &group);
+    // Moves queued work of abandoned batches off the front of the queue.
+    static size_t dropAbandonedQueueHeadLocked(
+        PeerConnectionGroup &group, std::deque<TcpWorkItem> &abandoned);
     static void closeSocketNoThrow(
         const std::shared_ptr<asio::ip::tcp::socket> &socket) noexcept;
     void shutdownConnectionLanes();
