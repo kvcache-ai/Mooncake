@@ -317,7 +317,9 @@ class TransferEngine {
 
     // Non-blocking drain of terminal batches. See BatchCompletion.
     // Does not free batch handles and does not send peer notify.
-    // CompletionNotificationUnsupported when completionFd() is -1.
+    // One caller at a time. Concurrent calls race the queue tail and
+    // split one wake. CompletionNotificationUnsupported when
+    // completionFd() is -1.
     Status drainCompletions(std::vector<BatchCompletion>& out);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;

@@ -2144,7 +2144,9 @@ PYBIND11_MODULE(engine, m) {
                 return out;
             },
             "Non-blocking drain of terminal batches. Each item has batch_id, "
-            "status, and transferred_bytes. Does not free batch handles.");
+            "status, and transferred_bytes. Does not free batch handles. "
+            "One caller at a time. Concurrent calls race the queue tail "
+            "and split one wake.");
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 

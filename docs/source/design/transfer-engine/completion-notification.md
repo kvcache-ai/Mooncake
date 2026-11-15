@@ -35,9 +35,10 @@ queued. It does not name the batch.
 
 `drainCompletions` is the only way to learn which batches reached a
 terminal snapshot. It removes the records it returns and does not free
-batch handles. A dispatcher therefore matches `batch_id` itself. Reading
-the fd and ignoring the records drops completions that belonged to other
-batches.
+batch handles. One call at a time owns that consumer. The queue tail and
+the eventfd counter are not shared by concurrent drains. A dispatcher
+therefore matches `batch_id` itself. Reading the fd and ignoring the
+records drops completions that belonged to other batches.
 
 The counter is level-triggered. The engine writes it when the queue goes
 from empty to non-empty. Further records that arrive before the next drain
