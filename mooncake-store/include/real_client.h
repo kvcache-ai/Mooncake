@@ -1330,6 +1330,9 @@ class RealClient : public PyClient {
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
 
+    // Limits direct MLU IPC reads; contending RPCs use host staging.
+    std::mutex mlu_ipc_local_read_mutex_;
+
     // Dummy Client manage related members
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();

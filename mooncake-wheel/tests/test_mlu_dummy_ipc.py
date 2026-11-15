@@ -197,6 +197,44 @@ class TestMluDummyIpc(unittest.TestCase):
             self.assertTrue(bool(torch.all(actual[i, size:] == 165)))
         self.assertTrue(bool(torch.all(actual[5:] == 165)))
 
+    def test_concurrent_raw_reads_preserve_results_and_guards(self):
+        torch = self.torch
+        # Eight active reads fit the 4 MiB service staging pool.
+        size = 256 << 10
+        callers = 8
+        arena = torch.full((callers, 4, size + 8), 165, dtype=torch.uint8, device="mlu")
+        keys = [self.key() for _ in range(callers)]
+        missing = [self.key() for _ in range(callers)]
+        for i in range(callers):
+            arena[i, 0, :size].fill_(i + 1)
+        torch.mlu.synchronize()
+        barrier = threading.Barrier(callers, timeout=30)
+        with registered(self.store, arena):
+            for i, key in enumerate(keys):
+                self.assertEqual(
+                    self.store.put_from(key, arena[i, 0].data_ptr(), size), 0
+                )
+
+            def worker(i):
+                torch.mlu.set_device(arena.device)
+                barrier.wait()
+                for _ in range(20):
+                    results = self.store.batch_get_into(
+                        [keys[i], missing[i], keys[i]],
+                        [arena[i, j].data_ptr() for j in (1, 2, 3)],
+                        [size + 8, size, size - 1],
+                    )
+                    self.assertEqual(results[0], size)
+                    self.assertTrue(all(result < 0 for result in results[1:]))
+
+            with ThreadPoolExecutor(max_workers=callers) as pool:
+                list(pool.map(worker, range(callers)))
+        actual = arena.cpu()
+        for i in range(callers):
+            self.assertTrue(bool(torch.all(actual[i, 1, :size] == i + 1)))
+            self.assertTrue(bool(torch.all(actual[i, 1, size:] == 165)))
+            self.assertTrue(bool(torch.all(actual[i, 2:] == 165)))
+
     def test_raw_batch_larger_than_staging_pool(self):
         # Run the remote-provider suite with a 4 MiB service pool to exercise
         # deferred reads; the eight-object batch is larger than that pool.

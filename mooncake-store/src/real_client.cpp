@@ -6778,6 +6778,10 @@ RealClient::batch_get_into_mlu_ipc_dummy_helper(
     }
 
     if (full_keys.empty()) return results;
+    // A direct local read uses Store's memcpy worker. Under contention, stage
+    // through host memory and copy to MLU on this RPC thread so device copies
+    // can overlap without queuing behind another IPC read.
+    std::unique_lock direct_read(mlu_ipc_local_read_mutex_, std::try_to_lock);
     auto queries = client_->BatchQuery(full_keys);
     std::vector<std::string> batch_keys;
     std::vector<void *> batch_buffers;
@@ -6800,8 +6804,9 @@ RealClient::batch_get_into_mlu_ipc_dummy_helper(
         void *buffer = destinations[i];
         // Imported MLU memory is not registered with TCP/remote transports.
         // Batch those reads into registered host buffers, then copy only the
-        // successful values. Local memory replicas can copy directly to MLU.
-        if (size && (!metadata->replica.is_memory_replica() ||
+        // successful values. Uncontended local reads can copy directly to MLU.
+        if (size && (!direct_read.owns_lock() ||
+                     !metadata->replica.is_memory_replica() ||
                      !client_->CanUseLocalMemcpy(metadata->replica) ||
                      client_->IsHotCacheEnabled())) {
             auto allocation = client_buffer_allocator_
