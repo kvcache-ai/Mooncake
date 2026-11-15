@@ -272,6 +272,54 @@ TEST_F(MluTest, ClientBufferPoolFallsBackAfterPinnedAllocationFailure) {
 }
 #endif
 
+TEST_F(MluTest, MemcpyWorkerReusesThreadAfterSerialCopiesAndBursts) {
+    constexpr size_t size = 4096;
+    constexpr size_t copies = 32;
+    MluTestBuffer target;
+    ASSERT_EQ(target.allocate(size * copies), cnrtSuccess);
+    std::vector<char> expected(size * copies, 47), actual(size * copies);
+    MemcpyWorkerPool pool;
+    std::optional<size_t> serial_worker;
+    for (int round = 0; round < 4; ++round) {
+        // Returning to serial traffic must not keep rotating idle workers.
+        for (int i = 0; i < 32; ++i) {
+            auto state = std::make_shared<MemcpyOperationState>();
+            pool.submitTask(
+                MemcpyTask({{target.data(), expected.data(), size}}, state));
+            state->wait_for_completion();
+            ASSERT_EQ(state->get_result(), ErrorCode::OK);
+            const auto worker = mlu_h2d_worker_id.load();
+            if (!serial_worker) serial_worker = worker;
+            EXPECT_EQ(worker, *serial_worker);
+        }
+        std::vector<std::shared_ptr<MemcpyOperationState>> states;
+        {
+            ScopedMluH2dPause pause;
+            for (size_t i = 0; i < copies; ++i) {
+                states.push_back(std::make_shared<MemcpyOperationState>());
+                pool.submitTask(MemcpyTask(
+                    {{target.data(i * size), expected.data() + i * size, size}},
+                    states.back()));
+            }
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (mlu_h2d_inflight.load() < 2 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            EXPECT_GE(mlu_h2d_inflight.load(), 2U);
+        }
+        for (auto& state : states) {
+            state->wait_for_completion();
+            ASSERT_EQ(state->get_result(), ErrorCode::OK);
+        }
+    }
+    ASSERT_EQ(cnrtMemcpy(actual.data(), target.data(), actual.size(),
+                         cnrtMemcpyDevToHost),
+              cnrtSuccess);
+    EXPECT_EQ(actual, expected);
+}
+
 TEST_F(MluTest, MemcpyWorkersOverlapCopiesAndDrainAfterFailure) {
     constexpr size_t size = 4096;
     constexpr size_t copies = 32;

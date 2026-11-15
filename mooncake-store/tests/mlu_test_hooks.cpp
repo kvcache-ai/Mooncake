@@ -1,6 +1,7 @@
 #include "mlu_test_hooks.h"
 
 #include <cnrt.h>
+#include <thread>
 
 namespace mooncake::testing {
 std::atomic<bool> fail_mlu_h2d{false};
@@ -12,6 +13,7 @@ std::atomic<size_t> mlu_pinned_frees{0};
 std::atomic<size_t> mlu_pinned_free_errors{0};
 std::atomic<bool> pause_mlu_h2d{false};
 std::atomic<size_t> mlu_h2d_inflight{0};
+std::atomic<size_t> mlu_h2d_worker_id{0};
 }  // namespace mooncake::testing
 
 extern "C" {
@@ -28,6 +30,8 @@ cnrtRet_t __wrap_cnrtMemcpy(void* dst, void* src, size_t size,
         return cnrtErrorCndrvFuncCall;
     }
     if (direction == cnrtMemcpyHostToDev) {
+        mlu_h2d_worker_id.store(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
         ++mlu_h2d_inflight;
         while (pause_mlu_h2d.load()) pause_mlu_h2d.wait(true);
         auto result = __real_cnrtMemcpy(dst, src, size, direction);

@@ -411,12 +411,14 @@ class MemcpyWorkerPool {
     void submitTask(MemcpyTask task);
 
    private:
-    void workerThread();
+    void workerThread(bool primary);
 
     std::vector<std::thread> workers_;
     std::queue<MemcpyTask> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
+    std::condition_variable primary_cv_;
+    bool primary_busy_{false};
     std::atomic<bool> shutdown_;
 };
 

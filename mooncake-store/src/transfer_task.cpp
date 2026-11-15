@@ -694,7 +694,7 @@ MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     // Start worker threads
     workers_.reserve(kDefaultMemcpyWorkers);
     for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
-        workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
+        workers_.emplace_back(&MemcpyWorkerPool::workerThread, this, i == 0);
     }
 }
 
@@ -705,6 +705,7 @@ MemcpyWorkerPool::~MemcpyWorkerPool() {
         shutdown_.store(true);
     }
     queue_cv_.notify_all();
+    primary_cv_.notify_all();
 
     // Wait for all workers to finish
     for (auto& worker : workers_) {
@@ -717,6 +718,7 @@ MemcpyWorkerPool::~MemcpyWorkerPool() {
 }
 
 void MemcpyWorkerPool::submitTask(MemcpyTask task) {
+    bool wake_primary;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (shutdown_.load()) {
@@ -726,11 +728,12 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
             return;
         }
         task_queue_.push(std::move(task));
+        wake_primary = !primary_busy_;
     }
-    queue_cv_.notify_one();
+    (wake_primary ? primary_cv_ : queue_cv_).notify_one();
 }
 
-void MemcpyWorkerPool::workerThread() {
+void MemcpyWorkerPool::workerThread(bool primary) {
     VLOG(2) << "MemcpyWorkerPool worker thread started";
 
     while (true) {
@@ -739,8 +742,11 @@ void MemcpyWorkerPool::workerThread() {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
-                return shutdown_.load() || !task_queue_.empty();
+            // Keep serial copies on one worker; recruit other workers only
+            // while it is busy, avoiding thread/context rotation at low load.
+            (primary ? primary_cv_ : queue_cv_).wait(lock, [this, primary] {
+                return shutdown_.load() ||
+                       (!task_queue_.empty() && (primary || primary_busy_));
             });
 
             if (shutdown_.load() && task_queue_.empty()) {
@@ -750,9 +756,12 @@ void MemcpyWorkerPool::workerThread() {
             if (!task_queue_.empty()) {
                 task = std::move(task_queue_.front());
                 task_queue_.pop();
+                if (primary) primary_busy_ = true;
+                if (!task_queue_.empty()) queue_cv_.notify_one();
             }
         }
 
+        ErrorCode result = ErrorCode::TRANSFER_FAIL;
         // Execute the task if we have one
         if (task.state) {
             try {
@@ -813,13 +822,17 @@ void MemcpyWorkerPool::workerThread() {
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
                         << (ok ? "" : " (with GPU copy failure)");
-                task.state->set_completed(ok ? ErrorCode::OK
-                                             : ErrorCode::TRANSFER_FAIL);
+                result = ok ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
-                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             }
         }
+        if (primary) {
+            // Publish availability before completion can wake a serial caller.
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            primary_busy_ = false;
+        }
+        if (task.state) task.state->set_completed(result);
     }
 
     VLOG(2) << "MemcpyWorkerPool worker thread exiting";
