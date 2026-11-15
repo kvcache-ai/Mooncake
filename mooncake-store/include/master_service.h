@@ -2363,14 +2363,12 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
-     * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it
-     * to become durable. The local segment change has already happened and
-     * cannot be rolled back, so a failed append is only logged; nothing
-     * retries it.
+     * Commits a segment event using capacity reserved before the local change.
+     * Does not wait for durability; commit failures are returned to the caller.
      */
-    void PersistSegmentOpForHA(const char* why, OpType type,
-                               const std::string& key,
-                               const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHA(
+        const char* why, OrderedOpLogWriter::Reservation&& reservation,
+        const OpLogEntry& entry, DurableFinalizeCallback callback = nullptr);
 
     /**
      * Appends a REMOVE entry for the key, without waiting for it to become
