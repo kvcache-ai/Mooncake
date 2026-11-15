@@ -385,17 +385,18 @@ class RandomAllocationStrategy : public AllocationStrategy {
         // randomly. Non-serving segments are skipped here instead of building
         // the serving list, which would check every segment per allocation;
         // they do not count toward the retry limit.
-        const size_t start_idx = randomStartIndex(allocator_manager, names);
-        size_t try_count = 0;
-
-        for (size_t i = 0; i < names.size() && replicas.size() < replica_num &&
-                           try_count < kMaxRetryLimit;
-             ++i) {
-            const auto& name = names[(start_idx + i) % names.size()];
+        FallbackCandidateSearch search(
+            names.size(), randomStartIndex(allocator_manager, names));
+        while (replicas.size() < replica_num) {
+            const auto index = search.Next(replicas.empty());
+            if (!index) {
+                break;
+            }
+            const auto& name = names[*index];
             if (!allocator_manager.isServing(name)) {
                 continue;
             }
-            try_count++;
+            search.Charge();
 
             // Skip excluded and used segments
             if (excluded_segments.contains(name) ||
@@ -485,6 +486,62 @@ class RandomAllocationStrategy : public AllocationStrategy {
     }
 
    protected:
+    // Keep the 100-position charged budget. After 95 sequential positions with
+    // no replicas, spread the last five over the unseen suffix. Partial results
+    // keep the original sequential search. Each name is visited at most once.
+    // This uses O(1) state, not a uniform random permutation or subset.
+    class FallbackCandidateSearch {
+       public:
+        FallbackCandidateSearch(size_t size, size_t start)
+            : size_(size), start_(start) {}
+
+        std::optional<size_t> Next(bool allow_recovery) {
+            if (visited_ == size_ || charged_ == kMaxRetryLimit) {
+                return std::nullopt;
+            }
+            if (charged_ == kMaxRetryLimit - kExplorationBudget &&
+                recovery_size_ == 0 && allow_recovery &&
+                size_ - visited_ > kExplorationBudget) {
+                recovery_size_ = size_ - visited_;
+                recovery_start_ = Add(start_, visited_, size_);
+                position_ = randomIndex(recovery_size_);
+            }
+            size_t index;
+            if (recovery_size_ == 0) {
+                index = Add(start_, visited_, size_);
+            } else {
+                if (recovery_visited_++ != 0) {
+                    if (step_ == 0) {
+                        step_ =
+                            tryRandomCoprimeStep(recovery_size_).value_or(1);
+                    }
+                    position_ = Add(position_, step_, recovery_size_);
+                }
+                index = Add(recovery_start_, position_, size_);
+            }
+            ++visited_;
+            return index;
+        }
+
+        void Charge() { ++charged_; }
+
+       private:
+        static size_t Add(size_t position, size_t step, size_t size) {
+            return position >= size - step ? position - (size - step)
+                                           : position + step;
+        }
+
+        const size_t size_;
+        const size_t start_;
+        size_t visited_{0};
+        size_t charged_{0};
+        size_t recovery_size_{0};
+        size_t recovery_start_{0};
+        size_t recovery_visited_{0};
+        size_t position_{0};
+        size_t step_{0};
+    };
+
     // Draws again on a non-serving segment, so the serving segment right after
     // a run of them is not more likely to come first.
     static size_t randomStartIndex(const AllocatorManager& allocator_manager,
@@ -500,6 +557,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
    private:
     static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr size_t kExplorationBudget = 5;
     static constexpr int kMaxStartDraws = 16;
 };
 
@@ -594,16 +652,17 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return replicas;
         }
 
-        const size_t fallback_idx = randomIndex(names.size());
-        size_t try_count = 0;
-        for (size_t i = 0; i < names.size() && replicas.size() < replica_num &&
-                           try_count < kMaxRetryLimit;
-             ++i) {
-            const auto& name = names[(fallback_idx + i) % names.size()];
+        FallbackCandidateSearch search(names.size(), randomIndex(names.size()));
+        while (replicas.size() < replica_num) {
+            const auto index = search.Next(replicas.empty());
+            if (!index) {
+                break;
+            }
+            const auto& name = names[*index];
             if (!allocator_manager.isServing(name)) {
                 continue;
             }
-            ++try_count;
+            search.Charge();
             if (excluded_segments.contains(name) ||
                 used_segments.contains(name)) {
                 continue;
@@ -623,7 +682,6 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
     }
 
    private:
-    static constexpr size_t kMaxRetryLimit = 100;
     static constexpr size_t kCandidateMultiplier = 6;
 };
 
