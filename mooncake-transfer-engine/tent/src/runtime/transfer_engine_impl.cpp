@@ -1700,9 +1700,12 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
         const bool mlu_side =
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU;
-        rdma_direct =
-            allow_device_direct && (hint == UNSPEC || hint == RDMA) &&
-            deviceDirectRdmaReady(request, entry, local_mtype, remote_mtype);
+        if (cuda_side || xpu_side || mlu_side) {
+            rdma_direct = allow_device_direct &&
+                          (hint == UNSPEC || hint == RDMA) &&
+                          deviceDirectRdmaReady(request, entry, local_mtype,
+                                                remote_mtype);
+        }
         direct = ((xpu_side || mlu_side) && rdma_direct) ||
                  (cuda_side && !xpu_side && !mlu_side && allow_device_direct);
         xpu_ipc = xpu_side && !mlu_side && allow_xpu_ipc &&

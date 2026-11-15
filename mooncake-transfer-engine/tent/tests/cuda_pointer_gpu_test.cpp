@@ -127,6 +127,8 @@ TEST(CudaPointerGpuTest, ExportDmabufAlignmentSubRangeAndContextRestoration) {
     ASSERT_EQ(cudaSuccess, cudaMalloc(&base, kAlloc));
     ASSERT_EQ(cudaSuccess, cudaMalloc(&unaligned, kUnalignedSize));
 
+    const char* prev_peermem = std::getenv("WITH_NVIDIA_PEERMEM");
+    const std::string saved_peermem = prev_peermem ? prev_peermem : "";
     ASSERT_EQ(0, ::setenv("WITH_NVIDIA_PEERMEM", "0", 1));
     std::array<char, 64> host_buf{};
     DmabufExport host_exp;
@@ -168,7 +170,11 @@ TEST(CudaPointerGpuTest, ExportDmabufAlignmentSubRangeAndContextRestoration) {
     });
     worker.join();
 
-    ::unsetenv("WITH_NVIDIA_PEERMEM");
+    if (prev_peermem != nullptr) {
+        ::setenv("WITH_NVIDIA_PEERMEM", saved_peermem.c_str(), 1);
+    } else {
+        ::unsetenv("WITH_NVIDIA_PEERMEM");
+    }
     EXPECT_EQ(cudaSuccess, cudaFree(unaligned));
     EXPECT_EQ(cudaSuccess, cudaFree(base));
 }

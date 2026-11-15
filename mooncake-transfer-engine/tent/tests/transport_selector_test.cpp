@@ -574,6 +574,13 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToGpu) {
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, RDMA)
         << "RDMA should be available for CUDA-to-CUDA";
+
+    ctx.rdma_device_direct = false;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+
+    rdma->setDramToDram(true);
+    ctx.host_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, RDMA);
 }
 
 TEST(TransportSelectorTest, TransportCapabilityDramToGpu) {
