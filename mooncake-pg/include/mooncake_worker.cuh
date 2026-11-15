@@ -35,15 +35,17 @@ static constexpr size_t kBufferSize = 1u << 24;
 // TransferGroupMeta::halfReads) as they were when the flag was posted, one word
 // per half. A word holds the count in its low 32 bits and the sender's tag (see
 // syncFlagTag) in its high 32 bits. The flag word is the word of the flag's own
-// half, and a nonzero tag there marks the flag as set.
+// half, and a tag there with the number of the reader's run marks the flag of
+// that run as set.
 //
 // A reader reads each word with one aligned 8-byte load and trusts a count
-// only next to the tag of the process it expects. The words of one flag may
-// land in either order, but each word must land whole, as an aligned 8-byte
-// store does on the transports in use. A count that a reader sees late is
-// lower, which only costs a READ, and the count of a word left by an earlier
-// process has another tag. Arrival takes any nonzero tag, as the base took any
-// set flag.
+// only next to the tag it expects: its run's number and the process now in the
+// peer's slot. The words of one flag may land in either order, but each word
+// must land whole, as an aligned 8-byte store does on the transports in use. A
+// count that a reader sees late is lower, which only costs a READ. Between
+// admissions a word left by an earlier run has another number, so a flag that
+// lands after its reader has given up on it neither ends nor feeds a later run
+// (see TransferGroupMeta::bufferHalfRuns for what is left).
 struct alignas(16) SyncFlag {
     uint64_t words[2];
 };
@@ -52,10 +54,23 @@ static_assert(sizeof(SyncFlag) == 16, "a flag is two 8-byte words");
 // recognizes flag writes by this length.
 static constexpr size_t kSyncFlagBytes = sizeof(SyncFlag);
 
-// The tag a rank puts into its flag words. It is never zero, and it differs
-// between the rank epochs of a slot's processes.
-inline uint32_t syncFlagTag(uint64_t rank_epoch) {
-    return static_cast<uint32_t>(rank_epoch) << 1 | 1u;
+// The bits of a run's number on its half that a tag holds.
+static constexpr uint32_t kSyncFlagRunMask = (1u << 23) - 1;
+
+// The tag a rank puts into the flag words of a run. Bit 0 is always set, so a
+// tag is never zero. Bits 1-23 hold the run's number on its half (see
+// TransferGroupMeta::bufferHalfRuns), which every rank counts alike. Bits 24-31
+// hold the low 8 bits of the sender's rank epoch, which differ between
+// successive processes of a slot and repeat only after 256 of them.
+inline uint32_t syncFlagTag(uint64_t rank_epoch, uint32_t run) {
+    return static_cast<uint32_t>(rank_epoch) << 24 |
+           (run & kSyncFlagRunMask) << 1 | 1u;
+}
+
+// True when a tag was put there for the given run, by any process.
+inline bool syncFlagTagIsRun(uint32_t tag, uint32_t run) {
+    return (tag & 1u) != 0 &&
+           ((tag >> 1) & kSyncFlagRunMask) == (run & kSyncFlagRunMask);
 }
 
 inline uint64_t syncFlagWord(uint32_t tag, uint32_t count) {
@@ -157,8 +172,16 @@ struct TransferGroupMeta {
     std::atomic<int> activeSize{0};
     int taskCount;
     // Runs of each buffer half so far, counted by the host worker. A half has
-    // two sets of sync flags and a run uses the set of its count's parity. The
-    // counts restart only when a rank is admitted (see applyGroupState).
+    // two sets of sync flags and a run uses the set of its count's parity; its
+    // flags carry the count as the run's number (see syncFlagTag), so ranks
+    // must count a half's runs alike: each rank must apply every view that
+    // admits a rank, where all of them restart the counts (see
+    // applyGroupState). A flag that landed late in a run whose 23-bit number is
+    // 0 or 1, as the first two runs of a half after an admission are, can still
+    // match a run after the next admission. The end of a run clears its flag
+    // set whatever run a word is of; a flag that a rank admitted at a later
+    // view posts before this rank has finished its earlier runs is lost, which
+    // the quiescence required at an admission rules out.
     std::atomic<uint32_t> bufferHalfRuns[2]{};
     // Reads of each buffer half so far. A run is read when its copy-out is
     // done, and whoever issues the copy-out counts it right behind it: a kernel

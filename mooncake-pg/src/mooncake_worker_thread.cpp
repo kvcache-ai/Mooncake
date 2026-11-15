@@ -155,7 +155,9 @@ void MooncakeWorker::startWorker() {
         // Per-slot state owned exclusively by this worker thread.
         clock::time_point activeTime[kNumTasks_];
         BatchID batchIDs[kNumTasks_]{};
-        // The set of sync flags that the task's run uses.
+        // The task's run's number on its half, and the set of sync flags that
+        // the run uses.
+        uint32_t syncFlagRun[kNumTasks_]{};
         size_t syncFlagOffset[kNumTasks_]{};
         // A task that waits for its targets to read asks them for their read
         // counts with a batch of its own, and asks again later while a target
@@ -227,10 +229,10 @@ void MooncakeWorker::startWorker() {
                     active_failed_ranks_hint[i] = task.failedRanksHint;
                     // Consecutive runs of a half alternate between its two
                     // sets of sync flags.
-                    const uint32_t run =
+                    syncFlagRun[i] =
                         group->bufferHalfRuns[task.bufferOffset].fetch_add(
                             1, std::memory_order_relaxed);
-                    syncFlagOffset[i] = run % 2;
+                    syncFlagOffset[i] = syncFlagRun[i] % 2;
 
                     if (task.resetFailedRanksHint &&
                         active_failed_ranks_hint[i]) {
@@ -587,8 +589,8 @@ void MooncakeWorker::startWorker() {
                     // the one here.
                     auto source_ptr = &sendSync(*group, task.bufferOffset)
                                            ->flags[syncFlagOffset[i]];
-                    const uint32_t tag =
-                        syncFlagTag(group->rankEpochs[group->globalRank]);
+                    const uint32_t tag = syncFlagTag(
+                        group->rankEpochs[group->globalRank], syncFlagRun[i]);
                     for (int half = 0; half < 2; ++half) {
                         source_ptr->words[half] = syncFlagWord(
                             tag,
@@ -647,9 +649,13 @@ void MooncakeWorker::startWorker() {
                         }
                         group->engine->getTransferStatus(
                             batchIDs[i], rankToTaskId[i][j], status);
+                        // A flag of an earlier run on this flag set, which
+                        // landed after that run had given up on its sender,
+                        // does not count.
                         const uint64_t flag_word =
                             loadSyncFlagWord(signal_ptr[j].words[half]);
-                        if (syncFlagWordTag(flag_word) == 0 ||
+                        if (!syncFlagTagIsRun(syncFlagWordTag(flag_word),
+                                              syncFlagRun[i]) ||
                             status.s != TransferStatusEnum::COMPLETED) {
                             bool peer_dead = false;
                             if (status.s == TransferStatusEnum::FAILED) {
@@ -674,6 +680,25 @@ void MooncakeWorker::startWorker() {
                                     << syncFlagWordTag(flag_word)
                                     << " diff_us=" << diff.count();
                             } else {
+                                // A live peer whose flag here is of another
+                                // run counts that half's runs differently, so
+                                // its flag of this run may never come. Say so
+                                // once per timeout.
+                                const uint32_t tag = syncFlagWordTag(flag_word);
+                                if (j != group->rank && tag != 0 &&
+                                    !syncFlagTagIsRun(tag, syncFlagRun[i]) &&
+                                    diff.count() >
+                                        *group->collectiveTimeoutUs) {
+                                    LOG(WARNING)
+                                        << "Rank " << group->globalRank
+                                        << " [SYNC] peer " << j
+                                        << " (global=" << group->rank_order[j]
+                                        << ") left a flag of run "
+                                        << ((tag >> 1) & kSyncFlagRunMask)
+                                        << " in half " << half
+                                        << ", waiting for run "
+                                        << (syncFlagRun[i] & kSyncFlagRunMask);
+                                }
                                 task_done = false;
                                 break;
                             }
@@ -688,9 +713,10 @@ void MooncakeWorker::startWorker() {
                         // sent it, and the peer reads this run next. So it has
                         // read this run once its count for the half has passed
                         // the flag's, and until then its half takes no new
-                        // data from this rank. Only words with the tag of the
-                        // process now in the peer's slot count: a flag left by
-                        // an earlier process there says nothing about this one.
+                        // data from this rank. Only words with the tag of this
+                        // run and of the process now in the peer's slot count:
+                        // a flag left by an earlier run, or by an earlier
+                        // process there, says nothing about this one.
                         // A peer marked failed in this task is held to its
                         // flag too, if the flag landed: the peer runs this
                         // collective. A peer that stays without a flag keeps
@@ -700,8 +726,8 @@ void MooncakeWorker::startWorker() {
                                 group->peerReads[j].awaited[half] = false;
                             } else {
                                 auto& reads = peerReadsOf(*group, j);
-                                const uint32_t tag =
-                                    syncFlagTag(reads.rankEpoch);
+                                const uint32_t tag = syncFlagTag(
+                                    reads.rankEpoch, syncFlagRun[i]);
                                 uint64_t words[2] = {};
                                 words[half] =
                                     loadSyncFlagWord(signal_ptr[j].words[half]);
