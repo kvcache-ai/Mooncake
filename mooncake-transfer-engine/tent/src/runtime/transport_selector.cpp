@@ -509,6 +509,13 @@ bool TransportSelector::isTransportAvailable(
     // RDMA; otherwise the engine stages it through host DRAM.
     auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
 
+    if (type == RDMA && context.segment_type == SegmentType::Memory &&
+        !context.local_segment && !context.rdma_device_direct &&
+        (is_gpu(context.local_memory_type) ||
+         is_gpu(context.remote_memory_type))) {
+        return false;
+    }
+
     // For file segments, check file-specific capabilities (original logic)
     if (context.segment_type == SegmentType::File) {
         if (context.local_memory_type == MTYPE_CPU) return caps.dram_to_file;

@@ -580,8 +580,8 @@ class TransferEngineImpl {
     Status sendNotificationViaRpc(SegmentID target_id,
                                   const Notification& notifi);
 
-    void findStagingPolicy(const Request& req,
-                           std::vector<std::string>& policy);
+    void findStagingPolicy(const Request& req, std::vector<std::string>& policy,
+                           bool allow_device_direct = true);
 
     // True when a request touching XPU or MLU memory can go over RDMA without
     // host staging: the RDMA transport advertises the device capability the

@@ -20,6 +20,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
+#include <limits>
 #include <mutex>
 #include <numa.h>
 #include <vector>
@@ -293,12 +294,13 @@ Status CudaPlatform::exportDmabuf(void* addr, size_t length,
     CUcontext primary_ctx = nullptr;
     CHECK_CU(cuDevicePrimaryCtxRetain(&primary_ctx, cu_dev));
 
-    auto restore_ctx = [&]() {
-        (void)cuCtxSetCurrent(caller_ctx);
+    auto restore_ctx = [&]() -> CUresult {
+        const CUresult set_rc = cuCtxSetCurrent(caller_ctx);
         (void)cuDevicePrimaryCtxRelease(cu_dev);
+        return set_rc;
     };
     if (cuCtxSetCurrent(primary_ctx) != CUDA_SUCCESS) {
-        restore_ctx();
+        (void)restore_ctx();
         return Status::InternalError("cuCtxSetCurrent failed" LOC_MARK);
     }
 
@@ -309,7 +311,7 @@ Status CudaPlatform::exportDmabuf(void* addr, size_t length,
     if (rc != CUDA_SUCCESS) {
         const char* err_str = nullptr;
         cuGetErrorString(rc, &err_str);
-        restore_ctx();
+        (void)restore_ctx();
         return Status::InternalError(
             std::string("cuMemGetAddressRange failed: ") +
             (err_str ? err_str : "unknown") + LOC_MARK);
@@ -319,28 +321,55 @@ Status CudaPlatform::exportDmabuf(void* addr, size_t length,
     // When registering a sub-range (or a VMM growth chunk smaller than
     // `length`), export only [aligned, addr + length) rather than the whole
     // allocation so concurrent imports do not over-map BAR1.
-    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        (void)restore_ctx();
+        return Status::InternalError("Unable to query page size" LOC_MARK);
+    }
+    const size_t page = static_cast<size_t>(page_size);
     CUdeviceptr export_base = alloc_base;
     uint64_t export_offset = (uintptr_t)addr - (uintptr_t)alloc_base;
-    size_t export_size = (alloc_size + page - 1) & ~(page - 1);
+    size_t raw_size = alloc_size;
     if (export_offset != 0 || length != alloc_size) {
-        uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
-        if (aligned < (uintptr_t)alloc_base) aligned = (uintptr_t)alloc_base;
+        uintptr_t aligned = (uintptr_t)addr & ~(page - 1);
+        if (aligned < (uintptr_t)alloc_base) {
+            aligned = (uintptr_t)alloc_base;
+        }
         export_base = (CUdeviceptr)aligned;
         export_offset = (uintptr_t)addr - aligned;
-        export_size = (export_offset + length + page - 1) & ~(page - 1);
+        if (export_offset > std::numeric_limits<size_t>::max() - length) {
+            (void)restore_ctx();
+            return Status::InvalidArgument(
+                "CUDA DMA-BUF size overflow" LOC_MARK);
+        }
+        raw_size = static_cast<size_t>(export_offset) + length;
     }
+    if (raw_size > std::numeric_limits<size_t>::max() - (page - 1)) {
+        (void)restore_ctx();
+        return Status::InvalidArgument("CUDA DMA-BUF size overflow" LOC_MARK);
+    }
+    const size_t export_size = (raw_size + page - 1) & ~(page - 1);
 
     int fd = -1;
     rc = cuMemGetHandleForAddressRange(&fd, export_base, export_size,
                                        CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
-    restore_ctx();
+    const CUresult restore_rc = restore_ctx();
     if (rc != CUDA_SUCCESS) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
         const char* err_str = nullptr;
         cuGetErrorString(rc, &err_str);
         return Status::InternalError(
             std::string("cuMemGetHandleForAddressRange failed: ") +
             (err_str ? err_str : "unknown") + LOC_MARK);
+    }
+    if (restore_rc != CUDA_SUCCESS) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        return Status::InternalError(
+            "cuCtxSetCurrent failed to restore the caller context" LOC_MARK);
     }
 
     out.fd = fd;
