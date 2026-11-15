@@ -19,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +35,7 @@
 
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
+#include "ha/leadership/backends/etcd/etcd_leader_coordinator.h"
 #endif
 #include "common/network.h"
 #include "ha/kv/ha_kv_backend_factory.h"
@@ -359,6 +361,41 @@ bool WaitForServing(SupervisorChildProcess& child, int admin_port,
 }
 
 }  // namespace
+
+#ifdef STORE_USE_ETCD
+TEST_F(HighAvailabilityTest,
+       EtcdDiscoveryDiagnosticsReportResolvedMasterViewKey) {
+    const char* current_value = std::getenv("MC_STORE_CLUSTER_ID");
+    const std::optional<std::string> saved_value =
+        current_value == nullptr ? std::nullopt
+                                 : std::optional<std::string>(current_value);
+    struct EnvironmentRestore {
+        std::optional<std::string> value;
+        ~EnvironmentRestore() {
+            if (value.has_value()) {
+                setenv("MC_STORE_CLUSTER_ID", value->c_str(), 1);
+            } else {
+                unsetenv("MC_STORE_CLUSTER_ID");
+            }
+        }
+    } restore{saved_value};
+
+    unsetenv("MC_STORE_CLUSTER_ID");
+    auto default_spec = MakeEtcdBackendSpec("127.0.0.1:2379");
+    ha::backends::etcd::EtcdLeaderCoordinator default_coordinator(default_spec);
+    EXPECT_NE(std::string::npos,
+              default_coordinator.GetDiscoveryDiagnostics().find(
+                  std::string("view_key='mooncake-store/") +
+                  DEFAULT_CLUSTER_ID + "/master_view'"));
+
+    setenv("MC_STORE_CLUSTER_ID", "custom-cluster", 1);
+    auto custom_spec = MakeEtcdBackendSpec("127.0.0.1:2379");
+    ha::backends::etcd::EtcdLeaderCoordinator custom_coordinator(custom_spec);
+    EXPECT_NE(std::string::npos,
+              custom_coordinator.GetDiscoveryDiagnostics().find(
+                  "view_key='mooncake-store/custom-cluster/master_view'"));
+}
+#endif
 
 int RunSupervisorChild() {
     MasterServiceSupervisorConfig config;

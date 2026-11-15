@@ -80,5 +80,22 @@ TEST(HALeaseTtlConfigTest, SupervisorConfigCarriesMasterConfigTtl) {
     EXPECT_EQ(17, supervisor_config.ha_leader_lease_ttl_sec);
 }
 
+TEST(HABackendConnstringTest, RemovesOnlyEtcdBackendSelector) {
+    EXPECT_EQ("127.0.0.1:2379;127.0.0.2:2379",
+              ResolveConfiguredHABackendConnstring(
+                  "etcd", "etcd://127.0.0.1:2379;127.0.0.2:2379", ""));
+    EXPECT_EQ("https://127.0.0.1:2379",
+              ResolveConfiguredHABackendConnstring(
+                  "etcd", "https://127.0.0.1:2379", ""));
+    EXPECT_EQ("etcd://127.0.0.1:2379",
+              ResolveConfiguredHABackendConnstring(
+                  "redis", "etcd://127.0.0.1:2379", ""));
+}
+
+TEST(HABackendConnstringTest, NormalizesLegacyEtcdEndpointsToo) {
+    EXPECT_EQ("127.0.0.1:2379", ResolveConfiguredHABackendConnstring(
+                                    "etcd", "", "etcd://127.0.0.1:2379"));
+}
+
 }  // namespace
 }  // namespace mooncake::test

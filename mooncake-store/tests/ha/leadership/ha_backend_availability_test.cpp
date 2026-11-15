@@ -1,12 +1,8 @@
-#include "ha/ha_types.h"
+#include "client_master_address.h"
 
 #include <gtest/gtest.h>
-#include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
-
-tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
-    const std::string& master_server_entry);
 
 namespace ha {
 namespace {
@@ -56,6 +52,60 @@ TEST(HABackendAvailabilityTest, ClientSpecParsingMatchesK8sBuildFlag) {
     ASSERT_FALSE(spec.has_value());
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, spec.error());
 #endif
+}
+
+TEST(HABackendAvailabilityTest, ExplicitEtcdSchemeNormalizesEndpoints) {
+#ifdef STORE_USE_ETCD
+    const auto expect_etcd = [](const std::string& entry,
+                                const std::string& connstring) {
+        auto spec = ParseHABackendSpec(entry);
+        ASSERT_TRUE(spec.has_value()) << entry;
+        ASSERT_TRUE(spec->has_value()) << entry;
+        EXPECT_EQ(HABackendType::ETCD, (*spec)->type);
+        EXPECT_EQ(connstring, (*spec)->connstring);
+    };
+
+    expect_etcd("etcd://127.0.0.1:2379", "127.0.0.1:2379");
+    expect_etcd("etcd://https://127.0.0.1:2379", "https://127.0.0.1:2379");
+
+#else
+    auto spec = ParseHABackendSpec("etcd://127.0.0.1:2379");
+    ASSERT_FALSE(spec.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, spec.error());
+#endif
+}
+
+TEST(HABackendAvailabilityTest, BareHostPortRemainsDirectMasterAddress) {
+    for (const auto& entry : {"127.0.0.1:50051", "127.0.0.1:2379"}) {
+        auto spec = ParseHABackendSpec(entry);
+        ASSERT_TRUE(spec.has_value()) << entry;
+        EXPECT_FALSE(spec->has_value()) << entry;
+    }
+}
+
+TEST(HABackendAvailabilityTest, EtcdRequiresExplicitScheme) {
+    for (const auto& entry :
+         {"127.0.0.1:2379;127.0.0.2:2379", "127.0.0.1:2379,127.0.0.2:2379",
+          "https://127.0.0.1:2379"}) {
+        auto spec = ParseHABackendSpec(entry);
+        ASSERT_FALSE(spec.has_value()) << entry;
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, spec.error()) << entry;
+    }
+}
+
+TEST(HABackendAvailabilityTest, MalformedBareEndpointListIsRejected) {
+    auto spec = ParseHABackendSpec("127.0.0.1:2379;;127.0.0.2:2379");
+    ASSERT_FALSE(spec.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, spec.error());
+}
+
+TEST(HABackendAvailabilityTest, MalformedEtcdEndpointIsRejected) {
+    for (const auto& entry :
+         {"etcd://", "etcd://127.0.0.1:70000", "etcd://127.0.0.1:2379;;"}) {
+        auto spec = ParseHABackendSpec(entry);
+        ASSERT_FALSE(spec.has_value()) << entry;
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, spec.error()) << entry;
+    }
 }
 
 }  // namespace

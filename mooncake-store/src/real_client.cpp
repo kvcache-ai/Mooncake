@@ -1140,19 +1140,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_hostname = local_hostname;
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(hostname), local_rpc_port);
-        auto client_opt = mooncake::Client::Create(
+        auto client_result = mooncake::Client::CreateWithError(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
             {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
-        if (!client_opt) {
-            LOG(ERROR) << "Failed to create client";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        if (!client_result) {
+            const auto failure = client_result.error();
+            LOG(ERROR) << "Failed to create client: error="
+                       << toString(failure.code);
+            return tl::unexpected(failure.code);
         }
-        client_ = *client_opt;
+        client_ = std::move(client_result.value());
     } else {
-        // Auto port binding with retry on metadata registration failure
+        // Retry only when no local port can be reserved. A client setup error
+        // such as a metadata backend write failure cannot be fixed by a new
+        // Store endpoint.
         const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
         bool success = false;
+        ErrorCode last_error = ErrorCode::INTERNAL_ERROR;
 
         for (int retry = 0; retry < auto_port_config.max_retries; ++retry) {
             // Create port binder to hold a port
@@ -1171,31 +1176,33 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             this->local_hostname = buildHostNameWithPort(hostname, port);
             this->local_rpc_addr =
                 buildHostNameWithPort(hostname, local_rpc_port);
-            auto client_opt = mooncake::Client::Create(
+            auto client_result = mooncake::Client::CreateWithError(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
                 {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
-            if (client_opt) {
-                client_ = *client_opt;
+            if (client_result) {
+                client_ = std::move(client_result.value());
                 success = true;
                 LOG(INFO) << "Successfully created client on port " << port
                           << " after " << (retry + 1) << " attempt(s)";
                 break;
             }
 
-            // Failed to create client (possibly due to metadata registration
-            // conflict), release port and retry with a different port
-            LOG(WARNING) << "Failed to create client on port " << port
-                         << ", retry " << (retry + 1) << "/"
-                         << auto_port_config.max_retries;
+            const auto failure = client_result.error();
+            last_error = failure.code;
+            LOG(ERROR) << "Client setup failed on port " << port
+                       << ": error=" << toString(failure.code)
+                       << "; a different endpoint cannot recover this "
+                          "failure";
             port_binder_.reset();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            return tl::unexpected(failure.code);
         }
 
         if (!success) {
             LOG(ERROR) << "Failed to create client after "
-                       << auto_port_config.max_retries << " retries";
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                       << auto_port_config.max_retries
+                       << " retries: error=" << toString(last_error);
+            return tl::unexpected(last_error);
         }
     }
 

@@ -23,6 +23,8 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     tl::expected<std::optional<MasterView>, ErrorCode> ReadCurrentView()
         override;
 
+    std::string GetDiscoveryDiagnostics() const override;
+
     tl::expected<AcquireLeadershipResult, ErrorCode> TryAcquireLeadership(
         const std::string& leader_address) override;
 

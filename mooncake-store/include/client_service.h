@@ -34,6 +34,7 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
+class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -1012,6 +1013,21 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class RealClient;
+
+    struct CreateFailure {
+        ErrorCode code;
+    };
+
+    static tl::expected<std::shared_ptr<Client>, CreateFailure> CreateWithError(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names,
+        const std::string& master_server_entry,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        std::map<std::string, std::string> labels, const std::string& tenant_id,
+        std::shared_ptr<NVMeoFInitiator> nof_initiator);
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
