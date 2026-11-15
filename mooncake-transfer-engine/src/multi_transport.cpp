@@ -24,67 +24,8 @@
 #ifdef WITH_METRICS
 #include "transfer_engine_metrics.h"
 #endif
-#include "transport/rdma_transport/rdma_transport.h"
-#include "transport/rdma_twosided/rdma_twosided_transport.h"
-#ifdef USE_BAREX
-#include "transport/barex_transport/barex_transport.h"
-#endif
-#ifdef USE_TCP
-#include "transport/tcp_transport/tcp_transport.h"
-#endif
+#include "transport/transport_registry.h"
 #include "transport/transport.h"
-#ifdef USE_NVMEOF
-#include "transport/nvmeof_transport/nvmeof_transport.h"
-#endif
-#ifdef USE_NCCL_HOST
-#include "transport/nccl_transport/nccl_transport.h"
-#endif
-#ifdef USE_ASCEND_DIRECT
-#include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
-#endif
-#ifdef USE_ASCEND_HETEROGENEOUS
-#include "transport/ascend_transport/heterogeneous_rdma_transport.h"
-#endif
-#ifdef USE_INTRA_NVLINK
-#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
-#endif
-#ifdef USE_HIP
-#include "transport/hip_transport/hip_transport.h"
-#endif
-#ifdef USE_HYLINK
-#include "transport/hylink_transport/hylink_transport.h"
-#endif
-#ifdef USE_MACA
-#include "transport/maca_transport/maca_transport.h"
-#endif
-#ifdef USE_MUSA
-#include "transport/musa_transport/musa_transport.h"
-#endif
-#ifdef USE_MNNVL
-#include "transport/nvlink_transport/nvlink_transport.h"
-#endif
-#ifdef USE_CXL
-#include "transport/cxl_transport/cxl_transport.h"
-#endif
-#include "transport/shm_transport/shm_transport.h"
-#ifdef USE_UBSHMEM
-#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
-#endif
-#ifdef USE_FLAGCX
-#include "transport/flagcx_transport/flagcx_transport.h"
-#endif
-#ifdef USE_EFA
-#include "transport/efa_transport/efa_transport.h"
-#endif
-#ifdef USE_CXI
-#include "transport/cxi_transport/cxi_transport.h"
-#endif
-#ifdef USE_SUNRISE
-#include "transport/sunrise_link_transport/sunrise_link_transport.h"
-#endif
-#ifdef USE_UB
-#include "transport/kunpeng_transport/ub_transport.h"
-#endif
 
 #include <cassert>
 
@@ -583,9 +524,9 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-static Status lookupTask(BatchID batch_id, size_t task_id,
+static Status lookupTask(Transport::BatchID batch_id, size_t task_id,
                          const Transport::TransferTask*& task) {
-    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+    if (batch_id == 0 || batch_id == static_cast<Transport::BatchID>(-1))
         return Status::InvalidArgument("Invalid Batch ID");
     const auto& batch_desc = Transport::toBatchDesc(batch_id);
     if (task_id >= batch_desc.task_list.size())
@@ -778,176 +719,48 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
-#ifdef USE_NCCL_HOST
-    if ((proto == "nccl" && !transport_map_.empty()) ||
-        (proto != "nccl" && transport_map_.count("nccl") != 0)) {
+    const bool requested_exclusive =
+        TransportRegistry::requiresExclusiveEngine(proto);
+    bool exclusive_installed = false;
+    for (const auto& [installed_proto, unused] : transport_map_) {
+        (void)unused;
+        if (TransportRegistry::requiresExclusiveEngine(installed_proto)) {
+            exclusive_installed = true;
+            break;
+        }
+    }
+    if ((requested_exclusive && !transport_map_.empty()) ||
+        (!requested_exclusive && exclusive_installed)) {
         LOG(ERROR) << "NCCL host transport must be the only transport "
                       "installed in a Transfer Engine instance";
         return nullptr;
     }
-#endif
-    Transport* transport = nullptr;
-    if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
+
+    if (proto == "rdma" || proto == "rdma_twosided") {
         if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
             (proto == "rdma_twosided" && transport_map_.count("rdma"))) {
             LOG(ERROR) << "Cannot install both rdma and rdma_twosided "
                           "transports in the same Transfer Engine instance";
             return nullptr;
         }
-        if (std::string(proto) == "rdma") {
-            transport = new RdmaTransport();
-        } else {
-            transport = new RdmaTwoSidedTransport();
-        }
     }
-#ifdef USE_UB
-    else if (std::string(proto) == "ub") {
-        transport = new UbTransport();
-    }
-#endif
-#ifdef USE_BAREX
-    else if (std::string(proto) == "barex") {
-        transport = new BarexTransport();
-    }
-#endif
-#ifdef USE_TCP
-    else if (std::string(proto) == "tcp") {
-        transport = new TcpTransport();
-    }
-#endif
-#ifdef USE_NVMEOF
-    else if (std::string(proto) == "nvmeof") {
-        transport = new NVMeoFTransport();
-    }
-#endif
-#ifdef USE_NCCL_HOST
-    else if (std::string(proto) == "nccl") {
-        transport = new NcclHostTransport();
-    }
-#endif
-#ifdef USE_ASCEND_DIRECT
-    else if (std::string(proto) == "ascend") {
-        transport = new AscendDirectTransport();
-    }
-#endif
-#ifdef USE_ASCEND_HETEROGENEOUS
-    else if (std::string(proto) == "ascend") {
-        transport = new HeterogeneousRdmaTransport();
-    }
-#endif
 
-#ifdef USE_INTRA_NVLINK
-    else if (std::string(proto) == "nvlink_intra") {
-        transport = new IntraNodeNvlinkTransport();
-    }
-#endif
-
-#ifdef USE_HIP
-    else if (std::string(proto) == "hip") {
-        transport = new HipTransport();
-    }
-#endif
-#ifdef USE_HYLINK
-    else if (std::string(proto) == "hylink") {
-        transport = new HylinkTransport();
-    }
-#endif
-#ifdef USE_MACA
-    else if (std::string(proto) == "maca") {
-        transport = new MacaTransport();
-    }
-#endif
-#ifdef USE_MUSA
-    else if (std::string(proto) == "musa") {
-        transport = new MusaTransport();
-    }
-#endif
-#ifdef USE_MNNVL
-    else if (std::string(proto) == "nvlink") {
-        transport = new NvlinkTransport();
-    }
-#endif  // USE_MNNVL
-#ifdef USE_CXL
-    else if (std::string(proto) == "cxl") {
-        transport = new CxlTransport();
-    }
-#endif
-    else if (std::string(proto) == "shm") {
-        transport = new ShmTransport();
-    }
-#ifdef USE_UBSHMEM
-    else if (std::string(proto) == "ubshmem") {
-        transport = new UBShmemTransport();
-    }
-#endif
-#ifdef USE_FLAGCX
-    else if (std::string(proto) == "flagcx") {
-        transport = new FlagCxTransport();
-    }
-#endif
-#ifdef USE_EFA
-    else if (std::string(proto) == "efa") {
-        transport = new EfaTransport();
-    }
-#endif
-#ifdef USE_CXI
-    else if (std::string(proto) == "cxi") {
-        transport = new CxiTransport();
-    }
-#endif
-#ifdef USE_SUNRISE
-    else if (std::string(proto) == "sunrise_link") {
-        transport = new SunriseLinkTransport();
-    }
-#endif
-
+    auto transport = TransportRegistry::create(proto);
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
                    << ", please rebuild Mooncake";
         return nullptr;
     }
 
-#ifdef USE_BAREX
-    bool use_eic = false;
-    for (auto& dev : topo->getHcaList()) {
-        if (dev.find("soe") != std::string::npos ||
-            dev.find("solar") != std::string::npos) {
-            use_eic = true;
-        }
-    }
-
-    if (std::string(proto) == "barex") {
-        std::string nics;
-        for (auto& dev : topo->getHcaList()) {
-            if (use_eic) {
-                if (dev.find("soe") == std::string::npos &&
-                    dev.find("solar") == std::string::npos) {
-                    // ignore no eic nics
-                    continue;
-                }
-            }
-            nics += dev;
-            nics += ",";
-        }
-
-        // Remove the last extra comma
-        if (!nics.empty()) {
-            nics.pop_back();
-        }
-
-        if (!nics.empty()) {
-            LOG(INFO) << "ACCL_USE_NICS is set to " << nics;
-            setenv("ACCL_USE_NICS", nics.c_str(), 1);
-        }
-    }
-#endif
+    TransportRegistry::prepareInstall(proto, topo);
     if (transport->install(local_server_name_, metadata_, topo)) {
-        delete transport;
         return nullptr;
     }
 
-    transport_map_[proto] = std::shared_ptr<Transport>(transport);
-    return transport;
+    auto shared_transport = std::shared_ptr<Transport>(std::move(transport));
+    Transport* raw_transport = shared_transport.get();
+    transport_map_[proto] = std::move(shared_transport);
+    return raw_transport;
 }
 
 Status MultiTransport::selectTransports(

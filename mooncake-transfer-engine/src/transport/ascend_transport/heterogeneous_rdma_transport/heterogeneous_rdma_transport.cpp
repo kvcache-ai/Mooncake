@@ -1,4 +1,5 @@
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
+#include "transport/transport_registry.h"
 #include <chrono>
 
 namespace mooncake {
@@ -460,3 +461,7 @@ Status HeterogeneousRdmaTransport::getTransferStatus(BatchID batch_id,
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT_WITH_OPTIONS(
+    ascend_heterogeneous, "ascend", mooncake::HeterogeneousRdmaTransport,
+    false, nullptr, 1);

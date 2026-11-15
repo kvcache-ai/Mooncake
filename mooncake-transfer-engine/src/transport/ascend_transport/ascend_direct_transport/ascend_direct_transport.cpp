@@ -16,6 +16,7 @@
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 
@@ -529,3 +530,6 @@ int AscendDirectTransport::unregisterLocalMemoryBatch(
     return first_error ? first_error : metadata_ret;
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(ascend_direct, "ascend",
+                            mooncake::AscendDirectTransport);

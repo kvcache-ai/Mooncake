@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+#include "transport/transport_registry.h"
 
 #include <bits/stdint-uintn.h>
 #include "cuda_alike.h"
@@ -859,3 +860,6 @@ void IntraNodeNvlinkTransport::freePinnedLocalMemory(void *ptr) {
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(nvlink_intra, "nvlink_intra",
+                            mooncake::IntraNodeNvlinkTransport);
