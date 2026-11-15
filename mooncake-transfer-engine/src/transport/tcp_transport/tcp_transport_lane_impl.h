@@ -827,7 +827,17 @@ void TcpTransport::runGroupPump(
 
         for (const auto& lane : group->lanes) {
             dropAbandonedQueueHeadLocked(*group, abandoned);
-            if (group->queue.empty()) break;
+            if (group->queue.empty()) {
+                // Dropping the abandoned head can empty the queue while a
+                // healthy request is still in pending_admissions. Promote it
+                // now, and schedule a follow-up pump if this loop cannot hand
+                // it to an idle lane; otherwise the promotion at the end of
+                // the function leaves it queued with no wake-up.
+                promoted += promotePendingAdmissionsLocked(*group);
+                if (!group->queue.empty())
+                    queue_detached_after_scheduling = true;
+                if (group->queue.empty()) break;
+            }
             if (lane->state != LaneState::IDLE) continue;
             // is_open() only describes the local descriptor. A peer may have
             // closed an otherwise idle pooled connection since its last ACK.
