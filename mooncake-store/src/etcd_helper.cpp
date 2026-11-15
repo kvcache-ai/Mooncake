@@ -277,10 +277,19 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
         return ErrorCode::ETCD_TRANSACTION_FAIL;
     }
     if (ret != 0) {
-        LOG(ERROR) << "TxnCompareAndPut failed: "
-                   << (err_msg == nullptr ? "" : err_msg);
+        const std::string error_message =
+            err_msg == nullptr ? std::string() : std::string(err_msg);
+        LOG(ERROR) << "TxnCompareAndPut failed: " << error_message;
         if (err_msg != nullptr) {
             free(err_msg);
+        }
+        // A deterministic request-size rejection cannot succeed on retry.
+        // Match the concrete backend messages only; a bare ResourceExhausted
+        // can also mean quota or rate limiting, which stay retryable.
+        if (error_message.find("request is too large") != std::string::npos ||
+            error_message.find("message larger than max") !=
+                std::string::npos) {
+            return ErrorCode::INVALID_PARAMS;
         }
         return ErrorCode::ETCD_OPERATION_ERROR;
     }

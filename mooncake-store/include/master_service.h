@@ -2347,9 +2347,12 @@ class MasterService {
         const std::string& payload, DurableFinalizeCallback callback);
     // Commit a set of entries as one indivisible batch record, so a durable
     // prefix either covers the whole set or none of it. Returns the last
-    // assigned sequence id on success.
+    // assigned sequence id on success. allow_oversize lets an indivisible
+    // group exceed the writer's admission target; CommitBatch still bounds its
+    // encoded record with max_batch_record_bytes.
     tl::expected<uint64_t, ErrorCode> AppendOpLogBatchWithDurableFinalize(
-        std::vector<OpLogEntry> entries, DurableFinalizeCallback callback);
+        std::vector<OpLogEntry> entries, DurableFinalizeCallback callback,
+        bool allow_oversize = false);
     tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
     ReserveBatchOpLogSlot();
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
