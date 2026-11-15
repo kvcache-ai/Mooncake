@@ -24,9 +24,13 @@ Prerequisites:
   - ``mooncake_master`` running with master config containing:
       ``--enable_offload=true``
       ``--root_fs_dir=<dir>``
+      ``--default_kv_lease_ttl=500`` (the refresh-deadline test waits 2s,
+          past the read-lease midpoint; scale ``REFRESH_WAIT_SECONDS``
+          with a different lease TTL)
   - ``MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=<dir>`` set on the client side.
 """
 
+import ctypes
 import os
 import time
 import unittest
@@ -39,6 +43,10 @@ VALUE_SIZE = 64 * 1024
 OFFLOAD_WAIT_SECONDS = int(os.getenv("OFFLOAD_WAIT_SECONDS", "45"))
 CLOSE_SETTLE_SECONDS = int(os.getenv("CLOSE_SETTLE_SECONDS", "30"))
 POLL_INTERVAL_SECONDS = 0.5
+# refresh_at is the read-lease midpoint: with the CI master's
+# --default_kv_lease_ttl=500 that is ~250 ms, so two seconds is safely
+# past the deadline.
+REFRESH_WAIT_SECONDS = float(os.getenv("REFRESH_WAIT_SECONDS", "2"))
 
 
 def make_store(reader: bool) -> MooncakeDistributedStore:
@@ -84,6 +92,22 @@ def has_complete_disk_replica(store: MooncakeDistributedStore, key: str) -> bool
 
 def has_memory_replica(store: MooncakeDistributedStore, key: str) -> bool:
     return any(row["memory"] for row in replica_rows(store, key))
+
+
+def read_through_snapshot(store, snapshot, key):
+    """One ranged read through the snapshot into a fresh registered buffer."""
+    buf = (ctypes.c_ubyte * VALUE_SIZE).from_buffer(bytearray(VALUE_SIZE))
+    ptr = ctypes.addressof(buf)
+    if store.register_buffer(ptr, VALUE_SIZE) != 0:
+        raise RuntimeError("register_buffer failed")
+    try:
+        rc = store.get_into_ranges_from_snapshot(
+            snapshot, [ptr], [[key]], [[[0]]], [[[0]]], [[[VALUE_SIZE]]]
+        )
+        return rc, bytes(buf)
+    finally:
+        if store.unregister_buffer(ptr) != 0:
+            raise RuntimeError("unregister_buffer failed")
 
 
 class TestSnapshotAfterClose(unittest.TestCase):
@@ -141,6 +165,35 @@ class TestSnapshotAfterClose(unittest.TestCase):
                 del snapshot
             if reader is not None:
                 reader.close()
+            writer.close()
+
+    def test_snapshot_reuse_across_refresh_deadline(self):
+        """Read through the snapshot twice, straddling the refresh deadline.
+
+        The second read happens after refresh_at (the read-lease midpoint),
+        so it exercises the weak-reference promotion plus the metadata
+        refresh path through the real Python binding, on a Store that is
+        still open.
+        """
+        key = "snapshot-refresh-deadline/value"
+        value = bytes(97 + i % 26 for i in range(VALUE_SIZE))
+        writer = make_store(reader=False)
+        snapshot = None
+        try:
+            self.assertEqual(writer.put(key, value), 0)
+            snapshot = writer.prepare_get_into_ranges_snapshot([key])
+
+            rc, data = read_through_snapshot(writer, snapshot, key)
+            self.assertEqual(rc, [[[VALUE_SIZE]]])
+            self.assertEqual(data, value)
+
+            time.sleep(REFRESH_WAIT_SECONDS)
+
+            rc, data = read_through_snapshot(writer, snapshot, key)
+            self.assertEqual(rc, [[[VALUE_SIZE]]])
+            self.assertEqual(data, value)
+        finally:
+            del snapshot
             writer.close()
 
 
