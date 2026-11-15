@@ -19,6 +19,9 @@ bool ThreadUSRBIOResource::Initialize(const Hf3fsConfig &config) {
     if (ret < 0) {
         return false;
     }
+    // 3FS FUSE has mapped the buffer by now. Without the unlink, its /dev/shm
+    // file is removed only by hf3fs_iovdestroy and outlives a SIGKILL.
+    hf3fs_iovunlink(&iov_);
 
     // Create read I/O ring
     ret = hf3fs_iorcreate4(&ior_read_, config.mount_root.c_str(),
