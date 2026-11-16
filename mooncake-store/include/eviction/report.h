@@ -2,6 +2,7 @@
 
 // What one eviction run did, object by object (Effect) and in total (Report).
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -72,6 +73,14 @@ struct Report {
     uint64_t offload_rejected_drops = 0;
     // An OpLog write failed and cut the run short.
     bool stopped = false;
+    uint64_t visited = 0;
+    uint64_t moved = 0;
+    uint64_t busy =
+        0;  // Busy or concurrently removed before key-lock admission.
+    uint64_t lease_active = 0;
+    uint64_t scanned_slots = 0;
+    uint64_t scan_waves = 0;
+    uint32_t workers = 1;  // Largest worker count used by this run.
 
     [[nodiscard]] uint64_t Count(Outcome outcome) const {
         return outcomes[static_cast<size_t>(outcome)];
@@ -80,6 +89,24 @@ struct Report {
     // Something was released or queued for offload.
     [[nodiscard]] bool MadeProgress() const {
         return evicted_objects > 0 || Count(Outcome::kOffloadQueued) > 0;
+    }
+
+    void Merge(const Report& other) {
+        evicted_objects += other.evicted_objects;
+        released_bytes += other.released_bytes;
+        offload_bytes += other.offload_bytes;
+        offload_cap_drops += other.offload_cap_drops;
+        offload_rejected_drops += other.offload_rejected_drops;
+        stopped = stopped || other.stopped;
+        visited += other.visited;
+        moved += other.moved;
+        busy += other.busy;
+        lease_active += other.lease_active;
+        scanned_slots += other.scanned_slots;
+        scan_waves += other.scan_waves;
+        workers = std::max(workers, other.workers);
+        for (size_t i = 0; i < outcomes.size(); ++i)
+            outcomes[i] += other.outcomes[i];
     }
 
     void Add(const Effect& effect) {

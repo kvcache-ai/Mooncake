@@ -56,7 +56,7 @@ class DynamicReplicationController {
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
-        std::shared_ptr<ClientLivenessRecord> source_liveness;
+        ClientSessionSharedPtr source_session;
     };
 
     // Runs on the admission thread once per queued object.

@@ -1166,6 +1166,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("storage-b", ClientEpoch(1)),
                 segment_name: SegmentName::new("segment-b"),
+                allocation_id: None,
                 offset: Some(64),
                 segment_offset: 64,
                 length: 12,
@@ -1561,6 +1562,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 segment_name: SegmentName::new("hot-segment-a"),
+                allocation_id: None,
                 offset: None,
                 segment_offset: 0,
                 length: 12,
@@ -1996,6 +1998,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
                 offset: None,
                 segment_offset: 12,
                 length: 34,

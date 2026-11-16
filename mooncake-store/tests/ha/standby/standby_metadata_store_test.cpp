@@ -1,6 +1,10 @@
 #include "ha/standby_metadata_store.h"
 
 #include <gtest/gtest.h>
+#include <limits>
+
+#include "ha/oplog/oplog_applier.h"
+#include "ha/standby_controller.h"
 
 #include <set>
 #include <string>
@@ -153,3 +157,256 @@ TEST(StandbyMetadataStoreTest,
 }
 
 }  // namespace mooncake::test
+
+namespace mooncake {
+namespace {
+
+ObjectReplicaTarget Target() {
+    return {"s3", "http://localhost:9000", "objects", "us-east-1", "test/",
+            true};
+}
+
+ObjectUploadRecord Upload() {
+    return {Target(),
+            "default",
+            "key",
+            {1, 2},
+            7,
+            {"attempt-7", 1024},
+            ObjectUploadPhase::AUTHORIZED,
+            0,
+            false};
+}
+
+TEST(ObjectReplicaStateTest, CommitAndRetirementShareTheRecoveryAuthority) {
+    StandbyMetadataStore store;
+    auto record = Upload();
+    ObjectReplicaMutation prepare{Target(), {record}, {}, {}, false};
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("", "key", prepare));
+    EXPECT_FALSE(store.Exists("default", "key"));
+
+    MetadataPayload payload;
+    payload.client_id = record.writer;
+    payload.size = record.object.object_size;
+    Replica::Descriptor replica;
+    replica.descriptor_variant = DiskDescriptor{"existing-disk", payload.size};
+    payload.replicas = {replica};
+    payload.replicas[0].id = record.replica_id;
+    record.phase = ObjectUploadPhase::UPLOADED;
+    record.upload_finished = true;
+    ObjectReplicaMutation commit{Target(),
+                                 {record},
+                                 {},
+                                 struct_pack::serialize<std::string>(payload),
+                                 false};
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", commit));
+    ASSERT_TRUE(store.Exists("default", "key"));
+    const auto recovered = store.GetMetadata("default", "key");
+    ASSERT_TRUE(recovered);
+    EXPECT_TRUE(recovered->replicas[0].is_disk_replica());
+
+    // The existing logical REMOVE must not erase upload/cleanup obligations.
+    ASSERT_TRUE(store.Remove("default", "key"));
+    EXPECT_EQ(store.SnapshotObjectReplicas().records.size(), 1);
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms = 100;
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, false}));
+    EXPECT_FALSE(store.Exists("default", "key"));
+}
+
+TEST(ObjectReplicaStateTest, RejectsInvalidRecordsWithoutChangingState) {
+    StandbyMetadataStore store;
+    const auto original = Upload();
+    auto other = original;
+    other.object.object_key = "second-name";
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {original, other}, {}, {}, false}));
+    EXPECT_FALSE(store.HasObjectReplicaState());
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {original}, {}, {}, false}));
+    auto wrong_size = original;
+    wrong_size.object.object_size++;
+    auto wrong_id = original;
+    wrong_id.replica_id++;
+    auto unfinished = original;
+    unfinished.phase = ObjectUploadPhase::UPLOADED;
+    for (const auto& invalid : {other, wrong_size, wrong_id, unfinished}) {
+        EXPECT_FALSE(store.ApplyObjectReplicaMutation(
+            "default", "key", {Target(), {invalid}, {}, {}, false}));
+    }
+    auto retired = original;
+    retired.phase = ObjectUploadPhase::RETIRED;
+    retired.not_before_ms = 100;
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {retired}, {}, {}, false}));
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {original}, {}, {}, false}));
+    auto target = Target();
+    target.bucket = "another-bucket";
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation(
+        "default", "key", {target, {}, {"attempt-7"}, {}, false}));
+    const auto snapshot = store.SnapshotObjectReplicas();
+    ASSERT_EQ(snapshot.records.size(), 1);
+    EXPECT_EQ(snapshot.records.front().not_before_ms, 100);
+    ReplicaID maximum = 0;
+    ASSERT_TRUE(store.ValidateReplicaIds(maximum));
+    EXPECT_EQ(maximum, original.replica_id);
+    store.Clear();
+    EXPECT_FALSE(store.HasObjectReplicaState());
+    EXPECT_TRUE(store.SnapshotObjectReplicas().records.empty());
+}
+
+TEST(ObjectReplicaStateTest, RejectsInvalidMetadataWithoutPartialApply) {
+    StandbyMetadataStore store;
+    auto record = Upload();
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, false}));
+    MetadataPayload payload;
+    payload.client_id = record.writer;
+    payload.size = record.object.object_size;
+    Replica::Descriptor replica;
+    replica.descriptor_variant = DiskDescriptor{"existing-disk", payload.size};
+    replica.id = record.replica_id;
+    payload.replicas = {replica};
+    ASSERT_TRUE(
+        store.PutMetadata("default", "key", payload.ToStandbyMetadata()));
+    const auto original_uploads =
+        struct_pack::serialize<std::string>(store.SnapshotObjectReplicas());
+    const auto original_value = struct_pack::serialize<std::string>(
+        *store.GetMetadata("default", "key"));
+    record.phase = ObjectUploadPhase::UPLOADED;
+    record.upload_finished = true;
+    auto wrong_writer = payload;
+    wrong_writer.client_id = {9, 9};
+    auto zero_id = payload;
+    zero_id.replicas.front().id = 0;
+    auto reserved_id = payload;
+    reserved_id.replicas.front().id = std::numeric_limits<ReplicaID>::max();
+    auto duplicate_id = payload;
+    duplicate_id.replicas.push_back(replica);
+    ObjectReplicaMutation commit{Target(), {record}, {}, {}, false};
+    for (const auto& invalid :
+         {wrong_writer, zero_id, reserved_id, duplicate_id}) {
+        commit.metadata_payload = struct_pack::serialize<std::string>(invalid);
+        EXPECT_FALSE(
+            store.ApplyObjectReplicaMutation("default", "key", commit));
+        EXPECT_EQ(original_uploads, struct_pack::serialize<std::string>(
+                                        store.SnapshotObjectReplicas()));
+        const auto current = store.GetMetadata("default", "key");
+        ASSERT_TRUE(current);
+        EXPECT_EQ(original_value,
+                  struct_pack::serialize<std::string>(*current));
+    }
+    commit.metadata_payload = struct_pack::serialize<std::string>(payload);
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", commit));
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms = 100;
+    ObjectReplicaMutation remove{
+        Target(), {record}, {"missing-name"}, {}, true};
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation("default", "key", remove));
+    EXPECT_TRUE(store.Exists("default", "key"));
+    EXPECT_EQ(store.SnapshotObjectReplicas().records.front().phase,
+              ObjectUploadPhase::UPLOADED);
+    remove.forget.clear();
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", remove));
+    EXPECT_FALSE(store.Exists("default", "key"));
+    EXPECT_EQ(store.SnapshotObjectReplicas().records.front().phase,
+              ObjectUploadPhase::RETIRED);
+}
+
+TEST(ObjectReplicaStateTest, UncertainRetirementCannotBeForgotten) {
+    StandbyMetadataStore store;
+    auto record = Upload();
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, false}));
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms = 100;
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, true}));
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation(
+        "default", "key",
+        {Target(), {}, {record.object.object_key}, {}, false}));
+    auto snapshot = store.SnapshotObjectReplicas();
+    ASSERT_TRUE(store.RestoreObjectReplicas(snapshot));
+    snapshot.records.push_back(record);
+    EXPECT_FALSE(store.RestoreObjectReplicas(snapshot));
+    EXPECT_EQ(store.SnapshotObjectReplicas().records.size(), 1);
+    EXPECT_FALSE(
+        store.SnapshotObjectReplicas().records.front().upload_finished);
+    record.upload_finished = true;
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, false}));
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key",
+        {Target(), {}, {record.object.object_key}, {}, false}));
+    EXPECT_TRUE(store.SnapshotObjectReplicas().records.empty());
+    EXPECT_TRUE(store.SnapshotObjectReplicas().target);
+}
+
+OpLogEntry MutationEntry(uint64_t sequence,
+                         const ObjectReplicaMutation& mutation) {
+    OpLogEntry entry;
+    entry.sequence_id = sequence;
+    entry.tenant_id = "default";
+    entry.object_key = "key";
+    entry.op_type = OpType::OBJECT_STORAGE_MUTATION;
+    entry.payload = struct_pack::serialize<std::string>(mutation);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    return entry;
+}
+
+TEST(ObjectReplicaStateTest, OrderedReplayRejectsInvalidEntries) {
+    StandbyMetadataStore store;
+    OpLogApplier applier(&store);
+    auto record = Upload();
+    auto authorize = MutationEntry(1, {Target(), {record}, {}, {}, false});
+    ASSERT_TRUE(applier.ApplyOpLogEntry(authorize));
+    EXPECT_TRUE(applier.ApplyOpLogEntry(authorize));  // duplicate delivery
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms = 100;
+    auto retire = MutationEntry(2, {Target(), {record}, {}, {}, false});
+    ASSERT_TRUE(applier.ApplyOpLogEntry(retire));
+    auto invalid = MutationEntry(3, {Target(), {}, {"attempt-7"}, {}, false});
+    EXPECT_FALSE(applier.ApplyOpLogEntry(invalid));
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 3);
+    EXPECT_FALSE(
+        store.SnapshotObjectReplicas().records.front().upload_finished);
+}
+
+TEST(ObjectReplicaStateTest, PromotionDetectsBothRecoveryHandoffs) {
+    ha::PromotionContext handoff;
+    EXPECT_FALSE(handoff.HasObjectReplicaState());
+    handoff.object_storage = {Target(), {}};
+    EXPECT_TRUE(handoff.HasObjectReplicaState());
+    handoff.object_storage = {};
+    handoff.metadata_store = std::make_unique<StandbyMetadataStore>();
+    EXPECT_FALSE(handoff.HasObjectReplicaState());
+    ASSERT_TRUE(handoff.metadata_store->RestoreObjectReplicas({Target(), {}}));
+    EXPECT_TRUE(handoff.HasObjectReplicaState());
+}
+
+struct PreviousStandbySnapshot {
+    uint64_t oplog_sequence_id{0};
+    std::vector<StandbySegmentInfo> segments;
+    std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
+    YLT_REFL(PreviousStandbySnapshot, oplog_sequence_id, segments, objects,
+             weight_metadata);
+};
+
+TEST(ObjectReplicaStateTest, ExistingSnapshotWireShapeRemainsReadable) {
+    PreviousStandbySnapshot old;
+    old.oplog_sequence_id = 100;
+    StandbySnapshot current;
+    ASSERT_EQ(struct_pack::deserialize_to(current, struct_pack::serialize(old)),
+              struct_pack::errc::ok);
+    EXPECT_FALSE(current.object_storage);
+    current.object_storage = ObjectReplicaSnapshot{Target(), {Upload()}};
+    ASSERT_EQ(struct_pack::deserialize_to(old, struct_pack::serialize(current)),
+              struct_pack::errc::ok);
+    EXPECT_EQ(old.oplog_sequence_id, 100);
+}
+
+}  // namespace
+}  // namespace mooncake

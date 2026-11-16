@@ -278,6 +278,7 @@ pub(in super::super) fn cold_backing_placeholder(
     ReplicaRoute {
         owner: cold_backing.owner.clone(),
         segment_name: SegmentName::new("__cold_backing__"),
+        allocation_id: None,
         offset: None,
         segment_offset: 0,
         length: cold_backing.length,
@@ -329,6 +330,8 @@ pub(in super::super) fn with_disjoint_restore_caller_buffers(
             dst: slots[*index]
                 .take()
                 .expect("each restore read index should be unique"),
+            allow_intermediate_buffer: false,
+            allow_padded_direct_read: false,
         })
         .collect::<Vec<_>>();
     indices.into_iter().zip(f(&mut reads)).collect()
@@ -341,17 +344,10 @@ pub(in super::super) fn read_local_hot_replica_payload(
     route: &ObjectRoute,
     replica: &ReplicaRoute,
 ) -> Result<PendingOffloadPayload> {
-    if let Some(announcement) = allocator.lock().announcement(&replica.segment_name) {
-        if announcement.owner != replica.owner {
-            return Err(StoreError::InvalidState(format!(
-                "segment {} owner mismatch while materializing {}",
-                replica.segment_name.0, route.key.0
-            )));
-        }
-    }
-    let payload = copy_replica_payload_from_local_memory(state, replica).or_else(|_| {
+    validate_local_hot_replica_owner(allocator, replica)?;
+    let payload = pin_replica_payload_in_local_memory(allocator, state, replica).or_else(|_| {
         load_offload_source(backend, route)?
-            .map(PendingOffloadPayload::new)
+            .map(PendingOffloadPayload::from_vec)
             .ok_or_else(|| {
                 StoreError::NotFound(format!(
                     "route {} has no source payload available for offload",
@@ -359,58 +355,58 @@ pub(in super::super) fn read_local_hot_replica_payload(
                 ))
             })
     })?;
-    if payload.len() != replica.length as usize {
-        return Err(StoreError::InvalidState(format!(
-            "route {} local payload length mismatch: expected {} actual {}",
-            route.key.0,
-            replica.length,
-            payload.len()
-        )));
-    }
+    validate_local_hot_replica_length(replica, &payload)?;
     validate_replica_checksum(replica, payload.as_slice())?;
     Ok(payload)
 }
 
-pub(in super::super) fn local_hot_replica_checksum(
+pub(in super::super) fn pin_local_hot_replica_payload(
     allocator: &Arc<Mutex<LocalAllocatorState>>,
     state: &Arc<Mutex<StoreState>>,
-    route: &ObjectRoute,
     replica: &ReplicaRoute,
-) -> Result<u64> {
+) -> Result<PendingOffloadPayload> {
+    validate_local_hot_replica_owner(allocator, replica)?;
+    let payload = pin_replica_payload_in_local_memory(allocator, state, replica)?;
+    validate_local_hot_replica_length(replica, &payload)?;
+    Ok(payload)
+}
+
+fn validate_local_hot_replica_owner(
+    allocator: &Arc<Mutex<LocalAllocatorState>>,
+    replica: &ReplicaRoute,
+) -> Result<()> {
     if let Some(announcement) = allocator.lock().announcement(&replica.segment_name) {
         if announcement.owner != replica.owner {
             return Err(StoreError::InvalidState(format!(
-                "segment {} owner mismatch while checksumming {}",
-                replica.segment_name.0, route.key.0
+                "segment {} owner mismatch while pinning cold-tier source",
+                replica.segment_name.0
             )));
         }
     }
-    let payload = copy_replica_payload_from_local_memory(state, replica)?;
+    Ok(())
+}
+
+fn validate_local_hot_replica_length(
+    replica: &ReplicaRoute,
+    payload: &PendingOffloadPayload,
+) -> Result<()> {
     if payload.len() != replica.length as usize {
         return Err(StoreError::InvalidState(format!(
-            "route {} local payload length mismatch while checksumming: expected {} actual {}",
-            route.key.0,
+            "segment {} local payload length mismatch: expected {} actual {}",
+            replica.segment_name.0,
             replica.length,
             payload.len()
         )));
     }
-    Ok(payload_checksum(payload.as_slice()))
+    Ok(())
 }
 
-fn copy_replica_payload_from_local_memory(
+fn pin_replica_payload_in_local_memory(
+    allocator: &Arc<Mutex<LocalAllocatorState>>,
     state: &Arc<Mutex<StoreState>>,
     replica: &ReplicaRoute,
 ) -> Result<PendingOffloadPayload> {
-    let payload = {
-        let state = state.lock();
-        let addr = state
-            .memory_ref()?
-            .storage_address(&replica.segment_name, replica.segment_offset as usize)?;
-        // Keep pending offload materialization independent from hot-slot reuse.
-        // The route/allocator state may move on before the backend write runs.
-        unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), replica.length as usize).to_vec() }
-    };
-    Ok(PendingOffloadPayload::new(payload))
+    PendingOffloadPayload::pin_local_memory(allocator, state, replica)
 }
 
 fn load_offload_source(

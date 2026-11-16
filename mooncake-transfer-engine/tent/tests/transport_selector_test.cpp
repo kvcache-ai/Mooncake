@@ -205,6 +205,37 @@ TEST(TransportSelectorTest, ForceTcpOverridesBufferTransportOrder) {
     EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, UNSPEC);
 }
 
+TEST(TransportSelectorTest, ForceFabricOverridesMemoryTransportPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"tcp-only","segment_type":"memory","transports":["tcp"]}]})")
+            .ok());
+    ConfigHelper::forceFabric(*conf, "efa");
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    transports[FABRIC] = std::make_shared<FakeTransport>(FABRIC);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[FABRIC].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {TCP, FABRIC};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, FABRIC);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
+}
+
 TEST(TransportSelectorTest, ForceTcpDoesNotOverrideFileTransportPolicy) {
     auto conf = std::make_shared<Config>();
     ASSERT_TRUE(

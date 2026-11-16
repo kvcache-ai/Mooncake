@@ -957,7 +957,7 @@ void ControlService::onProbe(const std::string_view& request,
 void ControlService::onDelegate(const std::string_view& request,
                                 std::string& response) {
     Request user_request = json::parse(std::string(request)).get<Request>();
-    auto status = impl_->transferSync({user_request});
+    auto status = impl_->submitAndWaitTransfer({user_request});
     if (!status.ok()) response = status.ToString();
 }
 

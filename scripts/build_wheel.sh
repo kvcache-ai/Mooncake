@@ -404,7 +404,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MEMFABRIC_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD XPU_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MEMFABRIC_BUILD MUSA_BUILD HIP_BUILD XPU_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -469,34 +469,6 @@ elif [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-memfabric"
-elif [ "$EFA_BUILD" = "1" ]; then
-    echo "Modifying package name for AWS EFA build (CUDA)"
-    # Backup original pyproject.toml
-    cp pyproject.toml pyproject.toml.backup
-    # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa"/' pyproject.toml
-    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA version)"/' pyproject.toml
-    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-efa"
-elif [ "$EFA_CU13_BUILD" = "1" ]; then
-    echo "Modifying package name for AWS EFA build (CUDA 13)"
-    # Backup original pyproject.toml
-    cp pyproject.toml pyproject.toml.backup
-    # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-cuda13"/' pyproject.toml
-    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA 13 version)"/' pyproject.toml
-    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda13"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-efa-cuda13"
-elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
-    echo "Modifying package name for AWS EFA build (non-CUDA)"
-    # Backup original pyproject.toml
-    cp pyproject.toml pyproject.toml.backup
-    # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-non-cuda"/' pyproject.toml
-    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, Non-CUDA version)"/' pyproject.toml
-    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "non-cuda"]/' pyproject.toml
-    sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-efa-non-cuda"
 elif [ "$MUSA_BUILD" = "1" ]; then
     echo "Modifying package name for MUSA build"
     # Backup original pyproject.toml

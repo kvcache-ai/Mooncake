@@ -16,14 +16,16 @@ impl StoreClient {
         reservations: &[mooncake_store_core::SegmentReservation],
         reason: &str,
     ) {
-        if let Err(error) = self.release_reserved_allocations(targets, reservations) {
+        if targets.len() != reservations.len() {
             warn!(
                 runtime = %self.lease.runtime,
-                error = %error,
+                targets = targets.len(),
+                reservations = reservations.len(),
                 reason,
-                "failed to release reserved allocations"
+                "rollback target and reservation counts differ"
             );
         }
+        self.release_reservations_or_enqueue(reservations, reason);
     }
 
     fn load_tenant_quota_policies(
@@ -418,7 +420,7 @@ impl StoreClient {
         options: PutObjectCurrentOptions<'_>,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
         let tenant = object_id.scope.tenant.as_str();
         let key = object_id.logical_key.as_str();
         let scoped_key = mooncake_store_core::ObjectKey::from_logical_id(object_id);
@@ -456,7 +458,7 @@ impl StoreClient {
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
-            self.flush_due_reclaims()?;
+            self.flush_due_reclaims_best_effort();
             let quota_reservation = self.reserve_tenant_quota_for_put(
                 object_id,
                 &scoped_key,
@@ -552,6 +554,7 @@ impl StoreClient {
                     .map(|(priority, (target, offset))| ReplicaRoute {
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
+                        allocation_id: Some(reservations[priority].allocation_id),
                         offset: Some(*offset),
                         segment_offset: reservations[priority].offset_bytes,
                         length: value.len() as u64,
@@ -592,11 +595,28 @@ impl StoreClient {
                 "route_publish_cas_complete"
             );
             cas_tracker.finish(&cas_result, 0);
-            let mut cas = cas_result?;
+            let mut cas = match cas_result {
+                Ok(cas) => cas,
+                Err(error) => {
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
+                        &reservations,
+                        "put_stage_route_compare_and_swap_outcome_unknown",
+                    );
+                    let _ = self.abort_tenant_quota_reservation(
+                        quota_reservation.as_ref(),
+                        "put_stage_route_compare_and_swap_outcome_unknown",
+                    );
+                    return Err(error);
+                }
+            };
             if !cas.applied && expected_version.is_none() && cas.current.is_none() {
+                if cas.delete_version.is_none() && cas.version_floor.is_some() {
+                    registry::record_delete_marker_event("legacy_floor_retry", 1);
+                }
                 let retry_version = cas
-                    .version_floor
-                    .map(|floor| floor.next())
+                    .delete_version
+                    .or(cas.version_floor)
+                    .map(|version| version.next())
                     .unwrap_or_else(|| next_route_version(None, &self.route_ops(), &scoped_key));
                 if retry_version > route.version {
                     route.version = retry_version;
@@ -613,7 +633,20 @@ impl StoreClient {
                         },
                         retry_started.elapsed(),
                     );
-                    cas = retry_result?;
+                    cas = match retry_result {
+                        Ok(cas) => cas,
+                        Err(error) => {
+                            self.release_only_legacy_reservations_after_unknown_route_publish(
+                                &reservations,
+                                "put_stage_route_floor_retry_outcome_unknown",
+                            );
+                            let _ = self.abort_tenant_quota_reservation(
+                                quota_reservation.as_ref(),
+                                "put_stage_route_floor_retry_outcome_unknown",
+                            );
+                            return Err(error);
+                        }
+                    };
                 }
             }
             if !cas.applied {
@@ -1085,7 +1118,7 @@ impl StoreClient {
         plan: &ExplicitMigrationPlan,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
 
         let current = self
             .route_ops()
@@ -1135,6 +1168,7 @@ impl StoreClient {
             .map(|(priority, (target, offset))| ReplicaRoute {
                 owner: target.storage_runtime.clone(),
                 segment_name: target.segment_name.clone(),
+                allocation_id: Some(reservations[priority].allocation_id),
                 offset: Some(*offset),
                 segment_offset: reservations[priority].offset_bytes,
                 length: payload.len() as u64,
@@ -1183,10 +1217,9 @@ impl StoreClient {
             {
                 Ok(cas) => cas,
                 Err(error) => {
-                    self.best_effort_release_reserved_allocations(
-                        &targets,
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
                         &reservations,
-                        "explicit_migration_route_cas_error",
+                        "explicit_migration_route_cas_outcome_unknown",
                     );
                     return Err(error);
                 }
@@ -1545,6 +1578,11 @@ impl StoreClient {
                 },
             ) {
                 Ok(next) => {
+                    refresh_live_client_cache(
+                        self.metadata.as_ref(),
+                        &self.live_client_cache,
+                        "live_client_snapshot_after_drain_route_publish",
+                    )?;
                     writer.ensure_object_route_at_least(&next)?;
                     if let Err(error) = self.reclaim_route(&confirmed, ReclaimMode::Immediate) {
                         warn!(
@@ -1657,6 +1695,11 @@ impl StoreClient {
                 },
             ) {
                 Ok(next) => {
+                    refresh_live_client_cache(
+                        self.metadata.as_ref(),
+                        &self.live_client_cache,
+                        "live_client_snapshot_after_drain_route_publish",
+                    )?;
                     writer.ensure_object_route_at_least(&next)?;
                     if let Err(error) = self.reclaim_route(&confirmed, ReclaimMode::Immediate) {
                         warn!(
@@ -1781,12 +1824,14 @@ impl StoreClient {
         &self,
         live_allocations: &BTreeSet<AllocationSpan>,
     ) -> Result<usize> {
+        let recovered_pending_publications =
+            self.storage_owner.recover_due_pending_publications()?;
         let stale = self
             .allocator
             .lock()
             .stale_allocations(live_allocations, now_ms());
         if stale.is_empty() {
-            return Ok(0);
+            return Ok(recovered_pending_publications);
         }
         let releases = stale
             .iter()
@@ -1795,10 +1840,11 @@ impl StoreClient {
                 segment_name: allocation.segment_name.clone(),
                 offset_bytes: allocation.offset_bytes,
                 length_bytes: allocation.length_bytes,
+                allocation_id: 0,
             })
             .collect::<Vec<_>>();
         self.release_segment_allocations_batch(&releases)?;
-        Ok(stale.len())
+        Ok(recovered_pending_publications.saturating_add(stale.len()))
     }
 
     fn retire_empty_draining_segments(&self) -> Result<()> {
@@ -2174,12 +2220,24 @@ impl StoreClient {
                 }
             }
         }
-        for runtime in failed_runtimes {
+        if failed_runtimes.len() == 1 {
+            let runtime = failed_runtimes
+                .into_iter()
+                .next()
+                .expect("single failed runtime checked above");
             eprintln!(
                 "[mooncake-store] marking remote write target suspect runtime={} context={} error={}",
                 runtime, context, error
             );
             self.mark_runtime_suspect(&runtime, context);
+        } else if !failed_runtimes.is_empty() {
+            debug!(
+                runtime = %self.lease.runtime,
+                targets = failed_runtimes.len(),
+                context,
+                error = %error,
+                "ambiguous remote write failure invalidated segment caches without quarantining every target"
+            );
         }
         let _ = refresh_live_client_cache(
             self.metadata.as_ref(),
@@ -3645,6 +3703,7 @@ impl StoreClient {
                     resolved[index].replica = ReplicaRoute {
                         owner: batch.owner_lease.runtime.clone(),
                         segment_name: segment_name.clone(),
+                        allocation_id: None,
                         offset: absolute_offset,
                         segment_offset: reply.segment_offset,
                         length: reply.length,
@@ -3932,6 +3991,7 @@ impl StoreClient {
                         resolved[index].replica = ReplicaRoute {
                             owner: batch.owner_lease.runtime.clone(),
                             segment_name: segment_name.clone(),
+                            allocation_id: None,
                             offset: absolute_offset,
                             segment_offset: reply.segment_offset,
                             length: reply.length,
@@ -6340,6 +6400,7 @@ mod runtime_io_tests {
         ReplicaRoute {
             owner: ClientRuntimeId::new("test-runtime", ClientEpoch(0)),
             segment_name: SegmentName::new(segment_name),
+            allocation_id: None,
             offset: Some(offset),
             segment_offset,
             length,

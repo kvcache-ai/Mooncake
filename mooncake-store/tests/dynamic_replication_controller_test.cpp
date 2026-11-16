@@ -33,7 +33,7 @@ DynamicReplicationController::Plan MakePlan() {
     return DynamicReplicationController::Plan{.source_segment = "source",
                                               .target_segment = "target",
                                               .target_domain = "",
-                                              .source_liveness = nullptr};
+                                              .source_session = nullptr};
 }
 
 // Issues and commits a lease for `key` the way a proposal does, leaving the

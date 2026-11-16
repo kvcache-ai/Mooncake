@@ -19,11 +19,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "buffer_range_index.h"
 #include "common.h"
+#include "config.h"
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -262,6 +265,199 @@ TEST(BufferRangeIndex, LastHitReusesHintDevice) {
     EXPECT_EQ(hinted_device, first_device);
 }
 
+// Gives the single buffer of MakeSegment() one key per HCA of `topology`.
+// Devices listed in `unkeyed` get no MR, i.e. a zero lkey and rkey.
+SegmentDesc MakeSparseSegment(const std::string &topology,
+                              const std::vector<std::string> &unkeyed = {},
+                              const std::string &location = "cpu:0") {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    EXPECT_EQ(desc.topology.parse(topology), 0);
+    auto &buffer = desc.buffers[0];
+    buffer.name = location;
+    buffer.lkey.clear();
+    buffer.rkey.clear();
+    for (const auto &hca : desc.topology.getHcaList()) {
+        const bool keyed =
+            std::find(unkeyed.begin(), unkeyed.end(), hca) == unkeyed.end();
+        const auto key = static_cast<BufferDesc::mr_key_t>(
+            keyed ? 100 + buffer.lkey.size() : 0);
+        buffer.lkey.push_back(key);
+        buffer.rkey.push_back(key);
+    }
+    return desc;
+}
+
+int DeviceIndex(const SegmentDesc &desc, const std::string &hca) {
+    return desc.topology.getDeviceIndex(kWildcardLocation, hca);
+}
+
+TEST(BufferRangeIndex, LastHitSkipsDeviceWithoutKey) {
+    auto desc =
+        MakeSparseSegment(R"({"cpu:0":[["mlx5_1"],["mlx5_0"]]})", {"mlx5_0"});
+    const int unkeyed = DeviceIndex(desc, "mlx5_0");
+    int buffer_id = -1, device_id = -1;
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                          device_id, 0, 0, unkeyed),
+              0);
+    EXPECT_EQ(device_id, DeviceIndex(desc, "mlx5_1"));
+}
+
+// Destination device affinity passes the local NIC name as the hint on every
+// retry. When the peer has no MR on that NIC the hint must act like an unknown
+// name, or no retry could move past it.
+TEST(BufferRangeIndex, NamedHintWithoutKeyFallsBackToTopology) {
+    auto desc =
+        MakeSparseSegment(R"({"cpu:0":[["mlx5_0"],["mlx5_1"]]})", {"mlx5_1"});
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, "mlx5_1",
+                                              buffer_id, device_id, retry),
+                  0);
+        EXPECT_EQ(device_id, DeviceIndex(desc, "mlx5_0")) << retry;
+    }
+}
+
+// With Data Direct pairing a GPU's entry lists only its paired NICs, so a hint
+// naming another NIC resolves only through the wildcard entry, which lists
+// every HCA. Without a key there, the hint must act like an unknown name too.
+TEST(BufferRangeIndex, WildcardHintWithoutKeyFallsBackToTopology) {
+    const std::string gpu0 = GPU_PREFIX + "0";
+    const std::string gpu1 = GPU_PREFIX + "1";
+    auto desc = MakeSparseSegment(
+        R"({")" + gpu0 + R"(":[["nic0"],[]],")" + gpu1 + R"(":[["nic1"],[]]})",
+        {"nic1"}, gpu0);
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, "nic1",
+                                              buffer_id, device_id, retry),
+                  0);
+        EXPECT_EQ(device_id, DeviceIndex(desc, "nic0")) << retry;
+    }
+}
+
+// Peer callers select once per retry count, so a single call must find the only
+// keyed HCA from any starting retry count, wherever it sits in the topology.
+TEST(BufferRangeIndex, KeyedDeviceFoundFromAnyRetry) {
+    struct Case {
+        const char *topology;
+        std::vector<std::string> unkeyed;
+        const char *keyed;
+    };
+    const std::vector<Case> cases = {
+        {R"({"cpu:0":[["a"],["b"]]})", {"a"}, "b"},
+        {R"({"cpu:0":[["a","b"],["c"]]})", {"a", "c"}, "b"},
+        {R"({"cpu:0":[["a","b"],["c","d"]]})", {"a", "b", "d"}, "c"},
+    };
+    for (const auto &c : cases) {
+        auto desc = MakeSparseSegment(c.topology, c.unkeyed);
+        for (int retry = 0; retry < 8; ++retry) {
+            int buffer_id = -1, device_id = -1;
+            ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                                  device_id, retry),
+                      0)
+                << c.topology << " retry " << retry;
+            EXPECT_EQ(device_id, DeviceIndex(desc, c.keyed))
+                << c.topology << " retry " << retry;
+        }
+    }
+}
+
+// Duplicate HCAs in an entry must not hide the keyed one.
+TEST(BufferRangeIndex, DuplicateHcaInLocationStillFindsKeyedDevice) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a","a","a"],["b"]]})", {"a"});
+    for (int retry = 0; retry < 8; ++retry) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  0)
+            << retry;
+        EXPECT_EQ(device_id, DeviceIndex(desc, "b")) << retry;
+    }
+}
+
+// The wildcard entry lists every HCA, so it is consulted only when the
+// buffer's location has no entry; an entry without keyed HCAs fails instead.
+TEST(BufferRangeIndex, ExistingLocationWithoutKeysDoesNotUseWildcard) {
+    const char *topology = R"({"cpu:0":[["a"],[]],"cpu:1":[["b"],[]]})";
+    auto desc = MakeSparseSegment(topology, {"a"});
+    auto unlisted = MakeSparseSegment(topology, {"a"}, "cpu:7");
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        EXPECT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  ERR_ADDRESS_NOT_REGISTERED)
+            << retry;
+        ASSERT_EQ(RdmaTransport::selectDevice(&unlisted, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  0)
+            << retry;
+        EXPECT_EQ(device_id, DeviceIndex(unlisted, "b")) << retry;
+    }
+}
+
+// A first attempt still spreads over the keyed preferred HCAs.
+TEST(BufferRangeIndex, RandomPickStaysOnKeyedPreferred) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a","b","c"],[]]})", {"b"});
+    std::set<int> seen;
+    for (int i = 0; i < 200; ++i) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, 0),
+                  0);
+        seen.insert(device_id);
+    }
+    EXPECT_EQ(seen,
+              (std::set<int>{DeviceIndex(desc, "a"), DeviceIndex(desc, "c")}));
+}
+
+TEST(BufferRangeIndex, BufferWithoutAnyKeyIsNotSelectable) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a"],["b"]]})", {"a", "b"});
+    for (int retry : {0, 1, 5}) {
+        int buffer_id = -1, device_id = -1;
+        EXPECT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, "a", buffer_id,
+                                              device_id, retry),
+                  ERR_ADDRESS_NOT_REGISTERED);
+    }
+}
+
+// Peer affinity is precomputed when the topology is parsed, so the mapping
+// only needs to be set while building the segment.
+SegmentDesc MakePeerAffinitySegment(const std::vector<std::string> &peers,
+                                    const std::vector<std::string> &unkeyed) {
+    auto &config = globalConfig();
+    const bool previous_enabled = config.enable_hca_peer_affinity;
+    const auto previous_mapping = config.nic_peer_affinity;
+    config.enable_hca_peer_affinity = true;
+    config.nic_peer_affinity = {{"local0", peers}};
+    const std::string gpu = GPU_PREFIX + "0";
+    auto desc = MakeSparseSegment(
+        R"({")" + gpu + R"(":[["nic_a","nic_b","nic_c"],[]]})", unkeyed, gpu);
+    config.enable_hca_peer_affinity = previous_enabled;
+    config.nic_peer_affinity = previous_mapping;
+    return desc;
+}
+
+// HCAs outside the mapping may be unreachable from local0, so selection finds
+// the keyed mapped candidate from any retry, and fails rather than leave the
+// mapping when no mapped candidate has a key.
+TEST(BufferRangeIndex, PeerAffinityOnlySelectsKeyedCandidates) {
+    auto desc = MakePeerAffinitySegment({"nic_a", "nic_c"}, {"nic_a"});
+    auto blocked = MakePeerAffinitySegment({"nic_a"}, {"nic_a"});
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDeviceByLocalHca(
+                      &desc, 0x1080, 16, "local0", buffer_id, device_id, retry),
+                  0)
+            << retry;
+        EXPECT_EQ(device_id, DeviceIndex(desc, "nic_c")) << retry;
+        EXPECT_EQ(
+            RdmaTransport::selectDeviceByLocalHca(
+                &blocked, 0x1080, 16, "local0", buffer_id, device_id, retry),
+            ERR_ADDRESS_NOT_REGISTERED)
+            << retry;
+    }
+}
+
 TEST(BufferRangeIndex, DeviceHintDoesNotFollowBufferJump) {
     auto desc = MakeSegment(
         {MakeBuffer(0x1000, 0x1000, 0), MakeBuffer(0x2000, 0x1000, 1)});
@@ -378,4 +574,36 @@ TEST(BufferRangeIndex, SelectDeviceMatchesLinearFirstMatch) {
         }
     }
     EXPECT_GE(compared, 100000);
+}
+
+// hasValidLkey() and hasValidRkey() check one key array each; hasValidKeys()
+// needs a valid key in every array the buffer publishes.
+TEST(RdmaKeyCheck, OneSidedKeys) {
+    SegmentDesc desc;
+    BufferDesc buffer;
+    buffer.lkey = {0};
+    buffer.rkey = {7};
+    EXPECT_FALSE(RdmaTransport::hasValidLkey(&desc, buffer, 0));
+    EXPECT_TRUE(RdmaTransport::hasValidRkey(&desc, buffer, 0));
+    EXPECT_FALSE(RdmaTransport::hasValidKeys(&desc, buffer, 0));
+
+    buffer.lkey = {7};
+    buffer.rkey.clear();  // local-only MR
+    EXPECT_TRUE(RdmaTransport::hasValidLkey(&desc, buffer, 0));
+    EXPECT_FALSE(RdmaTransport::hasValidRkey(&desc, buffer, 0));
+    EXPECT_TRUE(RdmaTransport::hasValidKeys(&desc, buffer, 0));
+}
+
+// Keys past the end of a non-empty devices list do not make a device valid.
+TEST(RdmaKeyCheck, DeviceOutsideSegmentIsRejected) {
+    SegmentDesc desc;
+    desc.devices.push_back({"mlx5_unit_test", 1, "", ""});
+    BufferDesc buffer;
+    buffer.lkey = {7, 8};
+    buffer.rkey = {7, 8};
+    EXPECT_TRUE(RdmaTransport::hasValidKeys(&desc, buffer, 0));
+    EXPECT_FALSE(RdmaTransport::hasValidLkey(&desc, buffer, 1));
+    EXPECT_FALSE(RdmaTransport::hasValidRkey(&desc, buffer, 1));
+    EXPECT_FALSE(RdmaTransport::hasValidKeys(&desc, buffer, 1));
+    EXPECT_FALSE(RdmaTransport::hasValidKeys(&desc, buffer, -1));
 }

@@ -1028,6 +1028,13 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
         if (ret) {
+            // The transport only reports the regions that failed. The ones
+            // that did register are released below too, so say so here.
+            LOG(ERROR) << "Failed to register a batch of " << buffer_list.size()
+                       << " memory region(s) with transport "
+                       << transport->getName() << " (ret=" << ret
+                       << "); unregistering the whole batch, so none of its "
+                          "regions stays registered";
             for (auto it = attempted_transports.rbegin();
                  it != attempted_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);

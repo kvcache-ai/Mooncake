@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <stdexcept>
+#include <utility>
 
 #include <cuda_alike.h>
 #include <glog/logging.h>
@@ -41,6 +42,13 @@ int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank, int num_sms,
     return static_cast<int>(
         ceil_div_i64(num_max_tokens_per_rank,
                      hybrid_num_channels(num_sms, channels_per_sm)));
+}
+
+std::vector<int32_t> identity_rank_map(int num_ranks) {
+    if (num_ranks <= 0) return {};
+    std::vector<int32_t> slots(num_ranks);
+    for (int rank = 0; rank < num_ranks; ++rank) slots[rank] = rank;
+    return slots;
 }
 
 int64_t elastic_workspace_num_bytes() {
@@ -169,8 +177,12 @@ struct NcclElasticState {
     NcclElasticState(int rank, int num_ranks, size_t bytes,
                      int requested_gin_context_count, bool use_rail_gin,
                      int gin_traffic_class,
-                     const std::vector<int32_t>& nccl_unique_id)
-        : transport(device::createNcclDeviceTransport()),
+                     const std::vector<int32_t>& nccl_unique_id,
+                     std::weak_ptr<std::function<bool(bool)>> status_callback)
+        : transport(status_callback.expired()
+                        ? device::createNcclDeviceTransport()
+                        : device::createNcclDeviceTransportWithStatusCallback(
+                              std::move(status_callback))),
           allocation_bytes(bytes),
           gin_context_count(requested_gin_context_count) {
         if (!transport) {
@@ -391,8 +403,10 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     ctx.workspace = local_base;
     ctx.buffer = local_base + workspace_bytes + scratch_bytes;
     ctx.mapped_host_workspace = mapped_host_workspace_;
-    ctx.rank = topology_.rank_idx;
+    ctx.rank = transport_rank_;
     ctx.num_ranks = topology_.num_ranks;
+    ctx.logical_to_transport_slots = logical_to_transport_slots_;
+    ctx.qps_per_rank = qps_per_rank_;
     ctx.scaleout_rank_idx = topology_.scaleout_rank_idx;
     ctx.scaleup_rank_idx = topology_.scaleup_rank_idx;
     ctx.num_scaleout_ranks = topology_.num_scaleout_ranks;
@@ -440,9 +454,46 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
     bool allow_multiple_reduction, bool prefer_overlap_with_compute, int sl_idx,
     int num_allocated_qps, int num_cpu_timeout_secs, int num_gpu_timeout_secs,
     const std::string& transport, const std::vector<int32_t>& nccl_unique_id)
-    : transport_(transport) {
-    if (rank < 0 || num_ranks <= 0 || rank >= num_ranks) {
+    : MooncakeElasticBuffer(
+          rank, num_ranks, rank, num_ranks, num_buffer_bytes,
+          num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
+          deterministic, allow_hybrid_mode, allow_multiple_reduction,
+          prefer_overlap_with_compute, sl_idx, num_allocated_qps,
+          num_cpu_timeout_secs, num_gpu_timeout_secs, transport, nccl_unique_id,
+          identity_rank_map(num_ranks)) {}
+
+MooncakeElasticBuffer::MooncakeElasticBuffer(
+    int transport_rank, int capacity_ranks, int logical_rank,
+    int logical_num_ranks, int64_t num_buffer_bytes,
+    int64_t num_max_tokens_per_rank, int64_t hidden, int64_t num_topk,
+    bool use_fp8_dispatch, bool deterministic, bool allow_hybrid_mode,
+    bool allow_multiple_reduction, bool prefer_overlap_with_compute, int sl_idx,
+    int num_allocated_qps, int num_cpu_timeout_secs, int num_gpu_timeout_secs,
+    const std::string& transport, const std::vector<int32_t>& nccl_unique_id,
+    const std::vector<int32_t>& logical_to_transport_slots,
+    std::function<bool(bool)> init_status_callback)
+    : transport_(transport),
+      transport_rank_(transport_rank),
+      capacity_ranks_(capacity_ranks),
+      qps_per_rank_(capacity_ranks > 0 ? MAX_QP_COUNT / capacity_ranks : 0),
+      logical_to_transport_slots_host_(logical_to_transport_slots) {
+    if (capacity_ranks_ <= 0 || transport_rank_ < 0 ||
+        transport_rank_ >= capacity_ranks_ || logical_num_ranks <= 0 ||
+        logical_rank < 0 || logical_rank >= logical_num_ranks ||
+        logical_to_transport_slots_host_.size() !=
+            static_cast<size_t>(logical_num_ranks) ||
+        qps_per_rank_ <= 0 ||
+        logical_to_transport_slots_host_[logical_rank] != transport_rank_) {
         throw std::invalid_argument("invalid ElasticBuffer rank or world size");
+    }
+    std::vector<int32_t> sorted_slots = logical_to_transport_slots_host_;
+    std::sort(sorted_slots.begin(), sorted_slots.end());
+    if (sorted_slots.front() < 0 || sorted_slots.back() >= capacity_ranks_ ||
+        std::adjacent_find(sorted_slots.begin(), sorted_slots.end()) !=
+            sorted_slots.end()) {
+        throw std::invalid_argument(
+            "logical ElasticBuffer members must map to distinct capacity "
+            "slots");
     }
     if (!allow_multiple_reduction) {
         throw std::runtime_error(
@@ -452,6 +503,10 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
     if (transport_ != "ibgda" && transport_ != "nccl") {
         throw std::invalid_argument(
             "ElasticBuffer transport must be either 'ibgda' or 'nccl'");
+    }
+    if (init_status_callback && transport_ != "nccl") {
+        throw std::invalid_argument(
+            "NCCL init status callbacks require transport='nccl'");
     }
 
     CUDA_CHECK(cudaGetDevice(&device_id_));
@@ -481,11 +536,17 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
 
     if (num_buffer_bytes == 0) {
         num_buffer_bytes = calculate_buffer_size(
-            num_ranks, num_max_tokens_per_rank, hidden, num_topk,
+            capacity_ranks_, num_max_tokens_per_rank, hidden, num_topk,
             use_fp8_dispatch, allow_hybrid_mode, allow_multiple_reduction);
     }
     if (num_buffer_bytes <= 0) {
         throw std::invalid_argument("ElasticBuffer size must be positive");
+    }
+
+    std::shared_ptr<std::function<bool(bool)>> status_callback_holder;
+    if (init_status_callback) {
+        status_callback_holder = std::make_shared<std::function<bool(bool)>>(
+            std::move(init_status_callback));
     }
 
     if (transport_ == "nccl") {
@@ -493,10 +554,11 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
         const int context_count =
             nccl_gin_context_count(num_allocated_qps, allow_hybrid_mode);
         nccl_state_ = std::make_unique<NcclElasticState>(
-            rank, num_ranks, static_cast<size_t>(num_buffer_bytes),
-            context_count, allow_hybrid_mode, sl_idx, nccl_unique_id);
-        topology_ = make_nccl_topology(*nccl_state_, rank, num_ranks,
-                                       allow_hybrid_mode);
+            logical_rank, logical_num_ranks,
+            static_cast<size_t>(num_buffer_bytes), context_count,
+            allow_hybrid_mode, sl_idx, nccl_unique_id, status_callback_holder);
+        topology_ = make_nccl_topology(*nccl_state_, logical_rank,
+                                       logical_num_ranks, allow_hybrid_mode);
 #else
         (void)nccl_unique_id;
         throw std::runtime_error(
@@ -508,9 +570,23 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
             throw std::invalid_argument(
                 "nccl_unique_id must be empty for transport='ibgda'");
         }
-        topology_ = discover_topology(rank, num_ranks, allow_hybrid_mode);
-        native_buffer_ = std::make_unique<MooncakeEpBuffer>(rank, num_ranks,
-                                                            num_buffer_bytes);
+        topology_ = discover_topology(logical_rank, logical_num_ranks,
+                                      allow_hybrid_mode);
+        native_buffer_ = std::make_unique<MooncakeEpBuffer>(
+            transport_rank_, capacity_ranks_, num_buffer_bytes);
+        native_buffer_->initialize_local_peer();
+    }
+
+    if (!using_nccl()) {
+        CUDA_CHECK(cudaMalloc(&logical_to_transport_slots_,
+                              capacity_ranks_ * sizeof(int32_t)));
+        logical_to_transport_slots_owner_ = std::shared_ptr<void>(
+            logical_to_transport_slots_, [](void* ptr) { cudaFree(ptr); });
+        CUDA_CHECK(cudaMemcpy(
+            logical_to_transport_slots_,
+            logical_to_transport_slots_host_.data(),
+            logical_to_transport_slots_host_.size() * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
     }
 
     host_workspace_bytes_ = elastic_workspace_num_bytes();
@@ -599,14 +675,31 @@ void MooncakeElasticBuffer::destroy() {
         host_workspace_ = nullptr;
         mapped_host_workspace_ = nullptr;
     }
+    logical_to_transport_slots_owner_.reset();
+    logical_to_transport_slots_ = nullptr;
     if (cleanup_error) std::rethrow_exception(cleanup_error);
 }
 
 void MooncakeElasticBuffer::reconfigure_nccl(
     const std::vector<int32_t>& nccl_unique_id) {
+    reconfigure_nccl_membership(nccl_unique_id, topology_.rank_idx,
+                                topology_.num_ranks,
+                                logical_to_transport_slots_host_);
+}
+
+void MooncakeElasticBuffer::reconfigure_nccl_membership(
+    const std::vector<int32_t>& nccl_unique_id, int logical_rank,
+    int logical_num_ranks,
+    const std::vector<int32_t>& logical_to_transport_slots) {
     if (destroyed_ || !nccl_state_) {
         throw std::runtime_error(
             "NCCL ElasticBuffer reconfiguration requires a live NCCL buffer");
+    }
+    if (logical_num_ranks <= 0 || logical_rank < 0 ||
+        logical_rank >= logical_num_ranks ||
+        logical_to_transport_slots.size() !=
+            static_cast<size_t>(logical_num_ranks)) {
+        throw std::invalid_argument("invalid NCCL ElasticBuffer membership");
     }
 #ifdef USE_NCCL_DEVICE
     const ScopedCudaDevice device_guard(device_id_);
@@ -615,8 +708,8 @@ void MooncakeElasticBuffer::reconfigure_nccl(
     // direct native callers that do not use the Python wrapper.
     CUDA_CHECK(cudaStreamSynchronize(nccl_state_->comm_stream.stream()));
 
-    const int rank = topology_.rank_idx;
-    const int num_ranks = topology_.num_ranks;
+    const int rank = logical_rank;
+    const int num_ranks = logical_num_ranks;
     const int context_count = nccl_state_->gin_context_count;
 
     // Build the complete replacement before publishing it. This intentionally
@@ -624,7 +717,8 @@ void MooncakeElasticBuffer::reconfigure_nccl(
     // ordinary CUDA stores while its old NCCL window remains registered.
     auto candidate = std::make_unique<NcclElasticState>(
         rank, num_ranks, nccl_state_->allocation_bytes, context_count,
-        config_.allow_hybrid_mode, config_.sl_idx, nccl_unique_id);
+        config_.allow_hybrid_mode, config_.sl_idx, nccl_unique_id,
+        std::weak_ptr<std::function<bool(bool)>>{});
     const auto candidate_topology = make_nccl_topology(
         *candidate, rank, num_ranks, config_.allow_hybrid_mode);
 
@@ -643,6 +737,7 @@ void MooncakeElasticBuffer::reconfigure_nccl(
     auto previous = std::move(nccl_state_);
     nccl_state_ = std::move(candidate);
     topology_ = candidate_topology;
+    logical_to_transport_slots_host_ = logical_to_transport_slots;
     std::memset(host_workspace_, 0, host_workspace_bytes_);
     deterministic_rank_count_buffer_.reset();
     deterministic_rank_count_buffer_bytes_ = 0;
@@ -656,9 +751,50 @@ void MooncakeElasticBuffer::reconfigure_nccl(
     }
 #else
     (void)nccl_unique_id;
+    (void)logical_to_transport_slots;
     throw std::runtime_error(
         "Mooncake EP was built without NCCL Device API support");
 #endif
+}
+
+void MooncakeElasticBuffer::set_ibgda_membership(
+    int logical_rank, int logical_num_ranks,
+    const std::vector<int32_t>& logical_to_transport_slots) {
+    if (destroyed_ || using_nccl() || !native_buffer_) {
+        throw std::runtime_error(
+            "IBGDA ElasticBuffer membership requires a live IBGDA buffer");
+    }
+    if (logical_num_ranks <= 0 || logical_rank < 0 ||
+        logical_rank >= logical_num_ranks ||
+        logical_to_transport_slots.size() !=
+            static_cast<size_t>(logical_num_ranks)) {
+        throw std::invalid_argument("invalid IBGDA ElasticBuffer membership");
+    }
+    std::vector<int32_t> sorted_slots = logical_to_transport_slots;
+    std::sort(sorted_slots.begin(), sorted_slots.end());
+    if (sorted_slots.front() < 0 || sorted_slots.back() >= capacity_ranks_ ||
+        std::adjacent_find(sorted_slots.begin(), sorted_slots.end()) !=
+            sorted_slots.end() ||
+        logical_to_transport_slots[logical_rank] != transport_rank_) {
+        throw std::invalid_argument(
+            "logical IBGDA members must map to distinct capacity slots");
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    topology_ = discover_topology(logical_rank, logical_num_ranks,
+                                  config_.allow_hybrid_mode);
+    logical_to_transport_slots_host_ = logical_to_transport_slots;
+    CUDA_CHECK(cudaMemcpy(
+        logical_to_transport_slots_, logical_to_transport_slots_host_.data(),
+        logical_to_transport_slots_host_.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    std::memset(host_workspace_, 0, host_workspace_bytes_);
+    CUDA_CHECK(cudaMemsetAsync(
+        native_buffer_->gdr_buffer, 0,
+        elastic_workspace_num_bytes() + elastic_atomic_scratch_num_bytes(),
+        native_buffer_->comm_stream));
+    CUDA_CHECK(cudaStreamSynchronize(native_buffer_->comm_stream));
+    deterministic_rank_count_buffer_.reset();
+    deterministic_rank_count_buffer_bytes_ = 0;
 }
 
 MooncakeEpBuffer& MooncakeElasticBuffer::native_buffer() {
@@ -735,6 +871,22 @@ void MooncakeElasticBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles,
     const std::vector<int>& active_ranks_mask) {
     native_buffer().sync_nvlink_ipc_handles(remote_handles, active_ranks_mask);
+}
+
+void MooncakeElasticBuffer::connect_peer(
+    int peer_rank, int64_t raddr, int32_t rkey, int64_t subnet_prefix,
+    int64_t interface_id, const std::vector<int32_t>& qpns,
+    const std::vector<int32_t>& lids, const std::vector<int32_t>& ipc_handle) {
+    native_buffer().connect_peer(peer_rank, raddr, rkey, subnet_prefix,
+                                 interface_id, qpns, lids, ipc_handle);
+}
+
+void MooncakeElasticBuffer::disconnect_peer(int peer_rank) {
+    native_buffer().disconnect_peer(peer_rank);
+}
+
+void MooncakeElasticBuffer::drain_queue_pairs() {
+    native_buffer().drain_queue_pairs();
 }
 
 cudaStream_t MooncakeElasticBuffer::communication_stream() const {

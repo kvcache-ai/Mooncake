@@ -113,6 +113,16 @@ struct MooncakeEpBuffer {
 
     void commit_staged_peers();
     void refresh_active_rank_bound();
+    void connect_rdma_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                           int64_t subnet_prefix, int64_t interface_id,
+                           const std::vector<int32_t>& qpns,
+                           const std::vector<int32_t>& lids,
+                           bool log_prepare_stream_destroy_failure);
+    void reset_rdma_peer(int peer_rank, cudaStream_t stream);
+    void stage_p2p_peer(int peer_rank, const std::vector<int32_t>& ipc_handle);
+    void publish_p2p_peer(int peer_rank);
+    void discard_staged_p2p_peer(int peer_rank);
+    void disconnect_p2p_peer(int peer_rank);
 
     bool ibgda_disabled_ = false;
     bool p2p_enabled_ = true;
@@ -147,6 +157,14 @@ struct MooncakeEpBuffer {
                     const std::vector<int32_t>& lids,
                     const std::vector<int32_t>& ipc_handle);
     void disconnect_ranks(const std::vector<int>& peer_ranks);
+    void connect_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                      int64_t subnet_prefix, int64_t interface_id,
+                      const std::vector<int32_t>& qpns,
+                      const std::vector<int32_t>& lids,
+                      const std::vector<int32_t>& ipc_handle);
+    void disconnect_peer(int peer_rank);
+    void initialize_local_peer();
+    void drain_queue_pairs();
     void update_mask_buffer(int peer_rank, bool masked, uint64_t stream_ptr);
     void query_mask_buffer(uint64_t output_ptr, uint64_t stream_ptr) const;
     void clean_mask_buffer(uint64_t stream_ptr);

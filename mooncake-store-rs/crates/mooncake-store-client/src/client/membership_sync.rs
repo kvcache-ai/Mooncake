@@ -213,6 +213,10 @@ const ASYNC_REPLICA_TRACK_QUEUE_CAPACITY: usize = 1024;
 const ASYNC_REPLICA_TRACK_DRAIN_BUDGET: usize = 4096;
 const ASYNC_REPLICA_TRACK_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const ASYNC_REPLICA_TRACK_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+const ASYNC_DELETE_PENDING_QUEUE_CAPACITY: usize = 1024;
+const ASYNC_DELETE_PENDING_DRAIN_BUDGET: usize = 4096;
+const ASYNC_DELETE_PENDING_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+const ASYNC_DELETE_PENDING_COALESCE_WINDOW: Duration = Duration::from_millis(2);
 const ASYNC_ROUTE_HIT_QUEUE_CAPACITY: usize = 4096;
 const ASYNC_ROUTE_HIT_DRAIN_BUDGET: usize = 8192;
 const ASYNC_ROUTE_HIT_RECV_TIMEOUT: Duration = Duration::from_millis(100);
@@ -319,6 +323,100 @@ impl AsyncReplicaTrackHandle {
 }
 
 impl Drop for AsyncReplicaTrackHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct AsyncDeletePendingHandle {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<DeletePendingEntry>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncDeletePendingHandle {
+    fn disabled() -> Self {
+        Self {
+            sender: None,
+            thread: None,
+        }
+    }
+
+    fn spawn(
+        runtime: &ClientRuntimeId,
+        metadata: Arc<dyn MetadataBackend>,
+        control_client: Arc<ControlPlaneClient>,
+        live_client_cache: SharedLiveClientCache,
+    ) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<DeletePendingEntry>>(
+            ASYNC_DELETE_PENDING_QUEUE_CAPACITY,
+        );
+        let local_runtime = runtime.clone();
+        let stable_id = runtime.stable_id.0.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("mooncake-delete-pending-{stable_id}"))
+            .spawn(move || loop {
+                let mut entries = match receiver.recv_timeout(ASYNC_DELETE_PENDING_RECV_TIMEOUT) {
+                    Ok(entries) => entries,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let started = Instant::now();
+                while entries.len() < ASYNC_DELETE_PENDING_DRAIN_BUDGET
+                    && started.elapsed() < ASYNC_DELETE_PENDING_COALESCE_WINDOW
+                {
+                    match receiver.try_recv() {
+                        Ok(mut more) => entries.append(&mut more),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                flush_async_delete_pending(
+                    &local_runtime,
+                    metadata.as_ref(),
+                    control_client.as_ref(),
+                    &live_client_cache,
+                    &entries,
+                );
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to spawn async delete pending worker: {error}"
+                ))
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn enqueue(&self, entries: &[DeletePendingEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        match sender.try_send(entries.to_vec()) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(entries)) => {
+                tracing::debug!(
+                    items = entries.len(),
+                    "dropping best-effort delete pending notification after async queue filled"
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for AsyncDeletePendingHandle {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -590,6 +688,66 @@ fn flush_async_replica_tracks(
                 error = %error,
                 items = routes.len(),
                 "async storage-owner route tracking failed"
+            );
+        }
+    }
+}
+
+fn flush_async_delete_pending(
+    local_runtime: &ClientRuntimeId,
+    metadata: &dyn MetadataBackend,
+    control_client: &ControlPlaneClient,
+    live_client_cache: &SharedLiveClientCache,
+    entries: &[DeletePendingEntry],
+) {
+    let mut grouped = BTreeMap::<ClientRuntimeId, BTreeSet<DeletePendingEntry>>::new();
+    for entry in entries {
+        let owner = match (&entry.identity, &entry.cold_backing) {
+            (Some(identity), _) => identity.owner.clone(),
+            (None, Some(cold)) => cold.owner.clone(),
+            (None, None) => continue,
+        };
+        if owner != *local_runtime {
+            grouped.entry(owner).or_default().insert(entry.clone());
+        }
+    }
+    if grouped.is_empty() {
+        return;
+    }
+    let wanted = grouped.keys().cloned().collect::<BTreeSet<_>>();
+    let leases = match replica_track_leases(metadata, live_client_cache, &wanted) {
+        Ok(leases) => leases,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                targets = wanted.len(),
+                "failed to resolve storage-owner leases for async delete notification"
+            );
+            return;
+        }
+    };
+    for (owner, entries) in grouped {
+        let Some(lease) = leases.get(&owner) else {
+            tracing::debug!(
+                storage_owner = %owner,
+                items = entries.len(),
+                "dropping best-effort delete notification for unavailable owner"
+            );
+            continue;
+        };
+        if !lease
+            .compatibility
+            .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY)
+        {
+            continue;
+        }
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if let Err(error) = control_client.batch_notify_delete_pending(lease, &entries) {
+            tracing::debug!(
+                storage_owner = %owner,
+                error = %error,
+                items = entries.len(),
+                "async storage-owner delete notification failed"
             );
         }
     }

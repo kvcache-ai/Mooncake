@@ -236,10 +236,9 @@ DomainState::DomainState(Config config, uint32_t generation)
 Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                     AdmissionEvidence* evidence) {
     const auto reject = [&](Decision decision, AdmissionDomain domain,
-                            AdmissionReason reason, DomainState* state) {
+                            AdmissionReason reason) {
         if (evidence != nullptr) {
-            *evidence = {domain, reason,
-                         state == nullptr ? Snapshot{} : snapshot(*state)};
+            *evidence = {domain, reason};
         }
         return decision;
     };
@@ -248,15 +247,14 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                                                 std::memory_order_acq_rel,
                                                 std::memory_order_relaxed)) {
         return reject(Decision::kDefer, AdmissionDomain::kNone,
-                      AdmissionReason::kNone, nullptr);
+                      AdmissionReason::kNone);
     }
 
     const AcquireResult device =
         CoreAccess::acquireOne(path.device, path.device_generation, bytes);
     if (device.decision != Decision::kAllow) {
         permit.active_.store(false, std::memory_order_release);
-        return reject(device.decision, AdmissionDomain::kDevice, device.reason,
-                      path.device);
+        return reject(device.decision, AdmissionDomain::kDevice, device.reason);
     }
 
     const AcquireResult route =
@@ -266,8 +264,7 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
             CoreAccess::releaseBytes(*path.device, bytes);
         }
         permit.active_.store(false, std::memory_order_release);
-        return reject(route.decision, AdmissionDomain::kRoute, route.reason,
-                      path.route);
+        return reject(route.decision, AdmissionDomain::kRoute, route.reason);
     }
 
     const bool device_current =
@@ -289,8 +286,7 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
         return reject(Decision::kAvoid,
                       !device_current ? AdmissionDomain::kDevice
                                       : AdmissionDomain::kRoute,
-                      AdmissionReason::kStaleGeneration,
-                      !device_current ? path.device : path.route);
+                      AdmissionReason::kStaleGeneration);
     }
 
     permit.device_ = path.device;
