@@ -100,12 +100,6 @@ ClientSessionRegistry::Slot ClientSessionRegistry::FindSlotLocked(
 
 std::optional<ClientSessionRegistry::SharedOperation>
 ClientSessionRegistry::ClientSlot::AcquireShared() {
-    {
-        // Turnstile: taking and releasing the gate lets an exclusive acquirer
-        // queuing behind it through, instead of being starved by a continuous
-        // stream of operations.
-        const std::lock_guard<std::mutex> gate(admission_gate);
-    }
     SharedOperation operation(operation_mutex);
     // Removal sets erased under ExclusiveOperation before dropping the slot.
     if (erased) return std::nullopt;
@@ -114,14 +108,10 @@ ClientSessionRegistry::ClientSlot::AcquireShared() {
 
 std::optional<ClientSessionRegistry::ExclusiveOperation>
 ClientSessionRegistry::ClientSlot::AcquireExclusive(bool try_lock) {
-    std::unique_lock<std::mutex> gate(admission_gate, std::defer_lock);
     ExclusiveOperation operation(operation_mutex, std::defer_lock);
     if (try_lock) {
-        if (!gate.try_lock() || !operation.try_lock()) return std::nullopt;
+        if (!operation.try_lock()) return std::nullopt;
     } else {
-        // Hold the gate while queuing: no new operation enters, so this waits
-        // only for the ones already in flight.
-        gate.lock();
         operation.lock();
     }
     if (erased) return std::nullopt;

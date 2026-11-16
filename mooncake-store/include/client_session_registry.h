@@ -120,30 +120,61 @@ class ClientSessionRegistry {
    private:
     friend class test::ClientSessionRegistryTestPeer;
 
-    using SharedOperation = std::shared_lock<std::shared_mutex>;
-    using ExclusiveOperation = std::unique_lock<std::shared_mutex>;
+    // A std::shared_mutex may prefer readers (the default on glibc), which
+    // would let overlapping operations postpone a state transition forever.
+    // Exclusive acquirers hold gate_ while queuing for mutex_, and shared
+    // acquirers pass through gate_ first so queued transitions drain in-flight
+    // operations in bounded time.
+    class TurnstileSharedMutex {
+       public:
+        TurnstileSharedMutex() = default;
+        TurnstileSharedMutex(const TurnstileSharedMutex&) = delete;
+        TurnstileSharedMutex& operator=(const TurnstileSharedMutex&) = delete;
+
+        void lock() {
+            const std::lock_guard<std::mutex> gate(gate_);
+            mutex_.lock();
+        }
+        bool try_lock() {
+            std::unique_lock<std::mutex> gate(gate_, std::try_to_lock);
+            return gate.owns_lock() && mutex_.try_lock();
+        }
+        void unlock() { mutex_.unlock(); }
+
+        void lock_shared() {
+            {
+                const std::lock_guard<std::mutex> gate(gate_);
+            }
+            mutex_.lock_shared();
+        }
+        bool try_lock_shared() {
+            std::unique_lock<std::mutex> gate(gate_, std::try_to_lock);
+            return gate.owns_lock() && mutex_.try_lock_shared();
+        }
+        void unlock_shared() { mutex_.unlock_shared(); }
+
+       private:
+        std::mutex gate_;
+        std::shared_mutex mutex_;
+    };
+
+    using SharedOperation = std::shared_lock<TurnstileSharedMutex>;
+    using ExclusiveOperation = std::unique_lock<TurnstileSharedMutex>;
 
     // A replaceable registry entry, not a permanent per-UUID allocation.
     // Scopes retain the slot so its mutex and liveness outlive their guards.
     struct ClientSlot {
         explicit ClientSlot(Record record) : liveness(std::move(record)) {}
 
-        // Lock order: admission gate -> slot operation. Empty if erased, or
-        // busy when try_lock is requested; validates slot identity only, not
-        // liveness admission.
+        // Empty if erased, or busy when try_lock is requested; validates slot
+        // identity only, not liveness admission.
         std::optional<SharedOperation> AcquireShared();
         std::optional<ExclusiveOperation> AcquireExclusive(
             bool try_lock = false);
 
         const Record liveness;
-        // Exclusive acquirers hold this while they queue for operation_mutex,
-        // and shared acquirers pass through it first. A shared_mutex may
-        // prefer readers (the default on glibc), so without the gate a stream
-        // of overlapping operations could postpone a transition forever.
-        std::mutex admission_gate;
-        // Shared by operations, exclusive for registration, removal and
-        // expiry.
-        std::shared_mutex operation_mutex;
+        // Shared by operations; exclusive for registration, removal and expiry.
+        TurnstileSharedMutex operation_mutex;
         // Set under exclusive operation_mutex in EraseSlot; once erased, a
         // slot never re-enters the registry.
         bool erased{false};
@@ -159,7 +190,7 @@ class ClientSessionRegistry {
     using Slots = std::unordered_map<UUID, Slot, boost::hash<UUID>>;
     using SlotSnapshot = std::vector<std::pair<UUID, Slot>>;
 
-    // Lock order: admission gate -> slot operation -> registry -> transition.
+    // Lock order: lifecycle -> slot operation -> registry -> transition.
     // Never acquire an operation under the registry lock. A record's
     // transition lock is a leaf.
     std::optional<SessionGuard> TryAcquireSession(const UUID& client_id,
