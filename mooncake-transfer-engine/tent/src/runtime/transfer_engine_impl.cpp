@@ -905,6 +905,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
+    if (options.type < 0 || options.type >= kSupportedTransportTypes)
+        return Status::InvalidArgument("Invalid memory transport" LOC_MARK);
     auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(

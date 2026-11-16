@@ -381,17 +381,39 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
-# NOT registered via add_test: needs a real GPU with POSIX-FD VMM support (the
-# peer buffer is exported by a forked child and imported via pidfd_getfd). Run
-# manually on a GPU box: ./tent_mnnvl_transport_test. MNNVL targets fully
-# connected NVLink domains; on a box whose GPUs lack P2P to each other, pin
-# CUDA_VISIBLE_DEVICES to one card.
+# CUDA cases skip explicitly without hardware. Each exporter case starts in a
+# fresh process so fork happens before CUDA or runtime threads initialize. Pin
+# CUDA_VISIBLE_DEVICES to one card on hosts without full peer access.
 if(USE_CUDA)
   add_executable(tent_mnnvl_transport_test mnnvl_transport_test.cpp)
   target_link_libraries(tent_mnnvl_transport_test PRIVATE gtest gtest_main
                                                           tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_mnnvl_transport_test PRIVATE asio_shared)
+  endif()
   target_include_directories(tent_mnnvl_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  if(UNIX AND NOT APPLE)
+    target_compile_definitions(tent_mnnvl_transport_test
+                               PRIVATE MNNVL_TEST_CUDA_WRAPPERS)
+    target_link_options(
+      tent_mnnvl_transport_test PRIVATE "-Wl,--wrap=cudaEventRecord"
+      "-Wl,--wrap=cudaEventQuery")
+  endif()
+  foreach(
+    case
+    RelocateImportsPosixFdHandle RelocateImportsLogicalSubrangeAndBoundsCache
+    RelocateFailsCleanlyWhenPeerIsGone
+    RelocateCacheIsScopedToTransportInstallation)
+    add_test(NAME tent_mnnvl_transport_${case}
+             COMMAND tent_mnnvl_transport_test
+                     --gtest_filter=MnnvlTransportTest.${case})
+    set_tests_properties(tent_mnnvl_transport_${case} PROPERTIES TIMEOUT 120)
+  endforeach()
+  add_test(NAME tent_mnnvl_completion_test
+           COMMAND tent_mnnvl_transport_test
+                   --gtest_filter=MnnvlCompletionTest.*)
+  set_tests_properties(tent_mnnvl_completion_test PROPERTIES TIMEOUT 120)
 
   # Native transport error paths with wrapped CUDA calls; no GPU required.
   add_executable(tent_cuda_transport_drain_test cuda_transport_drain_test.cpp)
@@ -412,7 +434,11 @@ if(USE_CUDA)
     "-Wl,--wrap=cudaEventRecord"
     "-Wl,--wrap=cudaEventDestroy"
     "-Wl,--wrap=cudaEventQuery"
-    "-Wl,--wrap=cudaStreamQuery")
+    "-Wl,--wrap=cudaStreamQuery"
+    "-Wl,--wrap=cudaStreamSynchronize"
+    "-Wl,--wrap=cudaEventSynchronize"
+    "-Wl,--wrap=cuCtxGetCurrent"
+    "-Wl,--wrap=cuCtxSetCurrent")
   add_test(NAME tent_cuda_transport_drain_test
            COMMAND tent_cuda_transport_drain_test)
 endif()
@@ -561,6 +587,16 @@ target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
 target_include_directories(tent_quota_accounting_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_quota_accounting_test COMMAND tent_quota_accounting_test)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(tent_shared_quota_test shared_quota_test.cpp)
+  target_link_libraries(tent_shared_quota_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  target_link_options(tent_shared_quota_test PRIVATE "-Wl,--wrap=clock_gettime")
+  target_include_directories(tent_shared_quota_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_shared_quota_test COMMAND tent_shared_quota_test)
+endif()
 
 # QoS Contract Schema Unit Test
 add_executable(tent_qos_contract_test qos_contract_test.cpp
