@@ -422,6 +422,16 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaDestDeviceAffinityEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_ENABLE_DEST_DEVICE_AFFINITY", "true");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/rdma/dest_device_affinity", false));
+}
+
 // "1" is how most MC_* switches are set; setFromString() would store it as an
 // integer, which get(..., false) cannot read as a bool.
 TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
@@ -429,6 +439,8 @@ TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
         {"MC_DISABLE_GPU_DIRECT_RDMA",
          "transports/rdma/disable_gpu_direct_rdma"},
         {"MC_LOG_RDMA_SLICE_AFFINITY", "transports/rdma/log_slice_affinity"},
+        {"MC_ENABLE_DEST_DEVICE_AFFINITY",
+         "transports/rdma/dest_device_affinity"},
     };
     for (const auto& [env, key] : cases) {
         SCOPED_TRACE(env);
