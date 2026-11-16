@@ -470,6 +470,11 @@ add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
+add_test(NAME dummy_client_session_test
+         COMMAND dummy_client_get_buffer_test
+                 --gtest_filter=DummyClientSessionTest.*)
+set_tests_properties(dummy_client_session_test
+                     PROPERTIES ENVIRONMENT "MC_FORCE_TCP=1" TIMEOUT 90)
 add_test(
   NAME dummy_client_object_checksum_test
   COMMAND

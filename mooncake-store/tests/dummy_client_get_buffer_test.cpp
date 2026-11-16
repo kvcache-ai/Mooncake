@@ -1,17 +1,20 @@
 // dummy_client_get_buffer_test.cpp
 // Verifies DummyClient::get_buffer / batch_get_buffer correctness,
-// including hot-cache shm path and allocator fallback path.
+// including hot-cache SHM, allocator fallback, and Dummy session ranges.
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <span>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +27,7 @@
 #include "dummy_client.h"
 #include "../src/config/client_object_checksum_config.h"
 #include "real_client.h"
+#include "shm_helper.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -62,6 +66,20 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::release_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_get_query_results>(&rc);
+    server.register_handler<&RealClient::batch_get_session_start_dummy_helper>(
+        &rc);
+    server.register_handler<&RealClient::batch_get_session_end_dummy_helper>(
+        &rc);
+    server.register_handler<
+        &RealClient::batch_get_into_multi_buffer_ranges_dummy_helper>(&rc);
+    server.register_handler<&RealClient::batch_put_session_start_dummy_helper>(
+        &rc);
+    server.register_handler<&RealClient::batch_put_session_end_dummy_helper>(
+        &rc);
+    server.register_handler<&RealClient::batch_put_session_revoke_dummy_helper>(
+        &rc);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffer_ranges_dummy_helper>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -80,13 +98,6 @@ static constexpr size_t kHotWarmCount = 4;    // keys to warm into hot cache
 
 class DummyClientGetBufferTest : public ::testing::Test {
    protected:
-    static void SetUpTestSuite() {
-        google::InitGoogleLogging("DummyClientGetBufferTest");
-        FLAGS_logtostderr = 1;
-    }
-
-    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
-
     void SetUp() override {
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
@@ -765,11 +776,373 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
         << "Batch hot cache path should be faster than fallback";
 }
 
+namespace {
+
+constexpr size_t kMiB = 1024 * 1024;
+constexpr size_t kLocalBufferSize = 4 * kMiB;
+constexpr int kInvalidParams = static_cast<int>(ErrorCode::INVALID_PARAMS);
+
+class DummyClientSessionTest : public ::testing::Test {
+   protected:
+    void TearDown() override {
+        for (auto &[owner, address] : shared_buffers_) {
+            EXPECT_EQ(owner->unregister_buffer(address), 0);
+            EXPECT_EQ(ShmHelper::getInstance()->free(address), 0);
+        }
+        shared_buffers_.clear();
+        // Destruct clients while their RPC server and Master are still alive;
+        // their destructors synchronously unmap SHM and close sessions.
+        dummies_.clear();
+        if (rpc_server_) {
+            rpc_server_->stop();
+            rpc_server_.reset();
+        }
+        real_.reset();
+        master_.Stop();
+    }
+
+    bool SetupStack() {
+        if (!master_.Start(InProcMasterConfigBuilder().build())) return false;
+        real_ = RealClient::create();
+        const auto te_port = getFreeTcpPort();
+        ipc_path_ = "@dummy_sessions_" + std::to_string(getpid()) + "_" +
+                    std::to_string(te_port);
+        if (real_->setup_real("localhost:" + std::to_string(te_port),
+                              "P2PHANDSHAKE", 16 * kMiB, kLocalBufferSize,
+                              "tcp", "", master_.master_address(), nullptr,
+                              ipc_path_) != 0) {
+            return false;
+        }
+        const auto rpc_port = getFreeTcpPort();
+        rpc_address_ = "127.0.0.1:" + std::to_string(rpc_port);
+        rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            2, rpc_port, "127.0.0.1", std::chrono::seconds(0), true);
+        RegisterRpcHandlers(*rpc_server_, *real_);
+        if (rpc_server_->async_start().hasResult()) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return AddDummy() != nullptr;
+    }
+
+    std::shared_ptr<DummyClient> AddDummy() {
+        auto dummy = std::make_shared<DummyClient>();
+        // A local staging region is sufficient; session callers provide their
+        // own registered buffers rather than allocate from a dummy pool.
+        if (dummy->setup_dummy(0, kLocalBufferSize, rpc_address_, ipc_path_) !=
+            0) {
+            return nullptr;
+        }
+        dummies_.push_back(dummy);
+        return dummy;
+    }
+
+    char *AllocateShared(const std::shared_ptr<DummyClient> &dummy,
+                         size_t size) {
+        auto *address =
+            static_cast<char *>(ShmHelper::getInstance()->allocate(size));
+        if (!address) return nullptr;
+        if (dummy->register_buffer(address, size) != 0) {
+            ShmHelper::getInstance()->free(address);
+            return nullptr;
+        }
+        shared_buffers_.emplace_back(dummy, address);
+        return address;
+    }
+
+    void PutObject(const std::string &key, const std::string &data) {
+        const std::span<const char> payload(data.data(), data.size());
+        ASSERT_EQ(real_->put(key, payload), 0);
+    }
+
+    InProcMaster master_;
+    std::shared_ptr<RealClient> real_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> rpc_server_;
+    std::vector<std::shared_ptr<DummyClient>> dummies_;
+    std::vector<std::pair<std::shared_ptr<DummyClient>, void *>>
+        shared_buffers_;
+    std::string ipc_path_;
+    std::string rpc_address_;
+};
+
+TEST_F(DummyClientSessionTest, LayersAndFragmentsRoundTripThroughCpuAndShm) {
+    ASSERT_TRUE(SetupStack());
+    auto &dummy = dummies_.front();
+    constexpr size_t kLayers = 3;
+    constexpr size_t kPage = 64;
+    constexpr size_t kObject = kLayers * kPage;
+    constexpr size_t kGuard = 8;
+    constexpr size_t kStride = kObject + 2 * kGuard;
+    const std::vector<std::string> keys = {"layer_a", "layer_b", "layer_c"};
+    std::vector<char> source(keys.size() * kStride, 's');
+    auto *destination = AllocateShared(dummy, source.size());
+    ASSERT_NE(destination, nullptr);
+    std::memset(destination, 'd', source.size());
+    for (size_t key = 0; key < keys.size(); ++key) {
+        for (size_t byte = 0; byte < kObject; ++byte) {
+            source[key * kStride + kGuard + byte] =
+                static_cast<char>((key * 31 + byte) % 127);
+        }
+    }
+    ASSERT_EQ(dummy->register_buffer(source.data(), source.size()), 0);
+    ASSERT_EQ(dummy->batch_put_session_start(
+                  keys, std::vector<size_t>(keys.size(), kObject)),
+              std::vector<int>(keys.size(), 0));
+    for (size_t layer = 0; layer < kLayers; ++layer) {
+        std::vector<std::vector<void *>> buffers;
+        for (size_t key = 0; key < keys.size(); ++key) {
+            auto *base = source.data() + key * kStride + kGuard + layer * kPage;
+            buffers.push_back({base, base + 17});
+        }
+        EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(
+                      keys, buffers,
+                      std::vector<std::vector<size_t>>(keys.size(), {17, 47}),
+                      std::vector<std::vector<size_t>>(
+                          keys.size(), {layer * kPage, layer * kPage + 17})),
+                  std::vector<int>(keys.size(), kPage));
+    }
+    ASSERT_EQ(dummy->batch_put_session_end(keys),
+              std::vector<int>(keys.size(), 0));
+    ASSERT_EQ(dummy->batch_get_session_start(keys),
+              std::vector<int>(keys.size(), 0));
+    for (size_t layer = 0; layer < kLayers; ++layer) {
+        std::vector<std::vector<void *>> buffers;
+        for (size_t key = 0; key < keys.size(); ++key) {
+            auto *base = destination + key * kStride + kGuard + layer * kPage;
+            // Deliberately reverse fragment order: offsets are object bytes,
+            // not an implicit concatenation order or a layer number.
+            buffers.push_back({base + 17, base});
+        }
+        EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                      keys, buffers,
+                      std::vector<std::vector<size_t>>(keys.size(), {47, 17}),
+                      std::vector<std::vector<size_t>>(
+                          keys.size(), {layer * kPage + 17, layer * kPage})),
+                  std::vector<int>(keys.size(), kPage));
+    }
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+    for (size_t key = 0; key < keys.size(); ++key) {
+        const auto base = key * kStride;
+        EXPECT_EQ(std::memcmp(destination + base + kGuard,
+                              source.data() + base + kGuard, kObject),
+                  0);
+        EXPECT_TRUE(std::all_of(destination + base, destination + base + kGuard,
+                                [](char value) { return value == 'd'; }));
+        EXPECT_TRUE(std::all_of(destination + base + kGuard + kObject,
+                                destination + base + kStride,
+                                [](char value) { return value == 'd'; }));
+    }
+    EXPECT_EQ(dummy->unregister_buffer(source.data()), 0);
+}
+
+TEST_F(DummyClientSessionTest, InvalidRangesPreserveSessionsAndDestinations) {
+    ASSERT_TRUE(SetupStack());
+    auto &dummy = dummies_.front();
+    constexpr size_t kBytes = 64;
+    const std::vector<std::string> keys = {"bounds"};
+    std::vector<char> source(kBytes, 'x');
+    std::vector<char> destination(kBytes, '?');
+    const std::vector<int> invalid = {kInvalidParams};
+    ASSERT_EQ(dummy->batch_put_session_start(keys, {kBytes}),
+              std::vector<int>{0});
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(keys, {{source.data()}},
+                                                        {{kBytes}}, {{0}}),
+              invalid);
+    ASSERT_EQ(dummy->register_buffer(source.data(), kBytes), 0);
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(keys, {}, {}, {}),
+              invalid);
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(
+                  keys, {{source.data(), source.data()}}, {{1}}, {{0}}),
+              invalid);
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(
+                  keys, {{source.data() + kBytes - 1}}, {{2}}, {{0}}),
+              invalid);
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(
+                  keys, {{source.data()}}, {{2}},
+                  {{std::numeric_limits<size_t>::max()}}),
+              invalid);
+    ASSERT_EQ(dummy->batch_put_from_multi_buffer_ranges(keys, {{source.data()}},
+                                                        {{kBytes}}, {{0}}),
+              std::vector<int>{kBytes});
+    ASSERT_EQ(dummy->batch_put_session_end(keys), std::vector<int>{0});
+    EXPECT_EQ(dummy->batch_put_session_end(keys), invalid);
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(keys, {{source.data()}},
+                                                        {{1}}, {{0}}),
+              invalid);
+
+    ASSERT_EQ(dummy->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  keys, {{destination.data()}}, {{kBytes}}, {{0}}),
+              invalid);
+    ASSERT_EQ(dummy->register_buffer(destination.data(), kBytes), 0);
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  keys, {{destination.data()}}, {{1, 1}}, {{0}}),
+              invalid);
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  keys, {{destination.data() + kBytes - 1}}, {{2}}, {{0}}),
+              invalid);
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  keys, {{destination.data()}}, {{1}}, {{kBytes}}),
+              invalid);
+    EXPECT_EQ(destination, std::vector<char>(kBytes, '?'));
+    ASSERT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  keys, {{destination.data()}}, {{kBytes}}, {{0}}),
+              std::vector<int>{kBytes});
+    EXPECT_EQ(destination, source);
+    ASSERT_EQ(dummy->unregister_buffer(destination.data()), 0);
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  keys, {{destination.data()}}, {{1}}, {{0}}),
+              invalid);
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(keys, {{source.data()}},
+                                                        {{1}}, {{0}}),
+              invalid);
+    EXPECT_EQ(dummy->unregister_buffer(source.data()), 0);
+}
+
+TEST_F(DummyClientSessionTest, PartialGetFailureKeepsRowsAndBytesAligned) {
+    ASSERT_TRUE(SetupStack());
+    auto &dummy = dummies_.front();
+    const std::string expected(64, 'v');
+    PutObject("present", expected);
+    const std::vector<std::string> keys = {"present", "absent"};
+    const auto start = dummy->batch_get_session_start(keys);
+    ASSERT_EQ(start.size(), 2u);
+    ASSERT_EQ(start[0], 0);
+    EXPECT_LT(start[1], 0);
+    std::vector<char> output(128, '?');
+    ASSERT_EQ(dummy->register_buffer(output.data(), output.size()), 0);
+    const auto result = dummy->batch_get_into_multi_buffer_ranges(
+        keys, {{output.data()}, {output.data() + 64}}, {{64}, {64}},
+        {{0}, {0}});
+    ASSERT_EQ(result.size(), 2u);
+    EXPECT_EQ(result[0], 64);
+    EXPECT_LT(result[1], 0);
+    EXPECT_EQ(std::string(output.data(), 64), expected);
+    EXPECT_EQ(std::string(output.data() + 64, 64), std::string(64, '?'));
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dummy->unregister_buffer(output.data()), 0);
+}
+
+TEST_F(DummyClientSessionTest, MalformedInnerRowsKeepValidRowsAndSessions) {
+    ASSERT_TRUE(SetupStack());
+    auto &dummy = dummies_.front();
+    const std::vector<std::string> keys = {"valid_row", "malformed_row"};
+    const std::vector<int> partial = {64, kInvalidParams};
+    std::vector<char> source(128, 'b');
+    std::fill(source.begin(), source.begin() + 64, 'a');
+    std::vector<char> output(128, '?');
+    ASSERT_EQ(dummy->register_buffer(source.data(), source.size()), 0);
+    ASSERT_EQ(dummy->register_buffer(output.data(), output.size()), 0);
+    ASSERT_EQ(dummy->batch_put_session_start(keys, {64, 64}),
+              std::vector<int>(2, 0));
+    EXPECT_EQ(
+        dummy->batch_put_from_multi_buffer_ranges(
+            keys, {{source.data()}, {source.data() + 64, source.data() + 65}},
+            {{64}, {64}}, {{0}, {0}}),
+        partial);
+    ASSERT_EQ(dummy->batch_put_from_multi_buffer_ranges(
+                  {keys[1]}, {{source.data() + 64}}, {{64}}, {{0}}),
+              std::vector<int>{64});
+    ASSERT_EQ(dummy->batch_put_session_end(keys), std::vector<int>(2, 0));
+    ASSERT_EQ(dummy->batch_get_session_start(keys), std::vector<int>(2, 0));
+    EXPECT_EQ(
+        dummy->batch_get_into_multi_buffer_ranges(
+            keys, {{output.data()}, {output.data() + 64, output.data() + 65}},
+            {{64}, {64}}, {{0}, {0}}),
+        partial);
+    EXPECT_EQ(std::string(output.data(), 64), std::string(64, 'a'));
+    EXPECT_EQ(std::string(output.data() + 64, 64), std::string(64, '?'));
+    ASSERT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  {keys[1]}, {{output.data() + 64}}, {{64}}, {{0}}),
+              std::vector<int>{64});
+    EXPECT_EQ(output, source);
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dummy->unregister_buffer(source.data()), 0);
+    EXPECT_EQ(dummy->unregister_buffer(output.data()), 0);
+}
+
+TEST_F(DummyClientSessionTest, TwoDummiesOwnIndependentSessionsForTheSameKey) {
+    ASSERT_TRUE(SetupStack());
+    auto first = dummies_.front();
+    auto second = AddDummy();
+    ASSERT_NE(second, nullptr);
+    const std::vector<std::string> keys = {"shared_read_key"};
+    PutObject(keys[0], std::string(64, 'r'));
+    std::vector<char> first_output(64, '?');
+    std::vector<char> second_output(64, '?');
+    ASSERT_EQ(first->register_buffer(first_output.data(), 64), 0);
+    ASSERT_EQ(second->register_buffer(second_output.data(), 64), 0);
+    ASSERT_EQ(first->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_EQ(second->batch_get_into_multi_buffer_ranges(
+                  keys, {{second_output.data()}}, {{64}}, {{0}}),
+              std::vector<int>{kInvalidParams});
+    EXPECT_EQ(second->batch_get_session_end(keys), 0);
+    EXPECT_EQ(first->batch_get_into_multi_buffer_ranges(
+                  keys, {{first_output.data()}}, {{64}}, {{0}}),
+              std::vector<int>{64});
+    ASSERT_EQ(second->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_EQ(first->batch_get_session_end(keys), 0);
+    EXPECT_EQ(second->batch_get_into_multi_buffer_ranges(
+                  keys, {{second_output.data()}}, {{64}}, {{0}}),
+              std::vector<int>{64});
+    EXPECT_EQ(first_output, std::vector<char>(64, 'r'));
+    EXPECT_EQ(second_output, first_output);
+    EXPECT_EQ(second->batch_get_session_end(keys), 0);
+
+    const std::vector<std::string> pending = {"owned_put"};
+    ASSERT_EQ(first->batch_put_session_start(pending, {64}),
+              std::vector<int>{0});
+    const auto competing_start = second->batch_put_session_start(pending, {64});
+    ASSERT_EQ(competing_start.size(), 1u);
+    EXPECT_EQ(competing_start[0], kInvalidParams);
+    EXPECT_EQ(second->batch_put_from_multi_buffer_ranges(
+                  pending, {{second_output.data()}}, {{64}}, {{0}}),
+              std::vector<int>{kInvalidParams});
+    EXPECT_EQ(second->batch_put_session_end(pending),
+              std::vector<int>{kInvalidParams});
+    EXPECT_EQ(second->batch_put_session_revoke(pending),
+              std::vector<int>{kInvalidParams});
+    EXPECT_EQ(first->batch_put_session_revoke(pending), std::vector<int>{0});
+    ASSERT_EQ(second->batch_put_session_start(pending, {64}),
+              std::vector<int>{0});
+    EXPECT_EQ(second->batch_put_session_revoke(pending), std::vector<int>{0});
+    EXPECT_EQ(first->unregister_buffer(first_output.data()), 0);
+    EXPECT_EQ(second->unregister_buffer(second_output.data()), 0);
+}
+
+TEST_F(DummyClientSessionTest, DisconnectRevokesOnlyThatDummysPendingWrites) {
+    ASSERT_TRUE(SetupStack());
+    auto first = dummies_.front();
+    auto second = AddDummy();
+    ASSERT_NE(second, nullptr);
+    const std::vector<std::string> abandoned = {"abandoned_write"};
+    const std::vector<std::string> retained = {"retained_write"};
+    ASSERT_EQ(first->batch_put_session_start(abandoned, {64}),
+              std::vector<int>{0});
+    ASSERT_EQ(second->batch_put_session_start(retained, {64}),
+              std::vector<int>{0});
+    EXPECT_EQ(first->tearDownAll(), 0);
+    EXPECT_EQ(first->tearDownAll(), 0);
+    // Successful restart proves the Master reservation was revoked as well as
+    // the daemon's session entry. Another dummy's reservation must survive.
+    EXPECT_EQ(second->batch_put_session_start(abandoned, {64}),
+              std::vector<int>{0});
+    EXPECT_EQ(second->batch_put_session_revoke(abandoned), std::vector<int>{0});
+    EXPECT_EQ(second->batch_put_session_revoke(retained), std::vector<int>{0});
+    dummies_.front().reset();
+    first.reset();
+}
+
+}  // namespace
+
 }  // namespace testing
 }  // namespace mooncake
 
 int main(int argc, char **argv) {
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = 1;
     ::testing::InitGoogleTest(&argc, argv);
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    return RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
+    google::ShutdownGoogleLogging();
+    return result;
 }
