@@ -87,6 +87,7 @@ class SunriseLinkTransport : public Transport {
     bool supportNotification() const override { return true; }
 
    private:
+    friend class SunriseLinkTransportTestPeer;
     Status startTransfer(SunriseLinkTask* task, SunriseLinkSubBatch* batch);
 
     // SunriseLink initialization

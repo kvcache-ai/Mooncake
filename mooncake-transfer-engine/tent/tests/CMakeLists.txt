@@ -539,6 +539,27 @@ if(USE_SUNRISE)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
   add_test(NAME tent_sunrise_link_transport_test
            COMMAND tent_sunrise_link_transport_test)
+
+  add_executable(tent_sunrise_link_drain_test sunrise_link_drain_test.cpp)
+  target_link_libraries(tent_sunrise_link_drain_test PRIVATE gtest gtest_main
+                                                             tent_link_group)
+  target_include_directories(
+    tent_sunrise_link_drain_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                         ${MC_TANGRT_ROOT}/include)
+  target_link_options(
+    tent_sunrise_link_drain_test
+    PRIVATE
+    "-Wl,--wrap=tangGetDevice"
+    "-Wl,--wrap=tangSetDevice"
+    "-Wl,--wrap=tangGetErrorString"
+    "-Wl,--wrap=tangPointerGetAttributes"
+    "-Wl,--wrap=tangStreamCreateWithFlags"
+    "-Wl,--wrap=tangStreamDestroy"
+    "-Wl,--wrap=tangMemcpyAsync"
+    "-Wl,--wrap=tangStreamQuery"
+    "-Wl,--wrap=tangStreamSynchronize")
+  add_test(NAME tent_sunrise_link_drain_test
+           COMMAND tent_sunrise_link_drain_test)
 endif()
 
 if(USE_MPCOMM)

@@ -518,9 +518,6 @@ Status SunriseLinkTransport::submitTransferTasks(
     };
 
     for (auto& request : request_list) {
-        shm_batch->task_list.push_back(SunriseLinkTask{});
-        auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
-
         uint64_t target_addr = request.target_offset;
         int target_gpu_id = -1;
         int local_gpu_id = infer_local_dev_best_effort(request.source);
@@ -536,6 +533,10 @@ Status SunriseLinkTransport::submitTransferTasks(
                 target_addr, request.length, request.target_id, &target_gpu_id);
             if (!status.ok()) return status;
         }
+        // Preflight failures must not leave an INITIAL task for drain to wait
+        // on. Keep earlier tasks intact: their copies may still be running.
+        shm_batch->task_list.push_back(SunriseLinkTask{});
+        auto& task = shm_batch->task_list.back();
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
