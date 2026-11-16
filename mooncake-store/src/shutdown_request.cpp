@@ -15,7 +15,7 @@ namespace {
 
 constexpr auto kWatchdogPollInterval = std::chrono::milliseconds(50);
 
-// 0 until the first SIGINT/SIGTERM, then that signal number.
+// 0 until the first shutdown signal, then that signal number.
 std::atomic<int> g_shutdown_signal{0};
 static_assert(std::atomic<int>::is_always_lock_free,
               "the signal handler needs a lock-free flag");
@@ -56,7 +56,8 @@ void RunWatchdog(std::chrono::milliseconds deadline) {
 
 namespace detail {
 
-bool InstallShutdownSignalHandlersWith(SigactionFn install) {
+bool InstallShutdownSignalHandlersWith(SigactionFn install,
+                                       bool include_sighup) {
     struct sigaction action{};
     action.sa_handler = HandleShutdownSignal;
     sigemptyset(&action.sa_mask);
@@ -66,13 +67,14 @@ bool InstallShutdownSignalHandlersWith(SigactionFn install) {
             return false;
         }
     }
-    return true;
+    return !include_sighup || install(SIGHUP, &action, nullptr) == 0;
 }
 
 }  // namespace detail
 
-bool InstallShutdownSignalHandlers() {
-    return detail::InstallShutdownSignalHandlersWith(&::sigaction);
+bool InstallShutdownSignalHandlers(bool include_sighup) {
+    return detail::InstallShutdownSignalHandlersWith(&::sigaction,
+                                                     include_sighup);
 }
 
 bool ShutdownRequested() {

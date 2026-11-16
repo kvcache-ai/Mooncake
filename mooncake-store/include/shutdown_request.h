@@ -6,17 +6,17 @@
 
 namespace mooncake {
 
-// Process-wide SIGINT/SIGTERM intake for a process that drains before it
+// Process-wide signal intake for a process that drains before it
 // exits. The first signal sets a sticky flag. A second signal ends the
 // process at once with _exit(128 + signo).
 
-// Installs the SIGINT and SIGTERM handlers with sigaction and SA_ONSTACK,
+// Installs SIGINT and SIGTERM (and optionally SIGHUP) handlers with SA_ONSTACK,
 // which the Go c-shared HA backends in the master process require. Returns
 // false with errno set if a sigaction call fails. A handler installed before
 // the failure stays installed.
-bool InstallShutdownSignalHandlers();
+bool InstallShutdownSignalHandlers(bool include_sighup = false);
 
-// True once SIGINT or SIGTERM was received. Safe from any thread.
+// True once a shutdown signal was received. Safe from any thread.
 bool ShutdownRequested();
 
 // Records a shutdown request that code other than the signal handler
@@ -46,7 +46,8 @@ namespace detail {
 using SigactionFn = int (*)(int, const struct sigaction*, struct sigaction*);
 
 // Test seam: InstallShutdownSignalHandlers() calls this with ::sigaction.
-bool InstallShutdownSignalHandlersWith(SigactionFn install);
+bool InstallShutdownSignalHandlersWith(SigactionFn install,
+                                       bool include_sighup = false);
 
 }  // namespace detail
 

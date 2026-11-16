@@ -797,7 +797,14 @@ RealClient::map_dummy_nested_addrs_to_real_ptrs(
     return real_all_buffers;
 }
 
-// ResourceTracker implementation using singleton pattern
+namespace {
+std::atomic<bool> resource_tracker_signals_disabled{false};
+}  // namespace
+
+void ResourceTracker::DisableSignalHandling() {
+    resource_tracker_signals_disabled.store(true, std::memory_order_relaxed);
+}
+
 // Use a deliberately leaked heap object to avoid static destruction
 // order issues with atexit/signal handlers during process teardown.
 ResourceTracker &ResourceTracker::getInstance() {
@@ -811,7 +818,8 @@ ResourceTracker::ResourceTracker() {
     // startSignalThread) would prevent Python from raising KeyboardInterrupt,
     // causing the process to hang on Ctrl-C.  Detect Python at runtime via
     // dlsym so we don't need to include <Python.h> or change any public API.
-    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+    if (!resource_tracker_signals_disabled.load(std::memory_order_relaxed) &&
+        !dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
         // Standalone C/C++ process – install our own signal handling.
         startSignalThread();
     }
