@@ -24,6 +24,9 @@ struct VllmStoredEvent {
     std::optional<int64_t> group_idx;
     std::optional<std::string> kv_cache_spec_kind;
     std::optional<int64_t> kv_cache_spec_sliding_window;
+    // Optional complete deployment declaration from AscendStoreConnector.
+    // Extension field: all upstream fields and the event tag remain unchanged.
+    std::optional<std::string> kv_cache_layout;
 };
 
 struct VllmRemovedEvent {
@@ -48,6 +51,7 @@ struct SglangStoredEvent {
     std::optional<int64_t> lora_id;
     std::optional<std::string> medium;
     std::optional<std::string> cache_salt;
+    std::optional<std::string> lora_name;
 };
 
 struct SglangRemovedEvent {

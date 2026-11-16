@@ -14,6 +14,7 @@
 #include <openssl/evp.h>
 #endif
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -880,11 +881,34 @@ ProjectedPrefix ProjectSglangDigest(
     return ProjectedPrefix{value};
 }
 
+std::string SglangNamespaceSeed(std::string_view tag,
+                                const std::optional<std::string>& key,
+                                const std::optional<std::string>& salt,
+                                std::optional<std::array<uint8_t, 32>>* seed) {
+    seed->reset();
+    if (!key && !salt) return "";
+    std::vector<uint8_t> input(tag.begin(), tag.end());
+    for (const auto* part : {&key, &salt}) {
+        input.push_back(part->has_value() ? 1 : 0);
+        if (!*part) continue;
+        const uint64_t size = part->value().size();
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            input.push_back(static_cast<uint8_t>(size >> shift));
+        input.insert(input.end(), part->value().begin(), part->value().end());
+    }
+    std::array<uint8_t, 32> digest;
+    if (auto error = Sha256(input, &digest); !error.empty()) return error;
+    *seed = digest;
+    return "";
+}
+
 class SglangHashChain final : public HashChain {
    public:
-    SglangHashChain(const ContextKey& context,
-                    std::span<const int32_t> token_ids,
-                    std::optional<std::string> cache_salt, bool bigram)
+    SglangHashChain(
+        const ContextKey& context, std::span<const int32_t> token_ids,
+        std::optional<std::string> cache_salt, bool bigram,
+        std::optional<std::array<uint8_t, 32>> initial_parent = std::nullopt,
+        std::optional<std::array<uint8_t, 32>> event_seed = std::nullopt)
         : token_ids_(token_ids),
           block_size_(static_cast<size_t>(context.block_size)),
           block_count_(
@@ -895,10 +919,14 @@ class SglangHashChain final : public HashChain {
                      : token_ids.size() / block_size_ +
                            (token_ids.size() % block_size_ != 0)),
           bigram_(bigram),
-          cache_salt_(std::move(cache_salt)) {
+          cache_salt_(std::move(cache_salt)),
+          event_seed_(std::move(event_seed)) {
         computed_.reserve(block_count_);
         encoded_.reserve(block_size_ * sizeof(uint32_t) * (bigram ? 2 : 1));
-        if (cache_salt_.has_value()) {
+        if (initial_parent) {
+            parent_ = *initial_parent;
+            has_parent_ = true;
+        } else if (cache_salt_.has_value()) {
             std::vector<uint8_t> root_input;
             constexpr std::string_view kSaltPrefix("sglang-cache-salt-v1\0",
                                                    21);
@@ -991,6 +1019,23 @@ class SglangHashChain final : public HashChain {
             hashed.projected = ProjectSglangDigest(hashed.digest);
             parent_ = hashed.digest;
             has_parent_ = true;
+            if (event_seed_) {
+                // Event namespacing transforms the exported hash only. The
+                // next block must still chain from the unmodified digest.
+                std::array<uint8_t, 40> namespaced;
+                std::copy(event_seed_->begin(), event_seed_->end(),
+                          namespaced.begin());
+                for (size_t byte = 0; byte < sizeof(uint64_t); ++byte)
+                    namespaced[32 + byte] = static_cast<uint8_t>(
+                        hashed.projected.value >> (56 - byte * 8));
+                if (auto hash_error = Sha256(namespaced, &hashed.digest);
+                    !hash_error.empty()) {
+                    sticky_error_ = std::move(hash_error);
+                    if (error != nullptr) *error = sticky_error_;
+                    return nullptr;
+                }
+                hashed.projected = ProjectSglangDigest(hashed.digest);
+            }
             computed_.push_back(std::move(hashed));
         }
         return &computed_[index];
@@ -1002,6 +1047,7 @@ class SglangHashChain final : public HashChain {
     size_t block_count_;
     bool bigram_;
     std::optional<std::string> cache_salt_;
+    std::optional<std::array<uint8_t, 32>> event_seed_;
     std::array<uint8_t, kSha256DigestSize> parent_{};
     bool has_parent_ = false;
     std::vector<HashBlock> computed_;
@@ -1011,7 +1057,9 @@ class SglangHashChain final : public HashChain {
 
 class SglangHashStrategy final : public HashStrategy {
    public:
-    explicit SglangHashStrategy(bool bigram) : bigram_(bigram) {}
+    SglangHashStrategy(bool bigram, HashDomain domain,
+                       std::optional<std::string> extra_key)
+        : bigram_(bigram), domain_(domain), extra_key_(std::move(extra_key)) {}
 
     std::string Compute(const ContextKey& context,
                         std::span<const int32_t> token_ids,
@@ -1042,12 +1090,39 @@ class SglangHashStrategy final : public HashStrategy {
             if (error != nullptr) *error = std::move(validation);
             return nullptr;
         }
-        return std::make_unique<SglangHashChain>(
-            context, token_ids, std::move(cache_salt), bigram_);
+        std::optional<std::array<uint8_t, 32>> root, event_seed;
+        if (domain_ == HashDomain::kSglangStorage) {
+            if (auto hash_error = SglangNamespaceSeed(
+                    "sglang-cache-namespace-v1", extra_key_, cache_salt, &root);
+                !hash_error.empty()) {
+                if (error != nullptr) *error = std::move(hash_error);
+                return nullptr;
+            }
+            cache_salt.reset();
+        } else if (domain_ != HashDomain::kRaw) {
+            const auto event_key =
+                domain_ == HashDomain::kSglangEvent && context.lora_name.empty()
+                    ? std::optional<std::string>{}
+                    : extra_key_;
+            if (auto hash_error = SglangNamespaceSeed(
+                    "sglang-kv-event-namespace-v1", event_key,
+                    domain_ == HashDomain::kSglangDynamo ? cache_salt
+                                                         : std::nullopt,
+                    &event_seed);
+                !hash_error.empty()) {
+                if (error != nullptr) *error = std::move(hash_error);
+                return nullptr;
+            }
+        }
+        return std::make_unique<SglangHashChain>(context, token_ids,
+                                                 std::move(cache_salt), bigram_,
+                                                 root, event_seed);
     }
 
    private:
     bool bigram_ = false;
+    HashDomain domain_;
+    std::optional<std::string> extra_key_;
 };
 
 }  // namespace
@@ -1127,8 +1202,9 @@ std::string ValidateHashProfile(const HashProfile& profile) {
     return "";
 }
 
-std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
-                                                 std::string* error) {
+std::unique_ptr<HashStrategy> CreateHashStrategy(
+    const HashProfile& profile, std::string* error, HashDomain domain,
+    std::optional<std::string> extra_key) {
     const std::string validation_error =
         ValidateResolvedHashProfileShape(profile);
     if (error != nullptr) {
@@ -1137,9 +1213,27 @@ std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
     if (!validation_error.empty()) {
         return nullptr;
     }
+    if (domain != HashDomain::kRaw && domain != HashDomain::kSglangStorage &&
+        domain != HashDomain::kSglangEvent &&
+        domain != HashDomain::kSglangDynamo) {
+        if (error != nullptr) *error = "unsupported hash domain";
+        return nullptr;
+    }
+    if (domain != HashDomain::kRaw) {
+        if (profile.strategy != "sglang" &&
+            profile.strategy != "sglang_bigram") {
+            if (error != nullptr)
+                *error = "SGLang domain requires SGLang strategy";
+            return nullptr;
+        }
+        if (extra_key && !IsValidUtf8(*extra_key)) {
+            if (error != nullptr) *error = "extra_key must contain valid UTF-8";
+            return nullptr;
+        }
+    }
     if (profile.strategy == "sglang" || profile.strategy == "sglang_bigram") {
-        return std::make_unique<SglangHashStrategy>(profile.strategy ==
-                                                    "sglang_bigram");
+        return std::make_unique<SglangHashStrategy>(
+            profile.strategy == "sglang_bigram", domain, std::move(extra_key));
     }
     const VllmValueCodec* codec = CodecForAlgorithm(profile.algorithm);
     if (codec == nullptr) {

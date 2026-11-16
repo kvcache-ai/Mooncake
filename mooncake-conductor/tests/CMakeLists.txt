@@ -15,6 +15,7 @@ add_executable(
   model_context_test.cpp
   compute_hash_test.cpp
   prefix_indexer_test.cpp
+  special_kv_test.cpp
   msgpack_reader_test.cpp
   msg_decoder_test.cpp
   zmq_client_test.cpp

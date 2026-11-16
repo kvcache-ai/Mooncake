@@ -57,6 +57,9 @@ add_library(
   src/client/conductor_client.cpp
   src/client/conductor_c.cpp
   src/prefixindex/hash_strategy.cpp
+  src/prefixindex/cache_layout.cpp
+  src/prefixindex/layout_parser.cpp
+  src/prefixindex/hybrid_index.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp
   src/zmq/msgpack_reader.cpp
@@ -64,6 +67,7 @@ add_library(
   src/kvevent/object_key_parser.cpp
   src/kvevent/config.cpp
   src/kvevent/event_handler.cpp
+  src/kvevent/layout_event_handler.cpp
   src/kvevent/conductor_service.cpp
   src/kvevent/rpc_service.cpp
   src/kvevent/event_manager.cpp)

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -887,10 +888,18 @@ class RouterEventPublisher {
     std::string Endpoint() { return socket_.Endpoint(); }
 
     bool WaitForSubscriber() {
-        zmq::detail::Message message;
-        const auto size = socket_.recv(message);
-        return size && *size > 0 &&
-               static_cast<const unsigned char*>(message.data())[0] == 1;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            zmq::detail::Message message;
+            const auto size = socket_.recv(message);
+            if (!size) return false;
+            if (*size > 0 &&
+                static_cast<const unsigned char*>(message.data())[0] == 1)
+                return true;
+            // A preceding registration may have left an unsubscribe frame.
+        }
+        return false;
     }
 
     void Publish(const std::string& payload) {
@@ -1342,6 +1351,108 @@ TEST(ClientServerE2ETest, VllmCpuLocalYieldsToMooncakeAcrossPublicQueries) {
     ASSERT_TRUE(wait_for(16, 0, 16));
     EXPECT_EQ(router.Route(request).backend, 1u);
 
+    client.Close();
+    manager.Stop();
+}
+
+TEST(ClientServerE2E, SpecialKVRegistrationEventsAndBothQueryTransports) {
+    RouterEventPublisher publisher;
+    EventManager manager({}, 0, kRpcPort);
+    ASSERT_TRUE(manager.StartHTTPServer());
+    ASSERT_TRUE(manager.StartRPCServer());
+    ConductorClient client;
+    SetupWithRetry(client, "127.0.0.1:" + std::to_string(kRpcPort));
+    common::ServiceConfig service;
+    service.endpoint = publisher.Endpoint();
+    service.publisher_kind = common::PublisherKind::kVllm;
+    service.model_name = "moonshotai/Kimi-K3";
+    service.tenant_id = "default";
+    service.instance_id = "hybrid-engine";
+    service.block_size = 16;
+    service.hash_profile = E2EProfile();
+    ASSERT_TRUE(client.Register(service));
+    ASSERT_TRUE(publisher.WaitForSubscriber());
+    QueryRequest request{E2EContext(), Sequence(1, 48)};
+    request.context.model_name = service.model_name;
+    const auto hashes =
+        ProjectedFor(request.context, service.hash_profile, request.token_ids);
+    auto publish = [&](bool removed, int group,
+                       const std::vector<ProjectedPrefix>& values) {
+        msgpack::sbuffer buffer;
+        msgpack::packer<msgpack::sbuffer> packer(&buffer);
+        packer.pack_array(3);
+        packer.pack(1.0);
+        packer.pack_array(1);
+        packer.pack_map(removed ? 4 : 9);
+        packer.pack("type");
+        packer.pack(removed ? "BlockRemoved" : "BlockStored");
+        packer.pack("block_hashes");
+        packer.pack_array(static_cast<uint32_t>(values.size()));
+        for (auto hash : values) packer.pack(hash.value);
+        packer.pack("medium");
+        packer.pack("GPU");
+        packer.pack("group_idx");
+        packer.pack(group);
+        if (!removed) {
+            packer.pack("block_size");
+            packer.pack(16);
+            packer.pack("parent_block_hash");
+            packer.pack_nil();
+            packer.pack("token_ids");
+            packer.pack(group == 0 ? request.token_ids
+                                   : std::vector<int32_t>{});
+            packer.pack("lora_id");
+            packer.pack_nil();
+            packer.pack("lora_name");
+            packer.pack_nil();
+        }
+        packer.pack(0);
+        publisher.Publish(std::string(buffer.data(), buffer.size()));
+    };
+    coro_http::coro_http_client http;
+    const auto http_port = EventManagerTestPeer::HttpPort(manager);
+    auto wait_for = [&](int64_t expected) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            const auto result = client.Query(request);
+            const auto response =
+                HttpPost(http, http_port, "/query", QueryMsgpackBody(request));
+            if (result && result->instances.contains(service.instance_id) &&
+                response.status == 200 &&
+                result->instances.at(service.instance_id).device == expected &&
+                DecodeMsgpackBody(response.body) == QueryResultToJson(*result))
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+    publish(false, 0, hashes);
+    ASSERT_TRUE(wait_for(0));  // Full presence cannot manufacture a checkpoint.
+    publish(false, 1, {hashes.back()});
+    ASSERT_TRUE(wait_for(0));  // No complete deployed group inventory on wire.
+    publish(true, 1, {hashes.back()});
+    ASSERT_TRUE(wait_for(0));
+    const auto view = client.GetGlobalView();
+    ASSERT_TRUE(view);
+    EXPECT_EQ(view->contexts.at(0).prefix_count, 0u);
+    ASSERT_TRUE(client.Unregister(service.instance_id, "default", 0));
+    const auto empty = client.Query(request);
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty->instances.empty());
+
+    // A different, unlisted model still uses the ordinary event/query path.
+    service.model_name = "unlisted-model";
+    request.context.model_name = service.model_name;
+    ASSERT_TRUE(client.Register(service));
+    ASSERT_TRUE(publisher.WaitForSubscriber());
+    const auto ordinary_hashes =
+        ProjectedFor(request.context, service.hash_profile, request.token_ids);
+    publish(false, 0, ordinary_hashes);
+    ASSERT_TRUE(wait_for(48));
+    publish(true, 0, ordinary_hashes);
+    ASSERT_TRUE(wait_for(0));
+    ASSERT_TRUE(client.Unregister(service.instance_id, "default", 0));
     client.Close();
     manager.Stop();
 }

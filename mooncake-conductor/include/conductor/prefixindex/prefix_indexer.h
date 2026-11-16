@@ -18,6 +18,10 @@
 
 namespace mooncake::conductor::prefixindex {
 
+class HybridIndex;
+struct GroupMutation;
+struct SourceLayout;
+
 struct RegistrationResult {
     bool inserted = false;
     std::string error;
@@ -68,6 +72,8 @@ struct ContextState {
     const size_t max_blocks;
     // Cumulative number of entries removed by capacity eviction.
     int64_t evicted_by_capacity = 0;
+    // Allocated only for contexts requiring grouped KV matching.
+    std::shared_ptr<HybridIndex> hybrid;
 };
 
 struct RankCacheHitResult {
@@ -115,8 +121,17 @@ class PrefixCacheTable {
         const EngineRegistration& registration);
 
     RegistrationResult Register(const EngineRegistration& registration);
-    std::string ValidateProfileBinding(const ContextKey& context,
-                                       const HashProfile& profile) const;
+    std::string BindLayout(const ContextKey& context,
+                           const HashProfile& profile,
+                           std::shared_ptr<const CacheLayout> layout);
+    std::string ActivateDeployment(const ContextKey& context,
+                                   const HashProfile& profile,
+                                   const SourceLayout& binding,
+                                   const std::string& instance, int64_t rank);
+    bool GetDeployment(const ContextKey& context, SourceLayout* binding) const;
+    std::string ValidateProfileBinding(
+        const ContextKey& context, const HashProfile& profile,
+        std::shared_ptr<const CacheLayout> layout = nullptr) const;
     std::string Unregister(const ContextKey& context,
                            const std::string& instance_id, int64_t dp_rank);
 
@@ -127,6 +142,12 @@ class PrefixCacheTable {
     std::string StoreShared(const SharedMutation& mutation);
     std::string RemoveShared(const SharedMutation& mutation);
     std::string ClearShared(const SharedClear& clear);
+
+    std::string StoreGrouped(const GroupMutation& mutation);
+    std::string RemoveGrouped(const GroupMutation& mutation);
+    std::string ClearGroupedSource(
+        const ContextKey& context, const std::string& source,
+        const std::optional<std::string>& backend = std::nullopt);
 
     std::map<std::string, CacheHitResult> Query(
         const ContextKey& context, std::span<const int32_t> token_ids,

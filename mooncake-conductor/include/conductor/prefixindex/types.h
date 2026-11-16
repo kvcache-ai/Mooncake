@@ -3,7 +3,9 @@
 #include <compare>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 #include <variant>
@@ -11,6 +13,8 @@
 #include "conductor/common/types.h"
 
 namespace mooncake::conductor::prefixindex {
+
+struct CacheLayout;
 
 struct ContextKey {
     std::string tenant_id;
@@ -59,6 +63,8 @@ struct EngineRegistration {
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
     common::PublisherKind publisher_kind = common::PublisherKind::kVllm;
+    std::shared_ptr<const CacheLayout> layout;
+    std::set<std::string> readable_domains;
 };
 
 struct EngineMutation {

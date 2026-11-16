@@ -178,8 +178,9 @@ void PackSglangCleared(Packer& packer) {
     packer.pack("AllBlocksCleared");
 }
 
-void PackVllmStored(Packer& packer, bool include_unknown = false) {
-    packer.pack_map(include_unknown ? 9 : 8);
+void PackVllmStored(Packer& packer, bool include_unknown = false,
+                    std::optional<std::string> layout = std::nullopt) {
+    packer.pack_map(8 + include_unknown + layout.has_value());
     packer.pack("type");
     packer.pack("BlockStored");
     packer.pack("block_hashes");
@@ -199,6 +200,10 @@ void PackVllmStored(Packer& packer, bool include_unknown = false) {
     packer.pack("GPU");
     packer.pack("lora_name");
     packer.pack_nil();
+    if (layout) {
+        packer.pack("kv_cache_layout");
+        packer.pack(*layout);
+    }
     if (include_unknown) {
         packer.pack("future_store_metadata");
         packer.pack_map(1);
@@ -368,6 +373,23 @@ void ExpectMooncakeCommon(const MooncakeEventFields& fields, uint64_t event_id,
 
 void ExpectErrorContains(const std::string& error, std::string_view expected) {
     EXPECT_NE(error.find(expected), std::string::npos) << error;
+}
+
+TEST(DecodeVllmEventBatch, OptionalDeploymentFieldPreservesLegacyStoredFields) {
+    for (auto layout :
+         {std::optional<std::string>{},
+          std::optional<std::string>{"{\"format\":\"ascend-store-v1\"}"}}) {
+        const auto payload = PackVllmBatch(
+            1, [&](Packer& packer) { PackVllmStored(packer, true, layout); });
+        const auto result =
+            DecodeVllmEventBatch(payload.data(), payload.size());
+        ASSERT_TRUE(result.ok) << result.error;
+        const auto* stored = GetEvent<VllmStoredEvent>(result.batch.events[0]);
+        ASSERT_NE(stored, nullptr) << result.batch.events[0].error;
+        EXPECT_EQ(stored->kv_cache_layout, layout);
+        EXPECT_EQ(stored->block_size, 2);
+        EXPECT_EQ(std::get<uint64_t>(stored->block_hashes.at(0)), 42u);
+    }
 }
 
 TEST(DecodeVllmEventBatch, DecodesCanonicalMsgspecProducerFixture) {

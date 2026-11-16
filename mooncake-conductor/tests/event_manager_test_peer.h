@@ -45,10 +45,12 @@ class EventManagerTestPeer {
     }
 
     static void FakeActiveService(EventManager& mgr, const std::string& key,
-                                  const common::ServiceConfig& service) {
+                                  const common::ServiceConfig& service,
+                                  prefixindex::SourceLayout layout = {}) {
         auto dummy =
             std::make_shared<zmq::ZMQClient>(zmq::ZMQClientConfig{}, nullptr);
-        auto handler = std::make_shared<KVEventHandler>(&mgr, service);
+        auto handler =
+            std::make_shared<KVEventHandler>(&mgr, service, std::move(layout));
         std::unique_lock lock(mgr.mu_);
         mgr.subscribers_[key] = std::move(dummy);
         mgr.handlers_[key] = std::move(handler);

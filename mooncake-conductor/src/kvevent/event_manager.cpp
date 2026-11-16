@@ -823,6 +823,22 @@ void EventManager::Stop() {
     stop_cv_.notify_all();
 }
 
+void EventManager::RefreshMooncakeDeployments(
+    const prefixindex::ContextKey& context) {
+    std::vector<std::shared_ptr<KVEventHandler>> selected;
+    {
+        std::shared_lock lock(mu_);
+        if (stopped_) return;
+        for (const auto& [key, service] : active_configs_) {
+            if (service.publisher_kind == common::PublisherKind::kMooncake &&
+                ContextFromService(service) == context)
+                selected.push_back(handlers_.at(key));
+        }
+    }
+    // Never enter a subscriber while holding mu_: its callback may need it.
+    for (const auto& handler : selected) handler->RefreshDeployment();
+}
+
 std::pair<bool, std::string> EventManager::SubscribeToService(
     const common::ServiceConfig& svc) {
     // The caller holds mu_ exclusively, so read stopped_ directly rather
@@ -864,7 +880,27 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     // Use ReplayEndpoint directly, fallback to empty if not provided
     const std::string replay_endpoint = svc.replay_endpoint;
 
-    auto handler = std::make_shared<KVEventHandler>(this, svc);
+    auto layout = prefixindex::ResolveModelLayout(svc);
+    if (layout.layout &&
+        svc.publisher_kind == common::PublisherKind::kMooncake) {
+        // The declaration identifies the engine's Store domain, whereas a
+        // raw object event does not identify its master RPC address. Until
+        // that association is explicit, never attach a second, potentially
+        // unrelated Store publisher to this hybrid deployment.
+        for (const auto& [key, active] : active_configs_) {
+            if (active.publisher_kind == common::PublisherKind::kMooncake &&
+                ContextFromService(active) == ContextFromService(svc))
+                return {false,
+                        "hybrid deployment requires one unambiguous Mooncake "
+                        "publisher per context"};
+        }
+    }
+    if (layout.layout && !layout.layout->unavailable_reason.empty()) {
+        LOG(WARNING) << "Special-KV matching is unavailable model="
+                     << svc.model_name
+                     << " reason=" << layout.layout->unavailable_reason;
+    }
+    auto handler = std::make_shared<KVEventHandler>(this, svc, layout);
 
     // Configure ZMQ Client
     zmq::ZMQClientConfig zmq_config;
@@ -883,16 +919,26 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     bool inserted_registration = false;
     if (svc.publisher_kind == common::PublisherKind::kVllm ||
         svc.publisher_kind == common::PublisherKind::kSglang) {
-        const auto registration_result =
-            indexer_.Register(RegistrationFromService(svc));
+        auto registration = RegistrationFromService(svc);
+        registration.layout = layout.layout;
+        registration.readable_domains = layout.readable_domains;
+        const auto registration_result = indexer_.Register(registration);
         if (!registration_result.error.empty()) {
             return {false, "failed to register prefix context: " +
                                registration_result.error};
         }
         inserted_registration = registration_result.inserted;
     } else {
+        if (layout.layout) {
+            if (auto error =
+                    indexer_.BindLayout(ContextFromService(svc),
+                                        ProfileFromService(svc), layout.layout);
+                !error.empty()) {
+                return {false, "failed to bind cache layout: " + error};
+            }
+        }
         const std::string binding_error = indexer_.ValidateProfileBinding(
-            ContextFromService(svc), ProfileFromService(svc));
+            ContextFromService(svc), ProfileFromService(svc), layout.layout);
         if (!binding_error.empty() &&
             binding_error != "ContextKey is not registered") {
             return {false,
