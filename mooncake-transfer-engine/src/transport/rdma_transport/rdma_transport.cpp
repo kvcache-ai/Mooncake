@@ -940,8 +940,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             if (!force_sequential) {
                 use_parallel_reg = globalConfig().parallel_reg_mr;
                 if (use_parallel_reg == -1) {
-                    use_parallel_reg = registration_nics.size() > 1 &&
-                                       do_pre_touch;
+                    use_parallel_reg =
+                        registration_nics.size() > 1 && do_pre_touch;
                 }
             }
 
@@ -1005,8 +1005,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                           << chunks.size() << ", addr=" << chunk_addr
                           << ", length=" << chunk_len
                           << ", contexts=" << registration_nics.size() << "/"
-                          << context_list_.size()
-                          << ", parallel="
+                          << context_list_.size() << ", parallel="
                           << (use_parallel_reg ? "true" : "false")
                           << ", duration=" << reg_duration_ms << "ms";
             }
@@ -1035,8 +1034,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             // that is not Data Direct-paired with the GPU), which could leave
             // the chunk reachable through no HCA at all.
             if (narrowed &&
-                std::all_of(buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
-                            [](BufferDesc::mr_key_t key) { return key == 0; })) {
+                std::all_of(
+                    buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
+                    [](BufferDesc::mr_key_t key) { return key == 0; })) {
                 LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no "
                               "topology-preferred HCA of "
                            << resolved_name << " holds an MR for " << chunk_addr
