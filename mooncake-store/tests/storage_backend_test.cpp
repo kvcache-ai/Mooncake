@@ -6880,4 +6880,350 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
 }
 #endif
 
+// While its master notification is pending, an evicted key stays in the
+// index as kPendingEviction: readers must not see it, the key count must not
+// include it, a re-offload of it must fail, and a failed notification must
+// restore it exactly.
+TEST_F(StorageBackendTest, BucketPendingEvictionHiddenThenRestored) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string old_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch;
+    old_batch.emplace("old_key", std::vector<Slice>{Slice{old_value.data(),
+                                                          old_value.size()}});
+    ASSERT_TRUE(storage_backend.BatchOffload(old_batch, NoopCompleteHandler())
+                    .has_value());
+
+    std::string new_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> new_batch;
+    new_batch.emplace("new_key", std::vector<Slice>{Slice{new_value.data(),
+                                                          new_value.size()}});
+    bool handler_ran = false;
+    std::optional<tl::expected<int64_t, ErrorCode>> nested_result;
+    auto new_result = storage_backend.BatchOffload(
+        new_batch, NoopCompleteHandler(),
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            handler_ran = true;
+            EXPECT_EQ(keys, std::vector<std::string>{"old_key"});
+            // old_key is pending eviction, new_key is a pending write:
+            // neither is visible.
+            for (const char* key : {"old_key", "new_key"}) {
+                auto exists = storage_backend.IsExist(key);
+                EXPECT_TRUE(exists.has_value());
+                EXPECT_FALSE(exists.value_or(true)) << key;
+            }
+            std::vector<char> buffer(old_value.size());
+            std::unordered_map<std::string, Slice> load;
+            load.emplace("old_key", Slice{buffer.data(), buffer.size()});
+            EXPECT_FALSE(storage_backend.BatchLoad(load).has_value());
+            auto metadata = storage_backend.GetStoreMetadata();
+            EXPECT_TRUE(metadata.has_value());
+            EXPECT_EQ(metadata->total_keys, 0);
+            // Re-offloading a key on its way out could lose its only copy.
+            nested_result.emplace(storage_backend.BatchOffload(
+                old_batch, NoopCompleteHandler(), AcceptAllEvictionHandler()));
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        });
+    ASSERT_TRUE(handler_ran);
+    ASSERT_FALSE(new_result.has_value());
+    EXPECT_EQ(new_result.error(), ErrorCode::INTERNAL_ERROR);
+    ASSERT_TRUE(nested_result.has_value());
+    ASSERT_FALSE(nested_result->has_value());
+    EXPECT_EQ(nested_result->error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    // The failed notification restored old_key and dropped new_key's
+    // reservation.
+    std::vector<char> buffer(old_value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace("old_key", Slice{buffer.data(), buffer.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load).has_value());
+    EXPECT_EQ(std::string(buffer.begin(), buffer.end()), old_value);
+    auto new_exists = storage_backend.IsExist("new_key");
+    ASSERT_TRUE(new_exists.has_value());
+    EXPECT_FALSE(new_exists.value());
+    auto metadata = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->total_keys, 1);
+
+    // A later attempt with an accepting master goes through cleanly.
+    ASSERT_TRUE(storage_backend
+                    .BatchOffload(new_batch, NoopCompleteHandler(),
+                                  AcceptAllEvictionHandler())
+                    .has_value());
+    auto old_exists = storage_backend.IsExist("old_key");
+    ASSERT_TRUE(old_exists.has_value());
+    EXPECT_FALSE(old_exists.value());
+    metadata = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->total_keys, 1);
+}
+
+// A key reserved as kPendingWrite by one offload and committed first by
+// another (here, an offload nested in the eviction handler) keeps the first
+// committed copy; the reserving offload neither overwrites nor drops it.
+TEST_F(StorageBackendTest, BucketPendingWriteTakenOverByEarlierCommit) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Something to evict, so the outer offload calls its eviction handler
+    // while "shared_key" is still only reserved.
+    std::string filler_value(6 * 1024, 'F');
+    std::unordered_map<std::string, std::vector<Slice>> filler_batch;
+    filler_batch.emplace(
+        "filler_key",
+        std::vector<Slice>{Slice{filler_value.data(), filler_value.size()}});
+    ASSERT_TRUE(
+        storage_backend.BatchOffload(filler_batch, NoopCompleteHandler())
+            .has_value());
+
+    std::string outer_value(6 * 1024, 'O');
+    std::unordered_map<std::string, std::vector<Slice>> outer_batch;
+    outer_batch.emplace(
+        "shared_key",
+        std::vector<Slice>{Slice{outer_value.data(), outer_value.size()}});
+    std::string nested_value(1024, 'N');
+    std::unordered_map<std::string, std::vector<Slice>> nested_batch;
+    nested_batch.emplace(
+        "shared_key",
+        std::vector<Slice>{Slice{nested_value.data(), nested_value.size()}});
+
+    std::optional<tl::expected<int64_t, ErrorCode>> nested_result;
+    auto outer_result = storage_backend.BatchOffload(
+        outer_batch, NoopCompleteHandler(),
+        [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            nested_result.emplace(storage_backend.BatchOffload(
+                nested_batch, NoopCompleteHandler(),
+                AcceptAllEvictionHandler()));
+            return {};
+        });
+    ASSERT_TRUE(outer_result.has_value()) << outer_result.error();
+    ASSERT_TRUE(nested_result.has_value());
+    ASSERT_TRUE(nested_result->has_value()) << nested_result->error();
+
+    std::vector<char> buffer(nested_value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace("shared_key", Slice{buffer.data(), buffer.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load).has_value());
+    EXPECT_EQ(std::string(buffer.begin(), buffer.end()), nested_value);
+    auto metadata = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->total_keys, 1);
+}
+
+// The physical-usage scan is cached outside the metadata lock. A cached
+// value is reused until FinalizeEviction invalidates it, after which the
+// next check re-measures the directory.
+TEST_F(StorageBackendTest, BucketPhysicalUsageCacheInvalidatedByEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_physical_bytes = int64_t{1} << 40;  // never binding
+    bucket_config.disk_scan_cache_ms = 3600 * 1000;       // never expires
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const auto write_file = [&](const std::string& name, size_t bytes) {
+        std::ofstream out(fs::path(data_path) / name, std::ios::binary);
+        ASSERT_TRUE(out.is_open());
+        // Incompressible, so st_blocks reflects the size on any file system.
+        std::string payload(bytes, '\0');
+        uint64_t state = 0x9E3779B97F4A7C15ull;
+        for (auto& c : payload) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            c = static_cast<char>(state);
+        }
+        out.write(payload.data(), static_cast<std::streamsize>(bytes));
+    };
+    constexpr size_t kProbeBytes = 1 << 20;
+    const int64_t before = storage_backend.ActualDiskBytesUsedForTest(0);
+    write_file("physical_usage_probe", kProbeBytes);
+    // Still the cached measurement: the probe file is not counted yet.
+    EXPECT_EQ(storage_backend.ActualDiskBytesUsedForTest(0), before);
+
+    std::string first_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> first_batch;
+    first_batch.emplace(
+        "first_key",
+        std::vector<Slice>{Slice{first_value.data(), first_value.size()}});
+    ASSERT_TRUE(storage_backend.BatchOffload(first_batch, NoopCompleteHandler())
+                    .has_value());
+    std::string second_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> second_batch;
+    second_batch.emplace(
+        "second_key",
+        std::vector<Slice>{Slice{second_value.data(), second_value.size()}});
+    std::vector<std::string> evicted;
+    ASSERT_TRUE(storage_backend
+                    .BatchOffload(second_batch, NoopCompleteHandler(),
+                                  [&](const std::vector<std::string>& keys)
+                                      -> tl::expected<void, ErrorCode> {
+                                      evicted = keys;
+                                      return {};
+                                  })
+                    .has_value());
+    ASSERT_EQ(evicted, std::vector<std::string>{"first_key"});
+
+    // FinalizeEviction deleted files and invalidated the cache: the next
+    // measurement is a fresh scan, which now sees the probe file.
+    EXPECT_GE(storage_backend.ActualDiskBytesUsedForTest(0),
+              before + static_cast<int64_t>(kProbeBytes));
+}
+
+// metadata_reserve_keys sizes the key index at Init(), so filling the node up
+// to that many keys never grows (rehashes) it under the metadata lock.
+TEST_F(StorageBackendTest, BucketKeyIndexReservedAtInit) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 500;
+    bucket_config.metadata_reserve_keys = 4096;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const size_t buckets_at_init = storage_backend.KeyIndexBucketCountForTest();
+    EXPECT_GE(buckets_at_init, 4096u);
+
+    constexpr int kBatches = 4;
+    constexpr int kKeysPerBatch = 500;
+    std::vector<std::string> values;
+    values.reserve(kBatches * kKeysPerBatch);
+    for (int batch = 0; batch < kBatches; ++batch) {
+        std::unordered_map<std::string, std::vector<Slice>> objects;
+        for (int i = 0; i < kKeysPerBatch; ++i) {
+            values.push_back(std::string(64, static_cast<char>('a' + batch)));
+            objects.emplace("reserve_key_" + std::to_string(batch) + "_" +
+                                std::to_string(i),
+                            std::vector<Slice>{Slice{values.back().data(),
+                                                     values.back().size()}});
+        }
+        ASSERT_TRUE(storage_backend.BatchOffload(objects, NoopCompleteHandler())
+                        .has_value());
+    }
+    EXPECT_EQ(storage_backend.KeyIndexBucketCountForTest(), buckets_at_init);
+    auto metadata = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->total_keys, kBatches * kKeysPerBatch);
+}
+
+// Concurrent offloads that keep evicting each other, with concurrent reads:
+// every successful read returns the value written for that key, and once
+// everything settles the reported key count equals the readable keys, i.e.
+// no kPendingWrite / kPendingEviction reservation leaked.
+TEST_F(StorageBackendTest, BucketConcurrentOffloadEvictLoadKeepsIndexExact) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 48 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    constexpr int kWriters = 4;
+    constexpr int kBatchesPerWriter = 40;
+    constexpr int kKeysPerBatch = 4;
+    constexpr size_t kValueSize = 1024;
+    // Built before any thread starts, so readers need no synchronisation.
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    for (int w = 0; w < kWriters; ++w) {
+        for (int b = 0; b < kBatchesPerWriter; ++b) {
+            for (int i = 0; i < kKeysPerBatch; ++i) {
+                keys.push_back("stress_" + std::to_string(w) + "_" +
+                               std::to_string(b) + "_" + std::to_string(i));
+                values.emplace_back(kValueSize,
+                                    static_cast<char>('a' + keys.size() % 26));
+            }
+        }
+    }
+    const auto index_of = [](int w, int b, int i) {
+        return (w * kBatchesPerWriter + b) * kKeysPerBatch + i;
+    };
+
+    std::atomic<bool> writers_done{false};
+    std::atomic<int> failed_writes{0};
+    std::atomic<int> successful_reads{0};
+    std::atomic<int> corrupt_reads{0};
+    std::vector<std::thread> writers;
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([&, w] {
+            for (int b = 0; b < kBatchesPerWriter; ++b) {
+                std::unordered_map<std::string, std::vector<Slice>> batch;
+                for (int i = 0; i < kKeysPerBatch; ++i) {
+                    auto& value = values[index_of(w, b, i)];
+                    batch.emplace(
+                        keys[index_of(w, b, i)],
+                        std::vector<Slice>{Slice{value.data(), value.size()}});
+                }
+                if (!storage_backend
+                         .BatchOffload(batch, NoopCompleteHandler(),
+                                       AcceptAllEvictionHandler())
+                         .has_value()) {
+                    failed_writes.fetch_add(1);
+                }
+            }
+        });
+    }
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 2; ++r) {
+        readers.emplace_back([&, r] {
+            std::vector<char> buffer(kValueSize);
+            size_t next = static_cast<size_t>(r) * 7919;
+            while (!writers_done.load()) {
+                next = (next * 1103515245 + 12345) % keys.size();
+                std::unordered_map<std::string, Slice> load;
+                load.emplace(keys[next], Slice{buffer.data(), buffer.size()});
+                if (storage_backend.BatchLoad(load).has_value()) {
+                    successful_reads.fetch_add(1);
+                    if (std::string_view(buffer.data(), buffer.size()) !=
+                        values[next]) {
+                        corrupt_reads.fetch_add(1);
+                    }
+                }
+            }
+        });
+    }
+    for (auto& t : writers) t.join();
+    writers_done.store(true);
+    for (auto& t : readers) t.join();
+
+    EXPECT_EQ(corrupt_reads.load(), 0);
+    EXPECT_EQ(failed_writes.load(), 0);
+    int64_t readable = 0;
+    for (const auto& key : keys) {
+        auto exists = storage_backend.IsExist(key);
+        ASSERT_TRUE(exists.has_value());
+        readable += exists.value() ? 1 : 0;
+    }
+    EXPECT_GT(readable, 0);
+    auto metadata = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->total_keys, readable);
+    LOG(INFO) << "stress: readable_keys=" << readable
+              << " successful_reads=" << successful_reads.load();
+}
+
 }  // namespace mooncake::test

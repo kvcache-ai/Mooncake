@@ -59,13 +59,20 @@ struct BucketBackendConfig {
     // actually triggers pod eviction. Set it to the real quota minus headroom.
     int64_t max_physical_bytes = 0;
 
-    // How long ActualDiskBytesUsedLocked() caches its directory-scan result
+    // How long ActualDiskBytesUsed() caches its directory-scan result
     // (milliseconds). Bounds scan cost under a high offload rate; larger =
     // cheaper but a staler physical bound (disk may momentarily exceed the cap
     // by roughly one interval's worth of writes), smaller = tighter but scans
     // more often. <=0 disables caching (scan every check). Only relevant when
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
+
+    // Number of keys the in-memory key index is sized for at Init(), so it
+    // does not rehash under the metadata lock while the node fills up.
+    // 0 = only size it for the keys recovered from disk and let it grow.
+    // Roughly: expected keys on this node, e.g. total quota / typical object
+    // size. Costs ~100 bytes of memory per reserved key.
+    int64_t metadata_reserve_keys = 0;
 
     // Write the final partial bucket in the current offload cycle instead of
     // carrying keys into a later cycle without their current offload tasks.
