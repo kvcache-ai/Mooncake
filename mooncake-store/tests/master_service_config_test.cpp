@@ -275,6 +275,29 @@ TEST(MasterServiceConfigTest,
     EXPECT_EQ(50u, config.restore_repair_durable_timeout_ms);
 }
 
+TEST(MasterServiceConfigTest, BatchOplogRetryTimeoutPropagatesToServingConfig) {
+    MasterConfig master_config{};
+    EXPECT_EQ(180u, master_config.batch_oplog_retry_timeout_sec);
+
+    master_config.batch_oplog_retry_timeout_sec = 42;
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(42u, service_config.batch_oplog_retry_timeout_sec);
+    EXPECT_EQ(42u, WrappedMasterServiceConfig(master_config, 1)
+                       .batch_oplog_retry_timeout_sec);
+}
+
+TEST(MasterServiceConfigTest, BatchOplogRetryTimeoutBuilderOverrideRespected) {
+    MasterServiceConfig defaults;
+    EXPECT_EQ(180u, defaults.batch_oplog_retry_timeout_sec);
+
+    auto config = MasterServiceConfig::builder()
+                      .set_batch_oplog_retry_timeout_sec(7)
+                      .build();
+    EXPECT_EQ(7u, config.batch_oplog_retry_timeout_sec);
+}
+
 TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     MasterConfig master_config{};
     master_config.metrics = {

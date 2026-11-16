@@ -520,6 +520,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           !enable_oplog_ ||
           config.weight_management_oplog_capability_confirmed),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
+      batch_oplog_retry_timeout_sec_(config.batch_oplog_retry_timeout_sec),
       restore_repair_durable_timeout_ms_(
           config.restore_repair_durable_timeout_ms),
       cluster_id_(config.cluster_id),
@@ -11563,6 +11564,8 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     OrderedOpLogWriterConfig writer_config;
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
     writer_config.initial_durable_prefix = durable_prefix;
+    writer_config.retry_timeout =
+        std::chrono::seconds(batch_oplog_retry_timeout_sec_);
     OpLogBatchStorage* storage_ptr = storage.get();
     const ViewVersionId producer_view_version = view_version_;
     OrderedOpLogWriter::WriteBatchFn write_batch =

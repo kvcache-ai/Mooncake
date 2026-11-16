@@ -7797,6 +7797,63 @@ TEST_F(MasterServiceHATest,
     verify_restored(*pending);
 }
 
+TEST_F(MasterServiceHATest, LeaderWriterInheritsConfiguredRetryTimeout) {
+    const std::string cluster_id = "test_leader_retry_timeout";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .set_batch_oplog_retry_timeout_sec(42)
+                              .build();
+    MasterService service(service_config);
+
+    std::optional<OrderedOpLogWriterConfig> captured;
+    MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+        [&captured](OrderedOpLogWriterConfig config,
+                    OrderedOpLogWriter::WriteBatchFn write_batch) {
+            captured = config;
+            return std::make_unique<GatedOrderedOpLogWriter>(
+                std::move(config), std::move(write_batch));
+        });
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                  std::move(backend)));
+    ASSERT_TRUE(HasOpLogWriter(service));
+    ASSERT_TRUE(captured.has_value());
+    EXPECT_EQ(std::chrono::milliseconds(42000), captured->retry_timeout);
+    service.StopBatchOpLogWriter();
+}
+
+TEST_F(MasterServiceHATest, LeaderWriterRetryTimeoutDefaultsTo180Seconds) {
+    const std::string cluster_id = "test_leader_retry_default";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+
+    std::optional<OrderedOpLogWriterConfig> captured;
+    MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+        [&captured](OrderedOpLogWriterConfig config,
+                    OrderedOpLogWriter::WriteBatchFn write_batch) {
+            captured = config;
+            return std::make_unique<GatedOrderedOpLogWriter>(
+                std::move(config), std::move(write_batch));
+        });
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                  std::move(backend)));
+    ASSERT_TRUE(HasOpLogWriter(service));
+    ASSERT_TRUE(captured.has_value());
+    EXPECT_EQ(std::chrono::milliseconds(180000), captured->retry_timeout);
+    service.StopBatchOpLogWriter();
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
