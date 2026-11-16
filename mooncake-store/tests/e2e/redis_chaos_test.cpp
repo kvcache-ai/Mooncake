@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/struct_json/json_reader.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -11,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -53,10 +55,14 @@ DEFINE_int32(redis_master_view_ttl_sec, 4,
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "Redis heartbeat interval for Redis master failover test");
 
-constexpr int kMasterPortBase = 51051;
 constexpr int kMasterNum = 3;
-constexpr int kClientPortBase = 52051;
-constexpr int kSnapshotPortBase = 53051;
+// Keep listeners below Linux's default ephemeral port range (32768-60999).
+// Outgoing connections must not claim a standby's RPC port before promotion.
+constexpr int kMasterPortBase = 21051;
+constexpr int kClientPortBase = 22051;
+constexpr int kSnapshotPortBase = 23051;
+constexpr int kMetricsPortBase = 24051;
+constexpr int kHeartbeatPortBase = 25051;
 
 namespace mooncake {
 namespace testing {
@@ -665,8 +671,49 @@ class RedisGracefulShutdownTest : public RedisChaosTest {
     }
 
     void ConfigureMasters(MasterRunnerConfig& config) override {
-        config.metrics_port_base = 54051;
-        config.heartbeat_rpc_port_base = 55051;
+        config.metrics_port_base = kMetricsPortBase;
+        config.heartbeat_rpc_port_base = kHeartbeatPortBase;
+    }
+
+    bool WaitForSnapshotReadiness(int index, const std::string& role,
+                                  bool ready, std::chrono::seconds timeout) {
+        RedisMasterRegistry registry(FLAGS_redis_cluster_id,
+                                     FLAGS_redis_endpoint, FLAGS_redis_username,
+                                     FLAGS_redis_password, 0);
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(kMasterPortBase + index);
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            coro_http::coro_http_client client;
+            auto response = client.get(
+                "http://127.0.0.1:" + std::to_string(kMetricsPortBase + index) +
+                "/ha/status");
+            if (response.status == 200) {
+                HAStatusSnapshot status;
+                struct_json::from_json(status, response.resp_body);
+                if (status.role == role && status.snapshot_ready == ready &&
+                    status.state ==
+                        (role == "primary" ? "RUNNING" : "WATCHING")) {
+                    std::vector<RedisMasterRegistryEntry> entries;
+                    if (registry.DiscoverAlive(std::chrono::seconds(10),
+                                               entries) == ErrorCode::OK) {
+                        for (const auto& entry : entries) {
+                            // Registry readiness counts standby snapshot
+                            // sources; primary fallback availability is
+                            // reported in HTTP.
+                            if (entry.master_endpoint == endpoint &&
+                                entry.role == role &&
+                                entry.snapshot_ready ==
+                                    (role == "standby" && ready)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
     }
 
     std::string RegistryInstance(int index) {
@@ -739,8 +786,8 @@ TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
     WaitForLeaderServiceReady();
     ASSERT_TRUE(TcpPortAccepting("127.0.0.1:" +
                                  std::to_string(kMasterPortBase + leader)));
-    ASSERT_TRUE(
-        TcpPortAccepting("127.0.0.1:" + std::to_string(55051 + leader)));
+    ASSERT_TRUE(TcpPortAccepting("127.0.0.1:" +
+                                 std::to_string(kHeartbeatPortBase + leader)));
     const auto instance_id = RegistryInstance(leader);
     ASSERT_FALSE(instance_id.empty());
 
@@ -750,8 +797,8 @@ TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
     ExpectRegistryRemoved(instance_id);
     EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
                                   std::to_string(kMasterPortBase + leader)));
-    EXPECT_FALSE(
-        TcpPortAccepting("127.0.0.1:" + std::to_string(55051 + leader)));
+    EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kHeartbeatPortBase + leader)));
     EXPECT_TRUE(
         WaitForMasterLog(leader, "released=1", std::chrono::seconds(1)));
     EXPECT_TRUE(WaitForMasterLog(leader, "HA shutdown completed",
@@ -766,7 +813,7 @@ TEST_F(RedisGracefulShutdownTest,
     WaitForLeaderServiceReady();
     const auto client_id = generate_uuid();
     P2PMasterClient client(client_id);
-    client.SetHeartbeatRpcPort(55051 + leader);
+    client.SetHeartbeatRpcPort(kHeartbeatPortBase + leader);
     ASSERT_EQ(
         client.Connect("127.0.0.1:" + std::to_string(kMasterPortBase + leader)),
         ErrorCode::OK);
@@ -808,7 +855,8 @@ TEST_F(RedisGracefulShutdownTest,
                     .has_value());
     coro_http::coro_http_client http;
     auto response = http.get(
-        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/status");
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+        "/ha/status");
     ASSERT_EQ(response.status, 200);
     HAStatusSnapshot status;
     struct_json::from_json(status, response.resp_body);
@@ -823,7 +871,7 @@ TEST_F(RedisGracefulShutdownTest,
     ViewVersionId next_version = 0;
     ASSERT_TRUE(WaitForNewLeader(leader, version, next_leader, next_version));
     WaitForLeaderServiceReady();
-    client.SetHeartbeatRpcPort(55051 + next_leader);
+    client.SetHeartbeatRpcPort(kHeartbeatPortBase + next_leader);
     ASSERT_EQ(client.Connect("127.0.0.1:" +
                              std::to_string(kMasterPortBase + next_leader)),
               ErrorCode::OK);
@@ -857,10 +905,10 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownReleasesLeaseBeforeTTL) {
     ASSERT_GT(ttl->integer, 5000) << "Lease expiry must not satisfy this test";
 
     coro_http::coro_http_client client;
-    auto response =
-        client.post("http://127.0.0.1:" + std::to_string(54051 + leader) +
-                        "/ha/stepdown?cooldown_sec=0",
-                    "", coro_http::req_content_type::octet_stream);
+    auto response = client.post(
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+            "/ha/stepdown?cooldown_sec=0",
+        "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ASSERT_NE(response.resp_body.find("\"success\":true"),
               std::string_view::npos);
@@ -890,10 +938,16 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
     ViewVersionId version = 0;
     ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
     WaitForLeaderServiceReady();
+    for (int i = 0; i < kMasterNum; ++i) {
+        ASSERT_TRUE(
+            WaitForSnapshotReadiness(i, i == leader ? "primary" : "standby",
+                                     true, std::chrono::seconds(3)))
+            << i;
+    }
     const auto log_offset = MasterLogEndOffset(leader);
     const auto start = std::chrono::steady_clock::now();
     const std::string url =
-        "http://127.0.0.1:" + std::to_string(54051 + leader);
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader);
     coro_http::coro_http_client client;
     auto response =
         client.post(url + "/ha/stepdown?cooldown_sec=5&drain_timeout_ms=1234",
@@ -910,6 +964,8 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
     EXPECT_TRUE(WaitForMasterLogSince(
         leader, "OpLog drain completed, drain_timeout_ms=1234", log_offset,
         std::chrono::seconds(1)));
+    ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", true,
+                                         std::chrono::seconds(3)));
 
     // Standby diagnostics remain reachable while election is paused.
     coro_http::coro_http_client status_client;
@@ -932,7 +988,8 @@ TEST_F(RedisGracefulShutdownTest, StepdownCooldownDoesNotBlockShutdown) {
     const auto log_offset = MasterLogEndOffset(leader);
     coro_http::coro_http_client client;
     auto response = client.post(
-        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/stepdown",
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+            "/ha/stepdown",
         "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ASSERT_NE(response.resp_body.find("\"cooldown_sec\":30"),
@@ -944,6 +1001,44 @@ TEST_F(RedisGracefulShutdownTest, StepdownCooldownDoesNotBlockShutdown) {
     EXPECT_TRUE(WaitForMasterLogSince(
         leader, "HA shutdown requested during election pause", log_offset,
         std::chrono::seconds(1)));
+}
+
+class RedisSnapshotDisabledTest : public RedisGracefulShutdownTest {
+   protected:
+    void ConfigureMasters(MasterRunnerConfig& config) override {
+        RedisGracefulShutdownTest::ConfigureMasters(config);
+        config.standby_snapshot_service_port_base = 0;
+    }
+};
+
+TEST_F(RedisSnapshotDisabledTest, ReadinessStaysFalseAcrossStepdown) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    for (int i = 0; i < kMasterNum; ++i) {
+        ASSERT_TRUE(
+            WaitForSnapshotReadiness(i, i == leader ? "primary" : "standby",
+                                     false, std::chrono::seconds(3)))
+            << i;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    coro_http::coro_http_client client;
+    auto response = client.post(
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+            "/ha/stepdown?cooldown_sec=30",
+        "", coro_http::req_content_type::octet_stream);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    ExpectPromptSuccessor(leader, version, start);
+    ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", false,
+                                         std::chrono::seconds(3)));
+    int successor = -1;
+    ViewVersionId next_version = 0;
+    ASSERT_TRUE(
+        WaitForLeader(successor, next_version, std::chrono::seconds(3)));
+    ASSERT_NE(successor, leader);
+    ASSERT_TRUE(WaitForSnapshotReadiness(successor, "primary", false,
+                                         std::chrono::seconds(15)));
 }
 
 TEST_F(RedisGracefulShutdownTest, StandbySigtermPreservesLeader) {
@@ -979,6 +1074,168 @@ TEST_F(RedisGracefulShutdownTest, SigtermBeforePromotionReleasesLease) {
     ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(5)));
     ExpectRegistryRemoved(instance_id);
     ExpectPromptSuccessor(leader, version, start);
+}
+
+class RedisOpLogStopTest : public RedisGracefulShutdownTest {
+   protected:
+    void ConfigureMasters(MasterRunnerConfig& config) override {
+        RedisGracefulShutdownTest::ConfigureMasters(config);
+        // clientctl follows the elected RPC address; keep heartbeats on it.
+        // The graceful-shutdown tests above cover dedicated heartbeat ports.
+        config.heartbeat_rpc_port_base = 0;
+    }
+
+    bool StartWriterClient(ClientCtlProcess& client) {
+        return client.Start() &&
+               client.SendAndWait(
+                   "create c_writes " + std::to_string(kClientPortBase + 30),
+                   "Successfully created client: c_writes",
+                   std::chrono::seconds(30));
+    }
+
+    std::jthread StartWrites(ClientCtlProcess& client, std::string prefix,
+                             std::atomic<size_t>& last_written) {
+        return std::jthread([&client, prefix = std::move(prefix),
+                             &last_written](std::stop_token stop) {
+            for (size_t n = 1; !stop.stop_requested(); ++n) {
+                const auto key = prefix + std::to_string(n);
+                // Role changes can fail a command; SendAndWait logs details.
+                if (client.SendAndWait("put c_writes " + key + " value",
+                                       "Successfully put value for key: " + key,
+                                       std::chrono::seconds(2))) {
+                    last_written.store(n);
+                }
+                // Also bound retries if clientctl exits or rejects immediately.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    std::string WaitForCommittedWrite(const std::string& prefix,
+                                      const std::atomic<size_t>& last_written,
+                                      size_t after) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto n = last_written.load();
+            if (n > after) {
+                const auto key = prefix + std::to_string(n);
+                if (WaitForReplicaOpLog(key, std::chrono::seconds(2))) {
+                    return key;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return {};
+    }
+
+    bool WaitForStoppedWriter(int index) {
+        const auto url =
+            "http://127.0.0.1:" + std::to_string(kMetricsPortBase + index) +
+            "/metrics";
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            coro_http::coro_http_client client;
+            auto response = client.get(url);
+            if (response.status == 200) {
+                std::istringstream lines(std::string(response.resp_body));
+                std::string line;
+                bool workers_stopped = false;
+                bool queue_empty = false;
+                while (std::getline(lines, line)) {
+                    std::istringstream metric(line);
+                    std::string name;
+                    double value = -1;
+                    if (metric >> name >> value) {
+                        if (name == "ha_oplog_async_workers_running") {
+                            workers_stopped = value == 0;
+                        } else if (name == "ha_oplog_async_queue_size") {
+                            queue_empty = value == 0;
+                        }
+                    }
+                }
+                if (workers_stopped && queue_empty) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+};
+
+TEST_F(RedisOpLogStopTest, SigtermDuringContinuousWrites) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    const auto instance_id = RegistryInstance(leader);
+    ASSERT_FALSE(instance_id.empty());
+
+    ClientCtlProcess client(/*index=*/30, FLAGS_out_dir);
+    ASSERT_TRUE(StartWriterClient(client));
+    std::atomic<size_t> last_written{0};
+    const std::string prefix = "sigterm_writes_";
+    // Stop/join before client and last_written are destroyed, including ASSERT.
+    auto writes = StartWrites(client, prefix, last_written);
+    ASSERT_FALSE(WaitForCommittedWrite(prefix, last_written, 2).empty());
+
+    const auto log_offset = MasterLogEndOffset(leader);
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(5)));
+    ExpectPromptSuccessor(leader, version, start);
+    ASSERT_FALSE(HasFatalFailure());
+    ExpectRegistryRemoved(instance_id);
+    EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kMasterPortBase + leader)));
+    EXPECT_TRUE(WaitForMasterLogOrderSince(
+        leader, "P2P primary shutdown OpLog drain completed", "released=1",
+        log_offset, std::chrono::seconds(1)));
+    EXPECT_TRUE(WaitForMasterLogSince(leader, "HA shutdown completed",
+                                      log_offset, std::chrono::seconds(1)));
+    WaitForLeaderServiceReady();
+    // Local/degraded put success is insufficient: require a newer committed
+    // PUBLISH_ROUTE after the successor is ready, using the same running
+    // client.
+    ASSERT_FALSE(
+        WaitForCommittedWrite(prefix, last_written, last_written.load())
+            .empty());
+}
+
+TEST_F(RedisOpLogStopTest, LeadershipLossDuringContinuousWrites) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    ClientCtlProcess client(/*index=*/30, FLAGS_out_dir);
+    ASSERT_TRUE(StartWriterClient(client));
+    std::atomic<size_t> last_written{0};
+    const std::string prefix = "demotion_writes_";
+    auto writes = StartWrites(client, prefix, last_written);
+    ASSERT_FALSE(WaitForCommittedWrite(prefix, last_written, 2).empty());
+
+    const auto log_offset = MasterLogEndOffset(leader);
+    ASSERT_TRUE(masters_[leader]->suspend());
+    int successor = -1;
+    ViewVersionId successor_version = 0;
+    ASSERT_TRUE(
+        WaitForNewLeader(leader, version, successor, successor_version));
+    ASSERT_TRUE(masters_[leader]->resume());
+    ASSERT_TRUE(WaitForMasterLogSince(
+        leader, "Starting P2P standby from demoted primary handoff", log_offset,
+        std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForStoppedWriter(leader));
+    ASSERT_TRUE(WaitForSnapshotReadiness(leader, "standby", true,
+                                         std::chrono::seconds(15)));
+
+    WaitForLeaderServiceReady();
+    const auto key =
+        WaitForCommittedWrite(prefix, last_written, last_written.load());
+    ASSERT_FALSE(key.empty());
+    // The old primary is still serving as a standby and consumes new commits
+    // after its own writer has stopped.
+    ASSERT_TRUE(WaitForSnapshotObject(leader, key, std::chrono::seconds(30)));
+    EXPECT_TRUE(WaitForStoppedWriter(leader));
 }
 
 TEST_F(RedisChaosTest, LeaderKilledFailover) {
@@ -1090,7 +1347,7 @@ TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {
     EXPECT_GT(next_version, version);
 }
 
-TEST_F(RedisChaosTest, DemotedPrimaryCatchesUpFromOplogWithoutSnapshot) {
+TEST_F(RedisChaosTest, DemotedPrimaryCatchesUpFromOpLogWithoutSnapshot) {
     int leader_index = -1;
     ViewVersionId version = 0;
     ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));

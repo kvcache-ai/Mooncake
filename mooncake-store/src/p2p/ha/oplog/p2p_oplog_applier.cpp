@@ -219,7 +219,7 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
                 return true;
             }
             // Publish entries: discard to avoid resurrecting stale state.
-            VLOG(1) << "OpLogApplier: discard late skipped entry, op_type="
+            VLOG(2) << "OpLogApplier: discard late skipped entry, op_type="
                     << static_cast<int>(entry.op_type)
                     << ", sequence_id=" << entry.sequence_id
                     << ", key=" << entry.object_key;
@@ -251,7 +251,7 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         pending_entries_[entry.sequence_id] = entry;
         HAMetricManager::instance().set_oplog_pending_entries(
             static_cast<int64_t>(pending_entries_.size()));
-        VLOG(1) << "OpLogApplier: future entry buffered, sequence_id="
+        VLOG(2) << "OpLogApplier: future entry buffered, sequence_id="
                 << entry.sequence_id << ", expected=" << expected
                 << ", key=" << entry.object_key
                 << ", pending_entries=" << pending_entries_.size();
@@ -382,9 +382,9 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
                 expected_sequence_id_.store(expected + 1);
                 skipped_count++;
                 HAMetricManager::instance().inc_oplog_skipped_entries();
-                LOG(WARNING) << "OpLogApplier: skipped confirmed missing entry "
-                                "seq="
-                             << expected;
+                VLOG(2) << "OpLogApplier: skipped confirmed missing entry "
+                           "seq="
+                        << expected;
                 continue;
             }
 
@@ -401,7 +401,7 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
             auto it = missing_sequence_ids_.find(missing_seq);
             if (it == missing_sequence_ids_.end()) {
                 missing_sequence_ids_[missing_seq] = now;
-                VLOG(1) << "OpLogApplier: scheduling wait for missing "
+                VLOG(2) << "OpLogApplier: scheduling wait for missing "
                            "sequence_id="
                         << missing_seq << ", will request after "
                         << kMissingEntryRequestSeconds << " seconds";
@@ -420,9 +420,9 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
                 expected_sequence_id_.store(missing_seq + 1);
                 skipped_count++;
                 HAMetricManager::instance().inc_oplog_skipped_entries();
-                LOG(WARNING)
-                    << "OpLogApplier: skipped missing entry seq=" << missing_seq
-                    << " after " << waited.count() << "s timeout";
+                VLOG(2) << "OpLogApplier: skipped missing entry seq="
+                        << missing_seq << " after " << waited.count()
+                        << "s timeout";
                 continue;  // may skip multiple consecutive gaps
             }
 
@@ -520,9 +520,8 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
             auto age = std::chrono::duration_cast<std::chrono::seconds>(
                 now - it->second);
             if (age.count() > 60) {
-                LOG(WARNING)
-                    << "OpLogApplier: giving up on missing sequence_id="
-                    << it->first << " after " << age.count() << " seconds";
+                VLOG(2) << "OpLogApplier: giving up on missing sequence_id="
+                        << it->first << " after " << age.count() << " seconds";
                 it = missing_sequence_ids_.erase(it);
             } else {
                 ++it;
@@ -543,16 +542,16 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
     }
 
     if (skipped_count > 0) {
-        LOG(WARNING) << "OpLogApplier: skipped " << skipped_count
-                     << " missing sequence_id(s) after timeout, "
-                        "expected_sequence_id now="
-                     << expected_sequence_id_.load();
+        LOG_EVERY_N(WARNING, 50) << "OpLogApplier: skipped " << skipped_count
+                                 << " missing sequence_id(s), "
+                                    "expected_sequence_id now="
+                                 << expected_sequence_id_.load();
     }
 
     if (processed_count > 0) {
-        LOG(INFO) << "OpLogApplier: processed " << processed_count
-                  << " pending entries, expected_sequence_id now="
-                  << expected_sequence_id_.load();
+        VLOG(1) << "OpLogApplier: processed " << processed_count
+                << " pending entries, expected_sequence_id now="
+                << expected_sequence_id_.load();
     }
 
     // Update pending entries metric
@@ -652,9 +651,9 @@ bool P2POpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
     OpLogEntry entry;
     ErrorCode err = oplog_store_->ReadOpLog(missing_seq_id, entry);
     if (err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
-        LOG(INFO) << "OpLogApplier: missing OpLog entry not found in store, "
-                     "sequence_id="
-                  << missing_seq_id;
+        VLOG(2) << "OpLogApplier: missing OpLog entry not found in store, "
+                   "sequence_id="
+                << missing_seq_id;
         return false;
     }
     if (err != ErrorCode::OK) {
@@ -683,10 +682,9 @@ bool P2POpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
     }
 
     // Successfully retrieved the missing OpLog entry
-    LOG(INFO) << "OpLogApplier: retrieved missing OpLog entry, sequence_id="
-              << missing_seq_id
-              << ", op_type=" << static_cast<int>(entry.op_type)
-              << ", key=" << entry.object_key;
+    VLOG(2) << "OpLogApplier: retrieved missing OpLog entry, sequence_id="
+            << missing_seq_id << ", op_type=" << static_cast<int>(entry.op_type)
+            << ", key=" << entry.object_key;
     HAMetricManager::instance().inc_oplog_gap_resolve_success();
 
     // Add to pending entries

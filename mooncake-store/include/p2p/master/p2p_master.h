@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "p2p/common/p2p_master_config.h"
@@ -32,10 +33,11 @@ class P2PMaster {
                                      const char* reason = "stepdown");
     int RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                             P2PMasterRpcService& service,
-                            std::function<void()> before_start = {},
+                            std::function<void()> after_start = {},
                             std::function<void()> after_stop = {},
                             std::function<bool()> stopping = {},
-                            std::function<bool()> stepping_down = {});
+                            std::function<bool()> stepping_down = {},
+                            std::string* startup_error = nullptr);
 
     P2PMasterConfig config_;
     static std::atomic<bool> shutdown_requested_;

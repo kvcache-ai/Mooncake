@@ -89,7 +89,10 @@ bool WaitForP2PElectionReadiness(const P2PMasterConfig& config,
         }
 
         HAStatusManager::instance().SetElectionReadinessBlocked(
-            true, readiness_decision.lag_entries,
+            true, self_status.applied_seq_id,
+            self_status.primary_seq_id_known
+                ? std::optional<uint64_t>(self_status.primary_seq_id)
+                : std::nullopt,
             config.oplog.election_max_standby_lag_entries);
         LOG_EVERY_N(INFO, 10)
             << "P2P election waiting for standby catch-up before election"

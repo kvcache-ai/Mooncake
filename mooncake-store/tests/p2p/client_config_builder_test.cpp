@@ -273,6 +273,32 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     EXPECT_EQ(config.transfer_direction_mode, TransferDirectionMode::REVERSE);
     EXPECT_EQ(config.redis_master_view_ttl_sec, 4);
     EXPECT_EQ(config.redis_heartbeat_interval_sec, 1);
+    EXPECT_EQ(config.heartbeat_rpc_timeout_ms, 1000);
+}
+
+TEST(ClientConfigBuilderTest, HeartbeatTimeoutConfigIsValidated) {
+    std::unordered_map<std::string, std::string> values = {
+        {"local_hostname", "127.0.0.1:12345"},
+        {"metadata_server", "P2PHANDSHAKE"},
+        {"tiered_backend_config", kTieredConfigJson},
+    };
+    auto config = P2PClientConfigBuilder::build_p2p_real_client(values);
+    ASSERT_TRUE(config);
+    EXPECT_EQ(config->heartbeat_rpc_timeout_ms, 1000);
+    for (const auto* valid : {"250", " +250 "}) {
+        SCOPED_TRACE(valid);
+        values["heartbeat_rpc_timeout_ms"] = valid;
+        config = P2PClientConfigBuilder::build_p2p_real_client(values);
+        ASSERT_TRUE(config);
+        EXPECT_EQ(config->heartbeat_rpc_timeout_ms, 250);
+    }
+    for (const auto* invalid : {"0", "-1", "", "abc", "250ms", "2147483648"}) {
+        SCOPED_TRACE(invalid);
+        values["heartbeat_rpc_timeout_ms"] = invalid;
+        config = P2PClientConfigBuilder::build_p2p_real_client(values);
+        ASSERT_FALSE(config);
+        EXPECT_EQ(config.error(), ErrorCode::INVALID_PARAMS);
+    }
 }
 
 TEST(ClientConfigBuilderTest, DataManagerVersionIsReadFromTheTierConfig) {

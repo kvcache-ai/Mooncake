@@ -67,6 +67,16 @@ struct P2PStandbySyncStatus {
 struct P2PSnapshotSourceSelection {
     std::vector<std::string> endpoints;
     bool used_primary_fallback{false};
+    size_t alive_count{0};
+    size_t qualified_standby_count{0};
+    size_t primary_fallback_count{0};
+    size_t excluded_count{0};
+    // Exclusion reasons are mutually exclusive.
+    size_t excluded_self_count{0};
+    size_t excluded_unavailable_count{0};
+    size_t excluded_stale_count{0};
+    size_t excluded_primary_not_used_count{0};
+    size_t excluded_role_count{0};
 };
 
 P2PSnapshotSourceSelection SelectP2PSnapshotSources(
@@ -122,7 +132,10 @@ class P2PHotStandbyService {
         return metadata_store_.get();
     }
     const std::string& GetClusterId() const { return config_.cluster_id; }
+    // Metadata readiness is also used by in-process snapshot sources.
     bool IsReadyForSnapshot() const;
+    // External advertisement additionally requires a started RPC server.
+    bool CanServeSnapshot() const;
 
    private:
     friend struct mooncake::test::P2PHotStandbyServiceTestAccess;
@@ -176,6 +189,10 @@ class P2PHotStandbyService {
 
     std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> snapshot_server_;
+    // StopSnapshotServer cannot hold mutex_ while joining snapshot handlers.
+    // Publish availability separately so heartbeat readers never race the
+    // pointer.
+    std::atomic<bool> snapshot_server_running_{false};
 };
 
 }  // namespace mooncake

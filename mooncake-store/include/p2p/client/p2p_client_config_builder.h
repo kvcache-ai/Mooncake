@@ -18,6 +18,8 @@ struct P2PClientConfig : RealClientConfigBase {
     // Dedicated master heartbeat port; must match --heartbeat_rpc_port.
     // Zero sends heartbeats to the main RPC port.
     uint16_t heartbeat_rpc_port = 0;
+    // Client connection/request timeout for heartbeat RPCs; must be positive.
+    int32_t heartbeat_rpc_timeout_ms = 1000;
 
     // Port for HTTP server.
     // Only used when enable_http_server is true.
@@ -149,7 +151,12 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
         const std::string& redis_username = "", uint16_t heartbeat_rpc_port = 0,
         size_t te_async_poll_worker_num = 32, bool start_local_only = false,
-        size_t business_coro_worker_num = 32) {
+        size_t business_coro_worker_num = 32,
+        int32_t heartbeat_rpc_timeout_ms = 1000) {
+        if (heartbeat_rpc_timeout_ms <= 0) {
+            LOG(ERROR) << "heartbeat_rpc_timeout_ms must be greater than 0";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -224,6 +231,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         config.transfer_direction_mode = *parsed_direction;
 
         config.heartbeat_rpc_port = heartbeat_rpc_port;
+        config.heartbeat_rpc_timeout_ms = heartbeat_rpc_timeout_ms;
         return config;
     }
 
@@ -297,6 +305,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         auto heartbeat_rpc_port =
             get_config_integer<uint16_t>(config, DictP2P::kHeartbeatRpcPort,
                                          DictP2P::kDefaultHeartbeatRpcPort);
+        auto heartbeat_rpc_timeout_ms = get_config_integer<int32_t>(
+            config, DictP2P::kHeartbeatRpcTimeoutMs, 1000);
         auto http_port =
             get_config_integer<uint16_t>(config, "http_port", 9003);
         bool enable_http_server =
@@ -314,8 +324,9 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             !te_async_poll_worker_num || !business_coro_worker_num ||
             !async_sender_thread_count || !async_max_batch_size ||
             !async_route_queue_size || !metric_report_interval_seconds ||
-            !heartbeat_rpc_port || !http_port || !key_lease_duration_ms ||
-            !key_lease_scan_interval_ms || !redis_config) {
+            !heartbeat_rpc_port || !heartbeat_rpc_timeout_ms || !http_port ||
+            !key_lease_duration_ms || !key_lease_scan_interval_ms ||
+            !redis_config) {
             LOG(ERROR) << "Failed to parse P2P numeric configuration";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -336,7 +347,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             redis_config->heartbeat_interval_sec, redis_config->username,
             *heartbeat_rpc_port, *te_async_poll_worker_num,
             get_config_bool(config, DictP2P::kStartLocalOnly, false),
-            *business_coro_worker_num);
+            *business_coro_worker_num, *heartbeat_rpc_timeout_ms);
         if (!result) {
             LOG(ERROR) << "P2P dict configuration is invalid: "
                        << result.error();
@@ -408,6 +419,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         static constexpr const char* kEnableMetricCollection =
             "enable_metric_collection";
         static constexpr const char* kHeartbeatRpcPort = "heartbeat_rpc_port";
+        static constexpr const char* kHeartbeatRpcTimeoutMs =
+            "heartbeat_rpc_timeout_ms";
         static constexpr uint64_t kDefaultMetricReportIntervalSeconds = 60;
         static constexpr bool kDefaultEnableMetricCollection = true;
         static constexpr uint16_t kDefaultHeartbeatRpcPort = 0;

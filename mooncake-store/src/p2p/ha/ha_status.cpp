@@ -117,7 +117,7 @@ std::string IssueSeverity(const std::string& code) {
         code == "OPLOG_CATCHUP_STALLED" || code == "OPLOG_POLL_STALE" ||
         code == "OPLOG_LAG_GROWING" || code == "PROMOTION_CATCHUP_INCOMPLETE" ||
         code == "OPLOG_DRAIN_INCOMPLETE" ||
-        code == "ELECTION_READINESS_BLOCKED") {
+        code == "ELECTION_READINESS_BLOCKED" || code == "ELECTION_NOT_READY") {
         return "warning";
     }
     return "error";
@@ -202,22 +202,21 @@ void HAStatusManager::Reset() {
     oplog_lag_growth_ = {};
     standby_snapshot_ = {};
     oplog_poll_ = {};
-    election_readiness_blocked_ = false;
-    election_readiness_blocked_lag_ = 0;
-    election_readiness_blocked_max_ = 0;
+    election_readiness_ = {};
     status_.oplog_pending_writes = 0;
     oplog_latest_stall_timeout_sec_ = 10;
     oplog_catchup_stall_timeout_sec_ = 10;
     TouchLocked();
 }
 
-void HAStatusManager::SetElectionReadinessBlocked(bool blocked,
-                                                  uint64_t lag_entries,
-                                                  uint64_t max_lag_entries) {
+void HAStatusManager::SetElectionReadinessBlocked(
+    bool blocked, uint64_t applied_sequence_id,
+    std::optional<uint64_t> latest_sequence_id, uint64_t max_lag_entries) {
     std::lock_guard<std::mutex> lock(mutex_);
-    election_readiness_blocked_ = blocked;
-    election_readiness_blocked_lag_ = lag_entries;
-    election_readiness_blocked_max_ = max_lag_entries;
+    election_readiness_ =
+        blocked ? ElectionReadiness{true, applied_sequence_id,
+                                    latest_sequence_id, max_lag_entries}
+                : ElectionReadiness{};
 }
 
 void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
@@ -553,6 +552,10 @@ void HAStatusManager::SetOpLogProgress(
     status_.oplog_lag = status_.latest_sequence_id > applied_sequence_id
                             ? status_.latest_sequence_id - applied_sequence_id
                             : 0;
+    // Use the same local watermark as /ha/status. On a primary this is the
+    // latest assigned sequence, which can differ from Redis's persisted latest.
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(applied_sequence_id));
     TouchLocked();
 }
 
@@ -651,9 +654,7 @@ void HAStatusManager::ClearDoctorIssues(bool preserve_stepdown_drain) {
     oplog_catchup_ = {};
     oplog_lag_growth_ = {};
     oplog_poll_ = {};
-    election_readiness_blocked_ = false;
-    election_readiness_blocked_lag_ = 0;
-    election_readiness_blocked_max_ = 0;
+    election_readiness_ = {};
     status_.oplog_pending_writes = 0;
 }
 
@@ -821,18 +822,35 @@ HADoctorReport HAStatusManager::GetDoctorReport() const {
                 report.issues.push_back(
                     MakeDoctorIssue("ELECTION_UNSTABLE", std::move(issue)));
             }
-            if (election_readiness_blocked_) {
+            if (election_readiness_.blocked) {
+                const auto& readiness = election_readiness_;
+                std::string message;
+                if (!readiness.latest_sequence_id.has_value()) {
+                    message =
+                        "standby latest oplog sequence is unknown; "
+                        "waiting before election";
+                } else {
+                    const auto latest = *readiness.latest_sequence_id;
+                    const auto lag =
+                        latest > readiness.applied_sequence_id
+                            ? latest - readiness.applied_sequence_id
+                            : 0;
+                    message =
+                        "standby oplog lag exceeds election readiness lag "
+                        "gate: "
+                        "lag=" +
+                        std::to_string(lag) +
+                        ", max=" + std::to_string(readiness.max_lag_entries);
+                }
+                message += " (applied_sequence_id=" +
+                           std::to_string(readiness.applied_sequence_id) +
+                           ", latest_sequence_id=" +
+                           (readiness.latest_sequence_id.has_value()
+                                ? std::to_string(*readiness.latest_sequence_id)
+                                : "unknown") +
+                           ")";
                 report.issues.push_back(MakeDoctorIssue(
-                    "ELECTION_READINESS_BLOCKED",
-                    "standby oplog lag exceeds election readiness lag gate: "
-                    "lag=" +
-                        std::to_string(election_readiness_blocked_lag_) +
-                        ", max=" +
-                        std::to_string(election_readiness_blocked_max_) +
-                        " (applied_sequence_id=" +
-                        std::to_string(status_.applied_sequence_id) +
-                        ", latest_sequence_id=" +
-                        std::to_string(status_.latest_sequence_id) + ")"));
+                    "ELECTION_READINESS_BLOCKED", std::move(message)));
             }
             if (auto issue = MasterViewMismatchMessageLocked();
                 !issue.empty()) {
@@ -858,6 +876,12 @@ HADoctorReport HAStatusManager::GetDoctorReport() const {
                     MakeDoctorIssue("OPLOG_TRIM_RISK", std::move(issue)));
             }
             for (const auto& [code, message] : doctor_issues_) {
+                // The P2P callback supplies the specific reason; Redis only
+                // knows that ShouldElect rejected the same attempt.
+                if (code == "ELECTION_NOT_READY" &&
+                    election_readiness_.blocked) {
+                    continue;
+                }
                 report.issues.push_back(MakeDoctorIssue(code, message));
             }
             if (auto issue = OpLogQueuePressureMessageLocked();
