@@ -172,6 +172,17 @@ class RealClientTest : public ::testing::Test {
         return config;
     }
 
+    uint64_t RpcCount(const std::string& name) const {
+        auto summary = py_client_->client_->GetSummaryMetrics();
+        EXPECT_TRUE(summary.has_value());
+        if (!summary) return 0;
+        const std::string prefix = "\n" + name + ": count=";
+        const auto pos = summary->find(prefix);
+        return pos == std::string::npos
+                   ? 0
+                   : std::stoull(summary->substr(pos + prefix.size()));
+    }
+
     std::string CreateTempSegmentFile(size_t size) {
         std::string path = "/tmp/mooncake_real_client_segment_XXXXXX";
         int fd = mkstemp(path.data());
@@ -1133,6 +1144,356 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     EXPECT_EQ(std::string(dst, test_data.size()), test_data);
 }
 
+TEST_F(RealClientTest, RangedReadBatchesMetadataAcrossBuffers) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    constexpr size_t object_count = 129;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<std::vector<size_t>> dst_offsets;
+    std::vector<std::vector<size_t>> src_offsets;
+    std::vector<std::vector<size_t>> sizes;
+    for (size_t i = 0; i < object_count; ++i) {
+        keys.push_back("ranged_batch_" + std::to_string(i));
+        values.emplace_back(32, static_cast<char>('A' + i % 26));
+        ASSERT_EQ(
+            py_client_->put(keys.back(), std::span<const char>(values.back())),
+            0);
+        dst_offsets.push_back({i * 4});
+        src_offsets.push_back({4});
+        sizes.push_back({4});
+    }
+    keys.push_back("ranged_batch_missing");
+    dst_offsets.push_back({object_count * 4});
+    src_offsets.push_back({0});
+    sizes.push_back({4});
+    auto destination = py_client_->allocate_client_buffer(keys.size() * 4);
+    auto duplicate = py_client_->allocate_client_buffer(object_count * 4);
+    ASSERT_TRUE(destination.has_value());
+    ASSERT_TRUE(duplicate.has_value());
+    std::memset(destination->ptr(), '?', keys.size() * 4);
+    std::vector<std::vector<size_t>> duplicate_offsets;
+    for (size_t i = 0; i < object_count; ++i) {
+        duplicate_offsets.push_back({i * 4});
+    }
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto results = py_client_->get_into_ranges(
+        {destination->ptr(), duplicate->ptr()},
+        {keys, std::vector<std::string>(object_count, keys.front())},
+        {dst_offsets, duplicate_offsets},
+        {src_offsets, std::vector<std::vector<size_t>>(object_count, {8})},
+        {sizes, std::vector<std::vector<size_t>>(object_count, {4})});
+
+    ASSERT_EQ(results.size(), 2);
+    ASSERT_EQ(results[0].size(), keys.size());
+    for (size_t i = 0; i < object_count; ++i) {
+        EXPECT_EQ(results[0][i], std::vector<int64_t>{4});
+        EXPECT_EQ(
+            std::string(static_cast<char*>(destination->ptr()) + i * 4, 4),
+            values[i].substr(4, 4));
+    }
+    EXPECT_EQ(results[0].back(),
+              std::vector<int64_t>{toInt(ErrorCode::OBJECT_NOT_FOUND)});
+    EXPECT_EQ(std::string(
+                  static_cast<char*>(destination->ptr()) + object_count * 4, 4),
+              "????");
+    ASSERT_EQ(results[1].size(), object_count);
+    for (size_t i = 0; i < object_count; ++i) {
+        EXPECT_EQ(results[1][i], std::vector<int64_t>{4});
+        EXPECT_EQ(std::string(static_cast<char*>(duplicate->ptr()) + i * 4, 4),
+                  values.front().substr(8, 4));
+    }
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    // One planning query for the whole request, however many keys it holds:
+    // duplicate keys share the planned entry across buffers and a lease that
+    // is still fresh is not renewed before the transfer.
+    EXPECT_EQ(RpcCount("BatchGetReplicaList") - batch_before, 1);
+}
+
+TEST_F(RealClientTest, RangedReadQueriesOnlyMissingOrExpiredCacheEntries) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    const std::vector<std::string> keys = {"ranged_cached", "ranged_expired",
+                                           "ranged_uncached",
+                                           "ranged_cached_error"};
+    for (const auto& key : keys) {
+        ASSERT_EQ(py_client_->put(key, std::span<const char>("abcdefgh", 8)),
+                  0);
+    }
+    auto queries = py_client_->batch_query({keys[0], keys[1]});
+    ASSERT_EQ(queries.size(), 2);
+    ASSERT_TRUE(queries[0]);
+    ASSERT_TRUE(queries[1]);
+    PyClient::QueryResultCache cache;
+    cache.emplace(keys[0], queries[0]);
+    cache.emplace(
+        keys[1],
+        QueryResult(
+            std::vector<Replica::Descriptor>(queries[1]->replicas),
+            std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    cache.emplace(keys[3], tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    // A live cache entry must still select its old leased replica, whereas
+    // an expired entry must query the replacement before reading.
+    ASSERT_EQ(py_client_->upsert(keys[0], std::span<const char>("XXXXXXXX", 8)),
+              0);
+    ASSERT_EQ(py_client_->upsert(keys[1], std::span<const char>("12345678", 8)),
+              0);
+    auto destination = py_client_->allocate_client_buffer(16);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', 16);
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto result = py_client_->get_into_ranges(
+        {destination->ptr()}, {keys}, {{{0}, {4}, {8}, {12}}},
+        {{{0}, {2}, {4}, {0}}}, {{{4}, {4}, {4}, {4}}}, &cache);
+    EXPECT_EQ(result,
+              (std::vector<std::vector<std::vector<int64_t>>>{
+                  {{4}, {4}, {4}, {toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 16),
+              "abcd3456efgh????");
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    // One planning query covering the expired and absent entries; the fresh
+    // lease it returns is spent before its midpoint, so nothing is renewed.
+    EXPECT_EQ(RpcCount("BatchGetReplicaList") - batch_before, 1);
+    EXPECT_TRUE(cache.at(keys[1])->IsLeaseExpired());
+    EXPECT_FALSE(cache.contains(keys[2]));
+}
+
+TEST_F(RealClientTest, RangedReadInvalidGroupsDoNotQueryMetadata) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    auto destination = py_client_->allocate_client_buffer(8);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', 8);
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto result = py_client_->get_into_ranges(
+        {nullptr, destination->ptr(), destination->ptr()},
+        {{"null_buffer"}, {"invalid_group"}, {"invalid_ranges"}},
+        {{{0}}, {}, {{0, 4}}}, {{{0}}, {{0}}, {{0}}}, {{{4}}, {{4}}, {{4}}});
+    EXPECT_EQ(result, (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::INVALID_PARAMS)}},
+                          {{toInt(ErrorCode::INVALID_PARAMS)}},
+                          {{toInt(ErrorCode::INVALID_PARAMS),
+                            toInt(ErrorCode::INVALID_PARAMS)}}}));
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    EXPECT_EQ(RpcCount("BatchGetReplicaList"), batch_before);
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 8),
+              "????????");
+}
+
+TEST_F(RealClientTest, RangedReadRenewsFileBackedLeasesAcrossKeys) {
+    // A ranged read resolves every key's metadata before any range runs, so
+    // with a short lease the planned descriptors expire while the request is
+    // still reading, and the file-backed path rejects a read whose lease
+    // expired in flight. The operation must renew its own leases instead.
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_ranged_dfs_lease_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    constexpr uint64_t kLeaseTtlMs = 10;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17826";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    // Many keys, each a cheap read: one range finishes well inside the lease,
+    // but the whole request does not.
+    constexpr size_t kObjectCount = 256;
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kRangeSize = 1024;
+    std::vector<std::string> keys;
+    std::vector<std::string> payloads;
+    keys.reserve(kObjectCount);
+    payloads.reserve(kObjectCount);
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        payloads.emplace_back(kObjectSize, '\0');
+        auto& payload = payloads.back();
+        for (size_t b = 0; b < payload.size(); ++b) {
+            payload[b] = static_cast<char>((i * 131 + b) % 251);
+        }
+        keys.push_back("ranged_dfs_lease_" + std::to_string(i));
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        ASSERT_EQ(py_client_->put(keys.back(), payload, config), 0);
+    }
+    ASSERT_EQ(py_client_->batch_replica_clear(keys, kClientAddress).size(),
+              kObjectCount);
+    for (const auto& key : keys) {
+        const auto replicas = py_client_->get_replica_desc(key);
+        ASSERT_EQ(replicas.size(), 1) << key;
+        ASSERT_TRUE(replicas.front().is_dfs_replica()) << key;
+    }
+
+    auto destination =
+        py_client_->allocate_client_buffer(kObjectCount * kRangeSize);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', kObjectCount * kRangeSize);
+    std::vector<std::vector<size_t>> dst_offsets;
+    std::vector<std::vector<size_t>> src_offsets;
+    std::vector<std::vector<size_t>> sizes;
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        dst_offsets.push_back({i * kRangeSize});
+        src_offsets.push_back({0});
+        sizes.push_back({kRangeSize});
+    }
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto started = std::chrono::steady_clock::now();
+    auto results = py_client_->get_into_ranges(
+        {destination->ptr()}, {keys}, {dst_offsets}, {src_offsets}, {sizes});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), kObjectCount);
+    const auto* bytes = static_cast<const char*>(destination->ptr());
+    size_t failed = 0;
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        ASSERT_EQ(results[0][i].size(), 1) << keys[i];
+        if (results[0][i][0] != static_cast<int64_t>(kRangeSize)) {
+            ++failed;
+            continue;
+        }
+        EXPECT_EQ(std::string(bytes + i * kRangeSize, kRangeSize),
+                  payloads[i].substr(0, kRangeSize))
+            << keys[i];
+    }
+    // Pre-resolution must not turn later file-backed ranges into
+    // LEASE_EXPIRED, and planning must stay a single batch query.
+    EXPECT_EQ(failed, 0u);
+    EXPECT_EQ(RpcCount("BatchGetReplicaList") - batch_before, 1);
+    if (elapsed > std::chrono::milliseconds(kLeaseTtlMs)) {
+        EXPECT_GT(RpcCount("GetReplicaList") - single_before, 0);
+    }
+}
+
+TEST_F(RealClientTest, RangedReadPreservesLiveCallerCacheDescriptor) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_cached_descriptor";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    // A caller descriptor that is well inside its lease. Renewal must extend
+    // what the caller described, not swap in whatever is current.
+    PyClient::QueryResultCache cache;
+    cache.emplace(
+        key, QueryResult(std::vector<Replica::Descriptor>(queries[0]->replicas),
+                         std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(80)));
+    // Replace the object, then let planning run past the renewal threshold so
+    // the request wants to refresh before its first range.
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', original.size());
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto result =
+        py_client_->get_into_ranges({destination->ptr()}, {{key}}, {{{0}}},
+                                    {{{0}}}, {{{original.size()}}}, &cache);
+
+    EXPECT_EQ(result, (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{static_cast<int64_t>(original.size())}}}));
+    EXPECT_EQ(
+        std::string(static_cast<char*>(destination->ptr()), original.size()),
+        original);
+    // The still-live caller descriptor is reused as-is, so nothing is asked of
+    // the Master and the upserted copy is never substituted for it.
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    EXPECT_EQ(RpcCount("BatchGetReplicaList"), batch_before);
+}
+
+TEST_F(RealClientTest, RangedReadRenewsAKeyReachedAfterItsPlanLeaseAged) {
+    // Resolving every key up front hands out one shared lease. A key reached
+    // after that lease has aged must still get nearly a full lease before its
+    // first range, the way the old per-key lazy query did, instead of being
+    // served with whatever the plan-time lease still has left.
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    constexpr uint64_t kLeaseTtlMs = 20;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, "", master_address_),
+              0);
+
+    // Two front keys are read first so the target key is reached once the
+    // plan-time lease has aged past a small slice of it, but well before the
+    // midpoint a lazy policy would wait for.
+    constexpr size_t kFrontRange = 8 * 1024 * 1024;
+    constexpr size_t kTargetRange = 1024 * 1024;
+    std::vector<std::string> keys = {
+        "ranged_late_front_0", "ranged_late_front_1", "ranged_late_target"};
+    std::vector<std::string> payloads;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t size = i < 2 ? kFrontRange : kTargetRange;
+        payloads.emplace_back(size, '\0');
+        auto& payload = payloads.back();
+        for (size_t b = 0; b < payload.size(); b += 4096) {
+            payload[b] = static_cast<char>((i * 37 + b) % 251);
+        }
+        ASSERT_EQ(py_client_->put(keys[i], std::span<const char>(payload)), 0);
+    }
+
+    auto destination =
+        py_client_->allocate_client_buffer(kFrontRange * 2 + kTargetRange);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', kFrontRange * 2 + kTargetRange);
+    const auto single_before = RpcCount("GetReplicaList");
+    auto result = py_client_->get_into_ranges(
+        {destination->ptr()}, {keys}, {{{0}, {kFrontRange}, {kFrontRange * 2}}},
+        {{{0}, {0}, {0}}}, {{{kFrontRange}, {kFrontRange}, {kTargetRange}}});
+
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), keys.size());
+    const auto* bytes = static_cast<const char*>(destination->ptr());
+    size_t offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t size = i < 2 ? kFrontRange : kTargetRange;
+        ASSERT_EQ(result[0][i].size(), 1) << keys[i];
+        EXPECT_EQ(result[0][i][0], static_cast<int64_t>(size)) << keys[i];
+        EXPECT_EQ(std::string(bytes + offset, size), payloads[i]) << keys[i];
+        offset += size;
+    }
+    // The target key was reached after its plan-time lease aged past the
+    // first-range threshold, so a renewal must have been requested before its
+    // read. A lazy policy waits for the midpoint and issues nothing here.
+    EXPECT_GT(RpcCount("GetReplicaList") - single_before, 0);
+}
+
 TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     StartMasterAndSetupClient();
     const std::string key = "ranged_snapshot_upsert";
@@ -1176,6 +1537,7 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
 }
 
 TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
     StartMasterAndSetupClient();
     const std::string key = "ranged_snapshot_expired";
     const std::string data(32, 'A');
@@ -1191,8 +1553,13 @@ TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
     auto destination = py_client_->allocate_client_buffer(data.size());
     ASSERT_TRUE(destination.has_value());
     auto read = [&]() {
-        return py_client_->get_into_ranges_from_snapshot(
+        const auto single_before = RpcCount("GetReplicaList");
+        const auto batch_before = RpcCount("BatchGetReplicaList");
+        auto result = py_client_->get_into_ranges_from_snapshot(
             {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+        EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+        EXPECT_EQ(RpcCount("BatchGetReplicaList"), batch_before);
+        return result;
     };
     EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
                           {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
