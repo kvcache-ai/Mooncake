@@ -475,6 +475,8 @@ add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_teardown_test dummy_client_teardown_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
+add_store_test(real_client_dummy_remount_test
+               real_client_dummy_remount_test.cpp)
 add_test(
   NAME dummy_client_object_checksum_test
   COMMAND
