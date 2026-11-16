@@ -592,6 +592,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             return Ok(CasResult {
                 applied: false,
                 current,
+                delete_version: None,
                 version_floor: None,
             });
         }
@@ -608,6 +609,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(CasResult {
             applied: true,
             current: next.cloned(),
+            delete_version: None,
             version_floor: None,
         })
     }
@@ -1358,6 +1360,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new(owner_id, ClientEpoch(1)),
                 segment_name: SegmentName::new(seg_name),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 4096,

@@ -222,7 +222,9 @@ static int runTarget(TransferEngine* engine) {
     LOG(INFO) << "Target ready. First buffer at " << bufs[0]
               << ". Waiting for initiator (Ctrl+C to stop)...";
 
+#if defined(USE_CUDA) || defined(USE_HIP)
     if (FLAGS_use_device) cudaSetDevice(0);
+#endif
     while (g_running) sleep(1);
 
     LOG(INFO) << "Shutting down target...";
@@ -318,7 +320,8 @@ static int runInitiator(TransferEngine* engine) {
 
     // Open remote segment
     auto segment_id = engine->openSegment(FLAGS_target);
-    if (segment_id < 0) {
+    // SegmentID is unsigned; failures are negative error codes cast to it.
+    if (static_cast<int64_t>(segment_id) < 0) {
         LOG(ERROR) << "openSegment failed for " << FLAGS_target;
         return 1;
     }

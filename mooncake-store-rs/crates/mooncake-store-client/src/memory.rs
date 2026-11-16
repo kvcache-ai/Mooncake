@@ -416,6 +416,31 @@ impl LocalMemoryState {
             .address_at(relative_offset)
     }
 
+    pub(crate) fn storage_slice(
+        &self,
+        segment: &SegmentName,
+        relative_offset: usize,
+        len: usize,
+    ) -> Result<StorageRegionSlice> {
+        let extent = self.storage.get(segment).ok_or_else(|| {
+            StoreError::NotFound(format!("storage segment {} not found", segment.0))
+        })?;
+        let end = relative_offset
+            .checked_add(len)
+            .ok_or_else(|| StoreError::Allocator("storage slice range overflow".to_string()))?;
+        if end > extent.region.capacity {
+            return Err(StoreError::Allocator(format!(
+                "storage slice exceeds segment {}: offset={relative_offset} len={len} capacity={}",
+                segment.0, extent.region.capacity
+            )));
+        }
+        Ok(StorageRegionSlice {
+            region: Arc::clone(&extent.region),
+            offset: relative_offset,
+            len,
+        })
+    }
+
     pub fn copy_storage_target_to(
         &self,
         segment: &SegmentName,
@@ -846,6 +871,25 @@ pub struct RegionAllocation {
 // by the pointer value itself.
 unsafe impl Send for RegionAllocation {}
 unsafe impl Sync for RegionAllocation {}
+
+/// An immutable view into registered storage memory that keeps the backing
+/// region alive while an external I/O operation borrows its bytes.
+#[derive(Clone, Debug)]
+pub(crate) struct StorageRegionSlice {
+    region: Arc<RegisteredRegion>,
+    offset: usize,
+    len: usize,
+}
+
+impl StorageRegionSlice {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        let ptr = unsafe { (self.region.base_addr as *const u8).add(self.offset) };
+        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+    }
+}
 
 fn storage_target_chunks(
     base: *mut c_void,

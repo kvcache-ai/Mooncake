@@ -1,6 +1,6 @@
 use super::super::{
     ClientLease, ClientRuntimeId, LocalMemoryConfig, Result, SharedRestorePromotionQueue,
-    StorageOwnerState, StoreError, DEFAULT_OFFLOAD_POLL_INTERVAL,
+    StorageOwnerState, StoreError,
 };
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ impl AsyncOffloadHandle {
         }
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
         let stable_id = runtime.stable_id.0.clone();
-        let interval = DEFAULT_OFFLOAD_POLL_INTERVAL;
+        let interval = storage_owner.cold_tier_devices.offload_poll_interval();
         let thread = std::thread::Builder::new()
             .name(format!("mooncake-async-offload-{stable_id}"))
             .spawn(move || {

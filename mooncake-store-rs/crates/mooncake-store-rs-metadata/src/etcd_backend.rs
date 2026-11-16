@@ -1194,6 +1194,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     return Ok(CasResult {
                         applied: false,
                         current,
+                        delete_version: None,
                         version_floor: None,
                     });
                 }
@@ -1215,6 +1216,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                         return Ok(CasResult {
                             applied: true,
                             current: None,
+                            delete_version: None,
                             version_floor: None,
                         });
                     }
@@ -1235,6 +1237,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     return Ok(CasResult {
                         applied: true,
                         current: next.cloned(),
+                        delete_version: None,
                         version_floor: None,
                     });
                 }
@@ -2785,6 +2788,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: sample_runtime(),
                 segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
                 offset: Some(32),
                 segment_offset: 32,
                 length: 12,

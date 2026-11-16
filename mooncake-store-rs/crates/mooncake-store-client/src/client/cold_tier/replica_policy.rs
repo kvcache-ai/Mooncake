@@ -1,6 +1,17 @@
 //! Provider-neutral replica placement and read load-balancing policy.
 
-use std::cmp::Ordering;
+// Capacity snapshots are updated asynchronously. Treat sub-per-mille score drift as the same
+// tier so the process-local byte counter, rather than a stale capacity sample, keeps equal-class
+// devices balanced. Material score and restore-load differences still win before this tie-breaker.
+const WRITE_SCORE_BUCKET_WIDTH: f64 = 1e-3;
+
+fn write_score_bucket(score: f64) -> i64 {
+    if score.is_finite() {
+        (score / WRITE_SCORE_BUCKET_WIDTH).round() as i64
+    } else {
+        0
+    }
+}
 
 /// Provider-computed write suitability for one replica target.
 ///
@@ -11,7 +22,7 @@ use std::cmp::Ordering;
 pub(in crate::client) struct ReplicaWriteCandidate<'a> {
     pub target_id: &'a str,
     pub score: f64,
-    pub accumulated_writes: u64,
+    pub accumulated_write_bytes: u64,
 }
 
 /// Load snapshot for one readable replica target.
@@ -53,11 +64,12 @@ impl ReplicaLoadBalanceStrategy for DefaultReplicaLoadBalanceStrategy {
         selected.sort_by(|left, right| {
             let left = &candidates[*left];
             let right = &candidates[*right];
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.accumulated_writes.cmp(&right.accumulated_writes))
+            write_score_bucket(right.score)
+                .cmp(&write_score_bucket(left.score))
+                .then_with(|| {
+                    left.accumulated_write_bytes
+                        .cmp(&right.accumulated_write_bytes)
+                })
                 .then_with(|| left.target_id.cmp(right.target_id))
         });
         selected.truncate(replica_count);
@@ -92,17 +104,17 @@ mod tests {
             ReplicaWriteCandidate {
                 target_id: "target-c",
                 score: 0.5,
-                accumulated_writes: 0,
+                accumulated_write_bytes: 0,
             },
             ReplicaWriteCandidate {
                 target_id: "target-b",
                 score: 0.8,
-                accumulated_writes: 0,
+                accumulated_write_bytes: 0,
             },
             ReplicaWriteCandidate {
                 target_id: "target-a",
                 score: 0.8,
-                accumulated_writes: 0,
+                accumulated_write_bytes: 0,
             },
         ];
 
@@ -113,17 +125,59 @@ mod tests {
     }
 
     #[test]
-    fn write_selection_uses_accumulated_writes_when_scores_are_equal() {
+    fn write_selection_uses_accumulated_bytes_when_scores_are_equal() {
         let candidates = [
             ReplicaWriteCandidate {
                 target_id: "target-a",
                 score: 0.0,
-                accumulated_writes: 4,
+                accumulated_write_bytes: 4096,
             },
             ReplicaWriteCandidate {
                 target_id: "target-b",
                 score: 0.0,
-                accumulated_writes: 1,
+                accumulated_write_bytes: 1024,
+            },
+        ];
+
+        assert_eq!(
+            DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn write_selection_uses_accumulated_bytes_when_scores_are_nearly_equal() {
+        let candidates = [
+            ReplicaWriteCandidate {
+                target_id: "target-a",
+                score: 0.800_003,
+                accumulated_write_bytes: 4096,
+            },
+            ReplicaWriteCandidate {
+                target_id: "target-b",
+                score: 0.8,
+                accumulated_write_bytes: 1024,
+            },
+        ];
+
+        assert_eq!(
+            DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn write_selection_ignores_stale_sub_per_mille_capacity_drift() {
+        let candidates = [
+            ReplicaWriteCandidate {
+                target_id: "target-a",
+                score: 0.800_3,
+                accumulated_write_bytes: 54 * 1024,
+            },
+            ReplicaWriteCandidate {
+                target_id: "target-b",
+                score: 0.8,
+                accumulated_write_bytes: 0,
             },
         ];
 

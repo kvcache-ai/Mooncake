@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include "tent/common/cuda_fabric_compat.h"
 
+#include <atomic>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -34,28 +35,38 @@
 namespace mooncake {
 namespace tent {
 
+struct MnnvlCompletion {
+    MnnvlCompletion() = default;
+    MnnvlCompletion(const MnnvlCompletion &) = delete;
+    MnnvlCompletion &operator=(const MnnvlCompletion &) = delete;
+    cudaEvent_t event{nullptr};
+    int device{-1};
+    cudaError_t result{cudaErrorNotReady};
+    ~MnnvlCompletion();
+};
+
 struct MnnvlTask {
     Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
+    TransferStatusEnum status_word{PENDING};
+    size_t transferred_bytes{0};
     uint64_t target_addr = 0;
-    cudaEvent_t completion_event = nullptr;
+    size_t completion_group{0};
 };
 
 struct MnnvlSubBatch : public Transport::SubBatch {
     std::vector<MnnvlTask> task_list;
-    size_t max_size;
+    size_t max_size{0};
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
     int stream_device_id = -1;
-    // Completion events created in startTransfer (one per submit). Destroyed by
-    // the destructor (RAII); Slab<T>::deallocate() invokes ~MnnvlSubBatch()
-    // before reusing the storage, so this runs on every free.
-    std::vector<cudaEvent_t> completion_events;
-    ~MnnvlSubBatch() {
-        for (auto event : completion_events) cudaEventDestroy(event);
+    mutable std::mutex mutex;
+    // One independently owned event per submission, even for appended work.
+    std::vector<std::unique_ptr<MnnvlCompletion>> completion_groups;
+    ~MnnvlSubBatch();
+    size_t size() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return task_list.size();
     }
-    virtual size_t size() const { return task_list.size(); }
 };
 
 class MnnvlTransport : public Transport {
@@ -87,6 +98,7 @@ class MnnvlTransport : public Transport {
                                    const MemoryOptions &options);
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
+    bool tracksLocalBuffer(const BufferDesc &desc) const override;
 
     virtual const char *getName() const { return "mnnvl"; }
 
@@ -96,7 +108,10 @@ class MnnvlTransport : public Transport {
     virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
-    void startTransfer(std::vector<MnnvlTask *> &tasks, MnnvlSubBatch *batch);
+    void startTransfer(std::vector<MnnvlTask *> &tasks,
+                       std::vector<void *> &srcs, std::vector<void *> &dsts,
+                       std::vector<size_t> &sizes, MnnvlSubBatch *batch,
+                       MnnvlCompletion &completion);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
@@ -110,11 +125,13 @@ class MnnvlTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
-    CudaPlatform *platform_;
+    CudaPlatform *platform_{nullptr};
 
     struct OpenedMnnvlEntry {
         void *mnnvl_addr;
-        uint64_t length;
+        uint64_t length;  // Logical range used by cache lookups.
+        uint64_t mapped_length;
+        uint64_t mapping_offset;
         int cuda_id;
     };
 
@@ -124,6 +141,8 @@ class MnnvlTransport : public Transport {
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
+    // Tags thread-local relocation caches; renewed on uninstall.
+    std::atomic<uint64_t> relocate_epoch_;
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
@@ -136,7 +155,13 @@ class MnnvlTransport : public Transport {
     bool supported_;
     CUmemAllocationHandleType handle_type_;
 
-    bool host_register_;
+    bool host_register_{true};
+    mutable std::mutex registration_mutex_;
+    struct HostPin {
+        size_t length;
+        std::shared_ptr<const uint8_t> owner;
+    };
+    std::unordered_map<uint64_t, HostPin> pinned_host_buffers_;
     // transports/mnnvl/egm: export HOST_NUMA (EGM) allocations so peers can
     // read/write host memory over NVLink; adds dram_to_dram / gpu_to_dram.
     bool egm_enabled_ = false;
