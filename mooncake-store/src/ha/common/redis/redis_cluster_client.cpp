@@ -651,7 +651,10 @@ RedisClusterClient::Lease RedisClusterClient::Execute(
         endpoint = Address(*parsed_endpoint);
         asking = kind == "ASK";
         lease.routing_error = RoutingError::UnknownTarget;
-        if (!asking && slots_[slot].primary != endpoint) break;
+        if (!asking && slots_[slot].primary != endpoint &&
+            shards_.find(endpoint) == shards_.end()) {
+            break;
+        }
     }
     lease.reply.reset();
     topology_valid_ = false;
@@ -707,7 +710,8 @@ tl::expected<size_t, ErrorCode> RedisClusterClient::Wait(
                                 : slotless ? slotless->membership
                                            : "";
         if (membership != lease.membership ||
-            slots_[lease.slot].primary != lease.slot_owner) {
+            (slots_[lease.slot].primary != lease.slot_owner &&
+             slots_[lease.slot].primary != lease.endpoint)) {
             lease.routing_error = RoutingError::MembershipChanged;
             return tl::make_unexpected(kError);
         }

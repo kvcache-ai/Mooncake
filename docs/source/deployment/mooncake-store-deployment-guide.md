@@ -223,8 +223,14 @@ mooncake_master \
   --enable_ha=true \
   --ha_backend_type=redis \
   --ha_backend_connstring="redis://127.0.0.1:6379" \
+  --ha_redis_expected_replicas_per_shard=2 \
   --rpc_address=10.0.0.1
 ```
+
+This example expects each Redis shard to have two replicas in addition to its
+primary. Configure the Redis replication topology to match
+`--ha_redis_expected_replicas_per_shard`; the value must be positive and the
+replica count must match on every shard.
 
 **Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. The build must include `STORE_USE_REDIS`.
 
