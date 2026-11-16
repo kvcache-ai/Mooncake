@@ -162,16 +162,14 @@ TEST_F(ClientSessionRegistryTest, OperationsOnOneClientRunConcurrently) {
     // (and requests that hold it as a replication source) stay parallel.
     auto second = std::async(std::launch::async, [&] {
         return registry.TryAcquireRetainingSession(kClient).has_value() &&
-               AcquireSharedOperation(registry, kClient, slot);
+               AcquireSharedOperation(slot);
     });
     EXPECT_EQ(second.wait_for(1s), std::future_status::ready);
     EXPECT_TRUE(second.get());
     // Transitions still wait for every operation admitted before them.
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, slot,
-                                           /*try_lock=*/true));
+    EXPECT_FALSE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
     first.reset();
-    EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, slot,
-                                          /*try_lock=*/true));
+    EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
     EXPECT_EQ(record->state(), State::ACTIVE);
 }
 
@@ -841,25 +839,24 @@ TEST_F(ClientSessionRegistryTest, WaitingAdmissionRejectsRolledBackRecord) {
 TEST_F(ClientSessionRegistryTest,
        CurrentOperationValidatesIdentityNotLiveness) {
     ClientSessionRegistry registry;
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, {}));
+    EXPECT_FALSE(AcquireExclusiveOperation({}));
     auto old = Register(registry);
     auto old_slot = FindSlot(registry, kClient);
-    EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, old_slot));
+    EXPECT_TRUE(AcquireExclusiveOperation(old_slot));
     ASSERT_TRUE(registry.Remove(kClient, old));
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, old_slot));
+    EXPECT_FALSE(AcquireExclusiveOperation(old_slot));
     auto current = Register(registry);
     auto current_slot = FindSlot(registry, kClient);
     EXPECT_NE(old_slot, current_slot);
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, old_slot));
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, old_slot,
-                                           /*try_lock=*/true));
-    EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, current_slot));
+    EXPECT_FALSE(AcquireExclusiveOperation(old_slot));
+    EXPECT_FALSE(AcquireExclusiveOperation(old_slot, /*try_lock=*/true));
+    EXPECT_TRUE(AcquireExclusiveOperation(current_slot));
     Suspect(current);
     Retire(current);
     // OFFLINE slots still belong to the registry until cleanup completes.
     // Operation validation must not prevent their removal.
     EXPECT_EQ(current->state(), State::OFFLINE);
-    EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, current_slot));
+    EXPECT_TRUE(AcquireExclusiveOperation(current_slot));
     EXPECT_FALSE(registry.TryAcquireRetainingSession(kClient));
     EXPECT_TRUE(registry.Remove(kClient, current));
 }
@@ -872,14 +869,12 @@ TEST_F(ClientSessionRegistryTest, CurrentOperationTryLockDoesNotWait) {
     {
         auto remount = registry.BeginRemount(kClient);
         acquired = std::async(std::launch::async, [&] {
-            return AcquireExclusiveOperation(registry, kClient, slot,
-                                             /*try_lock=*/true);
+            return AcquireExclusiveOperation(slot, /*try_lock=*/true);
         });
         EXPECT_EQ(acquired.wait_for(1s), std::future_status::ready);
     }
     EXPECT_FALSE(acquired.get());
-    EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, slot,
-                                          /*try_lock=*/true));
+    EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
 }
 
 TEST_F(ClientSessionRegistryTest, RemovedSlotIsReleasedDespiteRetainedRecord) {
@@ -1010,8 +1005,7 @@ TEST_F(ClientSessionRegistryTest,
             EXPECT_TRUE(registry.GetHostId(kClient).empty());
             EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
             // Retirement runs after releasing the slot operation lock.
-            EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, slot,
-                                                  /*try_lock=*/true));
+            EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
             retired_session = std::move(session);
             retired = true;
         });

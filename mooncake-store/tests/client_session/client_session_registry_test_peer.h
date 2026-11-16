@@ -50,7 +50,7 @@ class ClientSessionRegistryTestPeer {
     }
 
     static void Poll(ClientSessionRegistry& registry, Clock::time_point now) {
-        registry.ExpireSessions(now);
+        ExpireSessions(registry, now);
     }
 
     static Slot FindSlot(const ClientSessionRegistry& registry,
@@ -58,20 +58,12 @@ class ClientSessionRegistryTestPeer {
         return registry.FindSlot(client_id);
     }
 
-    static bool AcquireExclusiveOperation(const ClientSessionRegistry& registry,
-                                          const UUID& client_id,
-                                          const Slot& slot,
+    static bool AcquireExclusiveOperation(const Slot& slot,
                                           bool try_lock = false) {
-        (void)registry;
-        (void)client_id;
         return slot ? slot->AcquireExclusive(try_lock).has_value() : false;
     }
 
-    static bool AcquireSharedOperation(const ClientSessionRegistry& registry,
-                                       const UUID& client_id,
-                                       const Slot& slot) {
-        (void)registry;
-        (void)client_id;
+    static bool AcquireSharedOperation(const Slot& slot) {
         return slot ? slot->AcquireShared().has_value() : false;
     }
 };

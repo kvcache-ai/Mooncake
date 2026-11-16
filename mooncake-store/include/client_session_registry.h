@@ -113,8 +113,11 @@ class ClientSessionRegistry {
     // Drops every session. Only allowed once the expiry driver is stopped.
     void Reset();
 
-    // Driven by one monitor thread. Retirement callbacks run after releasing
-    // the slot operation, so resource cleanup never nests inside admission.
+    // Driven by one monitor thread. One deterministic expiry pass applies TTLs
+    // to expired sessions while excluding operations; a busy slot is retried
+    // and eventually waited for so continuous admission cannot starve expiry.
+    // Skipped while restore/reset holds lifecycle_mutex_; retirement callbacks
+    // run after releasing the slot operation lock.
     void ExpireSessions(Clock::time_point now);
 
    private:
@@ -204,28 +207,24 @@ class ClientSessionRegistry {
     // These helpers require the registry lock on entry.
     Slot FindSlotLocked(const UUID& client_id) const;
     void AdoptSlot(const UUID& client_id, const Slot& slot);
-    void ClearRemountState(const Slot& slot);
+    void SetSlotHostIdLocked(const Slot& slot, std::string host_id);
+    void ClearSlotStateLocked(const Slot& slot);
     // Requires exclusive lifecycle access.
     void AdoptRecords(const Records& records);
     // Requires a validated current slot operation and lifecycle access.
     void EraseSlot(const UUID& client_id, const Slot& slot,
                    const ExclusiveOperation& operation);
-    void ClearSlots();
 
     // Ping at an explicit time.
     ClientStatus Observe(const UUID& client_id, Clock::time_point now);
+    bool ObserveSlot(const UUID& client_id, const Slot& slot,
+                     Clock::time_point now);
     // Gauges for a transition this registry just caused. The
     // caller excludes EraseSlot, through the slot's exclusive operation or the
     // registry lock, so a removed session is counted in exactly one state.
     void PublishTransition(const UUID& client_id, const Slot& slot,
                            ClientLivenessState previous,
                            ClientLivenessState current);
-    // One deterministic expiry pass. Applies the TTLs to every session,
-    // excluding its operations for the evaluation. A busy session is retried
-    // on the next pass; one that stays busy is eventually waited for, so
-    // continuous admission cannot postpone it forever. The whole pass is
-    // skipped while restore/reset holds the lifecycle barrier -- expiry is
-    // frozen there, heartbeats and lookups are not.
 
     // Membership-changing operations take this before any other lock.
     // Registration/removal share it; restore/reset own it exclusively.

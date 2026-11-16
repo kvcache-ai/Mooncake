@@ -28,10 +28,7 @@ ClientSessionRegistry::ClientSessionRegistry(
       reserve_retirement_(std::move(reserve_retirement)),
       retire_(std::move(retire)) {}
 
-ClientSessionRegistry::~ClientSessionRegistry() {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
-    ClearSlots();
-}
+ClientSessionRegistry::~ClientSessionRegistry() { Reset(); }
 
 void ClientSessionRegistry::PublishTransition(const UUID& client_id,
                                               const Slot& slot,
@@ -73,9 +70,8 @@ void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
     // hint seen by an old or offline incarnation must not land on it or its
     // successor.
     std::unique_lock lock(mutex_);
-    if (FindSlotLocked(client_id) == slot &&
-        slot->liveness->ShouldRetainResources()) {
-        slot->host_id = host_id;
+    if (FindSlotLocked(client_id) == slot) {
+        SetSlotHostIdLocked(slot, host_id);
     }
 }
 
@@ -244,9 +240,7 @@ void ClientSessionRegistry::Registration::UpdateHostId(
     }
     if (committed_) {
         std::unique_lock lock(registry_.mutex_);
-        if (slot_->liveness->ShouldRetainResources()) {
-            slot_->host_id = host_id;
-        }
+        registry_.SetSlotHostIdLocked(slot_, host_id);
     } else {
         pending_host_id_ = host_id;
     }
@@ -259,31 +253,20 @@ void ClientSessionRegistry::Registration::Commit() {
         // Sample after lock acquisition and resource installation so neither
         // consumes the successfully registered client's active TTL. Keep an
         // explicit timestamp only for deterministic tests.
-        const auto now = observed_at_.value_or(Clock::now());
-        if (slot_->liveness->Observe(now) ==
-            ClientLivenessObservation::RECOVERED_ACTIVE) {
-            registry_.PublishTransition(client_id_, slot_,
-                                        ClientLivenessState::SUSPECTED,
-                                        ClientLivenessState::ACTIVE);
+        (void)registry_.ObserveSlot(client_id_, slot_,
+                                    observed_at_.value_or(Clock::now()));
+    }
+    if (kind_ == RegistrationKind::Remount || pending_host_id_) {
+        std::unique_lock lock(registry_.mutex_);
+        if (kind_ == RegistrationKind::Remount &&
+            slot_->liveness->ShouldRetainResources() &&
+            !std::exchange(slot_->remount_completed, true)) {
+            MasterMetricManager::instance().inc_active_clients();
         }
         if (pending_host_id_) {
-            std::unique_lock lock(registry_.mutex_);
-            if (slot_->liveness->ShouldRetainResources()) {
-                slot_->host_id = std::move(*pending_host_id_);
-            }
+            registry_.SetSlotHostIdLocked(slot_, std::move(*pending_host_id_));
             pending_host_id_.reset();
         }
-    } else {
-        std::unique_lock lock(registry_.mutex_);
-        if (slot_->liveness->ShouldRetainResources()) {
-            if (!std::exchange(slot_->remount_completed, true)) {
-                MasterMetricManager::instance().inc_active_clients();
-            }
-            if (pending_host_id_) {
-                slot_->host_id = std::move(*pending_host_id_);
-            }
-        }
-        pending_host_id_.reset();
     }
     committed_ = true;
 }
@@ -322,6 +305,21 @@ ClientStatus ClientSessionRegistry::Ping(const UUID& client_id) {
     return Observe(client_id, Clock::now());
 }
 
+bool ClientSessionRegistry::ObserveSlot(const UUID& client_id, const Slot& slot,
+                                        Clock::time_point now) {
+    switch (slot->liveness->Observe(now)) {
+        case ClientLivenessObservation::REJECTED_OFFLINE:
+            return false;
+        case ClientLivenessObservation::RECOVERED_ACTIVE:
+            PublishTransition(client_id, slot, ClientLivenessState::SUSPECTED,
+                              ClientLivenessState::ACTIVE);
+            return true;
+        case ClientLivenessObservation::REFRESHED_ACTIVE:
+            return true;
+    }
+    return false;
+}
+
 ClientStatus ClientSessionRegistry::Observe(const UUID& client_id,
                                             Clock::time_point now) {
     // Never the long operation lock. The registry lock covers the observation
@@ -329,18 +327,8 @@ ClientStatus ClientSessionRegistry::Observe(const UUID& client_id,
     // or not at all.
     std::shared_lock lock(mutex_);
     const auto slot = FindSlotLocked(client_id);
-    if (!slot) {
+    if (!slot || !ObserveSlot(client_id, slot, now)) {
         return ClientStatus::NEED_REMOUNT;
-    }
-    switch (slot->liveness->Observe(now)) {
-        case ClientLivenessObservation::REJECTED_OFFLINE:
-            return ClientStatus::NEED_REMOUNT;
-        case ClientLivenessObservation::RECOVERED_ACTIVE:
-            PublishTransition(client_id, slot, ClientLivenessState::SUSPECTED,
-                              ClientLivenessState::ACTIVE);
-            break;
-        case ClientLivenessObservation::REFRESHED_ACTIVE:
-            break;
     }
     return slot->remount_completed ? ClientStatus::OK
                                    : ClientStatus::NEED_REMOUNT;
@@ -373,10 +361,18 @@ void ClientSessionRegistry::AdoptSlot(const UUID& client_id, const Slot& slot) {
     MasterMetricManager::instance().client_liveness_record_created();
 }
 
-void ClientSessionRegistry::ClearRemountState(const Slot& slot) {
+void ClientSessionRegistry::SetSlotHostIdLocked(const Slot& slot,
+                                                std::string host_id) {
+    if (!host_id.empty() && slot->liveness->ShouldRetainResources()) {
+        slot->host_id = std::move(host_id);
+    }
+}
+
+void ClientSessionRegistry::ClearSlotStateLocked(const Slot& slot) {
     if (std::exchange(slot->remount_completed, false)) {
         MasterMetricManager::instance().dec_active_clients();
     }
+    slot->host_id.clear();
 }
 
 void ClientSessionRegistry::AdoptRecords(const Records& records) {
@@ -397,21 +393,17 @@ void ClientSessionRegistry::EraseSlot(const UUID& client_id, const Slot& slot,
     CHECK(FindSlotLocked(client_id) == slot);
     MasterMetricManager::instance().on_client_liveness_record_removed(
         slot->liveness->state());
-    ClearRemountState(slot);
+    ClearSlotStateLocked(slot);
     slots_.erase(client_id);
 }
 
-void ClientSessionRegistry::ClearSlots() {
+void ClientSessionRegistry::Reset() {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
     for (const auto& [client_id, slot] : SnapshotSlots()) {
         if (auto operation = slot->AcquireExclusive()) {
             EraseSlot(client_id, slot, *operation);
         }
     }
-}
-
-void ClientSessionRegistry::Reset() {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
-    ClearSlots();
 }
 
 void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
@@ -443,12 +435,10 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
             continue;
         }
         slot->busy_expiry_passes = 0;
-        switch (slot->liveness->EvaluateAndRetire(
-            now, active_ttl_, suspicion_ttl_,
-            [this] {
+        switch (
+            slot->liveness->Evaluate(now, active_ttl_, suspicion_ttl_, [this] {
                 if (reserve_retirement_) reserve_retirement_();
-            },
-            [] {})) {
+            })) {
             case ClientLivenessTransition::NONE:
                 break;
             case ClientLivenessTransition::BECAME_SUSPECTED:
@@ -461,8 +451,7 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
                 // still held, so the slot is the current one.
                 {
                     std::unique_lock lock(mutex_);
-                    ClearRemountState(slot);
-                    slot->host_id.clear();
+                    ClearSlotStateLocked(slot);
                 }
                 PublishTransition(client_id, slot,
                                   ClientLivenessState::SUSPECTED,
