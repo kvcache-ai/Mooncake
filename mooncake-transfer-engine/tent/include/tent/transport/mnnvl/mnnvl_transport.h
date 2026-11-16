@@ -26,6 +26,7 @@
 #include <queue>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
@@ -84,6 +85,8 @@ class MnnvlTransport : public Transport {
 
     virtual Status uninstall();
 
+    virtual Status quiesce();
+
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef &batch);
@@ -102,6 +105,13 @@ class MnnvlTransport : public Transport {
 
     virtual const char *getName() const { return "mnnvl"; }
 
+    bool strictFabricEgm() const {
+        return installed_ && egm_enabled_ && egm_strict_ &&
+               handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC;
+    }
+    Status getEgmNumaNodes(std::vector<int> &nodes, bool nearest);
+    Status getEgmGranularity(int node, size_t &granularity);
+
     virtual Status allocateLocalMemory(void **addr, size_t size,
                                        MemoryOptions &options);
 
@@ -118,6 +128,11 @@ class MnnvlTransport : public Transport {
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
 
+    static Status ensureCudaContext();
+
+    Status getLocalAllocationRange(uint64_t address, size_t length,
+                                   uint64_t &base, size_t &size);
+
     Status setPeerAccess();
 
    private:
@@ -128,12 +143,20 @@ class MnnvlTransport : public Transport {
     CudaPlatform *platform_{nullptr};
 
     struct OpenedMnnvlEntry {
-        void *mnnvl_addr;
-        uint64_t length;  // Logical range used by cache lookups.
-        uint64_t mapped_length;
-        uint64_t mapping_offset;
-        int cuda_id;
+        void *mnnvl_addr = nullptr;
+        uint64_t length = 0;  // Logical range used by cache lookups.
+        uint64_t mapped_length = 0;
+        uint64_t mapping_offset = 0;
+        int cuda_id = -1;
+        // Handle the mapping was imported from; a peer that re-registers the
+        // same address publishes a different one.
+        std::string mnnvl_handle;
     };
+
+    Status importRemoteBuffer(const BufferDesc &buffer,
+                              OpenedMnnvlEntry &entry);
+
+    static void releaseImportedEntry(const OpenedMnnvlEntry &entry);
 
     using HashMap =
         std::unordered_map<SegmentID,
@@ -141,16 +164,34 @@ class MnnvlTransport : public Transport {
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
-    // Tags thread-local relocation caches; renewed on uninstall.
+    // Tags thread-local relocation caches; renewed whenever relocate_map_
+    // changes and on uninstall.
     std::atomic<uint64_t> relocate_epoch_;
+    // Mappings replaced by a re-imported peer buffer. In-flight copies may
+    // still target them, so they are only unmapped by uninstall().
+    std::vector<OpenedMnnvlEntry> retired_entries_;
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
 
+    std::mutex batch_mutex_;
+    std::unordered_set<MnnvlSubBatch *> active_batches_;
+    // Each POSIX export has its own published pid-fd handle. Different
+    // registrations can share a VMM allocation without sharing an FD.
+    // Guarded by registration_mutex_.
+    std::unordered_map<std::string, int> exported_fds_;
+
     std::mutex allocate_mutex_;
-    // VMM allocations owned by this transport: base address -> mapped extent
-    // (rounded to the allocation granularity), needed to unmap on free.
-    std::unordered_map<void *, size_t> allocate_set_;
+    struct LocalAllocation {
+        void *addr = nullptr;
+        size_t size = 0;
+        CUmemGenericAllocationHandle handle = 0;
+        bool mapped = false;
+    };
+    // Retain every unfinished VMM cleanup stage, including early failures.
+    std::unordered_map<void *, LocalAllocation> allocate_set_;
+    std::vector<LocalAllocation> failed_allocations_;
+    static Status releaseLocalAllocation(LocalAllocation &allocation);
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;
@@ -165,6 +206,11 @@ class MnnvlTransport : public Transport {
     // transports/mnnvl/egm: export HOST_NUMA (EGM) allocations so peers can
     // read/write host memory over NVLink; adds dram_to_dram / gpu_to_dram.
     bool egm_enabled_ = false;
+    // transports/mnnvl/egm_strict: host memory must really be EGM. Host
+    // allocation fails instead of falling back to plain memory, and an
+    // explicit MNNVL registration (MemoryOptions::type == MNNVL) of a host
+    // buffer that cannot be exported fails instead of staying local-only.
+    bool egm_strict_ = false;
 };
 }  // namespace tent
 }  // namespace mooncake
