@@ -845,23 +845,23 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     // that latch sticky "Device is not active" (#5481).
     if (multi_transports_) {
         uint64_t region_length = 0;
-        if (!lookupLocalRegionLength(addr, &region_length)) {
-            LOG(ERROR) << "unregisterLocalMemory: address is not a registered "
-                          "base, refusing deregister addr="
-                       << addr;
-            return ERR_ADDRESS_NOT_REGISTERED;
-        }
-        Status st = multi_transports_->waitMemoryIdle(
-            addr, static_cast<size_t>(region_length), /*timeout_ms=*/5000);
-        if (st.IsBatchBusy()) {
-            LOG(ERROR) << "unregisterLocalMemory: buffer still in flight, "
-                          "refusing deregister addr="
-                       << addr;
-            return ERR_BATCH_BUSY;
-        }
-        if (!st.ok()) {
-            LOG(WARNING) << "unregisterLocalMemory waitMemoryIdle: "
-                         << st.ToString();
+        // Unknown addresses keep the transport's own not-registered contract.
+        // Quiesce only a base this engine actually registered.
+        if (lookupLocalRegionLength(addr, &region_length)) {
+            Status st = multi_transports_->waitMemoryIdle(
+                addr, static_cast<size_t>(region_length),
+                /*timeout_ms=*/5000);
+            if (st.IsBatchBusy()) {
+                LOG(ERROR)
+                    << "unregisterLocalMemory: buffer still in flight, "
+                       "refusing deregister addr="
+                    << addr;
+                return ERR_BATCH_BUSY;
+            }
+            if (!st.ok()) {
+                LOG(WARNING) << "unregisterLocalMemory waitMemoryIdle: "
+                             << st.ToString();
+            }
         }
     }
 
@@ -1084,12 +1084,7 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
     if (multi_transports_) {
         for (auto* addr : addr_list) {
             uint64_t region_length = 0;
-            if (!lookupLocalRegionLength(addr, &region_length)) {
-                LOG(ERROR) << "unregisterLocalMemoryBatch: address is not a "
-                              "registered base, refusing deregister addr="
-                           << addr;
-                return ERR_ADDRESS_NOT_REGISTERED;
-            }
+            if (!lookupLocalRegionLength(addr, &region_length)) continue;
             Status st = multi_transports_->waitMemoryIdle(
                 addr, static_cast<size_t>(region_length),
                 /*timeout_ms=*/5000);
@@ -1098,6 +1093,10 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
                               "flight, refusing deregister addr="
                            << addr;
                 return ERR_BATCH_BUSY;
+            }
+            if (!st.ok()) {
+                LOG(WARNING) << "unregisterLocalMemoryBatch waitMemoryIdle: "
+                             << st.ToString();
             }
         }
     }
@@ -1187,8 +1186,7 @@ void TransferEngineImpl::releaseMemoryRegions(
     }
 }
 
-bool TransferEngineImpl::lookupLocalRegionLength(void* addr,
-                                                 uint64_t* length) {
+bool TransferEngineImpl::lookupLocalRegionLength(void* addr, uint64_t* length) {
     if (!addr || !length) return false;
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = local_memory_regions_.find(reinterpret_cast<uintptr_t>(addr));
