@@ -1445,6 +1445,11 @@ int TransferEnginePy::batchUnregisterMemory(
     return engine_->unregisterLocalMemoryBatch(buffers);
 }
 
+int TransferEnginePy::enableSharedMemoryRegistration() {
+    if (!engine_) return ERR_INVALID_ARGUMENT;
+    return engine_->enableSharedMemoryRegistration();
+}
+
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
@@ -2061,6 +2066,8 @@ PYBIND11_MODULE(engine, m) {
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
+            .def("enable_shared_memory_registration",
+                 &TransferEnginePy::enableSharedMemoryRegistration)
             .def("register_memory", &TransferEnginePy::registerMemory,
                  py::arg("buffer_addr"), py::arg("capacity"),
                  py::arg("location") = kWildcardLocation,

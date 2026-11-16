@@ -591,6 +591,12 @@ Reads bytes from a buffer at the specified address and returns them as a Python 
 
 ### Memory Registration
 
+#### enable_shared_memory_registration()
+
+Enables {ref}`shared registrations <shared-memory-registration>` on a classic
+engine. Call before registering buffers or sharing the engine with Store.
+Returns `0` on success, a negative error code otherwise.
+
 #### register_memory()
 
 ```python
