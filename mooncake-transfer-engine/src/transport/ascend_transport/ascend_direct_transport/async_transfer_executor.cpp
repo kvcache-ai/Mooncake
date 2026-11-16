@@ -293,9 +293,11 @@ void AsyncTransferExecutor::processOneBatch(QueryBatch& batch,
         result.done = true;
         result.fail_entire_route = true;
         result.adxl_already_disconnected = true;
-        result.fail_reason = "Get transfer status failed, ret: " +
-                             std::to_string(static_cast<int>(ret)) +
-                             ", errmsg: " + aclGetRecentErrMsg();
+        const char* acl_error = aclGetRecentErrMsg();
+        result.fail_reason =
+            "Get transfer status failed, ret: " +
+            std::to_string(static_cast<int>(ret)) +
+            ", errmsg: " + (acl_error != nullptr ? acl_error : "unavailable");
         return;
     }
 

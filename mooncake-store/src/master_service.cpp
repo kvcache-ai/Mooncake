@@ -17,6 +17,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <regex>
@@ -4841,10 +4842,25 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
                                                             key);
-                for (const auto& segment_name : host_ordered_segments) {
-                    append_preferred_segment(segment_name);
-                }
                 if (!host_ordered_segments.empty()) {
+                    // Keep the vector's preference order while avoiding a
+                    // growing linear search for every host-ordered name.
+                    const size_t max_size = preferred_segments.size() +
+                                            host_ordered_segments.size();
+                    // Reserve before taking views so appends cannot move the
+                    // existing preference strings, including SSO strings.
+                    preferred_segments.reserve(max_size);
+                    std::unordered_set<std::string_view> seen;
+                    seen.reserve(max_size);
+                    seen.insert(preferred_segments.begin(),
+                                preferred_segments.end());
+                    for (const auto& segment_name : host_ordered_segments) {
+                        if (!segment_name.empty() &&
+                            seen.insert(std::string_view{segment_name})
+                                .second) {
+                            preferred_segments.push_back(segment_name);
+                        }
+                    }
                     VLOG(1) << "key=" << key
                             << ", writer_host_id=" << writer_host_id
                             << ", local_first_preferred_segments="
