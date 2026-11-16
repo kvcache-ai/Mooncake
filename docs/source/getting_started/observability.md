@@ -332,7 +332,7 @@ The dashboard targets Prometheus-compatible metrics from three independent sourc
 
 | Source | Required telemetry | Dashboard coverage |
 |--------|--------------------|--------------------|
-| Classic Transfer Engine | `MC_TE_METRIC=1` and an explicit `MC_TE_METRIC_HTTP_PORT` | Terminal task outcomes, completed throughput, and completion-observation latency |
+| TE | `MC_TE_METRIC=1` and an explicit `MC_TE_METRIC_HTTP_PORT` | Terminal task outcomes, completed throughput, and completion-observation latency |
 | Store client | Client HTTP server and client metric collection enabled | Heartbeat observations and operation-attributed counts, logical bytes, and latency |
 | Master | Admin HTTP `/metrics` endpoint | Batch request and item outcomes, eviction, capacity, clients, and keys |
 
@@ -347,7 +347,7 @@ The panel queries preserve the engine's accounting contract:
 - `requests_total` is a terminal-observation counter, not a submission counter.
 - `failures_total` includes `FAILED` and `CANCELED`; `timeouts_total` is displayed separately.
 - `bytes_total` and `latency_us` include completed transfers only. A timeout is not rewritten as a success when a late completion arrives.
-- Latency measures submission to the first terminal observation and therefore includes polling delay. Histogram microseconds are converted to milliseconds in Grafana.
+- Latency measures submission to the completion callback timestamp when available, falling back to the terminal observation time otherwise. Histogram microseconds are converted to milliseconds in Grafana.
 - The non-success ratio is `(failures + timeouts) / terminal observations`, clamped at zero for transient arithmetic around counter resets. With no terminal observations, the denominator filter produces **No data**, not zero percent.
 
 The dashboard does not infer TENT telemetry from these TE series. Missing optional telemetry produces missing panels or series rather than synthetic zero values.

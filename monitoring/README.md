@@ -1,6 +1,6 @@
 # Monitoring Mooncake with Prometheus and Grafana
 
-This document provides instructions on how to set up and run Prometheus and Grafana to monitor the `mooncake_master`, Store clients, and the Classic Transfer Engine.
+This document provides instructions on how to set up and run Prometheus and Grafana to monitor the `mooncake_master`, Store clients, and TE.
 
 ## 1. Running Monitoring Services
 
@@ -40,7 +40,7 @@ The Prometheus and Grafana services are configured to run inside Docker containe
     Grafana is pre-configured with the Prometheus datasource and two dashboards:
 
 - **Mooncake Master Dashboard** (`mooncake.json`) retains the existing Master-only view.
-- **Mooncake Core | TE, Store & Master** (`mooncake-core.json`) adds the unified Overview, Store, Classic Transfer Engine, and Master view. Use its datasource, job, instance, and Store operation selectors to narrow the displayed targets.
+- **Mooncake Core | TE, Store & Master** (`mooncake-core.json`) adds the unified Overview, Store, TE, and Master view. Use its datasource, job, instance, and Store operation selectors to narrow the displayed targets.
 
 ### Configuration
 
@@ -82,7 +82,7 @@ To be monitored by Prometheus, the `mooncake_master` must be started with metric
 
 Once both Prometheus and `mooncake_master` are running, you can go to the Prometheus UI (`http://localhost:9090`), navigate to **Status -> Targets**, and you should see the `mooncake-master` job with a state of "UP". You can then explore the pre-built dashboard in Grafana.
 
-## 3. Scraping Store Clients and the Classic Transfer Engine
+## 3. Scraping Store Clients and TE
 
 The Master scrape target alone is enough for the Master panels. Store and TE panels require separate opt-in client endpoints. Enable the client-local HTTP server as described in the [Observability guide](../docs/source/getting_started/observability.md), then enable TE metrics in each client process that should export them:
 
@@ -118,7 +118,7 @@ The Store and TE endpoints can belong to the same process but remain independent
 - **Overview** summarizes per-target scrape state, per-client heartbeat status and age, TE non-success ratios, p99 latency, completed throughput, and terminal observation rates. Target and heartbeat status are never averaged across instances, and missing heartbeat series remain Unknown or inapplicable.
 - **Store** shows per-client heartbeat details and operation-attributed counts, logical payload bytes, and latency by `op_name`. Store operation counts are not a unified success rate.
 - **TE task results and latency** separates completed, failed or canceled, and timed-out terminal observations. `requests_total` counts terminal observations, not submissions. A timeout is not rewritten as a success if a late completion arrives.
-- **TE request rate and throughput** shows terminal-observation rates and completed-transfer throughput. Bytes and latency include completed transfers only, and latency measures submission to the first terminal observation, including polling delay.
+- **TE request rate and throughput** shows terminal-observation rates and completed-transfer throughput. Bytes and latency include completed transfers only. Latency measures submission to the completion callback timestamp when available, falling back to the terminal observation time otherwise.
 - **Master** shows batch request and item outcomes, eviction, capacity, clients, and keys. Batch item rates use an `items/s` suffix, TE task rates use `tasks/s`, and evicted-key rates use `keys/s`; requests, items, tasks, operations, keys, bytes, ratios, and latency never share one axis.
 
 Derived non-success ratios have no denominator when there is no terminal TE traffic, so Grafana displays **No data** instead of a misleading zero. All rate queries use `$__rate_interval`, and Prometheus handles counter resets. The dashboard does not add request IDs, object keys, segment IDs, peer addresses, or raw pointers as labels.

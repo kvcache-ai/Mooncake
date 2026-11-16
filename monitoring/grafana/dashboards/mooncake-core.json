@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Unified Classic Transfer Engine, Store client and Master observability. Measurement boundaries and missing-series semantics are documented on each panel.",
+  "description": "Unified TE, Store client and Master observability. Measurement boundaries and missing-series semantics are documented on each panel.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "gnetId": null,
@@ -403,13 +403,13 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "TE read submission-to-first-terminal-observation p99, including polling delay. Bytes and latency exclude failures and timeouts.",
+      "description": "TE read submission-to-terminal latency p99. Uses the completion callback timestamp when available, with terminal observation time as fallback. Bytes and latency exclude failures and timeouts.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
-          "description": "TE read submission-to-first-terminal-observation p99, including polling delay. Bytes and latency exclude failures and timeouts.",
+          "description": "TE read submission-to-terminal latency p99. Uses the completion callback timestamp when available, with terminal observation time as fallback. Bytes and latency exclude failures and timeouts.",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -468,13 +468,13 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "TE write submission-to-first-terminal-observation p99, including polling delay. Bytes and latency exclude failures and timeouts.",
+      "description": "TE write submission-to-terminal latency p99. Uses the completion callback timestamp when available, with terminal observation time as fallback. Bytes and latency exclude failures and timeouts.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
-          "description": "TE write submission-to-first-terminal-observation p99, including polling delay. Bytes and latency exclude failures and timeouts.",
+          "description": "TE write submission-to-terminal latency p99. Uses the completion callback timestamp when available, with terminal observation time as fallback. Bytes and latency exclude failures and timeouts.",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -1895,7 +1895,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "TE read submission-to-first-terminal-observation latency. Only completed transfers record this histogram; polling delay is included.",
+      "description": "TE read submission-to-terminal latency. Only completed transfers record this histogram; the completion callback timestamp is preferred, with terminal observation time as fallback.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1931,7 +1931,7 @@
               "mode": "off"
             }
           },
-          "description": "TE read submission-to-first-terminal-observation latency. Only completed transfers record this histogram; polling delay is included.",
+          "description": "TE read submission-to-terminal latency. Only completed transfers record this histogram; the completion callback timestamp is preferred, with terminal observation time as fallback.",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -2006,7 +2006,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "TE write submission-to-first-terminal-observation latency. Only completed transfers record this histogram; polling delay is included.",
+      "description": "TE write submission-to-terminal latency. Only completed transfers record this histogram; the completion callback timestamp is preferred, with terminal observation time as fallback.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2042,7 +2042,7 @@
               "mode": "off"
             }
           },
-          "description": "TE write submission-to-first-terminal-observation latency. Only completed transfers record this histogram; polling delay is included.",
+          "description": "TE write submission-to-terminal latency. Only completed transfers record this histogram; the completion callback timestamp is preferred, with terminal observation time as fallback.",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
