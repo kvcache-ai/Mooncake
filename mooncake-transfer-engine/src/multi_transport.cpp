@@ -1209,8 +1209,6 @@ void* MultiTransport::getBaseAddr() {
     return 0;
 }
 
-
-
 void MultiTransport::trackLiveBatch(BatchID batch_id) {
     std::lock_guard<std::mutex> guard(live_batches_mutex_);
     live_batches_.insert(batch_id);
