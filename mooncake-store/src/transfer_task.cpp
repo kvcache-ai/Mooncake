@@ -870,6 +870,12 @@ void TransferEngineOperationState::check_tent_task_status() {
         cancel_tent_transfers();
         return;
     }
+    if (status.s != tent::PENDING) {
+        bool drained = false;
+        auto drain_status = tent_engine_->isBatchDrained(batch_id_, drained);
+        if (!drain_status.ok()) cancel_tent_transfers();
+        if (!drained) return;
+    }
     switch (status.s) {
         case tent::PENDING:
             return;

@@ -42,8 +42,7 @@ TransferEngine::~TransferEngine() {}
 bool TransferEngine::available() const { return impl_->available(); }
 
 bool TransferEngine::canTransfer(const Request& request) {
-    return available() && impl_->validateTransportHint(request, 0).ok() &&
-           impl_->getTransportType(request).transport != UNSPEC;
+    return available() && impl_->canTransfer(request);
 }
 
 const std::string TransferEngine::getSegmentName() const {
@@ -199,6 +198,10 @@ Status TransferEngine::waitTransfer(BatchID batch_id,
                                     std::vector<TransferStatus>* status_list,
                                     uint64_t timeout_ms) {
     return impl_->waitTransfer(batch_id, status_list, timeout_ms);
+}
+
+Status TransferEngine::isBatchDrained(BatchID batch_id, bool& drained) {
+    return impl_->isBatchDrained(batch_id, drained);
 }
 
 Status TransferEngine::progressBatch(BatchID batch_id,

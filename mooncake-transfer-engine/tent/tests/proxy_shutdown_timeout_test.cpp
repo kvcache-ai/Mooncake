@@ -62,6 +62,7 @@ class NeverCompletingTransport : public Transport {
 
     std::atomic<int> submit_calls{0};
     bool fail_second = false;
+    bool terminal_before_drain = false;
     std::atomic<bool> complete_first{false};
     std::atomic<int> failed_polls{0};
     std::atomic<int> free_local_memory_calls{0};
@@ -106,11 +107,26 @@ class NeverCompletingTransport : public Transport {
         if (fail_second && fb->submission == 2) {
             ++failed_polls;
             status.s = FAILED;
+        } else if (terminal_before_drain) {
+            status.s = TIMEOUT;
         } else if (complete_first.load()) {
             const auto& request = fb->requests[task_id];
             std::memcpy(reinterpret_cast<void*>(request.target_offset),
                         request.source, request.length);
             status = {COMPLETED, request.length};
+        }
+        return Status::OK();
+    }
+
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override {
+        auto* fb = static_cast<NeverCompletingSubBatch*>(batch);
+        if (!terminal_before_drain || fb->submission == 2)
+            return Transport::isSubBatchDrained(batch, drained);
+        drained = complete_first.load();
+        if (drained) {
+            for (const auto& request : fb->requests)
+                std::memcpy(reinterpret_cast<void*>(request.target_offset),
+                            request.source, request.length);
         }
         return Status::OK();
     }
@@ -255,46 +271,53 @@ TEST(ProxyShutdownTimeout, TimedOutDrainHandsResourcesToDeferredTeardown) {
 }
 
 TEST(ProxyShutdownTimeout, FailedSiblingDoesNotPublishParentBeforeCopyDrains) {
-    auto cfg = makeMinimalP2PConfig();
-    cfg->set("max_failover_attempts", 0);
-    cfg->set("staging/shutdown_drain_timeout_ms", 20L);
-    auto engine = std::make_unique<TransferEngineImpl>(cfg);
-    ASSERT_TRUE(engine->available());
-    auto transport = std::make_shared<NeverCompletingTransport>();
-    transport->fail_second = true;
-    engine->swapTransportForTest(TCP, transport);
-    std::vector<uint8_t> source(128, 0x91), target(128, 0);
-    ASSERT_TRUE(engine->registerLocalMemory(source.data(), source.size()).ok());
-    ASSERT_TRUE(engine->registerLocalMemory(target.data(), target.size()).ok());
-    TaskInfo task;
-    task.request.opcode = Request::WRITE;
-    task.request.source = source.data();
-    task.request.target_id = LOCAL_SEGMENT_ID;
-    task.request.target_offset = reinterpret_cast<uint64_t>(target.data());
-    task.request.length = source.size();
-    task.staging = true;
-    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 2);
-    ASSERT_TRUE(manager->submit(&task, 0, {"", kWildcardLocation, ""}).ok());
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (transport->failed_polls.load() == 0 &&
-           std::chrono::steady_clock::now() < deadline)
-        std::this_thread::yield();
-    EXPECT_GT(transport->failed_polls.load(), 0);
-    // Give the cleanup path time to run while the first copy is held.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    TransferStatus status{};
-    EXPECT_TRUE(manager->getStatus(&task, status).ok());
-    EXPECT_EQ(status.s, PENDING);
-    transport->complete_first = true;
-    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (task.staging_status.load() == PENDING &&
-           std::chrono::steady_clock::now() < deadline)
-        std::this_thread::yield();
-    EXPECT_EQ(task.staging_status.load(), FAILED);
-    manager.reset();
-    EXPECT_EQ(engine->aliveBatchCountForTest(), 0u);
-    EXPECT_TRUE(engine->unregisterLocalMemory(source.data()).ok());
-    EXPECT_TRUE(engine->unregisterLocalMemory(target.data()).ok());
+    for (bool terminal : {false, true}) {
+        auto cfg = makeMinimalP2PConfig();
+        cfg->set("max_failover_attempts", 0);
+        cfg->set("staging/shutdown_drain_timeout_ms", 20L);
+        auto engine = std::make_unique<TransferEngineImpl>(cfg);
+        ASSERT_TRUE(engine->available());
+        auto transport = std::make_shared<NeverCompletingTransport>();
+        transport->fail_second = true;
+        transport->terminal_before_drain = terminal;
+        engine->swapTransportForTest(TCP, transport);
+        std::vector<uint8_t> source(128, 0x91), target(128, 0);
+        ASSERT_TRUE(
+            engine->registerLocalMemory(source.data(), source.size()).ok());
+        ASSERT_TRUE(
+            engine->registerLocalMemory(target.data(), target.size()).ok());
+        TaskInfo task;
+        task.request.opcode = Request::WRITE;
+        task.request.source = source.data();
+        task.request.target_id = LOCAL_SEGMENT_ID;
+        task.request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        task.request.length = source.size();
+        task.staging = true;
+        auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 2);
+        ASSERT_TRUE(
+            manager->submit(&task, 0, {"", kWildcardLocation, ""}).ok());
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (transport->failed_polls.load() == 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        EXPECT_GT(transport->failed_polls.load(), 0);
+        // Give the cleanup path time to run while the first copy is held.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        TransferStatus status{};
+        EXPECT_TRUE(manager->getStatus(&task, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+        transport->complete_first = true;
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (task.staging_status.load() == PENDING &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        EXPECT_EQ(task.staging_status.load(), FAILED);
+        manager.reset();
+        EXPECT_EQ(engine->aliveBatchCountForTest(), 0u);
+        EXPECT_TRUE(engine->unregisterLocalMemory(source.data()).ok());
+        EXPECT_TRUE(engine->unregisterLocalMemory(target.data()).ok());
+    }
 }
 
 }  // namespace

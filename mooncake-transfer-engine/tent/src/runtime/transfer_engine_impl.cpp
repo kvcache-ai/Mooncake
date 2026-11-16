@@ -1650,6 +1650,26 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     return result;
 }
 
+bool TransferEngineImpl::canTransfer(const Request& request) {
+    if (!validateTransportHint(request, 0).ok()) return false;
+    auto route = getTransportType(request);
+    if (route.transport == UNSPEC) return false;
+    // A locally staged source is replaced with registered host memory.
+    if (route.transport != RDMA ||
+        (route.staging_params.size() == 3 && !route.staging_params[1].empty()))
+        return true;
+    // UNSPEC registration can succeed on NVLINK while RDMA registration
+    // fails. Global GPUDirect capability does not cover this source range.
+    auto local = metadata_->segmentManager().getLocal();
+    auto* source =
+        local ? local->findBuffer(reinterpret_cast<uint64_t>(request.source),
+                                  request.length)
+              : nullptr;
+    return source &&
+           std::find(source->transports.begin(), source->transports.end(),
+                     RDMA) != source->transports.end();
+}
+
 SelectionResult TransferEngineImpl::planTransport(const Request& request,
                                                   int transport_index,
                                                   bool allow_device_direct,
@@ -3889,6 +3909,27 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
     return getBatchStatus(batch_id, overall_status, true);
 }
 
+Status TransferEngineImpl::isBatchDrained(BatchID batch_id, bool& drained) {
+    drained = false;
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    TransferStatus overall_status;
+    CHECK_STATUS(getTransferStatus(batch_id, overall_status));
+    if (overall_status.s == PENDING) return Status::OK();
+    auto* batch = reinterpret_cast<Batch*>(batch_id);
+    // A failover can leave an earlier attempt in another sub-batch. Checking
+    // only each logical task's current transport would miss that access.
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        if (!batch->sub_batch[type]) continue;
+        bool sub_batch_drained = false;
+        CHECK_STATUS(transport_list_[type]->isSubBatchDrained(
+            batch->sub_batch[type], sub_batch_drained));
+        if (!sub_batch_drained) return Status::OK();
+    }
+    drained = true;
+    return Status::OK();
+}
+
 Status TransferEngineImpl::getNicLoadStats(
     std::vector<NicLoadStats>& stats) const {
     stats.clear();
@@ -4022,6 +4063,12 @@ Status TransferEngineImpl::waitTransfer(
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
     BatchGuard batch_guard(*this, batch_id);
     auto status = waitTransfer(batch_id);
+    for (uint64_t polls = 0;; ++polls) {
+        bool drained = false;
+        auto result = isBatchDrained(batch_id, drained);
+        if (result.ok() && drained) break;
+        waitBeforeNextPoll(polls);
+    }
     (void)batch_guard.reset();
     return status;
 }

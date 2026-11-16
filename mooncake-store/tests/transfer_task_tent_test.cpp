@@ -8,6 +8,7 @@
 #include <cstring>
 #include <future>
 #include <thread>
+#include <unordered_set>
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -36,6 +37,7 @@ class DelayedTransport : public tent::Transport {
    public:
     struct Batch : SubBatch {
         std::vector<tent::Request> requests;
+        std::unordered_set<int> copied;
         size_t size() const override { return requests.size(); }
     };
     DelayedTransport() { caps.dram_to_dram = true; }
@@ -74,9 +76,11 @@ class DelayedTransport : public tent::Transport {
             status = {tent::PENDING, 0};
         } else {
             const auto& request = static_cast<Batch*>(batch)->requests.at(id);
-            std::memcpy(reinterpret_cast<void*>(request.target_offset),
-                        request.source, request.length);
-            ++copies;
+            if (static_cast<Batch*>(batch)->copied.insert(id).second) {
+                std::memcpy(reinterpret_cast<void*>(request.target_offset),
+                            request.source, request.length);
+                ++copies;
+            }
             status = {tent::COMPLETED, request.length};
         }
         return tent::Status::OK();
@@ -140,6 +144,7 @@ class TentTransferLifetimeTest : public ::testing::Test {
         size_t count = 1, int64_t timeout = 60000) {
         auto batch = backend_->allocateBatch(count);
         std::vector<tent::Request> requests;
+        std::unordered_set<int> copied;
         for (size_t i = 0; i < count; ++i) requests.push_back(request(16 * i));
         EXPECT_TRUE(backend_->submitTransfer(batch, requests).ok());
         return std::make_shared<TransferEngineOperationState>(engine_, batch,
@@ -218,6 +223,11 @@ TEST_F(TentTransferLifetimeTest, DestroyingOperationDrainsPendingTransfers) {
 
 TEST_F(TentTransferLifetimeTest, RouteProbeDoesNotSubmitTransfers) {
     EXPECT_TRUE(backend_->canTransfer(request()));
+    auto view = request();
+    view.source = source_.data() + 16;
+    EXPECT_TRUE(backend_->canTransfer(view));
+    view.source = source_.data() + 17;
+    EXPECT_FALSE(backend_->canTransfer(view));
     auto invalid = request();
     invalid.target_offset += target_.size();
     EXPECT_FALSE(backend_->canTransfer(invalid));

@@ -70,6 +70,18 @@ endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
 add_store_test(real_client_direct_write_test real_client_direct_write_test.cpp)
+if(USE_TENT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_store_test(real_client_direct_write_tent_test
+                 real_client_direct_write_tent_test.cpp)
+  set(tensor_test_platform_loader
+      "_ZN8mooncake4tent8Platform9getLoaderESt10shared_ptrINS0_6ConfigEE")
+  target_compile_definitions(
+    real_client_direct_write_tent_test
+    PRIVATE TENT_TEST_PLATFORM_LOADER="${tensor_test_platform_loader}")
+  target_link_options(real_client_direct_write_tent_test PRIVATE
+                      "-Wl,--wrap=${tensor_test_platform_loader}")
+  set_tests_properties(real_client_direct_write_tent_test PROPERTIES TIMEOUT 60)
+endif()
 add_store_test(local_shm_conflict_test local_shm_conflict_test.cpp)
 add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
