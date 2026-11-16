@@ -33,19 +33,15 @@
 namespace mooncake {
 namespace tent {
 
+class MluTransportTestPeer;
+
 namespace mlu_detail {
 struct ImportEntry {
     std::string attr;
     uint64_t base = 0;
     uint64_t size = 0;
-    uint64_t snapshot_generation = 0;
     std::shared_ptr<void> mapping;
 };
-
-// Caller synchronizes access to entries and reconciled_snapshot.
-void reconcileImports(std::vector<ImportEntry> &entries,
-                      uint64_t &reconciled_snapshot, const SegmentDesc &segment,
-                      std::vector<std::shared_ptr<void>> &dropped);
 }  // namespace mlu_detail
 
 struct MluCopyQueue {
@@ -116,11 +112,21 @@ class MluTransport : public Transport {
                              const BufferDesc &entry, void *local_source);
     void closeRemoteSegment(SegmentID target_id);
 
+    // Both addresses must be local (or already imported). Peer accessibility
+    // is assumed symmetric, so this check is independent of the copy opcode.
+    // A false result requires engine-managed staging.
+    static bool canCopyPeer(void *src, void *dst);
+
     const char *getName() const override { return "mlu"; }
 
    private:
+    friend class MluTransportTestPeer;
+
     Status submitCopy(MluTask &task, bool to_device);
     Status submitPeerCopy(MluTask &task);
+    Status enqueueCopy(MluTask &task, std::shared_ptr<MluCopyQueue> &queue,
+                       CNcontext context, void *dst, void *src,
+                       CNcontext dst_context = nullptr);
     void startTransfer(MluTask *task);
     Status quiesceLocked();
     Status drainTask(MluTask &task);
@@ -129,12 +135,12 @@ class MluTransport : public Transport {
                                    size_t length);
 
     std::mutex mutex_;
-    std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 3>> queues_;
+    // D2H/D2D on the source context, H2D on the destination context.
+    std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 2>> queues_;
     std::unordered_set<MluSubBatch *> batches_;
     std::map<SegmentID, std::vector<mlu_detail::ImportEntry>> imports_;
-    std::map<SegmentID, uint64_t> reconciled_snapshots_;
+    std::map<SegmentID, uint64_t> high_water_;
     std::string machine_id_;
-    std::atomic<uint64_t> ipc_generation_{0};
     bool installed_ = false;
     bool ipc_enabled_ = true;
     MluPlatform *platform_ = nullptr;

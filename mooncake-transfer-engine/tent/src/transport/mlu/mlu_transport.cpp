@@ -16,12 +16,10 @@
 
 #include <glog/logging.h>
 #include <cnrt.h>
-#include <time.h>
 
 #include <algorithm>
 #include <charconv>
 #include <sstream>
-#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -37,17 +35,15 @@ struct IpcAttr {
     uint64_t size = 0;
     uintptr_t handle = 0;
     int device = -1;
-    uint64_t generation = 0;
 };
 
 std::string formatIpcAttr(const IpcAttr &attr) {
     return std::to_string(attr.base) + ':' + std::to_string(attr.size) + ':' +
-           std::to_string(attr.handle) + ':' + std::to_string(attr.device) +
-           ':' + std::to_string(attr.generation);
+           std::to_string(attr.handle) + ':' + std::to_string(attr.device);
 }
 
 bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
-    std::array<std::string_view, 5> fields;
+    std::array<std::string_view, 4> fields;
     size_t start = 0;
     for (size_t i = 0; i < fields.size(); ++i) {
         const size_t end = text.find(':', start);
@@ -63,19 +59,12 @@ bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
     };
     return number(fields[0], attr.base) && number(fields[1], attr.size) &&
            number(fields[2], attr.handle) && number(fields[3], attr.device) &&
-           number(fields[4], attr.generation) && attr.size && attr.handle &&
-           attr.device >= 0;
+           attr.size && attr.handle && attr.device >= 0;
 }
 
 bool rangeWithin(uint64_t addr, uint64_t length, uint64_t base, uint64_t size) {
     return addr >= base && addr - base <= size &&
            length <= size - (addr - base);
-}
-
-uint64_t bootTimeNs() {
-    timespec ts{};
-    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return 0;
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
 }
 
 Status driverStatus(CNresult result) {
@@ -88,6 +77,22 @@ Status driverStatus(CNresult result) {
 
 void logError(const Status &status) {
     if (!status.ok()) LOG(ERROR) << status.ToString();
+}
+
+// The caller holds mutex_ and has selected the queue's context.
+Status retireFailedQueue(std::shared_ptr<MluCopyQueue> &queue) {
+    if (!queue) return Status::OK();
+    auto previous = queue;
+    std::lock_guard<std::mutex> lock(previous->mutex);
+    if (!previous->error.ok()) {
+        auto ready = cnQueryQueue(previous->handle);
+        if (ready != CN_SUCCESS)
+            return ready == CN_ERROR_NOT_READY ? previous->error
+                                               : driverStatus(ready);
+        // Tasks retain the old queue until they have observed its drain.
+        queue.reset();
+    }
+    return Status::OK();
 }
 
 class ContextGuard {
@@ -176,8 +181,17 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
     if (metadata_) {
         auto local = metadata_->segmentManager().getLocal();
         if (local) machine_id_ = local->machine_id;
+        if (ipc_enabled_) {
+            // Keep this marker after the last buffer is removed. updateLocal()
+            // replaces it with the publication number on every update.
+            CHECK_STATUS(metadata_->segmentManager().updateLocal(
+                [](SegmentDesc &segment) {
+                    std::get<MemorySegmentDesc>(segment.detail)
+                        .transport_attrs.try_emplace(MLU);
+                    return Status::OK();
+                }));
+        }
     }
-    ipc_generation_ = bootTimeNs();
     installed_ = true;
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
@@ -189,7 +203,7 @@ Status MluTransport::uninstall() {
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
     imports_.clear();
-    reconciled_snapshots_.clear();
+    high_water_.clear();
     queues_.clear();
     metadata_.reset();
     platform_ = nullptr;
@@ -396,6 +410,21 @@ void MluTransport::startTransfer(MluTask *task) {
     }
 }
 
+bool MluTransport::canCopyPeer(void *src, void *dst) {
+    int src_device = -1, dst_device = -1;
+    if (cnGetMemAttribute(&src_device, CN_MEM_ATTRIBUTE_DEVICE_ORDINAL,
+                          reinterpret_cast<CNaddr>(src)) != CN_SUCCESS ||
+        cnGetMemAttribute(&dst_device, CN_MEM_ATTRIBUTE_DEVICE_ORDINAL,
+                          reinterpret_cast<CNaddr>(dst)) != CN_SUCCESS)
+        return false;
+    // Same-device copies across contexts use cnMemcpyPeerAsync.
+    if (src_device == dst_device) return true;
+    unsigned int accessible = 0;
+    return cnrtGetPeerAccessibility(&accessible, src_device, dst_device) ==
+               cnrtSuccess &&
+           accessible != 0;
+}
+
 Status MluTransport::submitPeerCopy(MluTask &task) {
     void *src = task.request.source;
     void *dst = reinterpret_cast<void *>(task.request.target_offset);
@@ -404,15 +433,17 @@ Status MluTransport::submitPeerCopy(MluTask &task) {
     if (!length) return Status::OK();
 
     CNcontext src_context = nullptr, dst_context = nullptr;
-    int src_device = -1, dst_device = -1;
-    for (auto [ptr, context, device] :
-         {std::tuple<CNaddr, CNcontext *, int *>{reinterpret_cast<CNaddr>(src),
-                                                 &src_context, &src_device},
-          {reinterpret_cast<CNaddr>(dst), &dst_context, &dst_device}}) {
-        CHECK_STATUS(driverStatus(
-            cnGetMemAttribute(context, CN_MEM_ATTRIBUTE_CONTEXT, ptr)));
-        CHECK_STATUS(driverStatus(
-            cnGetMemAttribute(device, CN_MEM_ATTRIBUTE_DEVICE_ORDINAL, ptr)));
+    // Route planning checks peer accessibility. Submission only resolves the
+    // contexts; enqueueCopy reports driver failures and drains ambiguous
+    // copies.
+    CHECK_STATUS(
+        driverStatus(cnGetMemAttribute(&src_context, CN_MEM_ATTRIBUTE_CONTEXT,
+                                       reinterpret_cast<CNaddr>(src))));
+    CHECK_STATUS(
+        driverStatus(cnGetMemAttribute(&dst_context, CN_MEM_ATTRIBUTE_CONTEXT,
+                                       reinterpret_cast<CNaddr>(dst))));
+    for (auto ptr :
+         {reinterpret_cast<CNaddr>(src), reinterpret_cast<CNaddr>(dst)}) {
         CNaddr base = 0;
         cn_uint64_t size = 0;
         CHECK_STATUS(driverStatus(cnMemGetAddressRange(&base, &size, ptr)));
@@ -420,86 +451,11 @@ Status MluTransport::submitPeerCopy(MluTask &task) {
             return Status::InvalidArgument(
                 "MLU peer memory range exceeds its allocation");
     }
-    bool accessible = src_context == dst_context;
-    if (src_device != dst_device) {
-        unsigned int peer_accessible = 0;
-        auto result =
-            cnrtGetPeerAccessibility(&peer_accessible, src_device, dst_device);
-        if (result != cnrtSuccess)
-            return Status::InternalError(cnrtGetErrorStr(result));
-        accessible = peer_accessible != 0;
-    }
-    if (!accessible) {
-        // Preserve the old host-staging behavior on systems without a direct
-        // device link or with two contexts on one device.
-        CHECK_STATUS(quiesceLocked());
-        void *host = nullptr;
-        auto allocated = cnrtHostMalloc(&host, length);
-        if (allocated != cnrtSuccess)
-            return Status::InternalError(cnrtGetErrorStr(allocated));
-        auto copied = platform_->copy(host, src, length);
-        if (copied.ok()) copied = platform_->copy(dst, host, length);
-        auto freed = cnrtFreeHost(host);
-        if (!copied.ok()) return copied;
-        if (freed != cnrtSuccess)
-            return Status::InternalError(cnrtGetErrorStr(freed));
-        return Status::OK();
-    }
-
     ContextGuard guard;
     CHECK_STATUS(guard.use(src_context));
-    auto &queue = queues_[src_context][2];
-    if (queue) {
-        auto previous = queue;
-        std::lock_guard<std::mutex> lock(previous->mutex);
-        if (!previous->error.ok()) {
-            auto ready = cnQueryQueue(previous->handle);
-            if (ready != CN_SUCCESS)
-                return ready == CN_ERROR_NOT_READY ? previous->error
-                                                   : driverStatus(ready);
-            queue.reset();
-        }
-    }
-    if (!queue) {
-        auto created = std::make_shared<MluCopyQueue>();
-        created->context = src_context;
-        CHECK_STATUS(driverStatus(cnCreateQueue(&created->handle, 0)));
-        queue = std::move(created);
-    }
-    task.queue = queue;
-    CHECK_STATUS(driverStatus(
-        cnCreateNotifier(&task.completion, CN_NOTIFIER_DISABLE_TIMING)));
-    std::lock_guard<std::mutex> lock(queue->mutex);
-    CHECK_STATUS(queue->error);
-    auto result =
-        src_context == dst_context
-            ? cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
-                               reinterpret_cast<CNaddr>(src), length,
-                               queue->handle)
-            : cnMemcpyPeerAsync(reinterpret_cast<CNaddr>(dst), dst_context,
-                                reinterpret_cast<CNaddr>(src), src_context,
-                                length, queue->handle);
-    auto status = driverStatus(result);
-    if (status.ok()) {
-        status = driverStatus(cnPlaceNotifier(task.completion, queue->handle));
-        task.drain_on_error = !status.ok();
-        if (!status.ok()) queue->error = status;
-    } else {
-        switch (result) {
-            case CN_ERROR_INVALID_VALUE:
-            case CN_ERROR_INVALID_ADDRESS:
-            case CN_MEMORY_ERROR_INVALID_ADDRESS:
-            case CN_CONTEXT_ERROR_INVALID:
-            case CN_QUEUE_ERROR_INVALID:
-            case CN_ERROR_NOT_INITIALIZED:
-            case CN_ERROR_DEINITIALIZED:
-                break;
-            default:
-                task.drain_on_error = true;
-                queue->error = status;
-        }
-    }
-    return status;
+    auto &queue = queues_[src_context][0];
+    CHECK_STATUS(retireFailedQueue(queue));
+    return enqueueCopy(task, queue, src_context, dst, src, dst_context);
 }
 
 Status MluTransport::submitCopy(MluTask &task, bool to_device) {
@@ -528,19 +484,7 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
     ContextGuard guard;
     CHECK_STATUS(guard.use(context));
     auto &queue = queues_[context][to_device ? 1 : 0];
-    if (queue) {
-        auto previous = queue;
-        std::lock_guard<std::mutex> lock(previous->mutex);
-        if (!previous->error.ok()) {
-            auto ready = cnQueryQueue(previous->handle);
-            if (ready != CN_SUCCESS)
-                return ready == CN_ERROR_NOT_READY ? previous->error
-                                                   : driverStatus(ready);
-            // Retire the drained queue instead of appending new work to it.
-            // Failed tasks may still need to poll it or release their buffers.
-            queue.reset();
-        }
-    }
+    CHECK_STATUS(retireFailedQueue(queue));
     if (small_h2d || !pinned) {
         if (!queue) return platform_->copy(dst, src, length);
         std::lock_guard<std::mutex> lock(queue->mutex);
@@ -570,22 +514,34 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
         length > size - (address - base))
         return Status::InvalidArgument(
             "MLU memory range exceeds its allocation");
-    {
-        if (!queue) {
-            auto created = std::make_shared<MluCopyQueue>();
-            created->context = context;
-            CHECK_STATUS(driverStatus(cnCreateQueue(&created->handle, 0)));
-            queue = std::move(created);
-        }
-        task.queue = queue;
+    return enqueueCopy(task, queue, context, dst, src);
+}
+
+Status MluTransport::enqueueCopy(MluTask &task,
+                                 std::shared_ptr<MluCopyQueue> &queue,
+                                 CNcontext context, void *dst, void *src,
+                                 CNcontext dst_context) {
+    // mutex_ and the context guard are held by the caller through notifier
+    // publication. D2D shares the source context's D2H queue.
+    if (!queue) {
+        auto created = std::make_shared<MluCopyQueue>();
+        created->context = context;
+        CHECK_STATUS(driverStatus(cnCreateQueue(&created->handle, 0)));
+        queue = std::move(created);
     }
+    task.queue = queue;
     CHECK_STATUS(driverStatus(
         cnCreateNotifier(&task.completion, CN_NOTIFIER_DISABLE_TIMING)));
     std::lock_guard<std::mutex> lock(task.queue->mutex);
     CHECK_STATUS(task.queue->error);
-    auto result_copy = cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
-                                        reinterpret_cast<CNaddr>(src), length,
-                                        task.queue->handle);
+    auto result_copy =
+        !dst_context || dst_context == context
+            ? cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
+                               reinterpret_cast<CNaddr>(src),
+                               task.request.length, queue->handle)
+            : cnMemcpyPeerAsync(reinterpret_cast<CNaddr>(dst), dst_context,
+                                reinterpret_cast<CNaddr>(src), context,
+                                task.request.length, queue->handle);
     auto status = driverStatus(result_copy);
     if (status.ok()) {
         status =
@@ -746,8 +702,7 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
             }
             if (status.ok() && handle) {
                 desc.transport_attrs[MLU] = formatIpcAttr(
-                    {base, size, reinterpret_cast<uintptr_t>(handle), device,
-                     ++ipc_generation_});
+                    {base, size, reinterpret_cast<uintptr_t>(handle), device});
             }
         }
         if (!status.ok()) {
@@ -790,6 +745,15 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
                                        const BufferDesc &entry,
                                        void *local_source) {
     if (!mayMapRemoteBuffer(target_id, segment, entry)) return false;
+    const auto *generation_text = segment.getMemory().getTransportAttrs(MLU);
+    uint64_t generation = 0;
+    if (!generation_text || generation_text->empty()) return false;
+    auto [end, ec] = std::from_chars(
+        generation_text->data(),
+        generation_text->data() + generation_text->size(), generation);
+    if (ec != std::errc() ||
+        end != generation_text->data() + generation_text->size() || !generation)
+        return false;
     const auto &attr_text = entry.transport_attrs.at(MLU);
     IpcAttr attr;
     if (!parseIpcAttr(attr_text, attr) ||
@@ -811,8 +775,34 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     std::vector<std::shared_ptr<void>> dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     auto &entries = imports_[target_id];
-    auto &reconciled = reconciled_snapshots_[target_id];
-    mlu_detail::reconcileImports(entries, reconciled, segment, dropped);
+    auto &watermark = high_water_[target_id];
+    if (generation < watermark) {
+        // A newer snapshot has already removed stale imports. Reuse a mapping
+        // it retained, but never create one from this older snapshot.
+        return std::any_of(entries.begin(), entries.end(),
+                           [&](const mlu_detail::ImportEntry &imported) {
+                               return imported.attr == attr_text;
+                           });
+    }
+    // Equal generations can still map another buffer from the same snapshot.
+    if (generation > watermark) {
+        std::unordered_set<std::string_view> published;
+        published.reserve(segment.getMemory().buffers.size());
+        for (const auto &buffer : segment.getMemory().buffers) {
+            auto it = buffer.transport_attrs.find(MLU);
+            if (it != buffer.transport_attrs.end())
+                published.insert(it->second);
+        }
+        entries.erase(
+            std::remove_if(entries.begin(), entries.end(),
+                           [&](const mlu_detail::ImportEntry &imported) {
+                               if (published.count(imported.attr)) return false;
+                               dropped.push_back(imported.mapping);
+                               return true;
+                           }),
+            entries.end());
+        watermark = generation;
+    }
     for (const auto &imported : entries)
         if (imported.attr == attr_text) return true;
 
@@ -845,49 +835,10 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
         }
         logError(status);
     });
-    entries.push_back({attr_text, attr.base, attr.size,
-                       segment.snapshot_generation, std::move(mapping)});
-    // An unversioned snapshot cannot be ordered against a versioned one.
-    // Force the next versioned look to check any mapping it just introduced.
-    if (!segment.snapshot_generation) reconciled = 0;
+    entries.push_back({attr_text, attr.base, attr.size, std::move(mapping)});
     LOG(INFO) << "MLU IPC mapped peer buffer " << (void *)attr.base << " of "
               << segment.name << " at " << mapped << " on mlu:" << attr.device;
     return true;
-}
-
-void mlu_detail::reconcileImports(std::vector<mlu_detail::ImportEntry> &entries,
-                                  uint64_t &reconciled,
-                                  const SegmentDesc &segment,
-                                  std::vector<std::shared_ptr<void>> &dropped) {
-    // Buffer registration generations do not describe a snapshot: removing
-    // the newest buffer makes their maximum go backwards. The publication
-    // generation also advances on removals, and orders snapshots across
-    // threads. Older snapshots cannot retire mappings imported from newer ones.
-    // A legacy descriptor has no publication generation (zero); its age
-    // cannot be established, so retain mappings until a versioned snapshot
-    // or closeRemoteSegment arrives.
-    if (segment.snapshot_generation &&
-        reconciled != segment.snapshot_generation) {
-        std::unordered_set<std::string_view> published;
-        published.reserve(segment.getMemory().buffers.size());
-        for (const auto &buffer : segment.getMemory().buffers) {
-            auto it = buffer.transport_attrs.find(MLU);
-            if (it != buffer.transport_attrs.end())
-                published.insert(it->second);
-        }
-        entries.erase(
-            std::remove_if(entries.begin(), entries.end(),
-                           [&](const mlu_detail::ImportEntry &imported) {
-                               const bool retired =
-                                   imported.snapshot_generation <=
-                                       segment.snapshot_generation &&
-                                   !published.count(imported.attr);
-                               if (retired) dropped.push_back(imported.mapping);
-                               return retired;
-                           }),
-            entries.end());
-        reconciled = segment.snapshot_generation;
-    }
 }
 
 std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
@@ -906,7 +857,7 @@ std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
 void MluTransport::closeRemoteSegment(SegmentID target_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     imports_.erase(target_id);
-    reconciled_snapshots_.erase(target_id);
+    high_water_.erase(target_id);
 }
 
 }  // namespace tent

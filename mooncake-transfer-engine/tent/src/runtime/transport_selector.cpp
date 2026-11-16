@@ -493,6 +493,12 @@ bool TransportSelector::isTransportAvailable(
     }
 
     const auto& caps = transport->capabilities();
+    if (context.local_mlu_staging) {
+        return type == MLU && context.local_segment &&
+               context.local_memory_type == MTYPE_MLU &&
+               context.remote_memory_type == MTYPE_MLU && caps.gpu_to_dram &&
+               caps.dram_to_gpu;
+    }
     // The IPC route copies the original buffers; only the network leg of a
     // staged request runs on host stage buffers.
     if (context.host_staging && !xpu_ipc && !mlu_ipc) {

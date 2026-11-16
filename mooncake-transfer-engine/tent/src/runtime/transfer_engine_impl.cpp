@@ -1605,6 +1605,27 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     // original memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
+    bool local_mlu_staging = false;
+#ifdef USE_MLU
+    if (desc->type == SegmentType::Memory &&
+        request.target_id == LOCAL_SEGMENT_ID && local_mtype == MTYPE_MLU &&
+        transport_list_[MLU]) {
+        auto* entry = desc->findBuffer(request.target_offset, request.length);
+        if (!entry) return SelectionResult{};
+        if (getTypeEnum(LocationParser(entry->location).type()) == MTYPE_MLU &&
+            !MluTransport::canCopyPeer(
+                request.source,
+                reinterpret_cast<void*>(request.target_offset))) {
+            findStagingPolicy(request, host_staging_params);
+            // An inaccessible device pair must not fall back to unstaged MLU.
+            if (host_staging_params.empty()) return SelectionResult{};
+            local_mlu_staging = true;
+            if (std::find(entry->transports.begin(), entry->transports.end(),
+                          MLU) != entry->transports.end())
+                staging_transports.push_back(MLU);
+        }
+    }
+#endif
     bool xpu_ipc = false;
     bool mlu_ipc = false;
     bool direct = false;
@@ -1663,7 +1684,8 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             }
         }
     }
-    const bool host_staging = !host_staging_params.empty();
+    const bool host_staging =
+        !host_staging_params.empty() && !local_mlu_staging;
     // IPC copies the original device buffers; network fallbacks use host
     // stage buffers. Without a staging route, only IPC may see the device.
     const bool ipc_mixed = (xpu_ipc || mlu_ipc) && !direct;
@@ -1714,10 +1736,15 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                 }
                 auto remote_mtype =
                     getTypeEnum(LocationParser(entry->location).type());
-                const auto& candidates = ipc_mixed      ? mixed_transports
-                                         : host_staging ? staging_transports
-                                                        : entry->transports;
+                const auto& candidates = ipc_mixed ? mixed_transports
+                                         : (host_staging || local_mlu_staging)
+                                             ? staging_transports
+                                             : entry->transports;
                 for (auto type : candidates) {
+                    if (local_mlu_staging) {
+                        if (type == MLU) raw.push_back(type);
+                        continue;
+                    }
                     // XPU/MLU may access same-host peer buffers over IPC.
                     if (type == MLU && request.target_id != LOCAL_SEGMENT_ID &&
                         !mlu_ipc)
@@ -1762,6 +1789,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     ctx.intent_type = request.intent_type;  // Business intent policy filter
     ctx.local_segment = request.target_id == LOCAL_SEGMENT_ID;
     ctx.host_staging = host_staging;
+    ctx.local_mlu_staging = local_mlu_staging;
     ctx.xpu_ipc = xpu_ipc;
     ctx.mlu_ipc = mlu_ipc;
     ctx.xpu_ipc_only = xpu_ipc && ipc_mixed && !host_staging;
@@ -1787,9 +1815,10 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         ctx.same_machine = same_machine;
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = remote_mtype;
-        ctx.buffer_transports = ipc_mixed      ? &mixed_transports
-                                : host_staging ? &staging_transports
-                                               : &entry->transports;
+        ctx.buffer_transports = ipc_mixed ? &mixed_transports
+                                : (host_staging || local_mlu_staging)
+                                    ? &staging_transports
+                                    : &entry->transports;
     }
 
     auto result = transport_selector_->select(ctx, transport_list_,
@@ -2157,7 +2186,20 @@ bool TransferEngineImpl::mluIpcReady(const Request& request,
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,
                                            std::vector<std::string>& policy) {
-    if (request.target_id == LOCAL_SEGMENT_ID) return;
+    policy.clear();
+    if (request.target_id == LOCAL_SEGMENT_ID) {
+#ifdef USE_MLU
+        // planTransport has established that this local MLU pair needs staging.
+        auto locations = Platform::getLoader().getLocation(request.source, 1);
+        if (locations.empty()) return;
+        auto stage = topology_->findNearMem(locations[0].location);
+        // PRE/CROSS (WRITE) or CROSS/POST (READ) performs two local
+        // MLU copies. No remote stage or RPC is needed, and both legs
+        // reuse one chunk pool even when the devices share a NUMA node.
+        if (!stage.empty()) policy = {"", stage, ""};
+#endif
+        return;
+    }
 
     SegmentDesc* desc = nullptr;
     BufferDesc* entry = nullptr;
@@ -2392,7 +2434,8 @@ Status TransferEngineImpl::prepareSubmit(
             }
         }
         owner.staging_params = owner.route.staging_params;
-        if (owner.staging_params.empty() &&
+        if (owner.request.target_id != LOCAL_SEGMENT_ID &&
+            owner.staging_params.empty() &&
             (owner.route.transport == TCP || owner.route.transport == HP_TCP)) {
             findStagingPolicy(owner.request, owner.staging_params);
         }
@@ -2892,7 +2935,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     if (!route.staging_params.empty() || task.type == TCP ||
         task.type == HP_TCP) {
         auto staging_params = route.staging_params;
-        if (staging_params.empty())
+        if (task.request.target_id != LOCAL_SEGMENT_ID &&
+            staging_params.empty())
             findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
             task.staging = true;

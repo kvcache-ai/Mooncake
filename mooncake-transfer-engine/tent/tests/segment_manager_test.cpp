@@ -108,14 +108,22 @@ TEST(SegmentManagerTest, UpdateLocalFailureDoesNotPublish) {
     EXPECT_FALSE(status.ok());
     EXPECT_EQ(manager->getLocal().get(), before.get());
     EXPECT_EQ(manager->getLocal()->name, "local_test_segment");
-    EXPECT_EQ(manager->getLocal()->snapshot_generation,
-              before->snapshot_generation);
 }
 
-TEST(SegmentManagerTest, SnapshotGenerationAdvancesWhenNewestBufferRemoved) {
+TEST(SegmentManagerTest, MluGenerationAdvancesWhenBufferRemoved) {
     auto manager = makeManager();
+    ASSERT_TRUE(manager
+                    ->updateLocal([](SegmentDesc& desc) -> Status {
+                        std::get<MemorySegmentDesc>(desc.detail)
+                            .transport_attrs.try_emplace(MLU);
+                        return Status::OK();
+                    })
+                    .ok());
     auto before = manager->getLocal();
-    ASSERT_GT(before->snapshot_generation, 0u);
+    const auto* before_text = before->getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(before_text, nullptr);
+    const auto before_generation = std::stoull(*before_text);
+    ASSERT_GT(before_generation, 0u);
     ASSERT_TRUE(manager
                     ->updateLocal([](SegmentDesc& desc) -> Status {
                         auto& buffers =
@@ -125,7 +133,10 @@ TEST(SegmentManagerTest, SnapshotGenerationAdvancesWhenNewestBufferRemoved) {
                     })
                     .ok());
     auto added = manager->getLocal();
-    EXPECT_GT(added->snapshot_generation, before->snapshot_generation);
+    const auto* added_text = added->getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(added_text, nullptr);
+    const auto added_generation = std::stoull(*added_text);
+    EXPECT_EQ(added_generation, before_generation + 1);
     ASSERT_TRUE(
         manager
             ->updateLocal([](SegmentDesc& desc) -> Status {
@@ -135,14 +146,17 @@ TEST(SegmentManagerTest, SnapshotGenerationAdvancesWhenNewestBufferRemoved) {
             .ok());
     auto removed = manager->getLocal();
     EXPECT_TRUE(removed->getMemory().buffers.empty());
-    EXPECT_GT(removed->snapshot_generation, added->snapshot_generation);
+    const auto* removed_text = removed->getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(removed_text, nullptr);
+    const auto removed_generation = std::stoull(*removed_text);
+    EXPECT_EQ(removed_generation, added_generation + 1);
 
-    auto decoded =
-        json::parse(*manager->getLocalDumpedJson()).get<SegmentDesc>();
-    EXPECT_EQ(decoded.snapshot_generation, removed->snapshot_generation);
-    auto legacy = json::parse(*manager->getLocalDumpedJson());
-    legacy.erase("snapshot_generation");
-    EXPECT_EQ(legacy.get<SegmentDesc>().snapshot_generation, 0u);
+    auto encoded = json::parse(*manager->getLocalDumpedJson());
+    EXPECT_FALSE(encoded.contains("snapshot_generation"));
+    auto decoded = encoded.get<SegmentDesc>();
+    const auto* decoded_text = decoded.getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(decoded_text, nullptr);
+    EXPECT_EQ(*decoded_text, std::to_string(removed_generation));
 }
 
 TEST(SegmentManagerTest, JsonCacheInvalidatedOnPublication) {

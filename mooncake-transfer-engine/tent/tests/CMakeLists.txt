@@ -941,6 +941,11 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  foreach(suite transport engine)
+    target_link_options(
+      tent_mlu_${suite}_test PRIVATE "-Wl,--wrap=cnGetMemAttribute"
+      "-Wl,--wrap=cnrtGetPeerAccessibility")
+  endforeach()
   target_link_options(
     tent_mlu_transport_test
     PRIVATE
@@ -949,6 +954,7 @@ if(USE_MLU)
     "-Wl,--wrap=numa_move_pages"
     "-Wl,--wrap=cnPlaceNotifier"
     "-Wl,--wrap=cnMemcpyAsync_V3"
+    "-Wl,--wrap=cnMemcpyPeerAsync"
     "-Wl,--wrap=cnMemcpyHtoD"
     "-Wl,--wrap=cnMemcpyDtoH"
     "-Wl,--wrap=cnQueueSync"

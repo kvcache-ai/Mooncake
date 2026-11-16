@@ -37,15 +37,20 @@
 #include "tent/runtime/platform.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/fault_proxy/fault_proxy_transport.h"
+#include "peer_access_test.h"
 
 namespace {
 std::atomic<bool> fail_notifier_record{false};
 std::atomic<CNresult> reject_copy{CN_SUCCESS};
+std::atomic<CNresult> reject_peer_copy{CN_SUCCESS};
+std::atomic<int> peer_copy_calls{0};
+std::atomic<CNcontext> peer_src_context{nullptr}, peer_dst_context{nullptr};
 std::atomic<CNqueue> fail_queue{nullptr};
 std::atomic<bool> fail_query{false};
 std::atomic<int> pending_queries{0};
 std::atomic<CNqueue> last_recorded_queue{nullptr};
 std::atomic<bool> fail_sync{false};
+std::atomic<int> host_malloc_calls{0}, queue_sync_calls{0};
 bool force_numa_mismatch = false;
 void *forced_pinned_allocation = nullptr;
 int forced_numa_node = -1;
@@ -57,6 +62,7 @@ std::function<void()> before_copy, before_record, before_inline,
 
 extern "C" cnrtRet_t __real_cnrtHostMalloc(void **, size_t);
 extern "C" cnrtRet_t __wrap_cnrtHostMalloc(void **ptr, size_t size) {
+    ++host_malloc_calls;
     auto result = __real_cnrtHostMalloc(ptr, size);
     if (force_numa_mismatch && result == cnrtSuccess)
         forced_pinned_allocation = *ptr;
@@ -103,6 +109,24 @@ extern "C" CNresult __wrap_cnMemcpyAsync_V3(CNaddr dst, CNaddr src,
     if (rejected != CN_SUCCESS) return rejected;
     return __real_cnMemcpyAsync_V3(dst, src, len, queue);
 }
+extern "C" CNresult __real_cnMemcpyPeerAsync(CNaddr, CNcontext, CNaddr,
+                                             CNcontext, cn_uint64_t, CNqueue);
+extern "C" CNresult __wrap_cnMemcpyPeerAsync(CNaddr dst, CNcontext dst_context,
+                                             CNaddr src, CNcontext src_context,
+                                             cn_uint64_t len, CNqueue queue) {
+    ++peer_copy_calls;
+    peer_src_context = src_context;
+    peer_dst_context = dst_context;
+    auto rejected = reject_peer_copy.exchange(CN_SUCCESS);
+    if (rejected != CN_SUCCESS && rejected != CN_INVOKE_ERROR_TIMEOUT)
+        return rejected;
+    auto result = __real_cnMemcpyPeerAsync(dst, dst_context, src, src_context,
+                                           len, queue);
+    // A timeout does not prove rejection: model a copy already queued behind
+    // the gate, so the transport must drain before reporting failure.
+    return result == CN_SUCCESS ? rejected : result;
+}
+
 extern "C" CNresult __real_cnMemcpyHtoD(CNaddr, const void *, cn_uint64_t);
 extern "C" CNresult __wrap_cnMemcpyHtoD(CNaddr dst, const void *src,
                                         cn_uint64_t len) {
@@ -117,6 +141,7 @@ extern "C" CNresult __wrap_cnMemcpyDtoH(void *dst, CNaddr src,
 }
 extern "C" CNresult __real_cnQueueSync(CNqueue);
 extern "C" CNresult __wrap_cnQueueSync(CNqueue queue) {
+    ++queue_sync_calls;
     if (fail_sync.exchange(false)) return CN_QUEUE_ERROR_INVALID;
     if (queue == fail_queue.load()) return CN_QUEUE_ERROR_INVALID;
     return __real_cnQueueSync(queue);
@@ -145,84 +170,42 @@ class TransferEngineImplTestPeer {
     }
 };
 namespace tent {
+class MluTransportTestPeer {
+   public:
+    static void seedImportCache(MluTransport &transport, SegmentID target_id,
+                                std::vector<mlu_detail::ImportEntry> entries,
+                                uint64_t generation) {
+        std::lock_guard<std::mutex> lock(transport.mutex_);
+        transport.machine_id_ = "test-machine";
+        transport.imports_[target_id] = std::move(entries);
+        transport.high_water_[target_id] = generation;
+    }
+};
+
 namespace {
 
 constexpr size_t kChunk = 64ul << 10;  // 64 KiB
 constexpr size_t kBufSize = 3 * kChunk;
 
-SegmentDesc ipcSnapshot(uint64_t generation,
-                        const std::vector<std::string> &attrs) {
+BufferDesc ipcBuffer(uint64_t base, uint64_t size, uint64_t handle) {
+    BufferDesc buffer{};
+    buffer.addr = base;
+    buffer.length = size;
+    buffer.transport_attrs[MLU] = std::to_string(base) + ':' +
+                                  std::to_string(size) + ':' +
+                                  std::to_string(handle) + ":0";
+    return buffer;
+}
+
+SegmentDesc ipcSnapshot(uint64_t generation, std::vector<BufferDesc> buffers) {
     SegmentDesc segment{};
     segment.type = SegmentType::Memory;
-    segment.snapshot_generation = generation;
+    segment.machine_id = "test-machine";
     segment.detail = MemorySegmentDesc{};
-    for (const auto &attr : attrs) {
-        BufferDesc buffer{};
-        buffer.transport_attrs[MLU] = attr;
-        std::get<MemorySegmentDesc>(segment.detail)
-            .buffers.push_back(std::move(buffer));
-    }
+    auto &memory = std::get<MemorySegmentDesc>(segment.detail);
+    memory.transport_attrs[MLU] = std::to_string(generation);
+    memory.buffers = std::move(buffers);
     return segment;
-}
-
-bool containsImport(const std::vector<mlu_detail::ImportEntry> &entries,
-                    const std::string &attr) {
-    return std::any_of(entries.begin(), entries.end(),
-                       [&](const auto &entry) { return entry.attr == attr; });
-}
-
-TEST(MluImportCacheTest, RemovalRetiresMappingEvenWhenHighestBufferIsGone) {
-    int released = 0;
-    std::vector<mlu_detail::ImportEntry> entries;
-    uint64_t reconciled = 0;
-    auto mapping = [&](int *value) {
-        return std::shared_ptr<void>(value, [&](void *ptr) {
-            delete static_cast<int *>(ptr);
-            ++released;
-        });
-    };
-    entries.push_back({"A", 0, 0, 10, mapping(new int(1))});
-    entries.push_back({"B", 0, 0, 10, mapping(new int(2))});
-
-    std::vector<std::shared_ptr<void>> dropped;
-    mlu_detail::reconcileImports(entries, reconciled,
-                                 ipcSnapshot(10, {"A", "B"}), dropped);
-    EXPECT_TRUE(dropped.empty());
-    EXPECT_EQ(reconciled, 10u);
-    mlu_detail::reconcileImports(entries, reconciled, ipcSnapshot(11, {"A"}),
-                                 dropped);
-    ASSERT_EQ(dropped.size(), 1u);
-    EXPECT_EQ(reconciled, 11u);
-    EXPECT_TRUE(containsImport(entries, "A"));
-    EXPECT_FALSE(containsImport(entries, "B"));
-    EXPECT_EQ(released, 0);
-    dropped.clear();
-    EXPECT_EQ(released, 1);
-}
-
-TEST(MluImportCacheTest, OlderSnapshotCannotRetireNewerImport) {
-    std::vector<mlu_detail::ImportEntry> entries;
-    uint64_t reconciled = 0;
-    std::vector<std::shared_ptr<void>> dropped;
-    entries.push_back({"A", 0, 0, 12, std::make_shared<int>(1)});
-    entries.push_back({"C", 0, 0, 12, std::make_shared<int>(3)});
-    auto current = ipcSnapshot(12, {"A", "C"});
-    mlu_detail::reconcileImports(entries, reconciled, current, dropped);
-    EXPECT_TRUE(dropped.empty());
-    EXPECT_EQ(reconciled, 12u);
-
-    auto older = ipcSnapshot(11, {"A", "B"});
-    mlu_detail::reconcileImports(entries, reconciled, older, dropped);
-    EXPECT_TRUE(dropped.empty());
-    EXPECT_EQ(reconciled, 11u);
-    EXPECT_TRUE(containsImport(entries, "C"));
-    entries.push_back({"B", 0, 0, 11, std::make_shared<int>(2)});
-
-    mlu_detail::reconcileImports(entries, reconciled, current, dropped);
-    ASSERT_EQ(dropped.size(), 1u);
-    EXPECT_EQ(reconciled, 12u);
-    EXPECT_FALSE(containsImport(entries, "B"));
-    EXPECT_TRUE(containsImport(entries, "C"));
 }
 
 class MluTransportTest : public ::testing::Test {
@@ -252,6 +235,7 @@ class MluTransportTest : public ::testing::Test {
         fail_sync = false;
         fail_queue = nullptr;
         reject_copy = CN_SUCCESS;
+        reject_peer_copy = CN_SUCCESS;
         fail_notifier_record = false;
         transport_.uninstall();
     }
@@ -312,6 +296,74 @@ class MluTransportTest : public ::testing::Test {
     Platform *loader_ = nullptr;
     MluTransport transport_;
 };
+
+TEST_F(MluTransportTest, DroppedIpcAttributeIsNotReturnedByLaterPrepare) {
+    // Cache reconciliation is independent of device peer accessibility.
+    std::vector<uint8_t> source(kChunk);
+
+    constexpr SegmentID target_id = 42;
+    auto a = ipcBuffer(0x1000, kChunk, 101);
+    auto b = ipcBuffer(0x20000, kChunk, 102);
+    auto old = ipcSnapshot(10, {a, b});
+    auto current = ipcSnapshot(11, {a});
+    auto released = std::make_shared<int>(0);
+    auto mapping = [released](int value) {
+        return std::shared_ptr<void>(new int(value), [released](void *ptr) {
+            delete static_cast<int *>(ptr);
+            ++*released;
+        });
+    };
+    std::vector<mlu_detail::ImportEntry> entries;
+    entries.push_back(
+        {a.transport_attrs.at(MLU), a.addr, a.length, mapping(1)});
+    entries.push_back(
+        {b.transport_attrs.at(MLU), b.addr, b.length, mapping(2)});
+    MluTransportTestPeer::seedImportCache(transport_, target_id,
+                                          std::move(entries), 10);
+
+    // Preparing A from the new snapshot removes B's old mapping.
+    ASSERT_TRUE(transport_.prepareRemoteBuffer(
+        target_id, current, current.getMemory().buffers[0], source.data()));
+    EXPECT_EQ(*released, 1);
+    // The older snapshot may reuse A, but cannot restore B.
+    EXPECT_FALSE(transport_.prepareRemoteBuffer(
+        target_id, old, old.getMemory().buffers[1], source.data()));
+    EXPECT_TRUE(transport_.prepareRemoteBuffer(
+        target_id, old, old.getMemory().buffers[0], source.data()));
+
+    transport_.closeRemoteSegment(target_id);
+    EXPECT_EQ(*released, 2);
+}
+
+TEST_F(MluTransportTest, CachedIpcMappingMustBeAccessibleForThisCopy) {
+    uint8_t *source = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&source, kChunk));
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&target, kChunk));
+    std::vector<uint8_t> host_source(kChunk);
+    constexpr SegmentID target_id = 42;
+    auto entry = ipcBuffer(0x1000, kChunk, 101);
+    // Model a cached export from another device, even on single-device hosts.
+    entry.transport_attrs[MLU] = "4096:" + std::to_string(kChunk) + ":101:1";
+    auto segment = ipcSnapshot(10, {entry});
+    MluTransportTestPeer::seedImportCache(
+        transport_, target_id,
+        {{entry.transport_attrs.at(MLU), entry.addr, entry.length,
+          std::shared_ptr<void>(target, [](void *) {})}},
+        10);
+    EXPECT_TRUE(transport_.prepareRemoteBuffer(target_id, segment, entry,
+                                               host_source.data()));
+    {
+        mlu_test::InaccessiblePeer inaccessible(source, kChunk);
+        EXPECT_FALSE(
+            transport_.prepareRemoteBuffer(target_id, segment, entry, source));
+    }
+    // A rejection for one source must not discard a still-valid mapping.
+    EXPECT_TRUE(transport_.prepareRemoteBuffer(target_id, segment, entry,
+                                               host_source.data()));
+    transport_.closeRemoteSegment(target_id);
+    EXPECT_TRUE(loader_->free(source, kChunk).ok());
+    EXPECT_TRUE(loader_->free(target, kChunk).ok());
+}
 
 TEST_F(MluTransportTest, RestrictedBuffersDoNotExportIpcHandle) {
     uint8_t *device = nullptr;
@@ -643,6 +695,155 @@ TEST_F(MluTransportTest, CopiesBetweenDeviceBuffers) {
     loader_->free(b, kChunk);
 }
 
+class MluCrossContextTest : public MluTransportTest {
+   protected:
+    void SetUp() override {
+        MluTransportTest::SetUp();
+        if (HasFatalFailure() || IsSkipped()) return;
+        ASSERT_EQ(cnCtxGetCurrent(&previous_), CN_SUCCESS);
+        restore_context_ = true;
+        CNdev device;
+        ASSERT_EQ(cnDeviceGet(&device, 0), CN_SUCCESS);
+        for (size_t i = 0; i < 2; ++i) {
+            ASSERT_EQ(cnCtxCreate(&contexts_[i], 0, device), CN_SUCCESS);
+            ASSERT_EQ(cnMalloc(&addresses_[i], kBufSize), CN_SUCCESS);
+            CNcontext owner = nullptr;
+            int ordinal = -1;
+            ASSERT_EQ(cnGetMemAttribute(&owner, CN_MEM_ATTRIBUTE_CONTEXT,
+                                        addresses_[i]),
+                      CN_SUCCESS);
+            ASSERT_EQ(
+                cnGetMemAttribute(&ordinal, CN_MEM_ATTRIBUTE_DEVICE_ORDINAL,
+                                  addresses_[i]),
+                CN_SUCCESS);
+            ASSERT_EQ(owner, contexts_[i]);
+            ASSERT_EQ(ordinal, 0);
+        }
+        ASSERT_NE(contexts_[0], contexts_[1]);
+        ASSERT_EQ(cnCtxSetCurrent(previous_), CN_SUCCESS);
+    }
+
+    void TearDown() override {
+        reject_peer_copy = CN_SUCCESS;
+        fail_notifier_record = false;
+        if (pending_batch_)
+            EXPECT_TRUE(transport_.freeSubBatch(pending_batch_).ok());
+        // Destroy all transport queues/notifiers before their owning contexts.
+        MluTransportTest::TearDown();
+        for (size_t i = 0; i < 2; ++i) {
+            if (!contexts_[i]) continue;
+            EXPECT_EQ(cnCtxSetCurrent(contexts_[i]), CN_SUCCESS);
+            if (addresses_[i]) EXPECT_EQ(cnFree(addresses_[i]), CN_SUCCESS);
+            EXPECT_EQ(cnCtxSetCurrent(previous_), CN_SUCCESS);
+            EXPECT_EQ(cnCtxDestroy(contexts_[i]), CN_SUCCESS);
+        }
+        if (restore_context_) EXPECT_EQ(cnCtxSetCurrent(previous_), CN_SUCCESS);
+    }
+
+    void *buffer(size_t i) { return reinterpret_cast<void *>(addresses_[i]); }
+
+    CNcontext contexts_[2]{};
+    CNaddr addresses_[2]{};
+    CNcontext previous_ = nullptr;
+    bool restore_context_ = false;
+    Transport::SubBatchRef pending_batch_ = nullptr;
+};
+
+TEST_F(MluCrossContextTest, CopiesReadAndWriteOnSameDevice) {
+    ASSERT_TRUE(MluTransport::canCopyPeer(buffer(0), buffer(1)));
+    ASSERT_TRUE(MluTransport::canCopyPeer(buffer(1), buffer(0)));
+    std::vector<uint8_t> expected(kBufSize), zero(kBufSize, 0),
+        actual(kBufSize);
+    for (auto opcode : {Request::WRITE, Request::READ}) {
+        const size_t src = opcode == Request::WRITE ? 0 : 1;
+        const size_t dst = 1 - src;
+        for (size_t i = 0; i < expected.size(); ++i)
+            expected[i] = (i + 17 * src) % 251;
+        ASSERT_TRUE(loader_->copy(buffer(src), expected.data(), kBufSize).ok());
+        ASSERT_TRUE(loader_->copy(buffer(dst), zero.data(), kBufSize).ok());
+        const int calls_before = peer_copy_calls;
+        const int ordinal_queries_before = mlu_test::device_ordinal_queries;
+        const int peer_queries_before = mlu_test::peer_access_queries;
+        auto status =
+            run(makeRequest(opcode, buffer(0), addresses_[1], kBufSize));
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kBufSize);
+        EXPECT_EQ(peer_copy_calls.load(), calls_before + 1);
+        EXPECT_EQ(mlu_test::device_ordinal_queries.load(),
+                  ordinal_queries_before);
+        EXPECT_EQ(mlu_test::peer_access_queries.load(), peer_queries_before);
+        EXPECT_EQ(peer_src_context.load(), contexts_[src]);
+        EXPECT_EQ(peer_dst_context.load(), contexts_[dst]);
+        ASSERT_TRUE(loader_->copy(actual.data(), buffer(dst), kBufSize).ok());
+        EXPECT_EQ(actual, expected);
+        CNcontext current = nullptr;
+        ASSERT_EQ(cnCtxGetCurrent(&current), CN_SUCCESS);
+        EXPECT_EQ(current, previous_);
+    }
+}
+
+class MluCrossContextFailureTest : public MluCrossContextTest,
+                                   public ::testing::WithParamInterface<
+                                       std::tuple<Request::OpCode, CNresult>> {
+};
+
+TEST_P(MluCrossContextFailureTest, DrainsAmbiguousCopiesAndRecoversQueue) {
+    const auto [opcode, failure] = GetParam();
+    const size_t src = opcode == Request::WRITE ? 0 : 1;
+    std::vector<uint8_t> expected(kBufSize, 0x6d), zero(kBufSize, 0),
+        actual(kBufSize);
+    ASSERT_TRUE(loader_->copy(buffer(src), expected.data(), kBufSize).ok());
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto d2h =
+        makeRequest(Request::WRITE, buffer(src),
+                    reinterpret_cast<uint64_t>(host.bytes.data()), kBufSize);
+    auto peer = makeRequest(opcode, buffer(0), addresses_[1], kBufSize);
+    auto queue = queueFor(d2h);
+    ASSERT_NE(queue, nullptr);
+    ASSERT_EQ(queue->context, contexts_[src]);
+    EXPECT_EQ(queueFor(peer), queue);
+    ASSERT_TRUE(loader_->copy(buffer(1 - src), zero.data(), kBufSize).ok());
+    QueueGate gate(queue->handle, queue->context);
+    ASSERT_TRUE(transport_.allocateSubBatch(pending_batch_, 1).ok());
+    const int calls_before = peer_copy_calls;
+    reject_peer_copy = failure;
+    fail_notifier_record = failure == CN_SUCCESS;
+    ASSERT_TRUE(transport_.submitTransferTasks(pending_batch_, {peer}).ok());
+    EXPECT_EQ(peer_copy_calls.load(), calls_before + 1);
+    EXPECT_EQ(reject_peer_copy.load(), CN_SUCCESS);
+    EXPECT_FALSE(fail_notifier_record.load());
+    EXPECT_EQ(peer_src_context.load(), contexts_[src]);
+    EXPECT_EQ(peer_dst_context.load(), contexts_[1 - src]);
+
+    const bool must_drain = failure != CN_ERROR_INVALID_VALUE;
+    TransferStatus status{};
+    EXPECT_TRUE(transport_.getTransferStatus(pending_batch_, 0, status).ok());
+    EXPECT_EQ(status.s, must_drain ? PENDING : FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_EQ(
+        static_cast<MluSubBatch *>(pending_batch_)->task_list[0].drain_on_error,
+        must_drain);
+    if (must_drain) EXPECT_EQ(run(d2h).s, FAILED);
+
+    gate.release();
+    status = wait(pending_batch_);
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_TRUE(transport_.freeSubBatch(pending_batch_).ok());
+    ASSERT_TRUE(loader_->copy(actual.data(), buffer(1 - src), kBufSize).ok());
+    EXPECT_EQ(actual, must_drain ? expected : zero);
+    auto recovered = queueFor(peer);
+    EXPECT_EQ(recovered == queue, !must_drain);
+    EXPECT_EQ(queueFor(d2h), recovered);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ReadWriteRejectedAmbiguousAndNotifier, MluCrossContextFailureTest,
+    ::testing::Combine(::testing::Values(Request::WRITE, Request::READ),
+                       ::testing::Values(CN_ERROR_INVALID_VALUE,
+                                         CN_INVOKE_ERROR_TIMEOUT, CN_SUCCESS)));
+
 TEST_F(MluTransportTest, CopiesBetweenPeerDevices) {
     unsigned int count = 0;
     ASSERT_EQ(cnrtGetDeviceCount(&count), cnrtSuccess);
@@ -668,6 +869,100 @@ TEST_F(MluTransportTest, CopiesBetweenPeerDevices) {
     EXPECT_TRUE(loader_->free(src, kChunk).ok());
     EXPECT_TRUE(loader_->free(dst, kChunk).ok());
 }
+
+TEST_F(MluTransportTest, RejectedPeerCopyDoesNotAllocateOrDrain) {
+    uint8_t *src = nullptr, *dst = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&src, kBufSize));
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dst, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto queue = queueFor(makeRequest(Request::WRITE, src,
+                                      (uint64_t)host.bytes.data(), kBufSize));
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    mlu_test::InaccessiblePeer inaccessible(src, kBufSize);
+    EXPECT_FALSE(MluTransport::canCopyPeer(src, dst));
+    EXPECT_FALSE(MluTransport::canCopyPeer(dst, src));
+    const int ordinal_queries_before = mlu_test::device_ordinal_queries;
+    const int peer_queries_before = mlu_test::peer_access_queries;
+    const int allocations_before = host_malloc_calls;
+    const int syncs_before = queue_sync_calls;
+    for (auto opcode : {Request::WRITE, Request::READ}) {
+        auto request = makeRequest(opcode, src, (uint64_t)dst, kBufSize);
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+        // Bypass engine selection and model a driver rejecting the copy.
+        // The real allocations share a context, so enqueue uses Async_V3.
+        reject_copy = CN_ERROR_INVALID_VALUE;
+        auto submit = std::async(std::launch::async, [&] {
+            return transport_.submitTransferTasks(batch, {request});
+        });
+        auto ready = submit.wait_for(std::chrono::milliseconds(150));
+        EXPECT_EQ(ready, std::future_status::ready);
+        // Release even on a regression so the test cannot hang in quiesce.
+        if (ready != std::future_status::ready) gate.release();
+        EXPECT_TRUE(submit.get().ok());
+        EXPECT_EQ(reject_copy.load(), CN_SUCCESS);
+        auto status = wait(batch);
+        EXPECT_EQ(status.s, FAILED);
+        EXPECT_EQ(status.transferred_bytes, 0u);
+        EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    }
+    EXPECT_EQ(host_malloc_calls.load(), allocations_before);
+    EXPECT_EQ(queue_sync_calls.load(), syncs_before);
+    EXPECT_EQ(mlu_test::device_ordinal_queries.load(), ordinal_queries_before);
+    EXPECT_EQ(mlu_test::peer_access_queries.load(), peer_queries_before);
+    gate.release();
+    EXPECT_TRUE(transport_.quiesce().ok());
+    EXPECT_TRUE(loader_->free(src, kBufSize).ok());
+    EXPECT_TRUE(loader_->free(dst, kBufSize).ok());
+}
+
+class MluPeerFailureTest : public MluTransportTest,
+                           public ::testing::WithParamInterface<CNresult> {};
+
+TEST_P(MluPeerFailureTest, SharesDeviceQueueAndPreservesDrainOnError) {
+    uint8_t *src = nullptr, *dst = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&src, kBufSize));
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dst, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto d2h =
+        makeRequest(Request::WRITE, src, (uint64_t)host.bytes.data(), kBufSize);
+    auto peer = makeRequest(Request::WRITE, src, (uint64_t)dst, kBufSize);
+    auto queue = queueFor(d2h);
+    ASSERT_NE(queue, nullptr);
+    EXPECT_EQ(queueFor(peer), queue);
+    QueueGate gate(queue);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    reject_copy = GetParam();
+    fail_notifier_record = GetParam() == CN_SUCCESS;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {peer}).ok());
+    const bool must_drain = GetParam() != CN_ERROR_INVALID_VALUE;
+    TransferStatus status{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, must_drain ? PENDING : FAILED);
+    EXPECT_EQ(static_cast<MluSubBatch *>(batch)->task_list[0].drain_on_error,
+              must_drain);
+    if (must_drain) {
+        // A later D2H must not extend this D2D task's uncertain drain.
+        EXPECT_EQ(run(d2h).s, FAILED);
+    }
+    gate.release();
+    EXPECT_EQ(wait(batch).s, FAILED);
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    auto recovered = queueFor(peer);
+    EXPECT_EQ(recovered == queue, !must_drain);
+    EXPECT_EQ(queueFor(d2h), recovered);
+    EXPECT_TRUE(loader_->free(src, kBufSize).ok());
+    EXPECT_TRUE(loader_->free(dst, kBufSize).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(RejectedAmbiguousAndNotifier, MluPeerFailureTest,
+                         ::testing::Values(CN_ERROR_INVALID_VALUE,
+                                           CN_INVOKE_ERROR_TIMEOUT,
+                                           CN_SUCCESS));
 
 TEST_F(MluTransportTest, FailsOnNonLocalTarget) {
     uint8_t *dev = nullptr;

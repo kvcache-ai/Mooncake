@@ -1005,6 +1005,72 @@ TEST(TransportSelectorTest, MluStagingUsesHostCapsWithoutBypassingPolicy) {
         << "staging must not bypass the original memory policy";
 }
 
+TEST(TransportSelectorTest, LocalMluStagingRequiresBothCopyDirections) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    auto mlu = std::make_shared<FakeTransport>(MLU);
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    transports[MLU] = mlu;
+    transports[TCP] = tcp;
+    tcp->setGpuToGpu(true);
+    tcp->setDramToDram(true);
+    mlu->setGpuToDram(true);
+    std::vector<TransportType> candidates{TCP, MLU};
+    SelectionContext ctx{};
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = ctx.local_segment = true;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_MLU;
+    ctx.buffer_transports = &candidates;
+    ctx.local_mlu_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+    mlu->setDramToGpu(true);
+    EXPECT_EQ(selector.select(ctx, transports).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 0, MLU).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+    ctx.local_segment = false;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+}
+
+TEST(TransportSelectorTest, LocalMluStagingHonorsPolicyAndForceTcp) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(conf->load(R"({"policy":[{"name":"local_mlu",
+        "segment_type":"memory","local_memory":"mlu",
+        "remote_memory":"mlu","transports":["mlu"]}]})")
+                    .ok());
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    auto mlu = std::make_shared<FakeTransport>(MLU);
+    mlu->setGpuToDram(true);
+    mlu->setDramToGpu(true);
+    transports[MLU] = mlu;
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    tcp->setGpuToGpu(true);
+    tcp->setDramToDram(true);
+    transports[TCP] = tcp;
+    SelectionContext ctx{};
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = ctx.local_segment = true;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_MLU;
+    ctx.local_mlu_staging = true;
+    TransportSelector selector(conf);
+    EXPECT_EQ(selector.select(ctx, transports).transport, MLU);
+    ctx.policy_name = "missing_policy";
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+    ctx.policy_name.reset();
+    ASSERT_TRUE(conf->load(R"({"policy":[{"name":"network_only",
+        "segment_type":"memory","transports":["tcp"]}]})")
+                    .ok());
+    TransportSelector network_only(conf);
+    EXPECT_EQ(network_only.select(ctx, transports).transport, UNSPEC);
+    auto forced_conf = std::make_shared<Config>();
+    forced_conf->set("transports/force_tcp", true);
+    TransportSelector force_tcp(forced_conf);
+    EXPECT_EQ(force_tcp.select(ctx, transports).transport, UNSPEC);
+}
+
 TEST(TransportSelectorTest, FileSegmentDramToFile) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);

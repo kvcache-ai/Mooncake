@@ -89,6 +89,9 @@ struct SelectionContext {
     // Match policy against the original memory types, but select a network
     // transport for the host-to-host leg of a staged request.
     bool host_staging{false};
+    // A local MLU pair without direct access uses one host stage. Both legs
+    // are MLU copies; there is no host-to-host network leg.
+    bool local_mlu_staging{false};
     // The peer's XPU buffer may be mapped into this process (Level Zero IPC),
     // so XpuTransport can address it, unstaged, although the segment is not
     // local. Other transports still follow host_staging.
