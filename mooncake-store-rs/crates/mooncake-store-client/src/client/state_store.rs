@@ -1962,8 +1962,6 @@ impl StorageOwnerState {
             let Some(route) = route else {
                 if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
                     reclaimed = reclaimed.saturating_add(1);
-                } else {
-                    self.hot_replicas.clock.lock().remove_id(&victim);
                 }
                 continue;
             };
