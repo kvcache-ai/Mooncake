@@ -597,13 +597,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
-        ReplicateConfig key_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            key_config.SetKeyIds(config, i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        results = master_service_.BatchPutStart(
+            client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
     }
 
     size_t failure_count = 0;

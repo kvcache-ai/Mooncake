@@ -2,11 +2,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "allocator_metric.h"
@@ -588,6 +590,39 @@ class MasterMetricManager {
     };
 
     // --- Metric Members ---
+    // Unlike ylt::metric::counter_t (which defaults to hardware_concurrency()),
+    // ylt::metric::gauge_t and histogram_t hardcode dupli_count=2, turning
+    // concurrent updates into cross-socket atomic RMW contention. Use Gauge and
+    // Histogram for all static gauges and histograms in MasterMetricManager.
+    static constexpr size_t kMetricDupliCount = 512;
+
+    struct Gauge : ylt::metric::gauge_t {
+        Gauge(std::string name, std::string help,
+              size_t dupli_count = kMetricDupliCount)
+            : ylt::metric::gauge_t(std::move(name), std::move(help),
+                                   dupli_count) {}
+        Gauge(std::string name, std::string help,
+              std::map<std::string, std::string> labels,
+              size_t dupli_count = kMetricDupliCount)
+            : ylt::metric::gauge_t(std::move(name), std::move(help),
+                                   std::move(labels), dupli_count) {}
+    };
+
+    struct Histogram : ylt::metric::histogram_t {
+        Histogram(std::string name, std::string help,
+                  std::vector<double> buckets,
+                  size_t dupli_count = kMetricDupliCount)
+            : ylt::metric::histogram_t(std::move(name), std::move(help),
+                                       std::move(buckets), dupli_count) {}
+        Histogram(std::string name, std::string help,
+                  std::vector<double> buckets,
+                  std::map<std::string, std::string> labels,
+                  size_t dupli_count = kMetricDupliCount)
+            : ylt::metric::histogram_t(std::move(name), std::move(help),
+                                       std::move(buckets), std::move(labels),
+                                       dupli_count) {}
+    };
+
     std::mutex summary_snapshot_mutex_;
     SummarySnapshot summary_snapshot_;
 
@@ -598,10 +633,8 @@ class MasterMetricManager {
     AllocatorMetric allocator_metric_;
 
     // Memory Storage Metrics
-    ylt::metric::gauge_t
-        mem_allocated_size_;  // Overall memory usage update for gauge
-    ylt::metric::gauge_t
-        mem_total_capacity_;  // Overall memory capacity update for gauge
+    Gauge mem_allocated_size_;  // Overall memory usage update for gauge
+    Gauge mem_total_capacity_;  // Overall memory capacity update for gauge
     ylt::metric::dynamic_gauge_1t
         mem_allocated_size_per_segment_;  // Segment memory usage update for
                                           // gauge
@@ -610,10 +643,8 @@ class MasterMetricManager {
                                           // gauge
 
     // NoF Segment Metrics
-    ylt::metric::gauge_t
-        nof_allocated_size_;  // Overall NoF SSD usage update for gauge
-    ylt::metric::gauge_t
-        nof_total_capacity_;  // Overall NoF SSD capacity update for gauge
+    Gauge nof_allocated_size_;  // Overall NoF SSD usage update for gauge
+    Gauge nof_total_capacity_;  // Overall NoF SSD capacity update for gauge
     ylt::metric::dynamic_gauge_1t
         nof_allocated_size_per_segment_;  // NoF segment usage update for
                                           // gauge
@@ -622,19 +653,19 @@ class MasterMetricManager {
                                           // gauge
 
     // File Storage Metrics
-    ylt::metric::gauge_t file_allocated_size_;
-    ylt::metric::gauge_t file_total_capacity_;
+    Gauge file_allocated_size_;
+    Gauge file_total_capacity_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
 
     // DFS Allocator Metrics
-    ylt::metric::gauge_t dfs_allocated_size_;
-    ylt::metric::gauge_t dfs_total_capacity_;
-    ylt::metric::gauge_t dfs_file_count_;
+    Gauge dfs_allocated_size_;
+    Gauge dfs_total_capacity_;
+    Gauge dfs_file_count_;
 
     // Key/Value Metrics
-    ylt::metric::gauge_t key_count_;
-    ylt::metric::gauge_t soft_pin_key_count_;
-    ylt::metric::histogram_t value_size_distribution_;
+    Gauge key_count_;
+    Gauge soft_pin_key_count_;
+    Histogram value_size_distribution_;
 
     // Key Group Metrics
     static constexpr size_t kMaxKeyGroups = 32;
@@ -651,15 +682,15 @@ class MasterMetricManager {
     ylt::metric::dynamic_gauge_1t value_bytes_by_group_;
 
     // Cluster Metrics
-    ylt::metric::gauge_t active_clients_;
-    ylt::metric::gauge_t client_liveness_active_clients_;
-    ylt::metric::gauge_t client_liveness_suspected_clients_;
-    ylt::metric::gauge_t client_liveness_offline_clients_;
+    Gauge active_clients_;
+    Gauge client_liveness_active_clients_;
+    Gauge client_liveness_suspected_clients_;
+    Gauge client_liveness_offline_clients_;
     ylt::metric::counter_t client_liveness_suspected_transitions_;
     ylt::metric::counter_t client_liveness_recoveries_;
     ylt::metric::counter_t client_liveness_offline_transitions_;
-    ylt::metric::gauge_t pending_client_offboarding_jobs_metric_;
-    ylt::metric::histogram_t client_offboarding_duration_ms_;
+    Gauge pending_client_offboarding_jobs_metric_;
+    Histogram client_offboarding_duration_ms_;
     ylt::metric::counter_t client_offboarding_retries_;
     ylt::metric::counter_t client_offboarding_alerts_;
 
@@ -703,7 +734,7 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_heartbeat_failure_total_;
     ylt::metric::counter_t nof_heartbeat_timeout_total_;
     ylt::metric::counter_t nof_segments_unmounted_by_heartbeat_total_;
-    ylt::metric::histogram_t nof_heartbeat_probe_latency_ms_;
+    Histogram nof_heartbeat_probe_latency_ms_;
 
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;
@@ -749,8 +780,8 @@ class MasterMetricManager {
     ylt::metric::counter_t file_cache_hit_nums_;
     ylt::metric::counter_t mem_cache_hit_bytes_;
     ylt::metric::counter_t file_cache_hit_bytes_;
-    ylt::metric::gauge_t mem_cache_nums_;
-    ylt::metric::gauge_t file_cache_nums_;
+    Gauge mem_cache_nums_;
+    Gauge file_cache_nums_;
 
     ylt::metric::counter_t valid_get_nums_;
     ylt::metric::counter_t total_get_nums_;
@@ -785,10 +816,10 @@ class MasterMetricManager {
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
-    ylt::metric::gauge_t put_start_discarded_staging_size_;
+    Gauge put_start_discarded_staging_size_;
 
     // Promotion-on-hit Metrics
-    ylt::metric::gauge_t promotion_in_flight_metric_;
+    Gauge promotion_in_flight_metric_;
     ylt::metric::counter_t promotion_admitted_;
     ylt::metric::counter_t promotion_completed_;
     ylt::metric::counter_t promotion_completed_bytes_;
@@ -848,9 +879,9 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_gauge_1t weight_revisions_by_availability_;
     ylt::metric::dynamic_gauge_1t weight_revisions_by_residency_;
-    ylt::metric::gauge_t weight_active_leases_;
-    ylt::metric::gauge_t weight_pending_operations_;
-    ylt::metric::gauge_t weight_oldest_operation_age_ms_;
+    Gauge weight_active_leases_;
+    Gauge weight_pending_operations_;
+    Gauge weight_oldest_operation_age_ms_;
     ylt::metric::counter_t weight_reconciliation_failures_;
 
     // Build Info Metric
@@ -861,7 +892,7 @@ class MasterMetricManager {
     // than a dynamic-label metric.
     // Shares the `mooncake_build_info` name with the client-side metric; the
     // two are told apart by the scrape target's job/instance labels.
-    ylt::metric::gauge_t build_info_;
+    Gauge build_info_;
 };
 
 }  // namespace mooncake

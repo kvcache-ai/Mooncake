@@ -13,6 +13,7 @@
 // only when it observes reads.
 
 #include <array>
+#include <bit>
 #include <cassert>
 #include <memory>
 #include <mutex>
@@ -165,17 +166,20 @@ class Namespace final : private route::RouteObserver {
 
     // One stripe of the in-flight list. Starting and finishing a write each
     // touch the list, so it is striped by key rather than put under one lock
-    // for the whole namespace. Only writers take these locks, and only to
-    // link or unlink, so it needs far fewer stripes than the route.
-    struct InFlightStripe {
+    // for the whole namespace. Cacheline-aligned so concurrent BatchPutStart
+    // and BatchPutEnd writers do not false-share adjacent stripe locks.
+    struct alignas(64) InFlightStripe {
         mutable std::mutex lock;
         InFlightList slots;
     };
 
-    static constexpr size_t kInFlightStripeCount = 64;
+    static constexpr size_t kInFlightStripeCount = 1024;
+    static_assert(std::has_single_bit(kInFlightStripeCount),
+                  "kInFlightStripeCount must be a power of two");
 
-    InFlightStripe& InFlightStripeOf(std::string_view key) {
-        return in_flight_[TransparentStringHash{}(key) % kInFlightStripeCount];
+    InFlightStripe& InFlightStripeOf(std::string_view key) noexcept {
+        return in_flight_[TransparentStringHash{}(key) &
+                          (kInFlightStripeCount - 1)];
     }
 
     const TenantId id_;

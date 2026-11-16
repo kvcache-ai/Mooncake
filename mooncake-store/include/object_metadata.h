@@ -235,25 +235,26 @@ struct ObjectMetadata {
         MutablePart(0).AddReplicas(std::move(replicas));
     }
 
-    std::vector<Replica> PopReplicas(
-        const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn);
+    template <typename Pred>
+    std::vector<Replica> PopReplicas(Pred&& pred_fn) {
+        return MutablePart(0).PopReplicas(std::forward<Pred>(pred_fn));
     }
 
     std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
 
-    size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn).size();
+    template <typename Pred>
+    size_t EraseReplicas(Pred&& pred_fn) {
+        return MutablePart(0).PopReplicas(std::forward<Pred>(pred_fn)).size();
     }
 
     // visit_fn may modify the replica but must not add or pop replicas.
-    size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
-                         const std::function<void(Replica&)>& visit_fn) {
+    template <typename Pred, typename Visit>
+    size_t VisitReplicas(Pred&& pred_fn, Visit&& visit_fn) {
         size_t num_visited = 0;
 
         for (auto& replica : MutablePart(0).replicas()) {
-            if (pred_fn(replica)) {
-                visit_fn(replica);
+            if (std::invoke(pred_fn, replica)) {
+                std::invoke(visit_fn, replica);
                 num_visited++;
             }
         }
@@ -261,14 +262,13 @@ struct ObjectMetadata {
         return num_visited;
     }
 
-    size_t VisitReplicas(
-        const std::function<bool(const Replica&)>& pred_fn,
-        const std::function<void(const Replica&)>& visit_fn) const {
+    template <typename Pred, typename Visit>
+    size_t VisitReplicas(Pred&& pred_fn, Visit&& visit_fn) const {
         size_t num_visited = 0;
 
         for (const auto& replica : GetPart(0).replicas()) {
-            if (pred_fn(replica)) {
-                visit_fn(replica);
+            if (std::invoke(pred_fn, replica)) {
+                std::invoke(visit_fn, replica);
                 num_visited++;
             }
         }
@@ -276,18 +276,22 @@ struct ObjectMetadata {
         return num_visited;
     }
 
-    bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
+    template <typename Pred>
+    bool HasReplica(Pred&& pred_fn) const {
+        return std::ranges::any_of(GetPart(0).replicas(),
+                                   std::forward<Pred>(pred_fn));
     }
 
-    bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::all_of(GetPart(0).replicas(), pred_fn);
+    template <typename Pred>
+    bool AllReplicas(Pred&& pred_fn) const {
+        return std::ranges::all_of(GetPart(0).replicas(),
+                                   std::forward<Pred>(pred_fn));
     }
 
-    size_t CountReplicas(
-        const std::function<bool(const Replica&)>& pred_fn) const {
-        return static_cast<size_t>(
-            std::ranges::count_if(GetPart(0).replicas(), pred_fn));
+    template <typename Pred>
+    size_t CountReplicas(Pred&& pred_fn) const {
+        return static_cast<size_t>(std::ranges::count_if(
+            GetPart(0).replicas(), std::forward<Pred>(pred_fn)));
     }
 
     size_t CountReplicas() const { return GetPart(0).replicas().size(); }
@@ -296,10 +300,11 @@ struct ObjectMetadata {
         return GetPart(0).replicas();
     }
 
-    Replica* GetFirstReplica(
-        const std::function<bool(const Replica&)>& pred_fn) {
+    template <typename Pred>
+    Replica* GetFirstReplica(Pred&& pred_fn) {
         auto replicas = MutablePart(0).replicas();
-        const auto it = std::ranges::find_if(replicas, pred_fn);
+        const auto it =
+            std::ranges::find_if(replicas, std::forward<Pred>(pred_fn));
         return it != replicas.end() ? &(*it) : nullptr;
     }
 
@@ -321,24 +326,32 @@ struct ObjectMetadata {
     // Grant a read lease at now() + ttl. Grouped objects extend the shared
     // group TTL; a zero ttl is a no-op on a live lease (PutEnd cannot
     // expire a live group).
-    void GrantReadLease(std::chrono::milliseconds ttl) const {
-        SpinLocker locker(&lock);
+    // Lock-free: `lease_` is rebound only under an exclusive key lock
+    // (`PublishLocked` / `RebuildGroupState`), and `Lease` methods use atomic
+    // monotonic-max CAS on `deadline_ns_`.
+    void GrantReadLease(std::chrono::milliseconds ttl) const
+        NO_THREAD_SAFETY_ANALYSIS {
         lease_->GrantReadLease(ttl);
     }
 
+    void ExtendReadLeaseTo(const std::chrono::system_clock::time_point deadline)
+        const NO_THREAD_SAFETY_ANALYSIS {
+        lease_->ExtendTo(deadline);
+    }
+
     // Whether the authoritative lease is expired.
-    bool IsLeaseExpired() const {
-        SpinLocker locker(&lock);
+    bool IsLeaseExpired() const NO_THREAD_SAFETY_ANALYSIS {
         return lease_->IsExpired(std::chrono::system_clock::now());
     }
 
-    bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
-        SpinLocker locker(&lock);
+    bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const
+        NO_THREAD_SAFETY_ANALYSIS {
         return lease_->IsExpired(now);
     }
 
     // Lease deadline eviction ranks the object by.
-    std::chrono::system_clock::time_point EvictionDeadline() const {
+    std::chrono::system_clock::time_point EvictionDeadline() const
+        NO_THREAD_SAFETY_ANALYSIS {
         return lease_->ExpiresAt();
     }
 
