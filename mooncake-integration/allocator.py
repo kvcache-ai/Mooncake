@@ -89,6 +89,10 @@ class NVLinkAllocator:
             return cls._instances[device]
 
 
+# Backs NVLink fabric memory on CUDA and UALink (UALoE) fabric memory on ROCm.
+FabricAllocator = NVLinkAllocator
+
+
 class BarexAllocator:
     _instances: Dict[torch_device, CUDAPluggableAllocator] = {}
     _lock: Final = threading.Lock()

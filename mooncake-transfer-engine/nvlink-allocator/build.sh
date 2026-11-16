@@ -12,28 +12,28 @@ USE_MACA=false
 CI_BUILD=false
 WITH_HYLINK=false
 
-if [[ "$1" == "--use-nvcc" ]]; then
-    USE_NVCC=true
-    shift
-elif [[ "$1" == "--use-hipcc" ]]; then
-    USE_HIPCC=true
-    shift
-elif [[ "$1" == "--use-mcc" ]]; then
-    USE_MCC=true
-    shift
-elif [[ "$1" == "--use-maca" ]]; then
-    USE_MACA=true
-    shift
-elif [[ "$1" == "--ci-build" ]]; then
-    CI_BUILD=true
-    shift
-fi
+HIP_LIB=""
+HIP_DEFINES=""
 
-# Optional feature flags may follow the compiler flag.
-if [[ "$1" == "--with-hylink" ]]; then
-    WITH_HYLINK=true
+while [[ "$1" == --* ]]; do
+    case "$1" in
+        --use-nvcc) USE_NVCC=true ;;
+        --use-hipcc) USE_HIPCC=true ;;
+        --use-mcc) USE_MCC=true ;;
+        --use-maca) USE_MACA=true ;;
+        --ci-build) CI_BUILD=true ;;
+        --with-hylink) WITH_HYLINK=true ;;
+        # Full path of the libamdhip64 CMake resolved (ROCm SDK wheels only
+        # ship the unversioned .so in the devel package).
+        --hip-lib=*) HIP_LIB="${1#*=}" ;;
+        --hip-fabric) HIP_DEFINES="-DMC_HIP_HAS_FABRIC_HANDLE" ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
     shift
-fi
+done
 
 # Get output directory from command line argument, default to current directory
 OUTPUT_DIR=${1:-.}
@@ -55,7 +55,15 @@ elif [ "$USE_HIPCC" = true ]; then
     HIPCC_DEFINES="-DUSE_HIP=1"
     [ "$WITH_HYLINK" = true ] && HIPCC_DEFINES="$HIPCC_DEFINES -DUSE_HYLINK=1"
     hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
-    hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} ${HIPCC_DEFINES}
+    if [ -n "$HIP_LIB" ]; then
+        # hipcc links "$HIP_PATH/lib/libamdhip64.so" itself; point it at the
+        # SDK that provides the library CMake found.
+        HIP_ROOT=$(dirname "$(dirname "$HIP_LIB")")
+        export HIP_PATH="$HIP_ROOT" ROCM_PATH="$HIP_ROOT"
+    else
+        HIP_ROOT=${ROCM_PATH:-$(hipconfig --path 2>/dev/null || echo /opt/rocm)}
+    fi
+    hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -L"${HIP_ROOT}/lib" -lamdhip64 -I"${HIP_ROOT}/include" ${INCLUDE_FLAGS} ${HIPCC_DEFINES} ${HIP_DEFINES}
 elif [ "$USE_MCC" = true ]; then
     mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
 elif [ "$USE_MACA" = true ]; then

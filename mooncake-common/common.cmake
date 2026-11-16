@@ -595,6 +595,52 @@ if(USE_HIP)
   add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
   message(STATUS "HIP support is enabled")
 
+  # Cross-host GPU memory sharing over UALink needs hipMemHandleTypeFabric.
+  option(USE_HIP_FABRIC "Share HIP VMM memory through fabric handles" ON)
+  if(USE_HIP_FABRIC)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${HIP_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_DEFINITIONS -D__HIP_PLATFORM_AMD__)
+    check_cxx_source_compiles(
+      "#include <hip/hip_runtime_api.h>
+      int main() {
+        hipMemFabricHandle_t handle;
+        (void)handle;
+        return (int)hipMemHandleTypeFabric +
+               (int)hipDeviceAttributeHandleTypeFabricSupported;
+      }"
+      MC_HIP_HAS_FABRIC_HANDLE)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_DEFINITIONS)
+    if(MC_HIP_HAS_FABRIC_HANDLE)
+      add_compile_definitions(MC_HIP_HAS_FABRIC_HANDLE)
+      message(STATUS "HIP fabric handle support is enabled")
+    else()
+      message(STATUS "HIP runtime has no fabric handle type, fabric disabled")
+    endif()
+  endif()
+
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${HIP_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_DEFINITIONS -D__HIP_PLATFORM_AMD__)
+  check_cxx_source_compiles(
+    "#include <hip/hip_runtime_api.h>
+    #include <type_traits>
+    static_assert(std::is_same<decltype(&hipMemcpyBatchAsync),
+                               hipError_t (*)(void**, void**, size_t*, size_t,
+                                              hipMemcpyAttributes*, size_t*,
+                                              size_t, size_t*,
+                                              hipStream_t)>::value,
+                  \"\");
+    int main() { return 0; }"
+    MC_HIP_HAS_MEMCPY_BATCH)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  if(MC_HIP_HAS_MEMCPY_BATCH)
+    add_compile_definitions(MC_HIP_HAS_MEMCPY_BATCH)
+    message(STATUS "HIP batched memcpy is enabled")
+  endif()
+
   find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
   if(NOT HIPIFY_PERL_EXECUTABLE)
     message(
