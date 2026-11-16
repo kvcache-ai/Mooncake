@@ -127,9 +127,8 @@ class Transport {
         for (size_t i = 0; i < batch->size(); ++i) {
             TransferStatus status{PENDING, 0};
             auto result = getTransferStatus(batch, i, status);
-            if (status.s == PENDING || status.s == INITIAL ||
-                status.s == INVALID)
-                return result;
+            if (status.s == PENDING || status.s == INITIAL) return result;
+            // INVALID is a terminal transfer failure, not a query error.
             // TCP can return a failure reason alongside a terminal status.
         }
         drained = true;

@@ -47,7 +47,7 @@ class DelayedTransport : public tent::Transport {
     std::atomic<int> copies{0};
     std::atomic<int> frees{0};
     bool cancel_error = false;
-    bool fail_first = false;
+    tent::TransferStatusEnum first_failure = tent::PENDING;
 
     tent::Status allocateSubBatch(SubBatchRef& batch, size_t) override {
         batch = new Batch;
@@ -70,8 +70,8 @@ class DelayedTransport : public tent::Transport {
                                    tent::TransferStatus& status) override {
         if (poll_error.exchange(false))
             return tent::Status::InternalError("injected poll failure");
-        if (fail_first && id == 0) {
-            status = {tent::FAILED, 0};
+        if (first_failure != tent::PENDING && id == 0) {
+            status = {first_failure, 0};
         } else if (!complete.load()) {
             status = {tent::PENDING, 0};
         } else {
@@ -144,7 +144,6 @@ class TentTransferLifetimeTest : public ::testing::Test {
         size_t count = 1, int64_t timeout = 60000) {
         auto batch = backend_->allocateBatch(count);
         std::vector<tent::Request> requests;
-        std::unordered_set<int> copied;
         for (size_t i = 0; i < count; ++i) requests.push_back(request(16 * i));
         EXPECT_TRUE(backend_->submitTransfer(batch, requests).ok());
         return std::make_shared<TransferEngineOperationState>(engine_, batch,
@@ -199,13 +198,26 @@ TEST_F(TentTransferLifetimeTest, PollFailureDoesNotReleasePendingBuffers) {
 }
 
 TEST_F(TentTransferLifetimeTest, FailedTaskWaitsForRemainingTransfers) {
-    transport_->fail_first = true;
+    transport_->first_failure = tent::FAILED;
     auto state = submit(2);
     EXPECT_FALSE(state->is_completed());
     transport_->complete = true;
     state->wait_for_completion();
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
     EXPECT_EQ(std::memcmp(source_.data() + 16, target_.data() + 16, 16), 0);
+}
+
+TEST_F(TentTransferLifetimeTest, InvalidFailureCompletesOperation) {
+    transport_->first_failure = tent::INVALID;
+    auto state = submit();
+    EXPECT_TRUE(state->is_completed());
+    // Also allow teardown to finish when testing the old drain predicate.
+    transport_->first_failure = tent::FAILED;
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+    state.reset();
+    EXPECT_EQ(transport_->frees.load(), 1);
+    EXPECT_EQ(transport_->copies.load(), 0);
 }
 
 TEST_F(TentTransferLifetimeTest, DestroyingOperationDrainsPendingTransfers) {
