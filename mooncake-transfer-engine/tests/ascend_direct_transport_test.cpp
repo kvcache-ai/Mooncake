@@ -76,6 +76,7 @@ static std::map<const void*, aclrtMemLocation> g_memory_locations;
 // signal handling thread looks like when it tears the client down.
 static bool g_thread_context_bound = true;
 static std::mutex g_acl_mutex;
+static std::atomic<bool> g_null_recent_error{false};
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
 static size_t g_malloc_physical_max_success = 0;
 static int g_malloc_physical_call_count = 0;
@@ -134,6 +135,7 @@ int DeviceForContext(aclrtContext context) {
 namespace mock_acl {
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_null_recent_error = false;
     g_device_id = 0;
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
@@ -453,7 +455,9 @@ aclError aclrtPointerGetAttributes(const void* ptr,
     return ACL_ERROR_NONE;
 }
 
-const char* aclGetRecentErrMsg() { return "mock acl error message"; }
+const char* aclGetRecentErrMsg() {
+    return g_null_recent_error ? nullptr : "mock acl error message";
+}
 
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
@@ -2693,6 +2697,49 @@ TEST_F(AscendDirectTransportTest,
     ASSERT_TRUE(result.finished);
     EXPECT_TRUE(result.failed)
         << "Transfer should have failed due to GetTransferStatus failure";
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_GetStatusFailureWithoutAclErrorMessage) {
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::FAILED);
+    g_null_recent_error = true;
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    initTestData(kTransferBufSize);
+    const auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_FailedStatusWithoutAclErrorMessage) {
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::FAILED);
+    g_null_recent_error = true;
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    initTestData(kTransferBufSize);
+    const auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
 }
 
 TEST_F(AscendDirectTransportTest, RemoteTransfer_Async_TransferTimeout) {

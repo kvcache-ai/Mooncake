@@ -178,6 +178,8 @@ impl ExtentStoreStorageBackend {
             .map(|(read, buffer)| ColdObjectRead {
                 cold_backing: read.cold_backing,
                 dst: &mut buffer[..],
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             })
             .collect::<Vec<_>>();
         let read_results = self.get_objects_into_batch(&mut batch_reads);

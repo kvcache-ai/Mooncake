@@ -87,6 +87,44 @@ struct ObjectRef {
     Generation generation{0};
 };
 
+// Per-slot filing record owned by the namespace's EvictionIndex. Stored inline
+// on KeySlot so filing a key allocates no node of its own.
+struct SlotEvictionState {
+    bool filed{false};
+    uint16_t shard{0};
+    int64_t rank{0};
+    uint64_t identity{0};
+    uint64_t born_seq{0};
+    uint64_t refile_seq{0};
+    void* group{nullptr};
+
+    bool operator==(const SlotEvictionState&) const noexcept = default;
+
+    void FileStandalone(uint16_t chosen_shard, int64_t at_rank,
+                        uint64_t entry_identity, uint64_t born) noexcept {
+        *this = SlotEvictionState{
+            .filed = true,
+            .shard = chosen_shard,
+            .rank = at_rank,
+            .identity = entry_identity,
+            .born_seq = born,
+        };
+    }
+
+    void FileGroup(uint16_t group_shard, int64_t at_rank,
+                   uint64_t entry_identity, void* group_ptr) noexcept {
+        *this = SlotEvictionState{
+            .filed = true,
+            .shard = group_shard,
+            .rank = at_rank,
+            .identity = entry_identity,
+            .group = group_ptr,
+        };
+    }
+
+    void Clear() noexcept { *this = SlotEvictionState{}; }
+};
+
 // What the route's owner keeps on every slot, guarded by the slot lock. The
 // route stores it and never reads it; it survives the objects published in the
 // slot, so the owner returns it to its initial value once the key holds none,
@@ -94,11 +132,8 @@ struct ObjectRef {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
-    // Whether the owner's eviction index files the slot, at what rank, and
-    // under which of the index's own entries for a group, if any.
-    bool eviction_filed{false};
-    int64_t eviction_rank{0};
-    void* eviction_group{nullptr};
+    // Where the owner's eviction index has filed the slot, if at all.
+    SlotEvictionState eviction{};
     // Two words for the owner's namespace policy.
     std::array<uint64_t, 2> policy_words{};
 };
@@ -125,6 +160,7 @@ class KeySlot {
     KeySlot& operator=(const KeySlot&) = delete;
 
     const std::string& key() const noexcept { return *key_; }
+    const SlotOwnerState& owner_state() const noexcept { return owner_; }
 
    private:
     friend class ObjectRoute;
@@ -165,8 +201,9 @@ class KeySlot {
     mutable std::shared_mutex mutex_;
     std::optional<Record> record_;
     SlotOwnerState owner_;
-    // Hooks into the owner's in-flight list and its eviction index.
+    // Hook into the owner's in-flight list.
     ListHook in_flight_hook_;
+    // Hook into the owner's eviction index.
     ListHook eviction_hook_;
 
    public:
@@ -355,6 +392,12 @@ class Guard {
           slot_(std::move(slot)),
           lock_(slot_->mutex_) {}
 
+    Guard(Route* route, SlotHandle slot,
+          std::try_to_lock_t) NO_THREAD_SAFETY_ANALYSIS
+        : route_(route),
+          slot_(std::move(slot)),
+          lock_(slot_->mutex_, std::try_to_lock) {}
+
     // Marks the guard as handed to a caller, so its release is reported to
     // the observer; one the route takes and drops itself, finding the key
     // empty or on another publication, is not.
@@ -409,6 +452,16 @@ class ObjectRoute {
     // The object under `key`, held exclusively; nullopt when it holds none.
     [[nodiscard]] std::optional<WriteGuard> Write(std::string_view key) {
         return Acquire<LockMode::kWrite>(*this, key, std::nullopt);
+    }
+    // Nonblocking key-lock admission for background range eviction. Finding
+    // the slot still takes its stripe lock; no key lock is waited on.
+    [[nodiscard]] std::optional<WriteGuard> TryWrite(std::string_view key) {
+        SlotHandle slot = FindSlot(key);
+        if (!slot) return std::nullopt;
+        WriteGuard guard(this, std::move(slot), std::try_to_lock);
+        if (!guard.lock_.owns_lock() || !guard.has_object())
+            return std::nullopt;
+        return std::optional<WriteGuard>(std::move(guard).HandOut());
     }
     // The same, only while `ref` is still the key's current publication.
     [[nodiscard]] std::optional<WriteGuard> Write(const ObjectRef& ref) {
