@@ -39,6 +39,10 @@ struct ObjectView {
 
 class EvictionObserver {
    public:
+    // Whether per-object callbacks may run concurrently for different keys.
+    // Opt in only when OnApplied and OnSkipped are thread-safe across keys.
+    virtual bool SupportsParallel() const { return false; }
+
     // An object was reclaimed; `view` shows it as reclaiming left it.
     virtual void OnApplied(const ObjectView& /*view*/,
                            const Effect& /*effect*/) {}

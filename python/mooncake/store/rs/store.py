@@ -60,6 +60,7 @@ _CACHE_COMPAT_POLICY = {
     "get_size": _CACHE_STATUS,
     "remove": _CACHE_STATUS,
     "batch_remove": _CACHE_STATUS_LIST,
+    "remove_all": _CACHE_STATUS,
 }
 
 
@@ -276,7 +277,6 @@ class MooncakeDistributedStore:
         self._worker = None
         self._lock = threading.RLock()
         self._registered_buffers: dict[int, int] = {}
-        self._tracked_keys: set[tuple[str | None, str | None, str | None, str]] = set()
         self._default_domain: str | None = None
         self._default_object_set: str | None = None
 
@@ -436,7 +436,6 @@ class MooncakeDistributedStore:
     def close(self) -> None:
         with self._lock:
             self._registered_buffers.clear()
-            self._tracked_keys.clear()
         try:
             self._invoke("close")
         finally:
@@ -468,8 +467,6 @@ class MooncakeDistributedStore:
             tenant=tenant,
             **_replication_kwargs(config),
         )
-        if result == 0:
-            self._track_keys([key], tenant=tenant)
         return result
 
     def put_from(
@@ -489,8 +486,6 @@ class MooncakeDistributedStore:
             tenant=tenant,
             **_replication_kwargs(config),
         )
-        if result == 0:
-            self._track_keys([key], tenant=tenant)
         return result
 
     def batch_put(
@@ -509,8 +504,6 @@ class MooncakeDistributedStore:
             tenant=tenant,
             **_replication_kwargs(config),
         )
-        if result == 0:
-            self._track_keys([key for key, _ in normalized], tenant=tenant)
         return result
 
     def put_batch(
@@ -534,9 +527,6 @@ class MooncakeDistributedStore:
                 **_replication_kwargs(config),
             )
             statuses = _coerce_batch_status_result(result, len(items))
-            self._track_successful_keys(
-                [key for key, _, _ in items], statuses, tenant=tenant
-            )
             return statuses
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
@@ -550,7 +540,6 @@ class MooncakeDistributedStore:
                 **_replication_kwargs(config),
             )
             statuses = _coerce_batch_status_result(result, len(keys))
-            self._track_successful_keys(keys, statuses, tenant=tenant)
             return statuses
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
@@ -1069,8 +1058,6 @@ class MooncakeDistributedStore:
 
     def remove(self, key: str, *, force: bool = False, tenant: str | None = None):
         result = self._invoke_cache("remove", key, force=force, tenant=tenant)
-        if result == 0:
-            self._forget_keys([key], tenant=tenant)
         return result
 
     def batch_remove(
@@ -1088,41 +1075,16 @@ class MooncakeDistributedStore:
             force=force,
             tenant=tenant,
         )
-        for key, status in zip(key_list, result):
-            if int(status) == 0:
-                self._forget_keys([key], tenant=tenant)
         return result
 
     def remove_all(self, force: bool = False):
-        try:
-            removed = self._invoke("remove_all", force=force)
-            if int(removed) >= 0:
-                self._tracked_keys.clear()
-            return removed
-        except Exception:
-            pass
-        removed = 0
-        for (tenant, domain, object_set), keys in self._group_tracked_keys().items():
-            original_domain = self._default_domain
-            original_object_set = self._default_object_set
-            self._default_domain = domain
-            self._default_object_set = object_set
-            try:
-                statuses = self._invoke_cache(
-                    "batch_remove",
-                    keys,
-                    fallback_count=len(keys),
-                    force=force,
-                    tenant=tenant,
-                )
-                for key, status in zip(keys, statuses):
-                    if int(status) == 0:
-                        self._forget_keys([key], tenant=tenant)
-                        removed += 1
-            finally:
-                self._default_domain = original_domain
-                self._default_object_set = original_object_set
-        return removed
+        """Run the native storage owner's evict-all operation.
+
+        Returns the evicted replica count on success and ``-1`` when the
+        optional cache operation fails. Cold data is retained. ``force`` does
+        not alter eviction policy.
+        """
+        return self._invoke_cache("remove_all", force=force)
 
     def start_metrics_server(self, bind_addr: str = "127.0.0.1:0") -> str:
         return self._invoke("start_metrics_server", bind_addr)
@@ -1142,41 +1104,6 @@ class MooncakeDistributedStore:
                     "buffer size is required for unknown pointers; call register_buffer first or pass size explicitly"
                 )
             return self._registered_buffers[int(buffer_ptr)]
-
-    def _track_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
-        with self._lock:
-            for key in keys:
-                self._tracked_keys.add(
-                    (tenant, self._default_domain, self._default_object_set, str(key))
-                )
-
-    def _forget_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
-        with self._lock:
-            for key in keys:
-                self._tracked_keys.discard(
-                    (tenant, self._default_domain, self._default_object_set, str(key))
-                )
-
-    def _track_successful_keys(
-        self,
-        keys: Iterable[str],
-        statuses: Iterable[int],
-        *,
-        tenant: str | None = None,
-    ) -> None:
-        self._track_keys(
-            (key for key, status in zip(keys, statuses) if int(status) == 0),
-            tenant=tenant,
-        )
-
-    def _group_tracked_keys(
-        self,
-    ) -> dict[tuple[str | None, str | None, str | None], list[str]]:
-        grouped: dict[tuple[str | None, str | None, str | None], list[str]] = {}
-        with self._lock:
-            for tenant, domain, object_set, key in self._tracked_keys:
-                grouped.setdefault((tenant, domain, object_set), []).append(key)
-        return grouped
 
     def _setup_from_config_dict(self, config: Mapping[str, object]):
         config = _apply_setup_env_defaults(dict(config))
@@ -1259,6 +1186,12 @@ class MooncakeDistributedStore:
             ),
             eviction_low_watermark_percent=_coerce_optional_int(
                 config.get("eviction_low_watermark_percent")
+            ),
+            max_pending_publications=_coerce_optional_int(
+                config.get("max_pending_publications")
+            ),
+            max_pending_publication_bytes=_coerce_optional_int(
+                config.get("max_pending_publication_bytes")
             ),
             route_control=str(config.get("route_control", "embedded_wrh")),
         )
@@ -1528,6 +1461,14 @@ _SETUP_ENV_DEFAULTS = {
     ),
     "eviction_low_watermark_percent": (
         "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT",
+        _coerce_optional_int,
+    ),
+    "max_pending_publications": (
+        "MC_STORE_RS_MAX_PENDING_PUBLICATIONS",
+        _coerce_optional_int,
+    ),
+    "max_pending_publication_bytes": (
+        "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES",
         _coerce_optional_int,
     ),
     "route_control": ("MC_STORE_RS_ROUTE_CONTROL", _coerce_optional_str),

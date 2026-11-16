@@ -814,9 +814,9 @@ TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledAppliesToOverallStatus) {
 // ---------------------------------------------------------------------------
 // P0c: Explicit progressBatch() drives one progress step and always allows
 // failover/resubmit, regardless of enable_auto_failover_on_poll. Internal
-// sync paths (waitTransferCompletion, transferSync) and the proxy event loop
-// are wired through it so observation-only callers stay decoupled from
-// progress-driving callers.
+// sync paths (waitTransferCompletion, submitAndWaitTransfer) and the proxy
+// event loop are wired through it so observation-only callers stay decoupled
+// from progress-driving callers.
 // ---------------------------------------------------------------------------
 
 TEST(EngineFailoverE2E, ProgressBatchRetriesWhenPollAutoFailoverDisabled) {
@@ -1056,7 +1056,8 @@ TEST(EngineFailoverE2E,
         engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
 }
 
-TEST(EngineFailoverE2E, TransferSyncUsesProgressBatchWhenPollDisabled) {
+TEST(EngineFailoverE2E,
+     SubmitAndWaitTransferUsesProgressBatchWhenPollDisabled) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("enable_auto_failover_on_poll", false);
     TransferEngineImpl engine(cfg);
@@ -1087,18 +1088,18 @@ TEST(EngineFailoverE2E, TransferSyncUsesProgressBatchWhenPollDisabled) {
     req.target_offset = reinterpret_cast<uint64_t>(buf.data());
     req.length = kBufLen;
 
-    EXPECT_TRUE(engine.transferSync({req}).ok());
+    EXPECT_TRUE(engine.submitAndWaitTransfer({req}).ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
     EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
 
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
-// transferSync() allocates a batch before submitting, so every error path out
-// of it has to release that batch. submitTransfer() rejecting an unregistered
-// buffer is the reachable one; the poll-failure path leaves through the same
-// guard.
-TEST(EngineFailoverE2E, TransferSyncFreesBatchWhenSubmitFails) {
+// submitAndWaitTransfer() allocates a batch before submitting, so every error
+// path out of it has to release that batch. submitTransfer() rejecting an
+// unregistered buffer is the reachable one; the poll-failure path leaves
+// through the same guard.
+TEST(EngineFailoverE2E, SubmitAndWaitTransferFreesBatchWhenSubmitFails) {
     auto cfg = makeMinimalP2PConfig();
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
@@ -1119,10 +1120,11 @@ TEST(EngineFailoverE2E, TransferSyncFreesBatchWhenSubmitFails) {
     req.target_offset = reinterpret_cast<uint64_t>(unregistered.data());
     req.length = unregistered.size();
 
-    EXPECT_FALSE(engine.transferSync({req}).ok());
+    EXPECT_FALSE(engine.submitAndWaitTransfer({req}).ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
     EXPECT_EQ(engine.aliveBatchCountForTest(), alive_before)
-        << "the batch allocated by transferSync outlived the failed submit";
+        << "the batch allocated by submitAndWaitTransfer outlived the failed "
+           "submit";
 }
 
 TEST(EngineFailoverE2E, ProgressBatchAdvancesExactlyOneStepPerCall) {

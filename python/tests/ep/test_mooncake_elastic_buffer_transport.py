@@ -575,6 +575,7 @@ def test_dispatch_cpu_sync_waits_for_async_kernels(
     monkeypatch.setattr(ep_buffer_module, "_native_current_stream_ptr", lambda: 0)
     buffer = object.__new__(ElasticBuffer)
     buffer.runtime = types.SimpleNamespace(dispatch=fake_dispatch)
+    buffer._active = True
     buffer.num_ranks = 1
     buffer.num_scaleup_ranks = 1
     buffer.num_scaleout_ranks = 1
@@ -601,6 +602,7 @@ def test_expanded_dispatch_output_includes_alignment_padding(monkeypatch) -> Non
     monkeypatch.setattr(elastic_buffer_module, "_native_current_stream_ptr", lambda: 0)
     buffer = object.__new__(ElasticBuffer)
     buffer.runtime = types.SimpleNamespace(dispatch=lambda *args: object())
+    buffer._active = True
     buffer.num_ranks = 1
     buffer.num_scaleup_ranks = 1
     buffer.num_scaleout_ranks = 1

@@ -8,13 +8,128 @@ use super::cold_tier_server::{
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
 use crate::observability::registry;
+use mooncake_store_route::RouteOwnerPage;
 use mooncake_store_route::{
     serve_route_control_request, RouteControlRequest, RouteControlResponse,
     DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };
+use prost::Message;
 use std::time::{Duration, Instant};
 
+const MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES: usize = 1024 * 1024;
+
+fn pb_route_owner_page(page: RouteOwnerPage) -> Result<pb::ListRoutesByReplicaOwnerReply> {
+    let RouteOwnerPage {
+        routes: page_routes,
+        next_cursor: page_next_cursor,
+        snapshot_epoch,
+    } = page;
+    let mut routes: Vec<pb::ObjectRoute> = Vec::with_capacity(page_routes.len());
+    let mut encoded_len: usize = 0;
+    let mut next_cursor = page_next_cursor;
+    let snapshot_epoch_field_len = optional_u64_field_len(snapshot_epoch);
+    for route in page_routes {
+        let route = pb_object_route(&route);
+        let route_len = route.encoded_len();
+        let route_field_len = 1 + prost_varint_len(route_len) + route_len;
+        if encoded_len
+            .saturating_add(route_field_len)
+            .saturating_add(snapshot_epoch_field_len)
+            > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+        {
+            if routes.is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "route {} exceeds the {} byte owner-list page limit",
+                    route.key, MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+                )));
+            }
+            next_cursor = routes.last().map(|last| last.key.clone());
+            while encoded_len
+                .saturating_add(snapshot_epoch_field_len)
+                .saturating_add(optional_string_field_len(next_cursor.as_deref()))
+                > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            {
+                let Some(last) = routes.pop() else {
+                    return Err(StoreError::InvalidState(format!(
+                        "route {} exceeds the {} byte owner-list page limit",
+                        route.key, MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+                    )));
+                };
+                let last_len = last.encoded_len();
+                encoded_len = encoded_len.saturating_sub(1 + prost_varint_len(last_len) + last_len);
+                next_cursor = routes.last().map(|last| last.key.clone());
+                if routes.is_empty() {
+                    return Err(StoreError::InvalidState(format!(
+                        "route owner cursor exceeds the {} byte page limit",
+                        MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+                    )));
+                }
+            }
+            return Ok(pb::ListRoutesByReplicaOwnerReply {
+                routes,
+                next_cursor,
+                error: None,
+                snapshot_epoch,
+            });
+        }
+        encoded_len = encoded_len.saturating_add(route_field_len);
+        routes.push(route);
+    }
+    while encoded_len
+        .saturating_add(snapshot_epoch_field_len)
+        .saturating_add(optional_string_field_len(next_cursor.as_deref()))
+        > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+    {
+        let Some(route) = routes.pop() else {
+            return Err(StoreError::InvalidState(format!(
+                "route owner cursor exceeds the {} byte page limit",
+                MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            )));
+        };
+        let route_len = route.encoded_len();
+        encoded_len = encoded_len.saturating_sub(1 + prost_varint_len(route_len) + route_len);
+        next_cursor = routes.last().map(|route| route.key.clone());
+        if routes.is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "route owner cursor exceeds the {} byte page limit",
+                MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            )));
+        }
+    }
+    Ok(pb::ListRoutesByReplicaOwnerReply {
+        routes,
+        next_cursor,
+        error: None,
+        snapshot_epoch,
+    })
+}
+
+fn optional_string_field_len(value: Option<&str>) -> usize {
+    value.map_or(0, |value| 1 + prost_varint_len(value.len()) + value.len())
+}
+
+fn optional_u64_field_len(value: Option<u64>) -> usize {
+    value.map_or(0, |mut value| {
+        let mut len = 1usize;
+        while value >= 0x80 {
+            value >>= 7;
+            len = len.saturating_add(1);
+        }
+        1 + len
+    })
+}
+
+fn prost_varint_len(mut value: usize) -> usize {
+    let mut len: usize = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len = len.saturating_add(1);
+    }
+    len
+}
+
 const SLOW_CONTROL_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
+const MAX_ALLOCATION_REFERENCE_QUERY_BATCH: usize = 64;
 
 pub(crate) struct ControlPlaneHandle {
     address: String,
@@ -389,20 +504,23 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             keys: vec![ObjectKey::new(request.key)],
         };
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::BatchGet(mut routes)) => match routes.pop() {
-                Some(Ok(route)) => pb::GetRouteReply {
-                    route: route.as_ref().map(pb_object_route),
+            Ok(RouteControlResponse::BatchGet(mut records)) => match records.pop() {
+                Some(Ok(record)) => pb::GetRouteReply {
+                    route: record.route.as_ref().map(pb_object_route),
                     error: None,
+                    delete_version: record.delete_version.map(|version| version.0),
                 },
                 Some(Err(error)) => pb::GetRouteReply {
                     route: None,
                     error: Some(pb_error(error)),
+                    delete_version: None,
                 },
                 None => pb::GetRouteReply {
                     route: None,
                     error: Some(pb_error(StoreError::Transport(
                         "control plane get_route reply is missing batch item".to_string(),
                     ))),
+                    delete_version: None,
                 },
             },
             Ok(_) => pb::GetRouteReply {
@@ -410,10 +528,12 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 error: Some(pb_error(StoreError::Transport(
                     "control plane get_route returned non-get route response".to_string(),
                 ))),
+                delete_version: None,
             },
             Err(error) => pb::GetRouteReply {
                 route: None,
                 error: Some(pb_error(error)),
+                delete_version: None,
             },
         };
         Ok(Response::new(reply))
@@ -436,16 +556,18 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             keys,
         };
         let replies = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::BatchGet(routes)) => routes
+            Ok(RouteControlResponse::BatchGet(records)) => records
                 .into_iter()
                 .map(|result| match result {
-                    Ok(route) => pb::GetRouteReply {
-                        route: route.as_ref().map(pb_object_route),
+                    Ok(record) => pb::GetRouteReply {
+                        route: record.route.as_ref().map(pb_object_route),
                         error: None,
+                        delete_version: record.delete_version.map(|version| version.0),
                     },
                     Err(error) => pb::GetRouteReply {
                         route: None,
                         error: Some(pb_error(error)),
+                        delete_version: None,
                     },
                 })
                 .collect(),
@@ -457,6 +579,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .map(|_| pb::GetRouteReply {
                         route: None,
                         error: Some(detail.clone()),
+                        delete_version: None,
                     })
                     .collect()
             }
@@ -466,6 +589,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .map(|_| pb::GetRouteReply {
                         route: None,
                         error: Some(detail.clone()),
+                        delete_version: None,
                     })
                     .collect()
             }
@@ -595,6 +719,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             authority: ClientStableId::new(request.authority),
             owner,
             cursor: request.cursor,
+            snapshot_epoch: request.snapshot_epoch,
             limit: if request.limit == 0 {
                 DEFAULT_ROUTE_OWNER_PAGE_SIZE
             } else {
@@ -604,13 +729,15 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             },
         };
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::ListByReplicaOwner(page)) => {
-                pb::ListRoutesByReplicaOwnerReply {
-                    routes: page.routes.iter().map(pb_object_route).collect(),
-                    error: None,
-                    next_cursor: page.next_cursor,
-                }
-            }
+            Ok(RouteControlResponse::ListByReplicaOwner(page)) => match pb_route_owner_page(page) {
+                Ok(reply) => reply,
+                Err(error) => pb::ListRoutesByReplicaOwnerReply {
+                    routes: Vec::new(),
+                    error: Some(pb_error(error)),
+                    next_cursor: None,
+                    snapshot_epoch: None,
+                },
+            },
             Ok(_) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
                 error: Some(pb_error(StoreError::Transport(
@@ -618,11 +745,69 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         .to_string(),
                 ))),
                 next_cursor: None,
+                snapshot_epoch: None,
             },
             Err(error) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
                 error: Some(pb_error(error)),
                 next_cursor: None,
+                snapshot_epoch: None,
+            },
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        let request = request.into_inner();
+        if request.identities.len() > MAX_ALLOCATION_REFERENCE_QUERY_BATCH {
+            return Err(Status::invalid_argument(format!(
+                "allocation reference query exceeds the {} item batch limit",
+                MAX_ALLOCATION_REFERENCE_QUERY_BATCH
+            )));
+        }
+        let identities = request
+            .identities
+            .into_iter()
+            .map(try_allocation_route_identity)
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route_request = RouteControlRequest::GetAllocationReferences {
+            namespace: request.namespace,
+            authority: ClientStableId::new(request.authority),
+            identities,
+            include_route_key: request.include_route_key,
+        };
+        let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
+            Ok(RouteControlResponse::AllocationReferences(references)) => {
+                pb::GetAllocationRouteReferencesReply {
+                    references: references
+                        .into_iter()
+                        .map(pb_allocation_reference_state)
+                        .collect(),
+                    error: None,
+                }
+            }
+            Ok(RouteControlResponse::AllocationReferenceKeys(references)) => {
+                pb::GetAllocationRouteReferencesReply {
+                    references: references
+                        .into_iter()
+                        .map(pb_allocation_reference)
+                        .collect(),
+                    error: None,
+                }
+            }
+            Ok(_) => pb::GetAllocationRouteReferencesReply {
+                references: Vec::new(),
+                error: Some(pb_error(StoreError::Transport(
+                    "control plane returned a non-allocation-reference response".to_string(),
+                ))),
+            },
+            Err(error) => pb::GetAllocationRouteReferencesReply {
+                references: Vec::new(),
+                error: Some(pb_error(error)),
             },
         };
         Ok(Response::new(reply))
@@ -698,6 +883,30 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 }
             }
         };
+        Ok(Response::new(reply))
+    }
+
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        let entries = request
+            .into_inner()
+            .entries
+            .into_iter()
+            .map(try_delete_pending_entry)
+            .collect::<Result<Vec<_>>>();
+        let reply =
+            match entries.and_then(|entries| self.eviction.batch_notify_delete_pending(&entries)) {
+                Ok(accepted) => pb::BatchNotifyDeletePendingReply {
+                    accepted: accepted as u64,
+                    error: None,
+                },
+                Err(error) => pb::BatchNotifyDeletePendingReply {
+                    accepted: 0,
+                    error: Some(pb_error(error)),
+                },
+            };
         Ok(Response::new(reply))
     }
 
@@ -841,7 +1050,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .transpose()
                     .map(|next| RouteCasRequest {
                         key: ObjectKey::new(entry.key),
-                        expected: None,
+                        expected: entry.delete_version.map(RouteVersion),
                         next,
                     })
             })
@@ -901,19 +1110,35 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::ReserveAnyRequest>,
     ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
         let request = request.into_inner();
-        let reply = match request
-            .owner
-            .as_ref()
-            .map(try_runtime_id)
-            .transpose()
-            .and_then(|owner| {
-                let owner = owner.ok_or_else(|| {
-                    StoreError::InvalidState(
-                        "control plane reserve_any request is missing owner".to_string(),
-                    )
-                })?;
-                self.allocator.reserve_any(&owner, request.length_bytes)
-            }) {
+        let allocator = self.allocator.clone();
+        let result = run_blocking_allocator("reserve_any", move || {
+            request
+                .owner
+                .as_ref()
+                .map(try_runtime_id)
+                .transpose()
+                .and_then(|owner| {
+                    let owner = owner.ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "control plane reserve_any request is missing owner".to_string(),
+                        )
+                    })?;
+                    if request.pending_publication {
+                        allocator
+                            .batch_reserve_any_with_pending_publication(
+                                &owner,
+                                &[request.length_bytes],
+                            )
+                            .into_iter()
+                            .next()
+                            .expect("single reserve request should produce one allocator result")
+                    } else {
+                        allocator.reserve_any(&owner, request.length_bytes)
+                    }
+                })
+        })
+        .await?;
+        let reply = match result {
             Ok(reservation) => pb::ReserveAnyReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
                 error: None,
@@ -940,9 +1165,18 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let owner = owner.ok_or_else(|| {
             Status::invalid_argument("control plane batch reserve_any request is missing owner")
         })?;
-        let replies = self
-            .allocator
-            .batch_reserve_any(&owner, &request.length_bytes)
+        let length_bytes = request.length_bytes;
+        let pending_publication = request.pending_publication;
+        let allocator = self.allocator.clone();
+        let results = run_blocking_allocator("batch reserve_any", move || {
+            if pending_publication {
+                allocator.batch_reserve_any_with_pending_publication(&owner, &length_bytes)
+            } else {
+                allocator.batch_reserve_any(&owner, &length_bytes)
+            }
+        })
+        .await?;
+        let replies = results
             .into_iter()
             .map(|result| match result {
                 Ok(reservation) => pb::ReserveAnyReply {
@@ -963,23 +1197,42 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::ReserveSpecificRequest>,
     ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
         let request = request.into_inner();
-        let reply = match request
-            .owner
-            .as_ref()
-            .map(try_runtime_id)
-            .transpose()
-            .and_then(|owner| {
-                let owner = owner.ok_or_else(|| {
-                    StoreError::InvalidState(
-                        "control plane reserve_specific request is missing owner".to_string(),
-                    )
-                })?;
-                self.allocator.reserve_specific(
-                    &owner,
-                    &SegmentName::new(request.segment_name),
-                    request.length_bytes,
-                )
-            }) {
+        let allocator = self.allocator.clone();
+        let result = run_blocking_allocator("reserve_specific", move || {
+            request
+                .owner
+                .as_ref()
+                .map(try_runtime_id)
+                .transpose()
+                .and_then(|owner| {
+                    let owner = owner.ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "control plane reserve_specific request is missing owner".to_string(),
+                        )
+                    })?;
+                    if request.pending_publication {
+                        allocator
+                            .batch_reserve_specific_with_pending_publication(
+                                &owner,
+                                &[ReserveSpecificOp {
+                                    segment_name: SegmentName::new(request.segment_name),
+                                    length_bytes: request.length_bytes,
+                                }],
+                            )
+                            .into_iter()
+                            .next()
+                            .expect("single reserve request should produce one allocator result")
+                    } else {
+                        allocator.reserve_specific(
+                            &owner,
+                            &SegmentName::new(request.segment_name),
+                            request.length_bytes,
+                        )
+                    }
+                })
+        })
+        .await?;
+        let reply = match result {
             Ok(reservation) => pb::ReserveSpecificReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
                 error: None,
@@ -1016,9 +1269,17 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 length_bytes: entry.length_bytes,
             })
             .collect::<Vec<_>>();
-        let replies = self
-            .allocator
-            .batch_reserve_specific(&owner, &entries)
+        let pending_publication = request.pending_publication;
+        let allocator = self.allocator.clone();
+        let results = run_blocking_allocator("batch reserve_specific", move || {
+            if pending_publication {
+                allocator.batch_reserve_specific_with_pending_publication(&owner, &entries)
+            } else {
+                allocator.batch_reserve_specific(&owner, &entries)
+            }
+        })
+        .await?;
+        let replies = results
             .into_iter()
             .map(|result| match result {
                 Ok(reservation) => pb::ReserveSpecificReply {
@@ -1055,6 +1316,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     &SegmentName::new(request.segment_name),
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )
             }) {
             Ok(()) => pb::ReleaseReply { error: None },
@@ -1086,6 +1348,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 segment_name: SegmentName::new(entry.segment_name),
                 offset_bytes: entry.offset_bytes,
                 length_bytes: entry.length_bytes,
+                allocation_id: entry.allocation_id,
             })
             .collect::<Vec<_>>();
         let replies = self
@@ -1159,6 +1422,21 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
     }
 }
 
+async fn run_blocking_allocator<T, F>(
+    operation: &'static str,
+    allocate: F,
+) -> std::result::Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(allocate)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("control plane {operation} worker failed: {error}"))
+        })
+}
+
 fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'static str {
     match request.body.as_ref() {
         Some(pb::control_stream_request::Body::RouteGet(_)) => "batch_get_routes",
@@ -1172,6 +1450,9 @@ fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'sta
         }
         Some(pb::control_stream_request::Body::EvictionTrackReplicaRoutes(_)) => {
             "batch_track_replica_routes"
+        }
+        Some(pb::control_stream_request::Body::EvictionNotifyDeletePending(_)) => {
+            "batch_notify_delete_pending"
         }
         Some(pb::control_stream_request::Body::RouteReplace(_)) => "batch_replace_routes",
         Some(pb::control_stream_request::Body::AllocatorReserveAny(_)) => "batch_reserve_any",
@@ -1326,6 +1607,11 @@ pub(super) async fn handle_control_stream_request(
             .await
             .map(Response::into_inner)
             .map(pb::control_stream_reply::Body::EvictionTrackReplicaRoutes),
+        Some(pb::control_stream_request::Body::EvictionNotifyDeletePending(batch)) => service
+            .batch_notify_delete_pending(Request::new(batch))
+            .await
+            .map(Response::into_inner)
+            .map(pb::control_stream_reply::Body::EvictionNotifyDeletePending),
         Some(pb::control_stream_request::Body::RouteReplace(batch)) => service
             .batch_replace_routes(Request::new(batch))
             .await
@@ -1361,5 +1647,119 @@ pub(super) async fn handle_control_stream_request(
             body: None,
             error: Some(pb_error(status_to_store_error(status))),
         },
+    }
+}
+
+#[cfg(test)]
+mod owner_page_tests {
+    use super::*;
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, ObjectKey, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
+    };
+
+    fn route(index: usize, padding_len: usize) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(format!("route-{index:03}-{}", "x".repeat(padding_len))),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
+                segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
+                offset: Some(0),
+                segment_offset: 0,
+                length: 1,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    fn route_fields_len(routes: &[ObjectRoute]) -> usize {
+        routes.iter().fold(0usize, |encoded_len, route| {
+            let route = pb_object_route(route);
+            let route_len = route.encoded_len();
+            encoded_len.saturating_add(1 + prost_varint_len(route_len) + route_len)
+        })
+    }
+
+    fn page_with_padding(padding_len: usize) -> RouteOwnerPage {
+        let routes = (0..DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|index| route(index, padding_len))
+            .collect::<Vec<_>>();
+        let next_cursor = routes.last().map(|route| route.key.0.clone());
+        RouteOwnerPage {
+            routes,
+            next_cursor,
+            snapshot_epoch: Some(1),
+        }
+    }
+
+    #[test]
+    fn byte_trimming_rewinds_cursor_to_last_returned_route() {
+        let mut low = 0usize;
+        let mut high = MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES / DEFAULT_ROUTE_OWNER_PAGE_SIZE;
+        while low < high {
+            let middle = low.saturating_add((high - low).div_ceil(2));
+            if route_fields_len(&page_with_padding(middle).routes)
+                <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            {
+                low = middle;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+
+        let page = page_with_padding(low);
+        let route_fields_len = route_fields_len(&page.routes);
+        let next_cursor = page
+            .next_cursor
+            .as_ref()
+            .expect("non-terminal source page must have a cursor");
+        let cursor_field_len = 1 + prost_varint_len(next_cursor.len()) + next_cursor.len();
+        assert!(route_fields_len <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES);
+        assert!(
+            route_fields_len.saturating_add(cursor_field_len) > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+        );
+
+        let reply = pb_route_owner_page(page).expect("byte-trimmed page should encode");
+        assert!(reply.encoded_len() <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES);
+        assert_eq!(reply.routes.len(), DEFAULT_ROUTE_OWNER_PAGE_SIZE - 1);
+        assert_eq!(
+            reply.next_cursor.as_deref(),
+            reply.routes.last().map(|route| route.key.as_str())
+        );
+    }
+
+    #[test]
+    fn byte_trimming_counts_snapshot_epoch() {
+        let mut low = 0usize;
+        let mut high = MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES / DEFAULT_ROUTE_OWNER_PAGE_SIZE;
+        while low < high {
+            let middle = low.saturating_add((high - low).div_ceil(2));
+            if route_fields_len(&page_with_padding(middle).routes)
+                .saturating_add(optional_u64_field_len(Some(u64::MAX)))
+                <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            {
+                low = middle;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+
+        let mut page = page_with_padding(low);
+        page.snapshot_epoch = Some(u64::MAX);
+        let reply = pb_route_owner_page(page).expect("page should trim for the snapshot epoch");
+        assert!(reply.encoded_len() <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES);
     }
 }

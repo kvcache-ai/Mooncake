@@ -638,6 +638,7 @@ impl NofTargetManager {
         wanted: usize,
         require_full_set: bool,
         excluded: &BTreeSet<String>,
+        write_bytes: u64,
     ) -> Option<(Vec<ReplicaWriteCandidate<'_>>, Vec<usize>)> {
         let _placement = self.placement_lock.lock();
         let candidates = self
@@ -657,7 +658,7 @@ impl NofTargetManager {
                     target_id,
                     // Managed target capacity is owner-local and is not published to every
                     // writer. Keep all healthy managed targets comparable and let the shared
-                    // strategy balance them by accumulated writes and stable target ID.
+                    // strategy balance them by accumulated bytes and stable target ID.
                     score: if self.is_managed() {
                         0.0
                     } else {
@@ -668,7 +669,9 @@ impl NofTargetManager {
                             _ => 0.0,
                         }
                     },
-                    accumulated_writes: target.accumulated_writes.load(Ordering::Relaxed),
+                    accumulated_write_bytes: target
+                        .accumulated_write_bytes
+                        .load(Ordering::Relaxed),
                 })
             })
             .collect::<Vec<_>>();
@@ -683,9 +686,19 @@ impl NofTargetManager {
             return None;
         }
         for index in &selected {
-            self.state.targets[candidates[*index].target_id]
-                .accumulated_writes
-                .fetch_add(1, Ordering::Relaxed);
+            let counter = &self.state.targets[candidates[*index].target_id].accumulated_write_bytes;
+            let mut bytes = counter.load(Ordering::Relaxed);
+            loop {
+                match counter.compare_exchange_weak(
+                    bytes,
+                    bytes.saturating_add(write_bytes),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => bytes = current,
+                }
+            }
         }
         Some((candidates, selected))
     }
@@ -707,7 +720,7 @@ impl NofTargetManager {
         };
         let require_full_set = data_plane == ProviderDataPlane::Physical;
         let Some((candidates, selected)) =
-            self.select_write_targets(wanted, require_full_set, &BTreeSet::new())
+            self.select_write_targets(wanted, require_full_set, &BTreeSet::new(), length)
         else {
             return Ok(None);
         };
@@ -786,7 +799,9 @@ impl NofTargetManager {
         let (candidates, selected) = if missing == 0 {
             (Vec::new(), Vec::new())
         } else {
-            let Some(selected) = self.select_write_targets(missing, true, &prepared_targets) else {
+            let Some(selected) =
+                self.select_write_targets(missing, true, &prepared_targets, length)
+            else {
                 return Err(StoreError::Backpressure(format!(
                     "managed NoF route {} cannot reach {} target replicas",
                     route.key.0, self.replica_count

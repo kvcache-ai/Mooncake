@@ -1,5 +1,8 @@
 import os
+import socket
 import warnings
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -12,12 +15,47 @@ from .mooncake_ep_buffer import (
     _synchronize_device,
     _wait_native_event_on_current_stream,
 )
-from .mooncake_ep_tcpstore import TCPStoreCollectives
+from .mooncake_ep_tcpstore import (
+    TCPStoreCollectives,
+    clone_tcp_store,
+    membership_peers_to_disconnect,
+    resolve_membership_transition,
+    slice_peer_qp_row,
+)
 
 
 _VALID_TRANSPORTS = {"auto", "ibgda", "nccl"}
 _TRANSPORT_TO_CODE = {"auto": 0, "ibgda": 1, "nccl": 2}
 _CODE_TO_TRANSPORT = {code: name for name, code in _TRANSPORT_TO_CODE.items()}
+_NCCL_INIT_STATUS_STAGES = (
+    "capabilities",
+    "device-communicator-create",
+    "gin-resources",
+    "device-communicator-copy",
+    "buffer-allocation",
+    "buffer-zero",
+    "buffer-registration",
+    "device-context",
+    "lsa-topology",
+    "topology-mode",
+    "topology-shape",
+    "mapped-host-workspace",
+)
+
+
+def _make_nccl_init_status_callback(collectives: TCPStoreCollectives):
+    round_idx = 0
+
+    def agree(local_success: bool) -> bool:
+        nonlocal round_idx
+        stage = _NCCL_INIT_STATUS_STAGES[round_idx]
+        values = collectives.all_gather(
+            f"nccl-init-status/{stage}", bool(local_success)
+        )
+        round_idx += 1
+        return all(bool(value) for value in values)
+
+    return agree
 
 
 def _requested_transport(transport: str) -> str:
@@ -360,6 +398,20 @@ class EPHandle:
         self.num_recv_tokens = int(recv_src_metadata.shape[0])
 
 
+@dataclass
+class _PreparedMembership:
+    source_id: int
+    source_generation: Optional[Tuple[int, ...]]
+    source_runtime: Any
+    old_members: List[int]
+    new_members: List[int]
+    store_namespace: str
+    transition_store: Any
+    old_collectives: TCPStoreCollectives
+    candidate: Optional[Any]
+    consumed: bool = False
+
+
 class ElasticBuffer:
     """
     Official DeepEP elastic EP API backed by Mooncake EP transports.
@@ -413,6 +465,16 @@ class ElasticBuffer:
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
         self._store_collectives: Optional[TCPStoreCollectives] = None
+        self._planned_scaling = False
+        self._capacity_ranks = self.num_ranks
+        self._transport_rank = self.rank_idx
+        self._members = list(range(self.num_ranks))
+        self._active = True
+        self._pending_membership = None
+        self._tcp_store = None
+        self._tcp_store_owner = None
+        self._store_namespace: Optional[str] = None
+        self._store_timeout_secs = 300
         on_xpu = _ep_device_type() == "xpu"
         self._device_index = _current_device_index()
         self.requested_transport = (
@@ -518,6 +580,7 @@ class ElasticBuffer:
         self._active_ranks = torch.ones(
             self.num_ranks, dtype=torch.int32, device=_ep_device_type()
         )
+        self._active_ranks_ready = None
 
         _synchronize_device()
         _dist_barrier(group)
@@ -547,15 +610,28 @@ class ElasticBuffer:
         explicitly_destroy: bool = False,
         transport: str = "auto",
         store_timeout_secs: int = 300,
+        capacity_ranks: Optional[int] = None,
+        active_members: Optional[Sequence[int]] = None,
+        previous_members: Sequence[int] = (),
+        _prepared_membership: bool = False,
+        _required_transport: Optional[str] = None,
+        _tcp_store_owner: Optional[dist.TCPStore] = None,
     ) -> "ElasticBuffer":
-        """Create a fixed-world buffer without initializing a ProcessGroup.
+        """Create a Store-backed ElasticBuffer without a ProcessGroup.
 
         Every rank in one buffer instance must use the same ``store_namespace``.
         Choose a fresh namespace for every other buffer instance and process
         restart; the Store protocol never reuses keys from an earlier instance.
         All ranks must call bootstrap, barriers, updates, and NCCL destruction in
-        the same order. This path does not support membership changes or rank
-        failure recovery.
+        the same order. Passing ``capacity_ranks`` or ``active_members`` enables
+        planned membership changes within stable capacity slots. New NCCL ranks
+        pass the target member list plus ``previous_members``; target NCCL ranks
+        prepare an inactive candidate while the old runtime is still installed.
+        The TCPStore server must remain available for the complete ElasticBuffer
+        session, even if its owner leaves active membership.
+        Existing ranks use ``prepare_membership`` and ``commit_membership`` or
+        the synchronous ``set_membership`` wrapper. IBGDA keeps its quiescent
+        transition path. This API does not provide rank-failure recovery.
         """
         if _ep_device_type() == "xpu":
             raise NotImplementedError(
@@ -567,14 +643,54 @@ class ElasticBuffer:
                 "Mooncake ElasticBuffer currently supports only "
                 "allow_multiple_reduction=True"
             )
-        if num_ranks <= 0 or not 0 <= rank < num_ranks:
-            raise ValueError("rank must be within the positive Store world size.")
-
+        capacity = num_ranks if capacity_ranks is None else int(capacity_ranks)
+        members = (
+            list(range(num_ranks))
+            if active_members is None
+            else [int(member) for member in active_members]
+        )
+        if (
+            capacity <= 0
+            or num_ranks <= 0
+            or len(members) != num_ranks
+            or len(set(members)) != len(members)
+            or any(member < 0 or member >= capacity for member in members)
+            or rank not in members
+        ):
+            raise ValueError(
+                "rank and active_members must describe a unique Store group "
+                "within capacity_ranks"
+            )
+        previous = [int(member) for member in previous_members]
+        if (
+            not store_namespace
+            or store_timeout_secs <= 0
+            or len(set(previous)) != len(previous)
+            or any(member < 0 or member >= capacity for member in previous)
+        ):
+            raise ValueError("invalid Store namespace, timeout, or previous members")
+        if tcp_store_group is None:
+            raise RuntimeError("ElasticBuffer.create_elastic requires a TCPStore.")
+        planned_scaling = (
+            capacity_ranks is not None or active_members is not None or bool(previous)
+        )
         self = cls.__new__(cls)
         self.group = None
-        self.rank_idx = rank
-        self.num_ranks = num_ranks
+        self.rank_idx = members.index(rank)
+        self.num_ranks = len(members)
         self._device_index = torch.cuda.current_device()
+        self._planned_scaling = planned_scaling
+        self._capacity_ranks = capacity
+        self._transport_rank = int(rank)
+        self._members = members
+        self._active = not _prepared_membership
+        self._pending_membership = None
+        self._tcp_store_owner = (
+            tcp_store_group if _tcp_store_owner is None else _tcp_store_owner
+        )
+        self._tcp_store = clone_tcp_store(tcp_store_group)
+        self._store_namespace = store_namespace
+        self._store_timeout_secs = store_timeout_secs
         self.requested_transport = _requested_transport(transport)
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
@@ -590,30 +706,35 @@ class ElasticBuffer:
         self.num_topk = num_topk
         self.use_fp8_dispatch = use_fp8_dispatch
         self._store_collectives = TCPStoreCollectives(
-            tcp_store_group,
-            rank,
-            num_ranks,
+            self._tcp_store,
+            self.rank_idx,
+            len(members),
             store_namespace,
             store_timeout_secs,
         )
 
+        capacity_bytes = cls.get_buffer_size_hint(
+            capacity,
+            num_max_tokens_per_rank,
+            hidden,
+            num_topk=num_topk,
+            use_fp8_dispatch=use_fp8_dispatch,
+            allow_hybrid_mode=allow_hybrid_mode,
+            allow_multiple_reduction=allow_multiple_reduction,
+        )
         if num_bytes is None:
-            num_bytes = cls.get_buffer_size_hint(
-                num_ranks,
-                num_max_tokens_per_rank,
-                hidden,
-                num_topk=num_topk,
-                use_fp8_dispatch=use_fp8_dispatch,
-                allow_hybrid_mode=allow_hybrid_mode,
-                allow_multiple_reduction=allow_multiple_reduction,
+            num_bytes = capacity_bytes
+        elif planned_scaling and num_bytes < capacity_bytes:
+            raise ValueError(
+                "planned-scaling num_bytes must cover the configured capacity"
             )
         self.num_bytes = num_bytes
         (
             self.num_scaleout_ranks,
             self.num_scaleup_ranks,
         ) = cls._calculate_logical_domain_size(num_ranks, allow_hybrid_mode)
-        self.scaleout_rank_idx = rank // self.num_scaleup_ranks
-        self.scaleup_rank_idx = rank % self.num_scaleup_ranks
+        self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
+        self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
         self.num_rdma_ranks, self.num_nvlink_ranks = (
             cls._calculate_physical_domain_size(num_ranks)
         )
@@ -622,43 +743,86 @@ class ElasticBuffer:
 
         from mooncake import ep
 
-        self.transport = self._select_store_transport(ep)
+        if previous and _required_transport is None:
+            required_key = self._membership_transition_key(
+                store_namespace, "required-transport"
+            )
+            self._tcp_store.wait([required_key], timedelta(seconds=store_timeout_secs))
+            _required_transport = self._tcp_store.get(required_key).decode()
+        self.transport = self._select_store_transport(
+            ep, required_transport=_required_transport
+        )
+        joining_nccl = bool(previous) and self.transport == "nccl"
+        if previous and not joining_nccl:
+            self._tcp_store.wait(
+                [self._membership_retired_key(store_namespace)],
+                timedelta(seconds=store_timeout_secs),
+            )
+        if joining_nccl:
+            self._active = False
         nccl_unique_id = []
         if self.transport == "nccl":
             nccl_unique_id = self._exchange_nccl_unique_id_from_store(ep)
             self._generation = tuple(nccl_unique_id)
-        self.runtime = ep.ElasticBuffer(
-            rank,
-            num_ranks,
-            num_bytes,
-            num_max_tokens_per_rank,
-            hidden,
-            num_topk,
-            use_fp8_dispatch,
-            deterministic,
-            allow_hybrid_mode,
-            allow_multiple_reduction,
-            prefer_overlap_with_compute,
-            self.sl_idx,
-            num_allocated_qps,
-            num_cpu_timeout_secs,
-            num_gpu_timeout_secs,
-            self.transport,
-            nccl_unique_id,
-        )
-        self._refresh_topology_from_runtime()
-        self._connect_native()
-        self._active_ranks = torch.ones(
-            self.num_ranks, dtype=torch.int32, device="cuda"
-        )
-        torch.cuda.synchronize()
-        self._store_collectives.barrier("initialize")
-        torch.cuda.synchronize()
+        elif planned_scaling:
+            self._generation = tuple(store_namespace.encode())
+        staged_candidate = _prepared_membership or joining_nccl
+        if staged_candidate:
+            self.runtime = None
+            status_collectives = TCPStoreCollectives(
+                clone_tcp_store(self._tcp_store),
+                self.rank_idx,
+                self.num_ranks,
+                f"{store_namespace}/candidate-init-status",
+                store_timeout_secs,
+            )
+            status_callback = _make_nccl_init_status_callback(status_collectives)
+            self.runtime = self._construct_capacity_runtime(
+                ep, nccl_unique_id, status_callback
+            )
+            with torch.cuda.device(self._device_index):
+                self._finish_native_runtime_initialization(staged_candidate=True)
+            if joining_nccl:
+                self._finish_joining_membership()
+            return self
+
+        if planned_scaling:
+            self.runtime = self._construct_capacity_runtime(ep, nccl_unique_id)
+        else:
+            self.runtime = ep.ElasticBuffer(
+                rank,
+                num_ranks,
+                num_bytes,
+                num_max_tokens_per_rank,
+                hidden,
+                num_topk,
+                use_fp8_dispatch,
+                deterministic,
+                allow_hybrid_mode,
+                allow_multiple_reduction,
+                prefer_overlap_with_compute,
+                self.sl_idx,
+                num_allocated_qps,
+                num_cpu_timeout_secs,
+                num_gpu_timeout_secs,
+                self.transport,
+                nccl_unique_id,
+            )
+        with torch.cuda.device(self._device_index):
+            self._finish_native_runtime_initialization(staged_candidate=False)
         return self
 
     def _select_store_transport(
         self, ep: Any, required_transport: Optional[str] = None
     ) -> str:
+        if self._planned_scaling:
+            member_views = self._store_collectives.all_gather(
+                "membership-view", tuple(self._members)
+            )
+            if any(tuple(view) != tuple(self._members) for view in member_views):
+                raise RuntimeError(
+                    "ElasticBuffer Store members disagree on the ordered stable slots"
+                )
         nccl_available = bool(ep.has_nccl_device_support())
         local_auto_choice = _select_transport(
             "auto",
@@ -744,13 +908,15 @@ class ElasticBuffer:
                 "dispatch again after update_ep_member()"
             )
 
-    def _connect_native(self, is_update: bool = False) -> None:
+    def _connect_native(
+        self, is_update: bool = False, peer_ranks: Optional[Sequence[int]] = None
+    ) -> None:
         from mooncake import ep
 
         if self.transport == "nccl":
             return
         if self._store_collectives is not None:
-            self._connect_native_from_store(ep, is_update)
+            self._connect_native_from_store(ep, is_update, peer_ranks)
             return
 
         if not bool(self.runtime.ibgda_disabled()):
@@ -867,7 +1033,15 @@ class ElasticBuffer:
                 stacklevel=2,
             )
 
-    def _connect_native_from_store(self, ep: Any, is_update: bool) -> None:
+    def _connect_native_from_store(
+        self,
+        ep: Any,
+        is_update: bool,
+        peer_ranks: Optional[Sequence[int]] = None,
+    ) -> None:
+        if self._planned_scaling:
+            self._connect_native_from_store_planned(ep, peer_ranks)
+            return
         was_disabled = bool(self.runtime.ibgda_disabled())
         if is_update:
             self.runtime.update_local_qpns()
@@ -975,6 +1149,124 @@ class ElasticBuffer:
                 f"ElasticBuffer: {exc}. Continuing with RDMA-only routing.",
                 RuntimeWarning,
                 stacklevel=2,
+            )
+
+    def _connect_native_from_store_planned(
+        self, ep: Any, peer_ranks: Optional[Sequence[int]]
+    ) -> None:
+        was_disabled = bool(self.runtime.ibgda_disabled())
+        metadata = None
+        max_qp_count = 0
+        if not was_disabled:
+            raddr, rkey = self.runtime.get_mr_info()
+            subnet_prefix, interface_id = self.runtime.get_gid()
+            max_qp_count = int(ep.MAX_QP_COUNT)
+            metadata = {
+                "raddr": int(raddr),
+                "rkey": int(rkey),
+                "subnet_prefix": int(subnet_prefix),
+                "interface_id": int(interface_id),
+                "qpns": tuple(int(value) for value in self.runtime.get_local_qpns()),
+                "lids": tuple(int(value) for value in self.runtime.get_local_lids()),
+            }
+        local_record = (
+            self._transport_rank,
+            socket.gethostname(),
+            was_disabled,
+            metadata,
+            max_qp_count,
+            tuple(int(value) for value in self.runtime.get_ipc_handle()),
+        )
+        records = self._store_collectives.all_gather("peer-bootstrap", local_record)
+        by_slot = {int(record[0]): record for record in records}
+        if set(by_slot) != set(self._members):
+            raise RuntimeError("ElasticBuffer Store members disagree on rank slots")
+        if len({record[2] for record in records}) != 1:
+            raise RuntimeError(
+                "ElasticBuffer ranks disagree on IBGDA readiness; native peer "
+                "synchronization cannot safely continue."
+            )
+
+        peers_to_connect = (
+            [slot for slot in self._members if slot != self._transport_rank]
+            if peer_ranks is None
+            else [int(slot) for slot in peer_ranks]
+        )
+        if len(set(peers_to_connect)) != len(peers_to_connect):
+            raise ValueError("remote_ranks must not contain duplicates.")
+        if any(
+            slot == self._transport_rank or slot not in self._members
+            for slot in peers_to_connect
+        ):
+            raise ValueError("remote rank is outside the active ElasticBuffer group")
+
+        if not was_disabled:
+            qp_limits = {int(record[4]) for record in records}
+            if len(qp_limits) != 1:
+                raise RuntimeError("ElasticBuffer ranks disagree on MAX_QP_COUNT.")
+            max_qps = next(iter(qp_limits))
+            expected_qps = max_qps // self._capacity_ranks * self._capacity_ranks
+            if expected_qps <= 0 or any(
+                len(record[3]["qpns"]) != expected_qps
+                or len(record[3]["lids"]) != expected_qps
+                for record in records
+            ):
+                raise RuntimeError(
+                    "IBGDA QP/LID metadata must match the fixed capacity layout."
+                )
+
+        local_hostname = socket.gethostname()
+        for peer_slot in peers_to_connect:
+            peer = by_slot[peer_slot]
+            _, peer_hostname, _, peer_metadata, _, peer_handle = peer
+            ipc_handle = list(peer_handle)
+            if peer_hostname != local_hostname:
+                ipc_handle = []
+            elif not ipc_handle:
+                raise RuntimeError(
+                    "same-host ElasticBuffer peers require a usable NVLink IPC handle"
+                )
+            if peer_metadata is None:
+                peer_metadata = {
+                    "raddr": 0,
+                    "rkey": 0,
+                    "subnet_prefix": 0,
+                    "interface_id": 0,
+                    "qpns": (),
+                    "lids": (),
+                }
+                peer_qpns = []
+                peer_lids = []
+            else:
+                peer_qpns = slice_peer_qp_row(
+                    peer_metadata["qpns"],
+                    self._capacity_ranks,
+                    self._transport_rank,
+                    max_qps,
+                )
+                peer_lids = slice_peer_qp_row(
+                    peer_metadata["lids"],
+                    self._capacity_ranks,
+                    self._transport_rank,
+                    max_qps,
+                )
+            self.runtime.connect_peer(
+                peer_slot,
+                int(peer_metadata["raddr"]),
+                int(peer_metadata["rkey"]),
+                int(peer_metadata["subnet_prefix"]),
+                int(peer_metadata["interface_id"]),
+                peer_qpns,
+                peer_lids,
+                ipc_handle,
+            )
+
+        disabled_after_sync = self._store_collectives.all_gather(
+            "ibgda-peer-sync", bool(self.runtime.ibgda_disabled())
+        )
+        if not was_disabled and any(disabled_after_sync):
+            raise RuntimeError(
+                "ElasticBuffer native peer synchronization disabled IBGDA."
             )
 
     def _connect_xpu_rdma(
@@ -1126,7 +1418,534 @@ class ElasticBuffer:
             )
         return [int(value) for value in result["unique_id"]]
 
+    def _construct_capacity_runtime(
+        self,
+        ep: Any,
+        nccl_unique_id: List[int],
+        init_status_callback: Optional[Any] = None,
+    ):
+        args = (
+            self._transport_rank,
+            self._capacity_ranks,
+            self.rank_idx,
+            self.num_ranks,
+            self.num_bytes,
+            self.num_max_tokens_per_rank,
+            self.hidden,
+            self.num_topk,
+            self.use_fp8_dispatch,
+            self.deterministic,
+            self.allow_hybrid_mode,
+            self.allow_multiple_reduction,
+            self.prefer_overlap_with_compute,
+            self.sl_idx,
+            self.num_allocated_qps,
+            self.num_cpu_timeout_secs,
+            self.num_gpu_timeout_secs,
+            self.transport,
+            nccl_unique_id,
+            self._members,
+        )
+        if init_status_callback is None:
+            return ep.ElasticBuffer(*args)
+        return ep.ElasticBuffer(*args, init_status_callback)
+
+    def _finish_native_runtime_initialization(self, staged_candidate: bool) -> None:
+        self._refresh_topology_from_runtime()
+        self._connect_native()
+        self._active_ranks = torch.ones(
+            self.num_ranks, dtype=torch.int32, device="cuda"
+        )
+        self._active_ranks_ready = None
+        if staged_candidate:
+            event_error = None
+            try:
+                self._active_ranks_ready = torch.cuda.Event()
+                self._active_ranks_ready.record(
+                    torch.cuda.current_stream(self._device_index)
+                )
+                self._active_ranks_ready.synchronize()
+            except BaseException as exc:
+                event_error = f"{type(exc).__name__}: {exc}"
+            event_status = self._store_collectives.all_gather(
+                "candidate-active-ranks-ready",
+                (self._transport_rank, event_error is None, event_error),
+            )
+            event_errors = [
+                f"rank {rank}: {error}"
+                for rank, ready, error in event_status
+                if not ready
+            ]
+            if event_errors:
+                raise RuntimeError(
+                    "candidate active-ranks CUDA event did not complete on all "
+                    "target ranks: " + "; ".join(event_errors)
+                )
+        else:
+            torch.cuda.synchronize()
+        self._store_collectives.barrier("initialize")
+        if staged_candidate:
+            if self.rank_idx == 0:
+                self._tcp_store.set(
+                    self._membership_transition_key(self._store_namespace, "prepared"),
+                    b"1",
+                )
+        else:
+            torch.cuda.synchronize()
+
+    def _destroy_runtime_local(self) -> None:
+        runtime = self.runtime
+        if runtime is None:
+            return
+        native_destroy = getattr(runtime, "destroy", None)
+        try:
+            if native_destroy is not None:
+                native_destroy()
+        finally:
+            self.runtime = None
+
+    @staticmethod
+    def _membership_retired_key(store_namespace: str) -> str:
+        return f"MOONCAKE_EP_ELASTIC/{store_namespace}/old-retired"
+
+    @staticmethod
+    def _membership_transition_key(store_namespace: str, phase: str) -> str:
+        return f"MOONCAKE_EP_ELASTIC/{store_namespace}/transition/{phase}"
+
+    def _finish_joining_membership(self) -> None:
+        self._tcp_store.wait(
+            [self._membership_transition_key(self._store_namespace, "old-drained")],
+            timedelta(seconds=self._store_timeout_secs),
+        )
+        self._store_collectives.barrier("membership-installed")
+        if self.rank_idx == 0:
+            self._tcp_store.set(
+                self._membership_transition_key(self._store_namespace, "installed"),
+                b"1",
+            )
+        self._tcp_store.wait(
+            [self._membership_retired_key(self._store_namespace)],
+            timedelta(seconds=self._store_timeout_secs),
+        )
+        if self._active_ranks_ready is not None:
+            self._active_ranks_ready.synchronize()
+            self._active_ranks_ready = None
+        self._store_collectives.barrier("membership-active")
+        self._active = True
+
+    def connect_ranks(
+        self,
+        remote_ranks: Sequence[int],
+        *,
+        active_members: Sequence[int],
+        store_namespace: str,
+    ) -> None:
+        """Grow membership at a planned boundary using ordinary peer-list syntax.
+
+        Every old member calls this or ``disconnect_ranks`` with the same target
+        membership and namespace. New processes use ``create_elastic`` with that
+        target and ``previous_members``. NCCL rebuilds its communicator as a group.
+        """
+        if not self._planned_scaling or not self._active:
+            raise RuntimeError(
+                "connect_ranks() requires an active capacity-aware Store buffer"
+            )
+        ranks = [int(peer) for peer in remote_ranks]
+        if self._transport_rank in ranks:
+            raise ValueError("remote_ranks cannot contain the local stable slot")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("remote_ranks must not contain duplicates.")
+        target = [int(member) for member in active_members]
+        joiners = set(target) - set(self._members)
+        if self._transport_rank not in target or not joiners:
+            raise ValueError("connect_ranks() requires a larger target membership")
+        if not joiners.issubset(ranks):
+            raise ValueError("remote_ranks must include every joining stable slot")
+        self.set_membership(target, store_namespace)
+
+    def disconnect_ranks(
+        self,
+        remote_ranks: Sequence[int],
+        *,
+        active_members: Sequence[int],
+        store_namespace: str,
+    ) -> None:
+        """Shrink or replace membership through the coordinated Store transition."""
+        if not self._planned_scaling or not self._active:
+            raise RuntimeError(
+                "disconnect_ranks() requires an active capacity-aware Store buffer"
+            )
+        ranks = [int(peer) for peer in remote_ranks]
+        if self._transport_rank in ranks:
+            raise ValueError("remote_ranks cannot contain the local stable slot")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("remote_ranks must not contain duplicates.")
+        target = [int(member) for member in active_members]
+        old = set(self._members)
+        new = set(target)
+        leavers = old - new
+        expected = (
+            leavers if self._transport_rank in new else old - {self._transport_rank}
+        )
+        if not leavers:
+            raise ValueError("disconnect_ranks() requires a smaller target membership")
+        if not expected.issubset(ranks):
+            raise ValueError(
+                "remote_ranks must include leaving peers (or all old peers for a leaver)"
+            )
+        self.set_membership(target, store_namespace)
+
+    def set_membership(
+        self, active_members: Sequence[int], store_namespace: str
+    ) -> None:
+        """Synchronously commit a planned transition; NCCL prepares first."""
+        if self.transport == "nccl":
+            prepared = self.prepare_membership(active_members, store_namespace)
+            self.commit_membership(prepared)
+            return
+        self._set_membership_ibgda(active_members, store_namespace)
+
+    def prepare_membership(
+        self, active_members: Sequence[int], store_namespace: str
+    ) -> _PreparedMembership:
+        """Prepare target NCCL candidates while the current runtime is installed.
+
+        All old members call this method. Target members construct a new buffer
+        with ``previous_members`` and synchronize each initialization status
+        through the TCPStore. ``commit_membership`` waits for target
+        preparation before draining the old cohort. A buffer supports one
+        pending transition at a time; it cannot be cancelled.
+        """
+        if self.transport != "nccl":
+            raise RuntimeError(
+                "overlapped membership preparation currently requires NCCL"
+            )
+        if not self._planned_scaling or not self._active:
+            raise RuntimeError(
+                "prepare_membership() requires an active capacity-aware Store buffer"
+            )
+        if self._pending_membership is not None:
+            raise RuntimeError("an ElasticBuffer membership transition is pending")
+        source_generation = self._generation
+        source_runtime = self.runtime
+        (
+            old_members,
+            new_members,
+            _survivors,
+            _leavers,
+            _joiners,
+        ) = resolve_membership_transition(
+            self._members, list(active_members), self._capacity_ranks
+        )
+        if not store_namespace or store_namespace == self._store_namespace:
+            raise ValueError(
+                "store_namespace must be fresh for each membership generation"
+            )
+
+        transition_store = clone_tcp_store(self._tcp_store)
+        old_collectives = TCPStoreCollectives(
+            transition_store,
+            self.rank_idx,
+            self.num_ranks,
+            f"{store_namespace}/old-transition",
+            self._store_timeout_secs,
+        )
+        prepared = _PreparedMembership(
+            id(self),
+            source_generation,
+            source_runtime,
+            old_members,
+            new_members,
+            store_namespace,
+            transition_store,
+            old_collectives,
+            None,
+        )
+        self._pending_membership = prepared
+        plans = old_collectives.all_gather(
+            "membership-plan",
+            (
+                tuple(new_members),
+                store_namespace,
+                self.transport,
+            ),
+        )
+        if any(
+            tuple(members) != tuple(new_members)
+            or namespace != store_namespace
+            or transport != self.transport
+            for members, namespace, transport in plans
+        ):
+            raise RuntimeError(
+                "old ElasticBuffer members disagree on the target membership"
+            )
+        if self._transport_rank == min(old_members):
+            transition_store.set(
+                self._membership_transition_key(store_namespace, "required-transport"),
+                self.transport.encode(),
+            )
+
+        candidate = None
+        if self._transport_rank in new_members:
+            with torch.cuda.device(self._device_index):
+                candidate = type(self).create_elastic(
+                    self._transport_rank,
+                    len(new_members),
+                    transition_store,
+                    store_namespace=store_namespace,
+                    num_bytes=self.num_bytes,
+                    num_max_tokens_per_rank=self.num_max_tokens_per_rank,
+                    hidden=self.hidden,
+                    num_topk=self.num_topk,
+                    use_fp8_dispatch=self.use_fp8_dispatch,
+                    deterministic=self.deterministic,
+                    allow_hybrid_mode=self.allow_hybrid_mode,
+                    allow_multiple_reduction=self.allow_multiple_reduction,
+                    prefer_overlap_with_compute=self.prefer_overlap_with_compute,
+                    sl_idx=self.sl_idx,
+                    num_allocated_qps=self.num_allocated_qps,
+                    num_cpu_timeout_secs=self.num_cpu_timeout_secs,
+                    num_gpu_timeout_secs=self.num_gpu_timeout_secs,
+                    explicitly_destroy=self.explicitly_destroy,
+                    transport=self.requested_transport,
+                    store_timeout_secs=self._store_timeout_secs,
+                    capacity_ranks=self._capacity_ranks,
+                    active_members=new_members,
+                    _prepared_membership=True,
+                    _required_transport=self.transport,
+                    _tcp_store_owner=self._tcp_store_owner,
+                )
+
+        prepared.candidate = candidate
+        return prepared
+
+    def commit_membership(self, prepared: _PreparedMembership) -> None:
+        """Wait for target readiness, drain old work, install, then retire NCCL."""
+        if (
+            not isinstance(prepared, _PreparedMembership)
+            or prepared.source_id != id(self)
+            or self._pending_membership is not prepared
+        ):
+            raise ValueError("prepared membership belongs to another ElasticBuffer")
+        if prepared.consumed:
+            raise RuntimeError("prepared membership has already been committed")
+        if (
+            prepared.source_generation != self._generation
+            or prepared.source_runtime is not self.runtime
+        ):
+            raise RuntimeError("prepared membership belongs to an obsolete generation")
+        if not self._active or self.runtime is None:
+            raise RuntimeError("set_membership() requires a live ElasticBuffer")
+        prepared.consumed = True
+
+        old_runtime = self.runtime
+        old_members = prepared.old_members
+        new_members = prepared.new_members
+        store_namespace = prepared.store_namespace
+        transition_store = prepared.transition_store
+        old_collectives = prepared.old_collectives
+
+        with torch.cuda.device(self._device_index):
+            transition_store.wait(
+                [self._membership_transition_key(store_namespace, "prepared")],
+                timedelta(seconds=self._store_timeout_secs),
+            )
+            self._active = False
+            torch.cuda.synchronize()
+            old_collectives.barrier("membership-old-drained")
+            if self._transport_rank == min(old_members):
+                transition_store.set(
+                    self._membership_transition_key(store_namespace, "old-drained"),
+                    b"1",
+                )
+
+            candidate = prepared.candidate
+            target_collectives = None
+            if candidate is not None:
+                candidate_state = candidate.__dict__.copy()
+                candidate_state["_active"] = False
+                candidate_state["_pending_membership"] = prepared
+                self.__dict__.update(candidate_state)
+                target_collectives = self._store_collectives
+
+            if self._transport_rank in new_members:
+                target_collectives.barrier("membership-installed")
+                if target_collectives.rank == 0:
+                    transition_store.set(
+                        self._membership_transition_key(store_namespace, "installed"),
+                        b"1",
+                    )
+            transition_store.wait(
+                [self._membership_transition_key(store_namespace, "installed")],
+                timedelta(seconds=self._store_timeout_secs),
+            )
+
+            old_runtime.destroy()
+            old_collectives.barrier("membership-old-retired")
+            if self._transport_rank == min(old_members):
+                transition_store.set(
+                    self._membership_retired_key(store_namespace), b"1"
+                )
+
+            if self._transport_rank not in new_members:
+                self._members = new_members
+                self.num_ranks = len(new_members)
+                self.rank_idx = -1
+                self._active = False
+                self._store_collectives = None
+                self._store_namespace = store_namespace
+                self.runtime = None
+                self._pending_membership = None
+                return
+
+            transition_store.wait(
+                [self._membership_retired_key(store_namespace)],
+                timedelta(seconds=self._store_timeout_secs),
+            )
+            if self._active_ranks_ready is not None:
+                self._active_ranks_ready.synchronize()
+                self._active_ranks_ready = None
+            target_collectives.barrier("membership-active")
+            candidate._active = True
+            candidate._active_ranks_ready = None
+            self._active = True
+            self._pending_membership = None
+
+    def _set_membership_ibgda(
+        self, active_members: Sequence[int], store_namespace: str
+    ) -> None:
+        """Move an IBGDA Store buffer at a quiescent planned boundary.
+
+        Every old member calls this method, including ranks that are leaving.
+        New members construct a capacity-aware buffer with the same target list
+        and namespace, and pass ``previous_members`` so they wait for old teardown
+        before allocating the IBGDA runtime.
+        """
+        if not self._planned_scaling or not self._active:
+            raise RuntimeError(
+                "set_membership() requires an active capacity-aware Store buffer"
+            )
+        (
+            old_members,
+            new_members,
+            _survivors,
+            leavers,
+            joiners,
+        ) = resolve_membership_transition(
+            self._members, list(active_members), self._capacity_ranks
+        )
+        if not store_namespace or store_namespace == self._store_namespace:
+            raise ValueError(
+                "store_namespace must be fresh for each membership generation"
+            )
+
+        old_set = set(old_members)
+        old_collectives = self._store_collectives
+        if self._transport_rank not in old_set:
+            raise RuntimeError("local rank is not in the old active membership")
+        plans = old_collectives.all_gather(
+            "membership-plan",
+            (tuple(new_members), store_namespace, self.transport),
+        )
+        if any(
+            tuple(members) != tuple(new_members)
+            or namespace != store_namespace
+            or transport != self.transport
+            for members, namespace, transport in plans
+        ):
+            raise RuntimeError(
+                "old ElasticBuffer members disagree on the target membership"
+            )
+        if self._transport_rank == min(old_members):
+            self._tcp_store.set(
+                self._membership_transition_key(store_namespace, "required-transport"),
+                self.transport.encode(),
+            )
+
+        with torch.cuda.device(self._device_index):
+            torch.cuda.synchronize()
+            if self.transport != "nccl":
+                self.runtime.drain_queue_pairs()
+            old_collectives.barrier("membership-old-drained")
+
+            if self.transport != "nccl":
+                peers_to_disconnect = membership_peers_to_disconnect(
+                    old_members, new_members, self._transport_rank
+                )
+                for peer in peers_to_disconnect:
+                    self.runtime.disconnect_peer(peer)
+            old_collectives.barrier("membership-old-disconnected")
+            if self.transport == "nccl" or self._transport_rank in leavers:
+                self._destroy_runtime_local()
+
+            old_collectives.barrier("membership-old-retired")
+            if self._transport_rank == min(old_members):
+                self._tcp_store.set(self._membership_retired_key(store_namespace), b"1")
+
+            if self._transport_rank in leavers:
+                self._members = new_members
+                self.num_ranks = len(new_members)
+                self.rank_idx = -1
+                self._active = False
+                self._store_collectives = None
+                self._store_namespace = store_namespace
+                return
+
+            self._members = new_members
+            self.num_ranks = len(new_members)
+            self.rank_idx = new_members.index(self._transport_rank)
+            self._store_namespace = store_namespace
+            self._store_collectives = TCPStoreCollectives(
+                self._tcp_store,
+                self.rank_idx,
+                self.num_ranks,
+                store_namespace,
+                self._store_timeout_secs,
+            )
+            self.num_rdma_ranks, self.num_nvlink_ranks = (
+                self._calculate_physical_domain_size(self.num_ranks)
+            )
+            self.num_scaleout_ranks, self.num_scaleup_ranks = (
+                self._calculate_logical_domain_size(
+                    self.num_ranks, self.allow_hybrid_mode
+                )
+            )
+            self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
+            self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
+
+            from mooncake import ep
+
+            selected_transport = self._select_store_transport(
+                ep, required_transport=self.transport
+            )
+            if selected_transport != self.transport:
+                raise RuntimeError(
+                    "ElasticBuffer membership change cannot change transports"
+                )
+            nccl_unique_id = []
+            if self.transport == "nccl":
+                nccl_unique_id = self._exchange_nccl_unique_id_from_store(ep)
+                self.runtime = self._construct_capacity_runtime(ep, nccl_unique_id)
+                self._generation = tuple(nccl_unique_id)
+            else:
+                self.runtime.set_ibgda_membership(
+                    self.rank_idx, self.num_ranks, self._members
+                )
+                self._connect_native_from_store_planned(ep, sorted(joiners))
+                self._generation = tuple(store_namespace.encode())
+            self._refresh_topology_from_runtime()
+            self._active_ranks = torch.ones(
+                self.num_ranks, dtype=torch.int32, device="cuda"
+            )
+            torch.cuda.synchronize()
+            self._store_collectives.barrier("initialize")
+            torch.cuda.synchronize()
+
     def update_ep_member(self) -> None:
+        if self._planned_scaling:
+            raise RuntimeError(
+                "capacity-aware buffers use set_membership() for planned changes"
+            )
         if self.transport != "nccl":
             self._connect_native(True)
             return
@@ -1184,6 +2003,10 @@ class ElasticBuffer:
             torch.cuda.synchronize()
 
     def destroy(self) -> None:
+        if self._pending_membership is not None:
+            raise RuntimeError(
+                "cannot destroy an ElasticBuffer with a pending membership transition"
+            )
         runtime = self.runtime
         if runtime is None:
             return
@@ -1380,6 +2203,8 @@ class ElasticBuffer:
     def barrier(
         self, use_comm_stream: bool = True, with_cpu_sync: bool = False
     ) -> None:
+        if not self._active:
+            raise RuntimeError("rank is outside the active ElasticBuffer membership")
         if with_cpu_sync:
             _synchronize_device()
         if self._store_collectives is not None:
@@ -1429,6 +2254,8 @@ class ElasticBuffer:
         EPHandle,
         EventOverlap,
     ]:
+        if not self._active:
+            raise RuntimeError("rank is outside the active ElasticBuffer membership")
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
         if handle is not None:
@@ -1778,6 +2605,8 @@ class ElasticBuffer:
         num_sms: Optional[int] = None,
         async_with_compute_stream: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        if not self._active:
+            raise RuntimeError("rank is outside the active ElasticBuffer membership")
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
         self._validate_handle_generation(handle)

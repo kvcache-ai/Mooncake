@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
-    ColdTierKind, ColdTierSsdEngine, ColdTierTargetSpec, RouteControlMode,
+    ColdTierKind, ColdTierRateLimitConfig, ColdTierSsdEngine, ColdTierTargetSpec, RouteControlMode,
 };
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
@@ -107,6 +107,10 @@ struct RunArgs {
     eviction_high_watermark_percent: Option<u8>,
     #[arg(long, env = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT")]
     eviction_low_watermark_percent: Option<u8>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATIONS")]
+    max_pending_publications: Option<usize>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES")]
+    max_pending_publication_bytes: Option<u64>,
     #[arg(long, default_value = "tcp", env = "MOONCAKE_PROTOCOL")]
     protocol: String,
     #[arg(long, default_value = "", env = "MC_STORE_RS_RDMA_DEVICES")]
@@ -228,6 +232,42 @@ struct RunArgs {
     cold_tier_tags: Vec<String>,
     #[arg(long, help = "Bootstrap cold tier device capacity override in bytes")]
     cold_tier_capacity_bytes: Option<u64>,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_MAX_IN_FLIGHT",
+        help = "Maximum concurrent cold-tier offloads for this runtime"
+    )]
+    cold_tier_offload_runtime_max_in_flight: Option<usize>,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_MAX_IN_FLIGHT",
+        help = "Maximum concurrent cold-tier offloads per device"
+    )]
+    cold_tier_offload_device_max_in_flight: Option<usize>,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_OPS_PER_SEC",
+        help = "Cold-tier offload rate limit for this runtime"
+    )]
+    cold_tier_offload_runtime_ops_per_sec: Option<u32>,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_OPS_PER_SEC",
+        help = "Cold-tier offload rate limit per device"
+    )]
+    cold_tier_offload_device_ops_per_sec: Option<u32>,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_FOREGROUND_OFFLOAD_KICK_BATCH",
+        help = "Pending offloads kicked by one foreground allocation"
+    )]
+    cold_tier_foreground_offload_kick_batch: Option<usize>,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_POLL_INTERVAL_MS",
+        help = "Background cold-tier offload poll interval in milliseconds"
+    )]
+    cold_tier_offload_poll_interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -315,7 +355,8 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let heartbeat_interval =
         effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
     let requested_initial_state = requested_initial_state(&args);
-    let runtime = build_runtime_args(&args, timeouts, metrics_addr.as_deref()).build()?;
+    let runtime = build_runtime_args(&args, timeouts, metrics_addr.as_deref())
+        .build_with_cold_tier_rate_limits(build_cold_tier_rate_limits(&args))?;
 
     let stable_id = runtime.stable_id.clone();
     let epoch = runtime.epoch;
@@ -857,6 +898,8 @@ fn build_runtime_args(
             local_buffer_size: args.scratch_bytes,
             eviction_high_watermark_percent: args.eviction_high_watermark_percent,
             eviction_low_watermark_percent: args.eviction_low_watermark_percent,
+            max_pending_publications: args.max_pending_publications,
+            max_pending_publication_bytes: args.max_pending_publication_bytes,
             protocol: args.protocol.clone(),
             _rdma_devices: args.rdma_devices.clone(),
             transport_rpc_port: args.transport_rpc_port,
@@ -882,6 +925,29 @@ fn build_runtime_args(
         initial_state: startup_initial_state(requested_initial_state(args)),
         route_control: args.route_control.into(),
     }
+}
+
+fn build_cold_tier_rate_limits(args: &RunArgs) -> ColdTierRateLimitConfig {
+    let mut limits = ColdTierRateLimitConfig::default();
+    if let Some(value) = args.cold_tier_offload_runtime_max_in_flight {
+        limits = limits.offload_runtime_max_in_flight(value);
+    }
+    if let Some(value) = args.cold_tier_offload_device_max_in_flight {
+        limits = limits.offload_device_max_in_flight(value);
+    }
+    if let Some(value) = args.cold_tier_offload_runtime_ops_per_sec {
+        limits = limits.offload_runtime_ops_per_sec(value);
+    }
+    if let Some(value) = args.cold_tier_offload_device_ops_per_sec {
+        limits = limits.offload_device_ops_per_sec(value);
+    }
+    if let Some(value) = args.cold_tier_foreground_offload_kick_batch {
+        limits = limits.foreground_offload_kick_batch(value);
+    }
+    if let Some(value) = args.cold_tier_offload_poll_interval_ms {
+        limits = limits.offload_poll_interval_ms(value);
+    }
+    limits
 }
 
 /// Build cold tier target specs from CLI flags.
@@ -1183,15 +1249,15 @@ mod tests {
     use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
 
     use super::{
-        build_cold_tier_specs, build_runtime_args, compat_warnings, drained_message,
-        dummy_worker_scope, effective_heartbeat_interval, emit_compat_warnings, fetch_http_body,
-        heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
-        parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
-        parse_route_control_arg, parse_transport_backend_arg, requested_initial_state,
-        resolve_timeout_config, should_activate_after_ready, start_metrics_if_needed,
-        started_message, startup_initial_state, validate_args, ColdTierKindArg,
-        ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg,
-        RunArgs, TransportBackendArg,
+        build_cold_tier_rate_limits, build_cold_tier_specs, build_runtime_args, compat_warnings,
+        drained_message, dummy_worker_scope, effective_heartbeat_interval, emit_compat_warnings,
+        fetch_http_body, heartbeat_retry_delay_ms, initial_heartbeat_delay_ms,
+        normalize_trace_filter, now_ms, parse_cli_from, parse_falsey_env_bool,
+        parse_hugepage_size_arg, parse_label, parse_route_control_arg, parse_transport_backend_arg,
+        requested_initial_state, resolve_timeout_config, should_activate_after_ready,
+        start_metrics_if_needed, started_message, startup_initial_state, validate_args,
+        ColdTierKindArg, ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg,
+        RouteControlArg, RunArgs, TransportBackendArg,
     };
     use mooncake_store_rs_runtime::DEFAULT_COMPAT_WORKER_SCOPE;
 
@@ -1214,6 +1280,8 @@ mod tests {
             scratch_bytes: 512,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1250,6 +1318,12 @@ mod tests {
             cold_tier_ssd_engine: None,
             cold_tier_tags: vec![],
             cold_tier_capacity_bytes: None,
+            cold_tier_offload_runtime_max_in_flight: None,
+            cold_tier_offload_device_max_in_flight: None,
+            cold_tier_offload_runtime_ops_per_sec: None,
+            cold_tier_offload_device_ops_per_sec: None,
+            cold_tier_foreground_offload_kick_batch: None,
+            cold_tier_offload_poll_interval_ms: None,
         }
     }
 
@@ -1552,6 +1626,49 @@ mod tests {
                 assert_eq!(args.trace_filter.as_deref(), Some("debug"));
                 assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
                 assert!(args.drain_on_exit);
+            },
+        );
+    }
+
+    #[test]
+    fn pending_publication_cli_env_precedence_and_runtime_forwarding() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_MAX_PENDING_PUBLICATIONS", Some("17")),
+                ("MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES", Some("4096")),
+            ],
+            || {
+                for explicit in [false, true] {
+                    let mut argv = vec![
+                        "mooncake-store-rs-client",
+                        "run",
+                        "--local-hostname",
+                        "127.0.0.1",
+                        "--metadata-url",
+                        "redis://127.0.0.1:6379/0",
+                    ];
+                    if explicit {
+                        argv.extend([
+                            "--max-pending-publications",
+                            "3",
+                            "--max-pending-publication-bytes",
+                            "512",
+                        ]);
+                    }
+                    let cli = parse_cli_from(argv).unwrap();
+                    let Command::Run(args) = cli.command else {
+                        panic!("expected run");
+                    };
+                    let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
+                    assert_eq!(
+                        runtime_args.setup.max_pending_publications,
+                        Some(if explicit { 3 } else { 17 })
+                    );
+                    assert_eq!(
+                        runtime_args.setup.max_pending_publication_bytes,
+                        Some(if explicit { 512 } else { 4096 })
+                    );
+                }
             },
         );
     }
@@ -2140,6 +2257,25 @@ mod tests {
     }
 
     #[test]
+    fn build_runtime_args_maps_cold_tier_rate_limits() {
+        let mut args = sample_args();
+        args.cold_tier_offload_runtime_max_in_flight = Some(32);
+        args.cold_tier_offload_device_max_in_flight = Some(4);
+        args.cold_tier_offload_runtime_ops_per_sec = Some(4_096);
+        args.cold_tier_offload_device_ops_per_sec = Some(1_024);
+        args.cold_tier_foreground_offload_kick_batch = Some(64);
+        args.cold_tier_offload_poll_interval_ms = Some(1);
+
+        let limits = build_cold_tier_rate_limits(&args);
+        assert_eq!(limits.offload_runtime_max_in_flight, 32);
+        assert_eq!(limits.offload_device_max_in_flight, 4);
+        assert_eq!(limits.offload_runtime_ops_per_sec, 4_096);
+        assert_eq!(limits.offload_device_ops_per_sec, 1_024);
+        assert_eq!(limits.foreground_offload_kick_batch, 64);
+        assert_eq!(limits.offload_poll_interval_ms, 1);
+    }
+
+    #[test]
     fn validate_args_rejects_cold_tier_id_without_target() {
         let mut args = sample_args();
         args.cold_tier_id = Some("ssd-a".to_string());
@@ -2157,5 +2293,80 @@ mod tests {
 
         let error = validate_args(&args).expect_err("directory+uuid should conflict");
         assert!(error.to_string().contains("mutually exclusive"));
+    }
+    #[test]
+    fn cold_tier_rate_limit_flags_override_environment() {
+        with_env_vars(
+            [
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_MAX_IN_FLIGHT",
+                    Some("11"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_MAX_IN_FLIGHT",
+                    Some("12"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_OPS_PER_SEC",
+                    Some("13"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_OPS_PER_SEC",
+                    Some("14"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_FOREGROUND_OFFLOAD_KICK_BATCH",
+                    Some("15"),
+                ),
+                ("MC_STORE_RS_COLD_TIER_OFFLOAD_POLL_INTERVAL_MS", Some("16")),
+            ],
+            || {
+                let base = [
+                    "mooncake-store-rs-client",
+                    "--local-hostname",
+                    "127.0.0.1",
+                    "--metadata-url",
+                    "redis://127.0.0.1:6379/0",
+                ];
+                let cli = parse_cli_from(base).expect("environment limits should parse");
+                let args = match cli.command {
+                    Command::Run(args) => args,
+                    _ => panic!("expected run command"),
+                };
+                let limits = build_cold_tier_rate_limits(&args);
+                assert_eq!(limits.offload_runtime_max_in_flight, 11);
+                assert_eq!(limits.offload_device_max_in_flight, 12);
+                assert_eq!(limits.offload_runtime_ops_per_sec, 13);
+                assert_eq!(limits.offload_device_ops_per_sec, 14);
+                assert_eq!(limits.foreground_offload_kick_batch, 15);
+                assert_eq!(limits.offload_poll_interval_ms, 16);
+                let cli = parse_cli_from(base.into_iter().chain([
+                    "--cold-tier-offload-runtime-max-in-flight",
+                    "31",
+                    "--cold-tier-offload-device-max-in-flight",
+                    "32",
+                    "--cold-tier-offload-runtime-ops-per-sec",
+                    "33",
+                    "--cold-tier-offload-device-ops-per-sec",
+                    "34",
+                    "--cold-tier-foreground-offload-kick-batch",
+                    "35",
+                    "--cold-tier-offload-poll-interval-ms",
+                    "36",
+                ]))
+                .expect("explicit limits should parse");
+                let args = match cli.command {
+                    Command::Run(args) => args,
+                    _ => panic!("expected run command"),
+                };
+                let limits = build_cold_tier_rate_limits(&args);
+                assert_eq!(limits.offload_runtime_max_in_flight, 31);
+                assert_eq!(limits.offload_device_max_in_flight, 32);
+                assert_eq!(limits.offload_runtime_ops_per_sec, 33);
+                assert_eq!(limits.offload_device_ops_per_sec, 34);
+                assert_eq!(limits.foreground_offload_kick_batch, 35);
+                assert_eq!(limits.offload_poll_interval_ms, 36);
+            },
+        );
     }
 }

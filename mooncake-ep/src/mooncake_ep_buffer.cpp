@@ -323,22 +323,36 @@ void MooncakeEpBuffer::configure_elastic(int num_experts_per_rank,
                                sizeof(self_active), cudaMemcpyHostToDevice,
                                comm_stream));
     if (rdma_transport_) {
-        const int64_t local_addr =
-            reinterpret_cast<int64_t>(rdma_memory_region_.addr);
-        const int32_t local_key =
-            static_cast<int32_t>(rdma_memory_region_.lkey);
-        CUDA_CHECK(
-            cudaMemcpyAsync(static_cast<char*>(rdma_transport_->raddrsPtr()) +
-                                rank * sizeof(uint64_t),
-                            &local_addr, sizeof(local_addr),
-                            cudaMemcpyHostToDevice, comm_stream));
-        CUDA_CHECK(
-            cudaMemcpyAsync(static_cast<char*>(rdma_transport_->rkeysPtr()) +
-                                rank * sizeof(uint32_t),
-                            &local_key, sizeof(local_key),
-                            cudaMemcpyHostToDevice, comm_stream));
+        initialize_local_peer();
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream));
     }
+}
+
+void MooncakeEpBuffer::initialize_local_peer() {
+    if (destroyed_) throw std::runtime_error("EP buffer has been destroyed");
+    if (!rdma_transport_) return;
+    const int64_t local_addr =
+        reinterpret_cast<int64_t>(rdma_memory_region_.addr);
+    const int32_t local_key = static_cast<int32_t>(rdma_memory_region_.lkey);
+    CUDA_CHECK(cudaMemcpyAsync(
+        static_cast<char*>(rdma_transport_->raddrsPtr()) +
+            rank * sizeof(uint64_t),
+        &local_addr, sizeof(local_addr), cudaMemcpyHostToDevice, comm_stream));
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(rdma_transport_->rkeysPtr()) +
+                                   rank * sizeof(uint32_t),
+                               &local_key, sizeof(local_key),
+                               cudaMemcpyHostToDevice, comm_stream));
     CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+}
+
+void MooncakeEpBuffer::drain_queue_pairs() {
+    if (destroyed_) throw std::runtime_error("EP buffer has been destroyed");
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (rdma_transport_ &&
+        rdma_transport_->drainQueuePairs(comm_stream, 1000) != 0) {
+        throw std::runtime_error("failed to drain elastic peer QPs");
+    }
 }
 
 void MooncakeEpBuffer::validate_connect_ranks(
@@ -359,6 +373,94 @@ void MooncakeEpBuffer::validate_connect_ranks(
                     << " is already connected; call disconnect_ranks() first";
             throw std::invalid_argument(message.str());
         }
+    }
+}
+
+void MooncakeEpBuffer::connect_rdma_peer(
+    int peer_rank, int64_t raddr, int32_t rkey, int64_t subnet_prefix,
+    int64_t interface_id, const std::vector<int32_t>& qpns,
+    const std::vector<int32_t>& lids, bool log_prepare_stream_destroy_failure) {
+    const int qps_per_rank = USE_QP_COUNT / num_ranks;
+    const int qp_offset = peer_rank * qps_per_rank;
+    std::vector<int64_t> remote_addrs(num_ranks, 0);
+    std::vector<int32_t> remote_keys(num_ranks, 0);
+    std::vector<int32_t> remote_qpns(USE_QP_COUNT, 0);
+    std::vector<int32_t> remote_lids(USE_QP_COUNT, 0);
+    std::vector<int64_t> subnet_prefixes(num_ranks, 0);
+    std::vector<int64_t> interface_ids(num_ranks, 0);
+    std::vector<int> active_peer(num_ranks, 0);
+    remote_addrs[peer_rank] = raddr;
+    remote_keys[peer_rank] = rkey;
+    subnet_prefixes[peer_rank] = subnet_prefix;
+    interface_ids[peer_rank] = interface_id;
+    std::copy(qpns.begin(), qpns.end(), remote_qpns.begin() + qp_offset);
+    std::copy(lids.begin(), lids.end(), remote_lids.begin() + qp_offset);
+    active_peer[peer_rank] = 1;
+
+    auto prepare_stream = create_comm_stream();
+    try {
+        if (rdma_transport_->resetQueuePairs(qp_offset, qps_per_rank,
+                                             prepare_stream) != 0) {
+            throw std::runtime_error("failed to reset elastic peer QPs");
+        }
+        if (rdma_transport_->connectPeers(
+                rank, rdma_transport_->isRoce(), rdma_memory_region_.lkey,
+                remote_addrs, remote_keys, remote_qpns, remote_lids,
+                subnet_prefixes, interface_ids, active_peer) != 0) {
+            throw std::runtime_error("failed to connect elastic peer QPs");
+        }
+    } catch (...) {
+        if (log_prepare_stream_destroy_failure) {
+            const auto status = cudaStreamDestroy(prepare_stream);
+            if (status != cudaSuccess) {
+                LOG(ERROR) << "failed to destroy elastic prepare stream: "
+                           << cudaGetErrorString(status);
+            }
+        } else {
+            cudaStreamDestroy(prepare_stream);
+        }
+        throw;
+    }
+    CUDA_CHECK(cudaStreamDestroy(prepare_stream));
+}
+
+void MooncakeEpBuffer::reset_rdma_peer(int peer_rank, cudaStream_t stream) {
+    const int qps_per_rank = USE_QP_COUNT / num_ranks;
+    const int qp_offset = peer_rank * qps_per_rank;
+    if (rdma_transport_->resetQueuePairs(qp_offset, qps_per_rank, stream) !=
+        0) {
+        throw std::runtime_error("failed to reset disconnected EP QPs");
+    }
+    CUDA_CHECK(
+        cudaMemsetAsync(static_cast<char*>(rdma_transport_->raddrsPtr()) +
+                            peer_rank * sizeof(uint64_t),
+                        0, sizeof(uint64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(rdma_transport_->rkeysPtr()) +
+                                   peer_rank * sizeof(uint32_t),
+                               0, sizeof(uint32_t), stream));
+}
+
+void MooncakeEpBuffer::stage_p2p_peer(int peer_rank,
+                                      const std::vector<int32_t>& ipc_handle) {
+    if (p2p_transport_->stagePeerHandle(gdr_buffer, rank, peer_rank,
+                                        ipc_handle) != 0) {
+        throw std::runtime_error("failed to stage elastic P2P peer mapping");
+    }
+}
+
+void MooncakeEpBuffer::publish_p2p_peer(int peer_rank) {
+    if (p2p_transport_->publishStagedPeer(peer_rank) != 0) {
+        throw std::runtime_error("failed to publish elastic P2P peer slot");
+    }
+}
+
+void MooncakeEpBuffer::discard_staged_p2p_peer(int peer_rank) {
+    p2p_transport_->discardStagedPeer(peer_rank);
+}
+
+void MooncakeEpBuffer::disconnect_p2p_peer(int peer_rank) {
+    if (p2p_transport_->disconnectPeer(peer_rank) != 0) {
+        throw std::runtime_error("failed to disconnect elastic P2P slot");
     }
 }
 
@@ -402,68 +504,80 @@ void MooncakeEpBuffer::stage_peer(int peer_rank, int64_t raddr, int32_t rkey,
 
     try {
         if (p2p_enabled_) {
-            const int ret = p2p_transport_->stagePeerHandle(
-                gdr_buffer, rank, peer_rank, ipc_handle);
-            if (ret != 0) {
-                throw std::runtime_error(
-                    "failed to stage elastic P2P peer mapping");
-            }
+            stage_p2p_peer(peer_rank, ipc_handle);
         }
 
         if (rdma_transport_) {
-            const int qps_per_rank = USE_QP_COUNT / num_ranks;
-            const int qp_offset = peer_rank * qps_per_rank;
-            std::vector<int64_t> remote_addrs(num_ranks, 0);
-            std::vector<int32_t> remote_keys(num_ranks, 0);
-            std::vector<int32_t> remote_qpns(USE_QP_COUNT, 0);
-            std::vector<int32_t> remote_lids(USE_QP_COUNT, 0);
-            std::vector<int64_t> subnet_prefixes(num_ranks, 0);
-            std::vector<int64_t> interface_ids(num_ranks, 0);
-            std::vector<int> active_peer(num_ranks, 0);
-            remote_addrs[peer_rank] = raddr;
-            remote_keys[peer_rank] = rkey;
-            subnet_prefixes[peer_rank] = subnet_prefix;
-            interface_ids[peer_rank] = interface_id;
-            std::copy(qpns.begin(), qpns.end(),
-                      remote_qpns.begin() + qp_offset);
-            std::copy(lids.begin(), lids.end(),
-                      remote_lids.begin() + qp_offset);
-            active_peer[peer_rank] = 1;
-
-            auto prepare_stream = create_comm_stream();
-            try {
-                if (rdma_transport_->resetQueuePairs(qp_offset, qps_per_rank,
-                                                     prepare_stream) != 0) {
-                    throw std::runtime_error(
-                        "failed to reset elastic peer QPs");
-                }
-                const int ret = rdma_transport_->connectPeers(
-                    rank, rdma_transport_->isRoce(), rdma_memory_region_.lkey,
-                    remote_addrs, remote_keys, remote_qpns, remote_lids,
-                    subnet_prefixes, interface_ids, active_peer);
-                if (ret != 0) {
-                    throw std::runtime_error(
-                        "failed to connect elastic peer QPs");
-                }
-            } catch (...) {
-                const auto status = cudaStreamDestroy(prepare_stream);
-                if (status != cudaSuccess) {
-                    LOG(ERROR) << "failed to destroy elastic prepare stream: "
-                               << cudaGetErrorString(status);
-                }
-                throw;
-            }
-            CUDA_CHECK(cudaStreamDestroy(prepare_stream));
+            connect_rdma_peer(peer_rank, raddr, rkey, subnet_prefix,
+                              interface_id, qpns, lids, true);
             LOG(INFO) << "[EP] prepared RDMA peer rank=" << peer_rank
                       << " (masked until commit)";
         }
     } catch (...) {
-        if (p2p_enabled_) p2p_transport_->discardStagedPeer(peer_rank);
+        if (p2p_enabled_) discard_staged_p2p_peer(peer_rank);
         throw;
     }
 
     elastic_connected_ranks_[peer_rank] = 1;
     elastic_staged_ranks_[peer_rank] = 1;
+}
+
+void MooncakeEpBuffer::connect_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                                    int64_t subnet_prefix, int64_t interface_id,
+                                    const std::vector<int32_t>& qpns,
+                                    const std::vector<int32_t>& lids,
+                                    const std::vector<int32_t>& ipc_handle) {
+    std::lock_guard<std::mutex> lock(elastic_mutex_);
+    if (destroyed_ || peer_rank < 0 || peer_rank >= num_ranks ||
+        peer_rank == rank) {
+        throw std::invalid_argument("invalid elastic EP peer rank");
+    }
+    const int qps_per_rank = USE_QP_COUNT / num_ranks;
+    if (rdma_transport_ && (static_cast<int>(qpns.size()) != qps_per_rank ||
+                            static_cast<int>(lids.size()) != qps_per_rank)) {
+        throw std::invalid_argument(
+            "elastic peer metadata must contain the fixed-capacity QP row");
+    }
+    if (p2p_enabled_ && ipc_handle.empty() && !rdma_transport_) {
+        throw std::runtime_error(
+            "elastic EP peer has no P2P handle and IBGDA is unavailable");
+    }
+    if (!p2p_enabled_ && !rdma_transport_) {
+        throw std::runtime_error("elastic EP has neither P2P nor IBGDA");
+    }
+
+    if (p2p_enabled_) {
+        stage_p2p_peer(peer_rank, ipc_handle);
+    }
+
+    try {
+        if (rdma_transport_) {
+            connect_rdma_peer(peer_rank, raddr, rkey, subnet_prefix,
+                              interface_id, qpns, lids, false);
+        }
+        if (p2p_enabled_) {
+            publish_p2p_peer(peer_rank);
+        }
+    } catch (...) {
+        if (p2p_enabled_) discard_staged_p2p_peer(peer_rank);
+        throw;
+    }
+}
+
+void MooncakeEpBuffer::disconnect_peer(int peer_rank) {
+    std::lock_guard<std::mutex> lock(elastic_mutex_);
+    if (destroyed_ || peer_rank < 0 || peer_rank >= num_ranks ||
+        peer_rank == rank) {
+        throw std::invalid_argument("invalid elastic EP disconnect rank");
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (rdma_transport_) {
+        reset_rdma_peer(peer_rank, comm_stream);
+    }
+    if (p2p_enabled_) {
+        disconnect_p2p_peer(peer_rank);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream));
 }
 
 void MooncakeEpBuffer::commit_staged_peers() {
@@ -476,8 +590,8 @@ void MooncakeEpBuffer::commit_staged_peers() {
     CUDA_CHECK(cudaDeviceSynchronize());
     for (int peer = 0; peer < num_ranks; ++peer) {
         if (!elastic_staged_ranks_[peer]) continue;
-        if (p2p_enabled_ && p2p_transport_->publishStagedPeer(peer) != 0) {
-            throw std::runtime_error("failed to publish elastic P2P peer slot");
+        if (p2p_enabled_) {
+            publish_p2p_peer(peer);
         }
         CUDA_CHECK(cudaMemsetAsync(barrier_send_count_ + peer, 0,
                                    sizeof(int32_t), comm_stream));
@@ -580,28 +694,14 @@ void MooncakeEpBuffer::disconnect_ranks(const std::vector<int>& peer_ranks) {
     refresh_active_rank_bound();
     CUDA_CHECK(cudaStreamSynchronize(comm_stream));
 
-    const int qps_per_rank = USE_QP_COUNT / num_ranks;
     for (int peer : peer_ranks) {
         if (elastic_staged_ranks_[peer] && p2p_transport_)
-            p2p_transport_->discardStagedPeer(peer);
+            discard_staged_p2p_peer(peer);
         if (rdma_transport_) {
-            const int qp_offset = peer * qps_per_rank;
-            if (rdma_transport_->resetQueuePairs(qp_offset, qps_per_rank,
-                                                 comm_stream) != 0) {
-                throw std::runtime_error("failed to reset disconnected EP QPs");
-            }
-            CUDA_CHECK(cudaMemsetAsync(
-                static_cast<char*>(rdma_transport_->raddrsPtr()) +
-                    peer * sizeof(uint64_t),
-                0, sizeof(uint64_t), comm_stream));
-            CUDA_CHECK(cudaMemsetAsync(
-                static_cast<char*>(rdma_transport_->rkeysPtr()) +
-                    peer * sizeof(uint32_t),
-                0, sizeof(uint32_t), comm_stream));
+            reset_rdma_peer(peer, comm_stream);
         }
-        if (elastic_committed_ranks_[peer] && p2p_enabled_ &&
-            p2p_transport_->disconnectPeer(peer) != 0) {
-            throw std::runtime_error("failed to disconnect elastic P2P slot");
+        if (elastic_committed_ranks_[peer] && p2p_enabled_) {
+            disconnect_p2p_peer(peer);
         }
         CUDA_CHECK(cudaMemsetAsync(barrier_send_count_ + peer, 0,
                                    sizeof(int32_t), comm_stream));
