@@ -100,6 +100,25 @@ class ClientLivenessRecord {
         return state() != ClientLivenessState::OFFLINE;
     }
 
+    // Fast pre-check under the leaf transition lock: true only when the
+    // current state has reached its TTL deadline at `now`.
+    [[nodiscard]] bool IsExpiredAt(TimePoint now, Clock::duration active_ttl,
+                                   Clock::duration suspicion_ttl) const {
+        if (!ShouldRetainResources()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(transition_mutex_);
+        switch (state_.load(std::memory_order_relaxed)) {
+            case ClientLivenessState::ACTIVE:
+                return now - last_liveness_at_ >= active_ttl;
+            case ClientLivenessState::SUSPECTED:
+                return now - suspected_since_ >= suspicion_ttl;
+            case ClientLivenessState::OFFLINE:
+                return false;
+        }
+        return false;
+    }
+
     [[nodiscard]] std::optional<ServingGuard> TryAcquireServingGuard() const {
         std::unique_lock<std::mutex> lock(transition_mutex_);
         if (state_.load(std::memory_order_relaxed) !=

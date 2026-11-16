@@ -62,14 +62,17 @@ class ClientSessionRegistryTestPeer {
                                           const UUID& client_id,
                                           const Slot& slot,
                                           bool try_lock = false) {
-        return registry.AcquireExclusiveOperation(client_id, slot, try_lock)
-            .has_value();
+        (void)registry;
+        (void)client_id;
+        return slot ? slot->AcquireExclusive(try_lock).has_value() : false;
     }
 
     static bool AcquireSharedOperation(const ClientSessionRegistry& registry,
                                        const UUID& client_id,
                                        const Slot& slot) {
-        return registry.AcquireSharedOperation(client_id, slot).has_value();
+        (void)registry;
+        (void)client_id;
+        return slot ? slot->AcquireShared().has_value() : false;
     }
 };
 

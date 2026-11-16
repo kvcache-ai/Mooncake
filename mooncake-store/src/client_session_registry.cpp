@@ -99,29 +99,23 @@ ClientSessionRegistry::Slot ClientSessionRegistry::FindSlotLocked(
 }
 
 std::optional<ClientSessionRegistry::SharedOperation>
-ClientSessionRegistry::AcquireSharedOperation(const UUID& client_id,
-                                              const Slot& slot) const {
-    if (!slot) return std::nullopt;
+ClientSessionRegistry::ClientSlot::AcquireShared() {
     {
         // Turnstile: taking and releasing the gate lets an exclusive acquirer
         // queuing behind it through, instead of being starved by a continuous
         // stream of operations.
-        const std::lock_guard<std::mutex> gate(slot->admission_gate);
+        const std::lock_guard<std::mutex> gate(admission_gate);
     }
-    SharedOperation operation(slot->operation_mutex);
-    // Removal holds this lock exclusively through erasure, so revalidate that
-    // the slot is still the registered one.
-    if (FindSlot(client_id) != slot) return std::nullopt;
+    SharedOperation operation(operation_mutex);
+    // Removal sets erased under ExclusiveOperation before dropping the slot.
+    if (erased) return std::nullopt;
     return operation;
 }
 
 std::optional<ClientSessionRegistry::ExclusiveOperation>
-ClientSessionRegistry::AcquireExclusiveOperation(const UUID& client_id,
-                                                 const Slot& slot,
-                                                 bool try_lock) const {
-    if (!slot) return std::nullopt;
-    std::unique_lock<std::mutex> gate(slot->admission_gate, std::defer_lock);
-    ExclusiveOperation operation(slot->operation_mutex, std::defer_lock);
+ClientSessionRegistry::ClientSlot::AcquireExclusive(bool try_lock) {
+    std::unique_lock<std::mutex> gate(admission_gate, std::defer_lock);
+    ExclusiveOperation operation(operation_mutex, std::defer_lock);
     if (try_lock) {
         if (!gate.try_lock() || !operation.try_lock()) return std::nullopt;
     } else {
@@ -130,29 +124,36 @@ ClientSessionRegistry::AcquireExclusiveOperation(const UUID& client_id,
         gate.lock();
         operation.lock();
     }
-    if (FindSlot(client_id) != slot) return std::nullopt;
+    if (erased) return std::nullopt;
     return operation;
 }
 
 std::optional<ClientSessionRegistry::SessionGuard>
-ClientSessionRegistry::TryAcquireRetainingSession(const UUID& client_id) const {
+ClientSessionRegistry::TryAcquireSession(const UUID& client_id,
+                                         bool require_serving) const {
     auto slot = FindSlot(client_id);
-    auto operation = AcquireSharedOperation(client_id, slot);
+    // OFFLINE is terminal and never recovers; SUSPECTED still acquires the
+    // shared lock so it waits for any in-flight registration recovering it.
+    if (!slot || !slot->liveness->ShouldRetainResources()) {
+        return std::nullopt;
+    }
+    auto operation = slot->AcquireShared();
     if (!operation) return std::nullopt;
-    if (!slot->liveness->ShouldRetainResources()) return std::nullopt;
+    const bool admitted = require_serving
+                              ? slot->liveness->IsServing()
+                              : slot->liveness->ShouldRetainResources();
+    if (!admitted) return std::nullopt;
     return SessionGuard(std::move(slot), std::move(*operation));
 }
 
 std::optional<ClientSessionRegistry::SessionGuard>
+ClientSessionRegistry::TryAcquireRetainingSession(const UUID& client_id) const {
+    return TryAcquireSession(client_id, /*require_serving=*/false);
+}
+
+std::optional<ClientSessionRegistry::SessionGuard>
 ClientSessionRegistry::TryAcquireServingSession(const UUID& client_id) const {
-    auto guard = TryAcquireRetainingSession(client_id);
-    // The shared operation lock excludes expiry, so liveness cannot degrade
-    // between this check and the caller's operation. Ping may still recover
-    // it.
-    if (guard && !guard->slot_->liveness->IsServing()) {
-        return std::nullopt;
-    }
-    return guard;
+    return TryAcquireSession(client_id, /*require_serving=*/true);
 }
 
 bool ClientSessionRegistry::Remove(const UUID& client_id,
@@ -160,7 +161,7 @@ bool ClientSessionRegistry::Remove(const UUID& client_id,
     std::shared_lock lifecycle_lock(lifecycle_mutex_);
     auto slot = FindSlot(client_id);
     if (!slot || slot->liveness != expected) return false;
-    auto operation = AcquireExclusiveOperation(client_id, slot);
+    auto operation = slot->AcquireExclusive();
     if (!operation) return false;
     EraseSlot(client_id, slot, *operation);
     return true;
@@ -180,51 +181,57 @@ ClientSessionRegistry::BeginRemount(const UUID& client_id) {
 std::optional<ClientSessionRegistry::Registration> ClientSessionRegistry::Begin(
     const UUID& client_id, RegistrationKind kind,
     std::optional<Clock::time_point> observed_at) {
-    Registration registration(*this, client_id, kind, observed_at);
-    if (!registration.admitted_) {
-        return std::nullopt;
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    for (;;) {
+        auto slot = FindSlot(client_id);
+        const bool provisional = !slot;
+        ExclusiveOperation operation;
+        if (provisional) {
+            // Sample after acquiring lifecycle_lock so waiting behind restore
+            // work does not consume the new session's active TTL.
+            slot = std::make_shared<ClientSlot>(
+                std::make_shared<ClientLivenessRecord>(
+                    client_id, observed_at.value_or(Clock::now())));
+            // Claim the private slot before publication; never acquire a
+            // published slot's operation lock under the registry lock.
+            operation = ExclusiveOperation(slot->operation_mutex);
+            std::unique_lock lock(mutex_);
+            if (FindSlotLocked(client_id)) {
+                // Lost the publication race; retry against the winner.
+                continue;
+            }
+            AdoptSlot(client_id, slot);
+        } else {
+            if (!slot->liveness->ShouldRetainResources()) {
+                return std::nullopt;
+            }
+            auto acquired = slot->AcquireExclusive();
+            // A preceding scope may have removed this slot while we waited.
+            if (!acquired) continue;
+            if (!slot->liveness->ShouldRetainResources()) {
+                return std::nullopt;
+            }
+            operation = std::move(*acquired);
+        }
+        return Registration(*this, std::move(lifecycle_lock), client_id, kind,
+                            observed_at, std::move(slot), std::move(operation),
+                            provisional);
     }
-    return registration;
 }
 
 ClientSessionRegistry::Registration::Registration(
-    ClientSessionRegistry& registry, const UUID& client_id,
-    RegistrationKind kind, std::optional<Clock::time_point> observed_at)
+    ClientSessionRegistry& registry,
+    std::shared_lock<std::shared_mutex> lifecycle_lock, const UUID& client_id,
+    RegistrationKind kind, std::optional<Clock::time_point> observed_at,
+    Slot slot, ExclusiveOperation operation, bool provisional)
     : registry_(registry),
-      lifecycle_lock_(registry.lifecycle_mutex_),
+      lifecycle_lock_(std::move(lifecycle_lock)),
       client_id_(client_id),
       kind_(kind),
-      observed_at_(observed_at) {
-    for (;;) {
-        slot_ = registry.FindSlot(client_id);
-        provisional_ = !slot_;
-        if (provisional_) {
-            // Sample after acquiring lifecycle_lock_ so waiting behind restore
-            // work does not consume the new session's active TTL.
-            slot_ = std::make_shared<ClientSlot>(
-                std::make_shared<ClientLivenessRecord>(
-                    client_id, observed_at_.value_or(Clock::now())));
-            // Claim the private slot before publication; never acquire a
-            // published slot's operation lock under the registry lock.
-            operation_ = ExclusiveOperation(slot_->operation_mutex);
-            std::unique_lock lock(registry.mutex_);
-            if (registry.FindSlotLocked(client_id)) {
-                // Lost the publication race; retry against the winner.
-                operation_ = {};
-                continue;
-            }
-            registry.AdoptSlot(client_id, slot_);
-        } else {
-            auto operation =
-                registry.AcquireExclusiveOperation(client_id, slot_);
-            // A preceding scope may have removed this slot while we waited.
-            if (!operation) continue;
-            operation_ = std::move(*operation);
-        }
-        admitted_ = slot_->liveness->ShouldRetainResources();
-        break;
-    }
-}
+      observed_at_(observed_at),
+      slot_(std::move(slot)),
+      operation_(std::move(operation)),
+      provisional_(provisional) {}
 
 ClientSessionRegistry::Registration::~Registration() {
     // A moved-from scope no longer owns the operation.
@@ -234,14 +241,14 @@ ClientSessionRegistry::Registration::~Registration() {
 }
 
 bool ClientSessionRegistry::Registration::NeedsRemount() const {
-    CHECK(operation_.owns_lock() && admitted_);
+    CHECK(operation_.owns_lock());
     std::shared_lock lock(registry_.mutex_);
     return !slot_->remount_completed;
 }
 
 void ClientSessionRegistry::Registration::UpdateHostId(
     const std::string& host_id) {
-    CHECK(operation_.owns_lock() && admitted_);
+    CHECK(operation_.owns_lock());
     if (host_id.empty()) {
         return;
     }
@@ -256,7 +263,7 @@ void ClientSessionRegistry::Registration::UpdateHostId(
 }
 
 void ClientSessionRegistry::Registration::Commit() {
-    CHECK(operation_.owns_lock() && admitted_);
+    CHECK(operation_.owns_lock());
     CHECK(!committed_);
     if (kind_ == RegistrationKind::Register) {
         // Sample after lock acquisition and resource installation so neither
@@ -356,9 +363,15 @@ bool ClientSessionRegistry::HasRetiredSession() const {
     });
 }
 
-ClientSessionRegistry::Slots ClientSessionRegistry::SnapshotSlots() const {
+ClientSessionRegistry::SlotSnapshot ClientSessionRegistry::SnapshotSlots()
+    const {
     std::shared_lock lock(mutex_);
-    return slots_;
+    SlotSnapshot snapshot;
+    snapshot.reserve(slots_.size());
+    for (const auto& entry : slots_) {
+        snapshot.push_back(entry);
+    }
+    return snapshot;
 }
 
 void ClientSessionRegistry::AdoptSlot(const UUID& client_id, const Slot& slot) {
@@ -386,9 +399,10 @@ void ClientSessionRegistry::AdoptRecords(const Records& records) {
 void ClientSessionRegistry::EraseSlot(const UUID& client_id, const Slot& slot,
                                       const ExclusiveOperation& operation) {
     CHECK(operation.owns_lock() && operation.mutex() == &slot->operation_mutex);
+    slot->erased = true;
     // The operation excludes other removers, expiry and registration, and the
     // registry lock excludes Ping, so the state read here is the one the
-    // gauges last counted. Waiters cannot validate this slot once it is gone.
+    // gauges last counted. Waiters cannot enter this slot once erased is set.
     std::unique_lock lock(mutex_);
     CHECK(FindSlotLocked(client_id) == slot);
     MasterMetricManager::instance().on_client_liveness_record_removed(
@@ -398,11 +412,10 @@ void ClientSessionRegistry::EraseSlot(const UUID& client_id, const Slot& slot,
 }
 
 void ClientSessionRegistry::ClearSlots() {
-    const auto slots = SnapshotSlots();
-    for (const auto& [client_id, slot] : slots) {
-        const std::lock_guard<std::mutex> gate(slot->admission_gate);
-        ExclusiveOperation operation(slot->operation_mutex);
-        EraseSlot(client_id, slot, operation);
+    for (const auto& [client_id, slot] : SnapshotSlots()) {
+        if (auto operation = slot->AcquireExclusive()) {
+            EraseSlot(client_id, slot, *operation);
+        }
     }
 }
 
@@ -421,25 +434,25 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
     if (!lifecycle_lock.owns_lock()) {
         return;
     }
-    const auto slots = SnapshotSlots();
     int waits_left = kMaxWaitingExpiryAcquisitionsPerPass;
-    for (const auto& [client_id, slot] : slots) {
+    for (const auto& [client_id, slot] : SnapshotSlots()) {
+        if (!slot->liveness->IsExpiredAt(now, active_ttl_, suspicion_ttl_)) {
+            slot->busy_expiry_passes = 0;
+            continue;
+        }
         // A continuously admitted session would otherwise postpone its own
         // expiry forever. That matters most when the admissions come from
         // other clients holding it as a replication source, so after a few
         // skipped passes queue behind the operations in flight instead.
-        const auto busy_passes =
-            slot->busy_expiry_passes.load(std::memory_order_relaxed);
-        const bool wait =
-            waits_left > 0 && busy_passes >= kBusyExpiryPassesBeforeWaiting;
-        auto operation = AcquireExclusiveOperation(client_id, slot,
-                                                   /*try_lock=*/!wait);
+        const bool wait = waits_left > 0 && slot->busy_expiry_passes >=
+                                                kBusyExpiryPassesBeforeWaiting;
+        auto operation = slot->AcquireExclusive(/*try_lock=*/!wait);
         if (wait) --waits_left;
         if (!operation) {
-            slot->busy_expiry_passes.fetch_add(1, std::memory_order_relaxed);
+            ++slot->busy_expiry_passes;
             continue;
         }
-        slot->busy_expiry_passes.store(0, std::memory_order_relaxed);
+        slot->busy_expiry_passes = 0;
         switch (slot->liveness->EvaluateAndRetire(
             now, active_ttl_, suspicion_ttl_,
             [this] {

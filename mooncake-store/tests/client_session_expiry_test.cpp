@@ -184,5 +184,42 @@ TEST(ClientSessionExpiryTest, LocalDiskCleanupUsesBoundSessionState) {
     EXPECT_TRUE(replica.has_stale_local_disk_client());
 }
 
+TEST(ClientSessionExpiryTest,
+     HealthyAdmittedSessionNeverQueuesExpiryOrBlocksAdmission) {
+    ClientSessionRegistry registry(10s, 20s);
+    auto record = Register(registry);
+    auto guard = registry.TryAcquireServingSession(kClient);
+    ASSERT_TRUE(guard);
+
+    // Unexpired slots skip admission_gate/operation_mutex completely, so a
+    // healthy busy client never hits kBusyExpiryPassesBeforeWaiting.
+    for (int pass = 0; pass < 5; ++pass) {
+        auto poll = std::async(std::launch::async,
+                               [&] { Poll(registry, kInitial + 5s); });
+        ASSERT_EQ(poll.wait_for(1s), std::future_status::ready);
+        poll.get();
+        EXPECT_EQ(record->state(), State::ACTIVE);
+        auto concurrent = std::async(std::launch::async, [&] {
+            return registry.TryAcquireServingSession(kClient).has_value();
+        });
+        ASSERT_EQ(concurrent.wait_for(1s), std::future_status::ready);
+        EXPECT_TRUE(concurrent.get());
+    }
+
+    // Two overdue skips followed by a heartbeat must reset the busy streak.
+    for (int pass = 0; pass < 2; ++pass) {
+        Poll(registry, kInitial + 10s);
+        ASSERT_EQ(record->state(), State::ACTIVE);
+    }
+    EXPECT_EQ(Ping(registry, kInitial + 11s), ClientStatus::NEED_REMOUNT);
+    Poll(registry, kInitial + 15s);
+    // Single overdue pass after the reset still uses try_lock and skips.
+    auto skipped =
+        std::async(std::launch::async, [&] { Poll(registry, kInitial + 21s); });
+    ASSERT_EQ(skipped.wait_for(1s), std::future_status::ready);
+    skipped.get();
+    EXPECT_EQ(record->state(), State::ACTIVE);
+}
+
 }  // namespace
 }  // namespace mooncake::test

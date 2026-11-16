@@ -2,7 +2,6 @@
 
 #include <boost/functional/hash.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -12,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "client_liveness.h"
 #include "types.h"
@@ -120,10 +120,20 @@ class ClientSessionRegistry {
    private:
     friend class test::ClientSessionRegistryTestPeer;
 
+    using SharedOperation = std::shared_lock<std::shared_mutex>;
+    using ExclusiveOperation = std::unique_lock<std::shared_mutex>;
+
     // A replaceable registry entry, not a permanent per-UUID allocation.
     // Scopes retain the slot so its mutex and liveness outlive their guards.
     struct ClientSlot {
         explicit ClientSlot(Record record) : liveness(std::move(record)) {}
+
+        // Lock order: admission gate -> slot operation. Empty if erased, or
+        // busy when try_lock is requested; validates slot identity only, not
+        // liveness admission.
+        std::optional<SharedOperation> AcquireShared();
+        std::optional<ExclusiveOperation> AcquireExclusive(
+            bool try_lock = false);
 
         const Record liveness;
         // Exclusive acquirers hold this while they queue for operation_mutex,
@@ -134,9 +144,12 @@ class ClientSessionRegistry {
         // Shared by operations, exclusive for registration, removal and
         // expiry.
         std::shared_mutex operation_mutex;
+        // Set under exclusive operation_mutex in EraseSlot; once erased, a
+        // slot never re-enters the registry.
+        bool erased{false};
         // Consecutive expiry passes that found this slot busy. Monitoring
         // reads and writes it while scanning; nothing else touches it.
-        std::atomic<unsigned> busy_expiry_passes{0};
+        unsigned busy_expiry_passes{0};
         // Protected by the registry mutex, not operation_mutex: Ping and host
         // hints must not wait for long registration/resource work.
         bool remount_completed{false};
@@ -144,21 +157,15 @@ class ClientSessionRegistry {
     };
     using Slot = std::shared_ptr<ClientSlot>;
     using Slots = std::unordered_map<UUID, Slot, boost::hash<UUID>>;
-    using SharedOperation = std::shared_lock<std::shared_mutex>;
-    using ExclusiveOperation = std::unique_lock<std::shared_mutex>;
+    using SlotSnapshot = std::vector<std::pair<UUID, Slot>>;
 
     // Lock order: admission gate -> slot operation -> registry -> transition.
     // Never acquire an operation under the registry lock. A record's
-    // transition lock is a leaf. The caller retains slot
-    // until the returned operation is released. Empty means missing/replaced,
-    // or busy when try_lock is requested; these validate slot identity only,
-    // not liveness admission.
-    std::optional<SharedOperation> AcquireSharedOperation(
-        const UUID& client_id, const Slot& slot) const;
-    std::optional<ExclusiveOperation> AcquireExclusiveOperation(
-        const UUID& client_id, const Slot& slot, bool try_lock = false) const;
+    // transition lock is a leaf.
+    std::optional<SessionGuard> TryAcquireSession(const UUID& client_id,
+                                                  bool require_serving) const;
     Slot FindSlot(const UUID& client_id) const;
-    Slots SnapshotSlots() const;
+    SlotSnapshot SnapshotSlots() const;
     std::optional<Registration> Begin(
         const UUID& client_id, RegistrationKind kind,
         std::optional<Clock::time_point> observed_at);
@@ -253,9 +260,11 @@ class ClientSessionRegistry::Registration {
 
    private:
     friend class ClientSessionRegistry;
-    Registration(ClientSessionRegistry& registry, const UUID& client_id,
-                 RegistrationKind kind,
-                 std::optional<Clock::time_point> observed_at);
+    Registration(ClientSessionRegistry& registry,
+                 std::shared_lock<std::shared_mutex> lifecycle_lock,
+                 const UUID& client_id, RegistrationKind kind,
+                 std::optional<Clock::time_point> observed_at, Slot slot,
+                 ExclusiveOperation operation, bool provisional);
 
     ClientSessionRegistry& registry_;
     std::shared_lock<std::shared_mutex> lifecycle_lock_;
@@ -265,7 +274,6 @@ class ClientSessionRegistry::Registration {
     std::optional<std::string> pending_host_id_;
     Slot slot_;
     ExclusiveOperation operation_;
-    bool admitted_{false};
     bool provisional_{false};
     bool committed_{false};
 };
