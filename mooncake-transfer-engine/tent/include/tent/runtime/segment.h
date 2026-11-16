@@ -81,6 +81,8 @@ struct BufferDesc {
     bool internal{false};
     // Local registration policy, deliberately excluded from JSON metadata.
     Permission permission{kGlobalReadWrite};
+    // Local-only ownership token; copies in registry snapshots retain identity.
+    std::shared_ptr<const uint8_t> mnnvl_host_pin;
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,

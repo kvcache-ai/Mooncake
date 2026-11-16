@@ -313,6 +313,16 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+int TransferEngine::completionFd() const { return impl_->completionFd(); }
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
+Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
+    return impl_->drainCompletions(out);
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();
@@ -694,6 +704,25 @@ int TransferEngine::init(const std::string& metadata_conn_string,
             if (!std::getenv("MC_FORCE_TCP")) {
                 LOG(INFO) << "protocol=tcp, forcing TENT memory transfers to "
                              "use TCP";
+            }
+        }
+        if (protocol == "efa") {
+            if (std::getenv("MC_FORCE_TCP")) {
+                mooncake::tent::ConfigHelper::forceTcp(*config);
+                LOG(INFO) << "MC_FORCE_TCP overrides protocol=efa, forcing "
+                             "TENT TCP";
+            } else {
+#ifdef USE_FABRIC
+                mooncake::tent::ConfigHelper::forceFabric(*config, "efa");
+                if (!tent_device_filter_.empty()) {
+                    config->set("transports/fabric/devices",
+                                tent_device_filter_);
+                }
+                LOG(INFO) << "protocol=efa, requiring TENT Fabric EFA";
+#else
+                LOG(ERROR) << "protocol=efa requires a TENT build with Fabric";
+                return ERR_NOT_IMPLEMENTED;
+#endif
             }
         }
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
@@ -1104,6 +1133,30 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+int TransferEngine::completionFd() const {
+    // TENT batches do not use classic BatchDesc, so the eventfd stays off
+    // until that runtime publishes through its own progress path.
+    if (use_tent_) return -1;
+    return impl_->completionFd();
+}
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    if (use_tent_) {
+        return Status::CompletionNotificationUnsupported(
+            "completion notification is not available for the TENT runtime");
+    }
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
+Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
+    if (use_tent_) {
+        out.clear();
+        return Status::CompletionNotificationUnsupported(
+            "completion eventfd is not available for the TENT runtime");
+    }
+    return impl_->drainCompletions(out);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

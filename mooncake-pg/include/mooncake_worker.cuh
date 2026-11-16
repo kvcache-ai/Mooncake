@@ -91,6 +91,10 @@ struct TransferGroupMeta {
     // Highest active InGroupRank plus one.
     std::atomic<int> activeSize{0};
     int taskCount;
+    // Runs of each buffer half so far, counted by the host worker. A half has
+    // two sets of sync flags and a run uses the set of its count's parity. The
+    // counts restart only when a rank is admitted (see applyGroupState).
+    std::atomic<uint32_t> bufferHalfRuns[2]{};
 
     GroupId group_id;
     std::atomic<uint64_t> epoch{0};
