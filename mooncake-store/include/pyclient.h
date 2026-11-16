@@ -451,8 +451,8 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
-    // Put/get sessions. Default stubs keep DummyClient unchanged; RealClient
-    // overrides with the real implementations.
+    // Put/get sessions. RealClient executes transfers; DummyClient forwards
+    // them to its own session state in a shared RealClient process.
     virtual std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) {
         return std::vector<int>(

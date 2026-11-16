@@ -30,6 +30,21 @@
 #endif
 
 namespace {
+std::vector<int> session_results(
+    tl::expected<std::vector<int>, mooncake::ErrorCode> result,
+    size_t expected_size) {
+    if (!result) {
+        return std::vector<int>(expected_size, mooncake::toInt(result.error()));
+    }
+    if (result->size() != expected_size) {
+        LOG(ERROR) << "Dummy session RPC response size mismatch: expected "
+                   << expected_size << ", got " << result->size();
+        return std::vector<int>(expected_size,
+                                mooncake::toInt(mooncake::ErrorCode::RPC_FAIL));
+    }
+    return std::move(*result);
+}
+
 size_t sum_value_sizes(const std::vector<std::span<const char>>& values) {
     size_t total = 0;
     for (const auto& value : values) {
@@ -1845,6 +1860,169 @@ std::vector<int64_t> DummyClient::batch_get_into(
                               total_bytes, elapsed_us_since(start_time), true);
     }
 
+    return results;
+}
+
+std::vector<int> DummyClient::batch_get_session_start(
+    const std::vector<std::string>& keys) {
+    return session_results(
+        invoke_rpc<&RealClient::batch_get_session_start_dummy_helper,
+                   std::vector<int>>(keys, client_id_),
+        keys.size());
+}
+
+int DummyClient::batch_get_session_end(const std::vector<std::string>& keys) {
+    auto result =
+        invoke_rpc<&RealClient::batch_get_session_end_dummy_helper, int>(
+            keys, client_id_);
+    return result ? *result : toInt(result.error());
+}
+
+std::vector<int> DummyClient::batch_put_session_start(
+    const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
+    const ReplicateConfig& config) {
+    if (keys.size() != sizes.size()) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_start_dummy_helper,
+                   std::vector<int>>(keys, sizes, config, client_id_),
+        keys.size());
+}
+
+std::vector<int> DummyClient::batch_put_session_end(
+    const std::vector<std::string>& keys) {
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_end_dummy_helper,
+                   std::vector<int>>(keys, client_id_),
+        keys.size());
+}
+
+std::vector<int> DummyClient::batch_put_session_revoke(
+    const std::vector<std::string>& keys) {
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_revoke_dummy_helper,
+                   std::vector<int>>(keys, client_id_),
+        keys.size());
+}
+
+std::vector<int> DummyClient::batch_get_into_multi_buffer_ranges(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::vector<size_t>>& all_src_offsets) {
+    return transfer_session_ranges(keys, all_buffers, all_sizes,
+                                   all_src_offsets, false);
+}
+
+std::vector<int> DummyClient::batch_put_from_multi_buffer_ranges(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::vector<size_t>>& all_dst_offsets) {
+    return transfer_session_ranges(keys, all_buffers, all_sizes,
+                                   all_dst_offsets, true);
+}
+
+std::vector<int> DummyClient::transfer_session_ranges(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::vector<size_t>>& all_offsets, bool is_write) {
+    std::vector<int> results(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size() ||
+        keys.size() != all_offsets.size()) {
+        return results;
+    }
+
+    std::vector<DummySessionRangeRequest> requests;
+    std::vector<std::vector<PreparedBuffer>> prepared;
+    std::vector<size_t> indices;
+    requests.reserve(keys.size());
+    prepared.reserve(keys.size());
+    indices.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (all_buffers[i].size() != all_sizes[i].size() ||
+            all_buffers[i].size() != all_offsets[i].size()) {
+            continue;
+        }
+        // Validate the full row before copying or allocating any staging.
+        size_t total_size = 0;
+        bool valid = true;
+        for (size_t j = 0; j < all_sizes[i].size(); ++j) {
+            if (all_sizes[i][j] >
+                    static_cast<size_t>(std::numeric_limits<int>::max()) -
+                        total_size ||
+                all_sizes[i][j] >
+                    std::numeric_limits<size_t>::max() - all_offsets[i][j]) {
+                valid = false;
+                break;
+            }
+            total_size += all_sizes[i][j];
+        }
+        if (!valid) continue;
+
+        DummySessionRangeRequest request{keys[i], {}};
+        std::vector<PreparedBuffer> row;
+        row.reserve(all_buffers[i].size());
+        request.buffers.reserve(all_buffers[i].size());
+        for (size_t j = 0; j < all_buffers[i].size(); ++j) {
+            auto buffer = prepare_buffer(all_buffers[i][j], all_sizes[i][j],
+                                         is_write, !is_write);
+            if (!buffer) {
+                valid = false;
+                break;
+            }
+            request.buffers.push_back(DummySessionBuffer{
+                reinterpret_cast<uint64_t>(buffer->dummy),
+                static_cast<uint64_t>(all_sizes[i][j]),
+                static_cast<uint64_t>(all_offsets[i][j]),
+            });
+            row.push_back(std::move(*buffer));
+        }
+        if (!valid) continue;
+        requests.push_back(std::move(request));
+        prepared.push_back(std::move(row));
+        indices.push_back(i);
+    }
+    if (requests.empty()) return results;
+
+    // Staging and its RealClient allocation handles must outlive the complete
+    // synchronous RPC, including all ranged transfers and read copy-back.
+    const auto start_time = std::chrono::steady_clock::now();
+    auto response =
+        is_write
+            ? invoke_rpc<
+                  &RealClient::batch_put_from_multi_buffer_ranges_dummy_helper,
+                  std::vector<int>>(requests, device_id_, client_id_)
+            : invoke_rpc<
+                  &RealClient::batch_get_into_multi_buffer_ranges_dummy_helper,
+                  std::vector<int>>(requests, device_id_, client_id_);
+    auto range_results = session_results(std::move(response), requests.size());
+    for (size_t i = 0; i < indices.size(); ++i) {
+        const size_t result_index = indices[i];
+        results[result_index] = range_results[i];
+        if (range_results[i] < 0) continue;
+        size_t expected_bytes = 0;
+        for (const auto& buffer : prepared[i]) expected_bytes += buffer.size;
+        if (static_cast<size_t>(range_results[i]) != expected_bytes) {
+            results[result_index] = toInt(ErrorCode::INTERNAL_ERROR);
+            continue;
+        }
+        if (!is_write) {
+            for (const auto& buffer : prepared[i]) {
+                if (!copy_from_staging(buffer, buffer.size)) {
+                    results[result_index] = toInt(ErrorCode::INTERNAL_ERROR);
+                    break;
+                }
+            }
+        }
+    }
+    ObserveTransferMetric(
+        is_write ? TransferOperationKind::kWrite : TransferOperationKind::kRead,
+        is_write ? "batch_put_from_multi_buffer_ranges"
+                 : "batch_get_into_multi_buffer_ranges",
+        sum_positive_results(results), elapsed_us_since(start_time), true);
     return results;
 }
 

@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -20,6 +23,21 @@ struct ObjectMeta {
     std::optional<uint64_t> object_checksum;
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
+
+// A range of one Store object using a DummyClient SHM address. External
+// host/device buffers are staged through the existing registered SHM pool.
+struct DummySessionBuffer {
+    uint64_t address = 0;
+    uint64_t size = 0;
+    uint64_t object_offset = 0;
+};
+YLT_REFL(DummySessionBuffer, address, size, object_offset);
+
+struct DummySessionRangeRequest {
+    std::string key;
+    std::vector<DummySessionBuffer> buffers;
+};
+YLT_REFL(DummySessionRangeRequest, key, buffers);
 
 enum class ReplicaActionType {
     ADD = 0,
