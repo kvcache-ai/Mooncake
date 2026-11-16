@@ -135,24 +135,75 @@ TEST(ClientSessionExpiryTest, ExpiryQueuesBehindPersistentlyAdmittedSlots) {
         Poll(registry, kInitial + 10s);
         ASSERT_EQ(record->state(), State::ACTIVE);
     }
-    // After that the scan queues for the slot instead of skipping forever:
-    // otherwise a session admitted without pause -- typically a dead client
-    // that others keep holding as a replication source -- never expires.
-    auto expiry =
+    // Once overdue past the grace passes, the scanner closes this client's
+    // admission turnstile and returns immediately without blocking on guard.
+    auto drain_poll =
         std::async(std::launch::async, [&] { Poll(registry, kInitial + 10s); });
-    EXPECT_EQ(expiry.wait_for(50ms), std::future_status::timeout);
+    ASSERT_EQ(drain_poll.wait_for(1s), std::future_status::ready);
+    drain_poll.get();
     EXPECT_EQ(record->state(), State::ACTIVE);
-    // New admissions wait behind the queued transition, so a steady stream of
+    // New admissions wait behind the closed turnstile, so a steady stream of
     // them cannot keep the slot busy indefinitely.
     auto admitted = std::async(std::launch::async, [&] {
         return registry.TryAcquireRetainingSession(kClient).has_value();
     });
     EXPECT_EQ(admitted.wait_for(50ms), std::future_status::timeout);
     guard.reset();
-    ASSERT_EQ(expiry.wait_for(5s), std::future_status::ready);
-    expiry.get();
+    Poll(registry, kInitial + 10s);
     EXPECT_EQ(record->state(), State::SUSPECTED);
+    ASSERT_EQ(admitted.wait_for(1s), std::future_status::ready);
     EXPECT_TRUE(admitted.get());
+}
+
+TEST(ClientSessionExpiryTest,
+     BusySlotDoesNotStallOtherClientExpiryOrRestoreAndHeartbeatCancelsDrain) {
+    ClientSessionRegistry registry(10s, 20s);
+    auto busy_record = Register(registry, kClient);
+    const UUID other{3, 4};
+    auto other_record = Register(registry, other);
+
+    auto guard = registry.TryAcquireServingSession(kClient);
+    ASSERT_TRUE(guard);
+
+    // Client A stays persistently busy for 5 overdue passes and enters drain
+    // mode, yet every scan returns without blocking and Client B still suspects
+    // and expires independently.
+    for (int pass = 0; pass < 5; ++pass) {
+        auto poll = std::async(std::launch::async,
+                               [&] { Poll(registry, kInitial + 10s); });
+        ASSERT_EQ(poll.wait_for(1s), std::future_status::ready);
+        poll.get();
+        EXPECT_EQ(busy_record->state(), State::ACTIVE);
+    }
+    EXPECT_EQ(other_record->state(), State::SUSPECTED);
+
+    auto offline_poll =
+        std::async(std::launch::async, [&] { Poll(registry, kInitial + 30s); });
+    ASSERT_EQ(offline_poll.wait_for(1s), std::future_status::ready);
+    offline_poll.get();
+    EXPECT_EQ(busy_record->state(), State::ACTIVE);
+    EXPECT_EQ(other_record->state(), State::OFFLINE);
+
+    // BeginRestore must not be stalled behind a busy draining slot.
+    auto restored = std::async(std::launch::async, [&] {
+        auto restore = registry.BeginRestore();
+        restore.Commit();
+    });
+    ASSERT_EQ(restored.wait_for(1s), std::future_status::ready);
+    restored.get();
+
+    // New admissions on Client A are parked behind the closed drain gate until
+    // a heartbeat cancels the drain — even before guard releases.
+    auto waiting_admission = std::async(std::launch::async, [&] {
+        return registry.TryAcquireServingSession(kClient).has_value();
+    });
+    EXPECT_EQ(waiting_admission.wait_for(50ms), std::future_status::timeout);
+
+    EXPECT_EQ(Ping(registry, kInitial + 31s), ClientStatus::NEED_REMOUNT);
+    ASSERT_EQ(waiting_admission.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(waiting_admission.get());
+
+    guard.reset();
 }
 
 TEST(ClientSessionExpiryTest, RestoreDefersExpiryWithoutHoldingRegistry) {

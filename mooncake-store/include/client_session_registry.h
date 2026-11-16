@@ -2,7 +2,9 @@
 
 #include <boost/functional/hash.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -114,10 +116,10 @@ class ClientSessionRegistry {
     void Reset();
 
     // Driven by one monitor thread. One deterministic expiry pass applies TTLs
-    // to expired sessions while excluding operations; a busy slot is retried
-    // and eventually waited for so continuous admission cannot starve expiry.
-    // Skipped while restore/reset holds lifecycle_mutex_; retirement callbacks
-    // run after releasing the slot operation lock.
+    // to expired sessions while excluding operations; a persistently busy slot
+    // closes its admission turnstile and defers evaluation without blocking the
+    // scanner thread. Skipped while restore/reset holds lifecycle_mutex_;
+    // retirement callbacks run after releasing the slot operation lock.
     void ExpireSessions(Clock::time_point now);
 
    private:
@@ -125,9 +127,10 @@ class ClientSessionRegistry {
 
     // A std::shared_mutex may prefer readers (the default on glibc), which
     // would let overlapping operations postpone a state transition forever.
-    // Exclusive acquirers hold gate_ while queuing for mutex_, and shared
-    // acquirers pass through gate_ first so queued transitions drain in-flight
-    // operations in bounded time.
+    // Exclusive acquirers increment waiting_writers_ while queuing for mutex_,
+    // and overdue expiry scans close the turnstile via expiry_draining_ without
+    // blocking the shared scanner thread so in-flight operations drain in
+    // bounded time.
     class TurnstileSharedMutex {
        public:
         TurnstileSharedMutex() = default;
@@ -135,29 +138,84 @@ class ClientSessionRegistry {
         TurnstileSharedMutex& operator=(const TurnstileSharedMutex&) = delete;
 
         void lock() {
-            const std::lock_guard<std::mutex> gate(gate_);
+            {
+                const std::lock_guard<std::mutex> gate(gate_mutex_);
+                ++waiting_writers_;
+            }
             mutex_.lock();
+            {
+                const std::lock_guard<std::mutex> gate(gate_mutex_);
+                if (--waiting_writers_ == 0 && !expiry_draining_) {
+                    gate_cv_.notify_all();
+                }
+            }
         }
         bool try_lock() {
-            std::unique_lock<std::mutex> gate(gate_, std::try_to_lock);
-            return gate.owns_lock() && mutex_.try_lock();
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            if (closed_ || waiting_writers_ > 0 || !mutex_.try_lock()) {
+                return false;
+            }
+            if (expiry_draining_) {
+                expiry_draining_ = false;
+                gate_cv_.notify_all();
+            }
+            return true;
+        }
+        bool try_lock_or_drain() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            if (closed_) {
+                return false;
+            }
+            if (waiting_writers_ == 0 && mutex_.try_lock()) {
+                if (expiry_draining_) {
+                    expiry_draining_ = false;
+                    gate_cv_.notify_all();
+                }
+                return true;
+            }
+            expiry_draining_ = true;
+            return false;
+        }
+        void cancel_drain() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            if (expiry_draining_) {
+                expiry_draining_ = false;
+                if (waiting_writers_ == 0) {
+                    gate_cv_.notify_all();
+                }
+            }
+        }
+        void close_permanently() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            closed_ = true;
+            expiry_draining_ = false;
+            gate_cv_.notify_all();
         }
         void unlock() { mutex_.unlock(); }
 
         void lock_shared() {
             {
-                const std::lock_guard<std::mutex> gate(gate_);
+                std::unique_lock<std::mutex> gate(gate_mutex_);
+                gate_cv_.wait(gate, [this] {
+                    return closed_ ||
+                           (waiting_writers_ == 0 && !expiry_draining_);
+                });
             }
             mutex_.lock_shared();
         }
         bool try_lock_shared() {
-            std::unique_lock<std::mutex> gate(gate_, std::try_to_lock);
-            return gate.owns_lock() && mutex_.try_lock_shared();
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            return !closed_ && waiting_writers_ == 0 && !expiry_draining_ &&
+                   mutex_.try_lock_shared();
         }
         void unlock_shared() { mutex_.unlock_shared(); }
 
        private:
-        std::mutex gate_;
+        std::mutex gate_mutex_;
+        std::condition_variable gate_cv_;
+        size_t waiting_writers_{0};
+        bool expiry_draining_{false};
+        bool closed_{false};
         std::shared_mutex mutex_;
     };
 
@@ -174,6 +232,9 @@ class ClientSessionRegistry {
         std::optional<SharedOperation> AcquireShared();
         std::optional<ExclusiveOperation> AcquireExclusive(
             bool try_lock = false);
+        std::optional<ExclusiveOperation> AcquireExclusiveForExpiry(
+            bool drain_if_busy);
+        void CancelExpiryDrain();
 
         const Record liveness;
         // Shared by operations; exclusive for registration, removal and expiry.
@@ -181,9 +242,9 @@ class ClientSessionRegistry {
         // Set under exclusive operation_mutex in EraseSlot; once erased, a
         // slot never re-enters the registry.
         bool erased{false};
-        // Consecutive expiry passes that found this slot busy. Monitoring
-        // reads and writes it while scanning; nothing else touches it.
-        unsigned busy_expiry_passes{0};
+        // Consecutive expiry passes that found this slot busy while expired.
+        // Reset on expiry evaluation or liveness observation.
+        std::atomic<unsigned> busy_expiry_passes{0};
         // Protected by the registry mutex, not operation_mutex: Ping and host
         // hints must not wait for long registration/resource work.
         bool remount_completed{false};

@@ -9,11 +9,8 @@
 namespace mooncake {
 namespace {
 
-// Passes a busy slot may be skipped before the scan queues for it instead.
+// Passes a busy slot may be skipped before expiry closes its admission gate.
 constexpr unsigned kBusyExpiryPassesBeforeWaiting = 3;
-// Slots that may be waited for in one pass, so a single long operation cannot
-// stall the rest of the scan.
-constexpr int kMaxWaitingExpiryAcquisitionsPerPass = 4;
 
 }  // namespace
 
@@ -112,6 +109,22 @@ ClientSessionRegistry::ClientSlot::AcquireExclusive(bool try_lock) {
     }
     if (erased) return std::nullopt;
     return operation;
+}
+
+std::optional<ClientSessionRegistry::ExclusiveOperation>
+ClientSessionRegistry::ClientSlot::AcquireExclusiveForExpiry(
+    bool drain_if_busy) {
+    const bool locked = drain_if_busy ? operation_mutex.try_lock_or_drain()
+                                      : operation_mutex.try_lock();
+    if (!locked) return std::nullopt;
+    ExclusiveOperation operation(operation_mutex, std::adopt_lock);
+    if (erased) return std::nullopt;
+    return operation;
+}
+
+void ClientSessionRegistry::ClientSlot::CancelExpiryDrain() {
+    busy_expiry_passes.store(0, std::memory_order_relaxed);
+    operation_mutex.cancel_drain();
 }
 
 std::optional<ClientSessionRegistry::SessionGuard>
@@ -311,10 +324,12 @@ bool ClientSessionRegistry::ObserveSlot(const UUID& client_id, const Slot& slot,
         case ClientLivenessObservation::REJECTED_OFFLINE:
             return false;
         case ClientLivenessObservation::RECOVERED_ACTIVE:
+            slot->CancelExpiryDrain();
             PublishTransition(client_id, slot, ClientLivenessState::SUSPECTED,
                               ClientLivenessState::ACTIVE);
             return true;
         case ClientLivenessObservation::REFRESHED_ACTIVE:
+            slot->CancelExpiryDrain();
             return true;
     }
     return false;
@@ -386,6 +401,7 @@ void ClientSessionRegistry::EraseSlot(const UUID& client_id, const Slot& slot,
                                       const ExclusiveOperation& operation) {
     CHECK(operation.owns_lock() && operation.mutex() == &slot->operation_mutex);
     slot->erased = true;
+    slot->operation_mutex.close_permanently();
     // The operation excludes other removers, expiry and registration, and the
     // registry lock excludes Ping, so the state read here is the one the
     // gauges last counted. Waiters cannot enter this slot once erased is set.
@@ -416,25 +432,28 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
     if (!lifecycle_lock.owns_lock()) {
         return;
     }
-    int waits_left = kMaxWaitingExpiryAcquisitionsPerPass;
     for (const auto& [client_id, slot] : SnapshotSlots()) {
         if (!slot->liveness->IsExpiredAt(now, active_ttl_, suspicion_ttl_)) {
-            slot->busy_expiry_passes = 0;
+            slot->CancelExpiryDrain();
             continue;
         }
         // A continuously admitted session would otherwise postpone its own
-        // expiry forever. That matters most when the admissions come from
-        // other clients holding it as a replication source, so after a few
-        // skipped passes queue behind the operations in flight instead.
-        const bool wait = waits_left > 0 && slot->busy_expiry_passes >=
-                                                kBusyExpiryPassesBeforeWaiting;
-        auto operation = slot->AcquireExclusive(/*try_lock=*/!wait);
-        if (wait) --waits_left;
+        // expiry forever. After a few skipped passes, close its turnstile so
+        // new admissions wait and the current operations drain before the next
+        // pass evaluates expiry without blocking unrelated clients.
+        const bool drain =
+            slot->busy_expiry_passes.load(std::memory_order_relaxed) >=
+            kBusyExpiryPassesBeforeWaiting;
+        auto operation = slot->AcquireExclusiveForExpiry(drain);
         if (!operation) {
-            ++slot->busy_expiry_passes;
+            slot->busy_expiry_passes.fetch_add(1, std::memory_order_relaxed);
+            if (drain && !slot->liveness->IsExpiredAt(now, active_ttl_,
+                                                      suspicion_ttl_)) {
+                slot->CancelExpiryDrain();
+            }
             continue;
         }
-        slot->busy_expiry_passes = 0;
+        slot->busy_expiry_passes.store(0, std::memory_order_relaxed);
         switch (
             slot->liveness->Evaluate(now, active_ttl_, suspicion_ttl_, [this] {
                 if (reserve_retirement_) reserve_retirement_();
