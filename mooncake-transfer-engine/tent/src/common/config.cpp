@@ -164,10 +164,23 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
 
 void ConfigHelper::forceTcp(Config& config) {
     config.set("transports/force_tcp", true);
+    config.set("transports/force_fabric", false);
     config.set("transports/tcp/enable", true);
     config.set("transports/rdma/enable", false);
     config.set("transports/hp_tcp/enable", false);
     config.set("transports/fabric/enable", false);
+}
+
+void ConfigHelper::forceFabric(Config& config, const std::string& provider) {
+    // Memory routing is pinned separately; leave file/platform paths available.
+    config.set("transports/force_tcp", false);
+    config.set("transports/force_fabric", true);
+    config.set("transports/tcp/enable", false);
+    config.set("transports/rdma/enable", false);
+    config.set("transports/hp_tcp/enable", false);
+    config.set("transports/shm/enable", false);
+    config.set("transports/fabric/enable", true);
+    config.set("transports/fabric/provider", provider);
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {

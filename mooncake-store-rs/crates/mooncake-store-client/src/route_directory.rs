@@ -2,24 +2,30 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, ObjectKey,
-    ObjectRoute, Result, RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, ObjectKey, ObjectRoute, Result,
+    RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
 };
 use mooncake_store_route::{
-    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityService, RouteMembershipProvider,
-    RouteMetricsSink, RouteOwnerPage,
+    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityRecord, RouteAuthorityService,
+    RouteMembershipProvider, RouteMetricsSink, RouteOwnerPage,
 };
 
 use crate::client::{
-    cached_live_client_snapshot, refresh_live_client_cache, SharedLiveClientCache,
-    SharedSuspectRuntimeCache,
+    cached_live_client_snapshot, cached_retained_live_client_snapshot, refresh_live_client_cache,
+    SharedLiveClientCache, SharedSuspectRuntimeCache,
 };
 use crate::control_plane::ControlPlaneClient;
 use crate::observability::{registry, OperationTracker};
 
+pub(crate) struct RouteDirectoryBuildConfig {
+    pub(crate) mode: RouteControlMode,
+    pub(crate) route_topk: usize,
+    pub(crate) delete_marker_budget_bytes: usize,
+}
+
 pub(crate) fn build_route_directory(
-    mode: RouteControlMode,
-    route_topk: usize,
+    config: RouteDirectoryBuildConfig,
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
     control_plane: Arc<ControlPlaneClient>,
@@ -33,8 +39,9 @@ pub(crate) fn build_route_directory(
         suspect_runtime_cache,
     });
     mooncake_store_route::build_route_directory(
-        mode,
-        route_topk,
+        config.mode,
+        config.route_topk,
+        config.delete_marker_budget_bytes,
         metadata,
         lease,
         control_plane,
@@ -58,12 +65,38 @@ pub(crate) fn authority_get(
     LocalRouteAuthority::new(namespace, authority.clone()).get_route(key)
 }
 
-pub(crate) fn authority_get_many(
+pub(crate) fn authority_get_record(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+) -> Result<RouteAuthorityRecord> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_route_record(key)
+}
+
+pub(crate) fn authority_get_records(
     namespace: &str,
     authority: &ClientStableId,
     keys: &[ObjectKey],
-) -> Result<Vec<Option<ObjectRoute>>> {
-    LocalRouteAuthority::new(namespace, authority.clone()).get_routes(keys)
+) -> Result<Vec<RouteAuthorityRecord>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_route_records(keys)
+}
+
+pub(crate) fn authority_get_allocation_route_references(
+    namespace: &str,
+    authority: &ClientStableId,
+    identities: &[AllocationRouteIdentity],
+) -> Result<Vec<AllocationRouteReferenceState>> {
+    LocalRouteAuthority::new(namespace, authority.clone())
+        .get_allocation_route_references(identities)
+}
+
+pub(crate) fn authority_get_allocation_route_reference_keys(
+    namespace: &str,
+    authority: &ClientStableId,
+    identities: &[AllocationRouteIdentity],
+) -> Result<Vec<AllocationRouteReference>> {
+    LocalRouteAuthority::new(namespace, authority.clone())
+        .get_allocation_route_reference_keys(identities)
 }
 
 pub(crate) fn authority_contains_many(
@@ -87,10 +120,15 @@ pub(crate) fn authority_list_routes_by_replica_owner_page(
     authority: &ClientStableId,
     owner: &ClientRuntimeId,
     cursor: Option<&str>,
+    snapshot_epoch: Option<u64>,
     limit: usize,
 ) -> Result<RouteOwnerPage> {
-    LocalRouteAuthority::new(namespace, authority.clone())
-        .list_routes_by_replica_owner_page(owner, cursor, limit)
+    LocalRouteAuthority::new(namespace, authority.clone()).list_routes_by_replica_owner_page(
+        owner,
+        cursor,
+        snapshot_epoch,
+        limit,
+    )
 }
 
 pub(crate) fn authority_compare_and_swap(
@@ -157,6 +195,10 @@ impl RouteMembershipProvider for ClientRouteMembership {
             .reconcile_with_leases(leases);
     }
 
+    fn retained_live_clients(&self, _operation: &'static str) -> Result<Vec<ClientLease>> {
+        cached_retained_live_client_snapshot(&self.live_client_cache)
+    }
+
     fn is_suspect(&self, runtime: &ClientRuntimeId) -> bool {
         self.suspect_runtime_cache.lock().contains(runtime)
     }
@@ -191,5 +233,13 @@ impl RouteMetricsSink for ClientRouteMetricsSink {
 
     fn remove_route(&self, key: &ObjectKey) {
         registry::remove_route(key);
+    }
+
+    fn record_delete_marker_state(&self, entries: u64, bytes: u64, budget_bytes: u64) {
+        registry::record_delete_marker_state(entries, bytes, budget_bytes);
+    }
+
+    fn record_delete_marker_event(&self, event: &'static str, count: u64) {
+        registry::record_delete_marker_event(event, count);
     }
 }
