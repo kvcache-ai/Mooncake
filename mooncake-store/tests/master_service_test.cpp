@@ -2251,6 +2251,58 @@ TEST_F(MasterServiceTest,
 }
 
 TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitNamesAcrossManyAppends) {
+    for (bool use_hint : {false, true}) {
+        for (size_t prefix_length : {0U, 96U}) {
+            SCOPED_TRACE(use_hint);
+            SCOPED_TRACE(prefix_length);
+            MasterServiceConfig config;
+            config.memory_allocator = BufferAllocatorType::OFFSET;
+            config.allocation_strategy_type =
+                use_hint ? AllocationStrategyType::RANDOM
+                         : AllocationStrategyType::LOCAL_FIRST;
+            MasterService service(config);
+            auto recorder = std::make_shared<PreferredSequenceRecorder>();
+            MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+            const UUID owner{1, 1};
+            const std::string prefix(prefix_length, 'x');
+            const std::string explicit_name = prefix + "preferred";
+            std::vector<std::string> expected{explicit_name};
+            size_t index = 0;
+            auto mount = [&](const std::string& name, const std::string& host) {
+                auto segment = MakeSegment(
+                    name, kDefaultSegmentBase + index++ * 65536, 65536);
+                segment.host_id = host;
+                return service.MountSegment(segment, owner);
+            };
+            for (size_t i = 0; i < 64; ++i) {
+                const auto name = prefix + "s" + std::to_string(i);
+                ASSERT_TRUE(mount(name, "host-" + std::to_string(100 + i)));
+                expected.push_back(name);
+            }
+            // These duplicates arrive after enough appends to relocate an
+            // unreserved vector. Short explicit names exercise SSO storage;
+            // the automatic duplicate has equal content in another string.
+            ASSERT_TRUE(mount(explicit_name, "host-z"));
+            ASSERT_TRUE(mount(expected[1], "host-zz"));
+            ReplicateConfig incoming;
+            incoming.host_id = "host-100";
+            incoming.prefer_alloc_in_same_node = use_hint;
+            incoming.preferred_segments = {"", explicit_name, explicit_name,
+                                           ""};
+            for (size_t request = 0; request < 2; ++request) {
+                const auto key = "many-appends-" + std::to_string(request);
+                ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(),
+                                             4096, incoming));
+                EXPECT_EQ(recorder->names, expected);
+                ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                              ReplicaType::MEMORY));
+            }
+        }
+    }
+}
+
+TEST_F(MasterServiceTest,
        LocalFirstMergePreservesUnknownHostAndUnavailableSegmentFallback) {
     MasterServiceConfig config;
     config.memory_allocator = BufferAllocatorType::OFFSET;
