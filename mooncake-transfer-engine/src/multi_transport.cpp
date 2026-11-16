@@ -1209,7 +1209,7 @@ void* MultiTransport::getBaseAddr() {
     return 0;
 }
 
-}  // namespace mooncake
+
 
 void MultiTransport::trackLiveBatch(BatchID batch_id) {
     std::lock_guard<std::mutex> guard(live_batches_mutex_);
@@ -1285,3 +1285,5 @@ Status MultiTransport::waitMemoryIdle(void* addr, size_t length,
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
+
+}  // namespace mooncake
