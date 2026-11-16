@@ -195,8 +195,6 @@ class AscendDirectTransport : public Transport {
 
     std::vector<std::unique_ptr<HixlEngine>> engines_;
     std::vector<int32_t> engine_physical_ids_;
-    mutable std::once_flag acl_inventory_once_;
-    mutable std::vector<uint32_t> acl_physical_ids_;
     std::vector<std::unique_ptr<LocalCopyEngine>> local_copies_;
     // Indexed like engines_: workers that hand remote groups to HIXL, and the
     // workers a local copy spreads its streams over.

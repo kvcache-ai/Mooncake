@@ -77,6 +77,45 @@ void BumpRange(std::vector<BufferDesc>& buffers,
         buffers[index].ref_count = logical + 1;
     }
 }
+
+void PruneRemovedTransportAttrs(
+    const std::vector<TransportType>& original_transports,
+    const BufferDesc& original_front, const BufferDesc& updated,
+    BufferDesc& target) {
+    auto has_transport = [](const std::vector<TransportType>& transports,
+                            TransportType type) {
+        return std::find(transports.begin(), transports.end(), type) !=
+               transports.end();
+    };
+    for (auto it = target.transport_attrs.begin();
+         it != target.transport_attrs.end();) {
+        const TransportType type = it->first;
+        const bool removed_from_transports =
+            has_transport(original_transports, type) &&
+            !has_transport(updated.transports, type);
+        const bool removed_from_attrs =
+            original_front.transport_attrs.find(type) !=
+                original_front.transport_attrs.end() &&
+            updated.transport_attrs.find(type) == updated.transport_attrs.end();
+        if (removed_from_transports || removed_from_attrs) {
+            it = target.transport_attrs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ApplyCleanupProgress(const BufferDesc& original_front,
+                          const BufferDesc& updated, BufferDesc& target) {
+    PruneRemovedTransportAttrs(target.transports, original_front, updated,
+                               target);
+    target.transports = updated.transports;
+    target.regions = updated.regions;
+    target.rkey = updated.rkey;
+    target.lkey = updated.lkey;
+    target.shm_path = updated.shm_path;
+    target.mnnvl_handle = updated.mnnvl_handle;
+}
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
@@ -244,11 +283,16 @@ Status SegmentTracker::remove(uint64_t base, size_t length,
     if (!removed) return Status::OK();
     auto status = callback(removed_desc);
     if (!status.ok()) {
-        // Successful transport removals may have scrubbed their keys. Keep
-        // the remaining registrations and one reference for a safe retry.
-        if (removed_group.size() == 1) {
-            removed_group.front() = std::move(removed_desc);
+        // Successful transport removals may have scrubbed their keys. Preserve
+        // that progress across every alias in the range for a safe retry.
+        for (size_t i = 1; i < removed_group.size(); ++i) {
+            ApplyCleanupProgress(removed_group.front(), removed_desc,
+                                 removed_group[i]);
         }
+        PruneRemovedTransportAttrs(removed_group.front().transports,
+                                   removed_group.front(), removed_desc,
+                                   removed_desc);
+        removed_group.front() = std::move(removed_desc);
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) {
             auto& buffers = std::get<MemorySegmentDesc>(desc.detail).buffers;
             for (auto& buffer : removed_group) {

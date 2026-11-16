@@ -443,6 +443,7 @@ class AscendDirectTransportTest : public ::testing::Test {
         }
         HixlEngine::SetVendorFactory(nullptr);
         ClearAscendEnv();
+        ResetAcl();
     }
 
     Status Install(std::shared_ptr<Config> conf = nullptr) {
@@ -1815,8 +1816,8 @@ TEST_F(AscendDirectTransportTest, SingleSegmentRoutesLikeClassic) {
     const uint64_t dest = 0x60000;
     const std::map<uint32_t, std::vector<uint32_t>> expected = {
         {8, {7, 6, 5, 4, 3, 2, 1, 0}},
-        {4, {3, 3, 2, 2, 1, 1, 0, 0}},
-        {2, {1, 1, 1, 1, 0, 0, 0, 0}},
+        {4, {3, 2, 1, 0, 3, 2, 1, 0}},
+        {2, {1, 0, 1, 0, 1, 0, 1, 0}},
         {1, {0, 0, 0, 0, 0, 0, 0, 0}}};
     for (const auto& [servers, indices] : expected) {
         for (uint32_t rank = 0; rank < 8; ++rank) {
@@ -1882,7 +1883,73 @@ TEST_F(AscendDirectTransportTest, SingleSegmentRoutesLikeClassic) {
     }
 }
 
-TEST_F(AscendDirectTransportTest, SingleSegmentUsesSparseAclRank) {
+TEST_F(AscendDirectTransportTest,
+       SingleSegmentIsolatedVisibilityDistributesAcrossServers) {
+    const uint64_t dest = 0x61000;
+    for (uint32_t servers : {8u, 4u, 2u, 1u}) {
+        std::vector<int> hits(servers, 0);
+        for (uint32_t phy = 0; phy < 8; ++phy) {
+            SCOPED_TRACE(::testing::Message()
+                         << "servers=" << servers << " phy=" << phy);
+            if (transport_) {
+                (void)transport_->uninstall();
+            }
+            transport_ = std::make_unique<AscendDirectTransport>();
+            g_device_count = 1;
+            g_device_id = 0;
+            g_physical_by_logic = {{0, static_cast<int32_t>(phy)}};
+            ASSERT_TRUE(Install().ok());
+            std::vector<std::string> names;
+            for (uint32_t i = 0; i < servers; ++i) {
+                names.push_back("remote-" + std::to_string(i));
+            }
+            ASSERT_TRUE(metadata_->segmentManager()
+                            .updateLocal([&](SegmentDesc& segment) {
+                                auto& mem =
+                                    std::get<MemorySegmentDesc>(segment.detail);
+                                std::string published = "[";
+                                for (size_t i = 0; i < names.size(); ++i) {
+                                    if (i != 0) published += ",";
+                                    published += "\"" + names[i] + "\"";
+                                }
+                                published += "]";
+                                mem.device_attrs[kHixlNamesAttr] = published;
+                                mem.buffers.clear();
+                                for (uint32_t i = 0; i < servers; ++i) {
+                                    BufferDesc buffer{};
+                                    buffer.addr = dest;
+                                    buffer.length = 8192;
+                                    buffer.location = "*";
+                                    buffer.transport_attrs[AscendDirect] =
+                                        std::to_string(i);
+                                    mem.buffers.push_back(buffer);
+                                }
+                                return Status::OK();
+                            })
+                            .ok());
+            const uint32_t selected = servers - 1 - (phy % servers);
+            ++hits[selected];
+            ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+            char src[16]{};
+            ASSERT_TRUE(transport_
+                            ->submitTransferTasks(
+                                batch_, {MakeRemoteWrite(src, 16, dest)})
+                            .ok());
+            WaitUntilTerminal(*transport_, batch_, 0);
+            TransferStatus status{};
+            ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+            ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+            EXPECT_EQ(state_->last_remote, names[selected]);
+            ASSERT_TRUE(transport_->freeSubBatch(batch_).ok());
+            batch_ = nullptr;
+        }
+        for (int count : hits) {
+            EXPECT_EQ(count, static_cast<int>(8 / servers));
+        }
+    }
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentUsesSparsePhysicalModulo) {
     g_device_count = 4;
     g_physical_by_logic = {{0, 4}, {1, 6}, {2, 9}, {3, 11}};
     g_device_id = 1;
@@ -1914,7 +1981,7 @@ TEST_F(AscendDirectTransportTest, SingleSegmentUsesSparseAclRank) {
     TransferStatus status{};
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    // Physical 6 is rank 1 of [4,6,9,11], so two candidates select index 1.
+    // Physical 6 with 2 candidates selects 2 - 1 - (6 % 2) = 1.
     EXPECT_EQ(state_->last_remote, "phy-7");
 }
 

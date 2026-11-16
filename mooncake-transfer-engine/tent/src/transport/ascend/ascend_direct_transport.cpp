@@ -597,12 +597,8 @@ std::string AscendDirectTransport::selectRemoteHixl(
     if (indices.size() == 1) {
         return resolver.NameAt(indices.front());
     }
-    std::call_once(acl_inventory_once_, [this] {
-        acl_physical_ids_ = mooncake::GetAscendPhysicalDeviceIds();
-    });
-    if (acl_physical_ids_.empty() ||
-        local_engine_idx >= engine_physical_ids_.size()) {
-        LOG(ERROR) << "ACL device set is unavailable for a multi-engine route";
+    if (local_engine_idx >= engine_physical_ids_.size()) {
+        LOG(ERROR) << "Physical device id unavailable for multi-engine route";
         return {};
     }
     const int32_t physical_id = engine_physical_ids_[local_engine_idx];
@@ -610,27 +606,16 @@ std::string AscendDirectTransport::selectRemoteHixl(
         LOG(ERROR) << "Physical device id unavailable for multi-engine route";
         return {};
     }
-    const auto it =
-        std::lower_bound(acl_physical_ids_.begin(), acl_physical_ids_.end(),
-                         static_cast<uint32_t>(physical_id));
-    if (it == acl_physical_ids_.end() ||
-        *it != static_cast<uint32_t>(physical_id)) {
-        LOG(ERROR) << "Cannot find client physical device " << physical_id
-                   << " in the ACL device set for multi-engine route";
-        return {};
-    }
-    const auto index = mooncake::ReverseDeviceIndex(
-        static_cast<uint32_t>(it - acl_physical_ids_.begin()),
-        static_cast<uint32_t>(acl_physical_ids_.size()),
-        static_cast<uint32_t>(indices.size()));
+    const auto index =
+        mooncake::ReverseDeviceIndex(static_cast<uint32_t>(physical_id),
+                                     static_cast<uint32_t>(indices.size()));
     if (!index || *index >= indices.size()) {
         return {};
     }
     const std::string& remote = resolver.NameAt(indices[*index]);
     VLOG(1) << "ACL single-segment route physical=" << physical_id
-            << " rank=" << (it - acl_physical_ids_.begin())
-            << " C=" << acl_physical_ids_.size() << " S=" << indices.size()
-            << " index=" << *index << " endpoint=" << remote;
+            << " S=" << indices.size() << " index=" << *index
+            << " endpoint=" << remote;
     return remote;
 }
 

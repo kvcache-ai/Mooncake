@@ -62,7 +62,6 @@ constexpr int kTransferStatusMaxRetries = 1000;
 static thread_local int g_device_id = 0;
 static int g_device_count = 1;
 static std::map<int32_t, int32_t> g_physical_device_ids;
-static aclError g_device_count_status = ACL_ERROR_NONE;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
 static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
@@ -141,7 +140,6 @@ void reset() {
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
     g_physical_device_ids.clear();
-    g_device_count_status = ACL_ERROR_NONE;
     g_context = ContextForDevice(0);
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
@@ -306,10 +304,6 @@ int stream_overlap_count() {
 extern "C" {
 
 aclError aclrtGetDeviceCount(uint32_t* count) {
-    if (g_device_count_status != ACL_ERROR_NONE) {
-        *count = 0;
-        return g_device_count_status;
-    }
     *count = static_cast<uint32_t>(g_device_count);
     return ACL_ERROR_NONE;
 }
@@ -2028,6 +2022,38 @@ TEST_F(AscendDirectTransportTest, SingleSegment_PartialRegisterRollsBack) {
 }
 
 TEST_F(AscendDirectTransportTest,
+       SingleSegment_RollbackFailureRetainsHandlesForDeregister) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    g_register_mem_results = {adxl::SUCCESS, adxl::SUCCESS, adxl::FAILED};
+    g_deregister_mem_results = {adxl::FAILED, adxl::SUCCESS};
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 3);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 2);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+
+    // Later cleanup must still find and retry the handle that failed rollback.
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 3);
+    const auto registered = adxl_mock::get_registered_mem_handles();
+    const auto deregistered = adxl_mock::get_deregistered_mem_handles();
+    ASSERT_EQ(registered.size(), 2u);
+    ASSERT_EQ(deregistered.size(), 3u);
+    EXPECT_EQ(deregistered.back(), registered.front());
+
+    // Once cleaned up, another unregister is a no-op.
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 3);
+}
+
+TEST_F(AscendDirectTransportTest,
        SingleSegment_DeregisterRetriesFailedHandleOnly) {
     globalConfig().ascend_agent_mode = true;
     globalConfig().ascend_standalone_single_segment = true;
@@ -2050,31 +2076,26 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(deregistered.back(), deregistered[1]);
 }
 
-TEST(AscendDeviceMappingTest, ReversesAndBalancesClientGroups) {
+TEST(AscendDeviceMappingTest, ReversesAndBalancesByPhysicalModulo) {
     const std::vector<std::vector<uint32_t>> expected = {
         {7, 6, 5, 4, 3, 2, 1, 0},
-        {3, 3, 2, 2, 1, 1, 0, 0},
-        {1, 1, 1, 1, 0, 0, 0, 0},
+        {3, 2, 1, 0, 3, 2, 1, 0},
+        {1, 0, 1, 0, 1, 0, 1, 0},
         {0, 0, 0, 0, 0, 0, 0, 0},
     };
     for (size_t row = 0; row < expected.size(); ++row) {
         const uint32_t servers = 8 >> row;
-        for (uint32_t client = 0; client < 8; ++client) {
-            EXPECT_EQ(ReverseDeviceIndex(client, 8, servers),
-                      expected[row][client]);
+        for (uint32_t physical_id = 0; physical_id < 8; ++physical_id) {
+            EXPECT_EQ(ReverseDeviceIndex(physical_id, servers),
+                      expected[row][physical_id]);
         }
     }
-    const std::vector<uint32_t> uneven = {1, 1, 1, 0, 0};
-    for (uint32_t client = 0; client < uneven.size(); ++client) {
-        EXPECT_EQ(ReverseDeviceIndex(client, 5, 2), uneven[client]);
-    }
-    EXPECT_FALSE(ReverseDeviceIndex(0, 0, 4));
-    EXPECT_FALSE(ReverseDeviceIndex(0, 8, 0));
-    EXPECT_FALSE(ReverseDeviceIndex(8, 8, 4));
+    EXPECT_EQ(ReverseDeviceIndex(6, 2), 1u);
+    EXPECT_EQ(ReverseDeviceIndex(9, 2), 0u);
+    EXPECT_FALSE(ReverseDeviceIndex(0, 0));
 }
 
 TEST_F(AscendDirectTransportTest, SingleSegment_ClientRoutesByPhysicalDevice) {
-    // C is the ACL-visible set. No client switch or new metadata field.
     const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
     for (uint32_t host_devices : {8, 16}) {
         mock_acl::set_device_count(static_cast<int>(host_devices));
@@ -2124,9 +2145,8 @@ TEST_F(AscendDirectTransportTest, SingleSegment_ClientRoutesByPhysicalDevice) {
                     auto published = desc;
                     transport->meta()->addLocalSegment(1, desc->name,
                                                        std::move(published));
-                    const size_t selected =
-                        server_ids.size() - 1 -
-                        physical_id * server_ids.size() / host_devices;
+                    const size_t selected = server_ids.size() - 1 -
+                                            (physical_id % server_ids.size());
                     ++counts[selected];
                     const int connects_before = adxl_mock::get_connect_count();
                     for (auto opcode : {Transport::TransferRequest::READ,
@@ -2152,18 +2172,53 @@ TEST_F(AscendDirectTransportTest, SingleSegment_ClientRoutesByPhysicalDevice) {
 }
 
 TEST_F(AscendDirectTransportTest,
-       SingleSegment_PhysicalInventoryIsSortedAndUnique) {
-    mock_acl::set_device_count(5);
-    g_physical_device_ids = {{0, 11}, {1, 4}, {2, 9}, {3, 6}, {4, 4}};
-    EXPECT_EQ(GetAscendPhysicalDeviceIds(),
-              (std::vector<uint32_t>{4, 6, 9, 11}));
+       SingleSegment_IsolatedVisibilityDistributesAcrossServers) {
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    for (uint32_t servers : {8u, 4u, 2u, 1u}) {
+        std::vector<int> counts(servers, 0);
+        for (uint32_t physical_id = 0; physical_id < 8; ++physical_id) {
+            SCOPED_TRACE(::testing::Message()
+                         << "servers=" << servers
+                         << " physical_id=" << physical_id);
+            mock_acl::set_device_count(1);
+            ASSERT_EQ(aclrtSetDevice(0), ACL_ERROR_NONE);
+            g_physical_device_ids = {{0, static_cast<int32_t>(physical_id)}};
+            auto transport = createTransport();
+            ASSERT_NE(transport, nullptr);
+            auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+            desc->name = "remote";
+            desc->protocol = "ascend";
+            desc->rank_info.hostIp = "192.168.1.100";
+            for (size_t i = 0; i < servers; ++i) {
+                desc->rank_info.endpoints.push_back("192.168.1.100:" +
+                                                    std::to_string(30000 + i));
+                TransferMetadata::BufferDesc buffer;
+                buffer.addr = dest;
+                buffer.length = kRegisterMemSize;
+                buffer.device_id = i;
+                desc->buffers.push_back(buffer);
+            }
+            transport->meta()->addLocalSegment(1, desc->name, std::move(desc));
+            const size_t selected = servers - 1 - (physical_id % servers);
+            ++counts[selected];
+            const auto result = runRemoteTransfer(
+                transport.get(), test_buffer_src_, 1, dest, kTransferBufSize);
+            ASSERT_TRUE(result.finished);
+            ASSERT_FALSE(result.failed);
+            EXPECT_EQ(adxl_mock::get_last_connect_target(),
+                      "192.168.1.100:" + std::to_string(30000 + selected));
+        }
+        for (int count : counts) {
+            EXPECT_EQ(count, static_cast<int>(8 / servers));
+        }
+    }
 }
 
 TEST_F(AscendDirectTransportTest,
-       SingleSegment_UnknownInventoryFailsSharedRouteOnly) {
+       SingleSegment_UnknownPhysicalIdFailsSharedRouteOnly) {
+    g_physical_device_ids = {{0, -1}};
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-    g_device_count_status = ACL_ERROR_FAILURE;
     const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
     addMultiEndpointRemoteSegment(
         transport->meta(), 1, "legacy", "192.168.1.100",
@@ -2185,8 +2240,7 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_TRUE(result.failed);
 }
 
-TEST_F(AscendDirectTransportTest,
-       SingleSegment_UsesRankInSparsePhysicalInventory) {
+TEST_F(AscendDirectTransportTest, SingleSegment_UsesSparsePhysicalModulo) {
     mock_acl::set_device_count(4);
     g_physical_device_ids = {{0, 4}, {1, 6}, {2, 9}, {3, 11}};
     ASSERT_EQ(aclrtSetDevice(1), ACL_ERROR_NONE);
@@ -2208,7 +2262,7 @@ TEST_F(AscendDirectTransportTest,
                                           dest, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
-    // Physical 6 is rank 1 of [4,6,9,11]: the first pair uses candidate 1.
+    // Physical 6 with 2 candidates selects 2 - 1 - (6 % 2) = 1.
     EXPECT_EQ(adxl_mock::get_last_connect_target(), "192.168.1.100:30007");
 }
 

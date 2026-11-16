@@ -575,23 +575,33 @@ void TransferExecutorBase::cleanupConnections() {
 }
 
 void TransferExecutorBase::rollbackRegisteredMem(
-    const std::vector<EngineMemHandle>& registered_mem_handles) {
+    void* addr, const std::vector<EngineMemHandle>& registered_mem_handles) {
+    std::vector<EngineMemHandle> retained_handles;
     for (const auto& [engine_idx, mem_handle] : registered_mem_handles) {
         if (engine_idx >= adxl_engines_.size() ||
             engine_idx >= local_engine_contexts_.size()) {
+            retained_handles.emplace_back(engine_idx, mem_handle);
             continue;
         }
         if (aclrtSetCurrentContext(local_engine_contexts_[engine_idx]) !=
             ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to restore context for rollback, engine_idx: "
                        << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
+            retained_handles.emplace_back(engine_idx, mem_handle);
             continue;
         }
         auto status = adxl_engines_[engine_idx]->DeregisterMem(mem_handle);
         if (status != adxl::SUCCESS) {
             LOG(ERROR) << "Rollback deregister failed, engine_idx: "
                        << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
+            retained_handles.emplace_back(engine_idx, mem_handle);
         }
+    }
+    if (!retained_handles.empty()) {
+        std::lock_guard<std::mutex> lock(mem_handle_mutex_);
+        auto& entry = addr_to_mem_handles_[addr];
+        entry.insert(entry.end(), retained_handles.begin(),
+                     retained_handles.end());
     }
 }
 
@@ -607,6 +617,19 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
     }
     if (adxl_engines_.empty()) {
         LOG(ERROR) << "Adxl engine is not available.";
+        return -1;
+    }
+
+    bool has_retained = false;
+    {
+        std::lock_guard<std::mutex> lock(mem_handle_mutex_);
+        has_retained =
+            addr_to_mem_handles_.find(addr) != addr_to_mem_handles_.end();
+    }
+    if (has_retained && deregisterMem(addr) != 0) {
+        LOG(ERROR) << "Failed to clean up retained handles before "
+                      "re-registering addr: "
+                   << addr;
         return -1;
     }
 
@@ -643,7 +666,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         if (engine_idx >= local_engine_contexts_.size()) {
             LOG(ERROR) << "Engine idx " << engine_idx
                        << " exceeds local_engine_contexts size";
-            rollbackRegisteredMem(registered_mem_handles);
+            rollbackRegisteredMem(addr, registered_mem_handles);
             return -1;
         }
         auto ctx_ret =
@@ -651,7 +674,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         if (ctx_ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "aclrtSetCurrentContext failed, engine_idx: "
                        << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
-            rollbackRegisteredMem(registered_mem_handles);
+            rollbackRegisteredMem(addr, registered_mem_handles);
             return -1;
         }
         adxl::MemHandle mem_handle = nullptr;
@@ -662,7 +685,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
                        << ", length: " << length
                        << ", engine index: " << engine_idx
                        << ", errmsg: " << aclGetRecentErrMsg();
-            rollbackRegisteredMem(registered_mem_handles);
+            rollbackRegisteredMem(addr, registered_mem_handles);
             return -1;
         }
         registered_mem_handles.emplace_back(engine_idx, mem_handle);
@@ -749,32 +772,17 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
         segment_desc->buffers, endpoints, dest_addr, length);
     if (candidates.size() == 1) return endpoints[*candidates.begin()];
     if (local_engine_idx >= local_engine_physical_ids_.size()) return {};
-    std::call_once(physical_inventory_once_, [this] {
-        physical_device_ids_ = GetAscendPhysicalDeviceIds();
-    });
     const int32_t physical_id = local_engine_physical_ids_[local_engine_idx];
     if (physical_id < 0) {
         LOG(ERROR) << "Physical device id unavailable for multi-engine route";
         return {};
     }
-    const auto it = std::lower_bound(physical_device_ids_.begin(),
-                                     physical_device_ids_.end(),
-                                     static_cast<uint32_t>(physical_id));
-    if (it == physical_device_ids_.end() ||
-        *it != static_cast<uint32_t>(physical_id)) {
-        LOG(ERROR) << "Cannot find client physical device " << physical_id
-                   << " in the ACL device set for multi-engine route";
-        return {};
-    }
-    const auto index = ReverseDeviceIndex(
-        static_cast<uint32_t>(it - physical_device_ids_.begin()),
-        static_cast<uint32_t>(physical_device_ids_.size()),
-        static_cast<uint32_t>(candidates.size()));
+    const auto index =
+        ReverseDeviceIndex(static_cast<uint32_t>(physical_id),
+                           static_cast<uint32_t>(candidates.size()));
     if (!index) return {};
     const auto selected = *std::next(candidates.begin(), *index);
     VLOG(1) << "ACL single-segment route physical=" << physical_id
-            << " rank=" << (it - physical_device_ids_.begin())
-            << " C=" << physical_device_ids_.size()
             << " S=" << candidates.size() << " index=" << *index
             << " endpoint=" << endpoints[selected];
     return endpoints[selected];

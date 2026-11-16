@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -407,6 +408,58 @@ TEST(SegmentTrackerTest, SharedRangeFailedRemoveRestoresAliasesForRetry) {
                             })
                     .ok());
     EXPECT_EQ(remove_callbacks, 2);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, SharedRangeFailedRemovePreservesCleanupProgress) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = SharedRangeBuffer(0x22600);
+    buffer.transports = {RDMA, AscendDirect};
+    buffer.rkey = {11, 22};
+    buffer.lkey = {33, 44};
+    buffer.transport_attrs[RDMA] = "rdma-tag";
+    std::vector<BufferDesc> once{buffer};
+    ASSERT_TRUE(tracker.addInBatch(once, AppendRangeAlias()).ok());
+
+    EXPECT_FALSE(tracker
+                     .remove(buffer.addr, buffer.length,
+                             [](BufferDesc& desc) -> Status {
+                                 desc.rkey.clear();
+                                 desc.lkey.clear();
+                                 desc.transports = {AscendDirect};
+                                 return Status::InternalError(
+                                     "injected ascend deregister failure");
+                             })
+                     .ok());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 2u);
+    std::set<std::string> attrs;
+    for (const auto& remaining : buffersOf(snapshot)) {
+        EXPECT_EQ(remaining.ref_count, 1);
+        EXPECT_EQ(remaining.transports,
+                  std::vector<TransportType>{AscendDirect});
+        EXPECT_TRUE(remaining.rkey.empty());
+        EXPECT_TRUE(remaining.lkey.empty());
+        EXPECT_EQ(remaining.transport_attrs.find(RDMA),
+                  remaining.transport_attrs.end());
+        auto it = remaining.transport_attrs.find(AscendDirect);
+        ASSERT_NE(it, remaining.transport_attrs.end());
+        attrs.insert(it->second);
+    }
+    EXPECT_EQ(attrs, (std::set<std::string>{"0", "1"}));
+
+    EXPECT_TRUE(tracker
+                    .remove(buffer.addr, buffer.length,
+                            [](BufferDesc& desc) -> Status {
+                                EXPECT_EQ(
+                                    desc.transports,
+                                    std::vector<TransportType>{AscendDirect});
+                                EXPECT_TRUE(desc.rkey.empty());
+                                EXPECT_TRUE(desc.lkey.empty());
+                                return Status::OK();
+                            })
+                    .ok());
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
 }
 

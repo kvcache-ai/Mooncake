@@ -154,9 +154,6 @@ class TransferExecutorBase {
     std::vector<aclrtContext> local_engine_contexts_;
     // Captured during initialization; dispatch threads need no ACL context.
     std::vector<int32_t> local_engine_physical_ids_;
-    // Queried only when a peer actually offers multiple registrations.
-    mutable std::once_flag physical_inventory_once_;
-    mutable std::vector<uint32_t> physical_device_ids_;
     std::mutex mem_handle_mutex_;
 
     std::unordered_map<size_t, std::set<std::string>> connected_segments_;
@@ -168,7 +165,7 @@ class TransferExecutorBase {
     using EngineMemHandle = std::pair<size_t, adxl::MemHandle>;
 
     void rollbackRegisteredMem(
-        const std::vector<EngineMemHandle>& registered_mem_handles);
+        void* addr, const std::vector<EngineMemHandle>& registered_mem_handles);
     std::map<void*, std::vector<EngineMemHandle>> addr_to_mem_handles_;
 };
 
