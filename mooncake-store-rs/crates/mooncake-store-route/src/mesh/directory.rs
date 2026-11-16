@@ -1289,6 +1289,66 @@ impl EmbeddedWrhRouteDirectory {
             last_errors,
         }
     }
+
+    fn validate_contains_object_routes(
+        &self,
+        keys: &[ObjectKey],
+        ranked_authorities: &[Vec<ClientLease>],
+        baseline_ranked_authorities: Option<&[Vec<ClientLease>]>,
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ranked_authorities = ranked_authorities.to_vec();
+        if let Some(baseline_ranked) = baseline_ranked_authorities {
+            for (authorities, baseline) in ranked_authorities.iter_mut().zip(baseline_ranked) {
+                for authority in baseline {
+                    if !authorities
+                        .iter()
+                        .any(|existing| existing.runtime.stable_id == authority.runtime.stable_id)
+                    {
+                        authorities.push(authority.clone());
+                    }
+                }
+            }
+        }
+        let rank_count = ranked_authorities.iter().map(Vec::len).max().unwrap_or(0);
+        let mut resolved = vec![None; keys.len()];
+        let mut observations =
+            vec![vec![RouteAuthorityObservation::Unobserved; rank_count]; keys.len()];
+        for rank in 0..rank_count {
+            self.read_ranked_authorities(
+                keys,
+                &ranked_authorities,
+                rank,
+                &mut resolved,
+                Some(observations.as_mut_slice()),
+                "contains validation route batch read failed",
+            )?;
+        }
+        // A live route proves existence; absence requires every selected authority to respond.
+        for (index, key) in keys.iter().enumerate() {
+            let selected = ranked_authorities[index].len();
+            let incomplete = selected == 0
+                || observations[index][..selected].iter().any(|observation| {
+                    matches!(observation, RouteAuthorityObservation::Unobserved)
+                });
+            let has_live_route = matches!(
+                resolved[index].as_ref(),
+                Some(RouteAuthorityValue::Route(_))
+            );
+            if incomplete && !has_live_route {
+                return Err(StoreError::Transport(format!(
+                    "contains validation could not confirm route state for key {}",
+                    key.0
+                )));
+            }
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|value| value.and_then(RouteAuthorityValue::into_route))
+            .collect())
+    }
 }
 
 impl Drop for EmbeddedWrhRouteDirectory {
@@ -1687,6 +1747,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             )?;
         }
 
+        let mut baseline_ranked_authorities = None;
         if !resolved.iter().all(|r| *r) {
             let fallback_candidates = {
                 let mut baseline = self.baseline.lock();
@@ -1742,6 +1803,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                         "baseline authority fallback route contains failed",
                     )?;
                 }
+                baseline_ranked_authorities = Some(baseline_ranked);
             }
         }
 
@@ -1756,7 +1818,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .iter()
             .map(|&index| keys[index].clone())
             .collect::<Vec<_>>();
-        let validated = self.get_object_routes(observer, &positive_keys)?;
+        let positive_ranked = positives
+            .iter()
+            .map(|&index| ranked_authorities[index].clone())
+            .collect::<Vec<_>>();
+        let positive_baseline_ranked = baseline_ranked_authorities.as_ref().map(|baseline| {
+            positives
+                .iter()
+                .map(|&index| baseline[index].clone())
+                .collect::<Vec<_>>()
+        });
+        let validated = self.validate_contains_object_routes(
+            &positive_keys,
+            &positive_ranked,
+            positive_baseline_ranked.as_deref(),
+        )?;
         for (index, route) in positives.into_iter().zip(validated) {
             resolved[index] = route.is_some();
         }
@@ -2169,6 +2245,34 @@ mod owner_page_contract_tests {
         leases: Vec<ClientLease>,
     }
 
+    struct MutableMembership {
+        leases: Mutex<Vec<ClientLease>>,
+    }
+
+    impl RouteMembershipProvider for MutableMembership {
+        fn live_clients(
+            &self,
+            _force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            Ok(self.leases.lock().clone())
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
     impl RouteMembershipProvider for TestMembership {
         fn live_clients(
             &self,
@@ -2306,6 +2410,7 @@ mod owner_page_contract_tests {
     struct RecordingConfirmationClient {
         routes: BTreeMap<String, Option<ObjectRoute>>,
         delete_versions: BTreeMap<String, Option<RouteVersion>>,
+        read_failures: BTreeSet<String>,
         queried_authorities: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2318,6 +2423,12 @@ mod owner_page_contract_tests {
             keys: &[ObjectKey],
         ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
             self.queried_authorities.lock().push(authority.0.clone());
+            if self.read_failures.contains(&authority.0) {
+                return Err(StoreError::Transport(format!(
+                    "injected route read failure for {}",
+                    authority.0
+                )));
+            }
             let route = self.routes.get(&authority.0).cloned().unwrap_or(None);
             Ok(keys
                 .iter()
@@ -2831,6 +2942,7 @@ mod owner_page_contract_tests {
             Arc::new(RecordingConfirmationClient {
                 routes,
                 delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::new(),
                 queried_authorities: queried_authorities.clone(),
             }),
             Arc::new(RetainedMembership { current, retained }),
@@ -3145,6 +3257,7 @@ mod owner_page_contract_tests {
                 Arc::new(RecordingConfirmationClient {
                     routes,
                     delete_versions,
+                    read_failures: BTreeSet::new(),
                     queried_authorities: queried_authorities.clone(),
                 }),
                 Arc::new(TestMembership {
@@ -3173,6 +3286,171 @@ mod owner_page_contract_tests {
                 expected.then_some(RouteVersion(live_version))
             );
         }
+    }
+
+    #[test]
+    fn contains_validation_propagates_route_read_failures() {
+        let observer = test_lease("contains-read-error-observer");
+        let authority = test_lease("contains-read-error-authority");
+        let authority_id = authority.runtime.stable_id.0.clone();
+        let key = ObjectKey::new("contains-read-error-key");
+        let route = test_route(&key.0, &observer.runtime);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([(authority_id.clone(), Some(route))]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::from([authority_id]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![authority],
+            }),
+        );
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a raw hit without a successful route read must not prove absence");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_rejects_partial_current_absence() {
+        let observer = test_lease("contains-partial-current-observer");
+        let candidates = vec![
+            test_lease("contains-partial-current-a"),
+            test_lease("contains-partial-current-b"),
+        ];
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = ObjectKey::new("contains-partial-current-key");
+        let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+        let failed = &ranked[0];
+        let missing = &ranked[1];
+        let route = test_route(&key.0, &observer.runtime);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([
+                    (failed.runtime.stable_id.0.clone(), Some(route)),
+                    (missing.runtime.stable_id.0.clone(), None),
+                ]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::from([failed.runtime.stable_id.0.clone()]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a peer miss must not hide a failed raw-positive authority read");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_rejects_partial_baseline_delete_marker() {
+        let observer = test_lease("contains-partial-baseline-observer");
+        let original = test_lease("contains-partial-baseline-original");
+        let current = std::iter::once(original.clone())
+            .chain((1..3).map(|index| test_lease(&format!("contains-partial-baseline-{index}"))))
+            .collect::<Vec<_>>();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = (0..100)
+            .map(|index| ObjectKey::new(format!("contains-partial-baseline-key-{index}")))
+            .find(|key| {
+                ranked_authorities(&namespace, &current, key)
+                    .last()
+                    .is_some_and(|authority| {
+                        authority.runtime.stable_id == original.runtime.stable_id
+                    })
+            })
+            .expect("a key should rank the original authority last");
+        let current_top = ranked_top_authorities(&namespace, &current, &key, 2);
+        let route = test_route(&key.0, &observer.runtime);
+        let membership = Arc::new(MutableMembership {
+            leases: Mutex::new(vec![original.clone()]),
+        });
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([(original.runtime.stable_id.0.clone(), Some(route))]),
+                delete_versions: BTreeMap::from([(
+                    current_top[0].runtime.stable_id.0.clone(),
+                    Some(RouteVersion(5)),
+                )]),
+                read_failures: BTreeSet::from([original.runtime.stable_id.0.clone()]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            membership.clone(),
+        );
+        *membership.leases.lock() = current;
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a delete marker must not hide a failed baseline authority read");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_stays_bounded_during_baseline_fallback() {
+        let observer = test_lease("contains-growth-observer");
+        let original = test_lease("contains-growth-original");
+        let current = std::iter::once(original.clone())
+            .chain((1..32).map(|index| test_lease(&format!("contains-growth-{index}"))))
+            .collect::<Vec<_>>();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = (0..1000)
+            .map(|index| ObjectKey::new(format!("contains-growth-key-{index}")))
+            .find(|key| {
+                ranked_authorities(&namespace, &current, key)
+                    .last()
+                    .is_some_and(|authority| {
+                        authority.runtime.stable_id == original.runtime.stable_id
+                    })
+            })
+            .expect("a key should rank the original authority last");
+        let current_top = ranked_top_authorities(&namespace, &current, &key, 2);
+        let route = test_route(&key.0, &observer.runtime);
+        let membership = Arc::new(MutableMembership {
+            leases: Mutex::new(vec![original.clone()]),
+        });
+        let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([(original.runtime.stable_id.0.clone(), Some(route))]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::new(),
+                queried_authorities: queried_authorities.clone(),
+            }),
+            membership.clone(),
+        );
+        *membership.leases.lock() = current;
+
+        assert!(directory.contains_object_route(&observer, &key).unwrap());
+
+        let expected_queries = current_top
+            .iter()
+            .chain(std::iter::once(&original))
+            .map(|authority| authority.runtime.stable_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let queried = queried_authorities.lock();
+        assert_eq!(queried.len(), expected_queries.len());
+        assert_eq!(
+            queried.iter().cloned().collect::<BTreeSet<_>>(),
+            expected_queries
+        );
     }
 
     #[test]
