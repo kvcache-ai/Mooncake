@@ -226,6 +226,37 @@ TEST_F(NvmeKvStorageBackendTest, BackendLoadsKnownObjectsFromDevice) {
     EXPECT_EQ(loaded_values, values);
 }
 
+TEST_F(NvmeKvStorageBackendTest, BatchLoadReportsFailureAndLoadsValidObjects) {
+    EnvVarGuard driver_guard("MOONCAKE_NVME_KV_DRIVER", "stub");
+    EnvVarGuard runtime_limit_guard("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT",
+                                    "4096");
+    FileStorageConfig config;
+    config.storage_filepath = data_path_ + "/partial_read";
+    config.storage_backend_type = StorageBackendType::kNvmeKv;
+    std::string value(9000, 'v');
+    std::unordered_map<std::string, std::vector<Slice>> input{
+        {"present", {{value.data(), value.size()}}}};
+    {
+        NvmeKvStorageBackend writer(config);
+        ASSERT_TRUE(writer.Init());
+        ASSERT_TRUE(writer.BatchOffload(
+            input, [](const auto &, auto &) { return ErrorCode::OK; }));
+    }
+    NvmeKvStorageBackend reader(config);
+    ASSERT_TRUE(reader.Init());
+    std::string missing(4, '?'), present(value.size(), '?');
+    std::unordered_map<std::string, Slice> output{
+        {"missing", {missing.data(), missing.size()}},
+        {"present", {present.data(), present.size()}}};
+
+    auto result = reader.BatchLoad(output);
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(missing, "????");
+    EXPECT_EQ(present, value);
+}
+
 TEST_F(NvmeKvStorageBackendTest, PipelinedStubRoundTripChunkedObjects) {
     EnvVarGuard driver_guard("MOONCAKE_NVME_KV_DRIVER", "stub");
     EnvVarGuard queue_depth_guard("MOONCAKE_NVME_KV_QUEUE_DEPTH", "8");

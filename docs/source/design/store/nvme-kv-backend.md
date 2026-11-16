@@ -4,7 +4,12 @@
 
 The NVMe KV backend extends Mooncake Store's node-local SSD offload path with an NVMe Key-Value namespace. It preserves Mooncake's logical object API while translating variable-length logical keys and values into fixed-size NVMe KV keys and bounded device values.
 
-The implementation separates object semantics from command transport. `NvmeKvStorageBackend` owns logical object layout, integrity validation, key-conflict handling, and batched I/O orchestration. `NvmeKvConnector` binds one configured device to one executor. `NvmeKvCommandExecutor` submits Store, Retrieve, and Delete commands through io_uring or ioctl.
+The implementation separates object semantics from command transport.
+
+- `NvmeKvStorageBackend` owns local quota accounting, completion callbacks, and the local object policy.
+- `NvmeKvObjectStore` shares object layout, integrity validation, and I/O orchestration while applying the backend's placement and conflict rules.
+- `NvmeKvConnector` initializes a namespace connection from configuration and binds it to one executor.
+- `NvmeKvCommandExecutor` submits Store, Retrieve, and Delete commands through io_uring or ioctl.
 
 ## Design Goals
 
@@ -33,11 +38,12 @@ flowchart TB
         RealClient["Mooncake real client"]
         FileStorage["FileStorage"]
         Backend["NvmeKvStorageBackend"]
+        ObjectStore["NvmeKvObjectStore"]
         Connector["NvmeKvConnector"]
         Executor["io_uring or ioctl executor"]
         Device["Local NVMe KV namespace"]
 
-        RealClient --> FileStorage --> Backend --> Connector --> Executor --> Device
+        RealClient --> FileStorage --> Backend --> ObjectStore --> Connector --> Executor --> Device
     end
 
     RequestClient <-->|"metadata query"| Master
@@ -52,10 +58,13 @@ The master records the object as a `LOCAL_DISK` replica owned by a real client. 
 | Layer | Responsibilities |
 |------|------------------|
 | `FileStorage` | Obtains memory slices, invokes the backend, reports successful replicas, and serves remote SSD reads. |
-| `NvmeKvStorageBackend` | Builds object layouts, applies key-conflict policy, coordinates bounded batch I/O, and verifies data returned by the device. |
+| `NvmeKvStorageBackend` | Adapts FileStorage requests, enforces local quotas, accounts for new objects, and reports completed offloads. |
+| `NvmeKvObjectStore` | Builds object layouts, applies hash-based physical-key selection and conflict handling through the local policy, coordinates I/O, and verifies returned data. |
 | `NvmeKvConnector` | Resolves the configured device, selects one executor during initialization, and forwards commands. |
 | `NvmeKvCommandExecutor` | Encodes and submits NVMe KV Store, Retrieve, and Delete commands while owning transport-specific buffers and completion handling. |
 | NVMe KV namespace | Executes commands submitted through the Linux device node. |
+
+The local policy implements five operations: `EncodePhysicalKey`, `PrepareWrite`, `ReadRoot`, `HandleWriteFailure`, and `AbortWrite`. It owns physical-address encoding, hash-slot lookup, and write-failure handling while reusing the common codec and Connector. The object store schedules these operations and manages batch submission, manifest caching, and output buffers. Each write attempt records its payload, plan, error, and confirmed writes so recovery and exception cleanup use the same state.
 
 ## Physical Keys and Conflicts
 
@@ -103,21 +112,28 @@ A larger object is split into raw chunk values followed by one root manifest. Ea
 sequenceDiagram
     participant F as FileStorage
     participant B as NvmeKvStorageBackend
+    participant O as NvmeKvObjectStore
+    participant P as LocalNvmeKvPolicy
     participant E as Executor
 
     F->>B: BatchOffload(key to slices)
-    B->>B: validate limits and prepare checksums/layout
+    B->>B: validate local quotas
+    B->>O: PutBatch(logical keys, slices)
+    O->>P: PrepareWrite
+    P-->>O: encoded root/chunks and hash addresses
     alt inline object
-        B->>E: Store root if not exists
+        O->>E: Store root if not exists
     else chunked object
-        B->>E: StoreBatch chunks if not exists
-        E-->>B: all chunks for one object complete
-        B->>E: queue root on the root lane
+        O->>E: StoreBatch chunks if not exists
+        E-->>O: all chunks for one object complete
+        O->>E: queue root on the root lane
     end
-    alt physical key already exists
-        B->>E: Retrieve existing value
-        B->>B: accept identical object or try next slot
+    alt write attempt failed
+        O->>P: HandleWriteFailure(attempt)
+        P->>E: clean permitted writes, retry or confirm existing value
+        P-->>O: final per-object result and attempt state
     end
+    O-->>B: per-object results and insertion flags
     B-->>F: successful keys and object metadata
 ```
 
@@ -158,7 +174,7 @@ The ioctl executor builds the same command fields in `nvme_passthru_cmd` and sub
 
 ## Concurrency and Ownership
 
-- Backend worker pools bound object preparation, chunk submission, root submission, and fallback I/O.
+- Object-store worker pools bound object preparation, chunk submission, root submission, and fallback I/O.
 - io_uring rings are thread-local, avoiding a shared hot-path ring lock.
 - Batch APIs are synchronous at their boundary, so request arrays and DMA buffers outlive all command completions.
 - Direct reads verify checksums in the destination buffer after completion.
