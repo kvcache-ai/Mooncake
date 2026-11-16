@@ -829,6 +829,104 @@ void ResourceTracker::registerInstance(
     instances_.push_back(instance);
 }
 
+void ResourceTracker::rearmStandaloneSignals() {
+    // In embedded (Python) environments the host runtime owns signal
+    // handling; only re-assert the contract in standalone processes.
+    if (dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+        return;
+    }
+
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
+    sigaddset(&set, SIGUSR1);  // used to interrupt sigwait on stop
+    // Re-block these signals on the calling (main) thread so the sigwait
+    // thread consumes them before any handler can run, keeping the
+    // graceful-cleanup path authoritative for the main flow.
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) {
+        LOG(ERROR) << "rearmStandaloneSignals: pthread_sigmask failed: "
+                   << strerror(errno);
+    }
+
+    // Install a process-wide fallback handler.  Threads created by third-party
+    // runtimes keep an unblocked mask, so a signal may be delivered to one of
+    // them instead of being consumed by sigwait.  The handler is strictly
+    // async-signal-safe: it only records the signal and lets the watchdog
+    // thread perform the unmount cleanup in normal thread context before the
+    // process terminates with the original signal.
+    struct sigaction sa;
+    sa.sa_handler = &ResourceTracker::fallbackSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGUSR1}) {
+        if (sigaction(sig, &sa, nullptr) != 0) {
+            LOG(ERROR) << "rearmStandaloneSignals: sigaction(" << sig
+                       << ") failed: " << strerror(errno);
+        }
+    }
+
+    startSignalWatchdog();
+
+    LOG(INFO) << "Standalone signal contract re-asserted (SIGINT/SIGTERM/"
+              << "SIGHUP/SIGUSR1)";
+}
+
+std::atomic<int> ResourceTracker::pending_cleanup_signal_{0};
+
+void ResourceTracker::fallbackSignalHandler(int signal) {
+    // Async-signal-safe: record only.  The watchdog performs cleanup.
+    pending_cleanup_signal_.store(signal, std::memory_order_release);
+}
+
+void ResourceTracker::startSignalWatchdog() {
+    bool expected = false;
+    if (!signal_watchdog_running_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    signal_watchdog_thread_ = std::thread([this]() {
+        // Keep the watched signals blocked on this thread so the final
+        // re-raise is controlled (unblock happens right before raise).
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGINT);
+        sigaddset(&set, SIGTERM);
+        sigaddset(&set, SIGHUP);
+        sigaddset(&set, SIGUSR1);
+        pthread_sigmask(SIG_BLOCK, &set, nullptr);
+
+        while (true) {
+            const int sig =
+                pending_cleanup_signal_.exchange(0, std::memory_order_acq_rel);
+            if (sig == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+
+            // Normal thread context: safe to log and to run the unmount
+            // cleanup (RPC calls, locking, glog).
+            LOG(INFO) << "fallback signal " << sig
+                      << " received; cleaning up resources in watchdog";
+            getInstance().cleanupAllResources();
+
+            // Restore the default action and re-raise so the process
+            // terminates with the original signal.
+            struct sigaction sa;
+            sa.sa_handler = SIG_DFL;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;
+            sigaction(sig, &sa, nullptr);
+            sigset_t unblock_set;
+            sigemptyset(&unblock_set);
+            sigaddset(&unblock_set, sig);
+            pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+            raise(sig);
+            break;  // unreachable: raise terminates the process
+        }
+    });
+}
+
 void ResourceTracker::cleanupAllResources() {
     // Ensure this runs only once
     bool expected = false;
@@ -848,8 +946,11 @@ void ResourceTracker::cleanupAllResources() {
 }
 
 void ResourceTracker::signalHandler(int signal) {
-    // Legacy path (kept for compatibility if handlers are ever installed).
-    // Prefer dedicated signal thread; avoid doing heavy work here.
+    // Fallback path, used when a signal is delivered to a thread that does
+    // not run sigwait (e.g. a third-party runtime thread with an unblocked
+    // mask): clean up in normal thread context, then restore the default
+    // action and re-raise so the process still terminates with the original
+    // signal.
     getInstance().cleanupAllResources();
     struct sigaction sa;
     sa.sa_handler = SIG_DFL;

@@ -113,6 +113,13 @@ struct MasterConfig {
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
     int64_t client_suspicion_ttl_sec;
+    // Client death probing: probe the transport endpoints of a suspected
+    // (heartbeat-missed) client and retire it immediately once death is
+    // confirmed, instead of waiting for the full suspicion TTL.
+    bool client_death_probe_enable = true;
+    int64_t client_death_probe_interval_ms = 1000;
+    uint32_t client_death_probe_timeout_ms = 500;
+    uint32_t client_death_probe_failures_threshold = 2;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
@@ -551,6 +558,10 @@ class WrappedMasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
+    bool client_death_probe_enable = true;
+    int64_t client_death_probe_interval_ms = 1000;
+    uint32_t client_death_probe_timeout_ms = 500;
+    uint32_t client_death_probe_failures_threshold = 2;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -645,6 +656,11 @@ class WrappedMasterServiceConfig {
         view_version = view_version_param;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
+        client_death_probe_enable = config.client_death_probe_enable;
+        client_death_probe_interval_ms = config.client_death_probe_interval_ms;
+        client_death_probe_timeout_ms = config.client_death_probe_timeout_ms;
+        client_death_probe_failures_threshold =
+            config.client_death_probe_failures_threshold;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -1220,6 +1236,10 @@ class MasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
+    bool client_death_probe_enable = true;
+    int64_t client_death_probe_interval_ms = 1000;
+    uint32_t client_death_probe_timeout_ms = 500;
+    uint32_t client_death_probe_failures_threshold = 2;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -1312,6 +1332,11 @@ class MasterServiceConfig {
         view_version = config.view_version;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
+        client_death_probe_enable = config.client_death_probe_enable;
+        client_death_probe_interval_ms = config.client_death_probe_interval_ms;
+        client_death_probe_timeout_ms = config.client_death_probe_timeout_ms;
+        client_death_probe_failures_threshold =
+            config.client_death_probe_failures_threshold;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =

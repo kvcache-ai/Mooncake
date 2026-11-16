@@ -357,6 +357,19 @@ DEFINE_int64(client_suspicion_ttl_sec,
              "Seconds a suspected client may recover before going offline; "
              "defaults to 20 seconds, or to an explicitly configured active "
              "TTL when omitted");
+DEFINE_bool(client_death_probe_enable, true,
+            "Probe the transport endpoints of suspected (heartbeat-missed) "
+            "clients and retire them immediately once death is confirmed, "
+            "instead of waiting for the full suspicion TTL");
+DEFINE_int64(client_death_probe_interval_ms, 1000,
+             "Interval between death probes of the same suspected client "
+             "(ms)");
+DEFINE_uint32(client_death_probe_timeout_ms, 500,
+              "Timeout of a single TCP-connect death probe (ms)");
+DEFINE_uint32(client_death_probe_failures_threshold, 2,
+              "Consecutive timed-out death probes before a suspected client "
+              "is retired immediately; a refused connection retires it at "
+              "once");
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -585,6 +598,19 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("nof_heartbeat_failures_threshold",
                              &master_config.nof_heartbeat_failures_threshold,
                              FLAGS_nof_heartbeat_failures_threshold);
+    default_config.GetBool("client_death_probe_enable",
+                           &master_config.client_death_probe_enable,
+                           FLAGS_client_death_probe_enable);
+    default_config.GetInt64("client_death_probe_interval_ms",
+                            &master_config.client_death_probe_interval_ms,
+                            FLAGS_client_death_probe_interval_ms);
+    default_config.GetUInt32("client_death_probe_timeout_ms",
+                             &master_config.client_death_probe_timeout_ms,
+                             FLAGS_client_death_probe_timeout_ms);
+    default_config.GetUInt32(
+        "client_death_probe_failures_threshold",
+        &master_config.client_death_probe_failures_threshold,
+        FLAGS_client_death_probe_failures_threshold);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
@@ -1148,6 +1174,33 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.nof_heartbeat_failures_threshold =
             FLAGS_nof_heartbeat_failures_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("client_death_probe_enable", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.client_death_probe_enable =
+            FLAGS_client_death_probe_enable;
+    }
+    if ((google::GetCommandLineFlagInfo("client_death_probe_interval_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.client_death_probe_interval_ms =
+            FLAGS_client_death_probe_interval_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("client_death_probe_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.client_death_probe_timeout_ms =
+            FLAGS_client_death_probe_timeout_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("client_death_probe_failures_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.client_death_probe_failures_threshold =
+            FLAGS_client_death_probe_failures_threshold;
     }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||

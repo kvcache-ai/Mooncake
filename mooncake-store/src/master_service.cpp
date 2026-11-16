@@ -24,6 +24,11 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <cerrno>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <ylt/util/tl/expected.hpp>
 #include <ylt/standalone/cinatra/url_encode_decode.hpp>
 #include <boost/algorithm/string.hpp>
@@ -496,6 +501,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
       view_version_(config.view_version),
       client_active_ttl_sec_(config.client_active_ttl_sec),
       client_suspicion_ttl_sec_(config.client_suspicion_ttl_sec),
+      client_death_probe_enable_(config.client_death_probe_enable),
+      client_death_probe_interval_ms_(
+          std::chrono::milliseconds(config.client_death_probe_interval_ms)),
+      client_death_probe_timeout_ms_(
+          std::chrono::milliseconds(config.client_death_probe_timeout_ms)),
+      client_death_probe_failures_threshold_(
+          config.client_death_probe_failures_threshold),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -762,6 +774,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::ClientMonitorFunc, this);
     VLOG(1) << "action=start_client_monitor_thread";
 
+    // Start the client death probe thread to retire confirmed-dead clients
+    // without waiting for the full suspicion TTL.
+    if (client_death_probe_enable_) {
+        client_death_probe_running_ = true;
+        client_death_probe_thread_ =
+            std::thread(&MasterService::ClientDeathProbeThreadFunc, this);
+        VLOG(1) << "action=start_client_death_probe_thread";
+    }
+
 #ifdef USE_NOF
     nof_heartbeat_running_ = true;
     nof_heartbeat_thread_ =
@@ -949,6 +970,7 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
+    client_death_probe_running_ = false;
 
     task_cleanup_running_ = false;
     {
@@ -981,6 +1003,9 @@ MasterService::~MasterService() {
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
+    }
+    if (client_death_probe_thread_.joinable()) {
+        client_death_probe_thread_.join();
     }
 #ifdef USE_NOF
     if (nof_heartbeat_thread_.joinable()) {
@@ -10233,92 +10258,7 @@ void MasterService::ClientMonitorFunc() {
                 now, std::chrono::seconds(client_active_ttl_sec_),
                 std::chrono::seconds(client_suspicion_ttl_sec_),
                 [&] { client_offboarding_worker_.ReserveJob(); },
-                [&] {
-                    {
-                        std::unique_lock<std::shared_mutex> client_lock(
-                            client_mutex_);
-                        const auto current =
-                            client_liveness_records_.find(client_id);
-                        CHECK(current != client_liveness_records_.end());
-                        CHECK(current->second == record);
-                        if (ok_client_.erase(client_id) != 0) {
-                            MasterMetricManager::instance()
-                                .dec_active_clients();
-                        }
-                        client_host_id_.erase(client_id);
-                    }
-                    graceful_unmount_scheduler_.RemoveIf(
-                        [&client_id](
-                            const GracefulUnmountDeadlineRecord& pending) {
-                            return pending.client_id == client_id;
-                        });
-
-                    ClientOffboardingJob job;
-                    job.client_id = client_id;
-                    job.liveness = record;
-                    std::shared_lock<std::shared_mutex> snapshot_lock(
-                        master_state_mutex_);
-                    {
-                        ScopedSegmentAccess segment_access =
-                            segment_manager_.getSegmentAccess();
-                        std::vector<Segment> segments;
-                        const auto get_result =
-                            segment_access.GetClientSegments(client_id,
-                                                             segments);
-                        if (get_result == ErrorCode::OK) {
-                            for (const auto& segment : segments) {
-                                SegmentStatus status = SegmentStatus::UNDEFINED;
-                                const auto status_result =
-                                    segment_access.GetSegmentStatusById(
-                                        segment.id, status);
-                                if (status_result ==
-                                    ErrorCode::SEGMENT_NOT_FOUND) {
-                                    continue;
-                                }
-                                if (status_result == ErrorCode::OK &&
-                                    status == SegmentStatus::UNMOUNTING) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    continue;
-                                }
-
-                                size_t metrics_dec_capacity = 0;
-                                const auto prepare_result =
-                                    segment_access.PrepareUnmountSegment(
-                                        segment.id, metrics_dec_capacity);
-                                if (prepare_result == ErrorCode::OK) {
-                                    job.prepared_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint,
-                                         .metrics_dec_capacity =
-                                             metrics_dec_capacity});
-                                } else if (prepare_result !=
-                                           ErrorCode::SEGMENT_NOT_FOUND) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    LOG(ERROR)
-                                        << "client_id=" << client_id
-                                        << ", segment_name=" << segment.name
-                                        << ", action=prepare_client_offboarding"
-                                        << ", error="
-                                        << toString(prepare_result);
-                                }
-                            }
-                        }
-                    }
-
-                    MasterMetricManager::instance()
-                        .client_liveness_became_offline();
-                    client_offboarding_worker_.ScheduleReserved(std::move(job));
-                });
+                [&] { RetireClientSession(client_id, record); });
 
             if (transition == ClientLivenessTransition::BECAME_SUSPECTED) {
                 MasterMetricManager::instance()
@@ -10333,6 +10273,317 @@ void MasterService::ClientMonitorFunc() {
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
+    }
+}
+
+// Shared by the client monitor and the death probe: run the offboarding
+// work for a client session that has transitioned to OFFLINE.
+void MasterService::RetireClientSession(
+    const UUID& client_id,
+    const std::shared_ptr<ClientLivenessRecord>& record) {
+    {
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        const auto current = client_liveness_records_.find(client_id);
+        CHECK(current != client_liveness_records_.end());
+        CHECK(current->second == record);
+        if (ok_client_.erase(client_id) != 0) {
+            MasterMetricManager::instance().dec_active_clients();
+        }
+        client_host_id_.erase(client_id);
+    }
+    graceful_unmount_scheduler_.RemoveIf(
+        [&client_id](const GracefulUnmountDeadlineRecord& pending) {
+            return pending.client_id == client_id;
+        });
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = record;
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        std::vector<Segment> segments;
+        const auto get_result =
+            segment_access.GetClientSegments(client_id, segments);
+        if (get_result == ErrorCode::OK) {
+            for (const auto& segment : segments) {
+                SegmentStatus status = SegmentStatus::UNDEFINED;
+                const auto status_result =
+                    segment_access.GetSegmentStatusById(segment.id, status);
+                if (status_result == ErrorCode::SEGMENT_NOT_FOUND) {
+                    continue;
+                }
+                if (status_result == ErrorCode::OK &&
+                    status == SegmentStatus::UNMOUNTING) {
+                    job.pending_prepare_segments.push_back(
+                        {.segment_id = segment.id,
+                         .segment_name = segment.name,
+                         .transport_endpoint = segment.te_endpoint});
+                    continue;
+                }
+
+                size_t metrics_dec_capacity = 0;
+                const auto prepare_result =
+                    segment_access.PrepareUnmountSegment(segment.id,
+                                                         metrics_dec_capacity);
+                if (prepare_result == ErrorCode::OK) {
+                    job.prepared_segments.push_back(
+                        {.segment_id = segment.id,
+                         .segment_name = segment.name,
+                         .transport_endpoint = segment.te_endpoint,
+                         .metrics_dec_capacity = metrics_dec_capacity});
+                } else if (prepare_result != ErrorCode::SEGMENT_NOT_FOUND) {
+                    job.pending_prepare_segments.push_back(
+                        {.segment_id = segment.id,
+                         .segment_name = segment.name,
+                         .transport_endpoint = segment.te_endpoint});
+                    LOG(ERROR) << "client_id=" << client_id
+                               << ", segment_name=" << segment.name
+                               << ", action=prepare_client_offboarding"
+                               << ", error=" << toString(prepare_result);
+                }
+            }
+        }
+    }
+
+    MasterMetricManager::instance().client_liveness_became_offline();
+    client_offboarding_worker_.ScheduleReserved(std::move(job));
+}
+
+namespace {
+enum class ProbeTcpOutcome { kReachable, kRefused, kUnreachable };
+
+// Non-blocking TCP connect with a bounded wait.  A refused connection is
+// proof that the owner process is gone; a timeout is inconclusive.
+ProbeTcpOutcome ProbeTcpEndpointOnce(const std::string& host,
+                                     const std::string& port, int timeout_ms) {
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 ||
+        res == nullptr) {
+        LOG(INFO) << "death_probe_resolve_fail host=" << host
+                  << " port=" << port;
+        return ProbeTcpOutcome::kUnreachable;
+    }
+    for (auto* ai = res; ai != nullptr; ai = ai->ai_next) {
+        const int fd =
+            ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            LOG(INFO) << "death_probe_socket_fail host=" << host
+                      << " port=" << port << " errno=" << errno;
+            continue;
+        }
+        const int fl = ::fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) {
+            ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        }
+        int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0) {
+            LOG(INFO) << "death_probe_connect_sync host=" << host
+                      << " port=" << port << " result=reachable";
+            ::close(fd);
+            freeaddrinfo(res);
+            return ProbeTcpOutcome::kReachable;
+        }
+        if (errno != EINPROGRESS) {
+            const bool refused = (errno == ECONNREFUSED);
+            LOG(INFO) << "death_probe_connect_sync host=" << host
+                      << " port=" << port << " errno=" << errno
+                      << " result=" << (refused ? "refused" : "unreachable");
+            ::close(fd);
+            freeaddrinfo(res);
+            return refused ? ProbeTcpOutcome::kRefused
+                           : ProbeTcpOutcome::kUnreachable;
+        }
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        rc = ::poll(&pfd, 1, timeout_ms);
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        ::close(fd);
+        freeaddrinfo(res);
+        LOG(INFO) << "death_probe_connect host=" << host << " port=" << port
+                  << " poll_rc=" << rc << " so_error=" << so_error
+                  << " revents=" << pfd.revents;
+        if (rc > 0 && so_error == 0) {
+            return ProbeTcpOutcome::kReachable;
+        }
+        return so_error == ECONNREFUSED ? ProbeTcpOutcome::kRefused
+                                        : ProbeTcpOutcome::kUnreachable;
+    }
+    freeaddrinfo(res);
+    LOG(INFO) << "death_probe_no_addr host=" << host << " port=" << port;
+    return ProbeTcpOutcome::kUnreachable;
+}
+}  // namespace
+
+MasterService::ClientDeathProbeOutcome MasterService::ProbeClientEndpoints(
+    const std::vector<std::string>& endpoints, uint32_t timeout_ms) {
+    bool any_refused = false;
+    LOG(INFO) << "death_probe_try count=" << endpoints.size();
+    for (const auto& endpoint : endpoints) {
+        // Endpoints are "host:port" strings.
+        const auto colon = endpoint.rfind(':');
+        if (colon == std::string::npos || colon == 0 ||
+            colon + 1 >= endpoint.size()) {
+            continue;
+        }
+        const auto outcome = ProbeTcpEndpointOnce(endpoint.substr(0, colon),
+                                                  endpoint.substr(colon + 1),
+                                                  static_cast<int>(timeout_ms));
+        if (outcome == ProbeTcpOutcome::kReachable) {
+            return ClientDeathProbeOutcome::kReachable;
+        }
+        any_refused = any_refused || outcome == ProbeTcpOutcome::kRefused;
+    }
+    return any_refused ? ClientDeathProbeOutcome::kRefused
+                       : ClientDeathProbeOutcome::kTimeout;
+}
+
+std::vector<std::string> MasterService::GetClientSegmentEndpoints(
+    const UUID& client_id) {
+    std::vector<std::string> endpoints;
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    if (segment_access.GetClientSegments(client_id, segments) ==
+        ErrorCode::OK) {
+        for (const auto& segment : segments) {
+            if (!segment.te_endpoint.empty()) {
+                endpoints.push_back(segment.te_endpoint);
+            }
+        }
+    }
+    return endpoints;
+}
+
+void MasterService::ClientDeathProbeThreadFunc() {
+    while (client_death_probe_running_) {
+        if (AdmitsBusinessWorkers()) {
+            ClientDeathProbeRound();
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kClientDeathProbeSleepMs));
+    }
+}
+
+void MasterService::ClientDeathProbeRound() {
+    const auto now = ClientLivenessRecord::Clock::now();
+
+    std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
+        suspected;
+    {
+        std::shared_lock<std::shared_mutex> lock(client_mutex_);
+        for (const auto& entry : client_liveness_records_) {
+            if (entry.second->state() == ClientLivenessState::SUSPECTED) {
+                suspected.push_back(entry);
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(client_death_probe_mutex_);
+        for (auto it = client_death_probes_.begin();
+             it != client_death_probes_.end();) {
+            const bool still_suspected = std::any_of(
+                suspected.begin(), suspected.end(),
+                [&it](const std::pair<
+                      UUID, std::shared_ptr<ClientLivenessRecord>>& entry) {
+                    return entry.first == it->first;
+                });
+            it = still_suspected ? std::next(it)
+                                 : client_death_probes_.erase(it);
+        }
+    }
+
+    if (suspected.empty()) {
+        return;
+    }
+
+    for (const auto& [client_id, record] : suspected) {
+        std::vector<std::string> endpoints;
+        bool due = false;
+        {
+            std::lock_guard<std::mutex> lock(client_death_probe_mutex_);
+            auto& probe = client_death_probes_[client_id];
+            if (!probe.endpoints_ready) {
+                probe.endpoints = GetClientSegmentEndpoints(client_id);
+                probe.endpoints_ready = true;
+            }
+            due = (probe.next_probe_at <= now);
+            endpoints = probe.endpoints;
+        }
+        if (!due) {
+            continue;
+        }
+
+        // A suspected client that no longer holds any segment has nothing
+        // left for the master to clean up (typically the client unmounted
+        // its own segments during a graceful exit); retire it immediately
+        // instead of probing an empty endpoint list.
+        const auto outcome =
+            endpoints.empty()
+                ? ClientDeathProbeOutcome::kNoSegments
+                : ProbeClientEndpoints(
+                      endpoints, static_cast<uint32_t>(
+                                     client_death_probe_timeout_ms_.count()));
+        bool force_offline = false;
+        {
+            std::lock_guard<std::mutex> lock(client_death_probe_mutex_);
+            auto it = client_death_probes_.find(client_id);
+            if (it == client_death_probes_.end()) {
+                continue;
+            }
+            auto& probe = it->second;
+            if (outcome == ClientDeathProbeOutcome::kReachable) {
+                probe.consecutive_failures = 0;
+            } else if (outcome == ClientDeathProbeOutcome::kRefused ||
+                       outcome == ClientDeathProbeOutcome::kNoSegments) {
+                // A refused connection proves the owner process is gone;
+                // no registered segment means nothing to protect.
+                client_death_probes_.erase(it);
+                force_offline = true;
+            } else {
+                probe.consecutive_failures++;
+                if (probe.consecutive_failures >=
+                    client_death_probe_failures_threshold_) {
+                    client_death_probes_.erase(it);
+                    force_offline = true;
+                }
+            }
+            probe.next_probe_at = now + client_death_probe_interval_ms_;
+        }
+
+        if (force_offline) {
+            const char* reason =
+                outcome == ClientDeathProbeOutcome::kNoSegments
+                    ? "no_segments_registered"
+                    : (outcome == ClientDeathProbeOutcome::kRefused
+                           ? "endpoint_refused"
+                           : "probe_timeouts_exhausted");
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", action=client_death_probe_force_offline"
+                         << ", reason=" << reason;
+            // Confirmed dead: skip the remaining suspicion TTL.
+            const auto transition = record->EvaluateAndRetire(
+                now, std::chrono::seconds(client_active_ttl_sec_),
+                std::chrono::seconds(0),
+                [this] { client_offboarding_worker_.ReserveJob(); },
+                [this, client_id, record] {
+                    RetireClientSession(client_id, record);
+                });
+            if (transition == ClientLivenessTransition::BECAME_OFFLINE) {
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=client_liveness_offline_by_death_probe";
+            }
+        }
     }
 }
 

@@ -153,6 +153,13 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // Device runtimes (e.g. accelerator SDKs) may have reconfigured the main
+    // thread's signal masks and handlers during device initialization, which
+    // would silently break the standalone signal contract established at
+    // startup and leave mounted segments behind when the process is killed.
+    // Re-assert the contract now that setup has completed.
+    mooncake::ResourceTracker::getInstance().rearmStandaloneSignals();
+
     if (client_inst->start_dummy_client_monitor()) {
         LOG(FATAL) << "Failed to start dummy client monitor thread";
         return -1;
