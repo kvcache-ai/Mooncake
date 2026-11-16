@@ -72,6 +72,10 @@ BucketBackendConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS,
                         config.disk_scan_cache_ms);
 
+    config.metadata_reserve_keys = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_BUCKET_METADATA_RESERVE_KEYS,
+        config.metadata_reserve_keys);
+
     // Per-disk quota list, positionally aligned with the storage path comma
     // list. Skipping an empty or unparsable entry would shift every later disk
     // onto its neighbour's quota, and falling back to the scalar quota would

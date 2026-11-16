@@ -49,6 +49,8 @@ struct BucketBackendEnvironment {
         "MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES"};
     ScopedEnvVar disk_scan_cache_ms{
         "MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS"};
+    ScopedEnvVar metadata_reserve_keys{
+        "MOONCAKE_OFFLOAD_BUCKET_METADATA_RESERVE_KEYS"};
     ScopedEnvVar eviction_policy{"MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar legacy_eviction_policy{"MOONCAKE_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar flush_partial_buckets{
@@ -69,6 +71,7 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.max_total_size, 0);
     EXPECT_EQ(config.max_physical_bytes, 0);
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
+    EXPECT_EQ(config.metadata_reserve_keys, 0);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
     EXPECT_FALSE(config.flush_partial_buckets);
     EXPECT_FALSE(config.aligned_direct_write);
@@ -101,9 +104,10 @@ TEST_F(BucketBackendConfigTest, ReadsPartialFlushBooleanValues) {
           Case{"FALSE", false}, Case{"invalid", false}}) {
         SCOPED_TRACE(entry.value);
         env.flush_partial_buckets.Set(entry.value);
-        EXPECT_EQ(
-            BucketBackendConfig::FromEnvironment().value().flush_partial_buckets,
-            entry.enabled);
+        EXPECT_EQ(BucketBackendConfig::FromEnvironment()
+                      .value()
+                      .flush_partial_buckets,
+                  entry.enabled);
     }
 }
 
@@ -126,6 +130,7 @@ TEST_F(BucketBackendConfigTest, ReadsIndependentValidValues) {
     env.max_total_size.Set("1073741824");
     env.max_physical_bytes.Set("2147483648");
     env.disk_scan_cache_ms.Set("250");
+    env.metadata_reserve_keys.Set("2000000");
     env.eviction_policy.Set("lru");
 
     const auto config = BucketBackendConfig::FromEnvironment().value();
@@ -135,6 +140,7 @@ TEST_F(BucketBackendConfigTest, ReadsIndependentValidValues) {
     EXPECT_EQ(config.max_total_size, 1073741824);
     EXPECT_EQ(config.max_physical_bytes, 2147483648);
     EXPECT_EQ(config.disk_scan_cache_ms, 250);
+    EXPECT_EQ(config.metadata_reserve_keys, 2000000);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::LRU);
 }
 
@@ -159,6 +165,7 @@ TEST_F(BucketBackendConfigTest, InvalidIntegersUseIndividualDefaults) {
         env.size_limit.Set(value);
         env.max_physical_bytes.Set(value);
         env.disk_scan_cache_ms.Set(value);
+        env.metadata_reserve_keys.Set(value);
         ::testing::internal::CaptureStderr();
 
         const auto config = BucketBackendConfig::FromEnvironment().value();
@@ -168,11 +175,13 @@ TEST_F(BucketBackendConfigTest, InvalidIntegersUseIndividualDefaults) {
         EXPECT_EQ(config.bucket_size_limit, 256 * 1024 * 1024) << value;
         EXPECT_EQ(config.max_physical_bytes, 0) << value;
         EXPECT_EQ(config.disk_scan_cache_ms, 500) << value;
+        EXPECT_EQ(config.metadata_reserve_keys, 0) << value;
         for (const char* name : {
                  "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT",
                  "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES",
                  "MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES",
                  "MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
+                 "MOONCAKE_OFFLOAD_BUCKET_METADATA_RESERVE_KEYS",
              }) {
             EXPECT_NE(logs.find(name), std::string::npos)
                 << name << '=' << value;
