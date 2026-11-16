@@ -75,6 +75,7 @@ add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
+add_store_test(client_session_registry_test client_session_registry_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
@@ -433,6 +434,7 @@ add_store_test(redis_connection_config_test redis_connection_config_test.cpp)
 add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
+add_store_test(nvme_kv_object_store_test nvme_kv/object_store_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(bucket_direct_write_test bucket_direct_write_test.cpp)
 if(TARGET Mooncake::liburing)
@@ -605,6 +607,8 @@ add_ha_test(oplog_batch_standby_reader_test
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ha_metric_manager_test
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(oplog_batch_storage_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ordered_oplog_writer_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
