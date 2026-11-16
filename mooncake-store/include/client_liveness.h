@@ -180,6 +180,7 @@ class ClientLivenessRecord {
     }
 
    private:
+    friend class ClientSessionRegistry;
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now, ClientLivenessState current_state) {
         last_liveness_at_ = now;
