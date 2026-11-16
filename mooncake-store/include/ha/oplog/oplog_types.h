@@ -23,6 +23,7 @@ enum class OpType : uint8_t {
     WEIGHT_METADATA_DELETE = 9,
     WEIGHT_LEASE_UPSERT = 10,
     WEIGHT_LEASE_DELETE = 11,
+    OBJECT_STORAGE_MUTATION = 12,
     OP_TYPE_MAX,
 };
 

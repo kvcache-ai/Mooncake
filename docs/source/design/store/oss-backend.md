@@ -280,3 +280,6 @@ for context.
   metadata usage can therefore differ from actual bucket usage.
 - Multipart uploads, automatic parallel range splitting, and automatic
   credential refresh are not implemented.
+
+The [object upload and cleanup recovery records](object-storage-catalog.md)
+describe the separate catalog review unit for first-class object replicas.

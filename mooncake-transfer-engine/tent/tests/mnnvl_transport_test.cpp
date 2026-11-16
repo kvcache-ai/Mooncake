@@ -13,14 +13,23 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda.h>
@@ -28,9 +37,41 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/mnnvl/mnnvl_transport.h"
 
+#ifdef MNNVL_TEST_CUDA_WRAPPERS
+namespace {
+std::atomic<bool> fail_completion_record{false};
+std::atomic<cudaEvent_t> fail_completion_query{nullptr};
+}  // namespace
+extern "C" cudaError_t CUDARTAPI __real_cudaEventRecord(cudaEvent_t,
+                                                        cudaStream_t);
+extern "C" cudaError_t CUDARTAPI __real_cudaEventQuery(cudaEvent_t);
+extern "C" cudaError_t CUDARTAPI __wrap_cudaEventRecord(cudaEvent_t event,
+                                                        cudaStream_t stream) {
+    if (stream != cudaStreamPerThread && fail_completion_record.exchange(false))
+        return cudaErrorInvalidResourceHandle;
+    return __real_cudaEventRecord(event, stream);
+}
+extern "C" cudaError_t CUDARTAPI __wrap_cudaEventQuery(cudaEvent_t event) {
+    auto expected = event;
+    if (fail_completion_query.compare_exchange_strong(expected, nullptr))
+        return cudaErrorInvalidResourceHandle;
+    return __real_cudaEventQuery(event);
+}
+#endif
+
 namespace mooncake {
+
+class TransferEngineImplTestPeer {
+   public:
+    static std::shared_ptr<tent::ControlService> metadata(
+        tent::TransferEngineImpl& engine) {
+        return engine.metadata_;
+    }
+};
+
 namespace tent {
 
 class MnnvlTransportTestPeer {
@@ -40,6 +81,82 @@ class MnnvlTransportTestPeer {
         return transport.relocateSharedMemoryAddress(address, length,
                                                      target_id);
     }
+    static void configureLocalCopies(MnnvlTransport& transport,
+                                     std::shared_ptr<ControlService> metadata) {
+        transport.metadata_ = std::move(metadata);
+        transport.platform_ =
+            dynamic_cast<CudaPlatform*>(&Platform::getLoader());
+        transport.handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
+        transport.caps.gpu_to_gpu = true;
+    }
+    static void configureRegistration(
+        MnnvlTransport& transport, std::shared_ptr<ControlService> metadata) {
+        configureLocalCopies(transport, std::move(metadata));
+        transport.handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    }
+
+    // Seed cache-only tests without creating a CUDA context or importing a
+    // real mapping. The transport stays uninstalled, so teardown never tries
+    // to unmap these synthetic addresses.
+    static void seed(MnnvlTransport& transport,
+                     std::shared_ptr<ControlService> metadata,
+                     uint64_t remote_addr, size_t length,
+                     const std::string& handle, uint64_t mapped_addr) {
+        transport.metadata_ = std::move(metadata);
+        transport.handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        MnnvlTransport::OpenedMnnvlEntry entry;
+        entry.mnnvl_addr = reinterpret_cast<void*>(mapped_addr);
+        entry.length = length;
+        entry.mapped_length = length;
+        entry.mnnvl_handle = handle;
+        transport.relocate_map_[LOCAL_SEGMENT_ID][remote_addr] =
+            std::move(entry);
+        // Production epochs count up from 1, so the high half is unique.
+        static std::atomic<uint64_t> seeded_epoch{1ull << 63};
+        transport.relocate_epoch_.store(seeded_epoch.fetch_add(1));
+    }
+
+    // Own ordinary pipe FDs without CUDA initialization. No batches, host
+    // registrations or mappings exist, so uninstall only closes these FDs.
+    static void seedExportedFd(MnnvlTransport& transport,
+                               const BufferDesc& desc, int fd) {
+        transport.installed_ = true;
+        transport.exported_fds_.emplace(desc.mnnvl_handle, fd);
+    }
+
+    static Status importHandle(MnnvlTransport& transport,
+                               CUmemAllocationHandleType type,
+                               const std::string& handle) {
+        transport.handle_type_ = type;
+        BufferDesc buffer;
+        buffer.length = 2 << 20;
+        buffer.mnnvl_handle = handle;
+        MnnvlTransport::OpenedMnnvlEntry entry;
+        auto status = transport.importRemoteBuffer(buffer, entry);
+        if (status.ok()) transport.releaseImportedEntry(entry);
+        return status;
+    }
+
+    static Status ensureContext() {
+        return MnnvlTransport::ensureCudaContext();
+    }
+
+    static Status setupPeerAccess(MnnvlTransport& transport) {
+        return transport.setPeerAccess();
+    }
+
+    // Synthetic allocation records exercise bounds checks without CUDA.
+    // The uninstalled transport never attempts to free these addresses.
+    static void seedAllocation(MnnvlTransport& transport, uint64_t base,
+                               size_t size, bool mapped = true) {
+        auto* addr = reinterpret_cast<void*>(base);
+        transport.allocate_set_[addr] = {addr, size, 0, mapped};
+    }
+
+    static Status allocationRange(MnnvlTransport& transport, uint64_t address,
+                                  size_t length, uint64_t& base, size_t& size) {
+        return transport.getLocalAllocationRange(address, length, base, size);
+    }
 };
 
 namespace {
@@ -47,6 +164,39 @@ namespace {
 constexpr uint64_t kRemoteAddress = 0x10000000;
 constexpr size_t kBufferLength = 4096;
 constexpr uint32_t kPattern = 0x5a3c69e7;
+
+class MnnvlLogSink : public google::LogSink {
+   public:
+    explicit MnnvlLogSink(int verbosity)
+        : old_v_(google::SetVLOGLevel("mnnvl_transport", verbosity)),
+          old_minloglevel_(FLAGS_minloglevel) {
+        FLAGS_minloglevel = google::INFO;
+        google::AddLogSink(this);
+    }
+    ~MnnvlLogSink() override {
+        google::RemoveLogSink(this);
+        google::SetVLOGLevel("mnnvl_transport", old_v_);
+        FLAGS_minloglevel = old_minloglevel_;
+    }
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.emplace_back(message, length);
+    }
+    size_t count(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return std::count_if(messages_.begin(), messages_.end(),
+                             [&](const std::string& message) {
+                                 return message.find(text) != std::string::npos;
+                             });
+    }
+
+   private:
+    int old_v_;
+    int old_minloglevel_;
+    std::mutex mutex_;
+    std::vector<std::string> messages_;
+};
 
 // POSIX-FD handles are imported through pidfd_getfd(), so the exporter must
 // be another process: the child allocates a VMM buffer with the
@@ -57,7 +207,7 @@ constexpr uint32_t kPattern = 0x5a3c69e7;
 // in MnnvlTransport::install(), after the child has been spawned.
 class PeerFdExporter {
    public:
-    PeerFdExporter() {
+    explicit PeerFdExporter(bool subrange = false) {
         if (pipe(ready_pipe_) != 0 || pipe(stop_pipe_) != 0) return;
 
         pid_t child = fork();
@@ -65,7 +215,7 @@ class PeerFdExporter {
         if (child == 0) {
             close(ready_pipe_[0]);
             close(stop_pipe_[1]);
-            _exit(childMain(ready_pipe_[1], stop_pipe_[0]));
+            _exit(childMain(ready_pipe_[1], stop_pipe_[0], subrange));
         }
 
         close(ready_pipe_[1]);
@@ -92,13 +242,12 @@ class PeerFdExporter {
     std::string mnnvlHandle() const {
         return std::to_string(child_pid_) + "-" + std::to_string(exported_fd_);
     }
-    // Granularity-rounded size of the child's mapping. addMemoryBuffer
-    // publishes this (not the requested length) in BufferDesc::length, and
+    // Granularity-rounded allocation extent, distinct from a logical subrange.
     // cuMemMap on the importing side requires a granularity multiple.
     size_t mappedSize() const { return mapped_size_; }
 
    private:
-    static int childMain(int ready_fd, int stop_fd) {
+    static int childMain(int ready_fd, int stop_fd, bool subrange) {
         int32_t status = 1;
         int device_count = 0;
         if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
@@ -133,6 +282,8 @@ class PeerFdExporter {
             return 4;
         size_t size =
             ((kBufferLength + granularity - 1) / granularity) * granularity;
+        if (subrange) size = 2 * size;
+        const size_t offset = subrange ? size / 2 + 64 : 0;
 
         CUmemGenericAllocationHandle handle;
         CUdeviceptr ptr = 0;
@@ -146,7 +297,9 @@ class PeerFdExporter {
 
         std::vector<uint32_t> pattern(kBufferLength / sizeof(uint32_t),
                                       kPattern);
-        if (cudaMemcpy(reinterpret_cast<void*>(ptr), pattern.data(),
+        if (cudaMemset(reinterpret_cast<void*>(ptr), 0x19, size) != cudaSuccess)
+            return 9;
+        if (cudaMemcpy(reinterpret_cast<void*>(ptr + offset), pattern.data(),
                        kBufferLength, cudaMemcpyHostToDevice) != cudaSuccess)
             return 9;
 
@@ -215,6 +368,18 @@ Status installLocalSegmentWithMnnvlHandle(ControlService& metadata,
         });
 }
 
+std::shared_ptr<Config> makeRegistrationEngineConfig() {
+    auto conf = std::make_shared<Config>();
+    conf->set("metadata_type", "p2p");
+    conf->set("rpc_server_hostname", "127.0.0.1");
+    conf->set("rpc_server_port", "0");
+    conf->set("log_level", "warning");
+    for (const auto* name : {"tcp", "shm", "rdma", "io_uring", "nvlink",
+                             "mnnvl", "gds", "ascend_direct"})
+        conf->set(std::string("transports/") + name + "/enable", false);
+    return conf;
+}
+
 std::shared_ptr<Config> makePosixFdConfig() {
     auto conf = std::make_shared<Config>();
     conf->set("transports/nvlink/handle_type", std::string("posix_fd"));
@@ -230,6 +395,217 @@ pid_t exitedChildPid() {
 }
 
 }  // namespace
+
+TEST(MnnvlTransportTest, OwnedVmmRangeIncludesSubranges) {
+    MnnvlTransport transport;
+    constexpr size_t mapped_size = 48 << 20;
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           mapped_size);
+    for (uint64_t address : {kRemoteAddress, kRemoteAddress + 64,
+                             kRemoteAddress + mapped_size - 64}) {
+        uint64_t base = 0;
+        size_t size = 0;
+        ASSERT_TRUE(MnnvlTransportTestPeer::allocationRange(transport, address,
+                                                            64, base, size)
+                        .ok());
+        EXPECT_EQ(base, kRemoteAddress);
+        EXPECT_EQ(size, mapped_size);
+    }
+}
+
+TEST(MnnvlTransportTest, OwnedVmmRangeRejectsOverflowAndOverrun) {
+    MnnvlTransport transport;
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           kBufferLength);
+    uint64_t base = 0;
+    size_t size = 0;
+    EXPECT_FALSE(
+        MnnvlTransportTestPeer::allocationRange(
+            transport, kRemoteAddress + kBufferLength - 32, 64, base, size)
+            .ok());
+    EXPECT_EQ(base, 0u);
+    EXPECT_EQ(size, 0u);
+    EXPECT_FALSE(MnnvlTransportTestPeer::allocationRange(
+                     transport, UINT64_MAX - 31, 64, base, size)
+                     .ok());
+    EXPECT_FALSE(MnnvlTransportTestPeer::allocationRange(
+                     transport, kRemoteAddress, 0, base, size)
+                     .ok());
+    EXPECT_FALSE(
+        MnnvlTransportTestPeer::allocationRange(transport, 0, 64, base, size)
+            .ok());
+
+    // Reject before exporting or initializing CUDA, even in non-strict mode.
+    BufferDesc desc;
+    desc.addr = kRemoteAddress + kBufferLength - 32;
+    desc.length = 64;
+    desc.location = "cpu:0";
+    MemoryOptions options;
+    options.type = MNNVL;
+    EXPECT_FALSE(transport.addMemoryBuffer(desc, options).ok());
+    EXPECT_TRUE(desc.mnnvl_handle.empty());
+    EXPECT_TRUE(desc.transports.empty());
+}
+
+TEST(MnnvlTransportTest, OwnedVmmRangeIgnoresUnknownAndUnmappedBuffers) {
+    MnnvlTransport transport;
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           kBufferLength);
+    for (uint64_t address :
+         {kRemoteAddress - 64, kRemoteAddress + kBufferLength}) {
+        uint64_t base = 1;
+        size_t size = 1;
+        EXPECT_TRUE(MnnvlTransportTestPeer::allocationRange(transport, address,
+                                                            64, base, size)
+                        .ok());
+        EXPECT_EQ(base, 0u);
+        EXPECT_EQ(size, 0u);
+    }
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           kBufferLength, false);
+    uint64_t base = 1;
+    size_t size = 1;
+    EXPECT_TRUE(MnnvlTransportTestPeer::allocationRange(
+                    transport, kRemoteAddress, 64, base, size)
+                    .ok());
+    EXPECT_EQ(base, 0u);
+    EXPECT_EQ(size, 0u);
+    MnnvlTransportTestPeer::seedAllocation(transport, UINT64_MAX - 31, 64);
+    EXPECT_TRUE(MnnvlTransportTestPeer::allocationRange(
+                    transport, UINT64_MAX - 31, 16, base, size)
+                    .ok());
+    EXPECT_EQ(base, 0u);
+    EXPECT_EQ(size, 0u);
+}
+
+TEST(MnnvlTransportTest, RemovingSameBaseRegistrationKeepsOtherExportOpen) {
+    for (int removed_index : {0, 1}) {
+        SCOPED_TRACE(removed_index);
+        int fds[2];
+        ASSERT_EQ(pipe(fds), 0);
+        MnnvlTransport transport;
+        BufferDesc descs[2];
+        for (int i = 0; i < 2; ++i) {
+            descs[i].addr = kRemoteAddress;
+            descs[i].length = kBufferLength;
+            descs[i].mnnvl_handle =
+                std::to_string(getpid()) + "-" + std::to_string(fds[i]);
+            MnnvlTransportTestPeer::seedExportedFd(transport, descs[i], fds[i]);
+        }
+        const int survivor_index = 1 - removed_index;
+        const auto removed_desc = descs[removed_index];
+        const auto survivor_handle = descs[survivor_index].mnnvl_handle;
+        EXPECT_TRUE(transport.removeMemoryBuffer(descs[removed_index]).ok());
+        EXPECT_TRUE(descs[removed_index].mnnvl_handle.empty());
+        EXPECT_EQ(fcntl(fds[removed_index], F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+        EXPECT_GE(fcntl(fds[survivor_index], F_GETFD), 0);
+        EXPECT_EQ(descs[survivor_index].mnnvl_handle, survivor_handle);
+
+        // Failed/foreign registration cleanup at the same base owns no FD.
+        auto unowned = descs[survivor_index];
+        unowned.mnnvl_handle.clear();
+        EXPECT_TRUE(transport.removeMemoryBuffer(unowned).ok());
+        unowned.mnnvl_handle = "unowned-handle";
+        EXPECT_TRUE(transport.removeMemoryBuffer(unowned).ok());
+        EXPECT_GE(fcntl(fds[survivor_index], F_GETFD), 0);
+
+        // A repeated removal must not close an unrelated reused FD number.
+        int reused_fd = dup(fds[survivor_index]);
+        ASSERT_GE(reused_fd, 0);
+        auto stale_desc = removed_desc;
+        EXPECT_TRUE(transport.removeMemoryBuffer(stale_desc).ok());
+        EXPECT_GE(fcntl(reused_fd, F_GETFD), 0);
+        EXPECT_EQ(close(reused_fd), 0);
+        EXPECT_TRUE(transport.removeMemoryBuffer(descs[removed_index]).ok());
+        EXPECT_GE(fcntl(fds[survivor_index], F_GETFD), 0);
+
+        EXPECT_TRUE(transport.removeMemoryBuffer(descs[survivor_index]).ok());
+        EXPECT_EQ(fcntl(fds[survivor_index], F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+    }
+}
+
+TEST(MnnvlTransportTest, UninstallClosesAllSameBaseExports) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    MnnvlTransport transport;
+    for (int fd : fds) {
+        BufferDesc desc;
+        desc.addr = kRemoteAddress;
+        desc.length = kBufferLength;
+        desc.mnnvl_handle = std::to_string(getpid()) + "-" + std::to_string(fd);
+        MnnvlTransportTestPeer::seedExportedFd(transport, desc, fd);
+    }
+    EXPECT_TRUE(transport.uninstall().ok());
+    for (int fd : fds) {
+        EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+    }
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, MalformedHandlesReturnErrorsWithoutThrowing) {
+    MnnvlTransport transport;
+    for (const std::string handle : {"not-a-pid-fd", "123-fd", "0-3",
+                                     "123-3junk", "99999999999999999999-3"}) {
+        SCOPED_TRACE(handle);
+        EXPECT_FALSE(
+            MnnvlTransportTestPeer::importHandle(
+                transport, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, handle)
+                .ok());
+    }
+    for (const std::string handle : {"f", "zz", "00"}) {
+        SCOPED_TRACE(handle);
+        EXPECT_FALSE(MnnvlTransportTestPeer::importHandle(
+                         transport, CU_MEM_HANDLE_TYPE_FABRIC, handle)
+                         .ok());
+    }
+}
+
+TEST(MnnvlTransportTest, RelocationCacheDetectsChangedPeerHandle) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "cached-handle", kRemoteAddress, kBufferLength)
+                    .ok());
+    MnnvlTransport transport;
+    constexpr uint64_t mapped_addr = 0x20000000;
+    MnnvlTransportTestPeer::seed(transport, metadata, kRemoteAddress,
+                                 kBufferLength, "cached-handle", mapped_addr);
+    uint64_t address = kRemoteAddress + 64;
+    ASSERT_TRUE(MnnvlTransportTestPeer::relocate(transport, address, 64,
+                                                 LOCAL_SEGMENT_ID)
+                    .ok());
+    EXPECT_EQ(address, mapped_addr + 64);
+
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "not-a-pid-fd", kRemoteAddress, kBufferLength)
+                    .ok());
+    address = kRemoteAddress + 64;
+    EXPECT_FALSE(MnnvlTransportTestPeer::relocate(transport, address, 64,
+                                                  LOCAL_SEGMENT_ID)
+                     .ok());
+    EXPECT_EQ(address, kRemoteAddress + 64);
+}
+
+TEST(MnnvlTransportTest, RelocationCacheIsIsolatedBetweenInstances) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "cached-handle", kRemoteAddress, kBufferLength)
+                    .ok());
+    MnnvlTransport first, second;
+    MnnvlTransportTestPeer::seed(first, metadata, kRemoteAddress, kBufferLength,
+                                 "cached-handle", 0x20000000);
+    MnnvlTransportTestPeer::seed(second, metadata, kRemoteAddress,
+                                 kBufferLength, "cached-handle", 0x30000000);
+    for (auto* transport : {&first, &second, &first}) {
+        uint64_t address = kRemoteAddress;
+        ASSERT_TRUE(MnnvlTransportTestPeer::relocate(*transport, address, 64,
+                                                     LOCAL_SEGMENT_ID)
+                        .ok());
+        EXPECT_EQ(address, transport == &first ? 0x20000000u : 0x30000000u);
+    }
+}
 
 // Regression guard: cuMemImportFromShareableHandle() takes the POSIX fd
 // value itself cast to void*, not a pointer to it. Passing &fd failed with
@@ -276,7 +652,72 @@ TEST(MnnvlTransportTest, RelocateImportsPosixFdHandle) {
     for (uint32_t value : readback) {
         EXPECT_EQ(value, kPattern);
     }
+    // The same thread must not reuse a mapping after uninstall/reinstall.
+    const auto old_mapping = dest_addr;
     ASSERT_TRUE(transport.uninstall().ok());
+    unsigned long long flags = 0;
+    CUmemLocation location{};
+    location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    location.id = 0;
+    EXPECT_NE(cuMemGetAccess(&flags, &location, (CUdeviceptr)old_mapping),
+              CUDA_SUCCESS);
+    ASSERT_TRUE(
+        transport
+            .install(local_segment_name, metadata, nullptr, makePosixFdConfig())
+            .ok());
+    dest_addr = kRemoteAddress + 64;
+    ASSERT_TRUE(MnnvlTransportTestPeer::relocate(
+                    transport, dest_addr, kBufferLength - 64, LOCAL_SEGMENT_ID)
+                    .ok());
+    ASSERT_EQ(cudaMemcpy(readback.data(), reinterpret_cast<void*>(dest_addr),
+                         kBufferLength - 64, cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (uint32_t value : readback) EXPECT_EQ(value, kPattern);
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, RelocateImportsLogicalSubrangeAndBoundsCache) {
+    PeerFdExporter exporter(true);
+    if (!exporter.forkOk() || !exporter.valid())
+        GTEST_SKIP() << "Peer export failed (fork/pipe error)";
+    if (exporter.childStatus() != 0)
+        GTEST_SKIP() << "No CUDA device with POSIX-FD VMM support";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+    const uint64_t offset = exporter.mappedSize() / 2 + 64;
+    const auto handle = json{
+        {"version", 1},
+        {"handle", exporter.mnnvlHandle()},
+        {"mapped_length", exporter.mappedSize()},
+        {"offset", offset}}.dump();
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, handle, kRemoteAddress, kBufferLength)
+                    .ok());
+    MnnvlTransport transport;
+    std::string name = "mnnvl_test_segment";
+    const auto installed =
+        transport.install(name, metadata, nullptr, makePosixFdConfig());
+    if (!installed.ok())
+        GTEST_SKIP() << "MnnvlTransport::install failed: "
+                     << installed.ToString();
+    for (uint64_t within_range : {uint64_t{0}, uint64_t{64}}) {
+        uint64_t address = kRemoteAddress + within_range;
+        ASSERT_TRUE(MnnvlTransportTestPeer::relocate(
+                        transport, address, kBufferLength - within_range,
+                        LOCAL_SEGMENT_ID)
+                        .ok());
+        std::vector<uint32_t> output((kBufferLength - within_range) / 4);
+        ASSERT_EQ(cudaMemcpy(output.data(), reinterpret_cast<void*>(address),
+                             output.size() * 4, cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        for (auto value : output) EXPECT_EQ(value, kPattern);
+    }
+    uint64_t outside = kRemoteAddress + kBufferLength;
+    EXPECT_FALSE(MnnvlTransportTestPeer::relocate(transport, outside, 1,
+                                                  LOCAL_SEGMENT_ID)
+                     .ok());
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 // A peer that is gone (or never exported the fd) must surface as a failed
@@ -313,6 +754,866 @@ TEST(MnnvlTransportTest, RelocateFailsCleanlyWhenPeerIsGone) {
                      transport, dest_addr, kBufferLength, LOCAL_SEGMENT_ID)
                      .ok());
     ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// The relocation cache is thread-local. A new transport, or a reinstalled one,
+// must not reach a peer address through mappings imported before it.
+TEST(MnnvlTransportTest, RelocateCacheIsScopedToTransportInstallation) {
+    PeerFdExporter exporter;
+    pid_t dead_pid = exitedChildPid();
+    if (!exporter.forkOk() || !exporter.valid() || dead_pid <= 0)
+        GTEST_SKIP() << "Peer export failed (fork/pipe error)";
+    if (exporter.childStatus() != 0)
+        GTEST_SKIP() << "No CUDA device with POSIX-FD VMM support";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+
+    auto live = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *live, exporter.mnnvlHandle(), kRemoteAddress,
+                    exporter.mappedSize())
+                    .ok());
+    auto dead = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *dead, std::to_string(dead_pid) + "-3", kRemoteAddress,
+                    exporter.mappedSize())
+                    .ok());
+
+    std::string name = "mnnvl_test_segment";
+    {
+        MnnvlTransport probe;
+        const auto installed =
+            probe.install(name, live, nullptr, makePosixFdConfig());
+        if (!installed.ok())
+            GTEST_SKIP() << "MnnvlTransport::install failed: "
+                         << installed.ToString();
+        ASSERT_TRUE(probe.uninstall().ok());
+    }
+    auto relocate_once = [&](MnnvlTransport& transport,
+                             std::shared_ptr<ControlService> metadata) {
+        auto status =
+            transport.install(name, metadata, nullptr, makePosixFdConfig());
+        if (!status.ok()) return status;
+        uint64_t address = kRemoteAddress;
+        status = MnnvlTransportTestPeer::relocate(
+            transport, address, kBufferLength, LOCAL_SEGMENT_ID);
+        EXPECT_TRUE(transport.uninstall().ok());
+        return status;
+    };
+
+    MnnvlTransport first, second;
+    EXPECT_TRUE(relocate_once(first, live).ok());
+    EXPECT_FALSE(relocate_once(second, dead).ok());  // new instance
+    EXPECT_TRUE(relocate_once(second, live).ok());
+    EXPECT_FALSE(relocate_once(second, dead).ok());  // reinstalled instance
+}
+
+// A malformed POSIX-FD handle published by a peer must fail the relocate
+// instead of escaping parsePidFd() as an exception.
+TEST(MnnvlTransportTest, RelocateRejectsMalformedPosixFdHandle) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(*metadata, "not-a-pid-fd",
+                                                   kRemoteAddress, 2 << 20)
+                    .ok());
+
+    MnnvlTransport transport;
+    std::string local_segment_name = "mnnvl_test_segment";
+    auto status = transport.install(local_segment_name, metadata, nullptr,
+                                    makePosixFdConfig());
+    if (!status.ok()) {
+        GTEST_SKIP() << "MnnvlTransport::install failed: " << status.ToString();
+    }
+
+    uint64_t dest_addr = kRemoteAddress;
+    EXPECT_FALSE(MnnvlTransportTestPeer::relocate(
+                     transport, dest_addr, kBufferLength, LOCAL_SEGMENT_ID)
+                     .ok());
+    EXPECT_EQ(dest_addr, kRemoteAddress);
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// transports/mnnvl/egm_strict without transports/mnnvl/egm must refuse host
+// allocations instead of silently handing out memory peers cannot address.
+TEST(MnnvlTransportTest, StrictEgmRejectsHostAllocationWithoutEgm) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/mnnvl/egm", false);
+    conf->set("transports/mnnvl/egm_strict", true);
+
+    MnnvlTransport transport;
+    std::string local_segment_name = "mnnvl_test_segment";
+    auto status =
+        transport.install(local_segment_name, metadata, nullptr, conf);
+    if (!status.ok()) {
+        GTEST_SKIP() << "MnnvlTransport::install failed: " << status.ToString();
+    }
+
+    MemoryOptions options;
+    options.location = "cpu:0";
+    void* addr = nullptr;
+    EXPECT_FALSE(transport.allocateLocalMemory(&addr, 2 << 20, options).ok());
+    EXPECT_EQ(addr, nullptr);
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, StrictRegistrationCleanupPreservesCallerPinning) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/mnnvl/egm", true);
+    conf->set("transports/mnnvl/egm_strict", true);
+    MnnvlTransport transport;
+    std::string segment_name = "mnnvl_test_segment";
+    auto status = transport.install(segment_name, metadata, nullptr, conf);
+    if (!status.ok()) GTEST_SKIP() << status.ToString();
+
+    std::vector<uint8_t> buffer(kBufferLength);
+    ASSERT_EQ(
+        cudaHostRegister(buffer.data(), buffer.size(), cudaHostRegisterDefault),
+        cudaSuccess);
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(buffer.data());
+    desc.length = buffer.size();
+    desc.location = "cpu:0";
+    MemoryOptions options;
+    options.type = MNNVL;
+    EXPECT_FALSE(transport.addMemoryBuffer(desc, options).ok());
+    EXPECT_TRUE(desc.mnnvl_handle.empty());
+    EXPECT_FALSE(transport.tracksLocalBuffer(desc));
+    EXPECT_TRUE(transport.removeMemoryBuffer(desc).ok());
+    // Caller ownership remains intact after defensive engine cleanup.
+    EXPECT_EQ(cudaHostUnregister(buffer.data()), cudaSuccess);
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// Exercise actual export bookkeeping for two subranges of one VMM
+// allocation. Unlike the pipe tests, this requires a CUDA-capable host.
+TEST(MnnvlTransportTest, SameVmmBaseRegistrationsKeepIndependentExports) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+    CUdevice device;
+    ASSERT_EQ(cuDeviceGet(&device, 0), CUDA_SUCCESS);
+    int fd_supported = 0;
+    ASSERT_EQ(
+        cuDeviceGetAttribute(
+            &fd_supported,
+            CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED,
+            device),
+        CUDA_SUCCESS);
+    if (!fd_supported) GTEST_SKIP() << "No POSIX-FD VMM support";
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    MnnvlTransport transport;
+    std::string segment_name = "mnnvl_test_segment";
+    auto conf = makePosixFdConfig();
+    conf->set("transports/mnnvl/egm_strict", true);
+    auto status = transport.install(segment_name, metadata, nullptr, conf);
+    if (!status.ok()) GTEST_SKIP() << status.ToString();
+
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cuda:0";
+    void* ptr = nullptr;
+    ASSERT_TRUE(
+        transport.allocateLocalMemory(&ptr, kBufferLength, options).ok());
+    auto free_buffer = [&transport](void* addr) {
+        EXPECT_TRUE(transport.freeLocalMemory(addr, kBufferLength).ok());
+    };
+    std::unique_ptr<void, decltype(free_buffer)> allocation(ptr, free_buffer);
+    BufferDesc first;
+    first.addr = reinterpret_cast<uint64_t>(ptr);
+    first.length = kBufferLength / 2;
+    first.location = options.location;
+    BufferDesc second = first;
+    second.addr += kBufferLength / 2;
+    uint64_t mapped_base = 0;
+    size_t mapped_size = 0;
+    ASSERT_TRUE(
+        MnnvlTransportTestPeer::allocationRange(
+            transport, first.addr, first.length, mapped_base, mapped_size)
+            .ok());
+    ASSERT_EQ(mapped_base, reinterpret_cast<uint64_t>(ptr));
+    ASSERT_GE(mapped_size, kBufferLength);
+    ASSERT_TRUE(transport.addMemoryBuffer(first, options).ok());
+    ASSERT_FALSE(first.mnnvl_handle.empty());
+    std::thread registration_thread([&] {
+        CUcontext context = nullptr;
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        ASSERT_EQ(context, nullptr);
+        auto registered = transport.addMemoryBuffer(second, options);
+        ASSERT_TRUE(registered.ok()) << registered.ToString();
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        EXPECT_NE(context, nullptr);
+    });
+    registration_thread.join();
+    ASSERT_FALSE(second.mnnvl_handle.empty());
+    // Both keep their logical ranges; envelopes describe the shared mapping.
+    EXPECT_EQ(first.addr, mapped_base);
+    EXPECT_EQ(first.length, kBufferLength / 2);
+    EXPECT_EQ(second.addr, mapped_base + kBufferLength / 2);
+    EXPECT_EQ(second.length, kBufferLength / 2);
+    EXPECT_NE(first.mnnvl_handle, second.mnnvl_handle);
+    const auto first_export = json::parse(first.mnnvl_handle);
+    const auto second_export = json::parse(second.mnnvl_handle);
+    EXPECT_EQ(first_export.at("mapped_length").get<size_t>(), mapped_size);
+    EXPECT_EQ(second_export.at("mapped_length").get<size_t>(), mapped_size);
+    EXPECT_EQ(first_export.at("offset").get<size_t>(), 0u);
+    EXPECT_EQ(second_export.at("offset").get<size_t>(), kBufferLength / 2);
+    auto exported_fd = [](const json& envelope) {
+        const auto handle = envelope.at("handle").get<std::string>();
+        return std::stoi(handle.substr(handle.find_last_of('-') + 1));
+    };
+    const int first_fd = exported_fd(first_export);
+    const int second_fd = exported_fd(second_export);
+    EXPECT_GE(fcntl(first_fd, F_GETFD), 0);
+    EXPECT_GE(fcntl(second_fd, F_GETFD), 0);
+
+    EXPECT_TRUE(transport.removeMemoryBuffer(first).ok());
+    EXPECT_EQ(fcntl(first_fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    EXPECT_GE(fcntl(second_fd, F_GETFD), 0);
+    // The surviving published FD must remain importable, not merely open.
+    CUmemGenericAllocationHandle imported;
+    ASSERT_EQ(cuMemImportFromShareableHandle(
+                  &imported,
+                  reinterpret_cast<void*>(static_cast<uintptr_t>(second_fd)),
+                  CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+              CUDA_SUCCESS);
+    EXPECT_EQ(cuMemRelease(imported), CUDA_SUCCESS);
+    EXPECT_TRUE(transport.removeMemoryBuffer(second).ok());
+    EXPECT_EQ(fcntl(second_fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    allocation.reset();
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, PeerAccessInitializesCudaContextOnFreshThread) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+    std::thread worker([] {
+        CUcontext context = nullptr;
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        ASSERT_EQ(context, nullptr);
+        MnnvlTransport transport;
+        auto status = MnnvlTransportTestPeer::setupPeerAccess(transport);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        EXPECT_NE(context, nullptr);
+    });
+    worker.join();
+}
+
+TEST(MnnvlTransportTest, PreservesCurrentCudaContext) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    // Also exercise a nonzero selected device when more than one is visible.
+    ASSERT_EQ(cudaSetDevice(device_count - 1), cudaSuccess);
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    CUcontext before = nullptr;
+    ASSERT_EQ(cuCtxGetCurrent(&before), CUDA_SUCCESS);
+    ASSERT_NE(before, nullptr);
+    auto status = MnnvlTransportTestPeer::ensureContext();
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    CUcontext after = nullptr;
+    ASSERT_EQ(cuCtxGetCurrent(&after), CUDA_SUCCESS);
+    EXPECT_EQ(after, before);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+}
+
+namespace {
+
+// Completion and caller ordering need a CUDA device, but not an IMEX domain.
+// Only the FABRIC allocation/import cases need actual MNNVL hardware.
+class MnnvlCompletionTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0)
+            GTEST_SKIP() << "No CUDA device available";
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&source_, kBufferLength), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&target_, kBufferLength), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&other_, kBufferLength), cudaSuccess);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        ASSERT_TRUE(
+            metadata_->segmentManager()
+                .updateLocal([&](SegmentDesc& segment) {
+                    segment.type = SegmentType::Memory;
+                    auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                    memory.buffers.clear();
+                    for (void* ptr : {source_, target_, other_}) {
+                        BufferDesc buffer;
+                        buffer.addr = reinterpret_cast<uint64_t>(ptr);
+                        buffer.length = kBufferLength;
+                        buffer.location = "cuda:0";
+                        buffer.permission = kLocalReadWrite;
+                        memory.buffers.push_back(buffer);
+                    }
+                    std::sort(memory.buffers.begin(), memory.buffers.end(),
+                              [](const auto& a, const auto& b) {
+                                  return a.addr < b.addr;
+                              });
+                    return Status::OK();
+                })
+                .ok());
+        MnnvlTransportTestPeer::configureLocalCopies(transport_, metadata_);
+        ASSERT_TRUE(transport_.allocateSubBatch(batch_, 16).ok());
+    }
+    void TearDown() override {
+        if (batch_) EXPECT_TRUE(transport_.freeSubBatch(batch_).ok());
+        if (source_) (void)cudaFree(source_);
+        if (target_) (void)cudaFree(target_);
+        if (other_) (void)cudaFree(other_);
+    }
+    Request request(Request::OpCode op = Request::WRITE,
+                    void* target = nullptr) {
+        Request req;
+        req.opcode = op;
+        req.source = source_;
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset =
+            reinterpret_cast<uint64_t>(target ? target : target_);
+        req.length = kBufferLength;
+        return req;
+    }
+    TransferStatus finish(int task) {
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            EXPECT_TRUE(
+                transport_.getTransferStatus(batch_, task, status).ok());
+            if (status.s != PENDING) return status;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        ADD_FAILURE() << "MNNVL completion timed out";
+        return status;
+    }
+    void expectPattern(void* ptr, uint8_t pattern) {
+        std::vector<uint8_t> output(kBufferLength);
+        ASSERT_EQ(cudaMemcpy(output.data(), ptr, output.size(),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        for (auto byte : output) EXPECT_EQ(byte, pattern);
+    }
+    void* source_{nullptr};
+    void* target_{nullptr};
+    void* other_{nullptr};
+    std::shared_ptr<ControlService> metadata_;
+    MnnvlTransport transport_;
+    Transport::SubBatchRef batch_{nullptr};
+};
+
+TEST_F(MnnvlCompletionTest, DefaultPlatformSupportsTopologyDiscovery) {
+    // SetUp() initializes the loader without a config, as direct transport
+    // users do. Topology probing must still be safe when an engine later
+    // reuses that singleton.
+    auto& platform = Platform::getLoader();
+    EXPECT_EQ(&platform, &Platform::getLoader(makeRegistrationEngineConfig()));
+    Topology topology;
+    ASSERT_TRUE(topology.discover({&platform}).ok());
+    EXPECT_FALSE(topology.empty());
+}
+
+TEST_F(MnnvlCompletionTest, VerboseLogsDescribeEachSubmissionAndCompletion) {
+    MnnvlLogSink logs(1);
+    ASSERT_EQ(
+        cudaMemsetAsync(source_, 0x5a, kBufferLength, cudaStreamPerThread),
+        cudaSuccess);
+    ASSERT_TRUE(transport_
+                    .submitTransferTasks(
+                        batch_, {request(), request(Request::WRITE, other_)})
+                    .ok());
+    EXPECT_EQ(logs.count("MnnvlTransport: submit batch="), 1);
+    EXPECT_EQ(
+        logs.count("tasks=2 bytes=8192 reads=0 writes=2 local=2 remote=0"), 1);
+    EXPECT_EQ(logs.count("handle_type=fabric"), 1);
+    EXPECT_EQ(logs.count("MnnvlTransport: copy stream ready batch="), 1);
+    EXPECT_EQ(logs.count("MnnvlTransport: complete batch="), 0);
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    EXPECT_EQ(finish(1).s, COMPLETED);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(finish(0).s, COMPLETED);
+        EXPECT_EQ(finish(1).s, COMPLETED);
+    }
+    EXPECT_EQ(logs.count("MnnvlTransport: complete batch="), 1);
+    EXPECT_EQ(logs.count("group=0 device=0 status=COMPLETED"), 1);
+    ASSERT_TRUE(
+        transport_.submitTransferTasks(batch_, {request(Request::READ)}).ok());
+    EXPECT_EQ(finish(2).s, COMPLETED);
+    EXPECT_EQ(logs.count("MnnvlTransport: submit batch="), 2);
+    EXPECT_EQ(
+        logs.count("tasks=1 bytes=4096 reads=1 writes=0 local=1 remote=0"), 1);
+    EXPECT_EQ(logs.count("MnnvlTransport: complete batch="), 2);
+    EXPECT_EQ(logs.count("group=1 device=0 status=COMPLETED"), 1);
+    EXPECT_EQ(logs.count("MnnvlTransport: copy stream ready batch="), 1);
+    expectPattern(source_, 0x5a);
+    expectPattern(other_, 0x5a);
+}
+
+TEST_F(MnnvlCompletionTest, TransferLogsAreQuietWhenVerboseLoggingIsDisabled) {
+    MnnvlLogSink logs(0);
+    ASSERT_EQ(cudaMemset(source_, 0x69, kBufferLength), cudaSuccess);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    EXPECT_EQ(logs.count("MnnvlTransport: submit batch="), 0);
+    EXPECT_EQ(logs.count("MnnvlTransport: complete batch="), 0);
+    EXPECT_EQ(logs.count("MnnvlTransport: copy stream ready batch="), 0);
+    expectPattern(target_, 0x69);
+}
+
+#ifdef MNNVL_TEST_CUDA_WRAPPERS
+TEST_F(MnnvlCompletionTest, VerboseCompletionFailureIsLoggedOncePerGroup) {
+    MnnvlLogSink logs(1);
+    ASSERT_EQ(cudaMemset(source_, 0x12, kBufferLength), cudaSuccess);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());
+    auto* batch = static_cast<MnnvlSubBatch*>(batch_);
+    fail_completion_query.store(batch->completion_groups[0]->event);
+    EXPECT_EQ(finish(0).s, FAILED);
+    EXPECT_EQ(finish(0).s, FAILED);
+    EXPECT_EQ(logs.count("MnnvlTransport: complete batch="), 1);
+    EXPECT_EQ(logs.count("group=0 device=0 status=FAILED"), 1);
+}
+#endif
+
+TEST_F(MnnvlCompletionTest,
+       AppendedSubmissionsAndCallerEventRerecordAreIndependent) {
+    ASSERT_EQ(
+        cudaMemsetAsync(source_, 0x3c, kBufferLength, cudaStreamPerThread),
+        cudaSuccess);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    ASSERT_EQ(
+        cudaMemsetAsync(source_, 0xa7, kBufferLength, cudaStreamPerThread),
+        cudaSuccess);
+    ASSERT_TRUE(
+        transport_
+            .submitTransferTasks(batch_, {request(Request::WRITE, other_)})
+            .ok());
+    auto* batch = static_cast<MnnvlSubBatch*>(batch_);
+    ASSERT_EQ(batch->completion_groups.size(), 2);
+    EXPECT_NE(batch->completion_groups[0]->event,
+              batch->completion_groups[1]->event);
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    EXPECT_EQ(finish(1).s, COMPLETED);
+    expectPattern(target_, 0x3c);
+    expectPattern(other_, 0xa7);
+}
+
+TEST_F(MnnvlCompletionTest, CpuBlockAndReadKeepExistingOrdering) {
+    ASSERT_EQ(
+        cudaMemsetAsync(target_, 0x69, kBufferLength, cudaStreamPerThread),
+        cudaSuccess);
+    ASSERT_TRUE(
+        transport_.submitTransferTasks(batch_, {request(Request::READ)}).ok());
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    expectPattern(source_, 0x69);
+}
+
+TEST_F(MnnvlCompletionTest, FailedValidationPreservesEarlierTasks) {
+    ASSERT_EQ(cudaMemset(source_, 0x12, kBufferLength), cudaSuccess);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());
+    auto invalid = request();
+    invalid.source = reinterpret_cast<void*>(1);
+    EXPECT_FALSE(
+        transport_.submitTransferTasks(batch_, {request(), invalid}).ok());
+    invalid = request();
+    invalid.target_offset = 1;
+    EXPECT_FALSE(
+        transport_.submitTransferTasks(batch_, {request(), invalid}).ok());
+    EXPECT_EQ(batch_->size(), 1);
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    expectPattern(target_, 0x12);
+}
+
+#ifdef MNNVL_TEST_CUDA_WRAPPERS
+TEST_F(MnnvlCompletionTest, CopyAndQueryErrorsDrainBeforeTerminalFailure) {
+    ASSERT_EQ(
+        cudaMemsetAsync(source_, 0x16, kBufferLength, cudaStreamPerThread),
+        cudaSuccess);
+    fail_completion_record.store(true);
+    // An injected post-copy record failure must not return a submit error.
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());
+    EXPECT_EQ(finish(0).s, FAILED);
+    expectPattern(target_, 0x16);
+    auto* batch = static_cast<MnnvlSubBatch*>(batch_);
+
+    ASSERT_TRUE(
+        transport_
+            .submitTransferTasks(batch_, {request(Request::WRITE, other_)})
+            .ok());
+    fail_completion_query.store(batch->completion_groups[1]->event);
+    EXPECT_EQ(finish(1).s, FAILED);
+    expectPattern(other_, 0x16);
+    EXPECT_TRUE(transport_.freeSubBatch(batch_).ok());
+}
+#endif
+
+TEST_F(MnnvlCompletionTest, ConcurrentBatchesRemainIndependent) {
+    ASSERT_EQ(cudaMemset(source_, 0x53, kBufferLength), cudaSuccess);
+    Transport::SubBatchRef second = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(second, 1).ok());
+    auto worker = [&](Transport::SubBatchRef batch, void* target) {
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_TRUE(
+            transport_
+                .submitTransferTasks(batch, {request(Request::WRITE, target)})
+                .ok());
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            ASSERT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, COMPLETED);
+    };
+    std::thread first_worker(worker, batch_, target_);
+    std::thread second_worker(worker, second, other_);
+    first_worker.join();
+    second_worker.join();
+    EXPECT_TRUE(transport_.freeSubBatch(second).ok());
+    expectPattern(target_, 0x53);
+    expectPattern(other_, 0x53);
+}
+
+TEST_F(MnnvlCompletionTest, MalformedFabricHandlesReturnValidationErrors) {
+    for (const auto& handle :
+         {std::string("bad"),
+          std::string(2 * sizeof(CUmemFabricHandle), 'z')}) {
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            auto* buffer = segment.findBuffer(
+                                reinterpret_cast<uint64_t>(target_),
+                                kBufferLength);
+                            buffer->permission = kGlobalReadWrite;
+                            buffer->transports = {MNNVL};
+                            buffer->mnnvl_handle = handle;
+                            return Status::OK();
+                        })
+                        .ok());
+        uint64_t address = reinterpret_cast<uint64_t>(target_);
+        EXPECT_TRUE(MnnvlTransportTestPeer::relocate(
+                        transport_, address, kBufferLength, LOCAL_SEGMENT_ID)
+                        .IsInvalidArgument());
+    }
+}
+
+TEST_F(MnnvlCompletionTest,
+       OwnedVmmSubrangesPreserveEngineRegistrationIdentity) {
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = 0;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    size_t granularity = 0;
+    if (cuMemGetAllocationGranularity(&granularity, &prop,
+                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+        CUDA_SUCCESS)
+        GTEST_SKIP() << "No CUDA POSIX-FD VMM allocation support";
+    TransferEngineImpl engine(makeRegistrationEngineConfig());
+    ASSERT_TRUE(engine.available());
+    auto fabric = std::make_shared<MnnvlTransport>();
+    auto metadata = TransferEngineImplTestPeer::metadata(engine);
+    MnnvlTransportTestPeer::configureRegistration(*fabric, metadata);
+    engine.swapTransportForTest(MNNVL, fabric);
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cuda:0";
+    void* base = nullptr;
+    const auto allocated =
+        engine.allocateLocalMemory(&base, 4 * granularity, options);
+    if (!allocated.ok()) GTEST_SKIP() << allocated.ToString();
+    BufferDesc oversized;
+    oversized.addr = reinterpret_cast<uint64_t>(base) + 64;
+    oversized.length = 4 * granularity;
+    oversized.location = "cuda:0";
+    EXPECT_TRUE(
+        fabric->addMemoryBuffer(oversized, options).IsInvalidArgument());
+    EXPECT_TRUE(oversized.mnnvl_handle.empty());
+    oversized.addr = UINT64_MAX - 63;
+    oversized.length = 128;
+    EXPECT_TRUE(
+        fabric->addMemoryBuffer(oversized, options).IsInvalidArgument());
+    auto* interior = static_cast<uint8_t*>(base) + granularity + 64;
+    const size_t interior_length = granularity - 128;
+    ASSERT_TRUE(engine
+                    .registerLocalMemory({base, interior},
+                                         {granularity, interior_length},
+                                         options)
+                    .ok());
+    ASSERT_TRUE(
+        engine.registerLocalMemory({base}, {granularity}, options).ok());
+    auto snapshot = metadata->segmentManager().getLocal();
+    ASSERT_EQ(snapshot->getMemory().buffers.size(), 2);
+    auto* prefix =
+        snapshot->findBuffer(reinterpret_cast<uint64_t>(base), granularity);
+    ASSERT_NE(prefix, nullptr);
+    EXPECT_EQ(prefix->addr, reinterpret_cast<uint64_t>(base));
+    EXPECT_EQ(prefix->length, granularity);
+    EXPECT_EQ(prefix->ref_count, 2);
+    auto* middle = snapshot->findBuffer(reinterpret_cast<uint64_t>(interior),
+                                        interior_length);
+    ASSERT_NE(middle, nullptr);
+    EXPECT_EQ(middle->addr, reinterpret_cast<uint64_t>(interior));
+    EXPECT_EQ(middle->length, interior_length);
+    const auto envelope = json::parse(middle->mnnvl_handle);
+    EXPECT_EQ(envelope.at("offset").get<size_t>(), granularity + 64);
+    EXPECT_EQ(envelope.at("mapped_length").get<size_t>(), 4 * granularity);
+    EXPECT_EQ(
+        snapshot->findBuffer(reinterpret_cast<uint64_t>(base) + granularity, 1),
+        nullptr);
+    EXPECT_EQ(snapshot->findBuffer(
+                  reinterpret_cast<uint64_t>(base) + 3 * granularity, 1),
+              nullptr);
+    EXPECT_TRUE(engine.unregisterLocalMemory(base, granularity).ok());
+    EXPECT_EQ(metadata->segmentManager().getLocal()->getMemory().buffers.size(),
+              2);
+    EXPECT_TRUE(engine.unregisterLocalMemory(base, granularity).ok());
+    EXPECT_EQ(metadata->segmentManager().getLocal()->getMemory().buffers.size(),
+              1);
+    EXPECT_TRUE(engine.unregisterLocalMemory(interior, interior_length).ok());
+    EXPECT_TRUE(
+        metadata->segmentManager().getLocal()->getMemory().buffers.empty());
+    EXPECT_TRUE(engine.freeLocalMemory(base).ok());
+}
+
+TEST_F(MnnvlCompletionTest, FailedHostPinRollbackPreservesEarlierRegistration) {
+    std::unique_ptr<void, decltype(&std::free)> host(
+        std::aligned_alloc(4096, 16384), &std::free);
+    ASSERT_NE(host.get(), nullptr);
+    TransferEngineImpl engine(makeRegistrationEngineConfig());
+    ASSERT_TRUE(engine.available());
+    auto fabric = std::make_shared<MnnvlTransport>();
+    auto metadata = TransferEngineImplTestPeer::metadata(engine);
+    MnnvlTransportTestPeer::configureRegistration(*fabric, metadata);
+    engine.swapTransportForTest(MNNVL, fabric);
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.perm = kLocalReadWrite;
+    ASSERT_TRUE(engine.registerLocalMemory({host.get()}, {8192}, options).ok());
+    auto snapshot = metadata->segmentManager().getLocal();
+    auto* registered =
+        snapshot->findBuffer(reinterpret_cast<uint64_t>(host.get()), 8192);
+    ASSERT_NE(registered, nullptr);
+    auto original = *registered;
+    EXPECT_TRUE(fabric->tracksLocalBuffer(original));
+    EXPECT_FALSE(json(original).contains("mnnvl_host_pin"));
+    auto* new_buffer = static_cast<uint8_t*>(host.get()) + 8192;
+    // One new pin succeeds before a conflicting registration fails. Defensive
+    // cleanup must undo only the new pin and leave the existing descriptor
+    // live.
+    EXPECT_FALSE(engine
+                     .registerLocalMemory({new_buffer, host.get()},
+                                          {4096, 4096}, options)
+                     .ok());
+    EXPECT_TRUE(fabric->tracksLocalBuffer(original));
+    EXPECT_EQ(metadata->segmentManager().getLocal()->getMemory().buffers.size(),
+              1);
+    cudaPointerAttributes attributes = {};
+    ASSERT_EQ(cudaPointerGetAttributes(&attributes, host.get()), cudaSuccess);
+    EXPECT_EQ(attributes.type, cudaMemoryTypeHost);
+    ASSERT_TRUE(engine.registerLocalMemory({new_buffer}, {4096}, options).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(new_buffer, 4096).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.get(), 8192).ok());
+    EXPECT_FALSE(fabric->tracksLocalBuffer(original));
+    // A stale snapshot must not remove a later owner's pin at the same address.
+    ASSERT_TRUE(engine.registerLocalMemory({host.get()}, {8192}, options).ok());
+    EXPECT_TRUE(fabric->removeMemoryBuffer(original).ok());
+    ASSERT_EQ(cudaPointerGetAttributes(&attributes, host.get()), cudaSuccess);
+    EXPECT_EQ(attributes.type, cudaMemoryTypeHost);
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.get(), 8192).ok());
+}
+
+TEST_F(MnnvlCompletionTest, MalformedExportEnvelopesRejectInvalidRanges) {
+    const auto raw = std::string(2 * sizeof(CUmemFabricHandle), '0');
+    for (auto envelope : {json{{"version", 2},
+                               {"handle", raw},
+                               {"mapped_length", 8192},
+                               {"offset", 0}},
+                          json{{"version", 1},
+                               {"handle", raw},
+                               {"mapped_length", 4096},
+                               {"offset", 1}},
+                          json{{"version", 1},
+                               {"handle", raw},
+                               {"mapped_length", 8192},
+                               {"offset", -1}},
+                          json{{"version", 1},
+                               {"handle", raw},
+                               {"mapped_length", "8192"},
+                               {"offset", 0}}}) {
+        ASSERT_TRUE(
+            installLocalSegmentWithMnnvlHandle(*metadata_, envelope.dump(),
+                                               kRemoteAddress, kBufferLength)
+                .ok());
+        uint64_t address = kRemoteAddress;
+        EXPECT_TRUE(MnnvlTransportTestPeer::relocate(
+                        transport_, address, kBufferLength, LOCAL_SEGMENT_ID)
+                        .IsInvalidArgument());
+    }
+}
+
+TEST_F(MnnvlCompletionTest,
+       ConcurrentAppendsAndPollingAreSerializedPerSubBatch) {
+    ASSERT_EQ(cudaMemset(source_, 0x24, kBufferLength), cudaSuccess);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&, i] {
+            EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
+            auto req = request();
+            req.source = static_cast<uint8_t*>(source_) + i * 1024;
+            req.target_offset += i * 1024;
+            req.length = 1024;
+            EXPECT_TRUE(transport_.submitTransferTasks(batch_, {req}).ok());
+        });
+    }
+    std::thread poller([&] {
+        EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (batch_->size() < 4 &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (batch_->size() != 0) {
+                TransferStatus status;
+                EXPECT_TRUE(
+                    transport_.getTransferStatus(batch_, 0, status).ok());
+            }
+            std::this_thread::yield();
+        }
+    });
+    for (auto& thread : threads) thread.join();
+    poller.join();
+    EXPECT_EQ(batch_->size(), 4);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(finish(i).s, COMPLETED);
+    expectPattern(target_, 0x24);
+}
+
+bool hasTwoCudaDevices() {
+    int device_count = 0;
+    return cudaGetDeviceCount(&device_count) == cudaSuccess &&
+           device_count >= 2;
+}
+
+// Drains a batch whose stream and completion event live on device 0 while
+// the caller is bound to the last device, optionally through a non-primary
+// context. Stream and event are created first because the stream pool
+// selects devices by ordinal.
+template <typename Drain>
+void expectCrossDeviceDrainKeepsCallerContext(bool custom_context,
+                                              Drain drain) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    const int caller_device = device_count - 1;
+    CUDAStreamPool pool;
+    MnnvlTransport transport;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto* mnnvl_batch = dynamic_cast<MnnvlSubBatch*>(batch);
+    ASSERT_NE(mnnvl_batch, nullptr);
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_TRUE(pool.acquire(mnnvl_batch->async_stream, 0).ok());
+    mnnvl_batch->stream_device_id = 0;
+    auto stream = mnnvl_batch->async_stream.get();
+    auto completion = std::make_unique<MnnvlCompletion>();
+    ASSERT_EQ(
+        cudaEventCreateWithFlags(&completion->event, cudaEventDisableTiming),
+        cudaSuccess);
+    completion->device = 0;
+    auto event = completion->event;
+    mnnvl_batch->completion_groups.push_back(std::move(completion));
+    void* buffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&buffer, kBufferLength), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(buffer, 0, kBufferLength, stream), cudaSuccess);
+    ASSERT_EQ(cudaEventRecord(event, stream), cudaSuccess);
+
+    CUcontext custom = nullptr;
+    if (custom_context) {
+        CUdevice device;
+        ASSERT_EQ(cuDeviceGet(&device, caller_device), CUDA_SUCCESS);
+#if CUDA_VERSION >= 13000
+        ASSERT_EQ(cuCtxCreate(&custom, nullptr, 0, device), CUDA_SUCCESS);
+#else
+        ASSERT_EQ(cuCtxCreate(&custom, 0, device), CUDA_SUCCESS);
+#endif
+    } else {
+        ASSERT_EQ(cudaSetDevice(caller_device), cudaSuccess);
+        ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    }
+    CUcontext before = nullptr;
+    ASSERT_EQ(cuCtxGetCurrent(&before), CUDA_SUCCESS);
+    ASSERT_NE(before, nullptr);
+
+    auto status = drain(transport, batch);
+    CUcontext after = nullptr;
+    auto query = cuCtxGetCurrent(&after);
+    int device_after = -1;
+    auto device_query = cudaGetDevice(&device_after);
+
+    // Clean up before asserting so a failure cannot leak the context.
+    if (custom) cuCtxDestroy(custom);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (batch) EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_EQ(cudaFree(buffer), cudaSuccess);
+
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_EQ(query, CUDA_SUCCESS);
+    EXPECT_EQ(after, before);
+    ASSERT_EQ(device_query, cudaSuccess);
+    EXPECT_EQ(device_after, caller_device);
+}
+
+}  // namespace
+
+TEST(MnnvlTransportTest, QuiescePreservesCustomContextAcrossDevices) {
+    if (!hasTwoCudaDevices()) GTEST_SKIP() << "Requires two CUDA devices";
+    expectCrossDeviceDrainKeepsCallerContext(
+        true, [](MnnvlTransport& transport, Transport::SubBatchRef&) {
+            return transport.quiesce();
+        });
+}
+
+// Covers drainMnnvlBatch(), ~MnnvlSubBatch() and completion event
+// destruction.
+TEST(MnnvlTransportTest, FreeSubBatchPreservesCustomContextAcrossDevices) {
+    if (!hasTwoCudaDevices()) GTEST_SKIP() << "Requires two CUDA devices";
+    expectCrossDeviceDrainKeepsCallerContext(
+        true, [](MnnvlTransport& transport, Transport::SubBatchRef& batch) {
+            return transport.freeSubBatch(batch);
+        });
+}
+
+TEST(MnnvlTransportTest, QuiescePreservesPrimaryContextAcrossDevices) {
+    if (!hasTwoCudaDevices()) GTEST_SKIP() << "Requires two CUDA devices";
+    expectCrossDeviceDrainKeepsCallerContext(
+        false, [](MnnvlTransport& transport, Transport::SubBatchRef&) {
+            return transport.quiesce();
+        });
 }
 
 }  // namespace tent
