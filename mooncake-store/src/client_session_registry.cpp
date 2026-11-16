@@ -311,4 +311,50 @@ void ClientSessionRegistry::ExpireSessions(
     }
 }
 
+std::vector<std::pair<UUID, ClientSessionSharedPtr>>
+ClientSessionRegistry::SnapshotSuspected() const {
+    std::vector<std::pair<UUID, ClientSessionSharedPtr>> suspected;
+    std::shared_lock lock(mutex_);
+    suspected.reserve(records_.size());
+    for (const auto& [id, record] : records_) {
+        if (record->state() == ClientLivenessState::SUSPECTED) {
+            suspected.emplace_back(id, record);
+        }
+    }
+    return suspected;
+}
+
+bool ClientSessionRegistry::ForceRetireSuspected(
+    const UUID& id, const std::function<void()>& reserve_retirement,
+    const std::function<void(const UUID&, const ClientSessionSharedPtr&)>&
+        retire) {
+    Record record;
+    {
+        std::unique_lock lock(mutex_);
+        const auto it = records_.find(id);
+        if (it == records_.end()) {
+            return false;
+        }
+        record = it->second;
+        std::lock_guard<std::mutex> transition(record->transition_mutex_);
+        if (record->state_.load(std::memory_order_relaxed) !=
+            ClientLivenessState::SUSPECTED) {
+            return false;
+        }
+        // Same barrier ordering as EvaluateAndRetire: reserve retirement
+        // before the OFFLINE publication so terminal work cannot be missed.
+        if (reserve_retirement) {
+            reserve_retirement();
+        }
+        record->state_.store(ClientLivenessState::OFFLINE,
+                             std::memory_order_release);
+        ClearSessionMetadataLocked(id);
+    }
+    MasterMetricManager::instance().client_liveness_became_offline();
+    if (retire) {
+        retire(id, record);
+    }
+    return true;
+}
+
 }  // namespace mooncake

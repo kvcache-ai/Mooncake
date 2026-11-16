@@ -62,6 +62,19 @@ class MasterServiceTestPeer {
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
 
+    // Drive one client death-probe round synchronously, without the periodic
+    // worker.
+    void RunClientDeathProbeRoundForTesting() {
+        service_.ClientDeathProbeRound();
+    }
+
+    // The death probe's endpoint classification for a list of "host:port"
+    // endpoints, without requiring a suspected session.
+    MasterService::ClientDeathProbeOutcome ProbeClientEndpointsForTesting(
+        const std::vector<std::string>& endpoints, uint32_t timeout_ms) {
+        return service_.ProbeClientEndpoints(endpoints, timeout_ms);
+    }
+
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
 

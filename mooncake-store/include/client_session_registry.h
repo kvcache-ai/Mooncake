@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "client_liveness.h"
 #include "types.h"
@@ -86,6 +87,23 @@ class ClientSessionRegistry {
         const std::function<void()>& reserve_retirement = {},
         const std::function<void(const UUID&, const ClientSessionSharedPtr&)>&
             retire = {});
+
+    // Snapshots every session currently in the SUSPECTED state, for active
+    // death probing. The shared_ptrs retain the records after the registry
+    // lock is released; callers must revalidate state before acting.
+    std::vector<std::pair<UUID, ClientSessionSharedPtr>> SnapshotSuspected()
+        const;
+
+    // Force-retires a session that is currently SUSPECTED, skipping the
+    // remaining suspicion TTL. Mirrors the BECAME_OFFLINE path of
+    // ExpireSessions: reserves retirement before publishing OFFLINE, clears
+    // session metadata, then runs the retire callback outside the registry
+    // lock. Returns false when the session is missing or no longer SUSPECTED
+    // (for example, recovered to ACTIVE or already retired).
+    bool ForceRetireSuspected(
+        const UUID& id, const std::function<void()>& reserve_retirement,
+        const std::function<void(const UUID&, const ClientSessionSharedPtr&)>&
+            retire);
 
     void Reset();
 
