@@ -880,7 +880,6 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                 return Status::InvalidArgument(
                     "Strict MNNVL requires an exportable EGM allocation");
             }
-            }
             // Plain host memory: usable as the local side of a transfer
             // (dram_to_gpu) but not addressable by peers.
             return pin_host();
