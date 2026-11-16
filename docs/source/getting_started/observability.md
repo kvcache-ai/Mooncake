@@ -170,6 +170,64 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 
 Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
 
+### Process and Allocator Memory Metrics
+
+Both `/metrics` endpoints export the resident set size of the serving process,
+so memory growth can be read from Mooncake itself rather than correlated
+against a container-level metric.
+
+| Metric | Type | Source |
+|--------|------|--------|
+| `mooncake_process_rss_bytes` | gauge | `VmRSS` |
+| `mooncake_process_rss_peak_bytes` | gauge | `VmHWM`, the high-water mark an OOM kill is decided on |
+| `mooncake_process_rss_anon_bytes` / `..._rss_file_bytes` / `..._rss_shmem_bytes` | gauge | `RssAnon` / `RssFile` / `RssShmem` |
+| `mooncake_process_vsize_bytes` | gauge | `VmSize` |
+| `mooncake_process_swap_bytes` | gauge | `VmSwap` |
+
+These come from `/proc/self/status` and are exported whichever allocator the
+binary is linked against, so they stay comparable across an allocator change.
+
+When the binary is built with `-DSTORE_USE_JEMALLOC=ON` (see below),
+`mooncake_jemalloc_enabled` reports `1` and the allocator's own accounting is
+exported alongside: `allocated` / `active` / `metadata` / `resident` /
+`retained` / `mapped` / `dirty` / `muzzy` bytes, arena and background-thread
+counts, the `opt.dirty_decay_ms` and `opt.muzzy_decay_ms` settings, and
+cumulative purge counters (`mooncake_jemalloc_dirty_purge_runs_total`,
+`..._dirty_madvises_total`, and the `muzzy` equivalents). Dirty and muzzy are
+reported separately because jemalloc decays them on separate paths.
+
+`mooncake_jemalloc_resident_bytes / mooncake_jemalloc_allocated_bytes` is the
+ratio to watch: it is how much memory the allocator holds beyond what the
+application asked for. To attribute that ratio to a specific allocation size,
+`mooncake_jemalloc_bin_regs`, `..._bin_slabs`, `..._bin_used_bytes` and
+`..._bin_slab_bytes` break it down per small size class, labelled by
+`size_class`. A slab is returned to the OS only once every region in it is
+free, so a class with low `bin_used_bytes / bin_slab_bytes` occupancy is
+holding pages it cannot release.
+
+Note that `mooncake_jemalloc_resident_bytes` is the allocator's own upper
+estimate over the extents it maps and can exceed `mooncake_process_rss_bytes`;
+compare the two for divergence rather than subtracting them.
+
+When the binary is not built with jemalloc, `mooncake_jemalloc_enabled` reports
+`0`, no `mooncake_jemalloc_*` values or per-size-class series are emitted, and
+the process series above still export.
+
+#### Building with jemalloc
+
+`STORE_USE_JEMALLOC` is **off by default**. It links jemalloc into the
+`mooncake_master` and `mooncake_client` executables only, never into
+`libmooncake_store`, so the Python extension keeps its host process's
+allocator:
+
+```bash
+cmake .. -DSTORE_USE_JEMALLOC=ON
+```
+
+Both executables are stripped at link time, so each logs the jemalloc version,
+`background_thread` state and both decay settings at startup. That line is the
+way to confirm on a release binary that the allocator was actually replaced.
+
 ## Client Metrics Endpoint
 
 Mooncake clients can also expose a client-local HTTP endpoint for health checks
@@ -222,3 +280,46 @@ running.
 Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
 client HTTP server remains enabled while metrics are disabled, `/metrics` and
 `/metrics/summary` return HTTP 503 with `metrics not available`.
+
+
+### Master heartbeat observations
+
+Clients running the storage heartbeat expose two gauges through `/metrics`:
+
+| Metric | Meaning |
+|--------|---------|
+| `mooncake_client_master_heartbeat_status_ok` | Last observed Ping status: `1` for `OK`, `0` for `NEED_REMOUNT`. |
+| `mooncake_client_master_heartbeat_observation_timestamp_seconds` | Client-side Unix receive time, in seconds, of the same observation. |
+
+Both samples carry the existing client labels. They are absent before the first
+valid heartbeat, after a failed heartbeat or an unsupported status, and while
+reconnecting. Late responses from an older connection cannot restore the
+observation. A successful remount alone does not set the status to `1`; a later
+Ping must return `OK`.
+
+A client without storage may never start this heartbeat. Memory or LocalDisk
+mounts and DFS backend activation start the storage control plane; creating a
+request-only client does not. Missing samples mean **unknown or inapplicable**,
+not `NEED_REMOUNT`. Disabling client metrics also disables these observations.
+
+The timestamp is an observation value, not a Prometheus sample timestamp. An
+in-flight Ping can leave the previous observation visible until it completes,
+so check its age as well as its status. For example, for targets expected to
+run a storage heartbeat, this query selects a recent `NEED_REMOUNT` observation
+using an illustrative 10-second freshness limit:
+
+```promql
+(mooncake_client_master_heartbeat_status_ok == 0)
+and
+((time() - mooncake_client_master_heartbeat_observation_timestamp_seconds) < 10)
+```
+
+Choose the freshness limit for the heartbeat/RPC timeouts and scrape interval
+in your deployment, and account for clock skew. Do not replace missing status
+samples with zero. Prometheus `up` describes the HTTP scrape, not Master Ping
+success; missing or stale observations need separate handling.
+
+This is a sampled control-plane response. `OK` does not prove that every
+segment is mounted, that transfer metadata or SSD recovery is complete, or
+that data RPCs and RDMA transfers are healthy. The existing `/health` check
+can remain healthy when a successful Ping returns `NEED_REMOUNT`.

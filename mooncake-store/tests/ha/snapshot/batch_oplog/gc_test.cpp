@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 
 #include <gtest/gtest.h>
@@ -133,7 +134,61 @@ TEST(BatchOpLogSnapshotGcTest, PointerMismatchSkipsDeletion) {
     EXPECT_TRUE(object_store.deleted.empty());
 }
 
+TEST(BatchOpLogSnapshotGcTest, MissingRecoveryArtifactSkipsDeletion) {
+    FakeBackend backend;
+    RecordingObjectStore object_store;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("c", "1");
+    auto descriptor = MakeDescriptor("snapshots", 2);
+    descriptor.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
+    descriptor.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
+    ha::BatchOpLogSnapshotManifest manifest;
+    manifest.schema_version = descriptor.schema_version;
+    manifest.snapshot_format = descriptor.snapshot_format;
+    manifest.snapshot_id = descriptor.snapshot_id;
+    manifest.last_included_batch_id = descriptor.last_included_batch_id;
+    manifest.last_included_seq = descriptor.last_included_seq;
+    manifest.producer_view_version = descriptor.producer_view_version;
+    manifest.segments = {ha::BuildBatchOpLogSnapshotSegmentsKey(
+                             "snapshots", descriptor.snapshot_id),
+                         1, Crc32cValue("s", 1)};
+    manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
+        ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots",
+                                                     descriptor.snapshot_id),
+        1, Crc32cValue("w", 1)};
+    manifest.object_storage = ha::BatchOpLogSnapshotObjectDescriptor{
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots",
+                                                    descriptor.snapshot_id),
+        1, Crc32cValue("o", 1)};
+    const auto manifest_json = ha::EncodeBatchOpLogSnapshotManifest(manifest);
+    descriptor.manifest_size = manifest_json.size();
+    descriptor.manifest_crc32c =
+        Crc32cValue(manifest_json.data(), manifest_json.size());
+    const auto pointer = ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
+    backend.values[ha::BuildBatchOpLogSnapshotLatestKey("c")] = pointer;
+    object_store.objects[descriptor.manifest_key] = {manifest_json.begin(),
+                                                     manifest_json.end()};
+    object_store.objects[manifest.segments.key] = {'s'};
+    object_store.objects[manifest.weight_metadata->key] = {'w'};
+    const auto stale_prefix =
+        ha::BuildBatchOpLogSnapshotArtifactPrefix("snapshots", "1-1");
+    object_store.objects[stale_prefix + "marker"] = {1};
+    object_store.objects[manifest.object_storage->key] = {'o'};
+    BatchOpLogSnapshotGc gc(backend, object_store, "c", "snapshots");
+    for (const auto& key :
+         {manifest.weight_metadata->key, manifest.object_storage->key}) {
+        const auto bytes = object_store.objects.at(key);
+        object_store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
+        EXPECT_TRUE(object_store.deleted.empty());
+        object_store.objects[key] = bytes;
+    }
+    EXPECT_EQ(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
+    ASSERT_EQ(1u, object_store.deleted.size());
+    EXPECT_EQ(stale_prefix, object_store.deleted.front());
+}
+
 TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
+    HAMetricManager::instance().reset_snapshot_runtime(true);
     constexpr std::string_view kRoot = "snapshots";
     FakeBackend backend;
     RecordingObjectStore object_store;
@@ -171,6 +226,12 @@ TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
                                                   std::string(kRoot))
                                  .Run(*lease, descriptor_json, std::nullopt));
     ASSERT_EQ(1U, object_store.deleted.size());
+    EXPECT_EQ(
+        1u,
+        HAMetricManager::instance().get_snapshot_runtime().gc_orphan_prefixes);
+    EXPECT_EQ(
+        1u,
+        HAMetricManager::instance().get_snapshot_runtime().gc_deleted_prefixes);
     EXPECT_EQ(stale_prefix, object_store.deleted.front());
 }
 

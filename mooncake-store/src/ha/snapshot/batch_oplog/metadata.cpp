@@ -122,12 +122,17 @@ bool ParseSnapshotId(std::string_view snapshot_id, uint64_t& batch_id) {
 
 template <typename SnapshotMetadata>
 bool ValidateIdentity(const SnapshotMetadata& metadata, std::string* reason) {
-    if (metadata.schema_version != kBatchOpLogSnapshotSchemaVersion) {
-        SetReason(reason, "unsupported snapshot schema_version");
-        return false;
-    }
-    if (metadata.snapshot_format != kBatchOpLogSnapshotFormat) {
-        SetReason(reason, "unsupported snapshot_format");
+    const bool legacy =
+        metadata.schema_version == kBatchOpLogSnapshotSchemaVersion &&
+        metadata.snapshot_format == kBatchOpLogSnapshotFormat;
+    const bool with_weights =
+        metadata.schema_version == kBatchOpLogWeightSnapshotSchemaVersion &&
+        metadata.snapshot_format == kBatchOpLogWeightSnapshotFormat;
+    const bool with_objects =
+        metadata.schema_version == kBatchOpLogObjectSnapshotSchemaVersion &&
+        metadata.snapshot_format == kBatchOpLogObjectSnapshotFormat;
+    if (!legacy && !with_weights && !with_objects) {
+        SetReason(reason, "unsupported snapshot version and format");
         return false;
     }
     uint64_t snapshot_batch_id = 0;
@@ -312,6 +317,14 @@ std::string EncodeBatchOpLogSnapshotManifest(
     Json::Value root(Json::objectValue);
     EncodeIdentity(manifest, root);
     root["segments"] = EncodeObjectDescriptor(manifest.segments);
+    if (manifest.object_storage) {
+        root["object_storage"] =
+            EncodeObjectDescriptor(*manifest.object_storage);
+    }
+    if (manifest.weight_metadata) {
+        root["weight_metadata"] =
+            EncodeObjectDescriptor(*manifest.weight_metadata);
+    }
     Json::Value chunks(Json::arrayValue);
     for (const auto& descriptor : manifest.object_chunks) {
         chunks.append(EncodeChunkDescriptor(descriptor));
@@ -335,6 +348,31 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
     }
     if (!DecodeObjectDescriptor(root["segments"], decoded.segments, &reason)) {
         return tl::make_unexpected(std::move(reason));
+    }
+    if (decoded.schema_version >= kBatchOpLogWeightSnapshotSchemaVersion) {
+        BatchOpLogSnapshotObjectDescriptor weights;
+        if (!root.isMember("weight_metadata") ||
+            !DecodeObjectDescriptor(root["weight_metadata"], weights,
+                                    &reason)) {
+            return tl::make_unexpected(
+                std::string("Invalid weight_metadata descriptor: ") + reason);
+        }
+        decoded.weight_metadata = std::move(weights);
+    } else if (root.isMember("weight_metadata")) {
+        return tl::make_unexpected(
+            std::string("Weight metadata requires snapshot v2"));
+    }
+    if (decoded.schema_version == kBatchOpLogObjectSnapshotSchemaVersion) {
+        BatchOpLogSnapshotObjectDescriptor objects;
+        if (!root.isMember("object_storage") ||
+            !DecodeObjectDescriptor(root["object_storage"], objects, &reason)) {
+            return tl::make_unexpected(
+                std::string("Invalid object_storage descriptor: ") + reason);
+        }
+        decoded.object_storage = std::move(objects);
+    } else if (root.isMember("object_storage")) {
+        return tl::make_unexpected(
+            std::string("Object storage requires snapshot v3"));
     }
     if (!root.isMember("object_chunks") || !root["object_chunks"].isArray()) {
         SetReason(&reason, "object_chunks must be a JSON array");
@@ -417,6 +455,19 @@ std::string BuildBatchOpLogSnapshotObjectChunkKey(
     return prefix.empty()
                ? std::string()
                : prefix + "objects/" + std::to_string(chunk_index) + ".bin";
+}
+
+std::string BuildBatchOpLogSnapshotWeightMetadataKey(
+    const std::string& snapshot_root, std::string_view snapshot_id) {
+    const std::string prefix = BuildArtifactPrefix(snapshot_root, snapshot_id);
+    return prefix.empty() ? std::string() : prefix + "weight_metadata.bin";
+}
+
+std::string BuildBatchOpLogSnapshotObjectStorageKey(
+    const std::string& snapshot_root, std::string_view snapshot_id) {
+    const auto prefix =
+        BuildBatchOpLogSnapshotArtifactPrefix(snapshot_root, snapshot_id);
+    return prefix.empty() ? std::string() : prefix + "object_storage.bin";
 }
 
 }  // namespace mooncake::ha

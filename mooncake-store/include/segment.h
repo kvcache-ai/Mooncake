@@ -14,7 +14,6 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
-#include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
 #include "segment/status.h"
 #include "segment/usage.h"
@@ -80,11 +79,10 @@ class ScopedSegmentAccess {
         : segment_manager_(segment_manager), lock_(mutex) {}
 
     /**
-     * @brief Mount a segment
+     * @brief Mount a segment under its non-null owner's client ID.
      */
-    ErrorCode MountSegment(
-        const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode MountSegment(const Segment& segment,
+                           ClientSessionSharedPtr owner_session);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -92,9 +90,8 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             ClientSessionSharedPtr owner_session);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
@@ -142,15 +139,10 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Rebind restored client-owned segment resources to a fresh
-     *        liveness record. Segment snapshots intentionally do not persist
-     *        record implementation state.
+     * @brief Bind all segments of the owner's client ID to `owner_session`.
      */
-    void BindClientLiveness(
-        const UUID& client_id,
-        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
-    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -336,47 +328,6 @@ class ScopedAllocatorAccess {
     std::shared_lock<std::shared_mutex> lock_;
 };
 
-/**
- * @brief Lock-free data view of SegmentManager for safely accessing inherited
- * data in forked child processes This class provides read-only access to
- * SegmentManager private members without any lock operations
- */
-class SegmentView {
-   public:
-    /**
-     * @brief Constructor
-     * @param segment_manager Reference to SegmentManager
-     */
-    explicit SegmentView(const SegmentManager* segment_manager)
-        : segment_manager_(segment_manager) {}
-
-    ErrorCode GetSegment(const std::shared_ptr<BufferAllocatorBase>& allocator,
-                         Segment& segment) const;
-
-    ErrorCode GetMountedSegment(const UUID& segment_id,
-                                MountedSegment& mountedSegment) const;
-
-   private:
-    const SegmentManager* segment_manager_;
-};
-
-class SegmentSerializer {
-   public:
-    explicit SegmentSerializer(SegmentManager* segment_manager)
-        : segment_manager_(segment_manager) {}
-
-    tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
-        const LocalSsdPersistedState& local_ssd_state);
-
-    tl::expected<LocalSsdPersistedState, SerializationError> Deserialize(
-        const std::vector<uint8_t>& data);
-
-    void Reset();
-
-   private:
-    SegmentManager* segment_manager_;
-};
-
 class SegmentManager {
    public:
     /**
@@ -416,8 +367,6 @@ class SegmentManager {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
                                      client_by_name_, segment_mutex_);
     }
-
-    SegmentView getView() const { return SegmentView(this); }
 
     /**
      * @brief Return current DRAM usage derived from mounted allocators.
@@ -473,9 +422,7 @@ class SegmentManager {
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;
-    friend class SegmentTest;        // for unit tests
-    friend class SegmentView;        // for fork serialize
-    friend class SegmentSerializer;  // for fork serialize
+    friend class SegmentTest;  // for unit tests
 };
 
 class NoFSegmentManager {

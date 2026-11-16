@@ -7,15 +7,16 @@
 // remote MEMORY > remote NOF_SSD > LOCAL_DISK > DISK). On top of that, when a
 // key has more than one *remote* MEMORY replica, the historical code kept the
 // first one master happened to return, which is effectively arbitrary. This
-// header adds an opt-in scoring hook so a better remote replica can be picked
-// (issue #2516).
+// header adds an opt-in scoring hook (issue #2516) and request-local HCA
+// affinity so a better memory replica can be picked.
 //
 // Design constraints:
-//   * Disabled by default — behaviour is byte-identical to the historical
-//     "first remote MEMORY" pick unless the operator sets
-//     MC_STORE_REPLICA_SCORING=1 or a scorer is injected.
+//   * Remote protocol scoring is opt-in via MC_STORE_REPLICA_SCORING=1 or an
+//     injected scorer. HCA hints rank affinity tiers, but tied tiers preserve
+//     the historical "first remote MEMORY" pick when scoring is disabled.
 //   * This layer only sees what a replica descriptor carries (endpoint,
-//     protocol). Richer signals (NIC role, NUMA distance, live load) live in
+//     protocol, storage locality). Richer signals (NIC role, NUMA distance,
+//     live load) live in
 //     the transfer engine; they can be fed in via SetRemoteReplicaScorer()
 //     without mooncake-store growing a dependency on that layer.
 
@@ -93,19 +94,29 @@ inline bool RemoteReplicaScoringEnabled() {
 // symmetric cluster degrades to the historical "first remote MEMORY" pick.
 inline const Replica::Descriptor *PickBestRemoteMemory(
     const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
+    const std::unordered_set<std::string> &local_endpoints,
+    const std::vector<std::string> &preferred_hcas = {}) {
     ReplicaScorer scorer = GetRemoteReplicaScorer();
+    const bool score_enabled =
+        preferred_hcas.empty() || scorer || RemoteReplicaScoringEnabled();
     const Replica::Descriptor *best = nullptr;
     double best_score = std::numeric_limits<double>::max();
+    int best_affinity = preferred_hcas.empty() ? 0 : 3;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (!r.is_memory_replica()) continue;
         if (local_endpoints.count(r.get_memory_descriptor()
                                       .buffer_descriptor.transport_endpoint_))
             continue;  // local replicas are handled by the caller
-        double score = scorer ? scorer(r) : BuiltinRemoteReplicaScore(r);
-        if (score < best_score) {
+        double score = score_enabled
+                           ? (scorer ? scorer(r) : BuiltinRemoteReplicaScore(r))
+                           : 0.0;
+        const int affinity =
+            HcaAffinityTier(r.get_memory_descriptor().locality, preferred_hcas);
+        if (affinity < best_affinity ||
+            (affinity == best_affinity && score < best_score)) {
             best_score = score;
+            best_affinity = affinity;
             best = &r;
         }
     }
@@ -114,12 +125,17 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 
 // Select the best replica from a list: prefer local MEMORY, local NOF_SSD,
 // remote MEMORY, remote NOF_SSD, LOCAL_DISK, DFS, then DISK. Master may return
-// replicas in any order, so we always scan. When scoring is enabled and there
-// are multiple remote MEMORY replicas, the best-scoring one is chosen instead
-// of the first encountered.
+// replicas in any order, so we always scan all replicas before deciding — this
+// ensures local MEMORY is always preferred over local NOF regardless of the
+// order replicas appear in the list. When scoring is enabled and there are
+// multiple remote MEMORY replicas, the best-scoring one is chosen instead of
+// the first encountered.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
+    const std::unordered_set<std::string> &local_endpoints,
+    const std::vector<std::string> &preferred_hcas = {}) {
+    const Replica::Descriptor *local_memory = nullptr;
+    const Replica::Descriptor *local_nof = nullptr;
     const Replica::Descriptor *first_memory = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
@@ -128,23 +144,35 @@ inline const Replica::Descriptor *SelectBestReplica(
             if (local_endpoints.count(
                     r.get_memory_descriptor()
                         .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
+                if (!local_memory ||
+                    HcaAffinityTier(r.get_memory_descriptor().locality,
+                                    preferred_hcas) <
+                        HcaAffinityTier(
+                            local_memory->get_memory_descriptor().locality,
+                            preferred_hcas))
+                    local_memory = &r;
+            } else {
+                if (!first_memory) first_memory = &r;
             }
-            if (!first_memory) first_memory = &r;
         } else if (r.is_nof_replica()) {
             if (local_endpoints.count(
                     r.get_nof_descriptor()
                         .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
+                if (!local_nof) local_nof = &r;
+            } else {
+                if (!first_nof) first_nof = &r;
             }
-            if (!first_nof) first_nof = &r;
         }
     }
+    // Local MEMORY always beats local NOF regardless of list order.
+    if (local_memory) return local_memory;
+    if (local_nof) return local_nof;
     // No local replica. Among remote MEMORY replicas, optionally pick the
     // best-scoring one instead of the first encountered (issue #2516).
-    if (first_memory && RemoteReplicaScoringEnabled()) {
-        if (const auto *scored =
-                PickBestRemoteMemory(replicas, local_endpoints)) {
+    if (first_memory &&
+        (!preferred_hcas.empty() || RemoteReplicaScoringEnabled())) {
+        if (const auto *scored = PickBestRemoteMemory(replicas, local_endpoints,
+                                                      preferred_hcas)) {
             return scored;
         }
     }
@@ -163,6 +191,30 @@ inline const Replica::Descriptor *SelectBestReplica(
         }
     }
     return best;
+}
+
+// Keep the original winner first for unknown destinations. Other complete
+// memory copies belong to the same query/lease and can be selected later when
+// the actual destination is known, including cached and session reads.
+inline std::vector<Replica::Descriptor> RetainMemoryReadCandidates(
+    const std::vector<Replica::Descriptor> &replicas,
+    const Replica::Descriptor &chosen, bool affinity_enabled) {
+    std::vector<Replica::Descriptor> result{chosen};
+    if (!affinity_enabled || !chosen.is_memory_replica()) return result;
+    const auto &original = chosen.get_memory_descriptor().buffer_descriptor;
+    for (const auto &replica : replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE ||
+            !replica.is_memory_replica())
+            continue;
+        const auto &buffer = replica.get_memory_descriptor().buffer_descriptor;
+        if (buffer.size_ != original.size_ ||
+            (replica.id == chosen.id &&
+             buffer.buffer_address_ == original.buffer_address_ &&
+             buffer.transport_endpoint_ == original.transport_endpoint_))
+            continue;
+        result.push_back(replica);
+    }
+    return result;
 }
 
 }  // namespace mooncake

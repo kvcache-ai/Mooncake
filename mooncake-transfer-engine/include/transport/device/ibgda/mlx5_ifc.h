@@ -64,6 +64,7 @@ enum {
     MLX5_CMD_OP_INIT2RTR_QP = 0x503,
     MLX5_CMD_OP_RTR2RTS_QP = 0x504,
     MLX5_CMD_OP_RTS2RTS_QP = 0x505,
+    MLX5_CMD_OP_QP_2RST = 0x50a,
     MLX5_CMD_OP_QUERY_QP = 0x50b,
     MLX5_CMD_OP_INIT2INIT_QP = 0x50e,
     MLX5_CMD_OP_CREATE_PSV = 0x600,
@@ -3863,6 +3864,28 @@ struct mlx5_ifc_rts2rts_qp_in_bits {
     u8 opt_param_mask_95_32[0x40];
 
     struct mlx5_ifc_qpc_ext_bits qpc_data_ext;
+};
+
+struct mlx5_ifc_qp_2rst_in_bits {
+    u8 opcode[0x10];
+    u8 uid[0x10];
+
+    u8 reserved_at_20[0x10];
+    u8 op_mod[0x10];
+
+    u8 reserved_at_40[0x8];
+    u8 qpn[0x18];
+
+    u8 reserved_at_60[0x20];
+};
+
+struct mlx5_ifc_qp_2rst_out_bits {
+    u8 status[0x8];
+    u8 reserved_at_8[0x18];
+
+    u8 syndrome[0x20];
+
+    u8 reserved_at_40[0x40];
 };
 
 struct mlx5_ifc_query_qp_out_bits {

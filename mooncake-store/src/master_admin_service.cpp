@@ -1070,6 +1070,59 @@ void MasterAdminServer::HandleSegmentStatus(
     });
 }
 
+struct HttpSetSegmentStatusRequest {
+    std::string status;
+};
+YLT_REFL(HttpSetSegmentStatusRequest, status);
+
+void MasterAdminServer::HandleSetSegmentStatus(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    const std::string segment_name(req.get_decode_query_value("segment"));
+    if (segment_name.empty()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Missing segment query parameter");
+        return;
+    }
+
+    HttpSetSegmentStatusRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+    SegmentStatus status;
+    if (request.status == "OK") {
+        status = SegmentStatus::OK;
+    } else if (request.status == "DRAINING") {
+        status = SegmentStatus::DRAINING;
+    } else {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "status must be OK or DRAINING");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetSegmentStatus(segment_name, status);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpSegmentStatusResponse payload;
+        payload.success = true;
+        payload.segment = segment_name;
+        payload.status = static_cast<int32_t>(status);
+        payload.status_name = EnumToString(status);
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
 struct HttpDiskReplicaInfo {
     std::string file_path;
     uint64_t object_size = 0;
@@ -1284,6 +1337,71 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
+struct HttpSoftPinRequest {
+    std::string tenant_id{"default"};
+    std::vector<std::string> keys;
+    std::optional<uint64_t> ttl_ms;
+};
+YLT_REFL(HttpSoftPinRequest, tenant_id, keys, ttl_ms);
+
+struct HttpSoftPinResult {
+    std::string key;
+    int32_t error_code{0};
+};
+YLT_REFL(HttpSoftPinResult, key, error_code);
+
+struct HttpSoftPinResponse {
+    std::vector<HttpSoftPinResult> results;
+};
+YLT_REFL(HttpSoftPinResponse, results);
+
+void MasterAdminServer::HandleSoftPin(coro_http::coro_http_request& req,
+                                      coro_http::coro_http_response& resp,
+                                      bool unpin) {
+    HttpSoftPinRequest request;
+    try {
+        const auto body = req.get_body();
+        auto cursor = body.begin();
+        auto end = body.end();
+        struct_json::from_json(request, cursor, end);
+        if (!std::all_of(cursor, end, [](char ch) {
+                return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+            })) {
+            WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                               ErrorCode::INVALID_PARAMS,
+                               "Unexpected content after JSON body");
+            return;
+        }
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+    if (request.keys.empty() || request.keys.size() > 4096 ||
+        !TenantId(request.tenant_id).IsValid() ||
+        (unpin ? request.ttl_ms.has_value() : !request.ttl_ms.has_value())) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Expected 1..4096 keys, a valid tenant, and ttl_ms "
+                           "only for soft_pin");
+        return;
+    }
+    WithActiveService(resp, [&](auto service) {
+        const auto results = service->BatchUpdateSoftPin(
+            request.keys, unpin ? 0 : *request.ttl_ms, request.tenant_id);
+        HttpSoftPinResponse payload;
+        payload.results.reserve(results.size());
+        for (size_t i = 0; i < results.size(); ++i) {
+            payload.results.push_back(
+                {request.keys[i],
+                 static_cast<int32_t>(results[i] ? ErrorCode::OK
+                                                 : results[i].error())});
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
 struct HttpRemoveAllResponse {
     bool success{true};
     long removed_count{0};
@@ -1313,6 +1431,17 @@ void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
 
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
+
+    http_server_.set_http_handler<POST>(
+        "/api/v1/soft_pin",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSoftPin(req, resp, false);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/soft_unpin",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSoftPin(req, resp, true);
+        });
 
     http_server_.set_http_handler<GET>(
         "/metrics", [this](coro_http_request& req, coro_http_response& resp) {
@@ -1402,6 +1531,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/segments/status",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSegmentStatus(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/segments/status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetSegmentStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/tenant_quotas",

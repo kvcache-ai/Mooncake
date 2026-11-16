@@ -29,7 +29,10 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
     int init_calls = 0;
     int health_check_calls = 0;
     int putv_calls = 0;
+    int put_batch_calls = 0;
+    std::vector<std::pair<const iovec*, int>> putv_inputs;
     int get_calls = 0;
+    int get_batch_calls = 0;
     bool fail_health_check = false;
     bool initialized = false;
 
@@ -42,6 +45,7 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<void, ErrorCode> PutV(const std::string& logical_key,
                                        const iovec* iov, int iovcnt) override {
         ++putv_calls;
+        putv_inputs.emplace_back(iov, iovcnt);
         if (fail_keys.contains(logical_key)) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -68,6 +72,18 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
             std::memcpy(buf, it->second.data(), bytes_read);
         }
         return bytes_read;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> PutBatch(
+        const std::vector<ObjectPutRequest>& requests) override {
+        ++put_batch_calls;
+        return ObjectStorageAdapter::PutBatch(requests);
+    }
+
+    std::vector<tl::expected<size_t, ErrorCode>> GetBatch(
+        const std::vector<ObjectGetRequest>& requests) override {
+        ++get_batch_calls;
+        return ObjectStorageAdapter::GetBatch(requests);
     }
 
     tl::expected<bool, ErrorCode> Exists(
@@ -110,31 +126,6 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
 class FakeFileSystemAdapter : public FileSystemAdapter {
    public:
     bool initialized = false;
-
-    tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string&, std::span<const char> data) override {
-        return data.size();
-    }
-
-    tl::expected<size_t, ErrorCode> ReadFile(const std::string&, void*,
-                                             size_t) override {
-        return 0;
-    }
-
-    tl::expected<size_t, ErrorCode> VectorWriteFile(const std::string&,
-                                                    const iovec* iov,
-                                                    int iovcnt,
-                                                    off_t) override {
-        size_t total = 0;
-        for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
-        return total;
-    }
-
-    tl::expected<size_t, ErrorCode> VectorReadFile(const std::string&,
-                                                   const iovec*, int,
-                                                   off_t) override {
-        return 0;
-    }
 
     tl::expected<void, ErrorCode> DeleteFile(const std::string&) override {
         return {};
@@ -192,6 +183,35 @@ class ObjectStorageAdapterTest : public ::testing::Test {
     std::filesystem::path root_dir_;
 };
 
+TEST_F(ObjectStorageAdapterTest, DefaultPutBatchForwardsIovecArrayAndCount) {
+    FakeObjectStorageAdapter adapter;
+    adapter.fail_keys.insert("failed");
+    std::string first = "first", second = "second", unused = "unused";
+    const iovec segments[] = {{first.data(), first.size()},
+                              {second.data(), second.size()},
+                              {unused.data(), unused.size()}};
+    auto results =
+        adapter.ObjectStorageAdapter::PutBatch({{"joined", segments, 2},
+                                                {"failed", segments + 1, 1},
+                                                {"empty", nullptr, 0}});
+    ASSERT_EQ(results.size(), 3U);
+    EXPECT_TRUE(results[0]);
+    ASSERT_FALSE(results[1]);
+    EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_TRUE(results[2]);
+    EXPECT_EQ(adapter.objects.at("joined"), first + second);
+    EXPECT_EQ(adapter.objects.at("empty"), "");
+    ASSERT_EQ(adapter.putv_inputs.size(), 3U);
+    EXPECT_EQ(adapter.putv_inputs[0].first, segments);
+    EXPECT_EQ(adapter.putv_inputs[0].second, 2);
+    EXPECT_EQ(adapter.putv_inputs[1].first, segments + 1);
+    EXPECT_EQ(adapter.putv_inputs[1].second, 1);
+    EXPECT_EQ(adapter.putv_inputs[2].first, nullptr);
+    EXPECT_EQ(adapter.putv_inputs[2].second, 0);
+    EXPECT_TRUE(adapter.ObjectStorageAdapter::PutBatch({}).empty());
+    EXPECT_EQ(adapter.putv_calls, 3);
+}
+
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);
@@ -199,6 +219,7 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     EXPECT_EQ(backend->GetStorageMode(),
               DistributedStorageMode::kObjectStorage);
     EXPECT_TRUE(backend->UsesObjectStorage());
+    EXPECT_FALSE(backend->SupportsArbitraryHostReadBuffers());
     ASSERT_TRUE(backend->Init());
     EXPECT_TRUE(adapter->initialized);
     EXPECT_EQ(adapter->init_calls, 1);
@@ -209,7 +230,7 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     EXPECT_EQ(adapter->init_calls, 1);
 }
 
-TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
+TEST_F(ObjectStorageAdapterTest, ObjectStorageModeValidatesDfsRequests) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);
     ASSERT_TRUE(backend->Init());
@@ -217,12 +238,12 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
     auto write_results = backend->BatchWrite({DfsWriteRequest{}});
     ASSERT_EQ(write_results.size(), 1);
     ASSERT_FALSE(write_results.front());
-    EXPECT_EQ(write_results.front().error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(write_results.front().error(), ErrorCode::INVALID_PARAMS);
 
     auto read_results = backend->BatchRead({DfsReadRequest{}});
     ASSERT_EQ(read_results.size(), 1);
     ASSERT_FALSE(read_results.front());
-    EXPECT_EQ(read_results.front().error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(read_results.front().error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRunsEnabledHealthCheck) {
@@ -277,6 +298,7 @@ TEST_F(ObjectStorageAdapterTest, BatchOffloadWritesMultiSliceObjects) {
 
     ASSERT_TRUE(result);
     EXPECT_EQ(*result, 2);
+    EXPECT_EQ(adapter->put_batch_calls, 1);
     EXPECT_EQ(adapter->putv_calls, 2);
     EXPECT_EQ(adapter->objects.at("first"), "hello-world");
     EXPECT_EQ(adapter->objects.at("second"), "payload");
@@ -462,6 +484,7 @@ TEST_F(ObjectStorageAdapterTest, BatchLoadReadsObjects) {
     ASSERT_TRUE(backend->BatchLoad(slices));
     EXPECT_EQ(std::string(first.data(), first.size()), "hello");
     EXPECT_EQ(std::string(second.data(), second.size()), "world");
+    EXPECT_EQ(adapter->get_batch_calls, 1);
     EXPECT_EQ(adapter->get_calls, 2);
 }
 
@@ -536,6 +559,7 @@ TEST_F(ObjectStorageAdapterTest, FileSystemModeKeepsDfsOnlyContract) {
 
     EXPECT_EQ(backend.GetStorageMode(), DistributedStorageMode::kFileSystem);
     EXPECT_FALSE(backend.UsesObjectStorage());
+    EXPECT_FALSE(backend.SupportsArbitraryHostReadBuffers());
 
     std::unordered_map<std::string, std::vector<Slice>> offload_batch;
     auto offload_result = backend.BatchOffload(

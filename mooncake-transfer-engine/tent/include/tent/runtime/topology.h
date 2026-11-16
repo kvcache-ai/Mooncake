@@ -48,7 +48,14 @@ class Topology {
         NIC_UNKNOWN = 2,
         NIC_UB = 3,
     };
-    enum MemType { MEM_HOST, MEM_CUDA, MEM_ROCM, MEM_ASCEND, MEM_UNKNOWN };
+    enum MemType {
+        MEM_HOST,
+        MEM_CUDA,
+        MEM_ROCM,
+        MEM_ASCEND,
+        MEM_UNKNOWN,
+        MEM_MLU
+    };
 
     using NicID = int;
     struct NicEntry {
@@ -159,6 +166,12 @@ class LocationParser {
     std::string type_;
     int index_;
 };
+
+// Only CUDA and MLU locations are keys for RDMA GPUDirect reachability.
+inline int gdrOrdinal(const LocationParser& location) {
+    const auto type = location.type();
+    return (type == "cuda" || type == "mlu") ? location.index() : -1;
+}
 
 // Canonical AMD GPU location prefix and alias handling live in
 // amd_location.h, shared with the rocm device plugin.

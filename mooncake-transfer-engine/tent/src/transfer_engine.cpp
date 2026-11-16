@@ -28,9 +28,10 @@ TransferEngine::TransferEngine(const std::string config_path) {
     auto conf = std::make_shared<Config>();
     auto status = conf->loadFile(config_path);
     if (!status.ok()) {
-        LOG(WARNING) << "Failed to read config file " << config_path;
+        LOG(ERROR) << "Failed to read config file " << config_path << ": "
+                   << status.ToString();
     }
-    impl_ = std::make_unique<TransferEngineImpl>(conf);
+    impl_ = std::make_unique<TransferEngineImpl>(conf, status.ok());
 }
 
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)
@@ -144,6 +145,12 @@ Status TransferEngine::submitTransfer(
     return impl_->submitTransfer(batch_id, request_list);
 }
 
+Status TransferEngine::submitTransferRequiringPostSubmitCancellation(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    return impl_->submitTransferRequiringPostSubmitCancellation(batch_id,
+                                                                request_list);
+}
+
 Status TransferEngine::submitTransfer(BatchID batch_id,
                                       const std::vector<Request>& request_list,
                                       const Notification& notifi) {
@@ -181,6 +188,12 @@ Status TransferEngine::getTransferStatus(
 Status TransferEngine::getTransferStatus(BatchID batch_id,
                                          TransferStatus& overall_status) {
     return impl_->getTransferStatus(batch_id, overall_status);
+}
+
+Status TransferEngine::waitTransfer(BatchID batch_id,
+                                    std::vector<TransferStatus>* status_list,
+                                    uint64_t timeout_ms) {
+    return impl_->waitTransfer(batch_id, status_list, timeout_ms);
 }
 
 Status TransferEngine::progressBatch(BatchID batch_id,

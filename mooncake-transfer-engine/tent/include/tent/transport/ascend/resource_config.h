@@ -29,6 +29,10 @@ namespace tent {
 
 constexpr int32_t kAscendDefaultTransferTimeoutMs = 10000;
 constexpr int32_t kAscendDefaultBasePort = 20000;
+// Disconnect timeout used when aborting the HIXL sessions of a timed-out route.
+// A caller-judged timeout must Disconnect the peer: HIXL never reports TIMEOUT
+// itself and has no cancel API, and Disconnect is what aborts the in-flight
+// device DMA of that peer.
 constexpr int32_t kAscendTimeoutDisconnectMs = 1000;
 constexpr const char* kDefaultLocalCommRes = R"({"version":"1.3"})";
 constexpr const char* kHixlNameAttr = "hixl_name";
@@ -49,6 +53,22 @@ struct AscendDirectOptions {
 
 bool ParseEnvEnabled(const char* name);
 
+// TE support for configuring HIXL's comm_resource_config.nic_topo_path in the
+// (already role-resolved) GlobalResourceConfig: fills it from the custom
+// topology path (topology/custom_json_path) when the HIXL option is empty.
+// Rules:
+//   - custom_topo_json empty                            -> returned unchanged
+//   - nic_topo_path already set (flat or nested, string, non-empty)
+//                                                       -> returned unchanged
+//   - otherwise the custom topology path is written under the nested
+//     "comm_resource_config" object when one exists (any stale flat key is
+//     dropped), otherwise as the flat key
+//     "comm_resource_config.nic_topo_path". An empty input yields a minimal
+//     {"comm_resource_config.nic_topo_path":"..."} object.
+// A non-empty but unparsable input is returned unchanged (HIXL rejects it).
+std::string InjectNicTopoPathFromCustomTopoTent(
+    const std::string& resolved_config, const std::string& custom_topo_json);
+
 AscendDirectOptions LoadAscendDirectOptions(
     const std::shared_ptr<Config>& conf);
 
@@ -64,11 +84,41 @@ std::map<std::string, std::string> WithHixlListenPort(
 
 std::string HostIpFromSegmentName(const std::string& segment_name);
 std::string MakeHixlEngineName(const std::string& host_ip, uint16_t port);
-uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id);
+uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports = {});
 
 std::vector<std::string> ParseHixlNames(const MemorySegmentDesc& detail);
 std::string ResolveRemoteHixlName(const MemorySegmentDesc& detail,
                                   uint64_t dest_addr);
+
+// Resolves the destination engine's HIXL name for many requests that target one
+// segment, for example the thousands of page requests of a page-granular
+// batch. Construction parses the segment's hixl_names JSON and the per-buffer
+// engine mapping once; Resolve() then only walks the small range table.
+// Reparsing the JSON per request dominated submission for a peer segment that
+// publishes many engines (for example the 16-engine segment holder of
+// standalone mode).
+class HixlNameResolver {
+   public:
+    HixlNameResolver() = default;
+    explicit HixlNameResolver(const MemorySegmentDesc& detail);
+
+    // HIXL engine name that owns dest_addr, or an empty string when the
+    // segment publishes no engine name.
+    const std::string& Resolve(uint64_t dest_addr) const;
+
+   private:
+    struct BufferRange {
+        uint64_t begin;
+        uint64_t length;
+        size_t name_idx;
+    };
+
+    std::vector<std::string> names_;
+    std::vector<BufferRange> ranges_;
+
+    static const std::string empty_;
+};
 
 }  // namespace tent
 }  // namespace mooncake

@@ -1,0 +1,17 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Generated from jit_config.h.in by CMake -- do not edit the generated copy.
+ *
+ * The JIT engine shells out to nvcc at runtime, so the kernel headers that the
+ * generated source #includes must be resolvable as files on disk. These are
+ * the paths CMake staged them to.
+ */
+
+#pragma once
+
+#define MOONCAKE_EP_JIT_SOURCE_DIR "@MOONCAKE_EP_JIT_SOURCE_DIR@"
+#define MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR "@MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR@"
+#define MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR "@MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR@"

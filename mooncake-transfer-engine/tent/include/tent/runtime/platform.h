@@ -20,19 +20,46 @@
 namespace mooncake {
 namespace tent {
 
-// New device memory types are appended last so the numeric values of the
-// existing entries are preserved. TPU HBM and Intel XPU VRAM are not
-// NIC-addressable in the MVP, so transfers touching them are staged through
-// host DRAM. TPU staging is routed by ProxyManager (see findStagingPolicy);
-// XPU currently only exposes the device-local alloc/copy primitives and is
-// classified by getTypeEnum, but its transport-layer staging is not yet wired.
+// Append new memory types to preserve existing numeric values. Add device
+// types to isGpuMemoryType() as well so routing and staging agree.
+// Intel XPU VRAM is NIC-addressable only when exported as a dma-buf and
+// registered with ibv_reg_dmabuf_mr (see Platform::exportDmabuf); otherwise
+// transfers are staged through host DRAM.
 enum MemoryType {
     MTYPE_UNKNOWN,
     MTYPE_CPU,
     MTYPE_CUDA,
     MTYPE_ROCM,
     MTYPE_TPU,
-    MTYPE_XPU
+    MTYPE_XPU,
+    MTYPE_MLU
+};
+
+// Shared by routing and staging. Copy capabilities depend on the transport.
+inline bool isGpuMemoryType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU ||
+           t == MTYPE_XPU || t == MTYPE_MLU;
+}
+
+// A device allocation exported as a Linux dma-buf so a NIC can register it
+// with ibv_reg_dmabuf_mr. Level Zero caches a borrowed descriptor per
+// allocation; CNDrv returns a new descriptor that the caller closes after
+// registration. The MR keeps its own reference to the dma-buf.
+// `offset` is the position of the requested address within the exported
+// buffer. The export must cover [offset, offset + requested length); the
+// exporter may use the whole allocation or a page-aligned subrange.
+struct DmabufExport {
+    int fd = -1;
+    uint64_t offset = 0;
+    bool close_fd = false;
+
+    // Close only caller-owned descriptors; safe to call more than once.
+    void close();
+};
+
+struct DmabufExportGuard {
+    DmabufExport &handle;
+    ~DmabufExportGuard() { handle.close(); }
 };
 
 class Platform {
@@ -64,6 +91,24 @@ class Platform {
     // GPU platforms flush those devices; CPU and others no-op. Failures are
     // logged and still return OK so teardown can continue.
     virtual Status synchronizeDevices(const Topology *topology);
+
+    // Export the device allocation containing [addr, addr+length) as a
+    // dma-buf for direct NIC registration. Returns NotImplemented when the
+    // platform has no dma-buf export path (the default), InvalidArgument when
+    // `addr` is not device memory owned by this platform (register it as host
+    // memory instead), and InternalError when the export itself failed. Only
+    // an OK status populates `out`. The caller closes the fd after registration
+    // only when `out.close_fd` is true.
+    virtual Status exportDmabuf(void *addr, size_t length, DmabufExport &out);
+
+    // Page-aligned host memory that this platform's device copies reach by
+    // DMA (pinned / page-locked), for staging buffers that are allocated once
+    // and reused. Release it with freePinnedHost, never with free(). The
+    // default returns ordinary page-aligned host memory, so platforms without
+    // a pinned-host API still work, only without the faster copies.
+    virtual Status allocatePinnedHost(void **pptr, size_t size);
+
+    virtual Status freePinnedHost(void *ptr, size_t size);
 
    protected:
     static std::vector<int> topologyDeviceIndices(const Topology *topology,

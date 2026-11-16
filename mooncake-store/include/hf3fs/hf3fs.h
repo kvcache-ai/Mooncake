@@ -1,13 +1,13 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <mutex>
 #include <thread>
 #include <hf3fs_usrbio.h>
-
-#include "file_interface.h"
-#include "types.h"
 
 namespace mooncake {
 
@@ -31,7 +31,7 @@ struct Hf3fsConfig {
 
 class USRBIOResourceManager {
    public:
-    USRBIOResourceManager() {}
+    USRBIOResourceManager();
 
     void setDefaultParams(const Hf3fsConfig &config) {
         default_config_ = config;
@@ -50,11 +50,15 @@ class USRBIOResourceManager {
     USRBIOResourceManager &operator=(const USRBIOResourceManager &) = delete;
     Hf3fsConfig default_config_;
 
+    // Unique across manager lifetimes, including reuse of the same address.
+    const uint64_t cache_id_;
+
     // Thread resources map protection lock
     std::mutex resource_map_mutex;
 
     // ThreadID to resource mapping
-    std::unordered_map<std::thread::id, struct ThreadUSRBIOResource *>
+    std::unordered_map<std::thread::id,
+                       std::unique_ptr<struct ThreadUSRBIOResource>>
         thread_resources;
 };
 
@@ -80,27 +84,6 @@ struct ThreadUSRBIOResource {
     void Cleanup();
 
     ~ThreadUSRBIOResource() { Cleanup(); }
-};
-
-class ThreeFSFile : public StorageFile {
-   public:
-    ThreeFSFile(const std::string &filename, int fd,
-                USRBIOResourceManager *resource_manager);
-    ~ThreeFSFile() override;
-
-    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
-                                          size_t length) override;
-    tl::expected<size_t, ErrorCode> write(std::span<const char> data,
-                                          size_t length) override;
-    tl::expected<size_t, ErrorCode> read(std::string &buffer,
-                                         size_t length) override;
-    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
-                                                 off_t offset) override;
-    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
-                                                off_t offset) override;
-
-   private:
-    USRBIOResourceManager *resource_manager_;
 };
 
 }  // namespace mooncake

@@ -20,6 +20,8 @@ class BatchOpLogSnapshotCapture {
           last_included_batch_id(other.last_included_batch_id),
           producer_view_version(other.producer_view_version),
           segments(std::move(other.segments)),
+          weight_metadata(std::move(other.weight_metadata)),
+          object_storage(std::move(other.object_storage)),
           cursor_(std::move(other.cursor_)),
           generation_(std::exchange(other.generation_, 0)),
           lease_state_(std::move(other.lease_state_)) {}
@@ -31,6 +33,8 @@ class BatchOpLogSnapshotCapture {
             last_included_batch_id = other.last_included_batch_id;
             producer_view_version = other.producer_view_version;
             segments = std::move(other.segments);
+            weight_metadata = std::move(other.weight_metadata);
+            object_storage = std::move(other.object_storage);
             cursor_ = std::move(other.cursor_);
             generation_ = std::exchange(other.generation_, 0);
             lease_state_ = std::move(other.lease_state_);
@@ -48,6 +52,8 @@ class BatchOpLogSnapshotCapture {
     uint64_t last_included_batch_id;
     ViewVersionId producer_view_version;
     std::vector<StandbySegmentInfo> segments;
+    WeightMetadataSnapshot weight_metadata;
+    ObjectReplicaSnapshot object_storage;
 
    private:
     friend class HotStandbyService;

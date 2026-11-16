@@ -3,14 +3,17 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
+#include <future>
+#include <utility>
 
+#include "common_types.h"
 #include "control_plane/control_types.h"
 #include "gpu_runtime.h"
 
 #include <transfer_engine.h>
 #include <mooncake_worker_kernels.cuh>
-#include "comm_types.h"
 
 #include <memory>
 #include <mutex>
@@ -25,6 +28,34 @@ namespace mooncake {
 static constexpr size_t kBufferSize = 1u << 24;
 
 class MooncakeCommunicator;
+
+class WorkCompletion {
+   public:
+    explicit WorkCompletion(std::shared_future<void> completion)
+        : completion_(std::move(completion)) {}
+
+    bool isCompleted() const {
+        if (completion_.wait_for(std::chrono::microseconds(0)) !=
+            std::future_status::ready) {
+            return false;
+        }
+        completion_.get();
+        return true;
+    }
+
+    bool wait(std::chrono::microseconds timeout) const {
+        if (timeout.count() < 0) {
+            completion_.wait();
+        } else if (completion_.wait_for(timeout) != std::future_status::ready) {
+            return false;
+        }
+        completion_.get();
+        return true;
+    }
+
+   private:
+    std::shared_future<void> completion_;
+};
 
 // Local collective extension state. Every communicator starts in Isolated.
 //
@@ -60,6 +91,10 @@ struct TransferGroupMeta {
     // Highest active InGroupRank plus one.
     std::atomic<int> activeSize{0};
     int taskCount;
+    // Runs of each buffer half so far, counted by the host worker. A half has
+    // two sets of sync flags and a run uses the set of its count's parity. The
+    // counts restart only when a rank is admitted (see applyGroupState).
+    std::atomic<uint32_t> bufferHalfRuns[2]{};
 
     GroupId group_id;
     std::atomic<uint64_t> epoch{0};
@@ -130,6 +165,11 @@ class MooncakeWorker {
     bool drainTasks(const TransferGroupMeta* meta) const;
 
    private:
+    struct CudaTaskSubmissionToken {
+        size_t task_id;
+        uint64_t sequence;
+    };
+
     void startWorker();
     void waitUntilTasksSubmitted(
         const std::vector<CudaTaskSubmissionToken>& tasks) const;

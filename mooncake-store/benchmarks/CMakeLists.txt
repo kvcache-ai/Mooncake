@@ -65,3 +65,7 @@ endif()
 
 add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
 target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
+
+# Add group index write path benchmark executable
+add_executable(group_index_contention_bench group_index_contention_bench.cpp)
+target_link_libraries(group_index_contention_bench PRIVATE mooncake_store)
