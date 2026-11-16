@@ -119,6 +119,10 @@ class RocmPlatform : public Platform {
 
     Status synchronizeDevices(const Topology* topology) override;
 
+    // Only hip_gem_allocator.so buffers (rocm_gem.h): ordinary HIP memory
+    // keeps the default (NotImplemented, registered with ibv_reg_mr).
+    Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
+
     Status getStreamFromPool(HIPStreamHandle& outHandle,
                              int deviceId = HIPStreamPool::kCurrentDevice);
 

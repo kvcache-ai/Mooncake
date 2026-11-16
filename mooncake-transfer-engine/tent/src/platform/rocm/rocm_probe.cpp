@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/platform/rocm.h"
+#include "tent/platform/rocm_gem.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
 #include "char_util.h"
@@ -263,6 +264,17 @@ MemoryType RocmPlatform::getMemoryType(void* addr) {
     return MTYPE_CPU;
 }
 
+// HIP reports memory imported with hipImportExternalMemory, such as a
+// HipGemAllocator buffer, as device 0's whichever device imported it; the
+// allocator knows the device it was allocated on. Called per transfer, so it
+// only uses an allocator that registration (warm-up, dma-buf export) found.
+static int deviceOfPointer(void* addr, int reported_device) {
+    int device = -1;
+    return lookupHipGemBuffer(addr, nullptr, nullptr, nullptr, &device, false)
+               ? device
+               : reported_device;
+}
+
 int RocmPlatform::getPointerDeviceId(void* addr) {
     hipPointerAttribute_t attributes{};
     if (hipPointerGetAttributes(&attributes, addr) != hipSuccess) {
@@ -274,7 +286,7 @@ int RocmPlatform::getPointerDeviceId(void* addr) {
     if (attributes.type != hipMemoryTypeDevice) {
         return HIPStreamPool::kCurrentDevice;
     }
-    return attributes.device;
+    return deviceOfPointer(addr, attributes.device);
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -309,7 +321,8 @@ const std::vector<RangeLocation> RocmPlatform::getLocation(void* start,
 
     if (attributes.type == hipMemoryTypeDevice) {
         entries.push_back(
-            {(uint64_t)start, len, genRocmNodeName(attributes.device)});
+            {(uint64_t)start, len,
+             genRocmNodeName(deviceOfPointer(start, attributes.device))});
         return entries;
     }
 
