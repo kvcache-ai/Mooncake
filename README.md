@@ -254,10 +254,12 @@ The Dynamo entry describes SGLang HiCache shared-cache routing. Its separate [KV
 
 Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects, as listed below. See the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html) and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html) for details.
 
-| <img src="image/partners/nvidia_logo.png" width="120" alt="NVIDIA"/> | <img src="image/partners/huawei_logo.png" width="120" alt="Huawei"/> | <img src="image/partners/amd_logo.png" width="120" alt="AMD"/> | <img src="image/hardwares/cambricon_logo.png" width="120" alt="Cambricon"/> | <img src="image/partners/moore_thread_logo.jpg" width="120" alt="Moore Threads"/> | <img src="image/partners/aws-logo.png" width="120" alt="AWS"/> |
-| --- | --- | --- | --- | --- | --- |
-| <img src="image/hardwares/MetaX_logo.png" width="120" alt="MetaX"/> | <img src="image/hardwares/T-Head_logo.png" width="120" alt="T-Head"/> | <img src="image/partners/aliyun_logo.png" width="120" alt="Alibaba Cloud"/> | <img src="image/partners/sunrise_logo.png" width="120" alt="Sunrise"/> | <img src="image/partners/hygon_logo.png" width="120" alt="Hygon"/> | <img src="image/hardwares/biren_logo.png" width="120" alt="Biren Technology"/> |
-| <img src="image/hardwares/intel_logo.png" width="120" alt="Intel"/> | <img src="image/hardwares/google_logo.png" width="120" alt="Google"/> | <img src="image/hardwares/hpe_logo.png" width="120" alt="HPE"/> | <img src="image/hardwares/iluvatar_corex_logo.png" width="120" alt="Iluvatar CoreX"/> | <img src="image/hardwares/flagos_logo.png" width="120" alt="FlagOS"/> | |
+<!-- Regenerate with: uv run scripts/generate_hardware_overview.py -->
+<p align="center">
+  <img src="image/hardwares/supported_hardware.png" width="960" alt="Supported hardware ecosystem: NVIDIA, Huawei, AMD, Cambricon, Moore Threads, AWS, MetaX, T-Head, Alibaba Cloud, Sunrise, Hygon, Biren Technology, Intel, Google, HPE, Iluvatar CoreX, FlagOS."/>
+</p>
+
+*Each logo has equal display space; placement does not indicate ranking.*
 
 <h2 id="quick-start">🚀 Getting Started</h2>
 
