@@ -193,14 +193,28 @@ inline const Replica::Descriptor *SelectBestReplica(
     return best;
 }
 
-// Keep the original winner first for unknown destinations. Other complete
-// memory copies belong to the same query/lease and can be selected later when
-// the actual destination is known, including cached and session reads.
+// Peer transport endpoint for MEMORY / NOF replicas. Empty for disk/DFS.
+inline std::string PeerReplicaEndpoint(const Replica::Descriptor &replica) {
+    if (replica.is_memory_replica()) {
+        return replica.get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_;
+    }
+    if (replica.is_nof_replica()) {
+        return replica.get_nof_descriptor()
+            .buffer_descriptor.transport_endpoint_;
+    }
+    return {};
+}
+
+// Keep the original winner first. Other complete MEMORY copies of the same
+// size stay available so a TRANSFER_FAIL against one peer can fall back to a
+// sibling without a second Query (Type-1). affinity_enabled is retained for
+// call-site compatibility; MEMORY siblings are always kept.
 inline std::vector<Replica::Descriptor> RetainMemoryReadCandidates(
     const std::vector<Replica::Descriptor> &replicas,
-    const Replica::Descriptor &chosen, bool affinity_enabled) {
+    const Replica::Descriptor &chosen, bool /*affinity_enabled*/) {
     std::vector<Replica::Descriptor> result{chosen};
-    if (!affinity_enabled || !chosen.is_memory_replica()) return result;
+    if (!chosen.is_memory_replica()) return result;
     const auto &original = chosen.get_memory_descriptor().buffer_descriptor;
     for (const auto &replica : replicas) {
         if (replica.status != ReplicaStatus::COMPLETE ||

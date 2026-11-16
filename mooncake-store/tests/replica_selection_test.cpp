@@ -509,7 +509,26 @@ TEST_F(ReplicaSelectionTest, CachedCandidatesReselectForCurrentDestination) {
                       .buffer_descriptor.transport_endpoint_,
                   address == 0x10000 ? "store-a" : "store-b");
     }
-    EXPECT_EQ(RetainMemoryReadCandidates(replicas, first, false).size(), 1);
+    // MEMORY siblings stay available for peer failover even when HCA affinity
+    // is off (Type-1: dead peer, healthy sibling).
+    EXPECT_EQ(RetainMemoryReadCandidates(replicas, first, false).size(), 2);
+}
+
+TEST_F(ReplicaSelectionTest, RetainMemorySiblingsWithoutAffinity) {
+    auto first = MakeMemory("store-a", "rdma");
+    auto second = MakeMemory("store-b", "rdma");
+    second.id = 1;
+    const std::vector<Replica::Descriptor> replicas{first, second};
+    const auto kept = RetainMemoryReadCandidates(replicas, first, false);
+    ASSERT_EQ(kept.size(), 2);
+    EXPECT_EQ(kept[0].get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "store-a");
+    EXPECT_EQ(kept[1].get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "store-b");
+    EXPECT_EQ(PeerReplicaEndpoint(first), "store-a");
+    EXPECT_TRUE(PeerReplicaEndpoint(MakeDisk("file")).empty());
 }
 
 TEST_F(ReplicaSelectionTest, HcaReadPreferenceKeepsLocalityAndUsableFallbacks) {

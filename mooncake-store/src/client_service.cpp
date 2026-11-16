@@ -28,6 +28,7 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <ylt/struct_json/json_reader.h>
@@ -1618,121 +1619,181 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
-    // Select a complete replica for this request's destination.
-    Replica::Descriptor replica;
-    ErrorCode err =
-        MakeReadReplicaSelector()(query_result.replicas, slices, replica);
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::INVALID_REPLICA) {
-            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+    // Peer transfer failures are local to one store endpoint. Keep MEMORY /
+    // NOF siblings in the query and retry once against another peer (Type-1).
+    // Do not restart TE; Device-not-active is Type-2 and is out of scope here.
+    constexpr int kMaxPeerRetries = 1;
+    std::unordered_set<std::string> excluded_endpoints;
+    ErrorCode last_err = ErrorCode::INVALID_REPLICA;
+
+    for (int attempt = 0; attempt <= kMaxPeerRetries; ++attempt) {
+        std::vector<Replica::Descriptor> candidates;
+        candidates.reserve(query_result.replicas.size());
+        for (const auto& replica : query_result.replicas) {
+            const std::string endpoint = PeerReplicaEndpoint(replica);
+            if (!endpoint.empty() && excluded_endpoints.count(endpoint)) {
+                continue;
+            }
+            candidates.push_back(replica);
         }
-        return tl::unexpected(err);
-    }
 
-    // Check local hot cache and update replica descriptor if cache hit
-    bool cache_used = false;
-    if (hot_cache_ && replica.is_memory_replica()) {
-        cache_used = RedirectToHotCache(object_key, replica);
-    }
+        Replica::Descriptor replica;
+        ErrorCode err =
+            MakeReadReplicaSelector()(candidates, slices, replica);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+            }
+            return tl::unexpected(attempt == 0 ? err : last_err);
+        }
 
-    auto t0_get = std::chrono::steady_clock::now();
-    if (replica.is_dfs_replica()) {
-        err = ReadDfsReplica(object_key, replica, slices);
-    } else {
-        err = TransferRead(replica, slices);
-    }
+        // Check local hot cache and update replica descriptor if cache hit
+        bool cache_used = false;
+        if (hot_cache_ && replica.is_memory_replica()) {
+            cache_used = RedirectToHotCache(object_key, replica);
+        }
 
-    // Release the cache block after transfer completes (memcpy is done)
-    if (hot_cache_ && cache_used) {
-        hot_cache_->ReleaseHotKey(object_key);
-    }
+        auto t0_get = std::chrono::steady_clock::now();
+        if (replica.is_dfs_replica()) {
+            err = ReadDfsReplica(object_key, replica, slices);
+        } else {
+            err = TransferRead(replica, slices);
+        }
 
-    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - t0_get)
-                      .count();
-    if (metrics_) {
-        metrics_->transfer_metric.get_latency_us.observe(us_get);
-    }
+        // Release the cache block after transfer completes (memcpy is done)
+        if (hot_cache_ && cache_used) {
+            hot_cache_->ReleaseHotKey(object_key);
+        }
 
-    if (err != ErrorCode::OK) {
+        auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t0_get)
+                          .count();
+        if (metrics_) {
+            metrics_->transfer_metric.get_latency_us.observe(us_get);
+        }
+
+        if (err == ErrorCode::OK) {
+            auto checksum_result = VerifyObjectChecksum(
+                object_key, slices, calculate_total_size(replica),
+                query_result.object_checksum);
+            if (!checksum_result) {
+                auto* dfs_metric = GetDfsMetricPtr();
+                if (replica.is_dfs_replica() && dfs_metric) {
+                    dfs_metric->RecordReadErrors(
+                        toString(checksum_result.error()));
+                }
+                return tl::unexpected(checksum_result.error());
+            }
+
+            if (ShouldAdmitToHotCache(object_key, cache_used)) {
+                ProcessSlicesAsync(object_key, slices, replica);
+            }
+
+            if (query_result.IsLeaseExpired()) {
+                LOG(WARNING)
+                    << "lease_expired_before_data_transfer_completed key="
+                    << object_key;
+                return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            }
+            if (hot_cache_ && replica.is_memory_replica()) {
+                VLOG(1) << "Get completed: key=" << object_key
+                        << " cache_hit=" << (cache_used ? 1 : 0);
+            }
+            return {};
+        }
+
         if (err == ErrorCode::OBJECT_NOT_FOUND) {
             ReconcileMissingKvcsReplica(object_key, query_result, replica);
         }
-        LOG(ERROR) << "transfer_read_failed key=" << object_key;
-        return tl::unexpected(err);
-    }
+        last_err = err;
 
-    auto checksum_result =
-        VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
-                             query_result.object_checksum);
-    if (!checksum_result) {
-        // add checksum err for single-key
-        auto* dfs_metric = GetDfsMetricPtr();
-        if (replica.is_dfs_replica() && dfs_metric) {
-            dfs_metric->RecordReadErrors(toString(checksum_result.error()));
+        const std::string endpoint = PeerReplicaEndpoint(replica);
+        const bool can_retry_peer =
+            err == ErrorCode::TRANSFER_FAIL && !endpoint.empty() &&
+            (replica.is_memory_replica() || replica.is_nof_replica()) &&
+            attempt < kMaxPeerRetries;
+        if (!can_retry_peer) {
+            LOG(ERROR) << "transfer_read_failed key=" << object_key;
+            return tl::unexpected(err);
         }
-        return tl::unexpected(checksum_result.error());
+
+        excluded_endpoints.insert(endpoint);
+        LOG(WARNING) << "transfer_read_failed peer=" << endpoint
+                     << " retrying sibling key=" << object_key;
     }
 
-    // Frequency admission: only promote frequently accessed keys to hot cache.
-    // Skip when cache_used — data was already served from local cache, no need
-    // to re-promote or increment the CMS counter.
-    if (ShouldAdmitToHotCache(object_key, cache_used)) {
-        ProcessSlicesAsync(object_key, slices, replica);
-    }
-
-    if (query_result.IsLeaseExpired()) {
-        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                     << object_key;
-        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
-    }
-    // Log cache hit statistics
-    if (hot_cache_ && replica.is_memory_replica()) {
-        VLOG(1) << "Get completed: key=" << object_key
-                << " cache_hit=" << (cache_used ? 1 : 0);
-    }
-
-    return {};
+    return tl::unexpected(last_err);
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
-    Replica::Descriptor replica;
-    ErrorCode err =
-        MakeReadReplicaSelector()(query_result.replicas, slices, replica);
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::INVALID_REPLICA) {
-            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+    constexpr int kMaxPeerRetries = 1;
+    std::unordered_set<std::string> excluded_endpoints;
+    ErrorCode last_err = ErrorCode::INVALID_REPLICA;
+
+    for (int attempt = 0; attempt <= kMaxPeerRetries; ++attempt) {
+        std::vector<Replica::Descriptor> candidates;
+        candidates.reserve(query_result.replicas.size());
+        for (const auto& replica : query_result.replicas) {
+            const std::string endpoint = PeerReplicaEndpoint(replica);
+            if (!endpoint.empty() && excluded_endpoints.count(endpoint)) {
+                continue;
+            }
+            candidates.push_back(replica);
         }
-        return tl::unexpected(err);
-    }
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "Range read only supported for memory replicas, key="
-                   << object_key;
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+
+        Replica::Descriptor replica;
+        ErrorCode err =
+            MakeReadReplicaSelector()(candidates, slices, replica);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+            }
+            return tl::unexpected(attempt == 0 ? err : last_err);
+        }
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << "Range read only supported for memory replicas, key="
+                       << object_key;
+            return tl::unexpected(ErrorCode::INVALID_REPLICA);
+        }
+
+        auto t0_get = std::chrono::steady_clock::now();
+        err = TransferReadRange(replica, slices, src_offset);
+        auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t0_get)
+                          .count();
+        if (metrics_) {
+            metrics_->transfer_metric.get_latency_us.observe(us_get);
+        }
+
+        if (err == ErrorCode::OK) {
+            if (query_result.IsLeaseExpired()) {
+                LOG(WARNING)
+                    << "lease_expired_before_data_transfer_completed key="
+                    << object_key;
+                return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            }
+            return {};
+        }
+
+        last_err = err;
+        const std::string endpoint = PeerReplicaEndpoint(replica);
+        const bool can_retry_peer = err == ErrorCode::TRANSFER_FAIL &&
+                                    !endpoint.empty() &&
+                                    attempt < kMaxPeerRetries;
+        if (!can_retry_peer) {
+            LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
+            return tl::unexpected(err);
+        }
+
+        excluded_endpoints.insert(endpoint);
+        LOG(WARNING) << "transfer_read_range_failed peer=" << endpoint
+                     << " retrying sibling key=" << object_key;
     }
 
-    auto t0_get = std::chrono::steady_clock::now();
-    err = TransferReadRange(replica, slices, src_offset);
-    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - t0_get)
-                      .count();
-    if (metrics_) {
-        metrics_->transfer_metric.get_latency_us.observe(us_get);
-    }
-
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
-        return tl::unexpected(err);
-    }
-    if (query_result.IsLeaseExpired()) {
-        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                     << object_key;
-        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
-    }
-    return {};
+    return tl::unexpected(last_err);
 }
 
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
