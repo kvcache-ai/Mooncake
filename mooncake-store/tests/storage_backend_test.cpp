@@ -6886,7 +6886,7 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     BucketBackendConfig bucket_config;
     std::string value(64, 'v');
     constexpr int keys_per_bucket = 500;
-    constexpr int bucket_count = 20;
+    constexpr int bucket_count = 160;
     auto make_batch = [&](int first) {
         std::unordered_map<std::string, std::vector<Slice>> batch;
         for (int i = first; i < first + keys_per_bucket; ++i) {
@@ -6911,7 +6911,8 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
         ASSERT_FALSE(failed.has_value());
         EXPECT_EQ(backend.GetStoreMetadata()->total_keys,
                   bucket_count * keys_per_bucket);
-        EXPECT_FALSE(*backend.IsExist("grow10000"));
+        EXPECT_FALSE(*backend.IsExist(
+            "grow" + std::to_string(bucket_count * keys_per_bucket)));
         ASSERT_TRUE(backend.DeleteBucket(buckets.front()));
         EXPECT_FALSE(*backend.IsExist("grow0"));
         // Reoffloading an existing bucket must not add duplicate entries.

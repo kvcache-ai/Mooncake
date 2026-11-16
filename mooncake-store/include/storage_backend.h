@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "ascii_string.h"
-#include "bucket_object_index.h"
+#include "common/sharded_map.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -1344,7 +1344,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Round-robin cursor for SelectDiskForWrite: the disk to try first on the
     // next write.
     int rr_cursor_ GUARDED_BY(mutex_) = 0;
-    BucketObjectIndex<> GUARDED_BY(mutex_) object_bucket_map_;
+    ShardedMap<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+        object_bucket_map_;
     // Reserved key sets stay global: key uniqueness is a property of the whole
     // backend, not of one disk.
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
