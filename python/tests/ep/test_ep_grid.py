@@ -483,6 +483,10 @@ class TestMooncakeEPBuffer(unittest.TestCase):
         os.environ["MASTER_PORT"] = str(port)
 
     def run_single_config(self, config_dict):
+        if self.world_size < 2:
+            self.skipTest(
+                f"EP multi-rank test requires at least 2 devices, found {self.world_size}"
+            )
         mp.spawn(
             worker,
             args=(self.world_size, config_dict, self.local_p2p, self.iterations),
@@ -492,6 +496,10 @@ class TestMooncakeEPBuffer(unittest.TestCase):
         )
 
     def test_combine_stale_data(self):
+        if self.world_size < 2:
+            self.skipTest(
+                f"EP multi-rank test requires at least 2 devices, found {self.world_size}"
+            )
         if self.local_p2p:
             self.skipTest("local P2P profile covers healthy-rank communication")
         mp.spawn(
