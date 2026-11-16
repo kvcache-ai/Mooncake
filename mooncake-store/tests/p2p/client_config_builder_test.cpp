@@ -220,7 +220,7 @@ TEST_F(RuntimeConfigBuilderTest, DictRejectsInvalidNumericInputs) {
 TEST_F(RuntimeConfigBuilderTest, DictBooleanControlsKeepDefaultsAndOverrides) {
     struct Control {
         const char* key;
-        bool P2PClientConfig::*field;
+        bool P2PClientConfig::* field;
         bool default_value;
     };
     const Control controls[] = {
