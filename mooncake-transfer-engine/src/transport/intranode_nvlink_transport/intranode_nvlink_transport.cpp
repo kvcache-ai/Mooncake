@@ -466,8 +466,18 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         ++task_id;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
+            // Open the peer IPC mapping on the source buffer's device so the
+            // copy stays a direct source->target NVLink path. A fresh thread
+            // defaults to device 0, and cudaIpcOpenMemHandle binds the
+            // mapping to the calling thread's context.
+            int saved_device = -1;
+            cudaGetDevice(&saved_device);
+            int src_device = getDeviceForPointer((void *)request.source);
+            if (src_device < 0) src_device = saved_device;
+            if (src_device != saved_device) cudaSetDevice(src_device);
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
+            if (src_device != saved_device) cudaSetDevice(saved_device);
             if (rc) return Status::Memory("device memory not registered");
         }
         task.total_bytes = request.length;
@@ -588,8 +598,18 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         auto &request = *task.request;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
+            // Open the peer IPC mapping on the source buffer's device so the
+            // copy stays a direct source->target NVLink path. A fresh thread
+            // defaults to device 0, and cudaIpcOpenMemHandle binds the
+            // mapping to the calling thread's context (issue #4986).
+            int saved_device = -1;
+            cudaGetDevice(&saved_device);
+            int src_device = getDeviceForPointer((void *)request.source);
+            if (src_device < 0) src_device = saved_device;
+            if (src_device != saved_device) cudaSetDevice(src_device);
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
+            if (src_device != saved_device) cudaSetDevice(saved_device);
             if (rc) return Status::Memory("device memory not registered");
         }
         task.total_bytes = request.length;
@@ -666,7 +686,23 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     cudaIpcMemHandle_t handle;
     err = cudaIpcGetMemHandle(&handle, (void *)base_ptr);
     if (err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaIpcGetMemHandle failed";
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaIpcGetMemHandle failed: "
+                   << cudaGetErrorString(err);
+        // Virtual-memory allocations (cuMemCreate) have no legacy IPC handle.
+        // cuMemRetainAllocationHandle only succeeds for those, so use it to
+        // tell the user why registration failed.
+        CUmemGenericAllocationHandle vmm_handle;
+        if (cuMemRetainAllocationHandle(&vmm_handle, (void *)base_ptr) ==
+            CUDA_SUCCESS) {
+            cuMemRelease(vmm_handle);
+            LOG(ERROR)
+                << "IntraNodeNvlinkTransport: buffer " << addr
+                << " is a virtual-memory (cuMemCreate) allocation, which has "
+                   "no cudaIpc handle. This is the case for PyTorch with "
+                   "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. Register "
+                   "a buffer allocated with cudaMalloc/cuMemAlloc instead, or "
+                   "disable expandable_segments for it.";
+        }
         return -1;
     }
 
@@ -739,6 +775,23 @@ int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         LOG(ERROR) << "IntraNodeNvlinkTransport: "
                                       "cudaIpcOpenMemHandle failed: "
                                    << cudaGetErrorString(err);
+                        // cudaErrorDeviceUninitialized ("invalid device
+                        // context") is what CUDA returns when the handle
+                        // looks like it was exported by this very process:
+                        // the exporter's PID equals ours. Peers in separate
+                        // PID namespaces (e.g. two containers) can get the
+                        // same PID.
+                        if (err == cudaErrorDeviceUninitialized) {
+                            LOG(ERROR)
+                                << "IntraNodeNvlinkTransport: the peer segment "
+                                << target_id
+                                << " may run in a different PID namespace "
+                                   "with the same PID as this process (CUDA "
+                                   "IPC handles carry the exporter's PID). "
+                                   "Run the peers in a shared PID namespace, "
+                                   "e.g. docker run --pid=host, or hostPID / "
+                                   "shareProcessNamespace in Kubernetes.";
+                        }
                         return -1;
                     }
                     OpenedShmEntry shm_entry;

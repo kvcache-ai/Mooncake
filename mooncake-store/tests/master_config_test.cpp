@@ -61,5 +61,24 @@ TEST(ClientLivenessConfigTest, LegacyBuilderSetterDefaultsBothWindows) {
     EXPECT_EQ(config.client_suspicion_ttl_sec, 45);
 }
 
+TEST(HALeaseTtlConfigTest, SupervisorConfigDefaultsToMasterViewTtl) {
+    const MasterServiceSupervisorConfig config{};
+
+    EXPECT_EQ(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+              config.ha_leader_lease_ttl_sec);
+}
+
+TEST(HALeaseTtlConfigTest, SupervisorConfigCarriesMasterConfigTtl) {
+    MasterConfig master_config{};
+    master_config.ha_backend_type = "etcd";
+    EXPECT_EQ(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+              master_config.ha_leader_lease_ttl_sec);
+    master_config.ha_leader_lease_ttl_sec = 17;
+
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+
+    EXPECT_EQ(17, supervisor_config.ha_leader_lease_ttl_sec);
+}
+
 }  // namespace
 }  // namespace mooncake::test

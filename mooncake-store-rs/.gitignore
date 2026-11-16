@@ -1,0 +1,8 @@
+/target
+/Cargo.lock
+/dist
+/.venv-wheel
+*build/
+!/scripts/build/
+!/scripts/build/*.sh
+*.egg-info/

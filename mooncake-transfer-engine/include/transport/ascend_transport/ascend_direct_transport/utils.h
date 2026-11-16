@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include <acl/acl.h>
+#include "ascend_affinity.h"
 
 namespace mooncake {
 
@@ -48,10 +50,10 @@ namespace mooncake {
 
 class ScopeGuard {
    public:
-    ScopeGuard(const ScopeGuard &) = delete;
-    ScopeGuard &operator=(const ScopeGuard &) = delete;
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
 
-    explicit ScopeGuard(const std::function<void()> &on_exit_scope)
+    explicit ScopeGuard(const std::function<void()>& on_exit_scope)
         : on_exit_scope_(on_exit_scope) {}
 
     ~ScopeGuard() {
@@ -59,7 +61,7 @@ class ScopeGuard {
             if (on_exit_scope_ != nullptr) {
                 try {
                     on_exit_scope_();
-                } catch (std::bad_function_call &) {
+                } catch (std::bad_function_call&) {
                     // no need log error
                 } catch (...) {
                     // no need log error
@@ -75,16 +77,42 @@ class ScopeGuard {
     bool dismissed_ = false;
 };
 
-std::string GenAdxlEngineName(const std::string &ip, const uint64_t port);
+// Classic Ascend direct transport helpers: the ASCEND_GLOBAL_RESOURCE_CONFIG
+// parser used by the dispatcher and host allocator, and the small generation
+// helpers. The NUMA affinity plan/thread pool come from ascend_affinity.h.
+std::string GenAdxlEngineName(const std::string& ip, const uint64_t port);
 
-uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
+uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports = {});
+
+// True only when HCCL_INTRA_ROCE_ENABLE=1. The standalone holder's
+// RoceDummyRealSliceDispatcher is selected from this flag. roce:device and
+// roce:host in ASCEND_GLOBAL_RESOURCE_CONFIG do not set it.
+bool IsHcclIntraRoceEnabled();
 
 // True when HCCL_INTRA_ROCE_ENABLE=1 or ASCEND_GLOBAL_RESOURCE_CONFIG sets
 // comm_resource_config.protocol_desc to a roce:* entry (string or array).
 bool IsRoceModeEnabled();
 
+int SetDeviceAndGetContext(int32_t device_id, aclrtContext* out_context);
+
+// ASCEND_GLOBAL_RESOURCE_CONFIG (and protocol_desc) helpers used by the classic
+// Ascend direct transport and the classic host allocator. TENT parses its own
+// configuration copy with the vendored nlohmann JSON library instead.
+
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
-bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
+bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str);
+
+// True when protocol_desc is "hccs:device", or an array containing that
+// entry. "hccs:host" and "roce:*" do not match. config_str is the already
+// role-resolved ASCEND_GLOBAL_RESOURCE_CONFIG.
+bool HasHccsDeviceProtocolDescInGlobalResourceConfig(const char* config_str);
+
+// True when protocol_desc is "roce:host", or an array containing that entry,
+// on this object or on its "store" subtree. "roce:device" does not match.
+// The store subtree is included because host memory is allocated after TE
+// init, when ascend_store_te_init has already been cleared.
+bool HasRoceHostProtocolDescInGlobalResourceConfig(const char* config_str);
 
 // Resolve the effective ASCEND_GLOBAL_RESOURCE_CONFIG for the current TE role.
 // Schema: the top-level object is the default config (passed verbatim to adxl
@@ -94,80 +122,22 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
 //   - has "store" and store-init TE  -> the "store" sub-object, serialized
 //   - has "store" and normal TE      -> root with "store" removed, serialized
 // A Store TE with no "store" key falls back to the default config.
-std::string ResolveAscendGlobalResourceConfig(const char *config_str);
+std::string ResolveAscendGlobalResourceConfig(const char* config_str);
 
-int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
-
-/**
- * @brief A simple thread pool for executing tasks asynchronously.
- *
- * This thread pool maintains a fixed number of worker threads that
- * execute tasks from a shared queue until the pool is stopped.
- */
-class AscendThreadPool {
-   public:
-    /**
-     * @brief Constructs a AscendThreadPool with the specified number of
-     * threads.
-     * @param num_threads The number of worker threads to create.
-     */
-    explicit AscendThreadPool(size_t num_threads);
-
-    /**
-     * @brief Destructor that stops the thread pool and waits for all threads.
-     */
-    ~AscendThreadPool();
-
-    /**
-     * @brief Stops the thread pool and waits for all threads to finish.
-     *
-     * No new tasks will be accepted after stopping. Tasks already
-     * in the queue will be processed before shutdown completes.
-     */
-    void stop();
-
-    /**
-     * @brief Checks if the thread pool is running.
-     * @return true if the pool is running, false otherwise.
-     */
-    bool isRunning() const;
-
-    /**
-     * @brief Enqueues a task to be executed by the thread pool.
-     * @tparam F The callable type.
-     * @tparam Args The argument types for the callable.
-     * @param f The callable to execute.
-     * @param args The arguments to pass to the callable.
-     *
-     * If the thread pool has been stopped, the task will not be enqueued.
-     */
-    template <class F, class... Args>
-    void enqueue(F &&f, Args &&...args);
-
-   private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    std::mutex queue_mutex_;
-    std::condition_variable condition_;
-    std::atomic<bool> running_{false};
-};
-
-template <class F, class... Args>
-void AscendThreadPool::enqueue(F &&f, Args &&...args) {
-    auto task = std::make_shared<std::function<void()>>(
-        [f = std::forward<F>(f),
-         ... args = std::forward<Args>(args)]() mutable {
-            std::invoke(f, args...);
-        });
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        if (!running_) {
-            return;
-        }
-        tasks_.emplace([task] { (*task)(); });
-    }
-    condition_.notify_one();
-}
+// TE support for configuring HIXL's comm_resource_config.nic_topo_path in the
+// (already role-resolved) GlobalResourceConfig: fills it from Mooncake's
+// MC_CUSTOM_TOPO_JSON path when the HIXL option is empty. Rules:
+//   - MC_CUSTOM_TOPO_JSON unset/empty                    -> returned unchanged
+//   - nic_topo_path already set (flat or nested, string, non-empty)
+//                                                       -> returned unchanged
+//   - otherwise the MC_CUSTOM_TOPO_JSON path is written under the nested
+//     "comm_resource_config" object when one exists (any stale flat key is
+//     dropped), otherwise as the flat key
+//     "comm_resource_config.nic_topo_path". An empty input yields a minimal
+//     {"comm_resource_config.nic_topo_path":"..."} object.
+// A non-empty but unparsable input is returned unchanged (HIXL rejects it).
+std::string InjectNicTopoPathFromCustomTopoEnvTe(
+    const std::string& resolved_config);
 
 }  // namespace mooncake
 #endif  // ASCEND_DIRECT_UTIL_H

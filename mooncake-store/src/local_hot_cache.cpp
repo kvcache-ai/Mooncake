@@ -166,7 +166,8 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
     // Keep the key on active removed blocks so release can find and retire it.
     for (auto& owned_block : blocks_) {
         HotMemBlock* block = owned_block.get();
-        if (block && block->key_ == key && block->ref_count > 0) {
+        // Detached fill blocks have no readers and their key is caller-owned.
+        if (block && block->ref_count > 0 && block->key_ == key) {
             block->ref_count--;
             if (block->ref_count == 0 &&
                 key_to_lru_it_.find(key) == key_to_lru_it_.end()) {
@@ -181,7 +182,7 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
 bool LocalHotCache::hasActiveBlockForKeyLocked(const std::string& key) const {
     for (const auto& owned_block : blocks_) {
         const HotMemBlock* block = owned_block.get();
-        if (block && block->key_ == key && block->ref_count > 0) {
+        if (block && block->ref_count > 0 && block->key_ == key) {
             return true;
         }
     }

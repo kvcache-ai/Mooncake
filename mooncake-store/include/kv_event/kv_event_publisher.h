@@ -34,11 +34,14 @@ class KvEventPublisher {
     // TenantId wrapper; the TenantId overloads preserve the existing API.
     void PublishStored(const std::string& object_key, const std::string& medium,
                        const std::string& tenant_id = "",
-                       const std::string& group_id = "");
+                       const std::string& group_id = "",
+                       const std::string& session_id = "");
     void PublishStored(const std::string& object_key, const std::string& medium,
                        const TenantId& tenant_id,
-                       const std::string& group_id = "") {
-        PublishStored(object_key, medium, tenant_id.value(), group_id);
+                       const std::string& group_id = "",
+                       const std::string& session_id = "") {
+        PublishStored(object_key, medium, tenant_id.value(), group_id,
+                      session_id);
     }
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium,
@@ -61,7 +64,8 @@ class KvEventPublisher {
     void PublishCommitted(const std::string& object_key,
                           const std::vector<std::string>& current_media,
                           const std::string& tenant_id = "",
-                          const std::string& group_id = "");
+                          const std::string& group_id = "",
+                          const std::string& session_id = "");
 
     // Synchronize replica availability after an internal metadata mutation.
     // previous_media is the medium set captured before the mutation; media that
@@ -70,7 +74,8 @@ class KvEventPublisher {
                          const std::vector<std::string>& current_media,
                          const std::string& tenant_id = "",
                          const std::string& group_id = "",
-                         const std::vector<std::string>& previous_media = {});
+                         const std::vector<std::string>& previous_media = {},
+                         const std::string& session_id = "");
 
     // Publish removal of every medium the object had before deletion.
     void PublishObjectRemoved(
@@ -95,6 +100,7 @@ class KvEventPublisher {
         std::string medium;
         std::string tenant_id;
         std::string group_id;
+        std::string session_id{};
     };
 
     void EnqueueBatch(std::vector<PendingEvent> events);
@@ -132,19 +138,22 @@ class KvEventPublisher {
     bool enabled() const { return false; }
 
     void PublishStored(const std::string&, const std::string&,
-                       const std::string& = "", const std::string& = "") {}
-    void PublishStored(const std::string&, const std::string&, const TenantId&,
+                       const std::string& = "", const std::string& = "",
                        const std::string& = "") {}
+    void PublishStored(const std::string&, const std::string&, const TenantId&,
+                       const std::string& = "", const std::string& = "") {}
     void PublishRemoved(const std::string&, const std::string&,
                         const std::string& = "", const std::string& = "") {}
     void PublishRemoved(const std::string&, const std::string&, const TenantId&,
                         const std::string& = "") {}
     void PublishCleared(const std::string& = "") {}
     void PublishCommitted(const std::string&, const std::vector<std::string>&,
-                          const std::string& = "", const std::string& = "") {}
+                          const std::string& = "", const std::string& = "",
+                          const std::string& = "") {}
     void SyncObjectState(const std::string&, const std::vector<std::string>&,
                          const std::string& = "", const std::string& = "",
-                         const std::vector<std::string>& = {}) {}
+                         const std::vector<std::string>& = {},
+                         const std::string& = "") {}
     void PublishObjectRemoved(const std::string&, const std::string& = "",
                               const std::string& = "",
                               const std::vector<std::string>& = {}) {}

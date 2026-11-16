@@ -22,13 +22,18 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/rpc/rpc.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
@@ -126,6 +131,23 @@ std::shared_ptr<StubNotifyTransport> installStub(TransferEngineImpl& engine,
     EXPECT_TRUE(stub->install(segment_name, nullptr, nullptr, nullptr).ok());
     engine.swapTransportForTest(slot, stub);
     return stub;
+}
+
+// The receiving end of the RPC leg without an engine, on loopback.
+std::string startReceiver(ControlService& receiver) {
+    uint16_t port = 0;
+    EXPECT_TRUE(receiver.start(port).ok());
+    return "127.0.0.1:" + std::to_string(port);
+}
+
+// ControlClient pools connections per thread, and a later server may reuse
+// an earlier one's port; a new thread has no stale connection to it.
+Status notifyFromNewThread(const std::string& addr, const std::string& msg) {
+    Status status;
+    std::thread([&] {
+        status = ControlClient::notify(addr, makeNotification(msg));
+    }).join();
+    return status;
 }
 
 }  // namespace
@@ -387,6 +409,121 @@ TEST(NotificationFallbackTest, RpcNotifyLandsWithoutTcpTransport) {
     // Delivered exactly once.
     ASSERT_TRUE(receiver.receiveNotification(received).ok());
     EXPECT_TRUE(received.empty());
+}
+
+// Nothing takes a notification before the callback is set or after teardown
+// clears it; the peer answered, so the sender sees neither OK nor an RPC error.
+TEST(NotifyAckTest, ANotifyBeforeTheCallbackIsRegisteredIsNotAcked) {
+    ControlService receiver("p2p", "", nullptr);
+    const std::string addr = startReceiver(receiver);
+
+    const Status status = notifyFromNewThread(addr, "too-early");
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+}
+
+TEST(NotifyAckTest, ANotifyAfterTheCallbackIsClearedIsNotAcked) {
+    std::atomic<int> delivered{0};
+    ControlService receiver("p2p", "", nullptr);
+    receiver.setNotifyCallback([&delivered](const Notification&) {
+        ++delivered;
+        return 0;
+    });
+    const std::string addr = startReceiver(receiver);
+
+    const Status before = notifyFromNewThread(addr, "before-teardown");
+    ASSERT_TRUE(before.ok()) << before.ToString();
+    receiver.setNotifyCallback(nullptr);
+    const Status after = notifyFromNewThread(addr, "after-teardown");
+    EXPECT_TRUE(after.IsInternalError()) << after.ToString();
+    EXPECT_EQ(delivered.load(), 1);
+}
+
+TEST(NotifyAckTest, AMalformedNotifyIsRejected) {
+    std::atomic<int> delivered{0};
+    ControlService receiver("p2p", "", nullptr);
+    receiver.setNotifyCallback([&delivered](const Notification&) {
+        ++delivered;
+        return 0;
+    });
+    const std::string addr = startReceiver(receiver);
+
+    CoroRpcAgent client;
+    std::string answer;
+    // Not JSON, then JSON that is not a notification.
+    for (const char* request : {"[]", R"({"name":1,"msg":"m"})", "{bad"}) {
+        SCOPED_TRACE(request);
+        answer.clear();
+        const Status sent = client.call(addr, Notify, request, answer);
+        ASSERT_TRUE(sent.ok()) << sent.ToString();
+        EXPECT_EQ(answer.rfind("malformed notification: ", 0), 0u) << answer;
+    }
+    EXPECT_EQ(delivered.load(), 0);
+
+    // notify() only sends valid JSON, so a stand-in replays the answer.
+    auto replay = [&answer](const std::string_view&, std::string& response) {
+        response = answer;
+    };
+    CoroRpcAgent stand_in;
+    ASSERT_TRUE(stand_in.registerFunction(Notify, replay).ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(stand_in.start(port).ok());
+    const Status status =
+        notifyFromNewThread("127.0.0.1:" + std::to_string(port), "replayed");
+    EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+}
+
+// A callback that throws did not take the notification, but a retry may
+// succeed: neither OK nor the unretryable answer to a malformed request.
+TEST(NotifyAckTest, ANotifyWhoseCallbackThrowsIsNotAcked) {
+    std::atomic<int> calls{0};
+    ControlService receiver("p2p", "", nullptr);
+    receiver.setNotifyCallback([&calls](const Notification&) -> int {
+        if (++calls == 1) throw std::runtime_error("queue full");
+        return nlohmann::json::parse("{").get<int>();
+    });
+    const std::string addr = startReceiver(receiver);
+
+    for (int i = 0; i < 2; ++i) {
+        const Status status = notifyFromNewThread(addr, "thrown");
+        EXPECT_TRUE(status.IsInternalError()) << i << status.ToString();
+    }
+    EXPECT_EQ(calls.load(), 2);
+}
+
+// A non-zero return means the callback did not take the notification.
+TEST(NotifyAckTest, ANotifyWhoseCallbackRejectsIsNotAcked) {
+    std::atomic<int> calls{0};
+    ControlService receiver("p2p", "", nullptr);
+    receiver.setNotifyCallback([&calls](const Notification&) {
+        ++calls;
+        return -1;
+    });
+    const std::string addr = startReceiver(receiver);
+
+    const Status status = notifyFromNewThread(addr, "rejected");
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+    EXPECT_NE(status.message().find("returned -1"), std::string_view::npos)
+        << status.ToString();
+    EXPECT_EQ(calls.load(), 1);
+}
+
+TEST(NotifyAckTest, ADeliveredNotifyIsAcked) {
+    std::mutex mutex;
+    std::vector<Notification> delivered;
+    ControlService receiver("p2p", "", nullptr);
+    receiver.setNotifyCallback([&](const Notification& notifi) {
+        std::lock_guard<std::mutex> lock(mutex);
+        delivered.push_back(notifi);
+        return 0;
+    });
+    const std::string addr = startReceiver(receiver);
+
+    const Status status = notifyFromNewThread(addr, "delivered");
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    std::lock_guard<std::mutex> lock(mutex);
+    ASSERT_EQ(delivered.size(), 1u);
+    EXPECT_EQ(delivered[0].name, "notification-fallback-test");
+    EXPECT_EQ(delivered[0].msg, "delivered");
 }
 
 }  // namespace tent

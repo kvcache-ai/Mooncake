@@ -18,7 +18,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef USE_SHCA
@@ -307,7 +306,11 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
     std::call_once(g_once_flag, fork_init);
 }
 
-RdmaContext::~RdmaContext() { disable(); }
+RdmaContext::~RdmaContext() {
+    if (disable())
+        LOG(FATAL)
+            << "Cannot destroy RDMA context with live endpoint resources";
+}
 
 int RdmaContext::construct(const std::string& device_name,
                            std::shared_ptr<RdmaParams> params) {
@@ -470,6 +473,7 @@ void RdmaContext::cleanupResources() {
             if (ret) PLOG(ERROR) << "ibv_dereg_mr";
         }
         mr_set_.clear();
+        dmabuf_mr_set_.clear();
     }
     for (auto& entry : cq_list_) {
         delete entry;
@@ -535,8 +539,8 @@ int RdmaContext::resume() {
                : -1;
 }
 
-RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
-                                                int access) {
+RdmaContext::MemReg RdmaContext::registerMemReg(
+    void* addr, size_t length, int access, const DmabufExport* shared_export) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
@@ -600,6 +604,56 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     }
 #endif
 
+    // Register exported device memory so the NIC DMAs to VRAM directly.
+    // NotImplemented or InvalidArgument may describe ordinary host memory;
+    // the memory-type check below prevents an MLU pointer from reaching
+    // ibv_reg_mr if export is unavailable. Any other export failure, or a
+    // failed ibv_reg_dmabuf_mr, leaves the buffer to the staging route.
+    if (shared_export && shared_export->fd >= 0 && !supportsDmabuf())
+        return nullptr;
+    if (verbs_.ibv_reg_dmabuf_mr) {
+        DmabufExport handle;
+        Status s = Status::NotImplemented("No shared dma-buf export");
+        if (shared_export) {
+            handle = *shared_export;
+            handle.close_fd = false;
+            if (handle.fd >= 0) s = Status::OK();
+        } else {
+            s = exportDmabuf(addr, length, handle);
+        }
+        DmabufExportGuard export_guard{handle};
+        if (s.ok()) {
+            ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
+                native_pd_, handle.offset, length,
+                reinterpret_cast<uint64_t>(addr), handle.fd, access);
+            // The MR takes its own reference to the dma-buf. Shared exports
+            // and Level Zero descriptors are borrowed; only a private,
+            // caller-owned export is closed by this guard.
+            if (!entry) {
+                const void* end = static_cast<const char*>(addr) + length;
+                PLOG(ERROR)
+                    << "Failed to register dma-buf device memory from " << addr
+                    << " to " << end << " in RDMA device " << device_name_;
+                return nullptr;
+            }
+            mr_set_mutex_.lock();
+            mr_set_.insert(entry);
+            dmabuf_mr_set_.insert(entry);
+            mr_set_mutex_.unlock();
+            return entry;
+        }
+        if (!s.IsNotImplemented() && !s.IsInvalidArgument()) {
+            LOG(ERROR) << "dma-buf export failed for device memory at " << addr
+                       << " (" << length << " bytes): " << s.message();
+            return nullptr;
+        }
+    }
+
+    // MLU memory must not reach the plain MR path when dma-buf verbs or export
+    // are unavailable. The engine may still use a separate host stage buffer.
+    const auto memory_type = Platform::getLoader().getMemoryType(addr);
+    if (memory_type == MTYPE_MLU) return nullptr;
+
     // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
@@ -650,6 +704,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     size_t region_length = entry->length;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
+    const bool is_dmabuf = dmabuf_mr_set_.erase(entry) != 0;
     mr_set_mutex_.unlock();
 
     if (verbs_.ibv_dereg_mr(entry)) {
@@ -658,16 +713,12 @@ int RdmaContext::unregisterMemReg(MemReg id) {
                    << " to " << end << " in RDMA device " << device_name_;
         return -1;
     }
-    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
-    // madvise(MADV_DONTFORK) on the registered range when fork protection
-    // is active; failing to undo this on unregister leaves VMAs permanently
-    // split, exhausting vm.max_map_count under high register/unregister churn.
-    // See issue #3639.
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // dma-buf MRs pin no host pages: rdma-core stores the dma-buf offset in
+    // `addr`, not a host VMA, so there is no fork state to restore.
+    if (is_dmabuf) return 0;
+    // No MADV_DOFORK here (reverted #3660): ibv_dereg_mr() already restores the
+    // fork state of a plain host MR through ibv_dofork_range(), and the extra
+    // call only failed with EINVAL/ENOMEM on dma-buf and device ranges.
 
     return 0;
 }
@@ -824,6 +875,24 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         PLOG(ERROR) << "Failed to query port " << static_cast<int>(port)
                     << " on " << device_name;
         return -1;
+    }
+
+    supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
+    max_qp_rd_atom_ = device_attr.max_qp_rd_atom;
+    max_qp_init_rd_atom_ = device_attr.max_qp_init_rd_atom;
+    if (!supports_rdma_atomic_) {
+        LOG(INFO) << "RNIC " << device_name
+                  << " reports no RDMA atomic; data QPs will not request "
+                     "IBV_ACCESS_REMOTE_ATOMIC";
+    }
+    if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+        max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+        LOG(WARNING) << "Device " << device_name
+                     << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                     << max_qp_rd_atom_
+                     << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                     << "; configured QP depths above this limit will be "
+                        "clamped";
     }
 
     MIN(params_->device.max_cqe, device_attr.max_cqe);

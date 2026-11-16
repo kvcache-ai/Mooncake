@@ -80,6 +80,80 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+### Stored-source geometry
+
+For an already published source, use `StoredWeightManifest` and
+`plan_stored_transfer_to_target_placement(source_manifest, target_placement)`.
+Each `StoredFragmentSnapshot` identifies a logical box by `global_offset` and
+`local_shape`, and its bytes by `object_key`, `object_offset`, and `nbytes`.
+There is no source rank, training mesh, or framework runtime object in this
+fragment contract. Source fragment count, boundaries, and dimensions can differ
+from the target placement.
+
+The framework adapter determines the logical boxes and which consistent source
+copy to publish. It must decompose any nonrectangular local allocation into
+valid boxes. Mooncake validates the declared snapshot and geometry, computes
+source/target intersections, and lowers them to byte ranges; it does not infer
+training sharding or select a training replica from runtime state.
+
+The stored-source planner tests reconstruct exact bytes for nonuniform 4-to-8
+and 8-to-4 layouts, both tensor dimensions, shuffled fragments, and padded
+object offsets. These are CPU planning regressions, not transport or throughput
+measurements. This path does not replace sparse coordinate planning or change
+its wire format.
+
+## Tiled COO Partial Reads
+
+`TiledCOOLayout` and `plan_tiled_coo_read` provide a CPU-only, two-dimensional
+range planner for sparse coordinate/value streams. Source and target boxes may
+split different dimensions or use different parallel degrees. This planner
+does not gather a full tensor or prepartition the payload for a particular
+target topology.
+
+The producer orders entries by source record, then by row-major tile. Tiles
+are aligned to global tensor coordinates; each source record has its own
+contiguous tile directory even when records share a tensor ID. Coordinates and
+values remain separate flat arrays in the same entry order. A cumulative
+directory of `total_tiles + 1` entry offsets addresses the entire packed stream,
+including empty tiles; offsets do not restart at zero for each record.
+
+```python
+from mooncake.reshard.weight import TiledCOOLayout, plan_tiled_coo_read
+
+layout = TiledCOOLayout.build(
+    names=("weight",),
+    shapes=((512, 4096),),
+    offsets=((0, 0),),
+    tile_shape=(128, 64),
+)
+plan = plan_tiled_coo_read(layout, local_target_fragments)
+```
+
+Reuse `layout` and `plan` while tensor geometry and target placement stay the
+same. For every generation:
+
+1. Read `plan.offset_ranges` into a compact directory buffer. The planner may
+   combine nearby metadata windows, with at most 64 extra directory entries
+   per bridged gap.
+2. Project those windows using `plan.offset_gather_indices` and pass the fresh
+   integer endpoints to `plan.bind_offsets`. Never reuse previous-generation
+   offsets merely because the model structure is unchanged.
+3. Read the returned `payload_ranges` from both coordinate and value arrays,
+   converting entry offsets to bytes for each array's element size. Payload
+   ranges never bridge unrelated entries. `counts` and `compact_entries` map
+   each `plan.tile_runs` item to its compact destination interval, including
+   empty runs.
+4. Filter coordinates against the exact source/target intersection before
+   applying updates: a boundary tile may contain entries outside the target.
+
+Multiple targets may read the same tile into different compact destination
+intervals. This API does not deduplicate replicas, select a source generation,
+choose sparse/dense thresholds, encode values, or define additive versus
+replacement updates. Those decisions belong to the producer/consumer layer.
+The executor owns array-length, address, capacity and native integer-overflow
+checks, transport completion, and buffer lifetime. No Store, CUDA, BufferPool,
+or framework dependency is required to construct or bind this plan.
+
 ## Runtime Binding
 
 `bind_logical_transfer_plan` attaches selected typed
@@ -92,6 +166,17 @@ This plan records runtime evidence but neither submits a copy nor retains the
 underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
+
+### Shared allocation validation
+
+Runtime binding checks every fragment's logical geometry and physical view
+range. Many disjoint model-weight views may share one backing allocation;
+identical `(storage_address, storage_nbytes)` pairs are collapsed only for the
+backing-allocation overlap sweep. Distinct overlapping allocations still fail,
+including a partial overlap hidden behind repeated aliases of another arena.
+The sweep sorts unique allocations once instead of repeatedly comparing every
+pair of views in the same arena. View-overlap and declared-alias checks are
+unchanged; no persistent validation cache or new lifetime owner is introduced.
 
 ## Transfer Engine Execution
 
@@ -139,9 +224,29 @@ the compatibility entry point. `max_batch_operations`,
 `max_region_segments`, and `max_total_lowered_segments` bound physical
 expansion before native submission.
 
-This version drains each batch ticket to a known terminal state before it
-submits the next batch or endpoint. Native non-draining submission and a
-bounded multi-ticket window are the next performance phase.
+Set `max_inflight_batches` on the reader or sink to overlap batches across
+selected endpoints. The default, `1`, drains each batch before submitting the
+next. Larger windows require the native `submit_scatter_read/write` methods,
+which return a completion ticket immediately after submission. The executor
+drains the oldest ticket when the window is full and returns receipts in
+submission order. Batch size limits still apply to each submitted batch.
+
+All published tickets are drained before returning a known failure. Unresolved
+tickets share one pending-transfer handle, which retains the active
+registrations and allocation tokens until every ticket reaches a terminal
+state. A native submit exception without a recoverable ticket requires engine
+restart. The resource-neutral API exposes the same window through
+`TransferSubmission.execute_batches(..., max_inflight_batches=N)`.
+
+Each composite pending-ticket drain shares one timeout budget across its
+children. Later children receive the remaining budget, including zero for a
+non-blocking completion check. Backend calls must honor that timeout; status
+queries and scheduling overhead are additional to the wait budget.
+
+`execute_batches` borrows its input iterable and does not call `close()` on
+caller-owned iterators. Keep a resource-owning generator alive on early exit,
+and explicitly close it after outstanding transfers reach a terminal state.
+Its `finally` block must not free buffers still retained by a pending transfer.
 
 Live TE adapters accept runtime-bound source fragments. Store-backed restore
 continues through `WeightStore.load()`, which uses the same target placement and
@@ -218,6 +323,55 @@ lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
 semantics. Legacy logical planning permits omission for compatibility; the
 Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
 
+A descriptor defaults to `components=(KEY, VALUE)`. Single-component resources
+can declare `LATENT`, `CONV`, or `SSM`; their shard-unit width is `key_head_dim`
+(`value_head_dim` remains the width of `VALUE`). Components share the descriptor's
+layer set, dtype and ownership. Use separate resources for different dtypes or
+shard axes, such as a BF16 convolution buffer and an FP32 recurrent state.
+Existing K/V JSON and canonical identities remain unchanged.
+
+For MLA, declare one global latent unit and explicit TP replicas, so the planner
+chooses one source replica per target. For recurrent state, use `page_size=1`
+and let the framework map request slots to rows. GDN convolution Q/K/V groups
+must be separate resources because each group is independently TP-sharded.
+`NHD_STRIDED` permits a row pitch larger than its contiguous head/dimension
+payload; `nbytes` describes the physical span including gaps. Storage offsets
+can select a group within a fused allocation. The ordinary `NHD` contract
+continues to require dense rows. These are byte-copy layouts, not dtype
+conversion, quantization, or arbitrary tensor transposition.
+
+Overlap checks for equal row strides are independent of row capacity. Validation
+is capped at 1,000,000 candidate-pair/expanded-interval work units per call;
+mixed-stride layouts exceeding that budget fail before their rows are expanded.
+
+Bindings with independent lifetimes must register regions with
+`owner_id=binding.digest`. Validation and execution, including cached results,
+require that claim to remain active on every region. Omitting `owner_id` retains
+the legacy runtime-wide claim, which authorizes all matching local bindings until
+released. Other owner IDs can pin memory but do not authorize binding execution.
+
+The framework retains responsibility for token-page and state-slot mappings,
+cache lifetime, coordinating all resources, and withholding request completion
+until every required resource writer succeeds. Mooncake does not infer model
+architecture or treat recurrent state as token-indexed KV.
+
+For a recurrent-state operation, the snapshot's row interval identifies the
+selected state slots in a framework-defined logical order, not all tokens of
+the requests. Source and target must agree on that order and on the state
+checkpoint; the framework supplies fingerprints that bind those semantics.
+Physical slot IDs can differ: export resolved ranges mapping each logical row
+to its local slot, or use `resolve_contiguous_runtime_binding` with an explicit
+`first_token_offset` for a contiguous run of rows, including `NHD_STRIDED` views.
+Only the selected payload bytes are copied; padding and other fused groups
+remain untouched. One operation covers one resource, so a hybrid request with
+K/V, convolution and recurrent state needs a framework-level completion barrier
+across those resources.
+
+These extensions apply to runtime-to-runtime transfers. Store reshard currently
+accepts only `(KEY, VALUE)` with an `NHD` descriptor and rejects state resources
+and `NHD_STRIDED` descriptors. Existing K/V model-domain keys, Store layout and
+manifest identities, and JSON encodings are preserved.
+
 The KV-cache implementation is split by responsibility:
 
 - `snapshot.py` defines content identity;
@@ -239,6 +393,40 @@ maps target DP ranks round-robin over the source placement's available DP ranks.
 public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
+
+## Weight reshard CPU overhead
+
+Weight planning and execution use call-local fragment indexes and membership
+sets to avoid repeated linear scans. Indexed lookups retain full fragment
+equality checks. Operation views share construction-time accumulators instead
+of repeatedly hashing executor keys containing long fragment tuples.
+
+Within one bind call, executor construction reuses runtime binding attestations
+created for the exact same placement and binding objects. This reuse does not
+cache validation across calls or extend allocation lifetimes. Canonical rank
+encoding retains the existing identity fields and serialized representation.
+
+Segment iteration advances N-dimensional offsets incrementally, with a direct
+range iterator for eligible one-dimensional regions. Batch lowering constructs
+bounded innermost runs for eligible canonical regions, advancing prefixes lazily
+and accumulating short runs within one operation up to the configured batch
+size. It preserves segment order and keeps different operations' allocation
+ranges separate. Custom region subclasses and unsupported stride
+or loop shapes continue through the segment iterator. Segment-budget rejection
+still occurs before a batch is produced; batching does not raise the budget.
+
+These implementation choices reduce Python bookkeeping while preserving
+coverage, bounds, canonical identities, and allocation lifetime contracts.
+Integer geometry normalization reuses exact immutable tuples only after checking
+every element and its minimum value. Lists and other supported sequences retain
+their existing normalization and validation behavior; no metadata is cached
+across bindings or generations.
+Strict geometry iteration uses the native `zip(strict=True)` implementation on
+Python 3.10 and newer, including its iterator construction and error semantics;
+the compatibility implementation remains available for older runtimes.
+End-to-end startup also includes framework initialization, model allocation,
+transport, and serving readiness; it must be measured separately from these
+CPU paths.
 
 Run the reshard tests from the repository root:
 

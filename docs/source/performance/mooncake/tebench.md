@@ -84,6 +84,68 @@ When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
 
+### 3.4 MLU Device Memory
+
+Build with `USE_TENT=ON`, `USE_MLU=ON`, `USE_CUDA=OFF` and
+`BUILD_BENCHMARK=ON`. Set `NEUWARE_ROOT` to the installed Neuware SDK.
+In this build, `--backend=tent --seg_type=VRAM` allocates MLU memory.
+`--local_gpu_id=N` selects a visible MLU ordinal; `-1` allocates a buffer on
+each visible MLU. `--seg_type_mix=dram,vram` includes both host and MLU buffers.
+
+Start the target:
+
+```bash
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=tcp --total_buffer_size=33554432
+```
+
+Use the printed segment name on the initiator:
+
+```bash
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=tcp --total_buffer_size=33554432 \
+  --target_seg_name=<SEG_NAME_FROM_TARGET> \
+  --start_block_size=65536 --max_block_size=65536 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=1 \
+  --check_consistency=true --duration=5
+```
+
+For separate hosts, configure `rpc_server_hostname` in `MC_TENT_CONF` with an
+address reachable from the peer. MLU transfers over TCP or HP TCP use host
+staging, which requires both the network transport and the MLU local-copy
+transport. For VRAM or mixed DRAM/VRAM runs, an explicit `--xport_type`
+also enables the MLU local-copy transport in the benchmark configuration.
+`--check_consistency` performs WRITE/READ round trips and copies the
+result back to host memory for comparison. For throughput measurements without
+payload checks, use `--check_consistency=false --op_type=read` or `write`.
+
+### 3.5 Intel XPU Device Memory and File Targets
+
+Build with `USE_TENT=ON`, `USE_XPU=ON` and `BUILD_BENCHMARK=ON`, using the
+Intel DPC++ compiler (`CXX=icpx`). In this build,
+`--backend=tent --seg_type=VRAM` allocates XPU device memory. `--local_gpu_id`
+works as in Section 3.4.
+
+A `file://<path>` target segment name makes the initiator transfer to and from
+a local file, so no target process is needed. Create the file first; it must
+cover `--target_offset` plus `max_num_threads * max_block_size *
+max_batch_size` bytes. Select the file transport with `--xport_type`:
+
+```bash
+fallocate -l 1G /mnt/nvme/tebench.dat
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=iouring --total_buffer_size=268435456 \
+  --target_seg_name=file:///mnt/nvme/tebench.dat \
+  --start_block_size=1048576 --max_block_size=1048576 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=8 \
+  --op_type=write --duration=10
+```
+
+To check the data, run once with `--op_type=write_seed` and then with
+`--op_type=read_verify` (Section 5.4).
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.
@@ -263,7 +325,10 @@ Example:
 
 ### 5.2 Data Consistency Check (`--check_consistency`)
 
-When enabled, the benchmark validates correctness in `mix` mode:
+When enabled, the benchmark runs and reports `mix` mode, including when
+`--op_type=read` or `--op_type=write` is requested. The `op_type` field in
+`--result_output_jsonl` records this effective mode. Both WRITE and READ
+batches contribute latency samples and transferred bytes:
 
 * Source buffers are filled with a known pattern before WRITE
 * Data is READ back and verified on the initiator
@@ -301,10 +366,9 @@ Example:
 * `--seg_type_mix` : comma-separated segment types for mixed DRAM+VRAM runs,
   e.g. `dram,vram`. When set, the target registers buffers of each listed
   type in one segment, and initiator threads round-robin across them so a
-  single tebench process drives traffic over multiple memory types (and
-  thus multiple transports — SHM for DRAM, NVLink for VRAM) concurrently.
-  Empty falls back to `--seg_type` (single type, existing behavior). See
-  Section 5.8 for usage and the multi-transport configuration it requires.
+  single tebench process drives traffic over multiple memory types
+  concurrently. Empty falls back to `--seg_type`. See Section 5.8 for
+  transport configuration examples.
 * `--target_seg_name` : target segment name (empty → Target mode).
   A comma-separated list enables multi-target initiator mode, and worker
   threads are distributed across all listed target segments.
@@ -364,12 +428,108 @@ buffer.
 ./tebench --target_seg_name=<SEG> --target_offset=536870912 --target_range_size=536870912
 ```
 
+By default every operation of a thread uses the same target offset. That
+suits memory targets and isolating transport overhead, but on file targets
+the results depend heavily on the storage device: repeated writes to the
+same blocks can hit a device rewrite penalty, and repeated reads can be
+served from the device's cache. Use `--target_access=random` for results
+comparable with storage benchmarks that use random offsets. It cannot be
+combined with `write_seed` / `read_verify`.
+
+Each thread owns its own region of the target, its window. Thread `i`'s
+window starts at `i x window size`, so threads never touch each other's
+blocks. With `random`, each operation (block size x batch size bytes) goes
+to a random operation-aligned offset in the window, never the same one twice
+in a row. Set the window with `--target_window_size`, normally the file size
+divided by the thread count; it must be a multiple of 4096 (file targets
+use `O_DIRECT`), at least `max_block_size x max_batch_size`, and is accepted
+only with `random`.
+Without it, the window is `max_block_size x max_batch_size` bytes, which at
+the largest block and batch size holds a single operation, so the offset
+stays fixed. `fixed` mode is unchanged: one offset per thread, spaced
+`max_block_size x max_batch_size` apart.
+
+```bash
+# 8 threads, random 4 KiB writes across a 1 GiB file:
+# window = 1 GiB / 8 = 128 MiB = 134217728 bytes, 32768 slots of 4 KiB
+./tebench --target_seg_name=file:///path/to/file --op_type=write \
+  --start_num_threads=8 --max_num_threads=8 --start_block_size=4096 \
+  --max_block_size=4096 --target_access=random --target_window_size=134217728
+```
+
 For read-only verification with multiple readers, first write deterministic data
 using `--op_type=write_seed`, then run readers with `--op_type=read_verify`
 against the same target range. `read_verify` performs pure READs and validates
 the local buffer without modifying the remote data. Do not combine these modes
 with `--check_consistency`; `--check_consistency` remains the existing
 WRITE→READ self-check mode.
+
+#### Multi-node orchestration
+
+`benchmark/scripts/run_tebench_multinode.sh` launches targets and initiators
+over SSH, discovers the target segment names, releases all initiators from a
+start barrier, and collects each process's log and result JSONL.
+
+The script is an orchestration layer over the existing endpoint-level
+multi-target interface. It does not add a new `peer` mode to `tebench`; an
+all-to-all node runs separate target and initiator processes. Weighted targets,
+hotspot routing, and arbitrary custom target plans remain outside this
+launcher's scope.
+
+Every host must provide Bash and `setsid`, and the same absolute `tebench` path
+must exist on each host. The launcher host also needs Python 3 to combine
+results. SSH public-key authentication and host-key verification
+must already be configured. Use the literal host name `local` for a role that
+should run without SSH.
+
+`--env` entries are passed unchanged to every host. For per-host settings such
+as `rpc_server_hostname` or `topology/rdma_whitelist`, place a host-local TENT
+config file at the same path on each host and pass `--env=MC_TENT_CONF=<path>`.
+
+```bash
+./mooncake-transfer-engine/benchmark/scripts/run_tebench_multinode.sh \
+  --topology=m2n \
+  --targets=target-a,target-b \
+  --initiators=initiator-a,initiator-b \
+  --tebench=/opt/mooncake/bin/tebench \
+  --backend=tent \
+  --xport-type=rdma \
+  --num-threads=4 \
+  --duration=30 \
+  --range-policy=per_initiator
+```
+
+Supported topologies are:
+
+| Topology | Target plan |
+| -------- | ----------- |
+| `fanout` | One initiator accesses every target. |
+| `incast` | Every initiator accesses one target. |
+| `m2n` | Every initiator accesses every target. |
+| `all_to_all` | Every node publishes a segment and accesses every other node. |
+
+Use `--range-policy=per_initiator` when multiple writers share a target. The
+script divides `--total-buffer-size` into non-overlapping ranges and passes the
+corresponding `--target_offset` and `--target_range_size` to each initiator.
+`--range-policy=shared` leaves every initiator on the same range and is useful
+for read-only fan-out or incast measurements.
+
+`--verify-data` runs two synchronized phases while the targets stay alive:
+`write_seed` followed by `read_verify`. This validates the same deterministic
+target ranges used by the performance run without relying on application data.
+
+Use `--dry-run` to validate topology expansion, target lists, thread counts,
+and range assignments without connecting to any host. Each run stores logs and
+per-target JSONL files under a new local `tebench-multinode-*` directory.
+The directory also contains `results.json`, a single JSON object with
+`schema_version`, `run_id`, `topology`, `backend`, and a `results` array.
+Each entry identifies the `host`, `phase`, `initiator_index`, and `exit_code`,
+and includes the original JSONL objects in `records`, preserving all per-target
+metrics. Failed runs include available records; an unavailable exit code is
+`null`. Invalid JSON causes collection to fail instead of publishing a partial
+summary. Original logs and JSONL files are retained.
+An existing run directory is rejected; use a new `--run-id` when rerunning with
+`--keep-remote`.
 
 ---
 
@@ -394,8 +554,10 @@ gpu_id + thread_id
 
 **Transport (TENT only)**
 
-* `--xport_type` : `rdma | shm | mnnvl | gds | iouring`. Selects a single
-  transport to enable (all others are disabled). Empty means no transport
+* `--xport_type` : selects the benchmark transport, such as `tcp`, `hp_tcp`,
+  `rdma`, `shm`, or `nvlink`, and disables the other selectable transports.
+  MLU VRAM runs also enable the local-copy transport needed for host staging.
+  Empty means no transport
   is explicitly enabled or disabled by tebench — the engine reads the
   transport enable list from the `MC_TENT_CONF` config file (see Section
   5.8 for multi-transport scenarios).
@@ -430,11 +592,14 @@ record has an unambiguous workload contract.
 
 ### 5.8 Mixed DRAM+VRAM and Multi-Transport
 
-By default, tebench allocates buffers of a single `--seg_type` and enables a
-single `--xport_type` per run. To exercise a mixed-transport workload where
-the engine's transport selector naturally picks SHM for DRAM→DRAM transfers
-and NVLink for VRAM→VRAM transfers within one process, combine
-`--seg_type_mix` with the `MC_TENT_CONF` environment variable:
+By default, tebench allocates buffers of a single `--seg_type`.
+`--seg_type_mix=dram,vram` allocates both host and device buffers. In a
+`USE_MLU` build, combine it with `--xport_type=tcp` or `hp_tcp` to transfer
+both memory types using host staging for MLU buffers; see Section 3.4.
+
+The following CUDA example uses SHM for DRAM→DRAM and NVLink for VRAM→VRAM
+within one process. It requires `USE_CUDA=ON` and enables multiple transports
+through `MC_TENT_CONF`:
 
 1. **Enable multiple transports via `MC_TENT_CONF`** — point it at a JSON
    config file (or inline JSON string) that enables the transports you want
@@ -479,7 +644,5 @@ and NVLink for VRAM→VRAM transfers within one process, combine
    threads share one GPU buffer and contend, which underrepresents NVLink
    throughput.
 
-Mixed mode requires `--start_num_threads` ≥ 2 (at least one thread per
-seg_type) and a build with `USE_CUDA=ON` (for VRAM/NVLink support). When
-`--seg_type_mix` is empty, tebench falls back to `--seg_type` (single type)
-and `--xport_type` (single transport) — the existing behavior.
+Use `--start_num_threads` ≥ 2 to exercise both memory types. When
+`--seg_type_mix` is empty, tebench uses `--seg_type` for all buffers.

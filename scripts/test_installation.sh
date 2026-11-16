@@ -41,26 +41,17 @@ cp -r mooncake-wheel/tests test_env/
 cp -r python/tests/services test_env/service_tests
 cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
+cp python/tests/store/test_fast_copy.py test_env/tests/
 cp -r python/tests/ssd test_env/ssd_tests
+mkdir -p test_env/store_tests
+cp python/tests/store/test_structured_ranges_properties.py test_env/store_tests/
 cd test_env
-# Pin torch to a PG build the wheel actually ships, otherwise a fresh PyPI
-# release makes mooncake.pg raise ImportError and the pg tests go red (#4439).
-pg_torch=$(python -c '
-import pkgutil, re, mooncake
-vers = [tuple(map(int, m.groups())) for m in
-        (re.fullmatch(r"pg_(\d+)_(\d+)_(\d+)", mod.name)
-         for mod in pkgutil.iter_modules(mooncake.__path__))
-        if m]
-print(".".join(map(str, max(vers))) if vers else "")
-' || true)
-if [ -n "$pg_torch" ]; then
-  pip install "torch==$pg_torch" numpy
-else
-  pip install torch numpy
-fi
+pip install torch numpy
 python -c "import mooncake._fast_copy"
+python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+python tests/test_transfer_engine_gil.py
 
 echo "Running HTTP metadata server test..."
 python -m unittest service_tests/test_http_metadata_server.py
@@ -70,7 +61,7 @@ python unit_tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
-python -m pytest reshard_tests ssd_tests -q
+python -m pytest reshard_tests ssd_tests store_tests -q
 
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable

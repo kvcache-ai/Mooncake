@@ -30,6 +30,7 @@ class ConductorClient {
     ConductorClient(const ConductorClient&) = delete;
     ConductorClient& operator=(const ConductorClient&) = delete;
 
+    // Replaces the previous connection; failure leaves the client unconnected.
     tl::expected<void, ErrorCode> Setup(const ConductorClientConfig& config);
     void Close();        // idempotent; Setup() may be called again afterwards
     bool HealthCheck();  // healthy if one ListServices call succeeds
