@@ -392,6 +392,29 @@ if(USE_CUDA)
                                                           tent_link_group)
   target_include_directories(tent_mnnvl_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  # Native transport error paths with wrapped CUDA calls; no GPU required.
+  add_executable(tent_cuda_transport_drain_test cuda_transport_drain_test.cpp)
+  target_link_libraries(tent_cuda_transport_drain_test PRIVATE gtest gtest_main
+                                                               tent_link_group)
+  target_include_directories(tent_cuda_transport_drain_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_options(
+    tent_cuda_transport_drain_test
+    PRIVATE
+    "-Wl,--wrap=cudaGetDevice"
+    "-Wl,--wrap=cudaSetDevice"
+    "-Wl,--wrap=cudaGetErrorString"
+    "-Wl,--wrap=cudaGetLastError"
+    "-Wl,--wrap=cudaMemcpyAsync"
+    "-Wl,--wrap=cudaMemcpyBatchAsync"
+    "-Wl,--wrap=cudaEventCreateWithFlags"
+    "-Wl,--wrap=cudaEventRecord"
+    "-Wl,--wrap=cudaEventDestroy"
+    "-Wl,--wrap=cudaEventQuery"
+    "-Wl,--wrap=cudaStreamQuery")
+  add_test(NAME tent_cuda_transport_drain_test
+           COMMAND tent_cuda_transport_drain_test)
 endif()
 
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)

@@ -488,6 +488,34 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+Status NVLinkTransport::isSubBatchDrained(SubBatchRef batch, bool& drained) {
+    drained = false;
+    auto* nvlink_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    if (!nvlink_batch)
+        return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    bool terminal = false;
+    CHECK_STATUS(Transport::isSubBatchDrained(batch, terminal));
+    if (!terminal) return Status::OK();
+
+    // Partial submission or event setup failure can publish FAILED while
+    // copies are still running, even without a usable completion event.
+    if (auto stream = nvlink_batch->async_stream.get()) {
+        int saved_device;
+        CHECK_CUDA(cudaGetDevice(&saved_device));
+        if (saved_device != nvlink_batch->stream_device_id)
+            CHECK_CUDA(cudaSetDevice(nvlink_batch->stream_device_id));
+        auto result = cudaStreamQuery(stream);
+        if (saved_device != nvlink_batch->stream_device_id)
+            CHECK_CUDA(cudaSetDevice(saved_device));
+        if (result == cudaErrorNotReady) return Status::OK();
+        if (result != cudaSuccess)
+            return Status::InternalError(std::string("cudaStreamQuery: ") +
+                                         cudaGetErrorString(result) + LOC_MARK);
+    }
+    drained = true;
+    return Status::OK();
+}
+
 Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                                         const MemoryOptions& options) {
     LocationParser location(desc.location);
