@@ -139,7 +139,9 @@ class RdmaTransport : public Transport {
     int refreshLocalDeviceDesc(const std::string &device_name, uint32_t lid,
                                const std::string &gid);
 
-    int preTouchMemory(void *addr, size_t length);
+    // Pre-touches through context_list_[context_index], which must be a NIC
+    // the buffer is being registered on.
+    int preTouchMemory(void *addr, size_t length, size_t context_index = 0);
 
    public:
     virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -154,6 +156,11 @@ class RdmaTransport : public Transport {
 
    private:
     int initializeRdmaResources();
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    void recordClassicCongestionControlMode(
+        adaptive_congestion_control::Mode mode);
+#endif
 
     int startHandshakeDaemon(std::string &local_server_name);
 
@@ -174,6 +181,20 @@ class RdmaTransport : public Transport {
                                       int hint_buffer_id = -1,
                                       int hint_device_id = -1);
 
+    // A buffer may have no MR on some HCAs (e.g. Data Direct pairing leaves
+    // zero keys on non-paired NICs). hasValidLkey() / hasValidRkey(): the
+    // device is within the segment and the buffer holds a nonzero lkey / rkey
+    // for it; false when the buffer publishes no such key array.
+    static bool hasValidLkey(const SegmentDesc *desc, const BufferDesc &buffer,
+                             int device_id);
+    static bool hasValidRkey(const SegmentDesc *desc, const BufferDesc &buffer,
+                             int device_id);
+    // hasValidKeys(): every key array the buffer publishes holds a valid key
+    // for the device. A local-only MR has no rkey array, so only its lkey
+    // counts.
+    static bool hasValidKeys(const SegmentDesc *desc, const BufferDesc &buffer,
+                             int device_id);
+
     const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
         return context_list_;
     }
@@ -182,7 +203,25 @@ class RdmaTransport : public Transport {
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    enum class ClassicCongestionControlMode {
+        kUninitialized = -1,
+        kOff = static_cast<int>(adaptive_congestion_control::Mode::kOff),
+        kObserve =
+            static_cast<int>(adaptive_congestion_control::Mode::kObserve),
+        kEnforce =
+            static_cast<int>(adaptive_congestion_control::Mode::kEnforce),
+        kConflict = -2,
+    };
+    std::atomic<ClassicCongestionControlMode> classic_congestion_control_mode_{
+        ClassicCongestionControlMode::kUninitialized};
+#endif
     std::shared_ptr<Topology> local_topology_;
+    // MC_RDMA_NIC_SELECTION=local: GPU location (e.g. "cuda:0") -> indices into
+    // context_list_ of its topology-preferred HCAs that opened. Built once in
+    // initializeRdmaResources() and read-only afterwards, so registration
+    // reads it without a lock. Empty in the default ALL mode.
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
     // "192.168.0.y:port") for NIC path construction, while

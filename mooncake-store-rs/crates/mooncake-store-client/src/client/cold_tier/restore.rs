@@ -1,13 +1,13 @@
 use super::super::{
-    cold_tier_device_id, compatibility_matches, registry, AsyncEvictionHandle,
-    AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead, ColdRestoreFlightLeader,
-    ColdRestoreFlightRegistration, ColdTierAdmissionPermit, ColdTierHandle,
-    ColdTierRateLimitConfig, ControlPlaneHandle, DebugEvictAllResult, LocalAllocatorState,
-    MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker, ReplicaRoute,
-    ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject, RestorePromotionKey,
-    RestorePromotionPayload, RestorePromotionPushOutcome, RestorePromotionQueue,
-    RestorePromotionTask, Result, RouteState, StorageOwnerState, StoreClient, StoreError,
-    DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
+    cold_tier_device_id, compatibility_matches, registry, AsyncDeletePendingHandle,
+    AsyncEvictionHandle, AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead,
+    ColdRestoreFlightLeader, ColdRestoreFlightRegistration, ColdTierAdmissionPermit,
+    ColdTierHandle, ColdTierRateLimitConfig, ControlPlaneHandle, DebugEvictAllResult,
+    LocalAllocatorState, MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker,
+    ReplicaRoute, ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject,
+    RestorePromotionKey, RestorePromotionPayload, RestorePromotionPushOutcome,
+    RestorePromotionQueue, RestorePromotionTask, Result, RouteState, StorageOwnerState,
+    StoreClient, StoreError, DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
 };
 use super::target_selection::promote_cold_backing_target;
 use super::{
@@ -652,6 +652,7 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
         membership_sync: MembershipSyncHandle::disabled(),
         _async_eviction: AsyncEvictionHandle::disabled(),
         async_replica_tracking: AsyncReplicaTrackHandle::disabled(),
+        async_delete_pending: AsyncDeletePendingHandle::disabled(),
         async_route_hit_reporting: AsyncRouteHitReportHandle::disabled(),
         cold_tier: ColdTierHandle::disabled(queue.clone()),
         cold_restore_flights: client.cold_restore_flights.clone(),
@@ -672,6 +673,8 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
         namespace_quota: client.namespace_quota.clone(),
         execution_fairness: client.execution_fairness.clone(),
         bandwidth_shaping: client.bandwidth_shaping.clone(),
+        allocation_lifecycle: client.allocation_lifecycle,
+        allocation_lifecycle_enabled: client.allocation_lifecycle_enabled,
         placement_policy: client.placement_policy.clone(),
         state: client.state.clone(),
         owns_local_state_lifecycle: false,
@@ -683,7 +686,7 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
 
 fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) -> Result<()> {
     client.ensure_local_memory()?;
-    client.flush_due_reclaims()?;
+    client.flush_due_reclaims_best_effort();
 
     let tenant = task.object_id.scope.tenant.as_str();
     let key = task.object_id.logical_key.as_str();
@@ -745,6 +748,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
         .map(|(priority, target)| ReplicaRoute {
             owner: target.storage_runtime.clone(),
             segment_name: target.segment_name.clone(),
+            allocation_id: Some(reservations[priority].allocation_id),
             offset: None,
             segment_offset: reservations[priority].offset_bytes,
             length: task.payload.len() as u64,
@@ -769,10 +773,9 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
     let cas = match cas_result {
         Ok(cas) => cas,
         Err(error) => {
-            client.best_effort_release_reserved_allocations(
-                &targets,
+            client.release_only_legacy_reservations_after_unknown_route_publish(
                 &reservations,
-                "restore_promote_route_cas_error",
+                "restore_promote_route_cas_outcome_unknown",
             );
             return Err(error);
         }
@@ -1314,6 +1317,7 @@ fn release_owner_restore_reservation(
         &reservation.segment_name,
         reservation.offset_bytes,
         reservation.length_bytes,
+        reservation.allocation_id,
     ) {
         warn!(
             runtime = %storage_owner.runtime,
@@ -1355,6 +1359,7 @@ fn build_owner_restored_route(
     next.replicas = vec![ReplicaRoute {
         owner: storage_owner.runtime.clone(),
         segment_name: reservation.segment_name.clone(),
+        allocation_id: Some(reservation.allocation_id),
         offset: absolute_offset,
         segment_offset: reservation.offset_bytes,
         length: cold_backing.length,
@@ -1950,12 +1955,12 @@ fn process_device_group(
             .map(|&gi| {
                 let entry = &group[gi];
                 let slot = staged_slots[gi].as_ref().unwrap();
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(slot.addr, entry.cold_backing.length as usize)
-                };
+                let dst = unsafe { std::slice::from_raw_parts_mut(slot.addr, slot.io_len()) };
                 ColdObjectRead {
                     cold_backing: &entry.cold_backing,
                     dst,
+                    allow_intermediate_buffer: false,
+                    allow_padded_direct_read: true,
                 }
             })
             .collect();
@@ -2525,9 +2530,8 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
     let mut ssd_io_us: u64 = 0;
     let mut checksum_us: u64 = 0;
     let ssd_read_result = (|| -> Result<()> {
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut(staging_slot.addr, cold_backing.length as usize)
-        };
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(staging_slot.addr, staging_slot.io_len()) };
         let t_backend = std::time::Instant::now();
         let backend = storage_owner.cold_tier_devices.backend_for_with_refresh(
             storage_owner.metadata.as_ref(),
@@ -2537,7 +2541,20 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
         backend_resolve_us = t_backend.elapsed().as_micros() as u64;
 
         let t_io = std::time::Instant::now();
-        let read_result = backend.get_object_into(&cold_backing, dst)?;
+        let mut read = [ColdObjectRead {
+            cold_backing: &cold_backing,
+            dst,
+            allow_intermediate_buffer: false,
+            allow_padded_direct_read: true,
+        }];
+        let read_result = backend
+            .get_objects_into_batch(&mut read)
+            .pop()
+            .unwrap_or_else(|| {
+                Err(StoreError::InvalidState(
+                    "empty staging SSD read result".to_string(),
+                ))
+            })?;
         ssd_io_us = t_io.elapsed().as_micros() as u64;
 
         let bytes_read = read_result.ok_or_else(|| {

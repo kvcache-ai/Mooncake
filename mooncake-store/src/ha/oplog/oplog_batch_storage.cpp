@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <string_view>
 
 #include <glog/logging.h>
@@ -368,8 +369,15 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
     }
 
     const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    const auto encode_started_at = std::chrono::steady_clock::now();
+#endif
     const std::string encoded_batch = EncodeOpLogBatchRecord(batch);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().observe_batch_record_encode_latency_us(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - encode_started_at)
+            .count());
     HAMetricManager::instance().observe_batch_record_batch_bytes(
         encoded_batch.size());
 #endif
@@ -392,7 +400,20 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
                             .batch_id = batch.batch_id,
                             .last_seq = batch.last_seq,
                         })});
-    ErrorCode err = backend_.Txn(txn);
+    auto execute_txn = [&] {
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        const auto txn_started_at = std::chrono::steady_clock::now();
+#endif
+        const auto result = backend_.Txn(txn);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        HAMetricManager::instance().observe_batch_record_backend_txn_latency_us(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - txn_started_at)
+                .count());
+#endif
+        return result;
+    };
+    ErrorCode err = execute_txn();
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
         std::string raw_prefix;
         DurablePrefix decoded_prefix;
@@ -401,7 +422,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
             DecodeDurablePrefix(raw_prefix, &decoded_prefix) &&
             decoded_prefix == expected_prefix) {
             txn.compares[durable_compare_index].expected_value = raw_prefix;
-            err = backend_.Txn(txn);
+            err = execute_txn();
         }
     }
     if (err != ErrorCode::ETCD_TRANSACTION_FAIL && !IsAmbiguousTxnError(err)) {
@@ -447,10 +468,19 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
         return err;
     }
     std::string reason;
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    const auto decode_started_at = std::chrono::steady_clock::now();
+#endif
     if (!DecodeOpLogBatchRecord(value, &batch, &reason)) {
         LOG(ERROR) << "Failed to decode OpLog batch record: " << reason;
         return ErrorCode::INTERNAL_ERROR;
     }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().observe_batch_record_decode_latency_us(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - decode_started_at)
+            .count());
+#endif
     if (batch.batch_id != batch_id) {
         LOG(ERROR) << "OpLog batch id does not match key: requested="
                    << batch_id << ", payload=" << batch.batch_id;
@@ -483,11 +513,20 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
             }
             OpLogBatchRecord batch;
             std::string reason;
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+            const auto decode_started_at = std::chrono::steady_clock::now();
+#endif
             if (!DecodeOpLogBatchRecord(kv.value, &batch, &reason)) {
                 LOG(ERROR) << "Failed to decode OpLog batch record at key="
                            << kv.key << ": " << reason;
                 return ErrorCode::INTERNAL_ERROR;
             }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+            HAMetricManager::instance().observe_batch_record_decode_latency_us(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - decode_started_at)
+                    .count());
+#endif
             if (batch.batch_id != key_batch_id) {
                 LOG(ERROR) << "OpLog batch id does not match key at key="
                            << kv.key;

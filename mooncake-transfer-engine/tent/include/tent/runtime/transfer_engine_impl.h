@@ -368,7 +368,11 @@ class TransferEngineImpl {
 
     Status waitTransferCompletion(BatchID batch_id);
 
-    Status transferSync(const std::vector<Request>& request_list);
+    Status waitTransfer(BatchID batch_id,
+                        std::vector<TransferStatus>* status_list = nullptr,
+                        uint64_t timeout_ms = 0);
+
+    Status submitAndWaitTransfer(const std::vector<Request>& request_list);
 
     uint64_t lockStageBuffer(const std::string& location);
 
@@ -542,6 +546,13 @@ class TransferEngineImpl {
                                      TransferStatusEnum terminal_status);
 
     Status cancelQueuedOwner(QueueOwnerId owner_id);
+
+    // Cancels the batch's owners that are still waiting in the admission queue
+    // and does not refill the dispatch window per owner: a refill in the middle
+    // of this loop could start another owner of the same batch. Owners that are
+    // already in the dispatch window are left for the caller to cancel in
+    // flight.
+    Status cancelQueuedOwners(BatchID batch_id);
 
     Status retireQueueForBatch(Batch* batch);
 

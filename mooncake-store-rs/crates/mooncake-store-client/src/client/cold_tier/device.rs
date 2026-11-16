@@ -65,6 +65,7 @@ impl StorageOwnerState {
     ) -> Self {
         let offload_mode = cold_tier.offload_mode;
         let offload_priority = cold_tier.offload_priority;
+        let nof_backing_tracking_enabled = !cold_tier.nof_targets.is_empty();
         let staging_pool_bytes = std::env::var("MC_STORE_RS_STAGING_POOL_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -72,6 +73,8 @@ impl StorageOwnerState {
         let staging_slot_ttl =
             Duration::from_millis(cold_tier.rate_limits.staging_slot_ttl_ms.max(1));
         let restore_max_distinct_flights = cold_tier.rate_limits.restore_max_distinct_flights;
+        let hot_replicas = super::super::HotReplicaTracker::for_runtime(&runtime);
+        let stale_candidate_reconcile_started_at_ms = current_time_ms();
         Self {
             runtime,
             route_ops,
@@ -79,12 +82,30 @@ impl StorageOwnerState {
             allocator: allocator.clone(),
             state,
             cold_tier_devices: ColdTierDeviceManager::new(cold_tier),
-            hot_replicas: super::super::HotReplicaTracker::default(),
+            hot_replicas,
+            nof_backing_tracking_enabled,
             nof_backings: super::super::HotReplicaTracker::default(),
             pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
             initial_cold_backing_repair_at_ms: AtomicU64::new(0),
-            stale_reclaim_scan_completed_at_ms: AtomicU64::new(0),
+            pending_evictions: parking_lot::Mutex::new(BTreeMap::new()),
+            pending_deletes: parking_lot::Mutex::new(super::super::PendingDeleteQueue::default()),
+            pending_cold_deletes: parking_lot::Mutex::new(
+                super::super::PendingColdDeleteQueue::default(),
+            ),
+            pending_delete_next_due_at_ms: AtomicU64::new(u64::MAX),
+            pending_publication_authority_retry: parking_lot::Mutex::new(
+                super::super::PendingPublicationAuthorityRetry::default(),
+            ),
+            // Treat startup as the last successful baseline so an idle owner
+            // does not immediately spend an eviction on reconciliation.
+            stale_candidate_reconcile_completed_at_ms: AtomicU64::new(
+                stale_candidate_reconcile_started_at_ms,
+            ),
+            stale_candidate_reconcile_started_at_ms: AtomicU64::new(
+                stale_candidate_reconcile_started_at_ms,
+            ),
+            stale_candidate_reconcile_in_progress: AtomicBool::new(false),
             offload_mode,
             offload_priority,
             owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::new(
@@ -719,6 +740,7 @@ impl ColdTierDeviceManager {
             devices: config.devices,
             watermarks: config.watermarks,
             admission: Arc::new(ColdTierAdmission::new(config.rate_limits)),
+            accumulated_write_bytes: parking_lot::Mutex::new(BTreeMap::new()),
             runtime: config.runtime,
         }
     }
@@ -867,16 +889,27 @@ impl ColdTierDeviceManager {
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
             .collect();
+        let mut accumulated_write_bytes = self.accumulated_write_bytes.lock();
         let candidates = eligible
             .iter()
             .map(|device| ReplicaWriteCandidate {
                 target_id: &device.device_id,
                 score: self.device_offload_score(device),
-                accumulated_writes: 0,
+                accumulated_write_bytes: accumulated_write_bytes
+                    .get(&device.device_id)
+                    .copied()
+                    .unwrap_or_default(),
             })
             .collect::<Vec<_>>();
-        DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY
-            .select_write_targets(&candidates, n)
+        let selected = DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, n);
+        for index in &selected {
+            let target_id = &eligible[*index].device_id;
+            let bytes = accumulated_write_bytes
+                .entry(target_id.clone())
+                .or_default();
+            *bytes = bytes.saturating_add(length);
+        }
+        selected
             .into_iter()
             .map(|index| eligible[index].clone())
             .collect()
@@ -982,6 +1015,14 @@ impl ColdTierDeviceManager {
 
     pub(in super::super) fn foreground_offload_kick_batch(&self) -> usize {
         self.admission.config.foreground_offload_kick_batch.max(1)
+    }
+
+    pub(in super::super) fn offload_parallelism(&self) -> usize {
+        self.admission.config.offload_runtime_max_in_flight.max(1)
+    }
+
+    pub(in super::super) fn offload_poll_interval(&self) -> Duration {
+        Duration::from_millis(self.admission.config.offload_poll_interval_ms.max(1))
     }
 
     pub(in super::super) fn pressure_increment_pending(&self) {
