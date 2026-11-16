@@ -2747,6 +2747,38 @@ TEST_F(MasterServiceTest, MoveEndReleasesSourceRefcountWhenTargetGone) {
     EXPECT_EQ(0, source_refcnt.value());
 }
 
+TEST_F(MasterServiceTest, PutStartPartialMemoryAllocationDoesNotArmEviction) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.eviction_ratio = 0;
+    service_config.eviction_high_watermark_ratio = 1;
+    MasterService service(service_config);
+    const auto full = PrepareSimpleSegment(service, "full");
+    PrepareSimpleSegment(service, "available",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig fill;
+    fill.replica_num = 1;
+    fill.preferred_segment = "full";
+    ASSERT_TRUE(service.PutStart(full.client_id, "fill", TenantId::Default(),
+                                 kDefaultSegmentSize, fill));
+    ASSERT_TRUE(service.PutEnd(full.client_id, "fill", TenantId::Default(),
+                               ReplicaType::MEMORY));
+    ASSERT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
+        EXPECT_TRUE(access.getAllocatorManager().hasEnoughServingNames(2));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto result = service.PutStart(full.client_id, "partial",
+                                   TenantId::Default(), 1024, config);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
+}
+
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
@@ -4433,6 +4465,41 @@ TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
     EXPECT_EQ(liveness->state(), ClientLivenessState::SUSPECTED);
     EXPECT_EQ(service.Ping(client_id)->client_status, ClientStatus::OK);
     EXPECT_EQ(liveness->state(), ClientLivenessState::ACTIVE);
+}
+
+TEST_F(MasterServiceTest, FailedRemountPreservesCommittedClientHostId) {
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build());
+    const UUID local_owner = generate_uuid();
+    const UUID remote_owner = generate_uuid();
+
+    auto local_seg = MakeSegment("local_host_seg", /*base=*/0x100000000);
+    local_seg.host_id = "host-a";
+    auto remote_seg = MakeSegment("remote_host_seg", /*base=*/0x200000000);
+    remote_seg.host_id = "host-b";
+    ASSERT_TRUE(service.MountSegment(local_seg, local_owner).has_value());
+    ASSERT_TRUE(service.MountSegment(remote_seg, remote_owner).has_value());
+
+    auto invalid_remount = local_seg;
+    invalid_remount.size *= 2;
+    invalid_remount.host_id = "host-b";
+    auto remount = service.ReMountSegment({invalid_remount}, local_owner);
+    ASSERT_FALSE(remount.has_value());
+    EXPECT_EQ(remount.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put = service.PutStart(local_owner, "local_after_failed_remount",
+                                TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put.has_value()) << toString(put.error());
+    ASSERT_EQ(put->size(), 1u);
+    const auto addr =
+        (*put)[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_GE(addr, local_seg.base);
+    EXPECT_LT(addr, local_seg.base + local_seg.size);
 }
 
 TEST_F(MasterServiceTest,
