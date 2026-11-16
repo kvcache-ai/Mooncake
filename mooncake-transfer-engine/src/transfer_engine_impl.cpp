@@ -844,8 +844,15 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     // transport deregister. Mid-flight ibv_dereg_mr causes LOC_PROT storms
     // that latch sticky "Device is not active" (#5481).
     if (multi_transports_) {
-        Status st = multi_transports_->waitMemoryIdle(addr, /*length=*/0,
-                                                      /*timeout_ms=*/5000);
+        uint64_t region_length = 0;
+        if (!lookupLocalRegionLength(addr, &region_length)) {
+            LOG(ERROR) << "unregisterLocalMemory: address is not a registered "
+                          "base, refusing deregister addr="
+                       << addr;
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        Status st = multi_transports_->waitMemoryIdle(
+            addr, static_cast<size_t>(region_length), /*timeout_ms=*/5000);
         if (st.IsBatchBusy()) {
             LOG(ERROR) << "unregisterLocalMemory: buffer still in flight, "
                           "refusing deregister addr="
@@ -1076,8 +1083,16 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
     if (multi_transports_) {
         for (auto* addr : addr_list) {
-            Status st = multi_transports_->waitMemoryIdle(addr, /*length=*/0,
-                                                          /*timeout_ms=*/5000);
+            uint64_t region_length = 0;
+            if (!lookupLocalRegionLength(addr, &region_length)) {
+                LOG(ERROR) << "unregisterLocalMemoryBatch: address is not a "
+                              "registered base, refusing deregister addr="
+                           << addr;
+                return ERR_ADDRESS_NOT_REGISTERED;
+            }
+            Status st = multi_transports_->waitMemoryIdle(
+                addr, static_cast<size_t>(region_length),
+                /*timeout_ms=*/5000);
             if (st.IsBatchBusy()) {
                 LOG(ERROR) << "unregisterLocalMemoryBatch: buffer still in "
                               "flight, refusing deregister addr="
@@ -1170,6 +1185,17 @@ void TransferEngineImpl::releaseMemoryRegions(
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
+}
+
+bool TransferEngineImpl::lookupLocalRegionLength(void* addr,
+                                                   uint64_t* length) const {
+    if (!addr || !length) return false;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = local_memory_regions_.find(reinterpret_cast<uintptr_t>(addr));
+    if (it == local_memory_regions_.end() || it->second.length == 0)
+        return false;
+    *length = it->second.length;
+    return true;
 }
 
 void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {

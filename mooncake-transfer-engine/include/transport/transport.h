@@ -645,6 +645,19 @@ class Transport {
         // and keep today's submit/status path with no eventfd write.
         bool event_enabled = false;
 
+        // Local source ranges copied at submit. Unregister scans these
+        // instead of task.request, which aliases the caller's vector.
+        // quiesce_publishing is set before task_list grows and cleared
+        // when the spans are visible. Both are only touched under the
+        // live-batch shard lock.
+        struct QuiesceSpan {
+            uintptr_t addr = 0;
+            size_t length = 0;
+            size_t task_index = 0;
+        };
+        std::vector<QuiesceSpan> quiesce_spans;
+        bool quiesce_publishing = false;
+
         // Number of completion callbacks currently holding a pin on this
         // BatchDesc and therefore still allowed to read or update it and the
         // TransferTask objects in task_list. freeBatchID() must not delete

@@ -216,9 +216,20 @@ class MultiTransport {
         std::unordered_set<BatchID> batches;
     };
     std::array<LiveBatchShard, kLiveBatchShards> live_batch_shards_{};
+    // BatchID is a BatchDesc address. Drop alignment bits and mix the
+    // rest so 16-byte allocation does not collapse onto 4 of 64 shards.
     static size_t liveBatchShard(BatchID batch_id) {
-        return static_cast<size_t>(batch_id % kLiveBatchShards);
+        uint64_t x = batch_id >> 4;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        return static_cast<size_t>(x % kLiveBatchShards);
     }
+
+    void beginQuiescePublish(BatchID batch_id);
+    void commitQuiesceSpans(BatchID batch_id,
+                            std::vector<BatchDesc::QuiesceSpan> spans);
+    void cancelQuiescePublish(BatchID batch_id);
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>
         deferred_cleanup_batches_;
