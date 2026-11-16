@@ -6880,4 +6880,60 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
 }
 #endif
 
+TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    std::string value(64, 'v');
+    constexpr int keys_per_bucket = 500;
+    constexpr int bucket_count = 20;
+    auto make_batch = [&](int first) {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        for (int i = first; i < first + keys_per_bucket; ++i) {
+            batch.emplace("grow" + std::to_string(i),
+                          std::vector<Slice>{{value.data(), value.size()}});
+        }
+        return batch;
+    };
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        std::vector<int64_t> buckets;
+        for (int i = 0; i < bucket_count; ++i) {
+            auto result =
+                backend.BatchOffload(make_batch(i * keys_per_bucket), nullptr);
+            ASSERT_TRUE(result.has_value());
+            buckets.push_back(*result);
+        }
+        auto failed = backend.BatchOffload(
+            make_batch(bucket_count * keys_per_bucket),
+            [](const auto&, auto&) { return ErrorCode::INTERNAL_ERROR; });
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(backend.GetStoreMetadata()->total_keys,
+                  bucket_count * keys_per_bucket);
+        EXPECT_FALSE(*backend.IsExist("grow10000"));
+        ASSERT_TRUE(backend.DeleteBucket(buckets.front()));
+        EXPECT_FALSE(*backend.IsExist("grow0"));
+        // Reoffloading an existing bucket must not add duplicate entries.
+        ASSERT_TRUE(backend.BatchOffload(make_batch(keys_per_bucket), nullptr));
+        EXPECT_EQ(backend.GetStoreMetadata()->total_keys,
+                  (bucket_count - 1) * keys_per_bucket);
+    }
+    BucketStorageBackend recovered(config, bucket_config);
+    ASSERT_TRUE(recovered.Init());
+    ASSERT_EQ(recovered.GetStoreMetadata()->total_keys,
+              (bucket_count - 1) * keys_per_bucket);
+    for (int i = keys_per_bucket; i < bucket_count * keys_per_bucket; ++i) {
+        std::string output(value.size(), '\0');
+        std::unordered_map<std::string, Slice> reads{
+            {"grow" + std::to_string(i), {output.data(), output.size()}}};
+        ASSERT_TRUE(recovered.BatchLoad(reads)) << i;
+        ASSERT_EQ(output, value) << i;
+    }
+    recovered.RemoveAll();
+    EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, 0);
+    ASSERT_TRUE(recovered.BatchOffload(make_batch(0), nullptr));
+    EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
+}
+
 }  // namespace mooncake::test
