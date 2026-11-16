@@ -3,14 +3,16 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use mooncake_store_core::{
-    CasResult, ClientRuntimeId, ClientStableId, ColdBackingState, NamespaceScope, ObjectKey,
-    ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientRuntimeId, ClientStableId, ColdBackingState, NamespaceScope, ObjectKey, ObjectRoute,
+    Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
 };
 use parking_lot::Mutex as ParkingMutex;
 
+use crate::metrics::record_delete_marker_state;
 use crate::shim::RouteAuthorityService;
 use crate::table::LocalRouteTable;
-use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
+use crate::{RouteAuthorityRecord, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
 pub(crate) fn bind_local_authority_service(
     namespace: &str,
@@ -56,6 +58,38 @@ pub(crate) fn authority_get_many(
     Ok(slot.table.get_many(keys))
 }
 
+pub(crate) fn authority_get_record(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+) -> Result<RouteAuthorityRecord> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    Ok(slot.table.get_record(key))
+}
+
+pub(crate) fn authority_get_records(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<RouteAuthorityRecord>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    Ok(slot.table.get_records(keys))
+}
+
 pub(crate) fn authority_contains_many(
     namespace: &str,
     authority: &ClientStableId,
@@ -97,7 +131,7 @@ pub(crate) fn authority_contains_many(
     }
 }
 
-pub(crate) fn authority_get_version_floor(
+pub(crate) fn authority_get_delete_marker(
     namespace: &str,
     authority: &ClientStableId,
     key: &ObjectKey,
@@ -105,10 +139,10 @@ pub(crate) fn authority_get_version_floor(
     let mesh = route_mesh(namespace);
     mesh.authorities
         .get(&authority.0)
-        .and_then(|slot| slot.table.version_floor(key))
+        .and_then(|slot| slot.table.delete_marker(key))
 }
 
-pub(crate) fn authority_get_version_floors(
+pub(crate) fn authority_get_delete_markers(
     namespace: &str,
     authority: &ClientStableId,
     keys: &[ObjectKey],
@@ -116,7 +150,7 @@ pub(crate) fn authority_get_version_floors(
     let mesh = route_mesh(namespace);
     mesh.authorities
         .get(&authority.0)
-        .map(|slot| slot.table.version_floors(keys))
+        .map(|slot| slot.table.delete_markers(keys))
         .unwrap_or_else(|| vec![None; keys.len()])
 }
 
@@ -144,11 +178,44 @@ pub(crate) fn authority_list_routes_by_replica_owner(
     Ok(page.routes)
 }
 
+pub(crate) fn authority_get_allocation_route_references(
+    namespace: &str,
+    authority: &ClientStableId,
+    identities: &[AllocationRouteIdentity],
+) -> Result<Vec<AllocationRouteReferenceState>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    slot.table.allocation_route_references(identities)
+}
+
+pub(crate) fn authority_get_allocation_route_reference_keys(
+    namespace: &str,
+    authority: &ClientStableId,
+    identities: &[AllocationRouteIdentity],
+) -> Result<Vec<AllocationRouteReference>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    slot.table.allocation_route_reference_keys(identities)
+}
+
 pub(crate) fn authority_list_routes_by_replica_owner_page(
     namespace: &str,
     authority: &ClientStableId,
     owner: &ClientRuntimeId,
     cursor: Option<&str>,
+    snapshot_epoch: Option<u64>,
     limit: usize,
 ) -> Result<RouteOwnerPage> {
     let mesh = route_mesh(namespace);
@@ -159,7 +226,8 @@ pub(crate) fn authority_list_routes_by_replica_owner_page(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
-    Ok(slot.table.list_by_replica_owner_page(owner, cursor, limit))
+    slot.table
+        .list_by_replica_owner_page_at_epoch(owner, cursor, limit, snapshot_epoch)
 }
 
 pub(crate) fn authority_list_routes(
@@ -325,10 +393,26 @@ struct AuthoritySlot {
     service: Option<Arc<dyn RouteAuthorityService>>,
 }
 
-pub(crate) fn register_local_authority(namespace: &str, authority: &ClientStableId) {
+pub(crate) fn register_local_authority(
+    namespace: &str,
+    authority: &ClientStableId,
+    delete_marker_budget_bytes: usize,
+) {
     let mesh = route_mesh(namespace);
-    let mut slot = mesh.authorities.entry(authority.0.clone()).or_default();
+    let mut slot = mesh
+        .authorities
+        .entry(authority.0.clone())
+        .or_insert_with(|| AuthoritySlot {
+            table: LocalRouteTable::with_delete_marker_budget(delete_marker_budget_bytes),
+            ..AuthoritySlot::default()
+        });
     slot.ref_count += 1;
+    let snapshot = slot.table.delete_marker_snapshot();
+    record_delete_marker_state(
+        snapshot.entries as u64,
+        snapshot.accounted_bytes as u64,
+        snapshot.budget_bytes as u64,
+    );
 }
 
 pub(crate) fn unregister_local_authority(namespace: &str, authority: &ClientStableId) {
@@ -340,6 +424,7 @@ pub(crate) fn unregister_local_authority(namespace: &str, authority: &ClientStab
                 slot.ref_count -= 1;
             } else {
                 occ.remove();
+                record_delete_marker_state(0, 0, 0);
             }
         }
         dashmap::mapref::entry::Entry::Vacant(_) => {}

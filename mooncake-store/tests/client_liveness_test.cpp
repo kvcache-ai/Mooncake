@@ -147,6 +147,7 @@ TEST(ClientLivenessRecordTest, LocalDiskCleanupUsesBoundIncarnation) {
     EXPECT_FALSE(new_replica.has_stale_local_disk_client());
     Replica unbound(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE);
     EXPECT_TRUE(unbound.has_stale_local_disk_client());
+    EXPECT_FALSE(unbound.isAffiliatedWith(nullptr));
 }
 
 }  // namespace mooncake::test

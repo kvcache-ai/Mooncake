@@ -400,7 +400,8 @@ std::string MakeHixlEngineName(const std::string& host_ip, uint16_t port) {
     return host_ip + ":" + std::to_string(port);
 }
 
-uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
+uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports) {
     if (device_id < 0 || !ValidBasePort(base_port)) {
         LOG(ERROR) << "Invalid HIXL port range: base_port=" << base_port
                    << ", device_id=" << device_id;
@@ -416,7 +417,7 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
                              static_cast<int64_t>(physical_dev_id) * kPortRange;
     const int64_t max_port =
         static_cast<int64_t>(base_port) +
-        (static_cast<int64_t>(physical_dev_id) + 1) * kPortRange;
+        (static_cast<int64_t>(physical_dev_id) + 1) * kPortRange - 1;
     if (min_port < kMinListenPort || max_port > kMaxListenPort) {
         LOG(ERROR) << "HIXL port range exceeds TCP port space: [" << min_port
                    << ", " << max_port << "]";
@@ -427,6 +428,10 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
     std::uniform_int_distribution<int64_t> rand_dist(min_port, max_port);
     for (int attempt = 0; attempt < kMaxPortAttempts; ++attempt) {
         const int port = static_cast<int>(rand_dist(rand_gen));
+        if (std::find(excluded_ports.begin(), excluded_ports.end(), port) !=
+            excluded_ports.end()) {
+            continue;
+        }
         int sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;

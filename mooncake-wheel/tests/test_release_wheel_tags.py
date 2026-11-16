@@ -25,8 +25,8 @@ import pytest
 yaml = pytest.importorskip("yaml")
 
 # Jobs delegating to this reusable workflow produce the standard CUDA and
-# non-CUDA wheel artifacts. Hardware-specific release-{efa,efa-non-cuda,musa,
-# npu}.yaml workflows do not call it and are out of scope.
+# non-CUDA wheel artifacts. Hardware-specific release-{musa,npu}.yaml workflows
+# do not call it and are out of scope.
 SHARED_BUILD_WORKFLOW = "_build-wheel.yaml"
 
 # The floor must come from a named manylinux image, matched to the runner's

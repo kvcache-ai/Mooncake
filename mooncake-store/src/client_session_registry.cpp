@@ -64,14 +64,17 @@ void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
     {
         std::shared_lock lock(mutex_);
         slot = FindSlotLocked(client_id);
-        if (!slot || slot->host_id == host_id) {
+        if (!slot || !slot->liveness->ShouldRetainResources() ||
+            slot->host_id == host_id) {
             return;
         }
     }
-    // The session may have been replaced between the two locks. A hint seen
-    // by the old incarnation must not land on its successor.
+    // The session may have been replaced or retired between the two locks. A
+    // hint seen by an old or offline incarnation must not land on it or its
+    // successor.
     std::unique_lock lock(mutex_);
-    if (FindSlotLocked(client_id) == slot) {
+    if (FindSlotLocked(client_id) == slot &&
+        slot->liveness->ShouldRetainResources()) {
         slot->host_id = host_id;
     }
 }
@@ -79,7 +82,8 @@ void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
 std::string ClientSessionRegistry::GetHostId(const UUID& client_id) const {
     std::shared_lock lock(mutex_);
     const auto slot = FindSlotLocked(client_id);
-    return slot ? slot->host_id : std::string();
+    return (slot && slot->liveness->ShouldRetainResources()) ? slot->host_id
+                                                             : std::string();
 }
 
 ClientSessionRegistry::Slot ClientSessionRegistry::FindSlot(
@@ -190,14 +194,16 @@ ClientSessionRegistry::Registration::Registration(
       lifecycle_lock_(registry.lifecycle_mutex_),
       client_id_(client_id),
       kind_(kind),
-      observed_at_(observed_at.value_or(Clock::now())) {
+      observed_at_(observed_at) {
     for (;;) {
         slot_ = registry.FindSlot(client_id);
         provisional_ = !slot_;
         if (provisional_) {
+            // Sample after acquiring lifecycle_lock_ so waiting behind restore
+            // work does not consume the new session's active TTL.
             slot_ = std::make_shared<ClientSlot>(
-                std::make_shared<ClientLivenessRecord>(client_id,
-                                                       observed_at_));
+                std::make_shared<ClientLivenessRecord>(
+                    client_id, observed_at_.value_or(Clock::now())));
             // Claim the private slot before publication; never acquire a
             // published slot's operation lock under the registry lock.
             operation_ = ExclusiveOperation(slot_->operation_mutex);
@@ -239,26 +245,48 @@ void ClientSessionRegistry::Registration::UpdateHostId(
     if (host_id.empty()) {
         return;
     }
-    std::unique_lock lock(registry_.mutex_);
-    slot_->host_id = host_id;
+    if (committed_) {
+        std::unique_lock lock(registry_.mutex_);
+        if (slot_->liveness->ShouldRetainResources()) {
+            slot_->host_id = host_id;
+        }
+    } else {
+        pending_host_id_ = host_id;
+    }
 }
 
 void ClientSessionRegistry::Registration::Commit() {
     CHECK(operation_.owns_lock() && admitted_);
     CHECK(!committed_);
     if (kind_ == RegistrationKind::Register) {
-        if (slot_->liveness->Observe(observed_at_) ==
+        // Sample after lock acquisition and resource installation so neither
+        // consumes the successfully registered client's active TTL. Keep an
+        // explicit timestamp only for deterministic tests.
+        const auto now = observed_at_.value_or(Clock::now());
+        if (slot_->liveness->Observe(now) ==
             ClientLivenessObservation::RECOVERED_ACTIVE) {
             registry_.PublishTransition(client_id_, slot_,
                                         ClientLivenessState::SUSPECTED,
                                         ClientLivenessState::ACTIVE);
         }
+        if (pending_host_id_) {
+            std::unique_lock lock(registry_.mutex_);
+            if (slot_->liveness->ShouldRetainResources()) {
+                slot_->host_id = std::move(*pending_host_id_);
+            }
+            pending_host_id_.reset();
+        }
     } else {
         std::unique_lock lock(registry_.mutex_);
-        if (slot_->liveness->ShouldRetainResources() &&
-            !std::exchange(slot_->remount_completed, true)) {
-            MasterMetricManager::instance().inc_active_clients();
+        if (slot_->liveness->ShouldRetainResources()) {
+            if (!std::exchange(slot_->remount_completed, true)) {
+                MasterMetricManager::instance().inc_active_clients();
+            }
+            if (pending_host_id_) {
+                slot_->host_id = std::move(*pending_host_id_);
+            }
         }
+        pending_host_id_.reset();
     }
     committed_ = true;
 }
@@ -289,6 +317,7 @@ ClientSessionSharedPtr ClientSessionRegistry::RestoreBatch::FindOrCreate(
 void ClientSessionRegistry::RestoreBatch::Commit() {
     CHECK(lifecycle_lock_.owns_lock() && !committed_);
     registry_.AdoptRecords(pending_);
+    pending_.clear();
     committed_ = true;
 }
 

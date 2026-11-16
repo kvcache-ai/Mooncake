@@ -168,9 +168,7 @@ def _head_bytes(
     placement: KVCachePlacementManifest, component: KVCacheComponent
 ) -> int:
     d = placement.descriptor
-    return d.itemsize * (
-        d.key_head_dim if component is KVCacheComponent.KEY else d.value_head_dim
-    )
+    return d.itemsize * d.head_dim(component)
 
 
 def _physical_spans(
@@ -333,7 +331,9 @@ def _validated_range_spans(
         groups.setdefault((item.global_layer_id, item.component), []).append(item)
     _check_disjoint(spans, "binding")
     expected_keys = {
-        (layer, component) for layer in part.layer_ids for component in KVCacheComponent
+        (layer, component)
+        for layer in part.layer_ids
+        for component in placement.descriptor.components
     }
     if set(groups) != expected_keys:
         raise ValueError("resolved binding misses layer/component coverage")
@@ -372,20 +372,38 @@ def resolve_contiguous_runtime_binding(
 ) -> KVCacheResolvedRuntimeBinding:
     """Adapt legacy contiguous buffers; offsets are supplied by the runtime.
 
+    Every view names its complete allocation with a runtime-scoped region ID,
+    independent of participant, fragment and operation. One executor per
+    runtime/endpoint deduplicates registration across bindings. The runtime must
+    keep that allocation pinned until all users are quiescent; callers releasing
+    bindings independently must use binding.digest as the executor's owner_id.
     Paged/noncontiguous allocations must export resolved ranges themselves.
     No framework page IDs or allocation metadata enter Mooncake.
     """
     validate_runtime_binding(placement, binding, snapshot=snapshot)
     require_integer(first_token_offset, "first_token_offset")
     part = placement.part(ParticipantId(binding.participant_id))
-    regions: list[KVCacheRegisteredRegion] = []
+    regions: dict[str, KVCacheRegisteredRegion] = {}
     ranges: list[KVCacheResolvedRange] = []
     for item in binding.buffers:
         f = item.fragment
         if first_token_offset + snapshot.token_count > f.local_shape[0]:
             raise ValueError("snapshot exceeds legacy runtime buffer token capacity")
-        regions.append(
-            KVCacheRegisteredRegion(f.fragment_id, f.endpoint, f.address, f.nbytes)
+        region_id = "kv-allocation:" + _canonical_digest(
+            {
+                "instance_id": binding.instance_id,
+                "worker_id": f.worker_id,
+                "device": f.device,
+                "endpoint": f.endpoint,
+                "address": f.storage_address,
+                "nbytes": f.storage_nbytes,
+            }
+        )
+        regions[region_id] = KVCacheRegisteredRegion(
+            region_id,
+            f.endpoint,
+            f.storage_address,
+            f.storage_nbytes,
         )
         ranges.append(
             KVCacheResolvedRange(
@@ -395,8 +413,8 @@ def resolve_contiguous_runtime_binding(
                 snapshot.token_count,
                 part.head_start,
                 part.head_count,
-                f.fragment_id,
-                first_token_offset * f.strides_bytes[0],
+                region_id,
+                f.storage_offset_bytes + first_token_offset * f.strides_bytes[0],
                 f.strides_bytes[0],
                 f.strides_bytes[1],
             )
@@ -411,7 +429,7 @@ def resolve_contiguous_runtime_binding(
         binding.participant_id,
         snapshot.snapshot_id,
         snapshot.digest,
-        tuple(regions),
+        tuple(regions.values()),
         tuple(ranges),
     )
     validate_resolved_runtime_binding(

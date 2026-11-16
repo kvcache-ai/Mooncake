@@ -114,6 +114,19 @@ For standard TCP, `transports/tcp/max_concurrent_tasks` controls the worker
 thread count and must be greater than zero. A zero value makes TCP installation
 return `InvalidArgument`; it does not select an automatic worker count.
 
+Standard TCP data RPCs use process and buffer-registration identities. Legacy
+v1 clients cannot send those identities, so a new server rejects v1 data RPCs
+by default. A TENT peer normally acts as both client and server, so a rolling
+upgrade requires two passes. In the first pass, set
+`transports/tcp/allow_unsafe_legacy_data_rpc` to `true` on each upgraded peer
+and restart or reinstall TENT on that peer. After every peer supports v2, set
+the option back to `false` and perform a second rolling restart or reinstall.
+The option is read by `TcpTransport::install()`; changing the configuration
+alone does not affect a running transport.
+Compatibility mode still requires every server-local buffer to have a current
+TCP registration and holds its lease for the full copy; it relaxes wire
+identity only, not unregister lifetime safety.
+
 (custom-nic-priority-matrix)=
 ### Custom NIC Priority Matrix
 

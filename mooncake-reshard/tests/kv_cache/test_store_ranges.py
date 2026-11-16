@@ -5,7 +5,6 @@ import ctypes
 import pytest
 from _store_test_utils import FORMATS, _reference, memory_binding
 from mooncake.reshard.kv_cache import (
-    KVCacheComponent,
     KVCacheTransferLimits,
     plan_kv_cache_store_load,
     plan_kv_cache_store_upload,
@@ -28,7 +27,7 @@ def test_lowered_ranges_restore_tp1pp3_to_tp2pp2(source_format, target_format):
             _reference(
                 layout, shard.layer_ids, shard.head_start, shard.head_count, component
             )
-            for component in KVCacheComponent
+            for component in layout.descriptor.components
         )
         for shard in layout.shards
     ]

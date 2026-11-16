@@ -333,8 +333,18 @@ pub struct TentStoreTransport(pub Arc<TentEngine>);
 
 impl StoreTransportFactory for TentTransportFactory {
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
+        // TENT's ascend_direct transport derives the HIXL listen IP from the
+        // local segment name ("<ip>[:<port>]"). Store-RS segment names are
+        // logical, so for the ascend path leave local_segment_name unset and
+        // let TENT build the "<rpc_server_hostname>:<rpc_server_port>" form.
+        let config = self.config.clone();
+        let config = if config.ascend_device_id().is_some() {
+            config
+        } else {
+            config.set("local_segment_name", segment_name)
+        };
         Ok(Arc::new(TentStoreTransport(Arc::new(TentEngine::new(
-            &self.config.clone().set("local_segment_name", segment_name),
+            &config,
         )?))))
     }
 }

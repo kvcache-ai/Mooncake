@@ -7,6 +7,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -66,14 +67,19 @@ TEST_F(ClientSessionRegistryTest, HostHintsBelongToTheSession) {
     registry.UpdateHostId(kClient, "host-a");
     registry.UpdateHostId(kClient, "");
     EXPECT_EQ(registry.GetHostId(kClient), "host-a");
-    // Remount can update a hint without recursively taking the registry lock.
+    // Host hints stage until Commit() so an abandoned scope preserves the old
+    // hint, and post-commit updates apply immediately while the scope is held.
     {
         auto registration = registry.BeginRegistration(kClient);
         ASSERT_TRUE(registration);
         registration->UpdateHostId("host-b");
         registration->UpdateHostId("");
-        EXPECT_EQ(registry.GetHostId(kClient), "host-b");
+        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
         registration->Commit();
+        EXPECT_EQ(registry.GetHostId(kClient), "host-b");
+        registration->UpdateHostId("host-c");
+        registration->UpdateHostId("");
+        EXPECT_EQ(registry.GetHostId(kClient), "host-c");
     }
     EXPECT_TRUE(registry.GetHostId(UUID{3, 4}).empty());
     registry.Reset();
@@ -92,9 +98,10 @@ TEST_F(ClientSessionRegistryTest,
         ASSERT_TRUE(remount);
         EXPECT_FALSE(original->Session());
         remount->UpdateHostId("host-a");
-        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+        EXPECT_TRUE(registry.GetHostId(kClient).empty());
         EXPECT_EQ(registry.GetHostId(other), "other-host");
         remount->Commit();
+        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
     }
     EXPECT_EQ(registry.GetHostId(kClient), "host-a");
 }
@@ -295,22 +302,69 @@ TEST_F(ClientSessionRegistryTest,
         registration->UpdateHostId("failed-host");
         return ErrorCode::INVALID_PARAMS;
     };
+
+    // 1. Provisional session and its staged host hint are discarded on failure.
     EXPECT_EQ(fail(), ErrorCode::INVALID_PARAMS);
     EXPECT_FALSE(Find(registry, kClient));
     EXPECT_TRUE(registry.GetHostId(kClient).empty());
+
+    // 2. Existing session survives failure, and its committed host hint is not
+    // overwritten by an uncommitted registration attempt.
     auto record = Register(registry);
+    registry.UpdateHostId(kClient, "committed-host");
     Suspect(record);
     EXPECT_EQ(fail(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(Find(registry, kClient), record);
     EXPECT_EQ(record->state(), State::SUSPECTED);
-    EXPECT_EQ(registry.GetHostId(kClient), "failed-host");
+    EXPECT_EQ(registry.GetHostId(kClient), "committed-host");
+
+    // 3. Committing publishes both the liveness recovery and the staged hint.
     {
         auto registration = registry.BeginRegistration(kClient, kInitial + 12s);
         ASSERT_TRUE(registration);
+        registration->UpdateHostId("updated-host");
         registration->Commit();
     }
     EXPECT_EQ(record->state(), State::ACTIVE);
+    EXPECT_EQ(registry.GetHostId(kClient), "updated-host");
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionRegistryTest, RegistrationSamplesLivenessAtCommit) {
+    constexpr auto active_ttl = 10ms;
+    for (const bool existing : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "existing=" << existing);
+        ClientSessionRegistry registry;
+        if (existing) {
+            auto record = Register(registry);
+            Suspect(record);
+        }
+
+        Clock::time_point before_commit;
+        Clock::time_point after_commit;
+        {
+            auto registration = registry.BeginRegistration(kClient);
+            ASSERT_TRUE(registration);
+            // Model resource installation taking longer than the active TTL.
+            std::this_thread::sleep_for(2 * active_ttl);
+            before_commit = Clock::now();
+            registration->Commit();
+            after_commit = Clock::now();
+        }
+
+        const auto record = Find(registry, kClient);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->state(), State::ACTIVE);
+        // Sampled bounds keep these checks independent of scheduling delays
+        // after Commit(): a full active TTL starts at the commit, not Begin().
+        EXPECT_EQ(
+            record->Evaluate(before_commit + active_ttl - Clock::duration{1},
+                             active_ttl, 20s),
+            Transition::NONE);
+        EXPECT_TRUE(registry.TryAcquireServingSession(kClient));
+        EXPECT_EQ(record->Evaluate(after_commit + active_ttl, active_ttl, 20s),
+                  Transition::BECAME_SUSPECTED);
+    }
 }
 
 TEST_F(ClientSessionRegistryTest, ExceptionsDiscardOnlyUncommittedNewRecords) {
@@ -338,6 +392,46 @@ TEST_F(ClientSessionRegistryTest, ExceptionsDiscardOnlyUncommittedNewRecords) {
 }
 
 TEST_F(ClientSessionRegistryTest,
+       RemountInitializesNewSessionAfterRegistryLockWait) {
+    ClientSessionRegistry registry;
+    constexpr auto active_ttl = 10ms;
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    std::future<bool> remounted;
+    Clock::time_point before_unlock;
+    {
+        // Block BeginRemount() before it can create the missing session.
+        // Keep the future outside this scope so the lock is released before
+        // joining the worker, including if an assertion fails.
+        auto blocker = registry.BeginRestore();
+        remounted = std::async(std::launch::async, [&] {
+            started.set_value();
+            auto remount = registry.BeginRemount(kClient);
+            if (!remount) return false;
+            remount->Commit();
+            return true;
+        });
+        started_future.wait();
+        EXPECT_EQ(remounted.wait_for(2 * active_ttl),
+                  std::future_status::timeout);
+        before_unlock = Clock::now();
+    }
+    ASSERT_TRUE(remounted.get());
+    const auto after_remount = Clock::now();
+
+    const auto record = Find(registry, kClient);
+    ASSERT_TRUE(record);
+    // Use sampled bounds, not wall time after joining, so scheduling delays
+    // cannot make the freshly initialized session expire during the check.
+    EXPECT_EQ(record->Evaluate(before_unlock + active_ttl - Clock::duration{1},
+                               active_ttl, 20s),
+              Transition::NONE);
+    EXPECT_TRUE(registry.TryAcquireServingSession(kClient));
+    EXPECT_EQ(record->Evaluate(after_remount + active_ttl, active_ttl, 20s),
+              Transition::BECAME_SUSPECTED);
+}
+
+TEST_F(ClientSessionRegistryTest,
        RemountCommitsReadinessWithoutRenewingLiveness) {
     ClientSessionRegistry registry;
     auto record = Register(registry);
@@ -349,7 +443,9 @@ TEST_F(ClientSessionRegistryTest,
         remount->Commit();
         EXPECT_FALSE(remount->NeedsRemount());
     }
-    Suspect(record);
+    // Remount must preserve the original registration's expiry deadline.
+    EXPECT_EQ(record->Evaluate(kInitial + 10s, 10s, 20s),
+              Transition::BECAME_SUSPECTED);
     EXPECT_EQ(record->state(), State::SUSPECTED);
     {
         auto remount = registry.BeginRemount(kClient);
@@ -835,6 +931,117 @@ TEST_F(ClientSessionRegistryTest, RestoreDoesNotBlockLookupOrHeartbeat) {
     }
     EXPECT_TRUE(lookup.get());
     EXPECT_TRUE(Find(registry, other));
+}
+
+TEST_F(ClientSessionRegistryTest,
+       UpdateHostIdIgnoresMissingAndOfflineSessions) {
+    ClientSessionRegistry registry;
+    registry.UpdateHostId(kClient, "unregistered-host");
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
+
+    auto old = Register(registry);
+    registry.UpdateHostId(kClient, "host-a");
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+    // Repeated identical updates and empty hints preserve the stored value.
+    registry.UpdateHostId(kClient, "host-a");
+    registry.UpdateHostId(kClient, "");
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+
+    Suspect(old);
+    registry.UpdateHostId(kClient, "host-b");
+    EXPECT_EQ(registry.GetHostId(kClient), "host-b");
+
+    const UUID retiring{5, 6};
+    auto offline = Register(registry, retiring);
+    Suspect(offline);
+    Retire(offline);
+    registry.UpdateHostId(retiring, "late-write-host");
+    EXPECT_TRUE(registry.GetHostId(retiring).empty());
+    ASSERT_TRUE(registry.Remove(retiring, offline));
+    Register(registry, retiring);
+    EXPECT_TRUE(registry.GetHostId(retiring).empty());
+}
+
+TEST_F(ClientSessionRegistryTest,
+       RemoveSerializesAgainstConcurrentSessionAcquisition) {
+    ClientSessionRegistry registry;
+    auto old = Register(registry);
+    auto in_flight = registry.TryAcquireRetainingSession(kClient);
+    ASSERT_TRUE(in_flight);
+
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto remover = std::async(std::launch::async, [&] {
+        started.set_value();
+        return registry.Remove(kClient, old);
+    });
+    started_future.wait();
+    EXPECT_EQ(remover.wait_for(20ms), std::future_status::timeout);
+
+    auto late_acquirer = std::async(std::launch::async, [&] {
+        return registry.TryAcquireRetainingSession(kClient).has_value();
+    });
+    EXPECT_EQ(late_acquirer.wait_for(20ms), std::future_status::timeout);
+
+    in_flight.reset();
+    EXPECT_TRUE(remover.get());
+    EXPECT_EQ(old->state(), State::ACTIVE);
+    EXPECT_FALSE(late_acquirer.get());
+}
+
+TEST_F(ClientSessionRegistryTest,
+       ExpireSessionsClearsMetadataBeforeRetireCallback) {
+    bool reserved = false;
+    bool retired = false;
+    ClientSessionSharedPtr retired_session;
+    Record record;
+    Slot slot;
+    ClientSessionRegistry registry(
+        10s, 20s, {},
+        [&] {
+            EXPECT_EQ(record->state(), State::SUSPECTED);
+            reserved = true;
+        },
+        [&](const UUID& id, ClientSessionSharedPtr session) {
+            EXPECT_TRUE(reserved);
+            EXPECT_EQ(id, kClient);
+            EXPECT_EQ(session, record);
+            EXPECT_EQ(session->state(), State::OFFLINE);
+            EXPECT_TRUE(registry.GetHostId(kClient).empty());
+            EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+            // Retirement runs after releasing the slot operation lock.
+            EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, slot,
+                                                  /*try_lock=*/true));
+            retired_session = std::move(session);
+            retired = true;
+        });
+
+    record = Register(registry);
+    slot = FindSlot(registry, kClient);
+    {
+        auto remount = registry.BeginRemount(kClient);
+        ASSERT_TRUE(remount);
+        remount->UpdateHostId("host-a");
+        remount->Commit();
+    }
+    ASSERT_EQ(registry.GetHostId(kClient), "host-a");
+
+    // First expiry pass moves ACTIVE -> SUSPECTED without retiring resources.
+    ExpireSessions(registry, kInitial + 10s);
+    EXPECT_EQ(record->state(), State::SUSPECTED);
+    EXPECT_FALSE(reserved);
+    EXPECT_FALSE(retired);
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+
+    // Second expiry pass reserves retirement before OFFLINE, clears readiness
+    // and host hints, and passes the terminal session to the retire callback.
+    ExpireSessions(registry, kInitial + 30s);
+    EXPECT_TRUE(retired);
+    EXPECT_EQ(retired_session, record);
+    EXPECT_TRUE(registry.HasRetiredSession());
+    EXPECT_EQ(Find(registry, kClient), record);
+    EXPECT_TRUE(registry.Remove(kClient, record));
+    EXPECT_FALSE(registry.HasRetiredSession());
 }
 
 }  // namespace

@@ -9,9 +9,17 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import Generic, NamedTuple, TypeVar, cast
 
 from ..resolved import KVCacheResolvedRange
-from ..types import KVCacheComponent, KVCacheDescriptor
+from ..types import KVCacheComponent, KVCacheDescriptor, KVCacheLayout
 
 _T = TypeVar("_T")
+
+
+def validate_store_descriptor(descriptor: KVCacheDescriptor) -> None:
+    """Keep the fixed-page Store contract separate from R2R state resources."""
+    if descriptor.components != (KVCacheComponent.KEY, KVCacheComponent.VALUE):
+        raise ValueError("Store reshard supports only K/V components")
+    if descriptor.layout is not KVCacheLayout.NHD:
+        raise ValueError("Store reshard supports only NHD descriptors")
 
 
 class HeadIntervalIndex(Generic[_T]):

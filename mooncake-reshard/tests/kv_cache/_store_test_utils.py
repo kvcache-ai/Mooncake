@@ -80,7 +80,7 @@ def memory_binding(
     layout = plan_kv_cache_store_upload(placement, object_format=fmt).layout
     regions, ranges, buffers, expected = [], [], [], []
     for page in range(pages):
-        for component in KVCacheComponent:
+        for component in d.components:
             data = _reference(
                 layout, part.layer_ids, part.head_start, part.head_count, component
             )

@@ -390,6 +390,7 @@ def _validate_executor_provenance(
         actual_indices[key] = list(
             operation_views.operation_indices_for(executor, side)
         )
+        executor_fragment_ids = set(executor.fragment_ids)
         expected_fragment_snapshots = tuple(
             sorted(
                 (
@@ -401,7 +402,7 @@ def _validate_executor_provenance(
                     for placement_fragment, runtime in attestation.worker_fragment_pairs(
                         executor.worker_id
                     )
-                    if runtime.fragment_id in executor.fragment_ids
+                    if runtime.fragment_id in executor_fragment_ids
                 ),
                 key=lambda item: item.fragment_id,
             )

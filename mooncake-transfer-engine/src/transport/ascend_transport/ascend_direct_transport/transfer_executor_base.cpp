@@ -55,6 +55,7 @@ constexpr const char* kAutoConnect = "AutoConnect";
 constexpr const char* kEnabled = "1";
 constexpr const char* kDisabled = "0";
 constexpr int32_t kTransferRetryTimes = 2;
+constexpr int kMaxAdxlInitAttempts = 4;
 
 void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     for (auto* slice : slice_list) {
@@ -343,31 +344,62 @@ int TransferExecutorBase::initEngines() {
         LOG(INFO) << "Use async transfer";
     }
 
-    const auto& endpoints = local_segment_desc->rank_info.endpoints;
+    auto& endpoints = local_segment_desc->rank_info.endpoints;
     for (size_t idx = 0; idx < endpoints.size(); ++idx) {
-        if (idx >= local_engine_contexts_.size()) {
-            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size, "
+        if (idx >= local_engine_contexts_.size() ||
+            idx >= params_.local_engine_device_ids.size()) {
+            LOG(ERROR) << "Endpoint count exceeds local engine state, "
                        << "idx: " << idx << ", endpoints: " << endpoints.size()
                        << ", local_engine_contexts: "
-                       << local_engine_contexts_.size();
+                       << local_engine_contexts_.size()
+                       << ", local_engine_device_ids: "
+                       << params_.local_engine_device_ids.size();
             return -1;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[idx]));
-        const auto& adxl_engine_name = endpoints[idx];
-        auto engine = std::make_shared<adxl::AdxlEngine>();
-        if (!engine) {
-            return ERR_MEMORY;
+        std::vector<uint16_t> excluded_ports;
+        for (int attempt = 0; attempt < kMaxAdxlInitAttempts; ++attempt) {
+            if (attempt > 0) {
+                // The probe and ADXL's listener bind are separate operations.
+                // Retry with a fresh candidate if another initializer won that
+                // race after the probe released the port.
+                const auto port = FindAdxlListenPort(
+                    params_.base_port, params_.local_engine_device_ids[idx],
+                    excluded_ports);
+                if (port == 0) {
+                    LOG(ERROR) << "Find available port failed for device: "
+                               << params_.local_engine_device_ids[idx];
+                    return -1;
+                }
+                endpoints[idx] = GenAdxlEngineName(
+                    local_segment_desc->rank_info.hostIp, port);
+            }
+            const auto& adxl_engine_name = endpoints[idx];
+            auto engine = std::make_shared<adxl::AdxlEngine>();
+            if (!engine) {
+                return ERR_MEMORY;
+            }
+            auto status = engine->Initialize(adxl_engine_name.c_str(), options);
+            if (status == adxl::SUCCESS) {
+                params_.local_adxl_engine_names.push_back(adxl_engine_name);
+                adxl_engines_.emplace_back(std::move(engine));
+                LOG(INFO) << "Success to initialize adxl engine:"
+                          << adxl_engine_name << ", pid:" << getpid();
+                break;
+            }
+            const auto parsed_name = parseHostNameWithPort(adxl_engine_name);
+            excluded_ports.push_back(static_cast<uint16_t>(parsed_name.second));
+            if (attempt + 1 == kMaxAdxlInitAttempts) {
+                LOG(ERROR) << "Failed to initialize AdxlEngine after "
+                           << kMaxAdxlInitAttempts
+                           << " attempts, status: " << status
+                           << ", errmsg: " << aclGetRecentErrMsg();
+                return -1;
+            }
+            LOG(WARNING) << "ADXL initialization failed for "
+                         << adxl_engine_name << ", status: " << status
+                         << "; retrying with a different listen port";
         }
-        auto status = engine->Initialize(adxl_engine_name.c_str(), options);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            return -1;
-        }
-        params_.local_adxl_engine_names.push_back(adxl_engine_name);
-        adxl_engines_.emplace_back(std::move(engine));
-        LOG(INFO) << "Success to initialize adxl engine:" << adxl_engine_name
-                  << ", pid:" << getpid();
     }
     return 0;
 }

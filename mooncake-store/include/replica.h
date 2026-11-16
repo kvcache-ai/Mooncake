@@ -618,12 +618,13 @@ class Replica {
     // Missing ownership is stale; SUSPECTED owners still retain resources.
     // Read atomic state without taking a transition guard under metadata locks.
     // OFFLINE is terminal, so a stale decision cannot race with recovery.
-    [[nodiscard]] bool has_stale_local_disk_client() const {
-        if (!is_local_disk_replica()) {
-            return false;
+    [[nodiscard]] bool has_stale_local_disk_client() const noexcept {
+        if (const auto* local =
+                std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
+            const auto& record = (*local)->owner_session;
+            return !record || !record->ShouldRetainResources();
         }
-        const auto record = getClientSession();
-        return !record || !record->ShouldRetainResources();
+        return false;
     }
 
     /**
@@ -645,28 +646,22 @@ class Replica {
         }
     }
 
-    [[nodiscard]] ClientSessionSharedPtr getClientSession() const {
-        if (is_memory_replica()) {
-            const auto& data = std::get<MemoryReplicaData>(data_);
-            return data.buffer ? data.buffer->getClientSession() : nullptr;
+    [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
+        const noexcept {
+        static const ClientSessionSharedPtr kNoSession;
+        if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+            return data->buffer ? data->buffer->getClientSession() : kNoSession;
         }
-        if (is_local_disk_replica()) {
-            return LocalDiskData(data_).owner_session;
+        if (const auto* local =
+                std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
+            return (*local)->owner_session;
         }
-        return nullptr;
+        return kNoSession;
     }
 
     [[nodiscard]] bool isAffiliatedWith(
-        const ClientSessionSharedPtr& owner_session) const {
-        if (is_memory_replica()) {
-            const auto& data = std::get<MemoryReplicaData>(data_);
-            return data.buffer &&
-                   data.buffer->getClientSession() == owner_session;
-        }
-        if (is_local_disk_replica()) {
-            return LocalDiskData(data_).owner_session == owner_session;
-        }
-        return false;
+        const ClientSessionSharedPtr& owner_session) const noexcept {
+        return owner_session != nullptr && getClientSession() == owner_session;
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {

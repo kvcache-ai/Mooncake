@@ -291,16 +291,30 @@ void ScopedSegmentAccess::BindClientSession(
     CHECK(owner_session);
     const auto client_segments_it =
         segment_manager_->client_segments_.find(owner_session->ClientId());
-    if (client_segments_it != segment_manager_->client_segments_.end()) {
-        for (const auto& segment_id : client_segments_it->second) {
-            auto mounted_it =
-                segment_manager_->mounted_segments_.find(segment_id);
-            if (mounted_it != segment_manager_->mounted_segments_.end() &&
-                mounted_it->second.allocator_registration) {
-                mounted_it->second.allocator_registration->BindClientSession(
-                    owner_session);
-            }
+    if (client_segments_it == segment_manager_->client_segments_.end()) {
+        return;
+    }
+    for (const auto& segment_id : client_segments_it->second) {
+        auto mounted_it = segment_manager_->mounted_segments_.find(segment_id);
+        if (mounted_it == segment_manager_->mounted_segments_.end() ||
+            !mounted_it->second.allocator_registration) {
+            continue;
         }
+        auto& mounted = mounted_it->second;
+        auto old_registration = mounted.allocator_registration;
+        if (old_registration->GetClientSession() == owner_session) {
+            continue;
+        }
+        const bool in_allocator_manager =
+            HasAllocatorRegistration(segment_manager_->allocator_manager_,
+                                     mounted.segment.name, old_registration);
+        auto next_registration = old_registration->ReplaceClientSession(
+            owner_session, mounted.buf_allocator, in_allocator_manager);
+        if (in_allocator_manager) {
+            CHECK(segment_manager_->allocator_manager_.replaceRegistrations(
+                {{mounted.segment.name, old_registration, next_registration}}));
+        }
+        mounted.allocator_registration = std::move(next_registration);
     }
 }
 
@@ -308,18 +322,6 @@ void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
                                               AllocatedBuffer& buffer) {
     segment_manager_->mounted_segments_.at(segment_id)
         .allocator_registration->BindBuffer(buffer);
-}
-
-bool ScopedSegmentAccess::RebindBufferToOwningSegment(AllocatedBuffer& buffer) {
-    for (auto& [segment_id, mounted] : segment_manager_->mounted_segments_) {
-        (void)segment_id;
-        if (mounted.allocator_registration &&
-            mounted.allocator_registration->OwnsBuffer(buffer)) {
-            mounted.allocator_registration->BindBuffer(buffer);
-            return true;
-        }
-    }
-    return false;
 }
 
 ErrorCode ScopedSegmentAccess::ReMountSegment(
@@ -397,7 +399,7 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
 
 bool ScopedSegmentAccess::ReplaceAllocators(
     const std::vector<AllocatorReplacement>& replacements) {
-    std::vector<AllocatorManager::Replacement> manager_replacements;
+    std::vector<AllocatorManager::RegistrationReplacement> manager_replacements;
     manager_replacements.reserve(replacements.size());
     for (const auto& replacement : replacements) {
         auto mounted =
@@ -409,25 +411,32 @@ bool ScopedSegmentAccess::ReplaceAllocators(
             !replacement.replacement) {
             return false;
         }
+        auto next_registration =
+            replacement.expected == replacement.replacement
+                ? mounted->second.allocator_registration
+                : mounted->second.allocator_registration->WithAllocator(
+                      replacement.replacement);
         manager_replacements.push_back({mounted->second.segment.name,
-                                        replacement.expected,
-                                        replacement.replacement});
-        if (replacement.expected != replacement.replacement) {
-            replacement.replacement->SetLocality(
-                mounted->second.segment.locality);
-        }
+                                        mounted->second.allocator_registration,
+                                        std::move(next_registration)});
     }
-    if (!segment_manager_->allocator_manager_.replaceAllocators(
+    if (!segment_manager_->allocator_manager_.replaceRegistrations(
             manager_replacements)) {
         return false;
     }
-    for (const auto& replacement : replacements) {
+    for (size_t i = 0; i < replacements.size(); ++i) {
+        const auto& replacement = replacements[i];
+        auto& mounted =
+            segment_manager_->mounted_segments_.at(replacement.segment_id);
         if (replacement.expected != replacement.replacement) {
+            replacement.replacement->SetLocality(mounted.segment.locality);
             replacement.replacement->AttachUsageTracker(
                 segment_manager_->usage_tracker_);
+            mounted.allocator_registration->SetAllocatable(false);
+            mounted.allocator_registration =
+                std::move(manager_replacements[i].replacement);
+            mounted.buf_allocator = replacement.replacement;
         }
-        segment_manager_->mounted_segments_.at(replacement.segment_id)
-            .buf_allocator = replacement.replacement;
     }
     return true;
 }
@@ -696,7 +705,10 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     const auto& allocators = allocator_manager.getAllocators(segment);
     if (allocators != nullptr) {
         for (const auto& registration : *allocators) {
-            const auto allocator = registration->GetAllocator();
+            const auto& allocator = registration->GetAllocator();
+            if (!allocator) {
+                continue;
+            }
             total_used += allocator->size();
             total_capacity += allocator->capacity();
         }
@@ -1057,7 +1069,10 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
     const auto& allocators = allocator_manager.getAllocators(segment);
     if (allocators != nullptr) {
         for (const auto& registration : *allocators) {
-            const auto allocator = registration->GetAllocator();
+            const auto& allocator = registration->GetAllocator();
+            if (!allocator) {
+                continue;
+            }
             total_used += allocator->size();
             total_capacity += allocator->capacity();
         }

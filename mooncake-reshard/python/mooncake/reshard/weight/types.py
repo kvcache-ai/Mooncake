@@ -318,6 +318,12 @@ def _require_integer_tuple(
     *,
     minimum: int,
 ) -> tuple[int, ...]:
+    if type(value) is tuple and type(minimum) is int:
+        for item in cast(tuple[object, ...], value):
+            if type(item) is not int or item < minimum:
+                break
+        else:
+            return cast(tuple[int, ...], value)
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise ValueError(f"{name} must contain integers")  # noqa: TRY004
     items = cast(Sequence[object], value)

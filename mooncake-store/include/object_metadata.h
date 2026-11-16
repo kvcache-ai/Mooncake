@@ -62,6 +62,7 @@ struct ObjectMetadata {
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
+        MasterMetricManager::instance().dec_key_group(key_group, TotalLength());
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
         }
@@ -86,10 +87,13 @@ struct ObjectMetadata {
           residency_affinity_id(std::move(residency_affinity_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
+          key_group(
+              MasterMetricManager::instance().classify_key_group(user_key)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin) {
         parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
+        MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
@@ -110,6 +114,7 @@ struct ObjectMetadata {
     const std::string residency_affinity_id;
     const TenantId tenant_id;
     const std::string user_key;
+    const uint8_t key_group;
 
     // Committed attribution only; protected by the key's lock.
     std::string session_id;

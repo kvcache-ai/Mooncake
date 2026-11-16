@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from typing import cast
 
-from ..serde import JsonValue, _descriptor_from_wire
+from ..serde import JsonValue, _descriptor_from_wire, _descriptor_to_wire
 from ._utils import canonical_json, load_json_object
 from ._utils import json_integer as _integer
 from ._utils import json_string as _string
@@ -56,6 +56,7 @@ def kv_cache_store_layout_to_json(layout: KVCacheStoreLayout) -> str:
     return _dump(
         {
             **asdict(layout),
+            "descriptor": _descriptor_to_wire(layout.descriptor),
             "layout_id": layout.layout_id,
             "layout_digest": layout.digest,
         }

@@ -49,6 +49,7 @@ class KVCacheTransferEngineExecutor:
         self.instance_id = instance_id
         self.endpoint = endpoint
         self._regions: dict[str, KVCacheRegisteredRegion] = {}
+        self._region_owners: dict[str, set[str | None]] = {}
         self._results: dict[
             tuple[str, str], tuple[str, tuple[KVCacheWriterReceipt, ...]]
         ] = {}
@@ -62,15 +63,27 @@ class KVCacheTransferEngineExecutor:
                 "in flight or registration state is uncertain"
             )
 
-    def register_region(self, region: KVCacheRegisteredRegion) -> None:
+    def register_region(
+        self, region: KVCacheRegisteredRegion, *, owner_id: str | None = None
+    ) -> None:
+        """Acquire one idempotent claim per owner on a runtime-owned region.
+
+        Independent binding lifetimes must use binding.digest as owner_id to
+        authorize validation/execution. Other owner IDs only keep memory pinned.
+        Omitting it retains the legacy single runtime claim, released once after
+        all users finish. All owners must use the same runtime/endpoint executor.
+        """
         if not isinstance(region, KVCacheRegisteredRegion):
             raise TypeError("region must be a KVCacheRegisteredRegion")
         if region.endpoint != self.endpoint:
             raise ValueError("region endpoint differs from local executor")
+        if owner_id is not None:
+            require_nonempty_string(owner_id, "owner_id")
         with self._lock:
             self._require_ready()
             if region.region_id in self._regions:
                 if self._regions[region.region_id] == region:
+                    self._region_owners[region.region_id].add(owner_id)
                     return
                 raise ValueError("registered region_id is already bound")
             if any(
@@ -86,17 +99,28 @@ class KVCacheTransferEngineExecutor:
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"TE register_memory failed: {code}")
             self._regions[region.region_id] = region
+            self._region_owners[region.region_id] = {owner_id}
             self._uncertain = False
 
-    def unregister_region(self, region_id: str) -> None:
+    def unregister_region(self, region_id: str, *, owner_id: str | None = None) -> None:
+        """Release a quiescent owner's claim; only the last release unpins it."""
+        if owner_id is not None:
+            require_nonempty_string(owner_id, "owner_id")
         with self._lock:
             self._require_ready()
             region = self._regions[region_id]
+            owners = self._region_owners[region_id]
+            if owner_id not in owners:
+                raise ValueError("region is not registered by this owner")
+            if len(owners) > 1:
+                owners.remove(owner_id)
+                return
             self._uncertain = True
             code = self.engine.unregister_memory(region.address)
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"TE unregister_memory failed: {code}")
             del self._regions[region_id]
+            del self._region_owners[region_id]
             self._uncertain = False
 
     def validate_local_binding(self, binding: KVCacheResolvedRuntimeBinding) -> None:
@@ -109,6 +133,13 @@ class KVCacheTransferEngineExecutor:
                 raise ValueError("binding instance differs from local executor")
             if any(self._regions.get(r.region_id) != r for r in binding.regions):
                 raise ValueError("binding region is not registered with this executor")
+            claims = [self._region_owners[r.region_id] for r in binding.regions]
+            if not all(None in owners for owners in claims):
+                owner_id = binding.digest
+                if any(
+                    None not in owners and owner_id not in owners for owners in claims
+                ):
+                    raise ValueError("binding owner claim is not active")
 
     def execute(
         self, plan: KVCacheRuntimeTransferPlan, writer_id: str, *, warmup: bool = False
@@ -127,6 +158,13 @@ class KVCacheTransferEngineExecutor:
                 raise ValueError(
                     "operation_id was already used with a different transfer"
                 )
+            bindings = [
+                b for b in plan.source_bindings if b.participant_id == writer_id
+            ]
+            if len(bindings) != 1:
+                raise ValueError("writer is not selected by runtime transfer")
+            binding = bindings[0]
+            self.validate_local_binding(binding)
             key = (plan.operation_id, writer_id)
             if key in self._results:
                 digest, receipts = self._results[key]
@@ -135,13 +173,6 @@ class KVCacheTransferEngineExecutor:
                         "operation_id was already used with a different transfer"
                     )
                 return receipts
-            bindings = [
-                b for b in plan.source_bindings if b.participant_id == writer_id
-            ]
-            if len(bindings) != 1:
-                raise ValueError("writer is not selected by runtime transfer")
-            binding = bindings[0]
-            self.validate_local_binding(binding)
             selected = [w for w in plan.writes if w.source_participant_id == writer_id]
             target_ids = sorted({w.target_participant_id for w in selected})
             completed = dict.fromkeys(target_ids, 0)

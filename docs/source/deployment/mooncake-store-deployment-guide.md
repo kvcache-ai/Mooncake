@@ -662,6 +662,11 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_requested_bytes_sum`
 - `mooncake_tenant_quota_effective_bytes_sum`
 
+With `--metrics_key_groups="kv:suffix:_k,state:prefix:state_"`, `/metrics` also
+reports `master_key_count_by_group{group}` and `master_value_bytes_by_group{group}`.
+Rules are `group:prefix|suffix|contains:pattern`; the first match wins and other
+keys count as `other`. Value bytes are logical, once per key.
+
 ---
 
 ## Tenant Quota Management
@@ -724,6 +729,7 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 |------|---------|-------------|
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
+| `--metrics_key_groups` | `""` | Break key count and value bytes down by key; see [Metrics Endpoints](#metrics-endpoints) |
 
 ### KV Cache Event Publisher
 

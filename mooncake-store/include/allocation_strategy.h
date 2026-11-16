@@ -67,8 +67,8 @@ class AllocatorManager {
         const std::shared_ptr<BufferAllocatorBase>& allocator,
         ClientSessionSharedPtr owner_session) {
         auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
-            new SegmentAllocatorRegistration(allocator,
-                                             std::move(owner_session)));
+            new SegmentAllocatorRegistration(
+                allocator, SegmentLifetime(std::move(owner_session))));
         addRegistration(name, registration);
         return registration;
     }
@@ -109,32 +109,37 @@ class AllocatorManager {
         return registration_removed;
     }
 
-    struct Replacement {
+    struct RegistrationReplacement {
         std::string name;
-        std::shared_ptr<BufferAllocatorBase> expected;
-        std::shared_ptr<BufferAllocatorBase> replacement;
+        std::shared_ptr<SegmentAllocatorRegistration> expected;
+        std::shared_ptr<SegmentAllocatorRegistration> replacement;
     };
 
-    bool replaceAllocators(const std::vector<Replacement>& replacements) {
-        std::vector<decltype(allocators_)::mapped_type::iterator> targets;
+    bool replaceRegistrations(
+        const std::vector<RegistrationReplacement>& replacements) {
+        // Slot addresses remain stable: validation never resizes the per-name
+        // vectors, and commit only overwrites their elements.
+        std::vector<std::shared_ptr<SegmentAllocatorRegistration>*> targets;
         targets.reserve(replacements.size());
         for (const auto& replacement : replacements) {
             auto it = allocators_.find(replacement.name);
             if (it == allocators_.end() || !replacement.replacement) {
                 return false;
             }
-            auto target = std::find_if(
-                it->second.begin(), it->second.end(),
-                [&replacement](const auto& registration) {
-                    return registration->GetAllocator() == replacement.expected;
-                });
+            auto target = std::find(it->second.begin(), it->second.end(),
+                                    replacement.expected);
             if (target == it->second.end()) {
                 return false;
             }
-            targets.push_back(target);
+            auto* slot = std::addressof(*target);
+            if (std::find(targets.begin(), targets.end(), slot) !=
+                targets.end()) {
+                return false;
+            }
+            targets.push_back(slot);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            (*targets[i])->BindAllocator(replacements[i].replacement);
+            *targets[i] = replacements[i].replacement;
         }
         return true;
     }
@@ -461,11 +466,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
             for (size_t i = 0; i < num_segs; ++i) {
                 const auto& registration =
                     (*allocators)[(i + seg_offset) % num_segs];
-                if (!preferred_hca_names.empty() &&
-                    HcaAffinityTier(
-                        registration->GetAllocator()->GetLocalityHandle().get(),
-                        preferred_hca_names) != tier) {
-                    continue;
+                if (!preferred_hca_names.empty()) {
+                    const auto& allocator = registration->GetAllocator();
+                    if (HcaAffinityTier(
+                            allocator ? allocator->GetLocalityHandle().get()
+                                      : nullptr,
+                            preferred_hca_names) != tier) {
+                        continue;
+                    }
                 }
                 if (auto buffer = registration->Allocate(slice_length)) {
                     return buffer;
@@ -650,7 +658,10 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
             if (!registration->IsAllocatable()) {
                 continue;
             }
-            const auto buffer_allocator = registration->GetAllocator();
+            const auto& buffer_allocator = registration->GetAllocator();
+            if (!buffer_allocator) {
+                continue;
+            }
             const auto capacity =
                 static_cast<uint64_t>(buffer_allocator->capacity());
             total_capacity += capacity;

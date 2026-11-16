@@ -80,23 +80,6 @@ class SegmentTest : public ::testing::Test {
                        boost::hash<UUID>>
         sessions_;
 
-    // Snapshot restoration creates registrations before owner sessions exist.
-    void InstallRestoredSegmentForTesting(SegmentManager& manager,
-                                          const Segment& segment,
-                                          const UUID& owner) {
-        auto allocator = std::make_shared<OffsetBufferAllocator>(
-            segment.name, segment.base, segment.size, segment.te_endpoint,
-            segment.protocol);
-        allocator->AttachUsageTracker(manager.usage_tracker_);
-        auto registration =
-            manager.allocator_manager_.addAllocator(segment.name, allocator);
-        manager.mounted_segments_[segment.id] = {segment, SegmentStatus::OK,
-                                                 allocator, registration};
-        manager.client_segments_[owner].push_back(segment.id);
-        manager.client_by_name_[segment.name] = owner;
-        manager.segment_id_by_name_[segment.name] = segment.id;
-    }
-
     void SetUp() override {
         // Initialize glog for logging
         google::InitGoogleLogging("EvictionStrategyTest");
@@ -464,6 +447,88 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     }
     replacement.reset();
     EXPECT_EQ(segment_manager.GetMemoryUsage().capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, ReplaceAllocatorsUpdatesMultipleSegmentsAtomically) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    const UUID client_id = generate_uuid();
+
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "replace_batch_first";
+    first.size = kSegmentSize;
+    first.base = 0x180000000;
+    first.locality = SegmentLocality{.numa_node = 1, .hca_names = {"mlx5_0"}};
+
+    Segment second;
+    second.id = generate_uuid();
+    second.name = "replace_batch_second";
+    second.size = kSegmentSize;
+    second.base = 0x190000000;
+
+    std::shared_ptr<BufferAllocatorBase> old_first;
+    std::shared_ptr<BufferAllocatorBase> old_second;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(first, SessionFor(client_id)),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(second, SessionFor(client_id)),
+                  ErrorCode::OK);
+        old_first = segment_access.GetAllocator(first.id);
+        old_second = segment_access.GetAllocator(second.id);
+    }
+    AllocatorManager old_snapshot;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        old_snapshot = access.SnapshotAllocatorManager();
+    }
+    const auto old_first_reg = old_snapshot.getAllocators(first.name)->front();
+    const auto old_second_reg =
+        old_snapshot.getAllocators(second.name)->front();
+
+    auto next_first = std::make_shared<OffsetBufferAllocator>(
+        first.name, first.base, first.size, first.te_endpoint, first.protocol);
+    auto next_second = std::make_shared<OffsetBufferAllocator>(
+        second.name, second.base, second.size, second.te_endpoint,
+        second.protocol);
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        // Duplicate target must be rejected with zero side effects on earlier
+        // entries in the batch.
+        EXPECT_FALSE(segment_access.ReplaceAllocators(
+            {{first.id, old_first, next_first},
+             {second.id, old_second, next_second},
+             {first.id, old_first, next_first}}));
+        EXPECT_EQ(segment_access.GetAllocator(first.id), old_first);
+        EXPECT_EQ(segment_access.GetAllocator(second.id), old_second);
+    }
+    EXPECT_EQ(next_first->GetLocalityHandle(), nullptr);
+    EXPECT_TRUE(old_first_reg->IsAllocatable());
+    EXPECT_TRUE(old_second_reg->IsAllocatable());
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{first.id, old_first, next_first},
+             {second.id, old_second, next_second}}));
+        EXPECT_EQ(segment_access.GetAllocator(first.id), next_first);
+        EXPECT_EQ(segment_access.GetAllocator(second.id), next_second);
+    }
+    EXPECT_NE(next_first->GetLocalityHandle(), nullptr);
+    EXPECT_FALSE(old_first_reg->IsAllocatable());
+    EXPECT_FALSE(old_second_reg->IsAllocatable());
+
+    AllocatorManager next_snapshot;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        next_snapshot = access.SnapshotAllocatorManager();
+    }
+    EXPECT_EQ(next_snapshot.getAllocators(first.name)->front()->GetAllocator(),
+              next_first);
+    EXPECT_EQ(next_snapshot.getAllocators(second.name)->front()->GetAllocator(),
+              next_second);
 }
 
 TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
@@ -843,16 +908,20 @@ TEST_F(SegmentTest, BufferLifetimeRetainsClientSessionWithoutRegistration) {
     EXPECT_TRUE(owner.expired());
 }
 
-TEST_F(SegmentTest, RestoredLifetimeAdoptsSessionWithoutLosingBufferIdentity) {
+TEST_F(SegmentTest, MountedLifetimeTracksSessionServingAndIdempotentRebind) {
     SegmentManager manager(BufferAllocatorType::OFFSET);
     Segment segment;
     segment.id = generate_uuid();
-    segment.name = "restored_session_lifetime";
+    segment.name = "mounted_session_lifetime";
     segment.base = DEFAULT_CXL_BASE;
     segment.size = 64 * 1024 * 1024;
-    segment.te_endpoint = "restored_session_endpoint";
+    segment.te_endpoint = "mounted_session_endpoint";
     const UUID owner = generate_uuid();
-    InstallRestoredSegmentForTesting(manager, segment, owner);
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, SessionFor(owner)),
+                  ErrorCode::OK);
+    }
     AllocatorManager snapshot;
     {
         auto access = manager.getAllocatorAccess();
@@ -861,12 +930,9 @@ TEST_F(SegmentTest, RestoredLifetimeAdoptsSessionWithoutLosingBufferIdentity) {
     auto registration = snapshot.getAllocators(segment.name)->front();
     auto buffer = registration->Allocate(1024);
     ASSERT_TRUE(buffer);
-    EXPECT_FALSE(buffer->getClientSession());
+    EXPECT_EQ(buffer->getClientSession(), SessionFor(owner));
     {
         auto access = manager.getSegmentAccess();
-        access.BindClientSession(SessionFor(owner));
-        EXPECT_EQ(buffer->getClientSession(), SessionFor(owner));
-        EXPECT_TRUE(access.RebindBufferToOwningSegment(*buffer));
         // Rebinding the same session must not invalidate existing buffers.
         access.BindClientSession(SessionFor(owner));
     }
@@ -895,57 +961,6 @@ TEST_F(SegmentTest, RestoredLifetimeAdoptsSessionWithoutLosingBufferIdentity) {
     EXPECT_FALSE(registration->IsAllocatable());
 }
 
-TEST_F(SegmentTest, RestoredOwnerPublicationSupportsConcurrentBufferReads) {
-    SegmentManager manager(BufferAllocatorType::OFFSET);
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "concurrent_restored_owner";
-    segment.base = DEFAULT_CXL_BASE;
-    segment.size = 64 * 1024 * 1024;
-    const UUID owner = generate_uuid();
-    auto session = SessionFor(owner);
-    InstallRestoredSegmentForTesting(manager, segment, owner);
-    AllocatorManager snapshot;
-    {
-        auto access = manager.getAllocatorAccess();
-        snapshot = access.SnapshotAllocatorManager();
-    }
-    auto registration = snapshot.getAllocators(segment.name)->front();
-    auto buffer = registration->Allocate(1024);
-    ASSERT_TRUE(buffer);
-
-    constexpr int kReaders = 4;
-    std::counting_semaphore<kReaders> started{0};
-    std::atomic<bool> bound{false};
-    std::vector<std::future<void>> readers;
-    for (int i = 0; i < kReaders; ++i) {
-        readers.push_back(std::async(std::launch::async, [&] {
-            EXPECT_FALSE(buffer->getClientSession());
-            started.release();
-            do {
-                auto observed = buffer->getClientSession();
-                EXPECT_TRUE(!observed || observed == session);
-                EXPECT_TRUE(buffer->isAllocatorValid());
-                EXPECT_TRUE(buffer->isAvailable());
-            } while (!bound.load(std::memory_order_acquire));
-            // Each reader checks the published owner after the concurrent walk.
-            EXPECT_EQ(buffer->getClientSession(), session);
-        }));
-    }
-    for (int i = 0; i < kReaders; ++i) {
-        started.acquire();
-    }
-    {
-        auto access = manager.getSegmentAccess();
-        access.BindClientSession(session);
-    }
-    bound.store(true, std::memory_order_release);
-    for (auto& reader : readers) {
-        reader.get();
-    }
-    EXPECT_EQ(buffer->getClientSession(), session);
-}
-
 TEST_F(SegmentTest, ReplacingSessionDoesNotReparentOldBuffersOrUndoDraining) {
     SegmentManager manager(BufferAllocatorType::OFFSET);
     Segment segment;
@@ -960,24 +975,29 @@ TEST_F(SegmentTest, ReplacingSessionDoesNotReparentOldBuffersOrUndoDraining) {
         ASSERT_EQ(access.MountSegment(segment, SessionFor(owner)),
                   ErrorCode::OK);
     }
-    AllocatorManager snapshot;
-    {
+    const auto snapshot_registration = [&] {
         auto access = manager.getAllocatorAccess();
-        snapshot = access.SnapshotAllocatorManager();
-    }
-    auto registration = snapshot.getAllocators(segment.name)->front();
-    auto old_buffer = registration->Allocate(1024);
+        auto snapshot = access.SnapshotAllocatorManager();
+        const auto* registrations = snapshot.getAllocators(segment.name);
+        return registrations && !registrations->empty() ? registrations->front()
+                                                        : nullptr;
+    };
+    auto old_registration = snapshot_registration();
+    ASSERT_NE(old_registration, nullptr);
+    auto old_buffer = old_registration->Allocate(1024);
     ASSERT_TRUE(old_buffer);
     auto replacement = std::make_shared<ClientLivenessRecord>(
         owner, ClientLivenessRecord::Clock::now());
     {
         auto access = manager.getSegmentAccess();
         access.BindClientSession(replacement);
-        EXPECT_FALSE(access.RebindBufferToOwningSegment(*old_buffer));
     }
     EXPECT_EQ(old_buffer->getClientSession(), SessionFor(owner));
     EXPECT_FALSE(old_buffer->isAllocatorValid());
-    auto new_buffer = registration->Allocate(1024);
+    EXPECT_FALSE(old_registration->Allocate(1024));
+    auto replacement_registration = snapshot_registration();
+    ASSERT_NE(replacement_registration, nullptr);
+    auto new_buffer = replacement_registration->Allocate(1024);
     ASSERT_TRUE(new_buffer);
     EXPECT_EQ(new_buffer->getClientSession(), replacement);
     EXPECT_TRUE(new_buffer->isAvailable());
@@ -991,8 +1011,10 @@ TEST_F(SegmentTest, ReplacingSessionDoesNotReparentOldBuffersOrUndoDraining) {
                   ErrorCode::OK);
         EXPECT_TRUE(new_buffer->isAvailable());
         access.BindClientSession(third);
+        EXPECT_FALSE(access.IsSegmentAllocatable(segment.name));
     }
-    EXPECT_FALSE(registration->Allocate(1024));
+    EXPECT_EQ(snapshot_registration(), nullptr);
+    EXPECT_FALSE(replacement_registration->Allocate(1024));
     EXPECT_FALSE(new_buffer->isAvailable());
     EXPECT_EQ(new_buffer->getClientSession(), replacement);
     {
@@ -1001,9 +1023,13 @@ TEST_F(SegmentTest, ReplacingSessionDoesNotReparentOldBuffersOrUndoDraining) {
             access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
             ErrorCode::OK);
     }
-    auto third_buffer = registration->Allocate(1024);
+    auto third_registration = snapshot_registration();
+    ASSERT_NE(third_registration, nullptr);
+    auto third_buffer = third_registration->Allocate(1024);
     ASSERT_TRUE(third_buffer);
     EXPECT_EQ(third_buffer->getClientSession(), third);
+    EXPECT_FALSE(old_registration->Allocate(1024));
+    EXPECT_FALSE(replacement_registration->Allocate(1024));
     EXPECT_FALSE(old_buffer->isAvailable());
     EXPECT_FALSE(new_buffer->isAvailable());
 }
@@ -1045,7 +1071,15 @@ TEST_F(SegmentTest, DetachedAllocationRejectsReplacedSessionLifetime) {
     blocking->resume_.release();
     ASSERT_TRUE(entered);
     EXPECT_EQ(allocation.get(), nullptr);
-    EXPECT_TRUE(registration->IsAllocatable());
+    EXPECT_FALSE(registration->IsAllocatable());
+    AllocatorManager next_snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        next_snapshot = access.SnapshotAllocatorManager();
+    }
+    auto next_registration = next_snapshot.getAllocators(segment.name)->front();
+    EXPECT_NE(next_registration, registration);
+    EXPECT_TRUE(next_registration->IsAllocatable());
 }
 
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {

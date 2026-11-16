@@ -254,6 +254,15 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
+    // Transfer workers must never perform metadata RPCs, even with metacache
+    // off.
+    std::shared_ptr<SegmentDesc> getCachedSegmentDescByID(
+        SegmentID segment_id) {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        return it == segment_id_to_desc_map_.end() ? nullptr : it->second;
+    }
+
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
     int updateSegmentDesc(const std::string &segment_name,

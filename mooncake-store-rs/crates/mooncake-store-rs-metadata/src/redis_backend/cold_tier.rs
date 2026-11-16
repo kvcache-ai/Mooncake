@@ -282,13 +282,13 @@ impl RedisMetadataBackend {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
-        let mut connection = self.connection("redis cas object route")?;
         let payload = next
             .map(|route| serde_json::to_string(route).map_err(json_error))
             .transpose()?;
         let next_version = next.map(|route| route.version.0).unwrap_or_default();
         let object_key = self.keyspace.object(key);
         let current = self.get_object_route(key)?;
+        let mut connection = self.connection("redis cas object route")?;
         let [old_device_index, old_state_index, old_owner_index] =
             self.cold_backing_index_keys(current.as_ref());
         let [new_device_index, new_state_index, new_owner_index] =
@@ -348,6 +348,7 @@ impl RedisMetadataBackend {
         Ok(CasResult {
             applied: current_payload.0 == 1,
             current,
+            delete_version: None,
             version_floor: None,
         })
     }

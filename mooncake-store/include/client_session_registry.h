@@ -84,7 +84,8 @@ class ClientSessionRegistry {
     // A missing session is provisionally created; OFFLINE rejects admission.
     // The registry must outlive these scopes.
     class Registration;
-    // Successful registration renews liveness (and recovers SUSPECTED).
+    // Successful registration renews liveness at commit time (and recovers
+    // SUSPECTED). An explicit observed_at overrides the clock for tests.
     [[nodiscard]] std::optional<Registration> BeginRegistration(
         const UUID& client_id,
         std::optional<Clock::time_point> observed_at = std::nullopt);
@@ -239,8 +240,10 @@ class ClientSessionRegistry::Registration {
     // Whether this incarnation still owes a successful remount handshake.
     // Independent of ACTIVE/SUSPECTED: a suspected session may need no remount.
     bool NeedsRemount() const;
-    // Updates immediately; empty hints preserve the previous value. The hint
-    // goes with the session, so rolling back a provisional one drops it.
+    // Stages a non-empty host hint before Commit() (or applies it directly if
+    // already committed while the scope is still held). Empty hints preserve
+    // the previous value. Rolling back a provisional scope or abandoning an
+    // uncommitted update discards the staged hint.
     void UpdateHostId(const std::string& host_id);
     // Exactly one commit, with semantics fixed by the Begin* call.
     // Destruction without Commit removes only a provisional session, not
@@ -258,7 +261,8 @@ class ClientSessionRegistry::Registration {
     std::shared_lock<std::shared_mutex> lifecycle_lock_;
     UUID client_id_;
     const RegistrationKind kind_;
-    Clock::time_point observed_at_;
+    const std::optional<Clock::time_point> observed_at_;
+    std::optional<std::string> pending_host_id_;
     Slot slot_;
     ExclusiveOperation operation_;
     bool admitted_{false};

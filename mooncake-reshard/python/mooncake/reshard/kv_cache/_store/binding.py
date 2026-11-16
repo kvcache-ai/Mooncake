@@ -18,6 +18,7 @@ from ..types import (
     require_nonempty_string,
     require_sha256,
 )
+from ._utils import validate_store_descriptor
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ def validate_store_binding(
         raise TypeError("placement must be a KVCachePlacementManifest")
     if not isinstance(limits, KVCacheTransferLimits):
         raise TypeError("limits must be KVCacheTransferLimits")
+    validate_store_descriptor(placement.descriptor)
     require_nonempty_string(operation_id, "operation_id")
     require_integer(token_start, "token_start")
     require_integer(token_count, "token_count", minimum=1)

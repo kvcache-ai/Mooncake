@@ -35,6 +35,7 @@
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_manager.h"
+#include "tent/runtime/tcp_data_plane.h"
 #include "tent/rpc/rpc.h"
 #include "tent/runtime/topology.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -124,13 +125,17 @@ struct XferDataDesc {
 };
 
 // Standard TCP RPC payload boundaries. READ retains the server's 1 GiB cap;
-// WRITE uses a 32-bit RPC attachment that includes XferDataDesc.
+// each WRITE protocol uses a 32-bit attachment that includes its own header.
 inline constexpr size_t kTcpMaxReadBytes = size_t{1} << 30;
 inline constexpr size_t kTcpMaxWriteBytes =
     std::numeric_limits<uint32_t>::max() - sizeof(XferDataDesc);
+inline constexpr size_t kTcpDataV2HeaderBytes = 5 * sizeof(uint64_t);
+inline constexpr size_t kTcpMaxWriteV2Bytes =
+    std::numeric_limits<uint32_t>::max() - kTcpDataV2HeaderBytes;
 
 inline constexpr size_t tcpMaxTransferBytes(Request::OpCode opcode) {
-    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+    // The submit planner must use the limit supported by both v1 and v2.
+    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteV2Bytes;
 }
 
 using OnReceiveBootstrap =
@@ -168,9 +173,19 @@ class ControlClient {
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
 
+    static Status sendDataV2(const std::string& server_addr,
+                             uint64_t peer_mem_addr, void* local_mem_addr,
+                             size_t length,
+                             const TcpDataPlaneIdentity& identity);
+
     static Status recvData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
+
+    static Status recvDataV2(const std::string& server_addr,
+                             uint64_t peer_mem_addr, void* local_mem_addr,
+                             size_t length,
+                             const TcpDataPlaneIdentity& identity);
 
     static Status notify(const std::string& server_addr,
                          const Notification& message);
@@ -217,6 +232,15 @@ class ControlService {
 
     SegmentManager& segmentManager() { return *manager_.get(); }
 
+    TcpBufferRegistry& tcpBufferRegistry() { return tcp_buffer_registry_; }
+    const TcpProcessIdentity& tcpProcessIdentity() const {
+        return tcp_process_identity_;
+    }
+    void setUnsafeLegacyTcpDataRpcEnabled(bool enabled) {
+        unsafe_legacy_tcp_data_rpc_enabled_.store(enabled,
+                                                  std::memory_order_release);
+    }
+
     void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback);
 
     void setBootstrapUbCallback(const OnReceiveUbBootstrap& callback) {
@@ -240,6 +264,10 @@ class ControlService {
     void onSendData(const std::string_view& request, std::string& response);
 
     void onRecvData(const std::string_view& request, std::string& response);
+
+    void onSendDataV2(const std::string_view& request, std::string& response);
+
+    void onRecvDataV2(const std::string_view& request, std::string& response);
 
     void onNotify(const std::string_view& request, std::string& response);
 
@@ -266,6 +294,9 @@ class ControlService {
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
+    TcpProcessIdentity tcp_process_identity_;
+    TcpBufferRegistry tcp_buffer_registry_;
+    std::atomic<bool> unsafe_legacy_tcp_data_rpc_enabled_{false};
 
     std::mutex bootstrap_cb_mutex_;
     std::condition_variable bootstrap_cb_cv_;

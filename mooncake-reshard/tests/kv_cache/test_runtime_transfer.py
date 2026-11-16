@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import json
-import struct
 from dataclasses import replace
 
 import pytest
@@ -55,14 +54,11 @@ def memory_binding(
     part = placement.part(participant_id)
     endpoint = endpoint or f"{participant_id}:12345"
     regions, ranges, buffers = [], [], []
+    itemsize = placement.descriptor.itemsize
     for layer in part.layer_ids:
-        for component in KVCacheComponent:
-            dim = (
-                placement.descriptor.key_head_dim
-                if component is KVCacheComponent.KEY
-                else placement.descriptor.value_head_dim
-            )
-            head_stride = dim * 2 + padding
+        for component in placement.descriptor.components:
+            dim = placement.descriptor.head_dim(component)
+            head_stride = dim * itemsize + padding
             row_stride = part.head_count * head_stride + padding
             buffer = ctypes.create_string_buffer(snapshot.token_count * row_stride)
             ctypes.memset(ctypes.addressof(buffer), 0xA5, len(buffer))
@@ -97,14 +93,14 @@ def memory_binding(
                         part.head_start, part.head_start + part.head_count
                     ):
                         for d in range(dim):
-                            struct.pack_into(
-                                "<H",
-                                buffer,
+                            offset = (
                                 slot * row_stride
                                 + (head - part.head_start) * head_stride
-                                + d * 2,
-                                content(layer, component, token, head, d),
+                                + d * itemsize
                             )
+                            buffer[offset : offset + itemsize] = content(
+                                layer, component, token, head, d
+                            ).to_bytes(itemsize, "little")
     binding = KVCacheResolvedRuntimeBinding(
         operation_id,
         placement.resource_id,
@@ -124,22 +120,18 @@ def memory_binding(
 def assert_content(placement, binding):
     regions = {r.region_id: r for r in binding.regions}
     touched = set()
+    itemsize = placement.descriptor.itemsize
     for item in binding.ranges:
-        dim = (
-            placement.descriptor.key_head_dim
-            if item.component is KVCacheComponent.KEY
-            else placement.descriptor.value_head_dim
-        )
+        dim = placement.descriptor.head_dim(item.component)
         for token in range(item.token_start, item.token_end):
             for head in range(item.head_start, item.head_end):
                 address = item.address(regions[item.region_id], token, head)
                 for d in range(dim):
-                    assert ctypes.c_uint16.from_address(
-                        address + d * 2
-                    ).value == content(
+                    start = address + d * itemsize
+                    assert ctypes.string_at(start, itemsize) == content(
                         item.global_layer_id, item.component, token, head, d
-                    )
-                    touched.update((address + d * 2, address + d * 2 + 1))
+                    ).to_bytes(itemsize, "little")
+                    touched.update(range(start, start + itemsize))
     for region in binding.regions:
         for address in range(region.address, region.address + region.nbytes):
             if address not in touched:
@@ -520,6 +512,45 @@ def test_local_registration_and_operation_reuse(small_operation):
         executor.execute(changed, b.participant_id)
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_released_owner_cannot_validate_or_execute(small_operation, cached):
+    plan, _keepalive = small_operation
+    binding = plan.source_bindings[0]
+    peer_plan = replace(
+        plan,
+        operation_id="peer-operation",
+        source_bindings=tuple(
+            replace(b, operation_id="peer-operation") for b in plan.source_bindings
+        ),
+        target_bindings=tuple(
+            replace(b, operation_id="peer-operation") for b in plan.target_bindings
+        ),
+    )
+    peer = peer_plan.source_bindings[0]
+    engine = MemoryEngine()
+    executor = KVCacheTransferEngineExecutor(
+        engine, instance_id=binding.instance_id, endpoint=binding.regions[0].endpoint
+    )
+    for region in binding.regions:
+        executor.register_region(region, owner_id=binding.digest)
+        executor.register_region(region, owner_id=peer.digest)
+    if cached:
+        assert all(r.success for r in executor.execute(plan, binding.participant_id))
+    for region in binding.regions:
+        executor.unregister_region(region.region_id, owner_id=binding.digest)
+    calls = len(engine.calls)
+    with pytest.raises(ValueError, match="owner claim"):
+        executor.validate_local_binding(binding)
+    with pytest.raises(ValueError, match="owner claim"):
+        executor.execute(plan, binding.participant_id)
+    assert len(engine.calls) == calls
+    executor.validate_local_binding(peer)
+    assert all(r.success for r in executor.execute(peer_plan, peer.participant_id))
+    assert len(engine.calls) > calls
+    for region in peer.regions:
+        executor.unregister_region(region.region_id, owner_id=peer.digest)
+
+
 @pytest.mark.parametrize("operation", ["register", "unregister"])
 @pytest.mark.parametrize("failure", [-7, False, RuntimeError, KeyboardInterrupt])
 def test_registration_failure_blocks_further_operations(
@@ -726,11 +757,11 @@ def test_adjacent_registered_regions_must_not_be_coalesced():
                 ctypes.addressof(allocation) + index * 320,
                 320,
             )
-            for index, component in enumerate(KVCacheComponent)
+            for index, component in enumerate(placement.descriptor.components)
         )
         ranges = tuple(
             KVCacheResolvedRange(0, component, 0, 5, 0, 4, component.value, 0, 64, 16)
-            for component in KVCacheComponent
+            for component in placement.descriptor.components
         )
         bindings.append(
             KVCacheResolvedRuntimeBinding(

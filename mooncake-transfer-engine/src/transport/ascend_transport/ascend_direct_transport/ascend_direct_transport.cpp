@@ -131,17 +131,11 @@ int AscendDirectTransport::install(std::string& local_server_name,
             << ret;
         return ret;
     }
-    ret = metadata_->updateLocalSegmentDesc();
-    if (ret) {
-        LOG(ERROR) << "cannot publish segments, "
-                      "check the availability of metadata storage, ret: "
-                   << ret;
-        return ret;
-    }
-
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
+    exec_params.local_engine_device_ids = local_engine_device_ids_;
+    exec_params.base_port = base_port_;
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
@@ -152,6 +146,13 @@ int AscendDirectTransport::install(std::string& local_server_name,
         LOG(ERROR)
             << "AscendDirectTransport: TransferExecutor init failed, ret: "
             << ret;
+        return ret;
+    }
+    ret = metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        LOG(ERROR) << "cannot publish segments, "
+                      "check the availability of metadata storage, ret: "
+                   << ret;
         return ret;
     }
 

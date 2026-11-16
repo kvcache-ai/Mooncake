@@ -1,6 +1,19 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_executable(task_congestion_observation_test
+                 ${WORKSPACE}/task_congestion_observation_test.cpp)
+  target_include_directories(
+    task_congestion_observation_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control
+      ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(
+    task_congestion_observation_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME task_congestion_observation_test
+           COMMAND task_congestion_observation_test)
+
   add_executable(adaptive_congestion_control_test
                  ${WORKSPACE}/adaptive_congestion_control_test.cpp)
   target_link_libraries(
@@ -91,6 +104,16 @@ add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
 target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
                                                   gtest_main)
 add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
+
+add_executable(task_congestion_c_abi_test
+               ${CMAKE_CURRENT_SOURCE_DIR}/task_congestion_c_abi_test.c)
+target_include_directories(
+  task_congestion_c_abi_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+          ${CMAKE_BINARY_DIR}/mooncake-transfer-engine/include)
+target_link_libraries(task_congestion_c_abi_test PRIVATE transfer_engine)
+set_target_properties(task_congestion_c_abi_test PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME task_congestion_c_abi_test COMMAND task_congestion_c_abi_test)
 
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
@@ -218,6 +241,16 @@ target_link_libraries(rdma_native_notify_test PUBLIC transfer_engine gtest
 add_test(NAME rdma_native_notify_test COMMAND rdma_native_notify_test)
 set_tests_properties(rdma_native_notify_test PROPERTIES LABELS "rdma" TIMEOUT
                                                         120)
+
+# Real CQ completions through the eventfd. Self-skips without an RDMA device
+# or when MC_SLICE_TIMEOUT disables the notification path.
+add_executable(rdma_completion_fd_test
+               ${WORKSPACE}/rdma_completion_fd_test.cpp)
+target_link_libraries(rdma_completion_fd_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_completion_fd_test COMMAND rdma_completion_fd_test)
+set_tests_properties(rdma_completion_fd_test PROPERTIES LABELS "rdma" TIMEOUT
+                                                       120)
 
 # CtrlChannel RDMA notify correctness. Self-skips without RDMA.
 add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
@@ -398,6 +431,18 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
+
+  add_executable(hip_stream_pool_test ${WORKSPACE}/hip_stream_pool_test.cpp)
+  target_link_libraries(hip_stream_pool_test PUBLIC transfer_engine gtest
+                                                    gtest_main)
+  foreach(priority default high invalid)
+    add_test(NAME hip_stream_pool_${priority}_test
+             COMMAND ${CMAKE_COMMAND} -E env MC_HIP_STREAM_PRIORITY=${priority}
+                     $<TARGET_FILE:hip_stream_pool_test>)
+  endforeach()
+  add_test(NAME hip_stream_pool_unset_test
+           COMMAND ${CMAKE_COMMAND} -E env --unset=MC_HIP_STREAM_PRIORITY
+                   $<TARGET_FILE:hip_stream_pool_test>)
 endif()
 
 if(USE_UBSHMEM)

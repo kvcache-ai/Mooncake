@@ -13,6 +13,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "common.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -528,12 +529,13 @@ class RangedReadSnapshotPy {
    public:
     RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
                          std::vector<std::string> keys)
-        : store_(std::move(store)), keys_(std::move(keys)) {
-        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+        : store_(store), keys_(std::move(keys)) {
+        snapshot_ = store->prepare_get_into_ranges_snapshot(keys_);
     }
 
     bool belongs_to(const std::shared_ptr<PyClient> &store) const {
-        return store_.get() == store.get();
+        const auto owner = store_.lock();
+        return owner && owner.get() == store.get();
     }
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
@@ -543,16 +545,28 @@ class RangedReadSnapshotPy {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (snapshot_.should_refresh()) {
-            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        // A snapshot must not keep a closed Store and its segments alive;
+        // reject use after close instead of reading through a torn-down
+        // client.
+        auto store = store_.lock();
+        if (!store) {
+            throw std::runtime_error(
+                "RangedReadSnapshot is no longer usable: the Store was "
+                "closed");
         }
-        return store_->get_into_ranges_from_snapshot(
+        if (snapshot_.should_refresh()) {
+            store->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store->get_into_ranges_from_snapshot(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
             snapshot_);
     }
 
    private:
-    std::shared_ptr<PyClient> store_;
+    // Weak by design: an idle snapshot must not extend the native client's
+    // lifetime beyond close(), otherwise its segments stay published and a
+    // later reader can observe a stale MEMORY replica (issue #5464).
+    std::weak_ptr<PyClient> store_;
     std::vector<std::string> keys_;
     PyClient::RangedReadSnapshot snapshot_;
     std::mutex mutex_;
@@ -3562,7 +3576,15 @@ PYBIND11_MODULE(_store, m) {
                              << ". Valid range: 0-" << max_node;
             }
 
-            if (numa_run_on_node(node) != 0) {
+            int rc;
+            {
+                // numa_run_on_node() fills libnuma's per-node cpumask cache
+                // on first use; see numaNodeCpuCacheMutex().
+                std::lock_guard<std::mutex> guard(
+                    mooncake::numaNodeCpuCacheMutex());
+                rc = numa_run_on_node(node);
+            }
+            if (rc != 0) {
                 LOG(WARNING) << "numa_run_on_node failed for node " << node;
             }
 

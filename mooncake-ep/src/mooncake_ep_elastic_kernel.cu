@@ -95,8 +95,10 @@ inline int combine_epilogue_smem_bytes(int hidden, int num_warps) {
     return num_warps * static_cast<int>(token_layout.get_num_bytes<false>());
 }
 
-inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
-    device::CommCtx comm_ctx{};
+inline elastic::transport::IbgdaOps::Context make_comm_ctx(
+    const ElasticLaunchContext& ctx) {
+    elastic::transport::IbgdaOps::Context result{};
+    auto& comm_ctx = result.comm;
     comm_ctx.rank = ctx.rank;
     comm_ctx.p2p.available = ctx.nvlink_available;
     comm_ctx.p2p.peer_ptrs = ctx.ipc_peer_ptrs;
@@ -107,7 +109,9 @@ inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
     comm_ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(ctx.rkeys);
     comm_ctx.ibgda.local_atomic_base = ctx.rdma_send_signal_buffer;
     comm_ctx.ibgda.remote_atomic_base = ctx.rdma_recv_signal_buffer;
-    return comm_ctx;
+    result.logical_to_transport_slots = ctx.logical_to_transport_slots;
+    result.qps_per_rank = ctx.qps_per_rank;
+    return result;
 }
 
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -138,7 +142,8 @@ __global__ void musa_elastic_prepare_init_kernel(void* workspace,
 }
 
 __global__ void musa_elastic_prepare_clear_barrier_kernel(
-    device::CommCtx comm_ctx, void* workspace, int rank_idx,
+    elastic::transport::IbgdaOps::Context comm_ctx, void* workspace,
+    int rank_idx,
     int num_scaleup_ranks, int num_experts, int64_t timeout_cycles) {
     const auto layout = elastic::layout::WorkspaceLayout(
         workspace, 1, num_scaleup_ranks, num_experts);
@@ -224,7 +229,8 @@ __global__ void musa_elastic_assign_slots_kernel(
 }
 
 __global__ void musa_elastic_publish_counts_kernel(
-    device::CommCtx comm_ctx, void* workspace, int rank_idx,
+    elastic::transport::IbgdaOps::Context comm_ctx, void* workspace,
+    int rank_idx,
     int num_scaleup_ranks, int num_experts) {
     const auto layout = elastic::layout::WorkspaceLayout(
         workspace, 1, num_scaleup_ranks, num_experts);
@@ -333,7 +339,8 @@ void launch_musa_elastic_prepare_dispatch(
     const int64_t* topk_idx, int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert, int* dst_buffer_slot_idx,
     int num_tokens, int num_max_tokens_per_rank, int num_experts, int num_topk,
-    int expert_alignment, const device::CommCtx& comm_ctx,
+    int expert_alignment,
+    const elastic::transport::IbgdaOps::Context& comm_ctx,
     const ElasticLaunchContext& ctx, cudaStream_t stream) {
     constexpr int kThreads = 256;
     const int blocks = std::max(1, std::min(128, ceil_div(num_tokens, kThreads)));

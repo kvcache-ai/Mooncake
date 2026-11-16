@@ -139,12 +139,10 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Bind restored segment resources to their owner session.
-     *        Segment snapshots intentionally do not persist session state.
+     * @brief Bind all segments of the owner's client ID to `owner_session`.
      */
     void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
-    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments

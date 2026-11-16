@@ -33,68 +33,37 @@ bool IsValidAllocation(const LiveAllocation& allocation,
 }  // namespace
 
 struct SegmentLifetime::State {
-    explicit State(ClientSessionSharedPtr owner)
-        : session(std::move(owner)), session_bound(session != nullptr) {}
+    explicit State(ClientSessionSharedPtr owner) : session(std::move(owner)) {}
 
     std::atomic<bool> valid{true};
-    // The owning pointer is written at construction, or once when restoring an
-    // initially unbound segment. Publishing session_bound releases that write;
-    // readers acquire it before accessing session, which never changes again.
-    // State itself retains the owner, so serving checks need neither an atomic
-    // shared_ptr load nor a reference-count increment.
-    ClientSessionSharedPtr session;
-    std::atomic<bool> session_bound;
+    // Retained directly by State and immutable from construction, so serving
+    // and affiliation checks need neither an atomic shared_ptr load nor a
+    // reference-count increment.
+    const ClientSessionSharedPtr session;
 };
 
 SegmentLifetime::SegmentLifetime(ClientSessionSharedPtr session)
     : state_(std::make_shared<State>(std::move(session))) {}
 
-SegmentLifetime::SegmentLifetime(std::shared_ptr<State> state)
-    : state_(std::move(state)) {}
-
-bool SegmentLifetime::isValid() const {
-    return state_->valid.load(std::memory_order_acquire);
+bool SegmentLifetime::isValid() const noexcept {
+    return !state_ || state_->valid.load(std::memory_order_acquire);
 }
 
-bool SegmentLifetime::isServing() const {
+bool SegmentLifetime::isServing() const noexcept {
     return isValid() &&
-           (!state_->session_bound.load(std::memory_order_acquire) ||
-            state_->session->IsServing());
+           (!state_ || !state_->session || state_->session->IsServing());
 }
 
-ClientSessionSharedPtr SegmentLifetime::getClientSession() const {
-    return state_->session_bound.load(std::memory_order_acquire)
-               ? state_->session
-               : nullptr;
+const ClientSessionSharedPtr& SegmentLifetime::getClientSession()
+    const noexcept {
+    static const ClientSessionSharedPtr kNoSession;
+    return state_ ? state_->session : kNoSession;
 }
 
-bool SegmentLifetime::operator==(const SegmentLifetime& other) const {
-    return state_ == other.state_;
-}
-
-void SegmentLifetime::BindSession(ClientSessionSharedPtr session) {
-    CHECK(session);
-    const auto previous = getClientSession();
-    if (previous == session) {
-        return;
+void SegmentLifetime::Invalidate() noexcept {
+    if (state_) {
+        state_->valid.store(false, std::memory_order_release);
     }
-    if (!previous) {
-        // Deserialization binds buffers before rebuilding client sessions.
-        // Keep segment identity so those buffers acquire the restored owner.
-        state_->session = std::move(session);
-        state_->session_bound.store(true, std::memory_order_release);
-        return;
-    }
-    auto next = std::make_shared<State>(std::move(session));
-    next->valid.store(isValid(), std::memory_order_relaxed);
-    // Old buffers retain the old session and become invalid; they must not
-    // silently migrate to a new client incarnation with the same UUID.
-    Invalidate();
-    state_ = std::move(next);
-}
-
-void SegmentLifetime::Invalidate() {
-    state_->valid.store(false, std::memory_order_release);
 }
 
 void BufferAllocatorBase::AttachUsageTracker(

@@ -103,6 +103,9 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
     bool force_tcp{false};
+    bool force_fabric{false};
+    std::optional<std::string> fabric_provider;
+    std::optional<std::vector<std::string>> fabric_devices;
     std::optional<std::vector<std::string>> rdma_whitelist;
     // Classic TE shim writes these nested leaves before construct(). Keep
     // them on the existing identity whitelist instead of growing Config.
@@ -232,6 +235,11 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     preserved.rpc_server_hostname = captureExplicitConfigValue(
         config, "rpc_server_hostname", std::string());
     preserved.force_tcp = config.get("transports/force_tcp", false);
+    preserved.force_fabric = config.get("transports/force_fabric", false);
+    preserved.fabric_provider = captureExplicitConfigValue(
+        config, "transports/fabric/provider", std::string());
+    preserved.fabric_devices = captureExplicitConfigValue(
+        config, "transports/fabric/devices", std::vector<std::string>());
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
     preserved.rdma_whitelist = captureExplicitConfigValue(
@@ -268,6 +276,16 @@ void restoreExplicitTransferEngineConfig(
     restoreExplicitConfigValue(config, "rpc_server_port",
                                preserved.rpc_server_port);
     if (preserved.force_tcp) {
+        ConfigHelper::forceTcp(config);
+    }
+    if (preserved.force_fabric) {
+        const std::string provider = preserved.fabric_provider.value_or(
+            config.get("transports/fabric/provider", std::string("auto")));
+        ConfigHelper::forceFabric(config, provider);
+        restoreExplicitConfigValue(config, "transports/fabric/devices",
+                                   preserved.fabric_devices);
+    }
+    if (std::getenv("MC_FORCE_TCP")) {
         ConfigHelper::forceTcp(config);
     }
     restoreExplicitConfigValue(config, "topology/rdma_whitelist",
@@ -475,6 +493,16 @@ Status TransferEngineImpl::construct() {
     }
 
     CHECK_STATUS(loadTransports());
+    const bool fabric_required = conf_->get("transports/force_fabric", false);
+    if (fabric_required && !transport_list_[FABRIC]) {
+        const Status cleanup = deconstruct();
+        if (!cleanup.ok()) {
+            LOG(ERROR) << "Failed to unwind TENT without required Fabric: "
+                       << cleanup.ToString();
+        }
+        return Status::NotImplemented(
+            "Required Fabric transport is not built or enabled" LOC_MARK);
+    }
 
     // A notification that arrives over the control plane - the RPC fallback
     // in sendNotification(), or a peer whose only notification path is RPC -
@@ -496,20 +524,24 @@ Status TransferEngineImpl::construct() {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
-                if (hp_tcp_transport_config_.enabled &&
-                    transport_index ==
-                        static_cast<size_t>(TransportType::HP_TCP)) {
-                    // HP TCP is explicitly required, so a failed install is a
-                    // construction failure rather than an optional-transport
-                    // skip. Unwind the already-started control service and
-                    // any preceding transports immediately; the destructor's
-                    // later deconstruct() call is intentionally idempotent.
+                const bool required =
+                    (hp_tcp_transport_config_.enabled &&
+                     transport_index ==
+                         static_cast<size_t>(TransportType::HP_TCP)) ||
+                    (fabric_required &&
+                     transport_index ==
+                         static_cast<size_t>(TransportType::FABRIC));
+                if (required) {
+                    // Unwind the already-started control service and any
+                    // preceding transports immediately; the destructor's later
+                    // deconstruct() call is intentionally idempotent.
+                    const std::string transport_name = transport->getName();
                     const Status cleanup = deconstruct();
                     if (!cleanup.ok()) {
                         LOG(ERROR)
-                            << "Failed to unwind TENT after required HP TCP "
-                               "install failure: "
-                            << cleanup.ToString();
+                            << "Failed to unwind TENT after required "
+                            << transport_name
+                            << " install failure: " << cleanup.ToString();
                     }
                     return status;
                 }
@@ -873,6 +905,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
+    if (options.type < 0 || options.type >= kSupportedTransportTypes)
+        return Status::InvalidArgument("Invalid memory transport" LOC_MARK);
     auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
@@ -1071,7 +1105,21 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
                  transports.front() == HP_TCP);
+            const bool fabric_required =
+                options.type == FABRIC ||
+                (options.type == UNSPEC &&
+                 conf_->get("transports/force_fabric", false));
             std::vector<TransportType> registered_transports;
+            auto rollbackRegisteredTransports = [&] {
+                for (auto registered : registered_transports) {
+                    for (auto& desc : descs) {
+                        auto cleanup =
+                            transport_list_[registered]->removeMemoryBuffer(
+                                desc);
+                        if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
+                    }
+                }
+            };
             Status first_error = Status::OK();
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
@@ -1087,6 +1135,10 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     }
                     if (first_error.ok()) first_error = s;
                     if (type == HP_TCP && hp_tcp_required) return s;
+                    if (type == FABRIC && fabric_required) {
+                        rollbackRegisteredTransports();
+                        return s;
+                    }
                     LOG(WARNING) << s.ToString();
                     // Explicit transport registration is strict. UNSPEC keeps
                     // the long-standing best-effort behavior across several
@@ -1099,6 +1151,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             }
             if (registered_transports.empty() && !first_error.ok()) {
                 return first_error;
+            }
+            if (fabric_required) {
+                for (const auto& desc : descs) {
+                    if (transport_list_[FABRIC]->tracksLocalBuffer(desc)) {
+                        continue;
+                    }
+                    rollbackRegisteredTransports();
+                    return Status::InternalError(
+                        "Required Fabric transport did not register "
+                        "memory" LOC_MARK);
+                }
             }
             // desc.transports lists the transports that actually registered
             // the buffer (each transport appends itself on success).
@@ -1701,7 +1764,8 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
 
     // Legacy mode: use original logic (before TransportSelector)
     if (transport_selector_ && transport_selector_->isLegacyMode() &&
-        !transport_selector_->isForceTcp()) {
+        !transport_selector_->isForceTcp() &&
+        !transport_selector_->isForceFabric()) {
         SelectionResult result;
         std::vector<TransportType> raw;
         if (desc->type == SegmentType::File) {
@@ -2802,6 +2866,26 @@ Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {
     return Status::OK();
 }
 
+Status TransferEngineImpl::cancelQueuedOwners(BatchID batch_id) {
+    if (!runtime_queue_config_.enabled) return Status::OK();
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!isBatchAlive(batch_id)) {
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    }
+    auto* batch = reinterpret_cast<Batch*>(batch_id);
+    // Submitted owners are already on a transport; the caller cancels those
+    // through the transport and they release their window slot when polled.
+    std::vector<QueueOwnerId> owner_ids;
+    for (const auto& entry : queued_owners_) {
+        if (entry.second.batch == batch && !entry.second.in_dispatch_window)
+            owner_ids.push_back(entry.first);
+    }
+    for (const auto owner_id : owner_ids) {
+        CHECK_STATUS(cancelQueuedOwner(owner_id));
+    }
+    return Status::OK();
+}
+
 Status TransferEngineImpl::detachQueuedOwnersOfBatch(
     Batch* batch, TransferStatusEnum terminal_status) {
     std::vector<QueueOwnerId> owner_ids;
@@ -3878,43 +3962,70 @@ class BatchGuard {
 };
 }  // namespace
 
-Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
-    BatchGuard batch_guard(*this, batch_id);
-    TransferStatus xfer_status;
-    for (uint64_t poll_count = 0;; ++poll_count) {
-        CHECK_STATUS(progressBatch(batch_id, xfer_status));
-        if (xfer_status.s != PENDING) {
-            // Deliberately dropping the free status, as the pre-existing code
-            // did: callers of this path get the transfer outcome, not the
-            // cleanup outcome. transferSync() propagates it instead.
-            (void)batch_guard.reset();
-            return xfer_status.s == COMPLETED
-                       ? Status::OK()
-                       : Status::InternalError(
-                             "Transfer failed: " +
-                             std::to_string((int)xfer_status.s));
-        }
-        waitBeforeNextPoll(poll_count);
-    }
-}
-
-Status TransferEngineImpl::transferSync(
+Status TransferEngineImpl::submitAndWaitTransfer(
     const std::vector<Request>& request_list) {
     auto batch_id = allocateBatch(request_list.size());
+    if (!batch_id)
+        return Status::TooManyRequests(
+            "No free batch slot for a synchronous transfer" LOC_MARK);
     BatchGuard batch_guard(*this, batch_id);
     CHECK_STATUS(submitTransfer(batch_id, request_list));
-    for (uint64_t poll_count = 0;; ++poll_count) {
-        TransferStatus xfer_status;
-        CHECK_STATUS(progressBatch(batch_id, xfer_status));
-        if (xfer_status.s == COMPLETED) break;
-        if (xfer_status.s != PENDING) {
-            CHECK_STATUS(batch_guard.reset());
-            return Status::InternalError(
-                "Transfer via stage buffer failed" LOC_MARK);
-        }
-        waitBeforeNextPoll(poll_count);
-    }
+    CHECK_STATUS(waitTransfer(batch_id));
     return batch_guard.reset();
+}
+
+Status TransferEngineImpl::waitTransfer(
+    BatchID batch_id, std::vector<TransferStatus>* status_list,
+    uint64_t timeout_ms) {
+    // A deadline beyond a year is treated as unbounded: converting a larger
+    // unsigned value to the clock duration overflows.
+    constexpr auto kMaxTimeout =
+        std::chrono::milliseconds(std::chrono::hours(24 * 365));
+    const auto deadline =
+        timeout_ms > static_cast<uint64_t>(kMaxTimeout.count())
+            ? std::chrono::steady_clock::time_point::max()
+            : std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
+    const auto timed_out = [&] {
+        return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
+    };
+
+    TransferStatus overall_status{};
+    for (uint64_t poll_count = 0;; ++poll_count) {
+        CHECK_STATUS(progressBatch(batch_id, overall_status));
+        if (overall_status.s != PENDING) break;
+        if (!timed_out()) {
+            waitBeforeNextPoll(poll_count);
+            continue;
+        }
+
+        // Stop admitting more of this batch before looking at its tasks:
+        // polling below frees dispatch window slots, and a refill would start
+        // another owner of a batch that is being torn down.
+        CHECK_STATUS(cancelQueuedOwners(batch_id));
+        std::vector<TransferStatus> task_status;
+        CHECK_STATUS(getTransferStatus(batch_id, task_status));
+        for (size_t task_id = 0; task_id < task_status.size(); ++task_id)
+            if (task_status[task_id].s == PENDING)
+                (void)cancelTransfer(batch_id, task_id);
+        CHECK_STATUS(refillDispatchWindow());
+        if (!status_list)
+            return Status::TimedOut("waitTransfer timed out" LOC_MARK);
+        return getTransferStatus(batch_id, *status_list);
+    }
+
+    if (status_list) return getTransferStatus(batch_id, *status_list);
+    return overall_status.s == COMPLETED
+               ? Status::OK()
+               : Status::InternalError(
+                     "Transfer via stage buffer failed" LOC_MARK);
+}
+
+Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
+    BatchGuard batch_guard(*this, batch_id);
+    auto status = waitTransfer(batch_id);
+    (void)batch_guard.reset();
+    return status;
 }
 
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {

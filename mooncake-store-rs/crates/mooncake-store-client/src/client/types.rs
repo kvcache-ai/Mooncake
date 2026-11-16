@@ -81,6 +81,42 @@ pub struct BandwidthShaping {
     pub max_inflight_bytes_per_batch: Option<u64>,
 }
 
+/// Bounds owner-local publications that still need exact route confirmation.
+///
+/// The limit is enforced by the allocation owner before a remote reserve takes
+/// physical memory. It only applies while asynchronous publication tracking is
+/// unhealthy; normal finalized writes do not accumulate in this ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationLifecycleConfig {
+    pub max_pending_publications: usize,
+    pub max_pending_publication_bytes: u64,
+}
+
+impl Default for AllocationLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_publications: 8192,
+            max_pending_publication_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl AllocationLifecycleConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn max_pending_publications(mut self, max_pending_publications: usize) -> Self {
+        self.max_pending_publications = max_pending_publications.max(1);
+        self
+    }
+
+    pub fn max_pending_publication_bytes(mut self, max_pending_publication_bytes: u64) -> Self {
+        self.max_pending_publication_bytes = max_pending_publication_bytes.max(1);
+        self
+    }
+}
+
 impl BandwidthShaping {
     pub fn new() -> Self {
         Self {

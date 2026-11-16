@@ -239,6 +239,15 @@ bool peerAnswered(coro_rpc::errc ec) {
     }
 }
 
+bool rpcFunctionWasNotFound(coro_rpc::errc ec, std::string_view message,
+                            int func_id) {
+    if (ec == coro_rpc::errc::function_not_registered) return true;
+    if (ec != coro_rpc::errc::rpc_throw_exception) return false;
+    const std::string expected =
+        "Unknown TENT RPC function: " + std::to_string(func_id);
+    return message.find(expected) != std::string_view::npos;
+}
+
 }  // namespace
 
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
@@ -288,10 +297,15 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             if (from_pool && !peerAnswered(call_result.error().code)) {
                 pool->clearIfCurrent(generation);
             }
+            const auto& error = call_result.error();
             auto msg = "Failed to call RPC function. server: " + server_addr +
                        ", func_id: " + std::to_string(func_id) +
-                       ", message: " + std::string{call_result.error().msg};
+                       ", message: " + std::string{error.msg};
             if (attempt + 1 < max_attempts) continue;
+            if (rpcFunctionWasNotFound(error.code, error.msg, func_id)) {
+                co_return std::make_pair(
+                    Status::RpcFunctionNotFound(msg + LOC_MARK), "");
+            }
             co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
                                      "");
         }

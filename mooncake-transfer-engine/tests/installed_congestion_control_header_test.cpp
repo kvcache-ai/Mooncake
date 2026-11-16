@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <transfer_engine.h>
+#include <transfer_engine_c.h>
 
 #if defined(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL) != \
     MC_EXPECT_ADAPTIVE_CONTROL
@@ -24,6 +25,15 @@ struct SliceCacheConsumer : mooncake::Transport {
 };
 
 int main() {
+    mooncake::TransferEngine engine(false);
+    mooncake::TaskCongestionState state;
+    mooncake::TaskCongestionDetail detail;
+    if (!engine.getTaskCongestionState(0, 0, state).IsInvalidArgument())
+        return 1;
+    if (!engine.getTaskCongestionDetail(0, 0, detail).IsInvalidArgument())
+        return 2;
+    int c_state = TASK_CONGESTION_UNKNOWN;
+    if (getTaskCongestionState(nullptr, 0, 0, &c_state) == 0) return 3;
     auto &cache = SliceCacheConsumer::getSliceCache();
     auto *slice = cache.allocate();
     slice->length = 64;

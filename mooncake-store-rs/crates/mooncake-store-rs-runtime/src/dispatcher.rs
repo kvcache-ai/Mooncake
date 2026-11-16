@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,6 @@ use crate::shm::{DummyClientId, OwnedMappedRegion};
 
 type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
-type TrackedKey = (String, String);
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,10 +139,6 @@ fn apply_scope_to_multi_buffer_get_request<'a>(
     request
 }
 
-pub(crate) struct DispatcherState {
-    tracked_keys: BTreeSet<TrackedKey>,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct HeartbeatHealthState {
     consecutive_failures: u64,
@@ -171,7 +166,6 @@ pub struct StoreDispatcher {
     client: Arc<StoreClient>,
     health: Arc<HealthChannel>,
     regions: Arc<Mutex<RegionMap>>,
-    state: Arc<Mutex<DispatcherState>>,
     closed: Arc<AtomicBool>,
     health_inflight: Arc<AtomicBool>,
     heartbeat_loop: Arc<Mutex<Option<HeartbeatLoopHandle>>>,
@@ -292,9 +286,6 @@ impl StoreDispatcher {
             client,
             health,
             regions: Arc::new(Mutex::new(BTreeMap::new())),
-            state: Arc::new(Mutex::new(DispatcherState {
-                tracked_keys: BTreeSet::new(),
-            })),
             closed: Arc::new(AtomicBool::new(false)),
             health_inflight: Arc::new(AtomicBool::new(false)),
             heartbeat_loop: Arc::new(Mutex::new(None)),
@@ -789,19 +780,6 @@ impl StoreDispatcher {
         );
     }
 
-    pub fn untrack_key(&self, key: &str, tenant: Option<&str>) {
-        let scope = self.object_scope(tenant.map(str::to_string));
-        untrack_key(&self.state, &scope.tenant, key);
-    }
-
-    pub fn untrack_keys(&self, keys: &[String], tenant: Option<&str>) {
-        let tenant = self.object_scope(tenant.map(str::to_string)).tenant;
-        let mut state = self.state.lock();
-        for key in keys {
-            state.tracked_keys.remove(&(tenant.clone(), key.clone()));
-        }
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn hot_cache_contains_for_test(&self, tenant: &str, key: &str) -> bool {
         let scope = self.object_scope(Some(tenant.to_string()));
@@ -821,9 +799,8 @@ impl StoreDispatcher {
     }
 
     pub async fn put(&self, request: pb::PutRequest) -> Result<i32, StoreError> {
-        let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
-        self.run_async(move |client| Ok(execute_put(client, hot_cache.as_ref(), &state, request)))
+        self.run_async(move |client| Ok(execute_put(client, hot_cache.as_ref(), request)))
             .await
     }
 
@@ -846,14 +823,12 @@ impl StoreDispatcher {
         request: pb::BatchPutFromRequest,
     ) -> Result<Vec<i32>, StoreError> {
         let regions = self.regions.clone();
-        let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
         self.run_async(move |client| {
             Ok(execute_batch_put_from(
                 client,
                 hot_cache.as_ref(),
                 &regions,
-                &state,
                 request,
             ))
         })
@@ -865,14 +840,12 @@ impl StoreDispatcher {
         request: pb::BatchPutFromMultiBuffersRequest,
     ) -> Result<Vec<i32>, StoreError> {
         let regions = self.regions.clone();
-        let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
         self.run_async(move |client| {
             Ok(execute_batch_put_from_multi_buffers(
                 client,
                 hot_cache.as_ref(),
                 &regions,
-                &state,
                 request,
             ))
         })
@@ -923,43 +896,27 @@ impl StoreDispatcher {
     }
 
     pub async fn remove(&self, request: pb::RemoveRequest) -> Result<i32, StoreError> {
-        let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
-        self.run_async(move |client| {
-            Ok(execute_remove(client, hot_cache.as_ref(), &state, request))
-        })
-        .await
+        self.run_async(move |client| Ok(execute_remove(client, hot_cache.as_ref(), request)))
+            .await
     }
 
     pub async fn batch_remove(
         &self,
         request: pb::BatchRemoveRequest,
     ) -> Result<Vec<i32>, StoreError> {
-        let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
-        self.run_async(move |client| {
-            Ok(execute_batch_remove(
-                client,
-                hot_cache.as_ref(),
-                &state,
-                request,
-            ))
-        })
-        .await
+        self.run_async(move |client| Ok(execute_batch_remove(client, hot_cache.as_ref(), request)))
+            .await
     }
 
     pub async fn remove_all(&self, force: bool) -> Result<(i32, i64), StoreError> {
-        let state = self.state.clone();
-        let hot_cache = self.hot_cache.clone();
-        self.run_async(move |client| {
-            Ok(execute_remove_all(
-                client,
-                hot_cache.as_ref(),
-                &state,
-                force,
-            ))
-        })
-        .await
+        self.run_async(move |client| execute_remove_all(client, force))
+            .await
+    }
+
+    pub fn remove_all_blocking(&self, force: bool) -> Result<(i32, i64), StoreError> {
+        self.run(move |client| execute_remove_all(client, force))
     }
 
     pub fn shutdown(&self) {
@@ -1168,7 +1125,6 @@ impl Drop for StoreDispatcher {
 fn execute_put(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    state: &Arc<Mutex<DispatcherState>>,
     request: pb::PutRequest,
 ) -> i32 {
     let tenant = normalized_tenant(client, &request.tenant);
@@ -1180,7 +1136,6 @@ fn execute_put(
         None => client.put_in_tenant(&tenant, &request.key, &request.value),
     };
     if result.is_ok() {
-        track_key(state, tenant.clone(), request.key.clone());
         invalidate_hot_cache(hot_cache, &tenant, &request.key);
         0
     } else {
@@ -1354,7 +1309,6 @@ fn execute_batch_put_from(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
     regions: &Arc<Mutex<RegionMap>>,
-    state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchPutFromRequest,
 ) -> Vec<i32> {
     let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
@@ -1395,7 +1349,6 @@ fn execute_batch_put_from(
             None => -1,
         };
         if status == 0 {
-            track_key(state, tenant.clone(), item.key.clone());
             invalidate_hot_cache(hot_cache, &tenant, &item.key);
         }
         statuses.push(status);
@@ -1407,7 +1360,6 @@ fn execute_batch_put_from_multi_buffers(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
     regions: &Arc<Mutex<RegionMap>>,
-    state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchPutFromMultiBuffersRequest,
 ) -> Vec<i32> {
     let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
@@ -1459,7 +1411,6 @@ fn execute_batch_put_from_multi_buffers(
             None => -1,
         };
         if status == 0 {
-            track_key(state, tenant.clone(), item.key.clone());
             invalidate_hot_cache(hot_cache, &tenant, &item.key);
         }
         statuses.push(status);
@@ -1684,6 +1635,44 @@ fn execute_batch_get_values_into_multi(
     all_buffer_ptrs: Vec<Vec<usize>>,
     all_sizes: Vec<Vec<usize>>,
 ) -> Result<Vec<i64>, StoreError> {
+    // Without a hot cache the whole batch can go through one data-plane call:
+    // store-client then issues a single transfer batch for every key instead
+    // of one submit/wait round trip per key. This is what makes multi-buffer
+    // reads bandwidth-bound instead of latency-bound.
+    if hot_cache.is_none() && keys.len() > 1 {
+        let mut buffer_groups: Vec<Vec<&mut [u8]>> = Vec::with_capacity(keys.len());
+        for (buffer_ptrs, sizes) in all_buffer_ptrs.iter().zip(all_sizes.iter()) {
+            let mut buffers = Vec::with_capacity(buffer_ptrs.len());
+            for (buffer_ptr, size) in buffer_ptrs.iter().zip(sizes.iter()) {
+                // Safety: the Python caller owns these buffers for the duration
+                // of the call; the pointer/size pairs are validated by the
+                // native facade entry point.
+                buffers
+                    .push(unsafe { std::slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size) });
+            }
+            buffer_groups.push(buffers);
+        }
+        let mut requests = keys
+            .iter()
+            .zip(buffer_groups.iter_mut())
+            .map(|(key, buffers)| {
+                apply_scope_to_multi_buffer_get_request(
+                    MultiBufferGetRequest::new(key.as_str(), buffers.as_mut_slice()),
+                    &scope,
+                )
+            })
+            .collect::<Vec<_>>();
+        match client.batch_get_into_multi_buffers(requests.as_mut_slice()) {
+            Ok(sizes) => return Ok(sizes.into_iter().map(|size| size as i64).collect()),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    items = requests.len(),
+                    "batched multi-buffer read failed, falling back to per-key reads"
+                );
+            }
+        }
+    }
     let mut lengths = Vec::with_capacity(keys.len());
     for ((key, buffer_ptrs), sizes) in keys.into_iter().zip(all_buffer_ptrs).zip(all_sizes) {
         let copied =
@@ -1712,7 +1701,6 @@ fn soft_get_status(error: &StoreError) -> i64 {
 fn execute_remove(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    state: &Arc<Mutex<DispatcherState>>,
     request: pb::RemoveRequest,
 ) -> i32 {
     let tenant = normalized_tenant(client, &request.tenant);
@@ -1721,7 +1709,6 @@ fn execute_remove(
         .is_ok()
     {
         invalidate_hot_cache(hot_cache, &tenant, &request.key);
-        untrack_key(state, &tenant, &request.key);
         0
     } else {
         -1
@@ -1731,7 +1718,6 @@ fn execute_remove(
 fn execute_batch_remove(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchRemoveRequest,
 ) -> Vec<i32> {
     request
@@ -1741,7 +1727,6 @@ fn execute_batch_remove(
             execute_remove(
                 client,
                 hot_cache,
-                state,
                 pb::RemoveRequest {
                     key: obj.key,
                     tenant: obj.tenant,
@@ -1752,22 +1737,17 @@ fn execute_batch_remove(
         .collect()
 }
 
-fn execute_remove_all(
-    client: &StoreClient,
-    hot_cache: Option<&Arc<LocalHotCache>>,
-    state: &Arc<Mutex<DispatcherState>>,
-    force: bool,
-) -> (i32, i64) {
-    let keys = tracked_keys_snapshot(state);
-    let mut removed = 0i64;
-    for (tenant, key) in keys {
-        if client.remove_in_tenant(&tenant, &key, force).is_ok() {
-            invalidate_hot_cache(hot_cache, &tenant, &key);
-            untrack_key(state, &tenant, &key);
-            removed += 1;
-        }
-    }
-    (0, removed)
+fn execute_remove_all(client: &StoreClient, force: bool) -> Result<(i32, i64), StoreError> {
+    // Keep the public `force` argument for Mooncake compatibility. Store-RS
+    // evict-all has one owner-local behavior and does not vary with `force`.
+    let _ = force;
+    let result = client.debug_evict_all()?;
+    Ok(remove_all_result_status(result.completed, result.evicted))
+}
+
+fn remove_all_result_status(completed: bool, evicted: usize) -> (i32, i64) {
+    let evicted = i64::try_from(evicted).unwrap_or(i64::MAX);
+    (if completed { 0 } else { -1 }, evicted)
 }
 
 fn acquire_hot_cache_reply(
@@ -1962,21 +1942,6 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_millis() as u64
-}
-
-fn track_key(state: &Arc<Mutex<DispatcherState>>, tenant: String, key: String) {
-    state.lock().tracked_keys.insert((tenant, key));
-}
-
-fn tracked_keys_snapshot(state: &Arc<Mutex<DispatcherState>>) -> Vec<TrackedKey> {
-    state.lock().tracked_keys.iter().cloned().collect()
-}
-
-fn untrack_key(state: &Arc<Mutex<DispatcherState>>, tenant: &str, key: &str) {
-    state
-        .lock()
-        .tracked_keys
-        .remove(&(tenant.to_string(), key.to_string()));
 }
 
 fn normalized_tenant(client: &StoreClient, tenant: &str) -> String {
@@ -2193,7 +2158,7 @@ fn build_range_read_error_results(
 mod tests {
     use mooncake_store_client::StoreClient;
 
-    use super::StoreDispatcher;
+    use super::{remove_all_result_status, StoreDispatcher};
 
     #[test]
     fn dispatcher_handle_is_send_sync() {
@@ -2205,5 +2170,10 @@ mod tests {
     fn store_client_is_send() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<StoreClient>();
+    }
+    #[test]
+    fn remove_all_preserves_partial_eviction_count_and_reports_failure() {
+        assert_eq!(remove_all_result_status(true, 7), (0, 7));
+        assert_eq!(remove_all_result_status(false, 3), (-1, 3));
     }
 }

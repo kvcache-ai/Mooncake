@@ -75,12 +75,16 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "RpcServiceError";
         case Code::kRpcConnectionError:
             return "RpcConnectionError";
+        case Code::kRpcFunctionNotFound:
+            return "RpcFunctionNotFound";
         case Code::kMalformedJson:
             return "MalformedJson";
         case Code::kInternalError:
             return "InternalError";
         case Code::kNotImplemented:
             return "NotImplemented";
+        case Code::kTimedOut:
+            return "TimedOut";
         default:
             LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
             return "UnknownCode";

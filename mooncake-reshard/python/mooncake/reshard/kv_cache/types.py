@@ -22,10 +22,14 @@ _T = TypeVar("_T")
 class KVCacheComponent(str, Enum):
     KEY = "key"
     VALUE = "value"
+    LATENT = "latent"
+    CONV = "conv"
+    SSM = "ssm"
 
 
 class KVCacheLayout(str, Enum):
     NHD = "nhd"
+    NHD_STRIDED = "nhd_strided"
 
 
 # Preserve the KV-cache public name while sharing the resource-neutral type.
@@ -57,6 +61,10 @@ class KVCacheDescriptor:
     key_head_dim: int
     value_head_dim: int
     layout: KVCacheLayout = KVCacheLayout.NHD
+    components: tuple[KVCacheComponent, ...] = (
+        KVCacheComponent.KEY,
+        KVCacheComponent.VALUE,
+    )
 
     def __post_init__(self) -> None:
         layers = require_integer_tuple(self.global_layer_ids, "global_layer_ids")
@@ -80,8 +88,29 @@ class KVCacheDescriptor:
             )
         if not isinstance(self.layout, KVCacheLayout):
             raise ValueError("layout must be a KVCacheLayout")  # noqa: TRY004
-        if self.layout is not KVCacheLayout.NHD:
-            raise ValueError("only NHD KV-cache layout is supported")
+        components = require_manifest_items(
+            self.components, "components", KVCacheComponent
+        )
+        if not components or len(components) != len(set(components)):
+            raise ValueError("components must be non-empty and unique")
+        object.__setattr__(
+            self, "components", tuple(sorted(components, key=lambda c: c.value))
+        )
+
+    def head_dim(self, component: KVCacheComponent) -> int:
+        """Width of one shard unit; non-K/V resources use key_head_dim.
+
+        A latent resource normally has one replicated unit. State resources use
+        their own dtype, layer set and shard units, with page_size=1 for slots.
+        Components with different widths or ownership use separate descriptors.
+        """
+        if component not in self.components:
+            raise ValueError("component is absent from KV-cache descriptor")
+        return (
+            self.value_head_dim
+            if component is KVCacheComponent.VALUE
+            else self.key_head_dim
+        )
 
 
 def placement_fragment_id(
@@ -177,6 +206,11 @@ def require_sha256(value: object, name: str) -> str:
 def descriptor_identity(descriptor: KVCacheDescriptor) -> dict[str, object]:
     value = asdict(descriptor)
     value["layout"] = descriptor.layout.value
+    # Preserve canonical IDs and wire compatibility for existing K/V resources.
+    if descriptor.components == (KVCacheComponent.KEY, KVCacheComponent.VALUE):
+        value.pop("components")
+    else:
+        value["components"] = [component.value for component in descriptor.components]
     return value
 
 
