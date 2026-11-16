@@ -41,6 +41,11 @@ TransferEngine::~TransferEngine() {}
 
 bool TransferEngine::available() const { return impl_->available(); }
 
+bool TransferEngine::canTransfer(const Request& request) {
+    return available() && impl_->validateTransportHint(request, 0).ok() &&
+           impl_->getTransportType(request).transport != UNSPEC;
+}
+
 const std::string TransferEngine::getSegmentName() const {
     return impl_->getSegmentName();
 }

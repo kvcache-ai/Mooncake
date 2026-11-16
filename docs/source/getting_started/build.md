@@ -130,13 +130,21 @@ contiguous Tensor containing the payload view. Metadata and unregistered slices
 use host staging. Noncontiguous inputs create temporary contiguous allocations,
 which keep the staging path unless those allocations are registered.
 
+This optimization applies to RealClient source registrations. CUDA IPC mappings
+imported from DummyClient are not registered through this path and retain host
+staging.
+
 TENT selects direct RDMA or staging according to the device and NIC capabilities.
+If no TENT route is available for a retained device pointer, Store uses host
+staging before submitting the write.
 TCP clients, classic Transfer Engine, CXL and mixed file/NoF replicas keep full
 Store staging. Object checksums still copy payload bytes to the host for CRC.
-After a successful synchronous write, the source can be unregistered and
-released. Unregistration waits for concurrent Tensor writes using the
-registration; keep Tensor owners alive and finish all operations before closing
-Store.
+Synchronous TENT writes wait for all transfers to stop accessing the buffers,
+including after a timeout or status-query failure. Cancellation is best effort,
+so this wait can exceed the transfer timeout. After the call returns, the source
+can be unregistered and released. Unregistration waits for concurrent Tensor
+writes using the registration; keep Tensor owners alive and finish all
+operations before closing Store.
 
 With `mooncake_master` running, run the real-device regression suite from the
 repository root:

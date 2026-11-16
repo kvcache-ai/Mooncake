@@ -825,9 +825,12 @@ void MemcpyWorkerPool::workerThread() {
 
 TransferEngineOperationState::~TransferEngineOperationState() {
 #ifdef USE_TENT
-    if (tent_engine_)
+    if (tent_engine_) {
+        // freeBatch() can defer cleanup while a transport still uses the
+        // caller's buffers. Keep those buffers protected until it is drained.
+        wait_for_completion();
         tent_engine_->freeBatch(batch_id_);
-    else
+    } else
 #endif
         engine_.freeBatchID(batch_id_);
 }
@@ -842,7 +845,57 @@ bool TransferEngineOperationState::is_completed() {
     return result_.has_value();
 }
 
+#ifdef USE_TENT
+void TransferEngineOperationState::cancel_tent_transfers() {
+    if (tent_failure_) return;
+    tent_failure_ = true;
+    // Cancellation is best effort. Neither acceptance nor failure proves that
+    // a posted transfer has stopped accessing its source or destination.
+    for (size_t i = batch_size_; i > 0; --i) {
+        auto status = tent_engine_->cancelTransfer(batch_id_, i - 1);
+        if (!status.ok() && !status.IsNotImplemented()) {
+            LOG(WARNING) << "Failed to cancel transfer: " << status.ToString();
+        }
+    }
+}
+
+void TransferEngineOperationState::check_tent_task_status() {
+    tent::TransferStatus status;
+    auto result = tent_engine_->getTransferStatus(batch_id_, status);
+    if (!result.ok()) {
+        if (!tent_failure_) {
+            LOG(ERROR) << "Failed to query batch " << batch_id_ << ": "
+                       << result.ToString();
+        }
+        cancel_tent_transfers();
+        return;
+    }
+    switch (status.s) {
+        case tent::PENDING:
+            return;
+        case tent::COMPLETED:
+            set_result_internal(tent_failure_ ? ErrorCode::TRANSFER_FAIL
+                                              : ErrorCode::OK);
+            return;
+        case tent::FAILED:
+        case tent::TIMEOUT:
+        case tent::CANCELED:
+        case tent::INVALID:
+            set_result_internal(ErrorCode::TRANSFER_FAIL);
+            return;
+        default:
+            cancel_tent_transfers();
+    }
+}
+#endif
+
 void TransferEngineOperationState::check_task_status() {
+#ifdef USE_TENT
+    if (tent_engine_) {
+        check_tent_task_status();
+        return;
+    }
+#endif
     // Check all transfers in the batch.
     // Wait for ALL tasks to reach a terminal state before setting the result,
     // even if some have already failed. This prevents the caller from seeing
@@ -853,41 +906,13 @@ void TransferEngineOperationState::check_task_status() {
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
-        Status s;
-#ifdef USE_TENT
-        if (tent_engine_) {
-            tent::TransferStatus tent_status;
-            auto tent_s =
-                tent_engine_->getTransferStatus(batch_id_, i, tent_status);
-            if (!tent_s.ok()) {
-                LOG(ERROR) << "Failed to get transfer status for batch "
-                           << batch_id_ << " task " << i << " with error "
-                           << tent_s.message();
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
-                return;
-            }
-            auto classic_status = ToClassicTransferStatus(tent_status.s);
-            if (!classic_status) {
-                LOG(ERROR) << "Unknown TENT transfer status for batch "
-                           << batch_id_ << " task " << i << " with status "
-                           << static_cast<int>(tent_status.s);
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
-                return;
-            }
-            status.s = *classic_status;
-            status.transferred_bytes = tent_status.transferred_bytes;
-            s = Status::OK();
-        } else
-#endif
-        {
-            s = engine_.getTransferStatus(batch_id_, i, status);
-            if (!s.ok()) {
-                LOG(ERROR) << "Failed to get transfer status for batch "
-                           << batch_id_ << " task " << i << " with error "
-                           << s.message();
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
-                return;
-            }
+        auto s = engine_.getTransferStatus(batch_id_, i, status);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to get transfer status for batch "
+                       << batch_id_ << " task " << i << " with error "
+                       << s.message();
+            set_result_internal(ErrorCode::TRANSFER_FAIL);
+            return;
         }
 
         switch (status.s) {
@@ -953,8 +978,7 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    const int64_t timeout_milliseconds = timeout_milliseconds_;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     // TENT batches do not use the classic transport BatchDesc layout.
@@ -1017,15 +1041,27 @@ void TransferEngineOperationState::wait_for_completion() {
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
     while (true) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (result_.has_value()) return;
         if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+#ifdef USE_TENT
+            if (tent_engine_) {
+                if (!tent_failure_) {
+                    LOG(ERROR) << "Transfer timed out for batch " << batch_id_
+                               << "; waiting for physical completion";
+                }
+                cancel_tent_transfers();
+            } else
+#endif
+            {
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_;
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
         }
 
-        std::unique_lock<std::mutex> lock(mutex_);
         check_task_status();
         if (result_.has_value()) {
             VLOG(1) << "Transfer engine operation completed for batch "
@@ -1036,6 +1072,10 @@ void TransferEngineOperationState::wait_for_completion() {
         // Continue polling
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
+        if (tent_failure_) {
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
     }
 }
 
@@ -1793,7 +1833,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         if (!tent_status.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error: "
                        << tent_status.ToString();
-            tent_engine_->freeBatch(batch_id);
+            TransferEngineOperationState drain(engine_, batch_id, batch_size);
+            drain.wait_for_completion();
             return std::nullopt;
         }
     } else

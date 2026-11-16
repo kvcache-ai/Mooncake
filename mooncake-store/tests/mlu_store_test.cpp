@@ -7,8 +7,10 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -137,6 +139,70 @@ class MluRemoteTensorWriteTest : public MluStoreTest {
         EXPECT_EQ(actual, expected);
     }
 };
+
+class MluRemoteTensorFallbackTest : public MluRemoteTensorWriteTest {
+   protected:
+    void SetUp() override {
+        if (!UsesRdma()) GTEST_SKIP() << "Requires an RDMA Store client";
+        if (const char* conf = std::getenv("MC_TENT_CONF")) old_conf_ = conf;
+        // Keep host TCP usable while removing both MLU direct RDMA and TENT
+        // MLU staging. Store must fall back before submitting device pointers.
+        setenv(
+            "MC_TENT_CONF",
+            R"({"transports":{"mlu":{"enable":false},"rdma":{"enable":false},"tcp":{"enable":true}}})",
+            1);
+        changed_conf_ = true;
+        MluRemoteTensorWriteTest::SetUp();
+    }
+    void TearDown() override {
+        MluRemoteTensorWriteTest::TearDown();
+        if (changed_conf_) {
+            if (old_conf_)
+                setenv("MC_TENT_CONF", old_conf_->c_str(), 1);
+            else
+                unsetenv("MC_TENT_CONF");
+        }
+    }
+    std::optional<std::string> old_conf_;
+    bool changed_conf_ = false;
+};
+
+TEST_F(MluRemoteTensorFallbackTest, RegisteredPutAndUpsertUseStoreStaging) {
+    // Both payloads fit in the 16 MiB pool. Allocating a second copy of the
+    // already staged payload would require 18 MiB and fail.
+    constexpr size_t size = 6 * 1024 * 1024;
+    ASSERT_EQ(source_.allocate(size), cnrtSuccess);
+    ASSERT_EQ(target_.allocate(size), cnrtSuccess);
+    ASSERT_NO_FATAL_FAILURE(Register(source_.data(), size));
+    const auto key = Key();
+    for (bool upsert : {false, true}) {
+        auto payload = Payload(size, upsert ? 71 : 37);
+        ASSERT_EQ(cnrtMemcpy(source_.data(), payload.data(), size,
+                             cnrtMemcpyHostToDev),
+                  cnrtSuccess);
+        ASSERT_EQ(cnrtMemcpy(target_.data(), payload.data(), size,
+                             cnrtMemcpyHostToDev),
+                  cnrtSuccess);
+        auto header = Payload(73, 11);
+        auto expected = header;
+        expected.insert(expected.end(), payload.begin(), payload.end());
+        expected.insert(expected.end(), payload.begin(), payload.end());
+        const auto before = mlu_d2h_bytes.load();
+        auto result =
+            upsert
+                ? client_->batch_upsert_from_multi_buffers(
+                      {key}, {{header.data(), source_.data(), target_.data()}},
+                      {{header.size(), size, size}}, ReplicateConfig{}, true)
+                : client_->batch_put_from_multi_buffers(
+                      {key}, {{header.data(), source_.data(), target_.data()}},
+                      {{header.size(), size, size}}, ReplicateConfig{}, true);
+        ASSERT_EQ(result, std::vector<int>{0});
+        // The unregistered slice was already staged by rdma_stager and must
+        // not incur a second D2H copy when the registered slice falls back.
+        EXPECT_EQ(mlu_d2h_bytes.load() - before, 2 * size);
+        ASSERT_NO_FATAL_FAILURE(VerifyObject(key, expected));
+    }
+}
 
 TEST_F(MluRemoteTensorWriteTest, RegisteredPayloadSkipsStoreStaging) {
     // Larger than the client's host pool: success also proves we did not

@@ -227,12 +227,14 @@ add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
 add_store_test(nof_probe_context_pool_test nof_probe_context_pool_test.cpp)
 if(USE_TENT)
+  target_sources(transfer_task_test PRIVATE transfer_task_tent_test.cpp)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
   add_test(
     NAME transfer_task_tent_completion_test
-    COMMAND transfer_task_test
-            --gtest_filter=TransferTaskTest.RemoteTransferWaitCompletesCorrectly
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.RemoteTransferWaitCompletesCorrectly:TentTransferLifetimeTest.*
   )
   set_tests_properties(transfer_task_tent_completion_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)

@@ -332,7 +332,8 @@ class Client {
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
     // rdma_stager may retain registered device slices for TENT RDMA clients
-    // writing ordinary memory replicas. TENT owns capability-based fallback.
+    // writing ordinary memory replicas. Pointers without a TENT route are
+    // passed through the full host stager before transfer submission.
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
@@ -1146,6 +1147,9 @@ class Client {
     void StageWriteBuffersForRemoteReplicas(
         std::vector<PutOperation>& ops, const WriteBufferStager& stager,
         const WriteBufferStager& rdma_stager);
+
+    bool CanTransferDeviceWriteSlices(const PutOperation& op,
+                                      const std::vector<Slice>& slices);
     void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);

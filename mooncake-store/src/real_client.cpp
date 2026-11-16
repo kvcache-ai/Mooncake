@@ -229,20 +229,20 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     const std::shared_ptr<ClientBufferAllocator> &allocator,
     const std::vector<Slice> &slices,
     std::vector<BufferHandle> &staging_handles,
-    const std::function<bool(const Slice &)> &keep_device_slice = {}) {
+    const std::function<bool(const Slice &)> &keep_slice) {
     size_t total_size = 0;
     size_t staged_size = 0;
-    std::vector<bool> direct;
-    direct.reserve(slices.size());
+    std::vector<bool> retained;
+    retained.reserve(slices.size());
     for (const auto &slice : slices) {
         if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
             return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
         total_size += slice.size;
-        direct.push_back(keep_device_slice && keep_device_slice(slice));
-        if (!direct.back()) staged_size += slice.size;
+        retained.push_back(keep_slice(slice));
+        if (!retained.back()) staged_size += slice.size;
     }
-    if (keep_device_slice && staged_size == 0) return slices;
+    if (staged_size == 0) return slices;
     if (!allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -260,7 +260,7 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     size_t offset = 0;
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto &slice = slices[i];
-        if (direct[i]) {
+        if (retained[i]) {
             staged_slices.push_back(slice);
             continue;
         }
@@ -315,7 +315,20 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     Client::WriteBufferStager rdma_stager;
     if (stage_nonlocal) {
         stager = [&](const std::vector<Slice> &slices) {
-            return StageWriteSlices(allocator, slices, staging_handles);
+            // A route fallback immediately follows selective staging. Keep
+            // slices in that allocation instead of allocating and copying
+            // them again; staging_handles owns it until the write finishes.
+            const auto *staged =
+                staging_handles.empty() ? nullptr : &staging_handles.back();
+            return StageWriteSlices(
+                allocator, slices, staging_handles, [&](const Slice &slice) {
+                    if (!staged) return false;
+                    const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+                    const auto base =
+                        reinterpret_cast<uintptr_t>(staged->ptr());
+                    return address >= base && address - base < staged->size() &&
+                           slice.size <= staged->size() - (address - base);
+                });
         };
         if (keep_device_slice) {
             rdma_stager = [&](const std::vector<Slice> &slices) {

@@ -603,8 +603,13 @@ TEST(RuntimeQueueDispatch, TimeoutDoesNotDispatchQueuedRequestsOfBatch) {
     // owner and frees its dispatch window slot; a refill would submit the
     // queued owner of the same batch unless it has already been canceled.
     std::atomic<int> polls{0};
+    const auto waiter = std::this_thread::get_id();
     auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, [&polls](const Request& request, int) {
+        RDMA, [&polls, waiter](const Request& request, int) {
+            // The queue's background worker may poll before waitTransfer()
+            // starts. Only the waiter advances this timeout scenario.
+            if (std::this_thread::get_id() != waiter)
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
             if (++polls == 1) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 return TransferStatus{TransferStatusEnum::PENDING, 0};

@@ -294,6 +294,10 @@ class TransferEngine {
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
+    // Probe the current route without submitting a transfer. A true result
+    // does not reserve resources or guarantee that a later submit succeeds.
+    bool canTransfer(const Request& request);
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);
