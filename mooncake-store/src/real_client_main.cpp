@@ -49,6 +49,9 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::probeKey_internal>(&real_client);
     server.register_handler<&RealClient::batchProbeKey_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
+    server.register_handler<&RealClient::get_replica_desc>(&real_client);
+    server.register_handler<&RealClient::batch_get_replica_desc>(&real_client);
+    server.register_handler<&RealClient::batch_get_query_results>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
     server.register_handler<
@@ -106,6 +109,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
+    server.register_handler<&RealClient::batch_get_offload_object_ranges>(
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
 }

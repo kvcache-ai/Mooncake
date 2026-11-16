@@ -13,6 +13,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "common.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -24,15 +25,6 @@
 
 #include "integration_utils.h"
 #include "buffer_pool.h"
-
-// Forward declaration for EngramStore bindings
-namespace mooncake {
-namespace engram {
-void bind_engram_store(py::module &m);
-}
-}  // namespace mooncake
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
 
 namespace py = pybind11;
 
@@ -157,6 +149,23 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
+py::object materialize_contiguous_tensor(const py::handle &tensor) {
+    py::object contiguous = tensor.attr("contiguous")();
+#ifdef USE_MLU
+    if (!contiguous.is(tensor) &&
+        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        // CNRT copies do not wait for work on PyTorch's current MLU stream.
+        // The caller can synchronize its input, but this new copy is ours.
+        // Wait before exposing its pointer to Store, including for TP shards.
+        py::module_::import("torch")
+            .attr("mlu")
+            .attr("current_stream")(contiguous.attr("device"))
+            .attr("synchronize")();
+    }
+#endif
+    return contiguous;
+}
+
 PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                       const std::string &key_name,
                                       bool require_contiguous,
@@ -181,7 +190,7 @@ PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         }
 
         py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
+            require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
         info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = inspected.attr("numel")().cast<size_t>();
@@ -520,12 +529,13 @@ class RangedReadSnapshotPy {
    public:
     RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
                          std::vector<std::string> keys)
-        : store_(std::move(store)), keys_(std::move(keys)) {
-        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+        : store_(store), keys_(std::move(keys)) {
+        snapshot_ = store->prepare_get_into_ranges_snapshot(keys_);
     }
 
     bool belongs_to(const std::shared_ptr<PyClient> &store) const {
-        return store_.get() == store.get();
+        const auto owner = store_.lock();
+        return owner && owner.get() == store.get();
     }
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
@@ -535,16 +545,28 @@ class RangedReadSnapshotPy {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (snapshot_.should_refresh()) {
-            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        // A snapshot must not keep a closed Store and its segments alive;
+        // reject use after close instead of reading through a torn-down
+        // client.
+        auto store = store_.lock();
+        if (!store) {
+            throw std::runtime_error(
+                "RangedReadSnapshot is no longer usable: the Store was "
+                "closed");
         }
-        return store_->get_into_ranges_from_snapshot(
+        if (snapshot_.should_refresh()) {
+            store->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store->get_into_ranges_from_snapshot(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
             snapshot_);
     }
 
    private:
-    std::shared_ptr<PyClient> store_;
+    // Weak by design: an idle snapshot must not extend the native client's
+    // lifetime beyond close(), otherwise its segments stay published and a
+    // later reader can observe a stale MEMORY replica (issue #5464).
+    std::weak_ptr<PyClient> store_;
     std::vector<std::string> keys_;
     PyClient::RangedReadSnapshot snapshot_;
     std::mutex mutex_;
@@ -1199,6 +1221,7 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
         if (!config.group_ids && !config.session_ids &&
+            !config.residency_affinity_ids &&
             !config.per_key_preferred_hca_names) {
             return config;
         }
@@ -1222,9 +1245,10 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (!config.HasValidKeyHints(key_count)) {
-            LOG(ERROR) << operation_name
-                       << ": group_ids and per-key HCA hint counts must match "
-                          "keys size";
+            LOG(ERROR)
+                << operation_name
+                << ": group, affinity and per-key HCA hint counts must match "
+                   "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1235,11 +1259,20 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        // Single-tensor TP keeps per-shard group/HCA hints and one source
-        // session ID, which is expanded to all shards below.
-        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
+        // Single-tensor TP keeps per-shard group/HCA hints. Session and
+        // residency affinity IDs describe the source tensor, not each shard.
+        if (!config.ValidSessionIds(1) ||
+            (config.residency_affinity_ids &&
+             config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
+            ReplicateConfig tp_config = config;
+            if (config.residency_affinity_ids) {
+                tp_config.residency_affinity_ids = std::vector<std::string>(
+                    tp_size, config.residency_affinity_ids->front());
+            }
+            if (!tp_config.HasValidKeyHints(tp_size))
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
@@ -1251,7 +1284,6 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            ReplicateConfig tp_config = config;
             if (config.session_ids) {
                 tp_config.session_ids =
                     std::vector<std::string>(tp_size, config.SessionId());
@@ -2196,6 +2228,18 @@ PYBIND11_MODULE(_store, m) {
                 if (ids) config.session_ids = std::move(*ids);
             })
         .def_property(
+            "residency_affinity_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.residency_affinity_ids) return std::nullopt;
+                return *config.residency_affinity_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.residency_affinity_ids.reset();
+                if (ids) config.residency_affinity_ids = std::move(*ids);
+            })
+        .def_property(
             "preferred_hca_names",
             [](const ReplicateConfig &config)
                 -> std::optional<std::vector<std::string>> {
@@ -2415,33 +2459,6 @@ PYBIND11_MODULE(_store, m) {
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
-    // Helper function to extract PyClient shared_ptr from
-    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
-    // PyClient We return it as a Python capsule to avoid type registration
-    // issues
-    m.def(
-        "_get_pyclient_from_wrapper",
-        [](MooncakeStorePyWrapper &wrapper) -> py::object {
-            if (!wrapper.store_) {
-                return py::none();
-            }
-            // Return as a capsule containing the shared_ptr
-            // The caller (engram_store_py.cpp) will extract it
-            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
-            // freed; otherwise release() transfers ownership to the capsule.
-            auto ptr =
-                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
-            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
-            py::object cap = py::capsule(raw_ptr, [](void *p) {
-                delete static_cast<std::shared_ptr<PyClient> *>(p);
-            });
-            (void)ptr.release();  // Transfer ownership to capsule
-            return cap;
-        },
-        py::arg("wrapper"),
-        "Get PyClient from MooncakeDistributedStore (internal use, returns "
-        "capsule)");
-
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
@@ -3559,7 +3576,15 @@ PYBIND11_MODULE(_store, m) {
                              << ". Valid range: 0-" << max_node;
             }
 
-            if (numa_run_on_node(node) != 0) {
+            int rc;
+            {
+                // numa_run_on_node() fills libnuma's per-node cpumask cache
+                // on first use; see numaNodeCpuCacheMutex().
+                std::lock_guard<std::mutex> guard(
+                    mooncake::numaNodeCpuCacheMutex());
+                rc = numa_run_on_node(node);
+            }
+            if (rc != 0) {
                 LOG(WARNING) << "numa_run_on_node failed for node " << node;
             }
 
@@ -3573,9 +3598,6 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
-
-    // Add EngramStore bindings
-    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake

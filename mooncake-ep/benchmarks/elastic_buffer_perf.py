@@ -11,6 +11,10 @@ Typical single-node usage:
     MOONCAKE_EP_NUM_LOCAL_RANKS=8 \
     torchrun --standalone --nproc_per_node=8 \
       mooncake-ep/benchmarks/elastic_buffer_perf.py --route alltoall
+
+On Intel GPUs the same command runs over torch.xpu, the xccl backend and Level
+Zero IPC, with RDMA to remote ranks (pass --transport ipc or leave it at
+auto).
 """
 
 from __future__ import annotations
@@ -25,6 +29,10 @@ import torch.distributed as dist
 import torch.testing as testing
 
 from mooncake.mooncake_elastic_buffer import ElasticBuffer
+
+# Intel GPUs run the same benchmark through torch.xpu and the xccl backend.
+DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
+ACCELERATOR = getattr(torch, DEVICE)
 
 
 @dataclass(frozen=True)
@@ -46,9 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
         "--transport",
-        choices=("auto", "ibgda", "nccl"),
+        choices=("auto", "ibgda", "nccl", "ipc"),
         default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
-        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA.",
+        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA. "
+        "XPU supports only auto/ipc.",
     )
     parser.add_argument(
         "--route",
@@ -79,11 +88,11 @@ def parse_args() -> argparse.Namespace:
 
 def init_distributed(seed: int) -> tuple[int, int]:
     if not dist.is_initialized():
-        dist.init_process_group("nccl")
+        dist.init_process_group("xccl" if DEVICE == "xpu" else "nccl")
     rank = dist.get_rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-    torch.cuda.set_device(local_rank)
-    torch.set_default_device("cuda")
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % ACCELERATOR.device_count()))
+    ACCELERATOR.set_device(local_rank)
+    torch.set_default_device(DEVICE)
     torch.set_default_dtype(torch.bfloat16)
     torch.manual_seed(seed + rank)
     return rank, dist.get_world_size()
@@ -103,7 +112,7 @@ def make_route_plan(
     if local_experts <= 0:
         raise ValueError("num_experts must be at least world_size")
     expert_offsets = (
-        torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+        torch.arange(num_topk, device=DEVICE, dtype=torch.long) % local_experts
     )
 
     if route == "cross" and buffer.num_scaleout_ranks > 1:
@@ -125,7 +134,7 @@ def make_route_plan(
         )
 
     dst_ranks = (
-        rank + torch.arange(num_topk, device="cuda", dtype=torch.long)
+        rank + torch.arange(num_topk, device=DEVICE, dtype=torch.long)
     ) % world_size
     choices = dst_ranks * local_experts + expert_offsets
     unique_dst_ranks = int(torch.unique(dst_ranks).numel())
@@ -137,7 +146,7 @@ def make_route_plan(
 
 
 def make_input(rank: int, iteration: int, num_tokens: int, hidden: int) -> torch.Tensor:
-    base = torch.arange(num_tokens * hidden, device="cuda", dtype=torch.float32)
+    base = torch.arange(num_tokens * hidden, device=DEVICE, dtype=torch.float32)
     base = base.view(num_tokens, hidden)
     return (base + rank * 1_000_000 + iteration * 17).to(torch.bfloat16).contiguous()
 
@@ -195,14 +204,14 @@ def main() -> None:
         route=args.route,
     )
     weights = torch.ones(
-        (args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32
+        (args.num_tokens, args.num_topk), device=DEVICE, dtype=torch.float32
     )
 
     def run_one(iteration: int, cached_handle):
         x = make_input(rank, iteration, args.num_tokens, args.hidden)
-        dispatch_start = torch.cuda.Event(enable_timing=True)
-        dispatch_end = torch.cuda.Event(enable_timing=True)
-        combine_end = torch.cuda.Event(enable_timing=True)
+        dispatch_start = ACCELERATOR.Event(enable_timing=True)
+        dispatch_end = ACCELERATOR.Event(enable_timing=True)
+        combine_end = ACCELERATOR.Event(enable_timing=True)
 
         use_cached = args.reuse_handle and cached_handle is not None
         dispatch_start.record()
@@ -243,7 +252,7 @@ def main() -> None:
             async_with_compute_stream=False,
         )
         combine_end.record()
-        torch.cuda.synchronize()
+        ACCELERATOR.synchronize()
 
         if args.check_correctness:
             expected = (x.float() * route_plan.expected_combine_factor).to(
@@ -265,7 +274,7 @@ def main() -> None:
         cached_handle, _dispatch_ms, _combine_ms, _actual = run_one(i, cached_handle)
 
     dist.barrier()
-    torch.cuda.synchronize()
+    ACCELERATOR.synchronize()
     dispatch_ms = []
     combine_ms = []
     recv_tokens = []
@@ -275,14 +284,14 @@ def main() -> None:
         dispatch_ms.append(d_ms)
         combine_ms.append(c_ms)
         recv_tokens.append(actual)
-    torch.cuda.synchronize()
+    ACCELERATOR.synchronize()
     dist.barrier()
     wall_seconds = time.time() - wall_start
 
     samples = (
         torch.tensor(
             [dispatch_ms, combine_ms, recv_tokens],
-            device="cuda",
+            device=DEVICE,
             dtype=torch.float64,
         )
         .transpose(0, 1)
@@ -293,7 +302,7 @@ def main() -> None:
 
     max_wall_seconds = torch.tensor(
         wall_seconds,
-        device="cuda",
+        device=DEVICE,
         dtype=torch.float64,
     )
     dist.all_reduce(max_wall_seconds, op=dist.ReduceOp.MAX)

@@ -50,6 +50,8 @@ enum RpcFuncID {
     NotifySegmentUpdated,
     // Appended to preserve the numeric values of the existing RPCs.
     BootstrapUb,
+    SendDataV2,
+    RecvDataV2,
 };
 
 class ClientPool;

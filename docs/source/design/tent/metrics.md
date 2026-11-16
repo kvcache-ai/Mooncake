@@ -45,7 +45,10 @@ TentMetrics::setEnabled(true);
 bool enabled = TentMetrics::isEnabled();
 ```
 
-When disabled at runtime, record functions return immediately after a single atomic load (~1ns overhead).
+When disabled at runtime, new requests return immediately after an atomic
+load. A request or attempt that started while recording was enabled still
+emits its terminal outcome after a later disable, so the accounting pair
+remains balanced.
 
 ## Configuration
 
@@ -258,10 +261,14 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
 | `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
 | `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
+| `tent_logical_requests_started_total` | Counter | `operation` | User-visible logical requests accepted for execution |
+| `tent_logical_request_outcomes_total` | Counter | `operation`, `outcome` | Terminal outcome of each counted logical request |
+| `tent_transport_attempt_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal outcome of each counted physical transport attempt |
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
+| `tent_logical_requests_inflight` | Gauge | `operation` | Counted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
@@ -290,28 +297,54 @@ visible when runtime transfer recording is disabled.
 | `tent_metrics_last_success_timestamp_seconds` | Gauge | `format` | Unix timestamp of the most recent successful serialization; `0` means that format has never succeeded |
 
 **Notes**:
+- The lossless accounting families form two conservation equations:
+  `logical started = logical outcomes + logical in-flight` and
+  `physical attempts = attempt outcomes + in-flight attempts`. A failover
+  therefore produces one logical outcome and multiple physical attempt
+  outcomes.
+- Logical accounting deliberately has no `transport` label. Transport can
+  change during failover; attaching one to the logical request would either
+  hide the failed attempt or double-count the request. Transport attribution
+  belongs to `tent_transport_attempt_outcomes_total`.
+- Accounting records only `success`, `failed`, `timeout`, and `canceled`.
+  Detailed error text and rare lifecycle diagnoses remain in logs instead of
+  becoming high-cardinality metric labels.
+- Accounting is a post-transition side channel. Its bounded label cells are
+  resolved during metrics initialization; request-path updates only load an
+  atomic cell pointer and perform relaxed atomic additions. A missing cell
+  drops the observation without allocation, locking, exceptions, or transfer
+  control-flow changes.
+- Runtime enable/disable is paired at start: a start accepted while enabled is
+  closed exactly once even if recording is disabled before completion. A
+  request that starts while disabled emits neither side of the pair.
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
 - `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
 - `tent_metrics_last_success_timestamp_seconds{format="..."} == 0` means that format has never completed a successful serialization. Prometheus freshness alerts must select `format="prometheus"` and guard on a value greater than zero; a Prometheus-only deployment is not expected to serialize JSON.
-- yalantinglibs omits zero-valued transfer counters/histograms from the Prometheus output, so a transfer metric only appears once it has been observed at least once. The metrics-pipeline self-observability families above are emitted unconditionally.
+- The bounded lossless-accounting label domains are pre-resolved, so their
+  series are present with zero values before traffic. Other dynamic transfer
+  counters and histograms may be omitted by yalantinglibs until their label
+  series is first observed. The metrics-pipeline self-observability families
+  above are emitted unconditionally.
 
 ### Labels
 
 Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
-can be sliced by transport without grepping logs. Attempt metrics also carry
-an `operation` label. Task failures add a closed-set `reason` label and metrics
-serialization adds a two-valued `format` label. Label values come from bounded
-sets; no request IDs, addresses, segment names, or other unbounded values are
-accepted.
+can be sliced by transport without grepping logs. Attempt and logical
+accounting carry an `operation` label; terminal accounting also carries the
+four-valued `outcome` label. Task failures add a closed-set `reason` label and
+metrics serialization adds a two-valued `format` label. Label values come from
+bounded sets; no request IDs, addresses, segment names, or other unbounded
+values are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
+| `outcome` | `success`, `failed`, `timeout`, `canceled` | Bounded terminal outcome |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
@@ -325,11 +358,12 @@ Transport label values come from the shared `transportTypeName()` mapping.
 **Cardinality**: the `transport` label has 19 values; the failover
 `from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
 few pairs ever occur), each attempt metric has at most 19x2 = 38
-transport/operation combinations, task failures have at most 19x4 = 76, and
-each serialization family has exactly two series. Build identity labels are
-constant for the life of the process; a served `tent_metrics_build_info` series
-itself confirms that metrics were compiled in. Total series across all metrics
-is bounded by these closed sets.
+transport/operation combinations, logical outcomes have at most 2x4 = 8,
+attempt outcomes have at most 19x2x4 = 152, task failures have at most 19x4 =
+76, and each serialization family has exactly two series. Build identity
+labels are constant for the life of the process; a served
+`tent_metrics_build_info` series itself confirms that metrics were compiled
+in. Total series across all metrics is bounded by these closed sets.
 
 ### Per-rail load (`getNicLoadStats`)
 
@@ -367,14 +401,17 @@ Metrics are automatically recorded at the TENT layer:
 - **Metrics recording**: When `getTransferStatus` detects task completion, latency is calculated and metrics are recorded
 - **Attempt tracking**: Each concrete `Transport::submitTransferTasks()` call is counted as one attempt. A failed attempt is closed before failover changes the task's current transport, and the replacement attempt gets a fresh attempt timestamp. Synchronous submit failures are also closed as failed attempts. The transport is captured when the attempt starts, so it is attributed correctly even if failover overwrites the task's current transport afterwards. Staging is an orchestration step, not a transport attempt: `ProxyManager` chunks the transfer and issues the real transport submissions, which are the ones counted, so a staged transfer is not double-counted.
 
-This provides two complementary views:
+This provides two complementary accounting views:
 
-- Logical request latency and outcome, attributed to the final transport for backward compatibility.
-- Physical attempt count, failure count, and latency, attributed to the transport that actually executed that attempt.
+- One transport-independent logical request start, terminal outcome, and
+  in-flight state.
+- One transport-attributed start, terminal outcome, and in-flight state for
+  every physical attempt.
 
-For a recovered RDMA→TCP request, request metrics record one successful TCP
-outcome, while attempt metrics record one failed RDMA attempt and one successful
-TCP attempt. The causal-chain stage metrics (`tent_stage_queue_wait_us`,
+For a recovered RDMA→TCP request, lossless accounting records one logical
+`success`, one RDMA attempt `failed`, and one TCP attempt `success`. The legacy
+request metrics still record one successful TCP outcome for compatibility.
+The causal-chain stage metrics (`tent_stage_queue_wait_us`,
 `tent_stage_dispatch_us`, `tent_stage_transport_us`) are unchanged by this
 addition: they remain attributed to the final transport and
 `tent_stage_transport_us` still spans the whole request, so existing dashboards
@@ -442,11 +479,9 @@ void TentMetrics::recordNewMetric(int64_t value) {
 
 ### Automatic Serialization
 
-Once registered in `registerMetrics()`, the new metric will be **automatically included** in:
-- `/metrics` (Prometheus format)
-- `/metrics/json` (JSON format)
-
-No changes to `getPrometheusMetrics()` or `getJsonMetrics()` are required.
+Once registered in `registerMetrics()`, a counter is included in `/metrics`.
+Add the corresponding aggregate to `getJsonMetrics()` when it must also be
+present in the flat JSON view.
 
 ## Advanced Configuration
 
@@ -526,6 +561,15 @@ rate(tent_transport_failover_total{from="rdma",to="tcp"}[5m])
 sum(rate(tent_transport_attempt_failures_total{transport="rdma"}[5m]))
 /
 sum(rate(tent_transport_attempts_total{transport="rdma"}[5m]))
+
+# Conservation checks: both should remain zero in steady state.
+sum(tent_logical_requests_started_total)
+- sum(tent_logical_request_outcomes_total)
+- sum(tent_logical_requests_inflight)
+
+sum(tent_transport_attempts_total)
+- sum(tent_transport_attempt_outcomes_total)
+- sum(tent_inflight_attempts)
 
 # P99 latency of RDMA write attempts
 histogram_quantile(

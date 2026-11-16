@@ -87,6 +87,27 @@ TEST_F(RpcWorkerPoolTest, ClientsCallPooledHandlersByMethodName) {
     EXPECT_EQ(answer.value(), 42);
 }
 
+// The master sizes the pool from a config value that is 0 when unset. A pool
+// asked for 0 threads must still run its handlers instead of queueing them on
+// a pool with no threads.
+TEST_F(RpcWorkerPoolTest, ZeroThreadCountStillRunsHandlers) {
+    TestService service;
+    RpcWorkerPool pool(0);
+    coro_rpc::coro_rpc_server server(/*thread_num=*/1, port_, "127.0.0.1",
+                                     std::chrono::seconds(0),
+                                     /*tcp_no_delay=*/true);
+    pool.Register<&TestService::Answer>(server, service);
+    ASSERT_NO_FATAL_FAILURE(Start(server));
+
+    coro_rpc::coro_rpc_client client;
+    ASSERT_NO_FATAL_FAILURE(Connect(client));
+
+    auto answer = syncAwait(
+        client.call_for<&TestService::Answer>(std::chrono::seconds(5)));
+    ASSERT_TRUE(answer.has_value()) << answer.error().msg;
+    EXPECT_EQ(answer.value(), 42);
+}
+
 // With one io thread, both connections are read by the same thread. A
 // pooled handler that never returns must still leave it free for the
 // inline Ping of the other connection.

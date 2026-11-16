@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // End-to-end coverage for the Delegate RPC, which had none:
-// ControlClient::delegate -> onDelegate -> TransferEngineImpl::transferSync.
+// ControlClient::delegate -> onDelegate ->
+// TransferEngineImpl::submitAndWaitTransfer.
 //
 // The engine runs in p2p mode on loopback, so getSegmentName() is the address
 // to delegate to, and a FakeTransport stands in for real hardware.

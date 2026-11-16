@@ -151,8 +151,10 @@ impl PyMooncakeDistributedStore {
         hugepage_size = None,
         eviction_high_watermark_percent = None,
         eviction_low_watermark_percent = None,
+        max_pending_publications = None,
+        max_pending_publication_bytes = None,
         route_control = "embedded_wrh"
-    ), text_signature = "(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', metadata_url='', *, stable_id=None, initial_state='active', tenant='default', domain=None, object_set=None, labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, route_control='embedded_wrh')")]
+    ), text_signature = "(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', metadata_url='', *, stable_id=None, initial_state='active', tenant='default', domain=None, object_set=None, labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, max_pending_publications=None, max_pending_publication_bytes=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &mut self,
@@ -182,6 +184,8 @@ impl PyMooncakeDistributedStore {
         hugepage_size: Option<usize>,
         eviction_high_watermark_percent: Option<u8>,
         eviction_low_watermark_percent: Option<u8>,
+        max_pending_publications: Option<usize>,
+        max_pending_publication_bytes: Option<u64>,
         route_control: &str,
     ) -> PyResult<i32> {
         let initial_state = parse_initial_state_arg(initial_state)?;
@@ -197,6 +201,8 @@ impl PyMooncakeDistributedStore {
                 local_buffer_size,
                 eviction_high_watermark_percent,
                 eviction_low_watermark_percent,
+                max_pending_publications,
+                max_pending_publication_bytes,
                 protocol: protocol.to_string(),
                 _rdma_devices: rdma_devices.to_string(),
                 transport_rpc_port,
@@ -324,7 +330,7 @@ impl PyMooncakeDistributedStore {
                         if let Some(policy) = policy {
                             request = request.replication(policy);
                         }
-                        client.batch_put(&[request]).map(|_| ())
+                        client.put_request(&request).map(|_| ())
                     })
                 })
                 .map_err(store_error_to_py)?;
@@ -1161,7 +1167,6 @@ impl PyMooncakeDistributedStore {
                     })
                 })
                 .map_err(store_error_to_py)?;
-                dispatcher.untrack_key(&cache_key, cache_tenant.as_deref());
                 dispatcher.invalidate_key(cache_key, cache_tenant);
                 Ok(0)
             }
@@ -1206,7 +1211,6 @@ impl PyMooncakeDistributedStore {
                     })
                 })
                 .map_err(store_error_to_py)?;
-                dispatcher.untrack_keys(&cache_keys, cache_tenant.as_deref());
                 dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(vec![0; key_count])
             }
@@ -1478,9 +1482,17 @@ impl PyMooncakeDistributedStore {
                 }
                 Ok(removed)
             }
-            StoreBackend::Real(_) => Err(PyRuntimeError::new_err(
-                "remove_all is not available for real-mode native store",
-            )),
+            StoreBackend::Real(dispatcher) => {
+                let (status, evicted) =
+                    run_without_gil(move || dispatcher.remove_all_blocking(force))
+                        .map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "real remove_all did not complete (evicted={evicted})"
+                    )));
+                }
+                Ok(evicted)
+            }
         }
     }
 
@@ -2560,6 +2572,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
+                allocation_id: None,
                 owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
                 segment_name: SegmentName::new("segment-z"),
                 offset: Some(64),
@@ -3156,6 +3169,13 @@ mod tests {
         store.enter_standby().expect("standby should succeed");
         store.activate().expect("activate should succeed");
 
+        let dispatcher = store
+            .real_dispatcher()
+            .expect("real dispatcher should remain available");
+        dispatcher
+            .run(|client| client.put("native-evict-all", b"native-payload"))
+            .expect("native write should succeed");
+
         store
             .remove("alpha", false, None)
             .expect("remove should succeed");
@@ -3165,7 +3185,18 @@ mod tests {
                 .expect("batch_remove should succeed"),
             vec![0, 0]
         );
-        assert!(store.remove_all(false).is_err());
+        let evicted = store
+            .remove_all(false)
+            .expect("real remove_all should use native evict-all");
+        assert!(
+            evicted > 0,
+            "native evict-all should evict the direct write"
+        );
+        let native_read = dispatcher.run(|client| client.get("native-evict-all"));
+        assert!(
+            matches!(native_read, Err(StoreError::NotFound(_))),
+            "native evict-all should remove the direct write from DRAM: {native_read:?}"
+        );
         assert!(!store.metrics_text().is_empty());
 
         store.enter_draining().expect("draining should succeed");
