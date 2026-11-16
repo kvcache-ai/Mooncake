@@ -102,6 +102,16 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+    BatchPiecePutStart(const UUID& client_id,
+                       const std::vector<PiecePutStartRequest>& requests,
+                       const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+    BatchPiecePutFinish(const UUID& client_id,
+                        const std::vector<PiecePutFinishRequest>& requests,
+                        const std::string& tenant_id = "default");
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,

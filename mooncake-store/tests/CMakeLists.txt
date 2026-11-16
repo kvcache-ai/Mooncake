@@ -37,6 +37,10 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+add_store_test(piece_put_manager_test piece_put_manager_test.cpp)
+add_store_test(piece_put_retry_test piece_put_retry_test.cpp)
+add_store_test(piece_put_master_test piece_put_master_test.cpp)
+add_store_test(piece_put_integration_test piece_put_integration_test.cpp)
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)

@@ -18,6 +18,7 @@
 #include "config/rpc_protocol_config.h"
 #include "config/rpc_timeout_config.h"
 #include "replica.h"
+#include "piece_put.h"
 #include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
@@ -258,6 +259,12 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys,
                                 const std::string& tenant_id);
+
+    [[nodiscard]] std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+    BatchPiecePutStart(const std::vector<PiecePutStartRequest>& requests);
+
+    [[nodiscard]] std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+    BatchPiecePutFinish(const std::vector<PiecePutFinishRequest>& requests);
 
     /**
      * @brief Starts a put operation

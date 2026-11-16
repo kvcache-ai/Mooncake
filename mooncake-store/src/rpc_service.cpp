@@ -466,6 +466,44 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
+std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+WrappedMasterService::BatchPiecePutStart(
+    const UUID& client_id, const std::vector<PiecePutStartRequest>& requests,
+    const std::string& tenant_id) {
+    auto resolved = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    if (!resolved) {
+        return std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>(
+            requests.size(), tl::unexpected(resolved.error()));
+    }
+    std::vector<tl::expected<PiecePutStartResponse, ErrorCode>> results;
+    results.reserve(requests.size());
+    for (const auto& request : requests) {
+        results.push_back(
+            master_service_.PiecePutStart(client_id, request, *resolved));
+    }
+    return results;
+}
+
+std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+WrappedMasterService::BatchPiecePutFinish(
+    const UUID& client_id, const std::vector<PiecePutFinishRequest>& requests,
+    const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        requests.size(), [&](const TenantId& resolved) {
+            std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+                results;
+            results.reserve(requests.size());
+            for (const auto& request : requests) {
+                results.push_back(master_service_.PiecePutFinish(
+                    client_id, request, resolved));
+            }
+            return results;
+        });
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
@@ -2083,6 +2121,8 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::BatchPiecePutStart,
+        &WrappedMasterService::BatchPiecePutFinish,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
