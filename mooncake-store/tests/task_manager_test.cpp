@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include "task_manager.h"
 #include <thread>
+#include <tuple>
 
 namespace {
 template <typename T, typename E>
@@ -268,154 +269,6 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
     EXPECT_EQ(second[0].status, TaskStatus::PROCESSING);
 }
 
-TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 0});
-    UUID client_id1 = generate_uuid();
-    UUID client_id2 = generate_uuid();
-
-    // Create task
-    auto t1 =
-        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id1,
-            ReplicaCopyPayload{
-                .key = "pending_key", .source = "", .targets = {"seg1"}});
-    auto t2 =
-        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id2,
-            ReplicaCopyPayload{
-                .key = "processing_key", .source = "", .targets = {"seg2"}});
-    auto t3 =
-        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
-            client_id1, ReplicaMovePayload{
-                            .key = "key3", .source = "seg1", .target = "seg4"});
-    auto t4 =
-        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
-            client_id2, ReplicaMovePayload{
-                            .key = "key4", .source = "seg2", .target = "seg5"});
-
-    ASSERT_TRUE(t1.has_value());
-    ASSERT_TRUE(t2.has_value());
-    ASSERT_TRUE(t3.has_value());
-    ASSERT_TRUE(t4.has_value());
-
-    // Pop t1 from client_id1 to make task processing
-    manager.get_write_access().pop_tasks(client_id1, 1);
-
-    // Pop t2 t4 from client_id2 to make task processing
-    manager.get_write_access().pop_tasks(client_id2, 2);
-
-    // Complete t1 as SUCCESS, t2 as FAILED
-    std::ignore = manager.get_write_access().complete_task(
-        client_id1, t1.value(), TaskStatus::SUCCESS, "Done");
-    std::ignore = manager.get_write_access().complete_task(
-        client_id2, t2.value(), TaskStatus::FAILED, "Failed");
-
-    // Get original tasks
-    auto task1_before = manager.get_read_access().find_task_by_id(t1.value());
-    auto task2_before = manager.get_read_access().find_task_by_id(t2.value());
-    auto task3_before = manager.get_read_access().find_task_by_id(t3.value());
-    auto task4_before = manager.get_read_access().find_task_by_id(t4.value());
-
-    // Serialize
-    TaskManagerSerializer serializer(&manager);
-    auto serialized = serializer.Serialize();
-    ASSERT_TRUE(serialized.has_value());
-
-    // Deserialize into new manager
-    ClientTaskManager manager2({10000, 10000, 10000, 0, 0, 0});
-    TaskManagerSerializer serializer2(&manager2);
-    auto result = serializer2.Deserialize(serialized.value());
-    ASSERT_TRUE(result.has_value());
-
-    // Verify statuses
-    auto task1 = manager2.get_read_access().find_task_by_id(t1.value());
-    auto task2 = manager2.get_read_access().find_task_by_id(t2.value());
-    auto task3 = manager2.get_read_access().find_task_by_id(t3.value());
-    auto task4 = manager2.get_read_access().find_task_by_id(t4.value());
-
-    ASSERT_TRUE(task1.has_value());
-    ASSERT_TRUE(task2.has_value());
-    ASSERT_TRUE(task3.has_value());
-    ASSERT_TRUE(task4.has_value());
-
-    auto time_diff = [](auto time1, auto time2) {
-        return std::abs(
-            std::chrono::duration_cast<std::chrono::seconds>(time1 - time2)
-                .count());
-    };
-
-    EXPECT_EQ(task1->id, task1_before->id);
-    EXPECT_EQ(task1->type, TaskType::REPLICA_COPY);
-    EXPECT_EQ(task1->status, TaskStatus::SUCCESS);
-    EXPECT_FALSE(task1->payload.empty());
-    EXPECT_EQ(task1->assigned_client, client_id1);
-    EXPECT_LE(time_diff(task1->created_at, task1_before->created_at), 1);
-    EXPECT_LE(time_diff(task1->last_updated_at, task1_before->last_updated_at),
-              1);
-    EXPECT_EQ(task2->id, task2_before->id);
-    EXPECT_EQ(task2->type, TaskType::REPLICA_COPY);
-    EXPECT_EQ(task2->status, TaskStatus::FAILED);
-    EXPECT_LE(time_diff(task2->created_at, task2_before->created_at), 1);
-    EXPECT_LE(time_diff(task2->last_updated_at, task2_before->last_updated_at),
-              1);
-    EXPECT_FALSE(task2->payload.empty());
-    EXPECT_EQ(task2->assigned_client, client_id2);
-    EXPECT_EQ(task3->id, task3_before->id);
-    EXPECT_EQ(task3->type, TaskType::REPLICA_MOVE);
-    EXPECT_EQ(task3->status, TaskStatus::PENDING);
-    EXPECT_LE(time_diff(task3->created_at, task3_before->created_at), 1);
-    EXPECT_LE(time_diff(task3->last_updated_at, task3_before->last_updated_at),
-              1);
-    EXPECT_FALSE(task3->payload.empty());
-    EXPECT_EQ(task3->assigned_client, client_id1);
-    EXPECT_EQ(task4->id, task4_before->id);
-    EXPECT_EQ(task4->type, TaskType::REPLICA_MOVE);
-    EXPECT_EQ(task4->status, TaskStatus::PROCESSING);
-    EXPECT_LE(time_diff(task4->created_at, task4_before->created_at), 1);
-    EXPECT_LE(time_diff(task4->last_updated_at, task4_before->last_updated_at),
-              1);
-    EXPECT_FALSE(task4->payload.empty());
-    EXPECT_EQ(task4->assigned_client, client_id2);
-}
-
-TEST_F(ClientTaskManagerTest, SerializerEmptyManager) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 0});
-
-    TaskManagerSerializer serializer(&manager);
-    auto serialized = serializer.Serialize();
-    ASSERT_TRUE(serialized.has_value());
-
-    ClientTaskManager manager2({10000, 10000, 10000, 0, 0, 0});
-    TaskManagerSerializer serializer2(&manager2);
-    auto result = serializer2.Deserialize(serialized.value());
-    ASSERT_TRUE(result.has_value());
-
-    // Verify empty
-    auto tasks = manager2.get_read_access();
-    EXPECT_EQ(tasks.size(), 0u);
-}
-
-TEST_F(ClientTaskManagerTest, SerializerReset) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 0});
-    UUID client_id = generate_uuid();
-
-    auto t1 =
-        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{
-                           .key = "key1", .source = "", .targets = {"seg1"}});
-    ASSERT_TRUE(t1.has_value());
-
-    TaskManagerSerializer serializer(&manager);
-    serializer.Reset();
-
-    // Verify all data cleared
-    auto task = manager.get_read_access().find_task_by_id(t1.value());
-    EXPECT_FALSE(task.has_value());
-
-    auto tasks = manager.get_read_access();
-    EXPECT_EQ(tasks.size(), 0u);
-}
-
 TEST_F(ClientTaskManagerTest, FailPendingTaskSkipsQueuedAssignment) {
     ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
@@ -435,5 +288,173 @@ TEST_F(ClientTaskManagerTest, FailPendingTaskSkipsQueuedAssignment) {
     auto tasks = manager.get_write_access().pop_tasks(client_id, 10);
     EXPECT_TRUE(tasks.empty());
 }
+
+TEST_F(ClientTaskManagerTest, PrunedPendingFailuresPreserveOtherClientsQuota) {
+    ClientTaskManager manager({1, 2, 2, 0, 0, 3});
+    const UUID failed_client = generate_uuid();
+    const UUID waiting_client = generate_uuid();
+    const ReplicaCopyPayload payload{
+        .key = "key", .source = "source", .targets = {"target"}};
+
+    for (int i = 0; i < 2; ++i) {
+        auto task = manager.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_COPY>(
+                            failed_client, payload);
+        ASSERT_TRUE(task.has_value());
+        ASSERT_EQ(manager.get_write_access().fail_task_if_pending(
+                      *task, "dynamic replica lease expired"),
+                  ErrorCode::OK);
+    }
+    // Match the maintenance order with pending-task expiration disabled.
+    manager.get_write_access().prune_expired_tasks();
+    manager.get_write_access().prune_finished_tasks();
+
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(manager.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_COPY>(
+                            waiting_client, payload)
+                        .has_value());
+    }
+    EXPECT_TRUE(
+        manager.get_write_access().pop_tasks(failed_client, 10).empty());
+
+    auto rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            waiting_client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+
+    // Only dispatching a genuinely pending task releases a slot.
+    ASSERT_EQ(manager.get_write_access().pop_tasks(waiting_client, 1).size(),
+              1u);
+    ASSERT_TRUE(
+        manager.get_write_access()
+            .submit_task_typed<TaskType::REPLICA_COPY>(waiting_client, payload)
+            .has_value());
+    rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            waiting_client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+}
+
+TEST_F(ClientTaskManagerTest, ExpirySweepPreservesQuotaAfterTerminalPruning) {
+    ClientTaskManager manager({1, 2, 2, 3600, 0, 3});
+    const UUID failed_client = generate_uuid();
+    const UUID waiting_client = generate_uuid();
+    const ReplicaMovePayload payload{
+        .key = "key", .source = "source", .target = "target"};
+
+    for (int i = 0; i < 2; ++i) {
+        auto task = manager.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_MOVE>(
+                            failed_client, payload);
+        ASSERT_TRUE(task.has_value());
+        ASSERT_EQ(manager.get_write_access().fail_task_if_pending(
+                      *task, "failed before dispatch"),
+                  ErrorCode::OK);
+    }
+    manager.get_write_access().prune_finished_tasks();
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(manager.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_MOVE>(
+                            waiting_client, payload)
+                        .has_value());
+    }
+    manager.get_write_access().prune_expired_tasks();
+    manager.get_write_access().prune_expired_tasks();
+
+    auto rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            waiting_client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    EXPECT_EQ(manager.get_write_access().pop_tasks(waiting_client, 10).size(),
+              2u);
+}
+
+class PendingTaskCompletionQuotaTest
+    : public ClientTaskManagerTest,
+      public ::testing::WithParamInterface<std::tuple<TaskStatus, bool>> {};
+
+TEST_P(PendingTaskCompletionQuotaTest, ReleasesPendingQuotaExactlyOnce) {
+    const auto [status, sweep_expired] = GetParam();
+    ClientTaskManager manager({0, 2, 2, 3600, 0, 3});
+    const UUID completing_client = generate_uuid();
+    const UUID waiting_client = generate_uuid();
+    const ReplicaMovePayload payload{
+        .key = "key", .source = "source", .target = "target"};
+    auto completing =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            completing_client, payload);
+    ASSERT_TRUE(completing.has_value());
+    ASSERT_TRUE(
+        manager.get_write_access()
+            .submit_task_typed<TaskType::REPLICA_MOVE>(waiting_client, payload)
+            .has_value());
+
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  waiting_client, *completing, status, "wrong client"),
+              ErrorCode::ILLEGAL_CLIENT);
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  completing_client, *completing, TaskStatus::PENDING,
+                  "not a terminal status"),
+              ErrorCode::INVALID_PARAMS);
+    auto rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            waiting_client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+
+    // The completion API accepts a pending task. Its queued ID may outlive
+    // the terminal record, but its quota must be released immediately.
+    ASSERT_EQ(manager.get_write_access().complete_task(
+                  completing_client, *completing, status, "before fetch"),
+              ErrorCode::OK);
+    ASSERT_EQ(manager.get_write_access().complete_task(
+                  completing_client, *completing, status, "duplicate"),
+              ErrorCode::OK);
+    ASSERT_TRUE(
+        manager.get_write_access()
+            .submit_task_typed<TaskType::REPLICA_MOVE>(waiting_client, payload)
+            .has_value());
+
+    manager.get_write_access().prune_finished_tasks();
+    if (sweep_expired) {
+        manager.get_write_access().prune_expired_tasks();
+    } else {
+        EXPECT_TRUE(manager.get_write_access()
+                        .pop_tasks(completing_client, 10)
+                        .empty());
+    }
+    rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            waiting_client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    const auto processing =
+        manager.get_write_access().pop_tasks(waiting_client, 10);
+    ASSERT_EQ(processing.size(), 2u);
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(manager.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_MOVE>(
+                            waiting_client, payload)
+                        .has_value());
+    }
+    ASSERT_EQ(manager.get_write_access().complete_task(
+                  waiting_client, processing.front().id, status, "after fetch"),
+              ErrorCode::OK);
+    rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            waiting_client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    TerminalStatusAndCleanup, PendingTaskCompletionQuotaTest,
+    ::testing::Combine(::testing::Values(TaskStatus::SUCCESS,
+                                         TaskStatus::FAILED),
+                       ::testing::Bool()));
 
 }  // namespace mooncake

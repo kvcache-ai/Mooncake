@@ -22,7 +22,8 @@ add_executable(
   event_manager_test.cpp
   conductor_service_test.cpp
   wire_types_test.cpp
-  client_server_e2e_test.cpp)
+  client_server_e2e_test.cpp
+  conductor_c_test.cpp)
 
 target_link_libraries(conductor_test PRIVATE conductor_cpp_core
                                              ${CONDUCTOR_GTEST_LIBS})

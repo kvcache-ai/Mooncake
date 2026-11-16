@@ -1302,6 +1302,14 @@ int DummyClient::isExist(const std::string& key) {
     }
 }
 
+int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
+    if (options.prefetch_to_memory) {
+        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
+                << "prefetch_to_memory ignored for key=" << key;
+    }
+    return isExist(key);
+}
+
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
@@ -1333,10 +1341,10 @@ int DummyClient::probeKey(const std::string& key) {
 }
 
 std::vector<int> DummyClient::batchProbeKey(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchProbeKey_internal, bool>(keys.size(),
-                                                                    keys);
+        invoke_batch_rpc<&RealClient::batchProbeKey_internal, bool>(
+            keys.size(), keys, policy);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1350,6 +1358,15 @@ std::vector<int> DummyClient::batchProbeKey(
     }
 
     return results;
+}
+
+std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
+                                           const ExistOptions& options) {
+    if (options.prefetch_to_memory) {
+        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
+                << "prefetch_to_memory ignored";
+    }
+    return batchIsExist(keys);
 }
 
 int64_t DummyClient::getSize(const std::string& key) {

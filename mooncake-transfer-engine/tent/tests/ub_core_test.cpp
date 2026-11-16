@@ -14,16 +14,18 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <thread>
 #include <vector>
 
+#include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
-#include "tent/transport/ub/device_selection.h"
+#include "tent/transport/ub/workers.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -207,6 +209,97 @@ TEST(UbQuotaTest, EnforcesBothLevelsAndReleasesIdempotently) {
     EXPECT_TRUE(quota.tryAcquire(first_path, 60).has_value());
 }
 
+TEST(UbQuotaTest, EndpointGenerationsShareOnePhysicalRailLimit) {
+    QuotaManager quota(/*default_device_limits=*/{200, 4},
+                       /*default_path_limits=*/{60, 1});
+    const auto old_generation = makePath(0, 1, 10);
+    const auto replacement = makePath(0, 1, 11);
+
+    auto old_reservation = quota.tryAcquire(old_generation, 60);
+    ASSERT_TRUE(old_reservation.has_value());
+    EXPECT_FALSE(quota.tryAcquire(replacement, 1).has_value());
+    EXPECT_EQ(quota.pathStats(replacement).usage.inflight_bytes, 60u);
+    ASSERT_EQ(quota.allPathStats().size(), 1u);
+    // Diagnostics follow the newest observed endpoint incarnation even when
+    // its acquisition is rejected by pressure left by the old generation.
+    EXPECT_EQ(quota.allPathStats().front().path.endpoint_generation, 11u);
+
+    EXPECT_TRUE(quota.release(*old_reservation));
+    auto replacement_reservation = quota.tryAcquire(replacement, 60);
+    ASSERT_TRUE(replacement_reservation.has_value());
+    ASSERT_EQ(quota.allPathStats().size(), 1u);
+    EXPECT_EQ(quota.allPathStats().front().path.endpoint_generation, 11u);
+    EXPECT_TRUE(quota.release(*replacement_reservation));
+}
+
+TEST(UbQuotaTest, ScoresProjectedPressureAndFallsBackAtomically) {
+    QuotaManager quota(/*default_device_limits=*/{200, 4},
+                       /*default_path_limits=*/{100, 2});
+    const auto preferred = makePath(0, 1, 1);
+    const auto alternate = makePath(0, 2, 1);
+
+    auto first = quota.tryAcquire(preferred, 50);
+    ASSERT_TRUE(first.has_value());
+    const auto preferred_pressure = quota.availability(preferred, 50);
+    const auto alternate_pressure = quota.availability(alternate, 50);
+    ASSERT_TRUE(preferred_pressure.can_acquire);
+    ASSERT_TRUE(alternate_pressure.can_acquire);
+    EXPECT_DOUBLE_EQ(preferred_pressure.normalized_inflight, 1.0);
+    EXPECT_DOUBLE_EQ(alternate_pressure.normalized_inflight, 0.5);
+
+    auto fill_preferred = quota.tryAcquire(preferred, 50);
+    ASSERT_TRUE(fill_preferred.has_value());
+    EXPECT_FALSE(quota.availability(preferred, 1).can_acquire);
+
+    // Preflight selection can race with another worker. The ordered commit
+    // must skip the now-full first rail and reserve the alternate rail while
+    // holding one quota lock.
+    auto selected = quota.tryAcquireFirst({preferred, alternate}, 50);
+    ASSERT_TRUE(selected.has_value());
+    EXPECT_EQ(selected->path, alternate);
+    EXPECT_EQ(quota.pathStats(preferred).rejected_acquisitions, 1U);
+    EXPECT_EQ(quota.aggregateStats().rejected_acquisitions, 0U);
+
+    EXPECT_TRUE(quota.release(*first));
+    EXPECT_TRUE(quota.release(*fill_preferred));
+    EXPECT_TRUE(quota.release(*selected));
+}
+
+TEST(UbPathSelectionScoreTest, AppliesCapacityLocalityPressureAndBandwidth) {
+    UbPathSelectionScore base;
+    base.quota_available = true;
+    base.topology_rank = 0;
+    base.normalized_inflight = 0.5;
+    base.normalized_quota_wrs = 0.5;
+    base.endpoint_outstanding_wrs = 2;
+    base.endpoint_outstanding_bytes = 128;
+    base.has_bandwidth_sample = true;
+    base.ewma_bandwidth_bytes_per_second = 100.0;
+
+    auto saturated = base;
+    saturated.quota_available = false;
+    saturated.topology_rank = 0;
+    saturated.normalized_inflight = 0.0;
+    EXPECT_TRUE(betterUbPathScore(base, saturated));
+
+    auto farther = base;
+    farther.topology_rank = 1;
+    farther.normalized_inflight = 0.0;
+    EXPECT_TRUE(betterUbPathScore(base, farther));
+
+    auto busier = base;
+    busier.normalized_inflight = 0.75;
+    EXPECT_TRUE(betterUbPathScore(base, busier));
+
+    auto endpoint_busier = base;
+    endpoint_busier.endpoint_outstanding_wrs = 3;
+    EXPECT_TRUE(betterUbPathScore(base, endpoint_busier));
+
+    auto slower = base;
+    slower.ewma_bandwidth_bytes_per_second = 50.0;
+    EXPECT_TRUE(betterUbPathScore(base, slower));
+}
+
 TEST(UbRailMonitorTest, PausesOnErrorWindowAndRecoversAfterCooldown) {
     RailMonitor monitor(RailMonitorConfig{/*error_threshold=*/2,
                                           /*error_window_ns=*/100,
@@ -358,6 +451,102 @@ TEST(UbDeviceSelectionTest, EmptyInputStaysEmpty) {
     const auto selected =
         preferBondingDevicesIfPresent({}, /*explicit_filter=*/false);
     EXPECT_TRUE(selected.empty());
+}
+
+TEST(UbRailMonitorTest, EndpointRebuildTelemetryDeduplicatesGeneration) {
+    RailMonitor monitor;
+    const auto first = makePath(0, 1, 10);
+    const auto replacement = makePath(0, 1, 11);
+
+    // The first ready generation is the rail's initial build, not a rebuild,
+    // so it seeds the watermark without advancing telemetry.
+    EXPECT_FALSE(monitor.recordEndpointRebuild(first, 100));
+    EXPECT_FALSE(monitor.recordEndpointRebuild(first, 101));
+    EXPECT_TRUE(monitor.recordEndpointRebuild(replacement, 102));
+    // A late callback for an older incarnation cannot double count it.
+    EXPECT_FALSE(monitor.recordEndpointRebuild(first, 103));
+
+    const auto stats = monitor.stats(replacement, 103);
+    EXPECT_EQ(stats.endpoint_rebuilds, 1U);
+    EXPECT_EQ(stats.latest_endpoint_generation, 11U);
+}
+
+TEST(UbRailMonitorTest, RebuildBaselineIsPerRail) {
+    RailMonitor monitor;
+    const auto rail_a = makePath(0, 1, 5);
+    const auto rail_b = makePath(0, 2, 9);
+
+    EXPECT_FALSE(monitor.recordEndpointRebuild(rail_a, 100));
+    EXPECT_FALSE(monitor.recordEndpointRebuild(rail_b, 101));
+    EXPECT_TRUE(monitor.recordEndpointRebuild(makePath(0, 1, 6), 102));
+
+    EXPECT_EQ(monitor.stats(rail_a, 102).endpoint_rebuilds, 1U);
+    EXPECT_EQ(monitor.stats(rail_b, 102).endpoint_rebuilds, 0U);
+}
+
+TEST(UbRailMonitorTest, StatsIfPresentDoesNotCreateOrSeedRails) {
+    RailMonitor monitor;
+    const auto unknown = makePath(0, 3, 1);
+
+    const auto before = monitor.statsIfPresent(unknown, 100);
+    EXPECT_FALSE(before.paused);
+    EXPECT_LT(before.ewma_bandwidth_bytes_per_second, 0.0);
+    EXPECT_EQ(monitor.pathCount(), 0U);
+
+    // A real record still creates the rail and a non-creating lookup then
+    // returns that state.
+    monitor.recordError(makePath(0, 1, 7), 101);
+    EXPECT_EQ(monitor.pathCount(), 1U);
+    EXPECT_EQ(monitor.statsIfPresent(makePath(0, 1, 7), 101).completion_errors,
+              1U);
+    EXPECT_EQ(monitor.statsIfPresent(unknown, 101).completion_errors, 0U);
+    EXPECT_EQ(monitor.pathCount(), 1U);
+}
+
+TEST(UbRailSelectionTest, AttemptOrderTakesOneRailPerLocalDevice) {
+    // Pre-score order puts both rails of device 0 above device 1's, which is
+    // what a cold peer with no quota pressure looks like.
+    const std::vector<Topology::NicID> ids{0, 0, 1, 1};
+    const auto order = ubResolutionAttemptOrder(ids);
+    ASSERT_EQ(order.size(), 4U);
+    // Device 0's best rail first, then device 1's, before device 0's second
+    // rail: the first two attempts must not share a device.
+    EXPECT_EQ(order[0], 0U);
+    EXPECT_EQ(order[1], 2U);
+    EXPECT_EQ(order[2], 1U);
+    EXPECT_EQ(order[3], 3U);
+}
+
+TEST(UbRailSelectionTest, AttemptOrderCoversEveryLocalDevice) {
+    const std::vector<Topology::NicID> ids{0, 0, 1, 1, 2, 2, 3, 3};
+    const auto order = ubResolutionAttemptOrder(ids);
+    ASSERT_EQ(order.size(), 8U);
+    EXPECT_EQ(order[0], 0U);
+    EXPECT_EQ(order[1], 2U);
+    EXPECT_EQ(order[2], 4U);
+    EXPECT_EQ(order[3], 6U);
+    // The resolve limit for four local devices is four, so every device is
+    // represented before any device gets a second candidate.
+    for (size_t index = 0; index < 4; ++index) {
+        EXPECT_EQ(ids[order[index]], static_cast<Topology::NicID>(index));
+    }
+}
+
+TEST(UbRailSelectionTest, SingleDeviceKeepsPreScoreOrder) {
+    const std::vector<Topology::NicID> ids{7, 7, 7};
+    // With one device there is nothing to spread across, so the attempt order
+    // is the pre-score order and the caller's floor of two candidates takes two
+    // rails on that device.
+    EXPECT_EQ(ubResolutionAttemptOrder(ids), (std::vector<size_t>{0, 1, 2}));
+}
+
+TEST(UbRailSelectionTest, AttemptOrderVisitsEveryRailExactlyOnce) {
+    const std::vector<Topology::NicID> ids{3, 1, 3, 2, 1};
+    const auto order = ubResolutionAttemptOrder(ids);
+    ASSERT_EQ(order.size(), ids.size());
+    for (size_t index = 0; index < ids.size(); ++index) {
+        EXPECT_EQ(std::count(order.begin(), order.end(), index), 1);
+    }
 }
 
 }  // namespace

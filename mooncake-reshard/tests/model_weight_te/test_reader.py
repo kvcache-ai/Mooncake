@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
 from mooncake.reshard.weight.te import (
     MooncakeTransferEngineReader,
     TransferCompletionUnknownError,
@@ -11,12 +10,14 @@ from mooncake.reshard.weight.te import (
 )
 
 from .helpers import (
-    allocation_guards_for_bindings,
-    allocation_guards,
+    FakeAsyncScatterTransferEngine,
     FakeBatchTransferTicket,
     FakeScatterTransferEngine,
     FakeTransferEngine,
     RuntimeInputs,
+    allocation_guards,
+    allocation_guards_for_bindings,
+    execute_reader,
     manifests,
     multi_worker_participant_inputs,
     participant_inputs,
@@ -24,6 +25,30 @@ from .helpers import (
     registration_leases,
     with_fragment_address,
 )
+
+
+def test_reader_bounds_inflight_batches_across_source_endpoints() -> None:
+    source = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=1, prefix="target", address_base=0x40000)
+    engine = FakeAsyncScatterTransferEngine()
+    reader = MooncakeTransferEngineReader(
+        engine,
+        max_batch_operations=1,
+        max_inflight_batches=2,
+    )
+
+    receipts = execute_reader(
+        reader,
+        plan_transfer_to_local_target(source, target),
+        source,
+        target,
+        source_registrations=registration_leases(source),
+    )
+
+    assert len(receipts) == 2
+    assert engine.peak_active_tickets == 2
+    assert engine.active_tickets == 0
+    assert [direction for direction, _ in engine.scatter_calls] == ["read", "read"]
 
 
 def test_te_reader_pulls_local_target_ranges_without_source_rpc() -> None:

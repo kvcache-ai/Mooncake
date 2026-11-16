@@ -116,6 +116,8 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_XPU (14)
 #define TRANSPORT_HYLINK (15)
 #define TRANSPORT_FABRIC (16)
+#define TRANSPORT_MLU (17)
+#define TRANSPORT_MEMFABRIC (18)
 
 struct tent_memory_options {
     char location[64];
@@ -174,8 +176,11 @@ int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
 int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
                      const char* name, const char* message);
 
+/* Free the previous result before reusing info. Successful empty polls return
+ * zero records and a null pointer. */
 int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info);
 
+/* Release records and reset info so it can be reused or freed again. */
 void tent_free_notifs(tent_notifi_info* info);
 
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
@@ -348,6 +353,17 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    // Blocks until every task in the batch terminates. status_list gets one
+    // entry per request; with a null status_list, a task that did not complete
+    // fails the call. On timeout the queued tasks are canceled and in-flight
+    // tasks are asked to stop; without status_list the call returns TimedOut,
+    // so the caller must confirm the tasks stopped before reusing the buffers.
+    // A PENDING entry means the engine may still touch that request's memory
+    // (0 waits forever). The batch stays owned by the caller.
+    Status waitTransfer(BatchID batch_id,
+                        std::vector<TransferStatus>* status_list = nullptr,
+                        uint64_t timeout_ms = 0);
 
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit
