@@ -1188,7 +1188,7 @@ void TransferEngineImpl::releaseMemoryRegions(
 }
 
 bool TransferEngineImpl::lookupLocalRegionLength(void* addr,
-                                                   uint64_t* length) const {
+                                                 uint64_t* length) const {
     if (!addr || !length) return false;
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = local_memory_regions_.find(reinterpret_cast<uintptr_t>(addr));
