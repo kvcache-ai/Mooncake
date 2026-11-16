@@ -2243,6 +2243,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     .collect();
             }
         };
+        let refreshed_readable_runtimes = ReadableRuntimeRefresh::new();
         let mut results: Vec<Vec<Vec<i64>>> = Vec::with_capacity(buffer_count);
 
         for i in 0..buffer_count {
@@ -2272,6 +2273,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                             cached.clone(),
                             &local_segments,
                             &readable_runtimes,
+                            &refreshed_readable_runtimes,
                         )
                     } else {
                         let route =
@@ -2284,6 +2286,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                                         route,
                                         &local_segments,
                                         &readable_runtimes,
+                                        &refreshed_readable_runtimes,
                                     )
                                 });
                         if route.is_err() {

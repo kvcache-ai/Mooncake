@@ -146,6 +146,7 @@ impl HotPathBlockedMetadataBackend {
 struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
+    fail_live_client_list: AtomicBool,
     get_object_route_calls: AtomicUsize,
     upsert_client_lease_calls: AtomicUsize,
     update_client_state_calls: AtomicUsize,
@@ -505,6 +506,7 @@ impl CountingMetadataBackend {
         Self {
             inner,
             list_live_clients_calls: AtomicUsize::new(0),
+            fail_live_client_list: AtomicBool::new(false),
             get_object_route_calls: AtomicUsize::new(0),
             upsert_client_lease_calls: AtomicUsize::new(0),
             update_client_state_calls: AtomicUsize::new(0),
@@ -1781,6 +1783,11 @@ impl MetadataBackend for CountingMetadataBackend {
 
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
         self.list_live_clients_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_live_client_list.load(Ordering::Relaxed) {
+            return Err(StoreError::Metadata(
+                "injected membership failure".to_string(),
+            ));
+        }
         self.visible_live_clients()
     }
 
@@ -18206,6 +18213,272 @@ fn drain_migration_updates_object_route_without_refreshing_draining_authority() 
         "object route facade must stop advertising the evacuated replica"
     );
     assert_eq!(writer.get(key).expect("migrated value should read"), value);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MembershipReadPath {
+    Single,
+    Batch,
+    Readable,
+    Ranges,
+}
+
+struct MembershipReadFixture {
+    metadata: Arc<CountingMetadataBackend>,
+    stores: [StoreClient; 2],
+    reader: StoreClient,
+    stale_membership: Vec<ClientLease>,
+    keys: Vec<String>,
+}
+
+impl MembershipReadFixture {
+    const PAYLOAD: &'static [u8] = b"membership-read-payload";
+
+    fn new() -> Self {
+        let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let transport = TestTransport::new("membership-read-segment");
+        let build = |name: &str, storage: bool, state| {
+            StoreClientBuilder::new(metadata.clone(), name)
+                .state(state)
+                .label("pool", "pool-a")
+                .label("storage", if storage { "true" } else { "false" })
+                .route_control(RouteControlMode::MetadataOnly)
+                .live_client_sync_interval(Duration::ZERO)
+                .transport(Arc::new(transport.peer(&format!("{name}-segment"))))
+                .local_memory(if storage {
+                    storage_config_with_bytes(65536)
+                } else {
+                    rw_only_config()
+                })
+                .build(test_future_expiry_ms())
+                .unwrap()
+        };
+        let mut store_a = build("membership-read-a", true, ClientLifecycleState::Standby);
+        let store_b = build("membership-read-b", true, ClientLifecycleState::Active);
+        let mut reader = build(
+            "membership-read-reader",
+            false,
+            ClientLifecycleState::Active,
+        );
+        for client in [&store_a, &store_b, &reader] {
+            client.register_local_memory().unwrap();
+            client.live_clients_snapshot(true).unwrap();
+        }
+        let stale_membership = reader.live_clients_snapshot(true).unwrap();
+        store_a.activate().unwrap();
+        reader.live_clients_snapshot(true).unwrap();
+        let policy = ReplicationPolicy::new()
+            .replica_count(2)
+            .prefer_local(false)
+            .preferred_storage_owners([
+                store_a.runtime_id().storage_key(),
+                store_b.runtime_id().storage_key(),
+            ]);
+        // Guarantee that healthy reads exercise non-primary load balancing.
+        let keys = (0..256)
+            .map(|i| format!("membership-read-key-{i}"))
+            .filter(|key| {
+                super::replica_balance_hash(
+                    &reader.runtime_id().stable_id.0,
+                    &format!("default::{key}"),
+                ) % 2
+                    == 1
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 8);
+        for key in &keys {
+            let route = reader.put_with_policy(key, Self::PAYLOAD, &policy).unwrap();
+            assert_eq!(route.replicas[0].owner, *store_a.runtime_id());
+            assert_eq!(route.replicas[1].owner, *store_b.runtime_id());
+        }
+        // Isolate foreground read counts from queued writes and hit-report callbacks.
+        reader.async_replica_tracking.shutdown();
+        reader.async_route_hit_reporting.shutdown();
+        Self {
+            metadata,
+            stores: [store_a, store_b],
+            reader,
+            stale_membership,
+            keys,
+        }
+    }
+
+    fn read(&self, path: MembershipReadPath) {
+        let objects = self
+            .keys
+            .iter()
+            .map(|key| ObjectRef::new(key))
+            .collect::<Vec<_>>();
+        match path {
+            MembershipReadPath::Single => {
+                for key in &self.keys {
+                    assert_eq!(self.reader.get(key).unwrap(), Self::PAYLOAD);
+                }
+            }
+            MembershipReadPath::Batch => {
+                assert_eq!(
+                    self.reader.batch_get(&objects).unwrap(),
+                    vec![Self::PAYLOAD.to_vec(); self.keys.len()]
+                );
+            }
+            MembershipReadPath::Readable => {
+                assert_eq!(
+                    self.reader.batch_is_readable(&objects).unwrap(),
+                    vec![true; self.keys.len()]
+                );
+            }
+            MembershipReadPath::Ranges => {
+                let len = Self::PAYLOAD.len();
+                let mut buffer = vec![0u8; len * self.keys.len()];
+                let pointer = buffer.as_mut_ptr();
+                self.reader
+                    .register_buffer(pointer.cast(), buffer.len())
+                    .unwrap();
+                let keys = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
+                let offsets = (0..keys.len()).map(|i| [i * len]).collect::<Vec<_>>();
+                let offsets = offsets
+                    .iter()
+                    .map(|offset| offset.as_slice())
+                    .collect::<Vec<_>>();
+                let zeros = [0];
+                let sizes = [len];
+                let sources = vec![zeros.as_slice(); keys.len()];
+                let lengths = vec![sizes.as_slice(); keys.len()];
+                let result = unsafe {
+                    self.reader.get_into_ranges(
+                        "default",
+                        &[pointer],
+                        &[buffer.len()],
+                        &[keys.as_slice()],
+                        &[offsets.as_slice()],
+                        &[sources.as_slice()],
+                        &[lengths.as_slice()],
+                    )
+                };
+                self.reader
+                    .unregister_buffer(pointer.cast(), buffer.len())
+                    .unwrap();
+                assert_eq!(result, vec![vec![vec![len as i64]; keys.len()]]);
+                assert_eq!(buffer, Self::PAYLOAD.repeat(keys.len()));
+            }
+        }
+    }
+
+    fn assert_replicas(&self, count: usize) {
+        for key in &self.keys {
+            let route = self.reader.query_route(key).unwrap().unwrap();
+            assert_eq!(route.replicas.len(), count, "route for {key}");
+            if count == 1 {
+                assert_eq!(route.replicas[0].owner, *self.stores[1].runtime_id());
+            }
+        }
+    }
+}
+
+#[test]
+fn healthy_replicated_reads_do_not_refresh_membership() {
+    let fixture = MembershipReadFixture::new();
+    for path in [
+        MembershipReadPath::Single,
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            0,
+            "{path:?}"
+        );
+        fixture.assert_replicas(2);
+    }
+}
+
+#[test]
+fn batch_read_pruning_refreshes_membership_once() {
+    for path in [
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let fixture = MembershipReadFixture::new();
+        fixture
+            .metadata
+            .update_client_state(
+                fixture.stores[0].runtime_id(),
+                ClientLifecycleState::Offline,
+            )
+            .unwrap();
+        fixture.reader.live_clients_snapshot(true).unwrap();
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            1,
+            "{path:?}"
+        );
+        fixture.assert_replicas(1);
+    }
+}
+
+#[test]
+fn batch_read_pruning_preserves_routes_when_membership_refresh_fails() {
+    for path in [
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let fixture = MembershipReadFixture::new();
+        fixture
+            .reader
+            .live_client_cache
+            .lock()
+            .store(fixture.stale_membership.clone());
+        fixture
+            .metadata
+            .fail_live_client_list
+            .store(true, Ordering::Relaxed);
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            1,
+            "{path:?}"
+        );
+        fixture.assert_replicas(2);
+        fixture
+            .metadata
+            .fail_live_client_list
+            .store(false, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn batch_reads_refresh_missing_membership_once() {
+    for path in [
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let fixture = MembershipReadFixture::new();
+        fixture
+            .reader
+            .live_client_cache
+            .lock()
+            .store(vec![fixture.reader.lease().clone()]);
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            1,
+            "{path:?}"
+        );
+        fixture.assert_replicas(2);
+    }
 }
 
 #[test]
