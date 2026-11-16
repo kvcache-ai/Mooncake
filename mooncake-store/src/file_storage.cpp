@@ -1778,8 +1778,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     int total_batches = 0;
     int total_failures = 0;
     // Reset the scan iterator so ScanMeta starts from the beginning.
-    // BucketStorageBackend uses cursor-based iteration (next_bucket_);
-    // after Init() completes the cursor is 0 and HasNext() returns false,
+    // BucketStorageBackend uses cursor-based iteration; after Init() completes
+    // the cursor is exhausted and HasNext() returns false,
     // which would make ScanMeta skip all buckets.
     storage_backend_->ResetScanIterator();
     LOG(INFO) << "ReRegisterOffloadedObjects: about to call "

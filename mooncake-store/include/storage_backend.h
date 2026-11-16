@@ -841,6 +841,11 @@ struct DiskState {
 
 class BucketStorageBackend : public StorageBackendInterface {
    public:
+    struct ScanCursor {
+        int64_t bucket_id;
+        size_t key_index;
+    };
+
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
@@ -929,7 +934,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void ResetScanIterator() override {
         MutexLocker locker(&iterator_mutex_);
-        next_bucket_ = -1;
+        next_scan_ = {-1, 0};
     }
 
     void SetDiskErrorObserver(DiskErrorObserver observer) override {
@@ -980,21 +985,22 @@ class BucketStorageBackend : public StorageBackendInterface {
     size_t UngroupedOffloadingObjectsSize() const;
 
     /**
-     * @brief Iterate over the metadata of stored objects starting from a
-     * specified bucket.
-     * @param bucket_id The ID of the bucket to start scanning from.
-     * @param keys          Output vector to receive object keys
-     * @param metadatas     Output vector to receive object metadata
-     * @param buckets       Output vector to receive corresponding destination
-     * bucket IDs
-     * @param limit         Maximum number of entries to return in this call
-     * @return tl::expected<int64_t, ErrorCode>
-     * - On success: the bucket ID where the next iteration should start  (or 0
-     * if all data has been scanned).
-     * - On failure: returns an error code (e.g., BUCKET_NOT_FOUND, IO_ERROR).
+     * @brief Iterate over stored object metadata from the given cursor,
+     * continuing inside a bucket when the batch limit is reached.
+     * @param cursor The bucket ID and key index to start scanning from.
+     * @param keys Output vector to receive object keys.
+     * @param metadatas Output vector to receive metadata corresponding to keys.
+     * @param buckets Output vector to receive IDs of buckets included in the
+     * batch.
+     * @param limit Maximum number of keys in the output batch; must be
+     * positive.
+     * @return tl::expected<ScanCursor, ErrorCode>
+     * - On success: the bucket ID and key index for the next batch, or
+     * bucket_id == 0 if all data has been scanned.
+     * - On failure: INVALID_PARAMS if limit is nonpositive.
      */
-    tl::expected<int64_t, ErrorCode> BucketScan(
-        int64_t bucket_id, std::vector<std::string>& keys,
+    tl::expected<ScanCursor, ErrorCode> BucketScan(
+        ScanCursor cursor, std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas,
         std::vector<int64_t>& buckets, int64_t limit);
 
@@ -1351,7 +1357,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
-    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+    ScanCursor GUARDED_BY(iterator_mutex_) next_scan_{-1, 0};
     BucketBackendConfig bucket_backend_config_;
 
     mutable Mutex offloading_mutex_;
