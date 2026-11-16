@@ -3973,9 +3973,8 @@ void waitBeforeNextPoll(uint64_t poll_count) {
 }
 
 namespace {
-// Frees the batch on every exit unless reset() already did. The wait loops
-// below leave through CHECK_STATUS early returns that used to skip freeBatch()
-// and leak the Batch slab with whatever SubBatches it held.
+// Drain before freeing on every synchronous exit, including submit/wait errors.
+// A terminal task status alone does not prove that buffer access has stopped.
 class BatchGuard {
    public:
     BatchGuard(TransferEngineImpl& engine, BatchID batch_id)
@@ -3992,6 +3991,12 @@ class BatchGuard {
 
     Status reset() {
         if (!batch_id_) return Status::OK();
+        for (uint64_t polls = 0;; ++polls) {
+            bool drained = false;
+            auto result = engine_.isBatchDrained(batch_id_, drained);
+            if (result.ok() && drained) break;
+            waitBeforeNextPoll(polls);
+        }
         auto batch_id = batch_id_;
         batch_id_ = 0;
         return engine_.freeBatch(batch_id);
@@ -4065,12 +4070,6 @@ Status TransferEngineImpl::waitTransfer(
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
     BatchGuard batch_guard(*this, batch_id);
     auto status = waitTransfer(batch_id);
-    for (uint64_t polls = 0;; ++polls) {
-        bool drained = false;
-        auto result = isBatchDrained(batch_id, drained);
-        if (result.ok() && drained) break;
-        waitBeforeNextPoll(polls);
-    }
     (void)batch_guard.reset();
     return status;
 }
