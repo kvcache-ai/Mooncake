@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -833,6 +834,52 @@ TEST_F(RedisGracefulShutdownTest,
                                 .service_state = P2PClientServiceState::ONLINE})
                     .has_value());
 
+    // Registration is asynchronous. Wait for its commit before pausing Redis:
+    // advancing latest holds the writer queue mutex, so pausing an unfinished
+    // registration can block PublishRoute until the pause has already expired.
+    coro_http::coro_http_client http;
+    const std::string status_url =
+        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
+        "/ha/status";
+    HAStatusSnapshot status;
+    const auto status_timeout = std::chrono::seconds(5);
+    const auto setup_deadline =
+        std::chrono::steady_clock::now() + status_timeout;
+    while (std::chrono::steady_clock::now() < setup_deadline) {
+        const auto remaining =
+            setup_deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            break;
+        }
+        // Connect and request timers run sequentially; share the budget.
+        http.set_conn_timeout(remaining / 2);
+        http.set_req_timeout(remaining / 2);
+        auto response = http.get(status_url);
+        ASSERT_EQ(response.status, 200)
+            << response.net_err.message() << ", body=" << response.resp_body;
+        struct_json::from_json(status, response.resp_body);
+        // This fresh cluster's first write is the registration above.
+        if (status.oplog_writer_last_committed_sequence_id > 0 &&
+            status.oplog_writer_pending_writes == 0) {
+            break;
+        }
+        std::this_thread::sleep_until(std::min(
+            setup_deadline,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+    }
+    ASSERT_LT(std::chrono::steady_clock::now(), setup_deadline)
+        << "Registration status exceeded the setup deadline, committed="
+        << status.oplog_writer_last_committed_sequence_id
+        << ", pending=" << status.oplog_writer_pending_writes;
+    ASSERT_TRUE(status.oplog_writer_running);
+    ASSERT_GT(status.oplog_writer_last_committed_sequence_id, 0u)
+        << "Registration must be committed before pausing Redis";
+    ASSERT_EQ(status.oplog_writer_pending_writes, 0u)
+        << "Setup writes must drain before pausing Redis";
+    // The post-publish read must not inherit the last poll's remaining budget.
+    http.set_conn_timeout(status_timeout);
+    http.set_req_timeout(status_timeout);
+
     auto [host, port] = ParseRedisEndpoint();
     auto ctx = std::unique_ptr<redisContext, decltype(&redisFree)>(
         redisConnect(host.c_str(), port), redisFree);
@@ -843,6 +890,7 @@ TEST_F(RedisGracefulShutdownTest,
     // 3s command/drain timeout and the 10s lease. RPC and cached HTTP status
     // remain live, so an acknowledgement with pending writes proves that the
     // request has returned before persistence, without client-side republish.
+    const auto pause_started = std::chrono::steady_clock::now();
     RedisReplyPtr paused(
         (redisReply*)redisCommand(ctx.get(), "CLIENT PAUSE 2000"));
     ASSERT_TRUE(paused && paused->type == REDIS_REPLY_STATUS);
@@ -853,14 +901,15 @@ TEST_F(RedisGracefulShutdownTest,
                                    .client_id = client_id,
                                    .segment_id = segment.id})
                     .has_value());
-    coro_http::coro_http_client http;
-    auto response = http.get(
-        "http://127.0.0.1:" + std::to_string(kMetricsPortBase + leader) +
-        "/ha/status");
+    auto response = http.get(status_url);
     ASSERT_EQ(response.status, 200);
-    HAStatusSnapshot status;
     struct_json::from_json(status, response.resp_body);
-    ASSERT_GT(status.oplog_writer_pending_writes, 0u);
+    ASSERT_GT(status.oplog_writer_pending_writes, 0u)
+        << "elapsed since Redis pause (ms)="
+        << std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - pause_started)
+               .count()
+        << ", status=" << response.resp_body;
 
     ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(8)));
     EXPECT_TRUE(WaitForMasterLogOrderSince(
