@@ -298,7 +298,7 @@ TEST_F(PruningTest, MissingObjectArtifactDoesNotAdvanceFloorOrDeleteLog) {
     }
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values.at(floor_key));
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, ObjectArtifactsWithoutChecksumsAreReadBackBeforePruning) {
@@ -312,7 +312,7 @@ TEST_F(PruningTest, ObjectArtifactsWithoutChecksumsAreReadBackBeforePruning) {
         ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", "10-101")};
     EXPECT_EQ(expected, store.downloaded_keys);
     EXPECT_EQ("10", backend.values.at(floor_key));
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, ObjectReadbackFailurePreservesFloorAndLog) {
@@ -343,7 +343,7 @@ TEST_F(PruningTest, ObjectReadbackFailurePreservesFloorAndLog) {
 
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values.at(floor_key));
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
