@@ -33,6 +33,10 @@ const static std::string GPU_PREFIX = "maca:";
 #define cuMemUnmap mcMemUnmap
 #define cuPointerGetAttribute mcPointerGetAttribute
 
+#define cudaDeviceProp mcDeviceProp_t
+#define cudaGetDeviceProperties mcGetDeviceProperties
+#define cudaErrorDeviceUninitialized mcErrorDeviceUninitialized
+
 #define CUDA_SUCCESS mcSuccess
 #define CUDA_ERROR_NOT_PERMITTED mcErrorNotPermitted
 #define CUDA_ERROR_NOT_SUPPORTED mcErrorNotSupported
