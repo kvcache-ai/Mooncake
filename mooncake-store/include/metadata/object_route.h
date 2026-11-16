@@ -41,6 +41,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -57,6 +58,10 @@
 #include <vector>
 
 #include <boost/intrusive/list.hpp>
+#include <boost/version.hpp>
+#if BOOST_VERSION >= 108100
+#include <boost/unordered/unordered_node_map.hpp>
+#endif
 #include <glog/logging.h>
 
 #include "common/shrink_buckets.h"
@@ -219,12 +224,21 @@ class KeySlot {
 };
 
 // Each slot is built in its map node and stays there while the map grows, so a
-// slot's address and its key's are stable.
+// slot's address and its key's are stable. Boost.Unordered's node map (1.81+)
+// keeps node stability while rehashing over a flat metadata array instead of
+// chasing heap node chains under the exclusive stripe lock.
+#if BOOST_VERSION >= 108100
+using SlotMap =
+    boost::unordered_node_map<std::string, KeySlot, TransparentStringHash,
+                              std::equal_to<>>;
+#else
 using SlotMap = std::unordered_map<std::string, KeySlot, TransparentStringHash,
                                    std::equal_to<>>;
+#endif
 
 // One of a route's stripes: a share of its slots under one lock.
-struct Stripe {
+// Cacheline-aligned so adjacent stripe locks do not false-share across sockets.
+struct alignas(64) Stripe {
     mutable std::shared_mutex lock;
     SlotMap slots;
 };
@@ -423,7 +437,9 @@ class ObjectRoute {
     // A stripe's map rehashes under its exclusive lock, which stalls every
     // reader of the stripe, and a batch read touches every stripe. Many
     // small stripes keep each stall short.
-    static constexpr size_t kStripeCount = 1024;
+    static constexpr size_t kStripeCount = 4096;
+    static_assert(std::has_single_bit(kStripeCount),
+                  "kStripeCount must be a power of two");
 
     // `observer`, when set, outlives the route; it hears of read releases
     // only when `report_reads` is set.
@@ -470,6 +486,15 @@ class ObjectRoute {
     // The key held exclusively whether or not it holds an object, so the
     // caller can publish one.
     [[nodiscard]] WriteGuard WriteKey(std::string_view key);
+
+    // Software prefetch hint for batch loops walking keys sequentially.
+    void Prefetch(std::string_view key) const noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(&StripeOf(key), 0, 1);
+#else
+        (void)key;
+#endif
+    }
 
     // Whether `key` holds an object right now. It takes the key's lock, so a
     // caller already holding that key must not ask.
@@ -528,10 +553,10 @@ class ObjectRoute {
     friend class Guard;
     friend struct test::ObjectRouteTestPeer;
 
-    [[nodiscard]] static size_t StripeIndex(std::string_view key) {
-        return TransparentStringHash{}(key) % kStripeCount;
+    [[nodiscard]] static size_t StripeIndex(std::string_view key) noexcept {
+        return TransparentStringHash{}(key) & (kStripeCount - 1);
     }
-    [[nodiscard]] Stripe& StripeOf(std::string_view key) const {
+    [[nodiscard]] Stripe& StripeOf(std::string_view key) const noexcept {
         return stripes_[StripeIndex(key)];
     }
 
@@ -567,8 +592,16 @@ class ObjectRoute {
     // How many cursors are open on the route, counted in debug builds only
     // so that the destructor can catch one. It exists in every build, so the
     // route's layout does not depend on NDEBUG.
+    struct StripeArray {
+        std::unique_ptr<Stripe[]> data =
+            std::make_unique<Stripe[]>(kStripeCount);
+        Stripe& operator[](size_t i) const noexcept { return data[i]; }
+        Stripe* begin() const noexcept { return data.get(); }
+        Stripe* end() const noexcept { return data.get() + kStripeCount; }
+    };
+
     mutable std::atomic<uint32_t> live_cursors_{0};
-    mutable std::array<Stripe, kStripeCount> stripes_;
+    mutable StripeArray stripes_;
     // Group membership and the one shared Lease per group.
     GroupIndex groups_;
 };

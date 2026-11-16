@@ -303,6 +303,12 @@ target_link_libraries(
           yalantinglibs::yalantinglibs)
 add_test(NAME parallel_eviction_test COMMAND parallel_eviction_test)
 set_tests_properties(parallel_eviction_test PROPERTIES TIMEOUT 90)
+add_executable(batch_hotpath_test batch_hotpath_test.cpp)
+target_link_libraries(
+  batch_hotpath_test PRIVATE mooncake_store_master cachelib_memory_allocator
+                             glog::glog gtest_main yalantinglibs::yalantinglibs)
+add_test(NAME batch_hotpath_test COMMAND batch_hotpath_test)
+set_tests_properties(batch_hotpath_test PROPERTIES TIMEOUT 90)
 add_store_test(evictor_test evictor_test.cpp)
 add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)

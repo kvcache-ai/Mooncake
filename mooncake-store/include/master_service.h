@@ -431,6 +431,12 @@ class MasterService {
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const TenantId& tenant_id,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
+
     /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)
@@ -1423,13 +1429,19 @@ class MasterService {
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
+    struct BatchPutContext;
+    void InitBatchPutContext(BatchPutContext& ctx,
+                             const ReplicateConfig& config,
+                             const std::string& writer_host_id);
+
     // Allocate the physical replicas without changing object metadata.  This
     // is used by leased upserts to prove that replacement storage is available
     // before the old metadata is removed.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
                           const std::string& writer_host_id,
-                          bool* dfs_allocation_failed = nullptr)
+                          bool* dfs_allocation_failed = nullptr,
+                          BatchPutContext* batch_ctx = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     class MetadataAccessorRW;
@@ -1458,8 +1470,17 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
-        bool* dfs_allocation_failed = nullptr)
+        bool* dfs_allocation_failed = nullptr,
+        BatchPutContext* batch_ctx = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    struct WriteConfigPlan {
+        ResolvedSoftPinRequest soft_pin_request;
+        std::string writer_host_id;
+    };
+    auto PrepareWriteConfig(const UUID& client_id, const TenantId& tenant_id,
+                            const ReplicateConfig& config)
+        -> tl::expected<WriteConfigPlan, ErrorCode>;
 
     // What PutStart and UpsertStart settle before they take the key.
     struct WriteStartPlan {
@@ -1485,6 +1506,9 @@ class MasterService {
     // with OBJECT_ALREADY_EXISTS.
     auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
         -> tl::expected<void, ErrorCode>;
+    auto PrepareSlotForPutStart(MetadataAccessorRW& accessor,
+                                std::chrono::system_clock::time_point now)
+        -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission
     // retried: once behind any recovery already running, then once more
@@ -1498,6 +1522,10 @@ class MasterService {
     // object's memory replicas whose segment is gone, and the object with them
     // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
+    auto PutEndLocked(MetadataAccessorRW& accessor, const UUID& client_id,
+                      const ObjectMeta& object_meta, ReplicaType replica_type,
+                      std::chrono::system_clock::time_point now)
+        -> tl::expected<void, ErrorCode>;
 
     // Discards the namespace's expired processing replicas and expired tasks.
     void DiscardExpiredProcessingReplicas(
@@ -1662,6 +1690,16 @@ class MasterService {
                                     : ns_->objects.Write(object_id.user_key)) {}
 
         // Holds the key only while it holds an object.
+        MetadataAccessorRW(MasterService* service, metadata::Namespace* ns,
+                           std::string_view user_key)
+            : service_(service),
+              ns_(ns),
+              guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
+                                    : ns_->objects.Write(user_key)) {
+            if (IsPublished()) {
+                service_->CleanupInvalidMemoryReplicas(*this);
+            }
+        }
         MetadataAccessorRW(MasterService* service,
                            const ObjectIdentity& object_id)
             : MetadataAccessorRW(service, object_id, AsIs{}) {
@@ -1676,15 +1714,21 @@ class MasterService {
         };
         // Holds the key whether or not it holds an object, creating the
         // namespace if needed, so the caller can publish one under it.
-        MetadataAccessorRW(MasterService* service,
-                           const ObjectIdentity& object_id, CreateKey options)
+        MetadataAccessorRW(MasterService* service, metadata::Namespace& ns,
+                           std::string_view user_key, CreateKey options)
             : service_(service),
-              ns_(&service_->namespaces_.GetOrCreate(object_id.tenant_id)),
-              guard_(ns_->objects.WriteKey(object_id.user_key)) {
+              ns_(&ns),
+              guard_(ns_->objects.WriteKey(user_key)) {
             if (options.cleanup_invalid && IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
             }
         }
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id, CreateKey options)
+            : MetadataAccessorRW(
+                  service,
+                  service->namespaces_.GetOrCreate(object_id.tenant_id),
+                  object_id.user_key, options) {}
 
         // Holds the key only while `ref` is still its current publication: a
         // key republished since `ref` was taken, or emptied, is not held.
@@ -1794,17 +1838,33 @@ class MasterService {
 
     class MetadataAccessorRO {
        public:
+        explicit MetadataAccessorRO(std::optional<route::ReadGuard> guard)
+            : guard_(std::move(guard)) {}
         // Reads the object without copying its identity, which a batch read
         // would otherwise pay for once per key.
+        MetadataAccessorRO(const metadata::Namespace* ns,
+                           std::string_view user_key)
+            : guard_(Hold(ns, user_key)) {}
         MetadataAccessorRO(const MasterService* service,
                            const TenantId& tenant_id,
                            const std::string& user_key)
-            : guard_(Hold(service->namespaces_.Lookup(tenant_id), user_key)) {}
+            : MetadataAccessorRO(service->namespaces_.Lookup(tenant_id),
+                                 user_key) {}
         MetadataAccessorRO(const MasterService* service,
                            const ObjectIdentity& object_id)
             : MetadataAccessorRO(service, object_id.tenant_id,
                                  object_id.user_key) {}
 
+       private:
+        static std::optional<route::ReadGuard> Hold(
+            const metadata::Namespace* ns, std::string_view user_key) {
+            if (ns == nullptr) {
+                return std::nullopt;
+            }
+            return ns->objects.Read(user_key);
+        }
+
+       public:
         // Check if metadata exists
         bool Exists() const {
             return IsPublished() && guard_->metadata().IsValid();
@@ -1825,14 +1885,6 @@ class MasterService {
         const route::ObjectState& GetState() const { return guard_->state(); }
 
        private:
-        static std::optional<route::ReadGuard> Hold(
-            const metadata::Namespace* ns, const std::string& user_key) {
-            if (ns == nullptr) {
-                return std::nullopt;
-            }
-            return ns->objects.Read(user_key);
-        }
-
         std::optional<route::ReadGuard> guard_;
     };
 
@@ -1872,15 +1924,43 @@ class MasterService {
         std::unordered_set<std::string> accessed_;
     };
 
+    class BatchReadStats {
+       public:
+        BatchReadStats() = default;
+        BatchReadStats(const BatchReadStats&) = delete;
+        BatchReadStats& operator=(const BatchReadStats&) = delete;
+        ~BatchReadStats() { Flush(); }
+
+        void Record(const Replica::Descriptor& first_replica, int64_t obj_len);
+        void Flush() noexcept;
+
+       private:
+        bool flushed_{false};
+        int64_t valid_gets_{0};
+        int64_t mem_hits_{0};
+        int64_t mem_hit_bytes_{0};
+        int64_t file_hits_{0};
+        int64_t file_hit_bytes_{0};
+    };
+
     // What ExistKey answers for an object: whether it has a replica to read,
     // granting it a read lease if it does and `grant_lease` is set.
     bool ReadExistence(const ObjectMetadata& metadata, bool grant_lease) const;
+    bool ReadExistence(const ObjectMetadata& metadata,
+                       std::optional<std::chrono::system_clock::time_point>
+                           lease_deadline) const;
     // A client read of an object: its readable replicas, after the read's
     // effects on it (the read lease, the DFS LRU, hit metrics). What is left
     // for when no key is held goes to `follow_ups`.
     auto ReadReplicaList(const TenantId& tenant_id, const std::string& key,
                          const ObjectMetadata& metadata,
                          ReadFollowUps& follow_ups)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    auto ReadReplicaList(const TenantId& tenant_id, const std::string& key,
+                         const ObjectMetadata& metadata,
+                         ReadFollowUps& follow_ups,
+                         std::chrono::system_clock::time_point lease_deadline,
+                         BatchReadStats& stats)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
     // An admin read of an object, which leaves it as it is.
     auto ReadReplicaListForAdmin(const ObjectMetadata& metadata) const
