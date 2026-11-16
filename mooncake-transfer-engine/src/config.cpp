@@ -594,14 +594,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.enable_dest_device_affinity = false;
     }
 
-    if (const char* value = std::getenv("MC_ENABLE_DEST_LOCAL_RAIL")) {
-        parseBoolConfigEnv(value, "MC_ENABLE_DEST_LOCAL_RAIL",
-                           config.enable_dest_local_rail);
+    if (const char* value = std::getenv("MC_RDMA_WRITE_PREFER_DEST_NIC")) {
+        parseBoolConfigEnv(value, "MC_RDMA_WRITE_PREFER_DEST_NIC",
+                           config.rdma_write_prefer_dest_nic);
     }
-    if (config.enable_dest_local_rail && !config.enable_dest_device_affinity) {
-        LOG(WARNING) << "MC_ENABLE_DEST_LOCAL_RAIL requires "
-                        "MC_ENABLE_DEST_DEVICE_AFFINITY; ignoring it";
-        config.enable_dest_local_rail = false;
+    if (config.rdma_write_prefer_dest_nic) {
+        if (config.enable_hca_peer_affinity) {
+            LOG(ERROR) << "MC_RDMA_WRITE_PREFER_DEST_NIC and "
+                          "MC_ENABLE_HCA_PEER_AFFINITY cannot be enabled at "
+                          "the same time; ignoring "
+                          "MC_RDMA_WRITE_PREFER_DEST_NIC.";
+            config.rdma_write_prefer_dest_nic = false;
+        } else {
+            // The sender's NIC then follows the destination, and the peer
+            // must answer on the NIC of the same name. A worker reuses its
+            // last peer pick across slices, so the pairing covers every
+            // operation rather than WRITEs alone.
+            config.enable_dest_device_affinity = true;
+        }
     }
 
     const char* log_rdma_slice_affinity_env =
@@ -976,8 +986,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
-    LOG(INFO) << "enable_dest_local_rail = "
-              << (config.enable_dest_local_rail ? "true" : "false");
+    LOG(INFO) << "rdma_write_prefer_dest_nic = "
+              << (config.rdma_write_prefer_dest_nic ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

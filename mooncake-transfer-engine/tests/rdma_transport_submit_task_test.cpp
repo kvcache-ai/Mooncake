@@ -159,29 +159,40 @@ class SubmitTransferTaskTest : public ::testing::Test {
         return task.slice_list.front()->rdma.source_lkey;
     }
 
-    // The local segment doubles as the target: add GPU memory pinned to
-    // mlx5_global, while the source (cpu:0) prefers mlx5_local, and split the
-    // source into `source_mrs` adjacent MRs of one block each.
+    // The local segment doubles as the target: add GPU memory, GPU 0
+    // preferring mlx5_global and GPU 1 mlx5_local, while the source (cpu:0)
+    // prefers mlx5_local. The source is `source_mrs` adjacent MRs of
+    // `source_blocks` blocks each; the GPU memory is two blocks at kGpuAddr,
+    // one MR on GPU 0, or with `split_gpus` one block on GPU 0 followed by
+    // one on GPU 1.
     static constexpr uint64_t kGpuAddr = 0x1000000;
-    void addPinnedGpuTarget(size_t source_mrs) {
+    void addGpuTarget(size_t source_mrs, size_t source_blocks = 1,
+                      bool split_gpus = false) {
         const auto original = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         auto desc = std::make_shared<SegmentDesc>(*original);
-        ASSERT_EQ(
-            desc->topology.parse(R"({"cpu:0": [["mlx5_local"], []],)"
-                                 R"("cpu:1": [["mlx5_global"], []], ")" +
-                                 GPU_PREFIX + R"(0": [["mlx5_global"], []]})"),
-            0);
+        ASSERT_EQ(desc->topology.parse(
+                      R"({"cpu:0": [["mlx5_local"], []],)"
+                      R"("cpu:1": [["mlx5_global"], []], ")" +
+                      GPU_PREFIX + R"(0": [["mlx5_global"], []], ")" +
+                      GPU_PREFIX + R"(1": [["mlx5_local"], []]})"),
+                  0);
         ASSERT_EQ(desc->topology.getHcaList(), original->topology.getHcaList());
         BufferDesc source = desc->buffers[0];
         desc->buffers.clear();
+        source.length = source_blocks * block_size_;
         for (size_t i = 0; i < source_mrs; ++i) {
-            source.addr = kBufferAddr + i * block_size_;
+            source.addr = kBufferAddr + i * source.length;
             desc->buffers.push_back(source);
         }
         source.name = GPU_PREFIX + "0";
         source.addr = kGpuAddr;
-        source.length = 2 * block_size_;
+        source.length = (split_gpus ? 1 : 2) * block_size_;
         desc->buffers.push_back(source);
+        if (split_gpus) {
+            source.name = GPU_PREFIX + "1";
+            source.addr = kGpuAddr + block_size_;
+            desc->buffers.push_back(source);
+        }
         desc->rebuildBufferRangeIndex();
         metadata_->addLocalSegment(LOCAL_SEGMENT_ID, desc->name,
                                    std::move(desc));
@@ -666,17 +677,10 @@ TEST_F(SubmitTransferTaskTest,
 
 // Defined last: NoDuplicateSlice expects the slice cache state the tests
 // above leave behind.
-struct DestinationRailOn {
-    bool local = globalConfig().enable_dest_local_rail;
-    bool affinity = globalConfig().enable_dest_device_affinity;
-    DestinationRailOn() {
-        globalConfig().enable_dest_local_rail = true;
-        globalConfig().enable_dest_device_affinity = true;
-    }
-    ~DestinationRailOn() {
-        globalConfig().enable_dest_local_rail = local;
-        globalConfig().enable_dest_device_affinity = affinity;
-    }
+struct PreferDestNicOn {
+    bool old = globalConfig().rdma_write_prefer_dest_nic;
+    PreferDestNicOn() { globalConfig().rdma_write_prefer_dest_nic = true; }
+    ~PreferDestNicOn() { globalConfig().rdma_write_prefer_dest_nic = old; }
 };
 
 Transport::TransferRequest makeRequest(Transport::TransferRequest::OpCode op,
@@ -691,9 +695,25 @@ Transport::TransferRequest makeRequest(Transport::TransferRequest::OpCode op,
     return request;
 }
 
-TEST_F(SubmitTransferTaskTest, DestinationRailIsNotReusedByLaterRequests) {
-    DestinationRailOn rail;
-    addPinnedGpuTarget(1);
+TEST_F(SubmitTransferTaskTest, DestinationNicIsOffByDefault) {
+    addGpuTarget(1);
+    const auto WRITE = Transport::TransferRequest::WRITE;
+    std::vector<Transport::TransferRequest> requests = {
+        // Into GPU memory, but without the option: source-local HCA.
+        makeRequest(WRITE, kBufferAddr, block_size_, kGpuAddr),
+        // Runs past the source MR, so the batch fails before posting.
+        makeRequest(WRITE, kBufferAddr, 2 * block_size_, kBufferAddr),
+    };
+    std::vector<Transport::TransferTask> tasks;
+    submitFailingBatch(requests, tasks);
+    ASSERT_EQ(tasks[0].slice_list.size(), 1u);
+    EXPECT_EQ(tasks[0].slice_list[0]->rdma.source_lkey,
+              lkeyForDevice(local_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, DestinationNicIsNotReusedByLaterRequests) {
+    PreferDestNicOn on;
+    addGpuTarget(1);
     const auto WRITE = Transport::TransferRequest::WRITE;
     const auto READ = Transport::TransferRequest::READ;
     std::vector<Transport::TransferRequest> requests = {
@@ -714,9 +734,9 @@ TEST_F(SubmitTransferTaskTest, DestinationRailIsNotReusedByLaterRequests) {
               lkeyForDevice(local_device_id_));
 }
 
-TEST_F(SubmitTransferTaskTest, SliceLevelDestinationRailIsNotReused) {
-    DestinationRailOn rail;
-    addPinnedGpuTarget(2);
+TEST_F(SubmitTransferTaskTest, SliceLevelDestinationNicIsNotReused) {
+    PreferDestNicOn on;
+    addGpuTarget(2);
     const auto WRITE = Transport::TransferRequest::WRITE;
     std::vector<Transport::TransferRequest> requests = {
         // Spans both source MRs, so each slice selects with the target hint.
@@ -733,6 +753,25 @@ TEST_F(SubmitTransferTaskTest, SliceLevelDestinationRailIsNotReused) {
     for (auto *slice : tasks[0].slice_list)
         EXPECT_EQ(slice->rdma.source_lkey, lkeyForDevice(global_device_id_));
     EXPECT_EQ(tasks[1].slice_list[0]->rdma.source_lkey,
+              lkeyForDevice(local_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, WriteAcrossPeerMrsSelectsEachSliceByItsGpu) {
+    PreferDestNicOn on;
+    addGpuTarget(1, 2, true);
+    const auto WRITE = Transport::TransferRequest::WRITE;
+    std::vector<Transport::TransferRequest> requests = {
+        // One source MR, but the destination crosses from GPU 0 into GPU 1.
+        makeRequest(WRITE, kBufferAddr, 2 * block_size_, kGpuAddr),
+        // Runs past the source MR, so the batch fails before posting.
+        makeRequest(WRITE, kBufferAddr, 3 * block_size_, kBufferAddr),
+    };
+    std::vector<Transport::TransferTask> tasks;
+    submitFailingBatch(requests, tasks);
+    ASSERT_EQ(tasks[0].slice_list.size(), 2u);
+    EXPECT_EQ(tasks[0].slice_list[0]->rdma.source_lkey,
+              lkeyForDevice(global_device_id_));
+    EXPECT_EQ(tasks[0].slice_list[1]->rdma.source_lkey,
               lkeyForDevice(local_device_id_));
 }
 
