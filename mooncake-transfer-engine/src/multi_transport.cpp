@@ -1476,13 +1476,15 @@ void* MultiTransport::getBaseAddr() {
 }
 
 void MultiTransport::trackLiveBatch(BatchID batch_id) {
-    std::lock_guard<std::mutex> guard(live_batches_mutex_);
-    live_batches_.insert(batch_id);
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    shard.batches.insert(batch_id);
 }
 
 void MultiTransport::untrackLiveBatch(BatchID batch_id) {
-    std::lock_guard<std::mutex> guard(live_batches_mutex_);
-    live_batches_.erase(batch_id);
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    shard.batches.erase(batch_id);
 }
 
 bool MultiTransport::memoryReferencedByBatch(BatchID batch_id, void* addr,
@@ -1511,9 +1513,25 @@ bool MultiTransport::memoryReferencedByBatch(BatchID batch_id, void* addr,
     return false;
 }
 
-bool MultiTransport::memoryBusyLocked(void* addr, size_t length) const {
-    for (BatchID batch_id : live_batches_) {
-        if (memoryReferencedByBatch(batch_id, addr, length)) return true;
+bool MultiTransport::memoryBusy(void* addr, size_t length) const {
+    auto shard_hits = [&](const LiveBatchShard& shard) {
+        for (BatchID batch_id : shard.batches) {
+            if (memoryReferencedByBatch(batch_id, addr, length)) return true;
+        }
+        return false;
+    };
+    for (const auto& shard : live_batch_shards_) {
+        std::lock_guard<std::mutex> guard(shard.mu);
+        if (shard_hits(shard)) return true;
+    }
+    // A batch can land in a shard we already released. Confirm once while
+    // holding every shard in index order (same order as any other full scan).
+    std::unique_lock<std::mutex> locks[kLiveBatchShards];
+    for (size_t i = 0; i < kLiveBatchShards; ++i) {
+        locks[i] = std::unique_lock<std::mutex>(live_batch_shards_[i].mu);
+    }
+    for (const auto& shard : live_batch_shards_) {
+        if (shard_hits(shard)) return true;
     }
     return false;
 }
@@ -1526,10 +1544,7 @@ Status MultiTransport::waitMemoryIdle(void* addr, size_t length,
         std::chrono::milliseconds(std::max<int64_t>(timeout_ms, 0));
     for (;;) {
         bool busy = false;
-        {
-            std::lock_guard<std::mutex> live_guard(live_batches_mutex_);
-            busy = memoryBusyLocked(addr, length);
-        }
+        busy = memoryBusy(addr, length);
         if (!busy) {
             std::lock_guard<std::mutex> def_guard(deferred_cleanup_mutex_);
             for (const auto& entry : deferred_cleanup_batches_) {

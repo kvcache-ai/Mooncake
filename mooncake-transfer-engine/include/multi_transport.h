@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -179,7 +180,9 @@ class MultiTransport {
     void untrackLiveBatch(BatchID batch_id);
     bool memoryReferencedByBatch(BatchID batch_id, void *addr,
                                  size_t length) const;
-    bool memoryBusyLocked(void *addr, size_t length) const;
+    // Scans live batches. A clean result is confirmed under every shard
+    // lock so a batch inserted into an already-scanned shard is not missed.
+    bool memoryBusy(void *addr, size_t length) const;
 
     // Stop a future or already-published event record from being delivered.
     // Does not delete the batch.
@@ -205,8 +208,17 @@ class MultiTransport {
     std::mutex deferred_cleanup_mutex_;
     // Always-on live batch index for unregister quiesce (#5481).
     // Distinct from optional CONFIG_USE_BATCH_DESC_SET ownership map.
-    mutable std::mutex live_batches_mutex_;
-    std::unordered_set<BatchID> live_batches_;
+    // Sharded so concurrent allocate/free only contend on one stripe;
+    // waitMemoryIdle (unregister) is the only full scan.
+    static constexpr size_t kLiveBatchShards = 64;
+    struct LiveBatchShard {
+        mutable std::mutex mu;
+        std::unordered_set<BatchID> batches;
+    };
+    std::array<LiveBatchShard, kLiveBatchShards> live_batch_shards_{};
+    static size_t liveBatchShard(BatchID batch_id) {
+        return static_cast<size_t>(batch_id % kLiveBatchShards);
+    }
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>
         deferred_cleanup_batches_;
