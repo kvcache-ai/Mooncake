@@ -22,6 +22,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[3]
+CORE_SCRIPT = ROOT / "scripts/xpu/run_core.sh"
 
 
 def load_script(name, path):
@@ -263,6 +264,34 @@ class WheelVariantTest(unittest.TestCase):
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_external_revisions_do_not_receive_shared_cache_credentials(self):
+        job = WORKFLOW["jobs"]["build-wheel-xpu"]
+        cache_step = next(
+            step for step in job["steps"] if step.get("name") == "Set up compiler cache"
+        )
+        trusted = (
+            "inputs.checkout_ref == '' && "
+            "(github.event_name == 'push' || github.event_name == 'schedule')"
+        )
+        self.assertEqual(cache_step["if"], trusted)
+        self.assertEqual(job["env"]["SCCACHE_GHA_ENABLED"], "${{ " + trusted + " }}")
+        self.assertEqual(
+            job["env"]["ENABLE_SCCACHE"],
+            "${{ " + trusted + " && 'ON' || 'OFF' }}",
+        )
+        self.assertIn(
+            '-DENABLE_SCCACHE="$ENABLE_SCCACHE"',
+            workflow_step("Configure and build project"),
+        )
+        self.assertEqual(
+            [
+                step["uses"]
+                for step in job["steps"]
+                if step.get("uses", "").startswith("./")
+            ],
+            [cache_step["uses"]],
+        )
+
     def test_xpu_selection_and_strict_gate_are_wired(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         jobs = workflow["jobs"]
@@ -991,7 +1020,7 @@ class ReportTest(unittest.TestCase):
                                 self.assertTrue(call.kwargs["require_gtest_status"])
                                 self.assertTrue(call.args[1])
                             result = json.loads((root / "result.json").read_text())
-                            self.assertEqual(result["cpp_cases"], 151)
+                            self.assertEqual(result["cpp_cases"], 152)
                             self.assertEqual(result["ep_rounds"], 8)
                         else:
                             with self.assertRaises((RuntimeError, FileNotFoundError)):
@@ -1017,23 +1046,34 @@ class ReportTest(unittest.TestCase):
             ("xpu_engine_test.cpp", VERIFY.ENGINE | VERIFY.RDMA),
             ("xpu_ipc_process_test.cpp", VERIFY.IPC),
         ):
-            declared = set(
-                re.findall(
-                    r"TEST_[FP]\(\s*(\w+),\s*(\w+)\s*\)", (tent / filename).read_text()
-                )
-            )
-            selected = {
-                (
-                    identity.split(".")[0].split("/")[-1],
-                    identity.split(".")[1].split("/")[0],
-                )
-                for identity in names
-            }
-            self.assertEqual(selected, declared, filename)
+            source = (tent / filename).read_text()
+            instances = {}
+            for prefix, suite, generator in re.findall(
+                r"INSTANTIATE_TEST_SUITE_P\(\s*(\w+),\s*(\w+),\s*" r"(.*?)\);",
+                source,
+                re.DOTALL,
+            ):
+                booleans = len(re.findall(r"::testing::Bool\(\)", generator))
+                self.assertGreater(booleans, 0, generator)
+                instances.setdefault(suite, []).append((prefix, 2**booleans))
+            declared = set()
+            for kind, suite, name in re.findall(
+                r"TEST_([FP])\(\s*(\w+),\s*(\w+)\s*\)", source
+            ):
+                if kind == "P":
+                    self.assertIn(suite, instances, filename)
+                    for prefix, count in instances[suite]:
+                        declared.update(
+                            VERIFY.case_names(f"{prefix}/{suite}", name, count)
+                        )
+                else:
+                    declared.add(f"{suite}.{name}")
+            self.assertEqual(names, declared, filename)
         self.assertEqual(len(VERIFY.ENGINE), 124)
+        self.assertEqual(len(VERIFY.IPC), 10)
         self.assertEqual(len(VERIFY.INAPPLICABLE), 10)
         self.assertEqual(
-            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 151
+            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 152
         )
         selected_engine = VERIFY.SUITES["tent_xpu_engine_test"][1]
         self.assertFalse(selected_engine & VERIFY.RDMA)
@@ -1129,7 +1169,11 @@ class ReportTest(unittest.TestCase):
 
 
 class ShellLifecycleTest(unittest.TestCase):
-    def test_inline_hardware_shell_syntax_and_removed_launchers(self):
+    def test_hardware_shell_syntax_and_trusted_entry_points(self):
+        result = subprocess.run(
+            ["bash", "-n", str(CORE_SCRIPT)], capture_output=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
         for step in INTEGRATION["jobs"]["core"]["steps"]:
             if "run" in step:
                 with self.subTest(step=step["name"]):
@@ -1147,6 +1191,83 @@ class ShellLifecycleTest(unittest.TestCase):
             "scripts/e2e/python/verify_xpu_ci.py unpack",
             hardware_step("Download exact build artifact"),
         )
+        for name, command in (
+            ("Execute isolated two-B60 core", "run"),
+            ("Recheck current-run container cleanup", "cleanup"),
+        ):
+            self.assertEqual(
+                hardware_step(name).strip(),
+                f"bash xpu-control/scripts/xpu/run_core.sh {command}",
+            )
+        cleanup_step = next(
+            step
+            for step in INTEGRATION["jobs"]["core"]["steps"]
+            if step.get("name") == "Recheck current-run container cleanup"
+        )
+        self.assertIn("always()", cleanup_step["if"])
+        self.assertNotIn("cleanup.sh", hardware_step("Allocate run directory"))
+
+    def prepare_host(self, root):
+        run_directory = self.prepare_run(root)
+        (root / "xpu-tested-source").mkdir()
+        startup = root / "host-mocks.sh"
+        startup.write_text(
+            "compgen() {\n"
+            '  if [ "${MOCK_DEVICES:-two}" = two ]; then\n'
+            "    printf '/dev/dri/renderD128\\n/dev/dri/renderD129\\n'\n"
+            "  fi\n"
+            "}\n"
+            "function [() {\n"
+            '  if [[ "$1" = -c && "$2" = /dev/dri/renderD* ]]; then\n'
+            "    return 0\n"
+            "  fi\n"
+            '  builtin [ "$@"\n'
+            "}\n"
+            'id() { echo "${MOCK_UID:-1000}"; }\n'
+            'git() { echo "${MOCK_SHA:-$CHECKOUT_SHA}"; }\n'
+            "stat() { echo 109; }\n"
+            'python3() { printf "%s\\n" "$@" > "$RUN_DIRECTORY/python.arguments"; }\n'
+            "timeout() {\n"
+            '  printf "%s\\n" "$@" > "$RUN_DIRECTORY/timeout.arguments"\n'
+            '  if [[ -n "${SUITE_SIGNAL:-}" ]]; then kill -s "$SUITE_SIGNAL" "$BASHPID"; fi\n'
+            "  shift 3\n"
+            '  "$@"\n'
+            "}\n"
+        )
+        docker = root / "docker"
+        docker.write_text(
+            "#!/bin/bash\n"
+            "set -eu\n"
+            'echo "$*" >> "$RUN_DIRECTORY/docker.commands"\n'
+            'case "$1" in\n'
+            "  pull|image|info|stop) exit 0 ;;\n"
+            "  create)\n"
+            '    printf "%s\\n" "$@" > "$RUN_DIRECTORY/docker.arguments"\n'
+            "    echo owned-container ;;\n"
+            '  start) exit "${SUITE_STATUS:-0}" ;;\n'
+            "  inspect)\n"
+            '    [ ! -e "$RUN_DIRECTORY/removed" ] || exit 1\n'
+            '    [ "${CLEANUP_FAILURE:-no}" != inspect ] || exit 1\n'
+            '    if [ "${2:-}" = --format ]; then echo false; else echo "{}"; fi ;;\n'
+            "  rm)\n"
+            '    [ "${CLEANUP_FAILURE:-no}" != yes ] || exit 1\n'
+            '    touch "$RUN_DIRECTORY/removed" ;;\n'
+            "  *) exit 99 ;;\n"
+            "esac\n"
+        )
+        docker.chmod(0o755)
+        return {
+            **os.environ,
+            "BASH_ENV": str(startup),
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "GITHUB_WORKSPACE": str(root),
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "XPU_IMAGE": "image@sha256:" + "a" * 64,
+            "ZE_AFFINITY_MASK": "4,5",
+            "CHECKOUT_SHA": "b" * 40,
+            "RUN_DIRECTORY": str(run_directory),
+        }
 
     def prepare_run(self, root):
         output = root / "github-output"
@@ -1165,41 +1286,20 @@ class ShellLifecycleTest(unittest.TestCase):
         return Path(output.read_text().strip().removeprefix("directory="))
 
     def test_network_isolation_sets_store_and_ep_loopback_interfaces(self):
-        script = hardware_step("Execute isolated two-B60 core")
-        start = script.index("container_id=$(docker create")
-        stop = script.index("timeout --signal=TERM", start)
-        docker_command = script[start:stop]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            docker = root / "docker"
-            docker.write_text("""#!/bin/bash
-set -eu
-printf '%s\\n' "$@" > "$DOCKER_ARGUMENTS"
-echo container-id
-""")
-            docker.chmod(0o755)
-            arguments = root / "arguments"
+            environment = self.prepare_host(root)
+            run_directory = Path(environment["RUN_DIRECTORY"])
             result = subprocess.run(
-                ["bash", "-ec", "device_args=()\n" + docker_command],
-                env={
-                    **os.environ,
-                    "PATH": f"{root}:{os.environ['PATH']}",
-                    "DOCKER_ARGUMENTS": str(arguments),
-                    "GITHUB_RUN_ID": "123",
-                    "GITHUB_RUN_ATTEMPT": "1",
-                    "XPU_IMAGE": "image",
-                    "ZE_AFFINITY_MASK": "4,5",
-                    "CHECKOUT_SHA": "a" * 40,
-                    "run_directory": str(root),
-                    "source_directory": str(ROOT),
-                    "control_directory": str(ROOT / "scripts"),
-                },
+                ["bash", str(CORE_SCRIPT), "run"],
+                cwd=root,
+                env=environment,
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            args = arguments.read_text().splitlines()
+            args = (run_directory / "docker.arguments").read_text().splitlines()
             self.assertEqual(args[args.index("--network") + 1], "none")
             for variable in (
                 "MOONCAKE_LOCAL_HOSTNAME=127.0.0.1",
@@ -1212,15 +1312,34 @@ echo container-id
                 self.assertIn(variable, args)
                 self.assertEqual(args[args.index(variable) - 1], "--env")
             self.assertNotIn("--privileged", args)
+            for device in ("/dev/dri/renderD128", "/dev/dri/renderD129"):
+                self.assertEqual(args[args.index(device) - 1], "--device")
+            for mount in (
+                f"type=bind,src={ROOT / 'scripts'},dst=/control,readonly",
+                f"type=bind,src={root / 'xpu-tested-source'},dst=/source,readonly",
+            ):
+                self.assertIn(mount, args)
+            self.assertIn("no-new-privileges", args)
+            self.assertIn("ALL", args)
+            self.assertIn(f"seccomp={run_directory}/output/seccomp.json", args)
+            self.assertEqual(
+                (run_directory / "timeout.arguments").read_text().splitlines(),
+                [
+                    "--signal=TERM",
+                    "--kill-after=30s",
+                    "70m",
+                    "docker",
+                    "start",
+                    "--attach",
+                    "owned-container",
+                ],
+            )
             self.assertIn(
                 "python3 /control/e2e/python/verify_xpu_ci.py run /bundle /source /output",
                 "\n".join(args),
             )
 
     def test_fixed_runner_masks_need_no_lock_or_profile_variables(self):
-        script = hardware_step("Execute isolated two-B60 core")
-        start = script.index(': "${ZE_AFFINITY_MASK:')
-        stop = script.index("# Preserve host GPU ordinals")
         for mask, valid in (
             ("0,1", True),
             ("2,3", True),
@@ -1232,45 +1351,29 @@ echo container-id
             ("0.0,0.1", False),
             ("", False),
         ):
-            environment = {
-                key: value
-                for key, value in os.environ.items()
-                if key
-                not in {
+            with self.subTest(mask=mask), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.prepare_host(root)
+                for key in (
                     "XPU_LOCK_DIRECTORY",
                     "XPU_SECCOMP_PROFILE",
                     "XPU_RENDER_DEVICES",
-                }
-            }
-            environment.update(
-                {
-                    "ZE_AFFINITY_MASK": mask,
-                    "XPU_IMAGE": "image@sha256:" + "a" * 64,
-                    "CHECKOUT_SHA": "b" * 40,
-                }
-            )
-            with self.subTest(mask=mask):
+                ):
+                    environment.pop(key, None)
+                environment["ZE_AFFINITY_MASK"] = mask
                 result = subprocess.run(
-                    [
-                        "bash",
-                        "-ec",
-                        'fail() { echo "$*" >&2; exit 1; }\n' + script[start:stop],
-                    ],
+                    ["bash", str(CORE_SCRIPT), "run"],
+                    cwd=root,
                     env=environment,
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
-        self.assertNotIn("XPU_LOCK_DIRECTORY", script)
-        self.assertNotIn("XPU_SECCOMP_PROFILE", script)
-        self.assertNotIn("XPU_RENDER_DEVICES", script)
-        self.assertNotIn("flock", script)
-        self.assertIn("devices=(/dev/dri/renderD*)", script)
-        self.assertIn('--env "ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK"', script)
-        self.assertIn(
-            '--security-opt "seccomp=$run_directory/output/seccomp.json"', script
-        )
+                self.assertEqual(
+                    (Path(environment["RUN_DIRECTORY"]) / "docker.arguments").exists(),
+                    valid,
+                )
 
     def test_cleanup_recheck_propagates_docker_query_failure(self):
         for query_status in (0, 2):
@@ -1290,11 +1393,7 @@ esac
 """)
                 docker.chmod(0o755)
                 result = subprocess.run(
-                    [
-                        "bash",
-                        "-ec",
-                        hardware_step("Recheck current-run container cleanup"),
-                    ],
+                    ["bash", str(CORE_SCRIPT), "cleanup"],
                     env={
                         **os.environ,
                         "PATH": f"{root}:{os.environ['PATH']}",
@@ -1314,55 +1413,25 @@ esac
                 )
 
     def test_owned_container_cleanup_and_failures_propagate(self):
-        script = hardware_step("Execute isolated two-B60 core")
-        cleanup = (
-            'source "$RUN_DIRECTORY/cleanup.sh"\n'
-            + script[
-                script.index("container_id=\n") : script.index(
-                    'docker pull "$XPU_IMAGE"'
-                )
-            ]
-        )
         for suite_status, cleanup_failure, expected in (
             (0, "no", 0),
             (2, "no", 2),
             (0, "yes", 1),
+            (0, "inspect", 1),
         ):
             with self.subTest(
                 suite_status=suite_status, cleanup_failure=cleanup_failure
             ):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
-                    run_directory = self.prepare_run(root)
-                    (run_directory / "output").mkdir()
-                    docker = root / "docker"
-                    docker.write_text("""#!/bin/bash
-set -eu
-echo "$*" >> "$RUN_DIRECTORY/docker.commands"
-case "$1" in
-  info) echo daemon-ready ;;
-  stop) echo owned-container ;;
-  inspect)
-    [ ! -e "$RUN_DIRECTORY/removed" ] || exit 1
-    if [ "${2:-}" = --format ]; then echo false; else echo '{}'; fi ;;
-  rm)
-    [ "$CLEANUP_FAILURE" = no ] || exit 1
-    touch "$RUN_DIRECTORY/removed" ;;
-  *) exit 99 ;;
-esac
-""")
-                    docker.chmod(0o755)
+                    environment = self.prepare_host(root)
+                    run_directory = Path(environment["RUN_DIRECTORY"])
                     result = subprocess.run(
-                        [
-                            "bash",
-                            "-ec",
-                            f"{cleanup}\ncontainer_id=owned-container\nexit {suite_status}",
-                        ],
+                        ["bash", str(CORE_SCRIPT), "run"],
+                        cwd=root,
                         env={
-                            **os.environ,
-                            "PATH": f"{root}:{os.environ['PATH']}",
-                            "run_directory": str(run_directory),
-                            "RUN_DIRECTORY": str(run_directory),
+                            **environment,
+                            "SUITE_STATUS": str(suite_status),
                             "CLEANUP_FAILURE": cleanup_failure,
                         },
                         capture_output=True,
@@ -1382,6 +1451,7 @@ esac
                     self.assertEqual(
                         report["cleanup_status"] == 0, cleanup_failure == "no"
                     )
+                    self.assertEqual(report["suite_status"], suite_status)
 
     def test_cleanup_recheck_removes_only_current_run_container(self):
         for container_id, valid in (("a" * 64, True), ("invalid-id", False)):
@@ -1406,11 +1476,7 @@ esac
 """)
                 docker.chmod(0o755)
                 result = subprocess.run(
-                    [
-                        "bash",
-                        "-ec",
-                        hardware_step("Recheck current-run container cleanup"),
-                    ],
+                    ["bash", str(CORE_SCRIPT), "cleanup"],
                     env={
                         **os.environ,
                         "PATH": f"{root}:{os.environ['PATH']}",
@@ -1440,28 +1506,67 @@ esac
     def test_host_preflight_rejects_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "output").mkdir()
-            fake_id = root / "id"
-            fake_id.write_text("#!/bin/sh\necho 0\n")
-            fake_id.chmod(0o755)
-            script = hardware_step("Execute isolated two-B60 core")
+            environment = self.prepare_host(root)
             result = subprocess.run(
-                [
-                    "bash",
-                    "-ec",
-                    script[script.index("exec >") :],
-                ],
-                env={
-                    **os.environ,
-                    "PATH": f"{root}:{os.environ['PATH']}",
-                    "run_directory": str(root),
-                },
+                ["bash", str(CORE_SCRIPT), "run"],
+                cwd=root,
+                env={**environment, "MOCK_UID": "0"},
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("must not run as root", result.stdout + result.stderr)
+
+    def test_preflight_failures_do_not_launch_containers(self):
+        for overrides, message in (
+            ({"MOCK_SHA": "c" * 40}, "source differs"),
+            ({"XPU_IMAGE": "unpinned:latest"}, "digest-pinned"),
+            ({"MOCK_DEVICES": "none"}, "At least two GPU"),
+        ):
+            with self.subTest(
+                overrides=overrides
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.prepare_host(root)
+                result = subprocess.run(
+                    ["bash", str(CORE_SCRIPT), "run"],
+                    cwd=root,
+                    env={**environment, **overrides},
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertFalse(
+                    (Path(environment["RUN_DIRECTORY"]) / "docker.commands").exists()
+                )
+
+    def test_signals_preserve_failure_status_and_cleanup(self):
+        for signal_name, status in (("INT", 130), ("TERM", 143)):
+            with self.subTest(
+                signal=signal_name
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.prepare_host(root)
+                run_directory = Path(environment["RUN_DIRECTORY"])
+                result = subprocess.run(
+                    ["bash", str(CORE_SCRIPT), "run"],
+                    cwd=root,
+                    env={**environment, "SUITE_SIGNAL": signal_name},
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    result.returncode, status, result.stdout + result.stderr
+                )
+                self.assertTrue((run_directory / "removed").exists())
+                self.assertEqual(
+                    json.loads((run_directory / "output/cleanup.json").read_text()),
+                    {"cleanup_status": 0, "suite_status": status},
+                )
 
 
 class SeccompTest(unittest.TestCase):

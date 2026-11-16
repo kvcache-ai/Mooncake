@@ -45,8 +45,8 @@ jobs:
       BUILD_DIR: build-xpu-ci
       OUTPUT_DIR: dist-xpu-ci
       DEBIAN_FRONTEND: noninteractive
-      SCCACHE_GHA_ENABLED: "true"
-      # Match the other wheel builders: PRs read shared entries but do not evict them.
+      SCCACHE_GHA_ENABLED: ${{ inputs.checkout_ref == '' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+      ENABLE_SCCACHE: ${{ inputs.checkout_ref == '' && (github.event_name == 'push' || github.event_name == 'schedule') && 'ON' || 'OFF' }}
       SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       # As in ROCm CI, git must exist before checkout to avoid a source tarball.
@@ -88,6 +88,7 @@ jobs:
           "$RUNNER_TEMP/xpu-build-env/bin/python" -m pip install numpy==2.5.4
 
       - name: Set up compiler cache
+        if: inputs.checkout_ref == '' && (github.event_name == 'push' || github.event_name == 'schedule')
         uses: ./.github/actions/setup-sccache
 
       - name: Configure and build project
@@ -107,7 +108,7 @@ jobs:
           cmake -G Ninja -S . -B "$BUILD_DIR" \
             -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
             -DPython3_EXECUTABLE="$(command -v python)" \
-            -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE=ON \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE="$ENABLE_SCCACHE" \
             -DUSE_XPU=ON -DUSE_TENT=ON -DUSE_CUDA=OFF -DUSE_XPU_GDS=OFF \
             -DWITH_EP=ON -DMOONCAKE_EP_XPU_AOT_DEVICES=bmg \
             -DWITH_STORE=ON -DWITH_STORE_RUST=OFF -DWITH_STORE_RS=OFF \

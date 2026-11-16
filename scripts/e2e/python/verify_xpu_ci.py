@@ -379,18 +379,14 @@ INAPPLICABLE = {
 }
 
 
-IPC = (
-    case_names(
-        "SelectionModes/XpuIpcProcessTest",
-        "DeviceToPeerDeviceReadAndWrite HostToPeerDeviceReadAndWrite",
-        2,
-    )
-    | case_names(
-        "SelectionModes/XpuIpcFallbackTest",
-        "DeviceToPeerDeviceFallsBackToStaging HostToPeerDeviceFallsBackToStaging",
-        2,
-    )
-    | case_names("XpuIpcProcessTest", "MappingClosedWhenPeerExits")
+IPC = case_names(
+    "SelectionModes/XpuIpcProcessTest",
+    "DeviceToPeerDeviceReadAndWrite HostToPeerDeviceReadAndWrite MappingClosedWhenPeerExits",
+    2,
+) | case_names(
+    "SelectionModes/XpuIpcFallbackTest",
+    "DeviceToPeerDeviceFallsBackToStaging HostToPeerDeviceFallsBackToStaging",
+    2,
 )
 
 

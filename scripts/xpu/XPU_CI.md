@@ -89,6 +89,10 @@ The hosted builder receives that exact SHA. Hardware downloads its artifact
 by ID in the same run and verifies the API identity, run/attempt, ZIP digest,
 payload/native hashes, source/image provenance, and build/runtime inventories.
 The host runs the trusted workflow-revision harness, not PR host scripts.
+Exact-revision E2E builds do not run the local compiler-cache action or enable
+sccache. Cache credentials are exported only for push/schedule builds without
+an external checkout revision; a read-only sccache setting is not a credential
+boundary for PR-controlled build code.
 
 The shared `E2E Gate` includes the XPU build and hardware job results using
 the existing gate policy. Cleanup failure fails the hardware job.
@@ -109,7 +113,8 @@ Core executes sequentially:
 - 7 XPU transport cases.
 - 114 engine cases: local copies, TCP/HP-TCP staging (tests explicitly disable
   IPC for those paths), retry/routing, IPC lifetime/policies, and io_uring.
-- 8 real cross-process IPC/fallback cases, including permission-denied peers.
+- 10 real cross-process IPC/fallback cases, including permission-denied peers
+  and mapping cleanup after peer exit in both selection modes.
 - 1 C++ Store foreign-USM roundtrip with an in-process master.
 - 1 existing Python Store tensor/registered-buffer roundtrip with a packaged
   local master.
@@ -119,7 +124,7 @@ Core executes sequentially:
   The existing script asserts native selection and must print its exact final
   completion record; missing rounds or zero-test execution fail.
 
-The **151 C++ cases** require exact GoogleTest identities and completed XML
+The **152 C++ cases** require exact GoogleTest identities and completed XML
 results. Ten parameter combinations that unconditionally skip because they
 are inapplicable are excluded *before* execution, with reasons in
 `selection.json`. No runtime skips are allowed. The eight direct-RDMA
@@ -149,11 +154,13 @@ Both the hosted XPU tests and hardware suites require GoogleTest's explicit
 pass their expected case identities to the same validator. Shared CTest and
 TENT CI retain their existing report and exit-code behavior.
 
-Docker launch, device mapping, traps and cleanup are inline in
-`.github/workflows/integration-test-xpu.yml`. A temporary cleanup helper is
-created from that trusted workflow in the host run directory and shared by
-the exit trap and the `always()` cleanup recheck; it is not mounted into the
-test container.
+Host GPU preflight, Docker launch, device mapping, traps and cleanup live in
+`scripts/xpu/run_core.sh`, with `run` and `cleanup` subcommands. The workflow
+invokes both from `xpu-control`, checked out at `github.workflow_sha`, never
+from `xpu-tested-source`. The `run` exit trap cleans its container; the separate
+`always()` workflow step calls `cleanup` to recheck containers labeled for the
+current run/attempt. No temporary cleanup script is generated. CPU-only
+regressions exercise these entry points with mocked host commands.
 
 `scripts/e2e/python/verify_xpu_ci.py` is the single verification entry point:
 no arguments retain the hosted wheel smoke checks; `reports <XML...>` validates
