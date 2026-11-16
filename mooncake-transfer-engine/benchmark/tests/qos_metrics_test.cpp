@@ -226,6 +226,29 @@ TEST(QosMetricsTest, UsesPerClassTransferredBytes) {
     EXPECT_NEAR(report.classes[1].throughput_gbps, 4.194304, 1e-12);
 }
 
+TEST(QosMetricsTest, UsesCompletedBytesForPartiallyCanceledBatches) {
+    std::vector<QosClassConfig> classes = {
+        {"foreground", 1, 0, 1.0, std::nullopt}};
+    std::vector<XferBenchStats> stats(1);
+    stats[0].total_duration.add(1000);
+    stats[0].transfer_duration.add(100);
+    stats[0].transferred_bytes = 8192;
+    for (const auto& shape :
+         {std::vector<uint64_t>{}, std::vector<uint64_t>{16384}}) {
+        const auto report = calculateQosMetricsFromBenchStats(
+            4096, 4, 1, classes, &stats, 0, shape);
+        ASSERT_EQ(report.classes.size(), 1u);
+        EXPECT_EQ(report.classes[0].transferred_bytes, 8192u);
+        EXPECT_NEAR(report.aggregate_throughput_gbps, 0.008192, 1e-12);
+    }
+    stats[0].transfer_duration.clear();
+    stats[0].transferred_bytes = 0;
+    const auto report =
+        calculateQosMetricsFromBenchStats(4096, 4, 1, classes, &stats, 0);
+    EXPECT_EQ(report.classes[0].transferred_bytes, 0u);
+    EXPECT_DOUBLE_EQ(report.aggregate_throughput_gbps, 0);
+}
+
 TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {
     std::vector<QosClassConfig> classes = {
         {"best_effort", 1, 0, 1.0, std::nullopt}};

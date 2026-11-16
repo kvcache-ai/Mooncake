@@ -27,6 +27,7 @@
 #include "tent/common/types.h"
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 
 using QueueOwnerId = uint64_t;
@@ -180,6 +181,8 @@ class LocalTransferAdmissionQueue {
     size_t dispatchingBytes() const;
 
    private:
+    friend class ::mooncake::TransferEngineImplTestPeer;
+
     enum class QueueState {
         Queued,
         Dispatching,

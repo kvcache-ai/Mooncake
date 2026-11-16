@@ -36,11 +36,20 @@ std::mutex g_split_output_mu;
 bool formatSplitXferLine(char* buf, size_t cap, const SplitXferSample& sample,
                          size_t* written) {
     if (buf == nullptr || written == nullptr || cap == 0) return false;
-    const int n = std::snprintf(
-        buf, cap,
-        "{\"batch_size\":%" PRIu64 ",\"submit_us\":%" PRIu64
-        ",\"wait_us\":%" PRIu64 ",\"polls\":%" PRIu64 "}\n",
-        sample.batch_size, sample.submit_us, sample.wait_us, sample.polls);
+    const int n =
+        sample.dropped != 0
+            ? std::snprintf(buf, cap,
+                            "{\"batch_size\":%" PRIu64 ",\"submit_us\":%" PRIu64
+                            ",\"wait_us\":%" PRIu64 ",\"polls\":%" PRIu64
+                            ",\"completed\":%" PRIu64 ",\"dropped\":%" PRIu64
+                            "}\n",
+                            sample.batch_size, sample.submit_us, sample.wait_us,
+                            sample.polls, sample.completed, sample.dropped)
+            : std::snprintf(buf, cap,
+                            "{\"batch_size\":%" PRIu64 ",\"submit_us\":%" PRIu64
+                            ",\"wait_us\":%" PRIu64 ",\"polls\":%" PRIu64 "}\n",
+                            sample.batch_size, sample.submit_us, sample.wait_us,
+                            sample.polls);
     if (n < 0 || static_cast<size_t>(n) >= cap) return false;
     *written = static_cast<size_t>(n);
     return true;
@@ -78,7 +87,7 @@ void closeSplitOutput() {
 
 void logSplitXfer(const SplitXferSample& sample) {
     if (!g_split_output_enabled) return;
-    char buf[160];
+    char buf[320];
     size_t n = 0;
     if (!formatSplitXferLine(buf, sizeof(buf), sample, &n)) return;
     std::lock_guard<std::mutex> lock(g_split_output_mu);

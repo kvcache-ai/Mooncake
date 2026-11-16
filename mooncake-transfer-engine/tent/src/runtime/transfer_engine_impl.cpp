@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -30,6 +31,7 @@
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/deadline_mlu.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
 #include "tent/runtime/progress_worker.h"
@@ -112,6 +114,10 @@ struct PreservedTentConfigOverrides {
     std::optional<bool> ascend_agent_mode;
     std::optional<bool> ascend_store_te_init;
     std::optional<bool> ascend_fabric_mem;
+    std::optional<bool> enable_runtime_queue;
+    std::optional<bool> deadline_aware;
+    std::optional<double> mlu_local_threshold;
+    std::optional<bool> deadline_bw_arbitration;
     std::optional<bool> memfabric_store_te_init;
 };
 
@@ -250,6 +256,14 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/ascend_direct/store_te_init", false);
     preserved.ascend_fabric_mem = captureExplicitConfigValue(
         config, "transports/ascend_direct/fabric_mem", false);
+    preserved.enable_runtime_queue =
+        captureExplicitConfigValue(config, "enable_runtime_queue", false);
+    preserved.deadline_aware = captureExplicitConfigValue(
+        config, "runtime_queue/deadline_aware", false);
+    preserved.mlu_local_threshold = captureExplicitConfigValue(
+        config, "runtime_queue/mlu_local_threshold", 0.0);
+    preserved.deadline_bw_arbitration = captureExplicitConfigValue(
+        config, "transports/rdma/deadline_bw_arbitration", false);
     preserved.memfabric_store_te_init = captureExplicitConfigValue(
         config, "transports/memfabric/store_te_init", false);
     return preserved;
@@ -296,6 +310,15 @@ void restoreExplicitTransferEngineConfig(
                                preserved.ascend_store_te_init);
     restoreExplicitConfigValue(config, "transports/ascend_direct/fabric_mem",
                                preserved.ascend_fabric_mem);
+    restoreExplicitConfigValue(config, "enable_runtime_queue",
+                               preserved.enable_runtime_queue);
+    restoreExplicitConfigValue(config, "runtime_queue/deadline_aware",
+                               preserved.deadline_aware);
+    restoreExplicitConfigValue(config, "runtime_queue/mlu_local_threshold",
+                               preserved.mlu_local_threshold);
+    restoreExplicitConfigValue(config,
+                               "transports/rdma/deadline_bw_arbitration",
+                               preserved.deadline_bw_arbitration);
     restoreExplicitConfigValue(config, "transports/memfabric/store_te_init",
                                preserved.memfabric_store_te_init);
 }
@@ -458,6 +481,30 @@ Status TransferEngineImpl::construct() {
         return Status::InvalidArgument(
             "runtime queue dispatch window must be non-zero" LOC_MARK);
     }
+    // The threshold only matters with the queue on and deadline_aware set.
+    // Values outside 0 or [1.0, inf) are still applied, so existing configs
+    // keep working; the warning says what they actually do.
+    if (runtime_queue_config_.enabled &&
+        runtime_queue_config_.limits.deadline_aware) {
+        const double theta = runtime_queue_config_.limits.mlu_local_threshold;
+        switch (ClassifyMluLocalThreshold(theta)) {
+            case MluThresholdEffect::kDropsFeasible:
+                LOG(WARNING) << "runtime_queue/mlu_local_threshold=" << theta
+                             << " is below 1.0, the predicted met/missed "
+                                "boundary; it also cancels requests predicted "
+                                "to meet their deadline";
+                break;
+            case MluThresholdEffect::kSilentlyDisabled:
+                LOG(WARNING) << "runtime_queue/mlu_local_threshold=" << theta
+                             << " disables the deadline drop; set it to 0 to "
+                                "disable the drop, or to a finite value >= "
+                                "1.0 to enable it";
+                break;
+            case MluThresholdEffect::kDisabled:
+            case MluThresholdEffect::kRecommended:
+                break;
+        }
+    }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);
     if (!hostname_.empty())
@@ -557,40 +604,7 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
-    if (runtime_queue_config_.limits.deadline_aware &&
-        runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
-        std::array<std::weak_ptr<Transport>, kSupportedTransportTypes>
-            bandwidth_providers;
-        bool has_bandwidth_provider = false;
-        for (auto type : {TransportType::RDMA, TransportType::UB}) {
-            auto& transport = transport_list_[static_cast<int>(type)];
-            if (transport) {
-                bandwidth_providers[static_cast<int>(type)] = transport;
-                has_bandwidth_provider = true;
-            }
-        }
-        if (has_bandwidth_provider) {
-            runtime_queue_->setTransportDegradationPolicy(
-                [bandwidth_providers](TransportType type) -> double {
-                    if (type < 0 || type >= kSupportedTransportTypes)
-                        return -1.0;
-                    if (auto transport =
-                            bandwidth_providers[static_cast<int>(type)]
-                                .lock()) {
-                        return transport->getEstimatedBandwidth();
-                    }
-                    return -1.0;
-                },
-                DegradationHooks{}, nullptr);
-            LOG(INFO) << "Admission queue degradation: live network bw"
-                      << ", theta_local="
-                      << runtime_queue_config_.limits.mlu_local_threshold;
-        } else {
-            LOG(WARNING)
-                << "Admission queue degradation requested but RDMA and UB "
-                   "transports are unavailable";
-        }
-    }
+    installDegradationPolicy();
 
     if (enable_progress_worker_) {
         progress_worker_ = std::make_unique<ProgressWorker>(
@@ -2841,6 +2855,42 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
     }
     queued_owners_.erase(queued_it);
     return Status::OK();
+}
+
+void TransferEngineImpl::installDegradationPolicy() {
+    if (!runtime_queue_ || !runtime_queue_config_.limits.deadline_aware ||
+        !(runtime_queue_config_.limits.mlu_local_threshold > 0.0) ||
+        !std::isfinite(runtime_queue_config_.limits.mlu_local_threshold)) {
+        return;
+    }
+    std::array<std::weak_ptr<Transport>, kSupportedTransportTypes>
+        bandwidth_providers;
+    bool has_bandwidth_provider = false;
+    for (auto type : {TransportType::RDMA, TransportType::UB}) {
+        auto& transport = transport_list_[static_cast<int>(type)];
+        if (transport) {
+            bandwidth_providers[static_cast<int>(type)] = transport;
+            has_bandwidth_provider = true;
+        }
+    }
+    if (!has_bandwidth_provider) {
+        LOG(WARNING) << "Admission queue degradation requested but RDMA and UB "
+                        "transports are unavailable";
+        return;
+    }
+    runtime_queue_->setTransportDegradationPolicy(
+        [bandwidth_providers](TransportType type) -> double {
+            if (type < 0 || type >= kSupportedTransportTypes) return -1.0;
+            if (auto transport =
+                    bandwidth_providers[static_cast<int>(type)].lock()) {
+                return transport->getEstimatedBandwidth();
+            }
+            return -1.0;
+        },
+        DegradationHooks{}, nullptr);
+    LOG(INFO) << "Admission queue degradation: live network bw"
+              << ", theta_local="
+              << runtime_queue_config_.limits.mlu_local_threshold;
 }
 
 Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {

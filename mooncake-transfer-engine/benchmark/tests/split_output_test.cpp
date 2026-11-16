@@ -43,6 +43,20 @@ TEST(SplitOutputTest, FormatsIntegerJsonLine) {
               "\"polls\":201}\n");
 }
 
+TEST(SplitOutputTest, ReportsCanceledBatchTaskCounts) {
+    char buf[320];
+    size_t n = 0;
+    ASSERT_TRUE(
+        formatSplitXferLine(buf, sizeof(buf), {4, 10, 20, 3, 2, 2}, &n));
+    EXPECT_EQ(std::string(buf, n),
+              "{\"batch_size\":4,\"submit_us\":10,\"wait_us\":20,\"polls\":3,"
+              "\"completed\":2,\"dropped\":2}\n");
+    ASSERT_TRUE(
+        formatSplitXferLine(buf, sizeof(buf), {4, 10, 20, 3, 0, 4}, &n));
+    EXPECT_NE(std::string(buf, n).find("\"completed\":0,\"dropped\":4"),
+              std::string::npos);
+}
+
 TEST(SplitOutputTest, RejectsTruncatedBuffer) {
     char buf[8];
     size_t n = 99;
