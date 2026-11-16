@@ -238,5 +238,27 @@ TEST(EfaTopologyIndexTest, SelectsTheGpusOwnNicsWithLocalKeys) {
     }
 }
 
+// MC_EFA_NIC_SELECTION=local builds its per-GPU NIC list through the shared
+// buildPreferredNicIndexMap(). A preferred HCA listed twice maps to one index,
+// so the buffer is not registered on the same NIC twice; missing HCAs are
+// skipped, and a GPU with none left gets no entry (the caller then falls back
+// to all NICs). efa_transport_test covers the same map but needs EFA hardware,
+// so CI only builds it; this suite runs.
+TEST(EfaLocalNicMapTest, DeduplicatesPreferredHca) {
+    TopologyMatrix matrix;
+    matrix["cuda:0"] =
+        TopologyEntry{.name = "cuda:0",
+                      .preferred_hca = {"rdmap1", "rdmap0", "rdmap1", "gone"},
+                      .avail_hca = {"rdmap2"}};
+    matrix["cuda:1"] = TopologyEntry{.name = "cuda:1",
+                                     .preferred_hca = {"gone", "gone"},
+                                     .avail_hca = {"rdmap0"}};
+    auto map =
+        EfaTransport::buildLocalNicMap(matrix, {"rdmap0", "rdmap1", "rdmap2"});
+    ASSERT_EQ(map.size(), 1u);
+    EXPECT_EQ(map.at("cuda:0"), (std::vector<size_t>{1, 0}));
+    EXPECT_EQ(map.count("cuda:1"), 0u);
+}
+
 }  // namespace
 }  // namespace mooncake
