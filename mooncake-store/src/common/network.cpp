@@ -1,6 +1,11 @@
 #include "common/network.h"
 
+#include <cerrno>
 #include <cstring>
+#include <ifaddrs.h>
+#include <memory>
+#include <net/if.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <random>
 #include <sys/socket.h>
@@ -23,7 +28,7 @@ bool isPortAvailable(int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
-    bool available = (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    bool available = (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     close(sock);
     return available;
 }
@@ -50,7 +55,7 @@ int AutoPortBinder::tryBindPort() {
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port);
 
-        if (bind(socket_fd_, (sockaddr*)&addr, sizeof(addr)) == 0) {
+        if (bind(socket_fd_, (sockaddr *)&addr, sizeof(addr)) == 0) {
             port_ = port;
             return port;
         } else {
@@ -76,13 +81,68 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-tl::expected<std::string, int> httpGet(const std::string& url) {
+tl::expected<std::string, int> httpGet(const std::string &url) {
     coro_http::coro_http_client client;
     auto res = client.get(url);
     if (res.status == 200) {
         return std::string(res.resp_body);
     }
     return tl::unexpected(res.status);
+}
+
+tl::expected<std::string, std::string> GetInterfaceIPv4Address(
+    const std::string &interface_name) {
+    if (interface_name.empty()) {
+        return tl::unexpected(std::string("network interface name is empty"));
+    }
+
+    struct ifaddrs *interfaces = nullptr;
+    if (getifaddrs(&interfaces) != 0) {
+        return tl::unexpected("getifaddrs failed: " +
+                              std::string(strerror(errno)));
+    }
+    std::unique_ptr<struct ifaddrs, decltype(&freeifaddrs)> interface_guard(
+        interfaces, freeifaddrs);
+
+    bool found_interface = false;
+    bool interface_is_up = false;
+    for (auto *current = interfaces; current != nullptr;
+         current = current->ifa_next) {
+        if (current->ifa_name == nullptr ||
+            interface_name != current->ifa_name) {
+            continue;
+        }
+
+        found_interface = true;
+        if ((current->ifa_flags & IFF_UP) == 0) {
+            continue;
+        }
+        interface_is_up = true;
+
+        if (current->ifa_addr == nullptr ||
+            current->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        char host[NI_MAXHOST] = {};
+        auto *ipv4_addr = reinterpret_cast<sockaddr_in *>(current->ifa_addr);
+        if (getnameinfo(reinterpret_cast<sockaddr *>(ipv4_addr),
+                        sizeof(*ipv4_addr), host, sizeof(host), nullptr, 0,
+                        NI_NUMERICHOST) == 0) {
+            return std::string(host);
+        }
+    }
+
+    if (!found_interface) {
+        return tl::unexpected("network interface '" + interface_name +
+                              "' was not found");
+    }
+    if (!interface_is_up) {
+        return tl::unexpected("network interface '" + interface_name +
+                              "' is down");
+    }
+    return tl::unexpected("network interface '" + interface_name +
+                          "' has no IPv4 address");
 }
 
 int getFreeTcpPort() {
@@ -92,12 +152,12 @@ int getFreeTcpPort() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(0);
-    if (::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
         ::close(sock);
         return -1;
     }
     socklen_t len = sizeof(addr);
-    if (::getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+    if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
         ::close(sock);
         return -1;
     }

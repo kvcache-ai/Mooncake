@@ -189,11 +189,15 @@ STORE_FACADE_SOURCE_DIR="python/mooncake/store"
 STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
 MIGRATED_PYTHON_INIT_BACKUP=""
 # Pending sources: F01-T110 (pools), F01-T114 (structured/ranges/fast-copy),
-# F01-T115 (CLI/config), F01-T116 (NoF), and F01-T113 (TE/EP/Reshard).
+# F01-T116 (NoF), and F01-T113 (TE/EP/Reshard).
 MIGRATED_PYTHON_MODULES=(
     __init__.py
     py.typed
+    http_metadata_server.py
     _launcher.py
+    cli.py
+    cli_client.py
+    mooncake_config.py
 )
 cleanup_migrated_python_staging() {
     for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
@@ -237,6 +241,8 @@ cleanup_wheel_metadata_state() {
 trap cleanup_wheel_metadata_state EXIT
 
 # TODO(F01-T118, replace-in=UPG1-F22-B02): Receive U's release variants and
+# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG1-F22-B02 implementation/merge review, before task acceptance.
 # platform-specific tool invocation, external-library exclusions, and NPU ELF
 # repair with supported providers. Owner: F22-B02; resolve Python-floor policy
 # explicitly and validate each approved platform instead of copying flags.

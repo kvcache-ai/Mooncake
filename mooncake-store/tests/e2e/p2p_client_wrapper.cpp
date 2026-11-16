@@ -41,15 +41,19 @@ ClientTestWrapper::CreateClientWrapper(
         /*route_cache_max_memory_bytes=*/0,
         /*route_cache_ttl_ms=*/60 * 1000, p2p_local_transfer_mode,
         /*local_io_worker_num=*/32, /*http_port=*/9003, enable_http_server);
-    if (!redis_cluster_id.empty()) {
-        config.redis_cluster_id = redis_cluster_id;
+    if (!config) {
+        LOG(ERROR) << "Failed to build P2P client config: " << config.error();
+        return std::nullopt;
     }
-    config.redis_username = redis_username;
-    config.redis_password = redis_password;
+    if (!redis_cluster_id.empty()) {
+        config->redis_cluster_id = redis_cluster_id;
+    }
+    config->redis_username = redis_username;
+    config->redis_password = redis_password;
     client = std::make_shared<P2PClientService>(
-        config.metadata_connstring, config.http_port, config.enable_http_server,
-        config.labels);
-    auto err = client->Init(config);
+        config->metadata_connstring, config->http_port,
+        config->enable_http_server, config->labels);
+    auto err = client->Init(*config);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "failed to init P2P client, error=" << err;
         return std::nullopt;

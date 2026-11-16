@@ -50,6 +50,8 @@ message(
   STATUS "Mooncake Python install directory: ${MOONCAKE_PYTHON_INSTALL_DIR}")
 
 # TODO(F01-T113, replace-in=UPG2-F01-public-build): Receive U's shared-segment,
+# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG2-F01-public-build implementation/merge review, before task acceptance.
 # TE/TENT/device bindings, allocator gates, and independent EP/Conductor/Reshard
 # package wiring with their real providers, including legacy-wheel consumers.
 # Owner: UPG2 public-build integration. Close only after the per-component
@@ -100,6 +102,8 @@ if(MOONCAKE_HAS_NVLINK_ALLOCATOR)
 endif()
 
 # TODO(F01-T114, replace-in=UPG1-F15): Add Engram binding sources/includes and
+# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG1-F15 implementation/merge review, before task acceptance.
 # structured/range/fast-copy Python package consumers with the approved native
 # features. Owner: F15 (S58, W01-W04, W06, W07); close after all assigned items.
 # F01-T110 also covers buffer_pool.cpp and buffer_pool.py installation in S13.
@@ -153,7 +157,7 @@ if(NOT SKBUILD)
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/__init__.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/py.typed"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/http_metadata_server.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
@@ -168,25 +172,37 @@ if(NOT SKBUILD)
     FILES_MATCHING
     PATTERN "*.py")
 
-  # TODO(F01-T115, replace-in=UPG1-F02-B05): Receive U's canonical Store
-  # CLI/client/config and full REST behavior. The U launcher was accepted in F01-3.2;
-  # its runtime validation remains assigned to F01-final-validation.
-  # Owner: F02-B05; keep the remaining feature consumers together.
+  # TODO(F01-T115, replace-in=UPG1-F02-B05): Complete installed CLI/config
+  # Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+  # Due: UPG1-F02-B05 implementation/merge review, before task acceptance.
+  # Deferred business-field handoffs are F02-T001/T002/T003; they do not block
+  # the current F02 base interface receipt or provide future business capability.
+  # validation and full REST behavior. Track deferred U config consumers in
+  # python/mooncake/mooncake_config.py with their downstream business tasks.
+  # Owner: F02-B05; retain this marker until all receiver obligations close.
   if(WITH_STORE)
+    set_target_properties(mooncake_master mooncake_client
+                          PROPERTIES INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
+    install(TARGETS mooncake_master mooncake_client
+            RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
     install(
       FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_client.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_config.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_client.py"
       DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
   endif()
 endif()
 
 # TODO(F01-T116, replace-in=UPG1-F10-S41): Install and collect U's NoF
+# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG1-F10-S41 implementation/merge review, before task acceptance.
 # administration, SSD register/unregister, and SPDK target tools with their
 # native providers and USE_NOF gate. Owner: F10-S41; verify installed commands.
 # TODO(F01-T117, replace-in=UPG1-F13-S57): Add U's conditional K8s lease runtime
+# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG1-F13-S57 implementation/merge review, before task acceptance.
 # library install and legacy-wheel collection with the lease backend.
 # Owner: F13-S57; verify enabled/disabled package contents and library loading.
 if(WITH_STORE)

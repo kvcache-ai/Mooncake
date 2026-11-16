@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 
 #include <ylt/coro_http/coro_http_server.hpp>
 
@@ -13,7 +15,8 @@ namespace mooncake {
 // the active RPC service binds the same metrics port.
 class P2PStatusHttpServer {
    public:
-    explicit P2PStatusHttpServer(uint16_t port) : port_(port) {}
+    explicit P2PStatusHttpServer(uint16_t port, std::string host = "0.0.0.0")
+        : port_(port), host_(std::move(host)) {}
 
     P2PStatusHttpServer(const P2PStatusHttpServer&) = delete;
     P2PStatusHttpServer& operator=(const P2PStatusHttpServer&) = delete;
@@ -28,6 +31,7 @@ class P2PStatusHttpServer {
 
    private:
     uint16_t port_;
+    std::string host_;
     std::unique_ptr<coro_http::coro_http_server> server_;
 };
 

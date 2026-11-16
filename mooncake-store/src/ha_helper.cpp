@@ -1,3 +1,5 @@
+#include "config/rpc_protocol_config.h"
+
 #include "ha_helper.h"
 #include "etcd_helper.h"
 #include "rpc_service.h"
@@ -119,9 +121,13 @@ int MasterServiceSupervisor::Start() {
         coro_rpc::coro_rpc_server server(
             config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
             config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
 
         LOG(INFO) << "Init leader election helper...";
@@ -154,6 +160,26 @@ int MasterServiceSupervisor::Start() {
         LOG(INFO) << "Starting master service...";
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(config_, view_version));
+        // TODO(F02-T011, replace-in=UPG1-F12-S50):
+        // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+        // Replace this HTTP-failure branch with U admin startup in
+        // ha/leadership/master_service_supervisor.cpp; remove the temporary
+        // CancelKeepAlive/join compensation, not just the comment.
+        // Due: before F12-S50 implementation acceptance; final TODO closure.
+        // Target: fixed U d01447808d10af78011e9203d53796a15a032a03.
+        // Close only after BOTH B05 and S50 eliminate every marked central
+        // bridge difference; equivalent rewrites or relocation do not qualify.
+        if (!wrapped_master_service.http_server_started()) {
+            LOG(ERROR) << "Failed to start master admin server, metrics_port="
+                       << config_.metrics_port;
+            auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+            if (etcd_err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to cancel keep leader alive: "
+                           << etcd_err;
+            }
+            keep_leader_thread.join();
+            return -1;
+        }
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

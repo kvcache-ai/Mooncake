@@ -368,5 +368,13 @@ endif()
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(yaml-cpp REQUIRED)
 find_package(gflags REQUIRED)
+# TODO-REF(F01-T113, receiver=UPG2-F01-public-build):
+# Source: UPG1-F02-B09; owner: UPG2-F01-public-build.
+# Stage: UPG2 / F01-public-build / public dependency implementation and merge;
+# Due: before UPG2 acceptance. Replace the old YLT provider and unconditional
+# IBV definition with fixed U FindYLT.cmake (7801bc9ad9021781f15217552214e325a1cf7373)
+# and its common.cmake capability/link gates. Close with actual dependency,
+# TCP/IBV build verification, review and receiving SHA; Store guards alone
+# do not provide the missing build capability.
 find_package(yalantinglibs CONFIG REQUIRED)
 add_compile_definitions(YLT_ENABLE_IBV)

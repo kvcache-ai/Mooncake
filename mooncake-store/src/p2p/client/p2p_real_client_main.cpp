@@ -43,6 +43,7 @@ DEFINE_validator(heartbeat_rpc_timeout_ms, [](const char* name, int32_t value) {
     }
     return true;
 });
+DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
 DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_string(tiered_backend_config, "conf/tiered_backend.json",
               "Tiered backend config: accepts a JSON string or a path to a "
@@ -112,10 +113,7 @@ int main(int argc, char* argv[]) {
     // spawning threads, leading to missing signal processing.
     mooncake::ResourceTracker::getInstance();
 
-    // when separately deploy real client,
-    // local buffer is shared by dummy client,
-    // real client does not have local buffer
-    const uint64_t local_buffer_size = 0;
+    size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);
 
     LOG(INFO) << "Using P2P client type"
               << ", client_rpc_port=" << FLAGS_client_rpc_port;
@@ -147,14 +145,22 @@ int main(int argc, char* argv[]) {
         FLAGS_p2p_start_local_only,
         static_cast<size_t>(FLAGS_business_coro_worker_num),
         FLAGS_heartbeat_rpc_timeout_ms);
+    if (!config) {
+        LOG(ERROR) << "Failed to build P2P client config: " << config.error();
+        return -1;
+    }
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
-        config, /*enable_dummy_service=*/true, FLAGS_threads, FLAGS_port);
+        *config, /*enable_dummy_service=*/true, FLAGS_threads, FLAGS_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
     }
 
-    return client_inst->wait_dummy_rpc_server();
+    auto result = client_inst->wait_dummy_rpc_server();
+    if (result != 0) {
+        LOG(ERROR) << "P2P client RPC service failed: " << result;
+    }
+    return result;
 }

@@ -83,7 +83,8 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
             "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data = "Hello, RealClient!";
@@ -135,7 +136,8 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
             "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 512 * 1024 * 1024, 512 * 1024 * 1024);
+            master_address_, 512 * 1024 * 1024, 512 * 1024 * 1024)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
@@ -269,7 +271,8 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
             "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, segment_size, segment_size);
+            master_address_, segment_size, segment_size)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     // Test Single Get Operation with Concurrent Put
@@ -528,7 +531,8 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
             master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024,
-            transfer_engine);
+            transfer_engine)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data = "Hello, RealClient!";
@@ -559,7 +563,8 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
             "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     std::string test_data(1000, '1');
@@ -637,7 +642,8 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
             "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data =
@@ -689,7 +695,8 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
             client1_addr, "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     // Setup client 2
@@ -700,7 +707,8 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
             client2_addr, "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024)
+            .value();
     ASSERT_EQ(py_client2->setup(setup_config2), 0);
 
     const std::string test_data = "Hello, CopyMoveQueryTask!";

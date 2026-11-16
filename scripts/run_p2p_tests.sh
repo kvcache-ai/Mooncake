@@ -103,7 +103,7 @@ done
 case "$RUN_TESTS_METADATA_SERVER_MODE" in
     managed)
         echo "Starting standalone HTTP metadata server..."
-        setsid mooncake_http_metadata_server --port 8080 >"$LOG_DIR/metadata.log" 2>&1 &
+        setsid mooncake_http_metadata_server --host 127.0.0.1 --port 8080 >"$LOG_DIR/metadata.log" 2>&1 &
         METADATA_SERVER_PID=$!
         ;;
     external)

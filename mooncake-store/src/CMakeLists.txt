@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_COMMON_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
     common/mmap_buffer.cpp
     client_resources.cpp
+    config/client_auto_port_config.cpp
     posix_file.cpp
     client_buffer.cpp
     real_client.cpp
@@ -27,6 +28,8 @@ set(EXTRA_LIBS "")
 
 if(USE_3FS)
   # TODO(F10-S38-T001, replace-in=UPG1-F10-S38): Reconcile this client-side
+  # Source: UPG1-F01-2.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+  # Due: UPG1-F10-S38 implementation/merge review, before task acceptance.
   # ThreeFSFile wiring with U's shared HF3FS resource manager and DFS adapter
   # when the approved descriptor-based DFS consumers are implemented.
   # Owner: F10-S38. Keep USE_3FS source/header/library conditions aligned;
@@ -220,6 +223,8 @@ target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 
 # TODO(F01-T070, replace-in=UPG2-F01-public-build): Export common headers through
+# Source: UPG1-F01-2.2; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG2-F01-public-build implementation/merge review, before task acceptance.
 # mooncake_common's PUBLIC include interface as in U. Owner: UPG2 public build.
 # Remove this temporary include block and marker after that interface is adopted.
 target_include_directories(mooncake_store_client_objects
@@ -230,6 +235,8 @@ target_include_directories(mooncake_master
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/include)
 
 # TODO(F01-T071, replace-in=UPG2-F01-public-build): Export TE headers through
+# Source: UPG1-F01-2.2; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG2-F01-public-build implementation/merge review, before task acceptance.
 # transfer_engine's PUBLIC include interface as in U. Owner: UPG2 public build.
 # Remove this temporary include block and marker after that interface is adopted.
 target_include_directories(mooncake_store_client_objects
@@ -239,13 +246,18 @@ target_include_directories(mooncake_store
 
 # Select the implementation of the standard Store targets.
 if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
+    target_sources(mooncake_store_shared_objects PRIVATE
+        config/rpc_protocol_config.cpp
+        config/rpc_timeout_config.cpp)
     # Sources and entry points of the selected centralized implementation.
     set(MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES
         master_service.cpp
         master_metric_manager.cpp
+        config/metrics_bootstrap_config_loader.cpp
         ha_helper.cpp
         segment.cpp
         rpc_service.cpp
+        master_admin_service.cpp
         http_metadata_server.cpp
         task_manager.cpp
     )
@@ -254,6 +266,7 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
         client_service.cpp
         centralized_real_client.cpp
         client_metric.cpp
+        config/client_metric_config.cpp
         master_client.cpp
         transfer_task.cpp
         file_storage.cpp

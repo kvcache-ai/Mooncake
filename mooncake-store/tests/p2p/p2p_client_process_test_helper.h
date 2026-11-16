@@ -252,10 +252,12 @@ class P2PPeerProcessStack {
     bool Start(const std::string& master_address, const std::string& host_name,
                uint16_t rpc_port, const std::string& local_transfer_mode,
                TransferDirectionMode transfer_direction_mode) {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", rpc_port);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                /*local_buffer_size=*/0, nullptr, "", rpc_port)
+                .value();
 
         config.enable_http_server = false;
         config.http_port = 0;

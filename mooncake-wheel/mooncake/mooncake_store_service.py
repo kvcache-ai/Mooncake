@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 
 from aiohttp import web
@@ -21,7 +22,34 @@ def _timed_handler(operation_name, handler):
         finally:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             logging.info(f"{operation_name} operation completed in {elapsed_ms:.2f} ms")
+
     return wrapper
+
+
+def _unblock_shutdown_signals():
+    try:
+        signal.pthread_sigmask(
+            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+    except AttributeError:
+        pass
+
+
+def _install_shutdown_signal_handlers(loop, shutdown_event):
+    def request_shutdown(signum):
+        logging.info("Received signal %s, shutting down", signum)
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown, sig)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(
+                sig,
+                lambda signum, _frame: loop.call_soon_threadsafe(
+                    request_shutdown, signum
+                ),
+            )
 
 
 class MooncakeStoreService:
@@ -93,12 +121,15 @@ class MooncakeStoreService:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
 
-    async def start_store_service(self, max_wait_time: float = 60):
+    async def start_store_service(
+        self, max_wait_time: float = 60, shutdown_event=None
+    ):
         """
         Start the store service with retry mechanism.
 
         Args:
             max_wait_time: Maximum total wait time in seconds (default: 60)
+            shutdown_event: Optional asyncio event used to cancel startup
 
         Returns:
             True if successful, False otherwise
@@ -107,7 +138,15 @@ class MooncakeStoreService:
         retry_interval = 1.0  # Fixed retry interval: 1 second
         start_time = time.perf_counter()
 
+        if shutdown_event is not None:
+            # Process any signal callback queued immediately before startup.
+            await asyncio.sleep(0)
+
         while True:
+            if shutdown_event is not None and shutdown_event.is_set():
+                logging.info("Store startup cancelled by shutdown request")
+                return False
+
             elapsed = time.perf_counter() - start_time
             if elapsed >= max_wait_time:
                 logging.error(
@@ -126,15 +165,35 @@ class MooncakeStoreService:
                 if self.is_p2p:
                     ret = self.store.setup_p2p_real_client(self.config)
                 else:
+                    # TODO-REF(F02-T001, receiver=UPG1-F10-S31): Wire SSD fields
+                    # with native setup before S31 implementation review.
+                    # TODO-REF(F02-T002, receiver=UPG1-F05-S44): Wire tenant_id
+                    # with tenant isolation before S44 implementation review.
+                    # TODO-REF(F02-T003, receiver=UPG1-F14-S49): Wire client HTTP
+                    # fields with the listener before S49 implementation review.
+                    # Source: F02-B05 block 3, Codex, 2026-11-12; not U code.
                     ret = self.store.setup(
-                        self.config.local_hostname,
-                        self.config.metadata_server,
-                        self.config.global_segment_size,
-                        self.config.local_buffer_size,
-                        self.config.protocol,
-                        self.config.device_name,
-                        self.config.master_server_address
+                        {
+                            "local_hostname": self.config.local_hostname,
+                            "metadata_server": self.config.metadata_server,
+                            "global_segment_size": self.config.global_segment_size,
+                            "local_buffer_size": self.config.local_buffer_size,
+                            "protocol": self.config.protocol,
+                            "rdma_devices": self.config.device_name,
+                            "master_server_addr": self.config.master_server_address,
+                        }
                     )
+
+                if shutdown_event is not None:
+                    # setup() is synchronous. Give asyncio signal callbacks a
+                    # chance to publish a shutdown requested while it ran.
+                    await asyncio.sleep(0)
+                    if shutdown_event.is_set():
+                        logging.info(
+                            "Store startup cancelled by shutdown request"
+                        )
+                        await self.stop()
+                        return False
 
                 if ret != 0:
                     raise RuntimeError("Store initialization failed")
@@ -151,7 +210,9 @@ class MooncakeStoreService:
                 remaining_time = max_wait_time - elapsed_after_attempt
 
                 # Calculate actual sleep duration
-                actual_sleep_time = min(retry_interval, remaining_time) if remaining_time > 0 else 0
+                actual_sleep_time = (
+                    min(retry_interval, remaining_time) if remaining_time > 0 else 0
+                )
 
                 logging.warning(
                     f"Store startup failed (attempt {retry_count}): {e}. "
@@ -160,7 +221,20 @@ class MooncakeStoreService:
 
                 # Wait before retry, but don't exceed max_wait_time
                 if actual_sleep_time > 0:
-                    await asyncio.sleep(actual_sleep_time)
+                    if shutdown_event is not None:
+                        try:
+                            await asyncio.wait_for(
+                                shutdown_event.wait(),
+                                timeout=actual_sleep_time,
+                            )
+                            logging.info(
+                                "Store startup cancelled by shutdown request"
+                            )
+                            return False
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(actual_sleep_time)
 
 
     async def start_http_service(self, port: int = 8080):
@@ -183,103 +257,137 @@ class MooncakeStoreService:
     async def handle_put(self, request):
         try:
             data = await request.json()
-            key = data.get('key')
-            value = data.get('value').encode()
+            key = data.get("key")
+            raw_value = data.get("value")
 
-            if not key or not value:
+            if not key or raw_value is None:
                 return web.Response(
                     status=400,
-                    text=json.dumps({'error': 'Missing key or value'}),
-                    content_type='application/json'
+                    text=json.dumps({"error": "Missing key or value"}),
+                    content_type="application/json",
                 )
 
+            value = raw_value.encode()
             ret = self.store.put(key, value)
             if ret != 0:
                 return web.Response(
                     status=500,
-                    text=json.dumps({'error': 'PUT operation failed'}),
-                    content_type='application/json'
+                    text=json.dumps({"error": "PUT operation failed"}),
+                    content_type="application/json",
                 )
 
             return web.Response(
                 status=200,
-                text=json.dumps({'status': 'success'}),
-                content_type='application/json'
+                text=json.dumps({"status": "success"}),
+                content_type="application/json",
             )
         except Exception as e:
             logging.error("PUT error: %s", e)
             return web.Response(
                 status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
             )
 
     async def handle_get(self, request):
         try:
-            key = request.match_info['key']
-            value = self.store.get(key)
+            key = request.match_info["key"]
+            exists = self.store.is_exist(key)
 
-            if not value:
+            if exists == 0:
                 return web.Response(
                     status=404,
-                    text=json.dumps({'error': 'Key not found'}),
-                    content_type='application/json'
+                    text=json.dumps({"error": "Key not found"}),
+                    content_type="application/json",
+                )
+            if exists < 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({"error": "Exist check failed"}),
+                    content_type="application/json",
                 )
 
+            value = self.store.get(key)
+            if value is None:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({"error": "GET operation failed"}),
+                    content_type="application/json",
+                )
+            if value == b"":
+                exists = self.store.is_exist(key)
+                if exists == 0:
+                    return web.Response(
+                        status=404,
+                        text=json.dumps({"error": "Key not found"}),
+                        content_type="application/json",
+                    )
+                if exists < 0:
+                    return web.Response(
+                        status=500,
+                        text=json.dumps({"error": "Exist check failed"}),
+                        content_type="application/json",
+                    )
+
             return web.Response(
-                status=200,
-                body=value,
-                content_type='application/octet-stream'
+                status=200, body=value, content_type="application/octet-stream"
             )
         except Exception as e:
             logging.error("GET error: %s", e)
             return web.Response(
                 status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
             )
 
     async def handle_exist(self, request):
         try:
-            key = request.match_info['key']
+            key = request.match_info["key"]
             exists = self.store.is_exist(key)
+
+            if exists < 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({"error": "Exist check failed"}),
+                    content_type="application/json",
+                )
 
             return web.Response(
                 status=200,
-                text=json.dumps({'exists': bool(exists)}),
-                content_type='application/json'
+                text=json.dumps({"exists": exists > 0}),
+                content_type="application/json",
             )
         except Exception as e:
             logging.error("EXIST error: %s", e)
             return web.Response(
                 status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
             )
 
     async def handle_remove(self, request):
         try:
-            key = request.match_info['key']
+            key = request.match_info["key"]
             ret = self.store.remove(key)
 
             if ret != 0:
                 return web.Response(
                     status=500,
-                    text=json.dumps({'error': 'Remove operation failed'}),
-                    content_type='application/json'
+                    text=json.dumps({"error": "Remove operation failed"}),
+                    content_type="application/json",
                 )
 
             return web.Response(
                 status=200,
-                text=json.dumps({'status': 'success'}),
-                content_type='application/json'
+                text=json.dumps({"status": "success"}),
+                content_type="application/json",
             )
         except Exception as e:
             logging.error("REMOVE error: %s", e)
             return web.Response(
                 status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
             )
 
     async def handle_remove_all(self, request):
@@ -289,44 +397,58 @@ class MooncakeStoreService:
             if ret < 0:
                 return web.Response(
                     status=500,
-                    text=json.dumps({'error': 'RemoveAll operation failed'}),
-                    content_type='application/json'
+                    text=json.dumps({"error": "RemoveAll operation failed"}),
+                    content_type="application/json",
                 )
 
             return web.Response(
                 status=200,
-                text=json.dumps({'status': 'success removed ' + str(ret) + ' keys'}),
-                content_type='application/json'
+                text=json.dumps({"status": "success removed " + str(ret) + " keys"}),
+                content_type="application/json",
             )
         except Exception as e:
             logging.error("REMOVE_ALL error: %s", e)
             return web.Response(
                 status=500,
-                text=json.dumps({'error': str(e)}),
-                content_type='application/json'
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
             )
 
     async def stop(self):
         if self.store:
-            self.store.close()
-            logging.info("Mooncake service stopped")
+            ret = self.store.close()
+            self.store = None
+            if ret != 0:
+                logging.warning("Mooncake service close returned %s", ret)
+            else:
+                logging.info("Mooncake service stopped")
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Mooncake Store Service with REST API')
-    parser.add_argument('--config', type=str,
-                        help='Path to Mooncake config file',
-                        required=False)
-    parser.add_argument('-D', '--define', action='append',
-                        help='Override configuration with key=value pairs (e.g., -Dlocal_hostname=example.com)',
-                        default=[])
-    parser.add_argument('--port', type=int,
-                        help='HTTP API port (default: 8080)',
-                        default=8080,
-                        required=False)
-    parser.add_argument('--max-wait-time', type=float,
-                        help='Maximum total wait time in seconds (default: 60)',
-                        default=60,
-                        required=False)
+    parser = argparse.ArgumentParser(description="Mooncake Store Service with REST API")
+    parser.add_argument(
+        "--config", type=str, help="Path to Mooncake config file", required=False
+    )
+    parser.add_argument(
+        "-D",
+        "--define",
+        action="append",
+        help="Override configuration with key=value pairs (e.g., -Dlocal_hostname=example.com)",
+        default=[],
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="HTTP API port (default: 8080)",
+        default=8080,
+        required=False,
+    )
+    parser.add_argument(
+        "--max-wait-time",
+        type=float,
+        help="Maximum total wait time in seconds (default: 60)",
+        default=60,
+        required=False,
+    )
     return parser.parse_args()
 
 async def main():
@@ -335,32 +457,46 @@ async def main():
     # Parse -D key=value pairs into a dictionary
     cli_config = {}
     for item in args.define:
-        if '=' in item:
-            key, value = item.split('=', 1)
+        if "=" in item:
+            key, value = item.split("=", 1)
             cli_config[key] = value
         else:
             logging.warning(f"Ignoring invalid CLI config: {item}")
 
     service = MooncakeStoreService(args.config, cli_config)
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    _install_shutdown_signal_handlers(loop, shutdown_event)
+    _unblock_shutdown_signals()
 
     try:
-        if not await service.start_store_service(max_wait_time=args.max_wait_time):
+        if not await service.start_store_service(
+            max_wait_time=args.max_wait_time,
+            shutdown_event=shutdown_event,
+        ):
+            if shutdown_event.is_set():
+                return
             raise RuntimeError("Failed to start store service")
+
+        _unblock_shutdown_signals()
+        await asyncio.sleep(0)
+        if shutdown_event.is_set():
+            return
 
         if not await service.start_http_service(args.port):
             raise RuntimeError("Failed to start HTTP service")
 
-        logging.info("Mooncake Store Service is running. Press Ctrl+C to stop.")
-        while True:
-            await asyncio.sleep(1)
+        logging.info("Mooncake Store Service is running")
+        await shutdown_event.wait()
 
     except KeyboardInterrupt:
-        logging.info("Received shutdown signal")
-        await service.stop()
+        logging.info("Received keyboard interrupt, shutting down")
     except Exception as e:
         logging.error("Service error: %s", e)
-        await service.stop()
         raise
+    finally:
+        await service.stop()
 
 
 def sync_main():

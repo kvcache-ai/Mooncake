@@ -49,10 +49,12 @@ class P2PClientIntegrationTest : public ::testing::Test {
         TransferDirectionMode transfer_direction_mode =
             TransferDirectionMode::REVERSE,
         size_t te_async_poll_worker_num = 32) {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", rpc_port);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                /*local_buffer_size=*/0, nullptr, "", rpc_port)
+                .value();
         if (local_transfer_mode == "te") {
             config.local_transfer_mode = LocalTransferMode::TE;
         } else {

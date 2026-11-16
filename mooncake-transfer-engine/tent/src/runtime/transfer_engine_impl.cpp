@@ -18,6 +18,7 @@
 #include <random>
 #include <cstdlib>
 #include <stdexcept>
+#include <optional>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -56,10 +57,97 @@ struct Batch {
     std::vector<SubmitHook> submit_hooks;
 };
 
+struct PreservedTentConfigOverrides {
+    std::optional<std::string> metadata_type;
+    std::optional<std::string> metadata_servers;
+    std::optional<std::string> local_segment_name;
+    std::optional<std::string> rpc_server_hostname;
+    std::optional<json> rpc_server_port;
+    bool force_tcp{false};
+    std::optional<std::vector<std::string>> rdma_whitelist;
+    // Classic TE shim writes these nested leaves before construct(). Keep
+    // them on the existing identity whitelist instead of growing Config.
+    std::optional<bool> ascend_agent_mode;
+    std::optional<bool> ascend_store_te_init;
+    std::optional<bool> ascend_fabric_mem;
+};
+
+template <typename T>
+std::optional<T> captureExplicitConfigValue(const Config& config,
+                                            const std::string& key,
+                                            const T& default_value) {
+    if (!config.contains(key)) {
+        return std::nullopt;
+    }
+    return config.get<T>(key, default_value);
+}
+
+PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
+    const Config& config) {
+    PreservedTentConfigOverrides preserved;
+    preserved.metadata_type =
+        captureExplicitConfigValue(config, "metadata_type", std::string());
+    preserved.metadata_servers =
+        captureExplicitConfigValue(config, "metadata_servers", std::string());
+    preserved.local_segment_name =
+        captureExplicitConfigValue(config, "local_segment_name", std::string());
+    preserved.rpc_server_hostname = captureExplicitConfigValue(
+        config, "rpc_server_hostname", std::string());
+    preserved.force_tcp = config.get("transports/force_tcp", false);
+    preserved.rpc_server_port =
+        captureExplicitConfigValue(config, "rpc_server_port", json());
+    preserved.rdma_whitelist = captureExplicitConfigValue(
+        config, "topology/rdma_whitelist", std::vector<std::string>());
+    preserved.ascend_agent_mode = captureExplicitConfigValue(
+        config, "transports/ascend_direct/agent_mode", false);
+    preserved.ascend_store_te_init = captureExplicitConfigValue(
+        config, "transports/ascend_direct/store_te_init", false);
+    preserved.ascend_fabric_mem = captureExplicitConfigValue(
+        config, "transports/ascend_direct/fabric_mem", false);
+    return preserved;
+}
+
+template <typename T>
+void restoreExplicitConfigValue(Config& config, const std::string& key,
+                                const std::optional<T>& value) {
+    if (value.has_value()) {
+        config.set(key, *value);
+    }
+}
+
+void restoreExplicitTransferEngineConfig(
+    Config& config, const PreservedTentConfigOverrides& preserved) {
+    restoreExplicitConfigValue(config, "metadata_type",
+                               preserved.metadata_type);
+    restoreExplicitConfigValue(config, "metadata_servers",
+                               preserved.metadata_servers);
+    restoreExplicitConfigValue(config, "local_segment_name",
+                               preserved.local_segment_name);
+    restoreExplicitConfigValue(config, "rpc_server_hostname",
+                               preserved.rpc_server_hostname);
+    restoreExplicitConfigValue(config, "rpc_server_port",
+                               preserved.rpc_server_port);
+    if (preserved.force_tcp) {
+        ConfigHelper::forceTcp(config);
+    }
+    restoreExplicitConfigValue(config, "topology/rdma_whitelist",
+                               preserved.rdma_whitelist);
+    restoreExplicitConfigValue(config, "transports/ascend_direct/agent_mode",
+                               preserved.ascend_agent_mode);
+    restoreExplicitConfigValue(config, "transports/ascend_direct/store_te_init",
+                               preserved.ascend_store_te_init);
+    restoreExplicitConfigValue(config, "transports/ascend_direct/fabric_mem",
+                               preserved.ascend_fabric_mem);
+}
+
 TransferEngineImpl::TransferEngineImpl()
-    : conf_(std::make_shared<Config>()), available_(false) {
-    ConfigHelper().loadFromEnv(*conf_);
-    auto status = construct();
+    : conf_(std::make_shared<Config>()),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
+    auto status = ConfigHelper().loadFromEnv(*conf_);
+    if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
@@ -68,11 +156,20 @@ TransferEngineImpl::TransferEngineImpl()
     }
 }
 
-TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
-    : conf_(conf), available_(false) {
-    // Load environment variables - they should override config file settings
-    ConfigHelper().loadFromEnv(*conf_);
-    auto status = construct();
+TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
+                                       bool config_loaded)
+    : conf_(conf),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
+    if (!config_loaded) return;
+    auto preserved = captureExplicitTransferEngineConfig(*conf_);
+    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
+    // explicit metadata identity intact.
+    auto status = ConfigHelper().loadFromEnv(*conf_);
+    restoreExplicitTransferEngineConfig(*conf_, preserved);
+    if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
@@ -248,17 +345,27 @@ Status TransferEngineImpl::construct() {
 Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
 
-    local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
-        for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-            if (transport_list_[type])
-                transport_list_[type]->removeMemoryBuffer(desc);
-        }
-        return Status::OK();
-    });
+    if (local_segment_tracker_) {
+        local_segment_tracker_->forEach([&](const BufferDesc& desc) -> Status {
+            // Snapshot entries are immutable; transports may scrub fields of
+            // their deregistration argument, so hand them a copy.
+            BufferDesc copy = desc;
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                if (transport_list_[type])
+                    transport_list_[type]->removeMemoryBuffer(copy);
+            }
+            return Status::OK();
+        });
+    }
     for (auto& transport : transport_list_) transport.reset();
     local_segment_tracker_.reset();
-    metadata_->segmentManager().deleteLocal();
-    metadata_.reset();
+    if (metadata_) {
+        // The in-process notify callback registered by construct() captures
+        // this engine; the transports already dropped theirs.
+        metadata_->setNotifyCallback(nullptr);
+        metadata_->segmentManager().deleteLocal();
+        metadata_.reset();
+    }
     batch_set_.forEach([&](BatchSet& entry) {
         for (auto& batch : entry.active) {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {

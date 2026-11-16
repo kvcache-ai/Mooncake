@@ -258,7 +258,6 @@ int DummyClient::setup(DummyClientConfig& config) {
         LOG(ERROR) << "DummyClient is already initialized";
         return -1;
     }
-    void* base_addr = nullptr;
     ErrorCode err = connect(config.real_client_addr);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to connect to real client";
@@ -267,42 +266,45 @@ int DummyClient::setup(DummyClientConfig& config) {
         return -1;
     }
 
-    shm_helper_ = ShmHelper::getInstance();
-    try {
-        base_addr = shm_helper_->allocate(config.local_buffer_size);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
-        connected_ = false;
-        deployment_mode_ = DeploymentMode::UNKNOWN;
-        return -1;
-    }
-
     ipc_socket_path_ = config.ipc_socket_path;
-
-    // Attempt registration for the primary segment
-    auto local_buffer_shm = shm_helper_->get_shm(base_addr);
-    if (!local_buffer_shm) {
-        LOG(ERROR) << "Failed to get shm segment for base address";
-        shm_helper_->free(base_addr);
-        connected_ = false;
-        deployment_mode_ = DeploymentMode::UNKNOWN;
-        return -1;
-    }
-
-    if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
-        LOG(ERROR) << "Failed to register SHM via IPC";
-        // A lost IPC reply can leave a mapping on Real despite a failed call.
-        if (unregister_shm() != 0) {
-            LOG(ERROR) << "Failed to roll back RealClient mappings after setup";
+    shm_helper_ = ShmHelper::getInstance();
+    if (config.local_buffer_size > 0) {
+        void* base_addr = nullptr;
+        try {
+            base_addr = shm_helper_->allocate(config.local_buffer_size);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
+            connected_ = false;
+            deployment_mode_ = DeploymentMode::UNKNOWN;
+            return -1;
         }
-        // Register failed, cleanup
-        shm_helper_->free(local_buffer_shm->base_addr);
-        connected_ = false;
-        deployment_mode_ = DeploymentMode::UNKNOWN;
-        return -1;
+
+        // Attempt registration for the primary segment.
+        auto local_buffer_shm = shm_helper_->get_shm(base_addr);
+        if (!local_buffer_shm) {
+            LOG(ERROR) << "Failed to get shm segment for base address";
+            shm_helper_->free(base_addr);
+            connected_ = false;
+            deployment_mode_ = DeploymentMode::UNKNOWN;
+            return -1;
+        }
+
+        if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
+            LOG(ERROR) << "Failed to register SHM via IPC";
+            // A lost IPC reply can leave a mapping on Real despite a failed
+            // call.
+            if (unregister_shm() != 0) {
+                LOG(ERROR)
+                    << "Failed to roll back RealClient mappings after setup";
+            }
+            shm_helper_->free(local_buffer_shm->base_addr);
+            connected_ = false;
+            deployment_mode_ = DeploymentMode::UNKNOWN;
+            return -1;
+        }
+        local_buffer_shm->is_local = true;
+        shm_helper_->set_registered(local_buffer_shm, true);
     }
-    local_buffer_shm->is_local = true;
-    shm_helper_->set_registered(local_buffer_shm, true);
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
@@ -500,7 +502,11 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(
 
 std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
     const std::string& key, const std::optional<ReadConfig>& config) {
-    // TODO: Make the returned SHM data lifetime safe for Dummy consumption.
+    // TODO(F02-T010, replace-in=UPG1-F07-S11): receiver=UPG1-F07-S11 must
+    // resolve this SHM borrowing lifetime during S11 analysis/implementation,
+    // before S11 review and acceptance; verify release/reuse/close or an
+    // explicitly approved unsupported path. Source: F02-B05 audit, Codex,
+    // 2026-11-12. No lifetime fix is implied by this tracking comment.
     // Real returns only an address and size and releases the allocation before
     // the RPC reply is consumed. It cannot tell when Dummy finishes reading,
     // so another allocation can overwrite the data.
@@ -685,13 +691,16 @@ void DummyClient::ping_thread_main() {
     while (ping_running_) {
         auto ping_result =
             invoke_rpc<&RealClient::ping, DummyHeartbeatResponse>(client_id_);
-
-        if (ping_result.has_value()) {
+        if (!ping_result) {
+            LOG(ERROR) << "RealClient heartbeat failed: "
+                       << ping_result.error();
+        } else if (ping_result->status != DummyClientStatus::HEALTH) {
+            LOG(ERROR) << "RealClient is unavailable, status="
+                       << ping_result->status;
+        } else {
             const auto& resp = ping_result.value();
             const size_t registered = shm_helper_->count_registered();
-            const bool needs_reregister =
-                resp.status == DummyClientStatus::DISCONNECTION ||
-                resp.mapped_shm_count < registered;
+            const bool needs_reregister = resp.mapped_shm_count < registered;
 
             if (!needs_reregister) {  // Client is healthy
                 ping_fail_count = 0;
@@ -727,25 +736,23 @@ void DummyClient::ping_thread_main() {
 
             // Reconnection Loop
             while (ping_running_) {
-                if (reregister_all_shms()) {
-                    LOG(INFO)
-                        << "Re-registered all shared memorys successfully";
-
-                    // Even if register_shm_via_ipc succeeded, confirm the RPC
-                    // is responsive AND the real_client side now holds all our
-                    // segments before declaring the connection restored.
-                    auto check_rpc =
-                        invoke_rpc<&RealClient::ping, DummyHeartbeatResponse>(
-                            client_id_);
-                    if (check_rpc.has_value() &&
-                        check_rpc.value().status == DummyClientStatus::HEALTH &&
-                        check_rpc.value().mapped_shm_count >=
-                            shm_helper_->count_registered()) {
-                        LOG(INFO) << "RPC connection restored";
-                        ping_fail_count = 0;
-                        connected_ = true;
-                        break;  // Exit reconnection loop
-                    }
+                auto check_rpc =
+                    invoke_rpc<&RealClient::ping, DummyHeartbeatResponse>(
+                        client_id_);
+                if (!check_rpc) {
+                    LOG(ERROR) << "RealClient reconnect ping failed: "
+                               << check_rpc.error();
+                } else if (check_rpc->status != DummyClientStatus::HEALTH) {
+                    LOG(ERROR) << "RealClient service is unavailable: "
+                               << check_rpc->status;
+                } else if (check_rpc->mapped_shm_count >=
+                           shm_helper_->count_registered()) {
+                    LOG(INFO) << "RPC connection restored";
+                    ping_fail_count = 0;
+                    connected_ = true;
+                    break;
+                } else if (!reregister_all_shms()) {
+                    LOG(ERROR) << "Failed to restore RealClient SHM mappings";
                 }
 
                 LOG(WARNING) << "Reconnection attempt failed, retrying in "

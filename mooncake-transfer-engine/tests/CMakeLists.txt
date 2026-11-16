@@ -81,6 +81,10 @@ add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
+add_executable(config_test ${WORKSPACE}/config_test.cpp)
+target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME config_test COMMAND config_test)
+
 # Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
 if (ENABLE_MULTI_PROTOCOL)
     add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)

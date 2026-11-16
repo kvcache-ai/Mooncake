@@ -19,6 +19,7 @@ import tempfile
 import time
 import traceback
 import unittest
+from urllib.request import urlopen
 import uuid
 
 
@@ -27,7 +28,7 @@ def emit(message):
     sys.stdout.flush()
 
 
-def dummy_worker(address, namespace):
+def dummy_worker(address, namespace, local_buffer_size=4 << 20):
     # Keep native stdout logs off the JSON reply channel.
     sys.stdout.flush()
     reply_fd = os.dup(sys.stdout.fileno())
@@ -36,8 +37,25 @@ def dummy_worker(address, namespace):
     from mooncake.store import MooncakeDistributedStore
 
     store = MooncakeDistributedStore()
-    if store.setup_dummy(4 << 20, 4 << 20, address) != 0:
+    if store.setup_dummy(4 << 20, local_buffer_size, address) != 0:
         raise RuntimeError("Dummy setup failed")
+    if local_buffer_size == 0:
+        # Delay the first registration to exercise the no-SHM heartbeat path.
+        emit({"ready": True})
+        for line in sys.stdin:
+            action = json.loads(line)["action"]
+            if action == "probe":
+                emit({"exists": store.is_exist(namespace)})
+            elif action == "close":
+                emit({"closed": store.close()})
+                return
+            elif action == "allocate":
+                break
+            else:
+                raise ValueError(f"Unknown unregistered worker action: {action}")
+        else:
+            store.close()
+            return
     buffer = store.alloc_from_mem_pool(4096)
     if not buffer or store.register_buffer(buffer, 4096) != 0:
         raise RuntimeError("Dummy buffer registration failed")
@@ -56,7 +74,7 @@ def dummy_worker(address, namespace):
     for counter, line in enumerate(sys.stdin):
         command = json.loads(line)
         action = command["action"]
-        if action not in ("memory", "close", "roundtrip", "down"):
+        if action not in ("memory", "close", "roundtrip", "local_io", "down"):
             raise ValueError(f"Unknown deployment worker action: {action}")
         keys = [f"{namespace}_{counter}_a", f"{namespace}_{counter}_b"]
         try:
@@ -83,23 +101,25 @@ def dummy_worker(address, namespace):
             short_ok = False
             single_ok = False
             single_write = None
-            if action == "roundtrip" and writes == [0, 0]:
-                for pointer in targets:
-                    ctypes.memset(pointer, 0x5a, 1024)
-                short = store.batch_get_into(keys, targets, [sizes[0] - 1, 1024])
-                short_ok = (len(short) == 2 and short[0] < 0 and short[1] == sizes[1]
-                            and ctypes.string_at(targets[0], 1024) == b"Z" * 1024
-                            and ctypes.string_at(targets[1], sizes[1]) == values[1])
+            if action in ("roundtrip", "local_io") and writes == [0, 0]:
+                if action == "roundtrip":
+                    for pointer in targets:
+                        ctypes.memset(pointer, 0x5a, 1024)
+                    short = store.batch_get_into(keys, targets, [sizes[0] - 1, 1024])
+                    short_ok = (len(short) == 2 and short[0] < 0 and short[1] == sizes[1]
+                                and ctypes.string_at(targets[0], 1024) == b"Z" * 1024
+                                and ctypes.string_at(targets[1], sizes[1]) == values[1])
                 for pointer in targets:
                     ctypes.memset(pointer, 0x5a, 1024)
                 reads = store.batch_get_into(keys, targets, [1024, 1024])
                 content_ok = (reads == sizes and
                               all(ctypes.string_at(pointer, len(value)) == value
                                   for pointer, value in zip(targets, values)))
-                single_key = keys[0] + "_bytes"
-                single_write = store.put(single_key, values[0])
-                single_ok = (single_write == 0 and
-                             store.get(single_key) == values[0])
+                if action == "roundtrip":
+                    single_key = keys[0] + "_bytes"
+                    single_write = store.put(single_key, values[0])
+                    single_ok = (single_write == 0 and
+                                 store.get(single_key) == values[0])
             emit({"writes": writes, "reads": reads, "sizes": sizes,
                   "content_ok": content_ok, "short_ok": short_ok,
                   "single_write": single_write, "single_ok": single_ok,
@@ -151,6 +171,29 @@ class Worker:
         return self.receive()
 
 
+class TestSetupConfiguration(unittest.TestCase):
+    def test_setup_configuration_errors_return_codes(self):
+        from mooncake.store import MooncakeDistributedStore
+
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+        values = {"local_hostname": "127.0.0.1", "metadata_server": "P2PHANDSHAKE"}
+        if hasattr(store, "setup_p2p_real_client"):
+            values["tiered_backend_config"] = "{invalid json"
+            self.assertEqual(store.setup_p2p_real_client(values), -600)
+            self.assertEqual(store.setup_p2p_real_client(
+                "127.0.0.1", "P2PHANDSHAKE", "{invalid json", 0,
+                "tcp", "", "127.0.0.1:50051"), -600)
+        else:
+            values["local_buffer_size"] = "invalid"
+            self.assertEqual(store.setup(values), -600)
+            values["local_buffer_size"] = "0"
+            values["client_rpc_port"] = "65536"
+            self.assertEqual(store.setup(values), -600)
+            self.assertEqual(store.setup(
+                "", "P2PHANDSHAKE", 0, 0, "tcp", "", "127.0.0.1:50051"), -600)
+
+
 @unittest.skipUnless(sys.platform == "linux" and
                      os.getenv("MOONCAKE_REAL_CLIENT_COMMAND"),
                      "Requires Linux, a matching daemon command and live master")
@@ -177,6 +220,7 @@ class TestDeploymentLifecycle(unittest.TestCase):
                                f"--rpc_port={master_port}", "--metrics_port=0",
                                "--enable_metric_reporting=false", "--enable_ha=false"]
             master, log = self.spawn(master_command, "master")
+            self.master = master
             deadline = time.monotonic() + 20
             while True:
                 self.assertIsNone(master.poll(), f"Master startup failed; log: {log}")
@@ -199,9 +243,10 @@ class TestDeploymentLifecycle(unittest.TestCase):
                              "--te_async_poll_worker_num=2",
                              '--runtime_config={"write":{"remote_weight":0.0}}']
         self.ipc = f"\0@mooncake_client_{self.port}.sock"
-        self.start_real()
         self.workers = []
-        for index in range(2):
+
+    def start_workers(self, count=2):
+        for index in range(count):
             namespace = f"deployment_{uuid.uuid4().hex}_{index}"
             process, log = self.spawn(
                 [sys.executable, "-u", str(Path(__file__).resolve()),
@@ -269,26 +314,38 @@ class TestDeploymentLifecycle(unittest.TestCase):
                 time.sleep(0.05)
         self.fail(f"Real did not become ready ({last_error}); log: {log}")
 
-    def assert_roundtrip(self, response):
+    def assert_buffer_io(self, response):
         self.assertEqual(response["writes"], [0, 0])
         self.assertEqual(response["reads"], response["sizes"])
+        self.assertTrue(response["content_ok"])
+        self.assertTrue(response["intact"])
+
+    def assert_roundtrip(self, response):
+        self.assert_buffer_io(response)
         self.assertEqual(response["single_write"], 0)
-        for field in ("content_ok", "short_ok", "single_ok", "shape_ok", "intact"):
+        for field in ("short_ok", "single_ok", "shape_ok"):
             self.assertTrue(response[field], field)
 
-    def wait_roundtrip(self, worker):
+    def wait_roundtrip(self, worker, *, expect_local_pool=True):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             response = worker.call("roundtrip")
             if (response["writes"] == [0, 0] and
                     response["reads"] == response["sizes"] and
-                    response["single_write"] == 0):
-                self.assert_roundtrip(response)
+                    (not expect_local_pool or response["single_write"] == 0)):
+                if expect_local_pool:
+                    self.assert_roundtrip(response)
+                else:
+                    self.assert_buffer_io(response)
+                    # Explicit SHM must not create the ordinary put/get pool.
+                    self.assertLess(response["single_write"], 0)
                 return
             time.sleep(0.1)
         self.fail(f"Dummy did not complete readiness/reconnect data checks; log: {worker.log}")
 
     def crash_and_reconnect(self, phase):
+        self.start_real()
+        self.start_workers()
         if phase == "after_reply":
             self.assert_roundtrip(self.workers[0].call("roundtrip"))
         elif phase == "pending_reply":
@@ -325,7 +382,84 @@ class TestDeploymentLifecycle(unittest.TestCase):
     def test_multi_dummy_real_crash_after_reply(self):
         self.crash_and_reconnect("after_reply")
 
+    def test_p2p_master_loss_preserves_dummy_local_io(self):
+        from mooncake.store import MooncakeDistributedStore
+
+        if not hasattr(MooncakeDistributedStore, "setup_p2p_real_client"):
+            self.skipTest("P2P local-service behavior")
+        if not hasattr(self, "master"):
+            self.skipTest("Requires a test-owned master")
+        # Keep the HTTP probe port distinct from the pending Dummy RPC listener.
+        with socket.socket() as rpc_reservation, socket.socket() as reservation:
+            rpc_reservation.bind(("127.0.0.1", self.port))
+            reservation.bind(("127.0.0.1", 0))
+            http_port = reservation.getsockname()[1]
+        self.command += ["--enable_http_server=true", f"--http_port={http_port}"]
+        self.start_real()
+        self.start_workers(count=1)
+        worker = self.workers[0]
+
+        def health():
+            with urlopen(f"http://127.0.0.1:{http_port}/health", timeout=1) as reply:
+                return reply.read().decode().strip()
+
+        self.assertEqual(health(), "ONLINE")
+        self.signal_owned(self.master, signal.SIGKILL)
+        self.master.wait(timeout=5)
+        deadline = time.monotonic() + 30
+        while health() != "DEGRADED":
+            self.assertIsNone(self.real.poll())
+            if time.monotonic() >= deadline:
+                self.fail(f"P2P did not enter DEGRADED; logs: {self.run_dir}")
+            time.sleep(0.1)
+        # Exercise Dummy forwarding across several nominal heartbeat periods.
+        # Native DEGRADED must still produce a HEALTH response for Dummy.
+        deadline = time.monotonic() + 5
+        while True:
+            self.assertIsNone(self.real.poll())
+            self.assert_buffer_io(worker.call("local_io"))
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+    def start_zero_buffer_worker(self):
+        namespace = f"zero_buffer_{uuid.uuid4().hex}"
+        process, log = self.spawn(
+            [sys.executable, "-u", str(Path(__file__).resolve()),
+             "--zero-buffer-worker", f"127.0.0.1:{self.port}", namespace],
+            "zero_buffer", pipes=True)
+        worker = Worker(process, log)
+        self.assertTrue(worker.receive().get("ready"))
+        return worker
+
+    def test_zero_buffer_close_without_mapping(self):
+        self.start_real()
+        worker = self.start_zero_buffer_worker()
+        self.assertEqual(worker.call("probe")["exists"], 0)
+        self.assertEqual(worker.call("close")["closed"], 0)
+        self.assertEqual(worker.process.wait(timeout=10), 0)
+
+    def test_zero_buffer_reconnect_then_explicit_io(self):
+        self.start_real()
+        worker = self.start_zero_buffer_worker()
+        self.signal_owned(self.real, signal.SIGKILL)
+        self.real.wait(timeout=5)
+        self.assertLess(worker.call("probe")["exists"], 0)
+        self.start_real()
+        deadline = time.monotonic() + 30
+        while worker.call("probe")["exists"] != 0:
+            if time.monotonic() >= deadline:
+                self.fail(f"Zero-buffer Dummy did not reconnect; log: {worker.log}")
+            time.sleep(0.1)
+        self.assertTrue(worker.call("allocate").get("ready"))
+        # RPC reconnection can precede eviction of the killed Real's segments.
+        self.wait_roundtrip(worker, expect_local_pool=False)
+        self.assertEqual(worker.call("close")["closed"], 0)
+        self.assertEqual(worker.process.wait(timeout=10), 0)
+
     def assert_signal_exit(self, order):
+        self.start_real()
+        self.start_workers()
         processes = [worker.process for worker in self.workers]
         if order == "real_first":
             processes.insert(0, self.real)
@@ -354,9 +488,11 @@ class TestDeploymentLifecycle(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--dummy-worker":
+    if len(sys.argv) == 4 and sys.argv[1] in (
+            "--dummy-worker", "--zero-buffer-worker"):
         try:
-            dummy_worker(sys.argv[2], sys.argv[3])
+            size = 0 if sys.argv[1] == "--zero-buffer-worker" else 4 << 20
+            dummy_worker(sys.argv[2], sys.argv[3], size)
         except Exception:
             traceback.print_exc()
             sys.exit(1)

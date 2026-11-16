@@ -13,6 +13,7 @@ struct P2PMasterConfig {
         uint32_t port = 50051;
         uint32_t thread_num = 4;
         std::string address = "0.0.0.0";
+        std::string interface;
         int32_t connection_timeout_seconds = 0;
         bool enable_tcp_no_delay = true;
         uint32_t heartbeat_port = 0;
@@ -22,6 +23,7 @@ struct P2PMasterConfig {
     struct Metrics {
         bool enable_reporting = true;
         uint32_t http_port = 9003;
+        std::string host = "0.0.0.0";
     } metrics;
 
     struct ClientLifecycle {

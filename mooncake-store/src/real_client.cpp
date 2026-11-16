@@ -11,6 +11,7 @@
 #include <chrono>
 #include <stop_token>
 
+#include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
@@ -44,9 +45,18 @@ ResourceTracker& ResourceTracker::getInstance() {
 }
 
 ResourceTracker::ResourceTracker() {
-    // Start dedicated signal handling thread (best-effort)
-    startSignalThread();
-    // Register exit handler as a backstop
+    // In embedded environments (e.g. Python), the host runtime owns signal
+    // handling.  Blocking SIGINT with pthread_sigmask (done inside
+    // startSignalThread) would prevent Python from raising KeyboardInterrupt,
+    // causing the process to hang on Ctrl-C.  Detect Python at runtime via
+    // dlsym so we don't need to include <Python.h> or change any public API.
+    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+        // Standalone C/C++ process – install our own signal handling.
+        startSignalThread();
+    }
+
+    // Register exit handler as a backstop (works in both standalone and
+    // embedded modes).
     std::atexit(exitHandler);
 }
 
@@ -1534,21 +1544,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
 tl::expected<DummyHeartbeatResponse, ErrorCode> RealClient::ping(
     const UUID& client_id) {
     const auto state = state_.load(std::memory_order_acquire);
-    if (state == State::CLOSING || state == State::CLOSED) {
-        LOG(ERROR) << "ping failed, error=" << ErrorCode::SHUTTING_DOWN;
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+    if (state != State::READY) {
+        const auto error = state == State::CLOSING || state == State::CLOSED
+                               ? ErrorCode::SHUTTING_DOWN
+                               : ErrorCode::INTERNAL_ERROR;
+        LOG(ERROR) << "ping failed: RealClient is not ready, error=" << error;
+        return tl::unexpected(error);
     }
     DummyHeartbeatResponse resp;
     auto context = find_shm_context(client_id);
-    if (!context) {
-        resp.status = DummyClientStatus::DISCONNECTION;
-        resp.mapped_shm_count = 0;
-        LOG(WARNING) << "receive heartbeat from a disconnected client"
-                     << ", client_id=" << client_id;
-        return resp;
-    }
-    resp.status = DummyClientStatus::HEALTH;
-    {
+    resp.status = client_service_->GetServiceStatus();
+
+    if (context) {
         SharedMutexLocker lock(&context->mutex_, shared_lock);
         resp.mapped_shm_count = context->mapped_shms_.size();
     }

@@ -1,8 +1,10 @@
 # Build CUDA 13 wheels for both Store architectures.
-# TODO(UPG-003.1/UPG-004.1): Replace this workflow with the shared CUDA 13
-# wheel profile and toolchain, preserving the Store architecture dimension.
-# Follow the shared-wheel deferral in ci.yml: F01-T118 / UPG1-F22-B02,
-# workflow integration in UPG1-F22-B04, and UPG2-F01-public-build providers.
+# TODO-REF(F02-T004, receiver=UPG1-F22-B04): Migrate shared wheel workflows
+# and legacy Docker jobs during B04 implementation, before B04 acceptance.
+# Keep architecture-specific artifacts; validate replacement image coverage
+# before removing old jobs/Buildx. Package profiles remain F01-T118/B02 and
+# public providers remain F01-T113/UPG2.
+# Source: UPG1-F02-B05 block 3 audit; clarified by Codex on 2026-11-12.
 name: 'Build Wheel (CUDA 13)'
 
 on:
@@ -82,7 +84,8 @@ jobs:
         mkdir build
         cd build
         args=("-DMOONCAKE_STORE_CLIENT_ARCH=$STORE_ARCH")
-        # TODO(UPG-001.1): Enable STORE_USE_REDIS for both architectures.
+        # TODO-REF(F02-T005, receiver=UPG1-F22-B04): Enable/verify supported
+        # Redis architectures after S50 delivery, before B04 CI acceptance.
         if [ "$STORE_ARCH" = centralized ]; then
           args+=(-DSTORE_USE_REDIS=OFF)
         else

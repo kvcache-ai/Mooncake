@@ -18,7 +18,9 @@ start_metadata_server() {
     local attempt
 
     echo "Starting standalone HTTP metadata server..."
-    mooncake_http_metadata_server --port 8080 &
+    # Loopback only: every client in this script is colocated, and the server
+    # refuses an unauthenticated non-loopback bind.
+    mooncake_http_metadata_server --host 127.0.0.1 --port 8080 &
     METADATA_SERVER_PID=$!
 
     for attempt in {1..50}; do

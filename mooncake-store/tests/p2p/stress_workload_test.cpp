@@ -116,7 +116,11 @@ bool initialize_client() {
             1024 * 1024,
         /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
         FLAGS_p2p_local_transfer_mode, FLAGS_local_io_worker_num);
-    auto client_opt = P2PClientService::Create(config);
+    if (!config) {
+        LOG(ERROR) << "Failed to build P2P client config: " << config.error();
+        return false;
+    }
+    auto client_opt = P2PClientService::Create(*config);
 
     if (!client_opt.has_value()) {
         LOG(ERROR) << "Failed to create client";
