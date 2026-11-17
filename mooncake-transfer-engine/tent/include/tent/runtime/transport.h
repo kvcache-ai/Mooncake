@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -57,6 +58,16 @@ class Transport {
         }
 
         uint64_t device_mask;  // Device mask for transport selection
+        // CQ / worker threads that complete without a foreground poll publish
+        // here (TENT analogue of classic TE BatchDesc::finished_task_count,
+        // PR #4199). Default transports leave both at 0 / false so
+        // getBatchStatus keeps walking.
+        std::atomic<uint64_t> finished_task_count{0};
+        // When set, the last-slice CAS publishes here instead of
+        // finished_task_count. TENT submit intervals use this so a completed
+        // interval can notify without a second CQ atomic on the batch counter.
+        std::atomic<uint64_t>* publish_finished_counter{nullptr};
+        std::atomic<bool> has_failure{false};
         // Named QP pool for this batch's transfers (RFC #2568 step 3). Empty =
         // no pool (default spray). Carried like device_mask, from the matched
         // SelectionPolicy down to each RdmaTask.
@@ -192,6 +203,12 @@ class Transport {
     virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
         return Status::OK();
     }
+
+    // True when this transport publishes SubBatch::finished_task_count from a
+    // worker / CQ path, so getBatchStatus can return PENDING without walking
+    // owners. RDMA opts in. TCP, NVLink, and test fakes stay on the walk:
+    // their progress is driven by getTransferStatus().
+    virtual bool publishesBatchCompletionCounter() const { return false; }
 
    protected:
     Capabilities caps;
