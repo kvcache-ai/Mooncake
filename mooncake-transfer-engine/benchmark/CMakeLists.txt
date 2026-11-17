@@ -71,6 +71,12 @@ set_target_properties(
 
 if(BUILD_UNIT_TESTS)
   if(USE_TENT)
+    add_executable(tebench_tent_polling_test tests/tent_polling_test.cpp)
+    target_link_libraries(tebench_tent_polling_test PRIVATE gtest gtest_main)
+    target_include_directories(tebench_tent_polling_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_polling_test COMMAND tebench_tent_polling_test)
+
     add_executable(
       tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
                                bench_runner.cpp split_output.cpp utils.cpp)

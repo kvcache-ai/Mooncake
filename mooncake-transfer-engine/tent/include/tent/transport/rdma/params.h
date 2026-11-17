@@ -191,6 +191,7 @@ inline NotifyQpRtsAttrs buildNotifyQpRtsAttrs(const EndPointParams& params) {
 
 struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
+    bool prefer_nic_local = false;
     int max_retry_count = 8;
     int block_size = 65536;
     uint64_t grace_period_ns = 5000000;  // 5ms

@@ -17,6 +17,7 @@
 #include "tent/transport/rdma/gdr_reachability.h"
 
 #include <sys/epoll.h>
+#include <sched.h>
 
 #include <algorithm>
 #include <cassert>
@@ -1352,9 +1353,16 @@ void Workers::showLatencyInfo() {
 }
 
 void Workers::workerThread(int thread_id) {
-    bindToSocket(thread_id % numa_num_configured_nodes());
+    const int bind_status =
+        bindToSocket(thread_id % numa_num_configured_nodes());
     tl_wid = thread_id;
     auto& worker = worker_context_[thread_id];
+    if (bind_status == 0) {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        const int cpu = sched_getcpu();
+        worker.bound_numa_node.store(cpu >= 0 ? numa_node_of_cpu(cpu) : -1,
+                                     std::memory_order_release);
+    }
 
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;

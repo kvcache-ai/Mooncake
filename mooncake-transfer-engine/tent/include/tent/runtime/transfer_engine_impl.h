@@ -728,8 +728,8 @@ class TransferEngineImpl {
     // With the runtime queue enabled, hot paths hold progress_mutex_ and
     // take the shard only for membership ops:
     //   progress_mutex_ -> shard (membership only)
-    static constexpr size_t kBatchLockShards = 64;
-    struct BatchShard {
+    static constexpr size_t kBatchLockShards = 1024;
+    struct alignas(64) BatchShard {
         std::recursive_mutex mtx;
         std::unordered_set<Batch*> active_batches;
         std::unordered_set<BatchID> alive_batches;
