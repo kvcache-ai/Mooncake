@@ -5625,8 +5625,13 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             }
         }
         if (!replacing_existing) {
-            // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
-            post.push_back(replica.get_descriptor());
+            // The new LOCAL_DISK replica is COMPLETE upon AddReplica. Same
+            // position as in memory: ahead of the existing LOCAL_DISK ones.
+            auto pos = std::find_if(post.begin(), post.end(),
+                                    [](const Replica::Descriptor& d) {
+                                        return d.is_local_disk_replica();
+                                    });
+            post.insert(pos, replica.get_descriptor());
         }
 
         auto persist_result = AppendOpLogVisibleBeforeDurable(
@@ -5638,9 +5643,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     }
 
     if (!replacing_existing) {
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(replica));
-        metadata.AddReplicas(std::move(replicas));
+        metadata.AddLocalDiskReplicaFirst(std::move(replica));
         SyncCacheTotalAccounting(metadata);
         SyncKvObjectState(key, metadata, object_id.tenant_id,
                           previous_kv_media);
@@ -8317,9 +8320,8 @@ auto MasterService::NotifyOffloadSuccess(
                                        return rep.get_local_disk_client_id() ==
                                               client_id;
                                    })) {
-                        std::vector<Replica> replicas;
-                        replicas.emplace_back(std::move(replica));
-                        obj_metadata.AddReplicas(std::move(replicas));
+                        obj_metadata.AddLocalDiskReplicaFirst(
+                            std::move(replica));
                         SyncCacheTotalAccounting(obj_metadata);
                         MasterMetricManager::instance().inc_offload_completed(
                             UuidToString(client_id));

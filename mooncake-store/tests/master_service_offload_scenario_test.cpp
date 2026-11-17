@@ -492,7 +492,13 @@ TEST(MasterServiceOffloadScenarioTest,
     for (const auto& task : tasks) {
         auto result = service.GetReplicaList(task.key, tenant);
         ASSERT_TRUE(result);
-        EXPECT_EQ(result->replicas.size(), 2);
+        ASSERT_EQ(result->replicas.size(), 2);
+        // Readers take the first LOCAL_DISK replica, so the restarted owner
+        // must be listed ahead of the old one while both exist.
+        EXPECT_EQ(result->replicas[0].get_local_disk_descriptor().client_id,
+                  new_owner);
+        EXPECT_EQ(result->replicas[1].get_local_disk_descriptor().client_id,
+                  old_owner);
     }
 
     // This is the same owner-scoped SSD sweep used to remove an old owner;
@@ -558,6 +564,16 @@ TEST(MasterServiceOffloadScenarioTest,
     auto result = service.GetReplicaList(key, tenant);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->replicas.size(), 3);
+    // The offload-completion branch also lists the new owner ahead of the old
+    // one, so readers that take the first LOCAL_DISK replica pick it.
+    std::vector<UUID> disk_owners;
+    for (const auto& replica : result->replicas) {
+        if (replica.is_local_disk_replica()) {
+            disk_owners.push_back(
+                replica.get_local_disk_descriptor().client_id);
+        }
+    }
+    EXPECT_EQ(disk_owners, (std::vector<UUID>{new_owner, old_owner}));
 
     ASSERT_TRUE(service.UnmountLocalDiskSegment(old_owner));
     ASSERT_TRUE(service.UnmountSegment(segment.id, new_owner));
