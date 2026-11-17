@@ -29,6 +29,7 @@ constexpr size_t kShmSize = 4 * kMB;
 // dereferences them.
 constexpr uint64_t kPoolAddr = 0x7f0000000000ULL;
 constexpr uint64_t kBufferAddr = 0x7f1000000000ULL;
+constexpr uint64_t kNewPoolAddr = 0x7f2000000000ULL;
 
 class RealClientDummyRemountTest : public ::testing::Test {
    protected:
@@ -126,6 +127,24 @@ TEST_F(RealClientDummyRemountTest, UnregisteringAnExpiredSegmentEndsRemount) {
 
     ASSERT_TRUE(client_->unregister_shm_buffer_internal(kPoolAddr, client_id_)
                     .has_value());
+    EXPECT_EQ(Ping(), ClientStatus::OK);
+}
+
+TEST_F(RealClientDummyRemountTest,
+       ExplicitTeardownClearsRemountForReregisteredClient) {
+    Map(kPoolAddr);
+    MissPings();
+    ASSERT_EQ(Ping(), ClientStatus::NEED_REMOUNT);
+
+    // The monitor already removed the active context. An explicit teardown
+    // still has to clear the expired client's remount record.
+    ASSERT_EQ(client_->unmap_shm_internal(client_id_).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(Ping(), ClientStatus::OK);
+
+    EXPECT_TRUE(
+        client_->is_shm_mapped_internal(kPoolAddr, client_id_).has_value());
+    Map(kNewPoolAddr);
     EXPECT_EQ(Ping(), ClientStatus::OK);
 }
 

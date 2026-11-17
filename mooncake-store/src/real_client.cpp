@@ -3474,6 +3474,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
 tl::expected<void, ErrorCode> RealClient::UnmapShmContext(
     const UUID &client_id, bool require_remount) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    if (!require_remount) remount_required_.erase(client_id);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
