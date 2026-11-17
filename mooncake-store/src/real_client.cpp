@@ -22,6 +22,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -950,6 +951,30 @@ RealClient::~RealClient() {
     if (!tearDownAll_internal()) {
         LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
                       "some buffers must stay mapped until process exit";
+        if (client_) {
+            // Deliberately process-lifetime: RAII destruction would release
+            // registered backing. Retain dependencies, never a Client cycle.
+            (void)new std::tuple{client_->transfer_engine_,
+                                 std::move(nof_runtime_),
+                                 std::move(port_binder_),
+                                 std::move(dynamic_segment_cleanup_),
+                                 std::move(client_buffer_allocator_),
+                                 std::move(setup_segment_pinned_regions_),
+                                 std::move(hugepage_segment_ptrs_),
+                                 std::move(segment_ptrs_),
+                                 std::move(ascend_segment_ptrs_),
+                                 std::move(ub_segment_ptrs_),
+#ifdef USE_MEMFABRIC
+                                 std::move(memfabric_segment_ptrs_),
+#endif
+#ifdef USE_VRAM_SEGMENT
+                                 std::move(vram_segment_ptrs_),
+#endif
+#if defined(USE_SUNRISE)
+                                 std::move(sunrise_segment_ptrs_),
+#endif
+                                 std::move(egm_segment_ptrs_)};
+        }
     }
 }
 
@@ -1928,8 +1953,9 @@ int RealClient::initAll(const std::string &protocol_,
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
-    if (!closed_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
+    const bool first_close = closed_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel);
+    if (!first_close) {
         // A previous teardown's cleanup failure must not decay into success
         // on repeat calls: retry the idempotent cleanups and keep reporting
         // failure until they heal.
@@ -1947,32 +1973,37 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         if (shm_rc != ErrorCode::OK) {
             return tl::unexpected(shm_rc);
         }
-        return {};
     }
 
-    // Drain the prefetch pool before any resource release below. Pool jobs
-    // capture shared_ptrs locked at submission, so a job blocked on its
-    // metadata RPC keeps Client alive past client_.reset(); segment memory
-    // must not be released (and must not stay registered with TE / published
-    // on the master) while such a job is still running.
-    if (prefetcher_) {
-        prefetcher_->Shutdown();
+    dynamic_segment_cleanup_->DeferRelease();
+    if (first_close) {
+        // Drain the prefetch pool before any resource release below. Pool jobs
+        // capture shared_ptrs locked at submission, so a job blocked on its
+        // metadata RPC keeps Client alive past client_.reset(); segment memory
+        // must not be released (and must not stay registered with TE /
+        // published on the master) while such a job is still running.
+        if (prefetcher_) {
+            prefetcher_->Shutdown();
+        }
+
+        stop_ipc_server();
+        stop_dummy_client_monitor();
+        stop_http_server();
+        if (offload_rpc_server_) {
+            offload_rpc_server_->stop();
+            offload_rpc_server_.reset();
+        }
+        file_storage_.reset();
     }
 
-    stop_ipc_server();
-    stop_dummy_client_monitor();
-    stop_http_server();
+    if (client_) client_->DrainWorkers();
+    dynamic_segment_cleanup_->FinishDrain();
 
     ErrorCode cleanup_error = ErrorCode::OK;
+    const ErrorCode dynamic_rc = CleanupDynamicSegments();
+    if (dynamic_rc != ErrorCode::OK) cleanup_error = dynamic_rc;
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
-            // Callers must quiesce in-flight requests before close. FileStorage
-            // owns a Client reference and workers that access segments.
-            if (offload_rpc_server_) {
-                offload_rpc_server_->stop();
-                offload_rpc_server_.reset();
-            }
-            file_storage_.reset();
             for (auto it = egm_segment_ptrs_.rbegin();
                  it != egm_segment_ptrs_.rend(); ++it) {
                 auto &owner = *it;
@@ -1996,27 +2027,28 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             protocol != "cxl") {
             auto unregister_result = client_->unregisterLocalMemory(
                 client_buffer_allocator_->getBase(), true);
+            if (!unregister_result &&
+                unregister_result.error() == ErrorCode::NOT_REGISTERED) {
+                if (client_->transfer_engine_->getMetadata()
+                        ->updateLocalSegmentDesc() == 0) {
+                    unregister_result = {};
+                }
+            }
             if (!unregister_result) {
                 LOG(WARNING)
                     << "Failed to unregister client local buffer on tear down: "
                     << toString(unregister_result.error());
+                if (cleanup_error == ErrorCode::OK)
+                    cleanup_error = unregister_result.error();
             }
-            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-            local_buffer_region_.reset();
         }
-        // Keep EGM Release separate from UnmountSegment above. Unmount only
-        // removes Master metadata and TE registration; replica copy/move
-        // workers may still hold local source slices. If reset drops the last
-        // Client reference, its destructor stops and joins those workers before
-        // we release backing memory. This is not a GPU completion barrier:
-        // transfers that timed out may still require deferred cleanup.
-        client_.reset();
+        if (dynamic_rc == ErrorCode::OK) {
+            auto result = client_->UnmountAllSegments();
+            if (!result && cleanup_error == ErrorCode::OK)
+                cleanup_error = result.error();
+        }
     }
-    if (embedded_master_) {
-        embedded_master_->Stop();
-        embedded_master_.reset();
-    }
-    // NoF I/O is drained by now (client_.reset() joined the worker pool).
+    // NoF I/O is drained by Client::DrainWorkers().
     // Release this client's NoF registrations; on failure the caller-owned
     // buffers may still be DMA-translated and must not be freed or remapped.
     {
@@ -2024,6 +2056,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         if (nof_rc != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
             cleanup_error = nof_rc;
         }
+    }
+    if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        local_buffer_region_.reset();
+    }
+    client_.reset();
+    if (embedded_master_) {
+        embedded_master_->Stop();
+        embedded_master_.reset();
     }
     for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
          ++it) {
@@ -2039,8 +2081,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
     }
     egm_segment_ptrs_.clear();
-    ReleaseAllMountedSegmentRecords();
-    ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
     port_binder_.reset();
     const bool setup_segments_safe_to_free = ReleasePinnedRegionsForFree(
@@ -2290,46 +2330,36 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
     }
 
     {
-        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+        std::lock_guard<std::mutex> lock(
+            dynamic_segment_cleanup_->mounted_mutex);
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
-            mounted_segment_records_[mounted_ids[i]] = mounted_records[i];
+            dynamic_segment_cleanup_->mounted[mounted_ids[i]] =
+                mounted_records[i];
         }
     }
     out_segment_ids = std::move(mounted_ids);
     return 0;
 }
 
-void RealClient::ReleaseMountedSegmentRecord(const std::string &segment_id) {
+void RealClient::DynamicSegmentCleanup::ReleaseMounted(
+    const std::string &segment_id) {
     MountedSegmentRecord record;
     bool found = false;
     {
-        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
-        auto it = mounted_segment_records_.find(segment_id);
-        if (it != mounted_segment_records_.end()) {
+        std::lock_guard<std::mutex> lock(mounted_mutex);
+        auto it = mounted.find(segment_id);
+        if (it != mounted.end()) {
+            if (release_deferred) {
+                confirmed_mounted.insert(segment_id);
+                return;
+            }
             record = it->second;
-            mounted_segment_records_.erase(it);
+            mounted.erase(it);
             found = true;
         }
     }
     if (found && record.mmap_base) {
         munmap(record.mmap_base, record.size);
-    }
-}
-
-void RealClient::ReleaseAllMountedSegmentRecords() {
-    std::vector<MountedSegmentRecord> records;
-    {
-        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
-        records.reserve(mounted_segment_records_.size());
-        for (auto &entry : mounted_segment_records_) {
-            records.push_back(entry.second);
-        }
-        mounted_segment_records_.clear();
-    }
-    for (auto &record : records) {
-        if (record.mmap_base) {
-            munmap(record.mmap_base, record.size);
-        }
     }
 }
 
@@ -2340,15 +2370,20 @@ void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
     }
 }
 
-void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
+void RealClient::DynamicSegmentCleanup::ReleaseAllocated(
+    const std::string &segment_id) {
     AllocatedSegmentRecord record;
     bool found = false;
     {
-        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
-        auto it = allocated_segment_records_.find(segment_id);
-        if (it != allocated_segment_records_.end()) {
+        std::lock_guard<std::mutex> lock(allocated_mutex);
+        auto it = allocated.find(segment_id);
+        if (it != allocated.end()) {
+            if (release_deferred) {
+                confirmed_allocated.insert(segment_id);
+                return;
+            }
             record = it->second;
-            allocated_segment_records_.erase(it);
+            allocated.erase(it);
             found = true;
         }
     }
@@ -2357,15 +2392,66 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
     }
 }
 
-void RealClient::ReleaseAllAllocatedSegmentRecords() {
-    std::unordered_map<std::string, AllocatedSegmentRecord> records;
+void RealClient::DynamicSegmentCleanup::DeferRelease() {
+    std::scoped_lock lock(mounted_mutex, allocated_mutex);
+    release_deferred = true;
+}
+
+void RealClient::DynamicSegmentCleanup::FinishDrain() {
+    std::unordered_set<std::string> mounted_ids, allocated_ids;
     {
-        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
-        records.swap(allocated_segment_records_);
+        std::scoped_lock lock(mounted_mutex, allocated_mutex);
+        release_deferred = false;
+        mounted_ids.swap(confirmed_mounted);
+        allocated_ids.swap(confirmed_allocated);
     }
-    for (auto &entry : records) {
-        FreeAllocatedStoreSegment(entry.second);
+    for (const auto &id : mounted_ids) ReleaseMounted(id);
+    for (const auto &id : allocated_ids) ReleaseAllocated(id);
+}
+
+ErrorCode RealClient::CleanupDynamicSegments() {
+    auto cleanup = dynamic_segment_cleanup_;
+    std::vector<std::string> mounted_ids, allocated_ids;
+    {
+        std::lock_guard<std::mutex> lock(cleanup->mounted_mutex);
+        for (const auto &entry : cleanup->mounted)
+            mounted_ids.push_back(entry.first);
     }
+    {
+        std::lock_guard<std::mutex> lock(cleanup->allocated_mutex);
+        for (const auto &entry : cleanup->allocated)
+            allocated_ids.push_back(entry.first);
+    }
+    ErrorCode first_error = ErrorCode::OK;
+    for (const auto &id : mounted_ids) {
+        UUID uuid;
+        auto result = StringToUuid(id, uuid) && client_
+                          ? client_->UnmountSegmentById(uuid)
+                          : tl::expected<void, ErrorCode>(
+                                tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        if (result) {
+            cleanup->ReleaseMounted(id);
+        } else {
+            std::lock_guard<std::mutex> lock(cleanup->mounted_mutex);
+            if (cleanup->mounted.contains(id) && first_error == ErrorCode::OK)
+                first_error = result.error();
+        }
+    }
+    for (const auto &id : allocated_ids) {
+        UUID uuid;
+        auto result = StringToUuid(id, uuid) && client_
+                          ? client_->UnmountSegmentById(uuid)
+                          : tl::expected<void, ErrorCode>(
+                                tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        if (result) {
+            cleanup->ReleaseAllocated(id);
+        } else {
+            std::lock_guard<std::mutex> lock(cleanup->allocated_mutex);
+            if (cleanup->allocated.contains(id) && first_error == ErrorCode::OK)
+                first_error = result.error();
+        }
+    }
+    return first_error;
 }
 
 int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
@@ -2384,7 +2470,8 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
     std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, MountedSegmentRecord>> to_cleanup;
     {
-        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+        std::lock_guard<std::mutex> lock(
+            dynamic_segment_cleanup_->mounted_mutex);
         for (const auto &segment_id : segment_ids) {
             UUID id;
             if (!StringToUuid(segment_id, id)) {
@@ -2393,8 +2480,8 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
                 continue;
             }
 
-            auto it = mounted_segment_records_.find(segment_id);
-            if (it == mounted_segment_records_.end()) {
+            auto it = dynamic_segment_cleanup_->mounted.find(segment_id);
+            if (it == dynamic_segment_cleanup_->mounted.end()) {
                 LOG(ERROR) << "segment_id not found in mounted records: "
                            << segment_id;
                 if (first_error == 0) first_error = -1;
@@ -2408,9 +2495,10 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
     for (auto &entry : to_unmount) {
         std::function<void(const UUID &)> cleanup_callback;
         if (grace_period_ms != 0) {
-            cleanup_callback = [this](const UUID &cleanup_id) {
-                ReleaseMountedSegmentRecord(UuidToString(cleanup_id));
-            };
+            cleanup_callback =
+                [cleanup = dynamic_segment_cleanup_](const UUID &cleanup_id) {
+                    cleanup->ReleaseMounted(UuidToString(cleanup_id));
+                };
         }
         auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
                                                   std::move(cleanup_callback));
@@ -2426,11 +2514,12 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
         // For graceful unmount, local mmap/fd is kept until the segment
         // is actually removed or the client destructor runs.
         if (grace_period_ms == 0) {
-            std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
-            auto it = mounted_segment_records_.find(entry.segment_id);
-            if (it != mounted_segment_records_.end()) {
+            std::lock_guard<std::mutex> lock(
+                dynamic_segment_cleanup_->mounted_mutex);
+            auto it = dynamic_segment_cleanup_->mounted.find(entry.segment_id);
+            if (it != dynamic_segment_cleanup_->mounted.end()) {
                 to_cleanup.emplace_back(entry.segment_id, it->second);
-                mounted_segment_records_.erase(it);
+                dynamic_segment_cleanup_->mounted.erase(it);
             }
         }
     }
@@ -2520,9 +2609,11 @@ int RealClient::allocateAndMountSegment(
     }
 
     {
-        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        std::lock_guard<std::mutex> lock(
+            dynamic_segment_cleanup_->allocated_mutex);
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
-            allocated_segment_records_[mounted_ids[i]] = allocated_records[i];
+            dynamic_segment_cleanup_->allocated[mounted_ids[i]] =
+                allocated_records[i];
         }
     }
     if (out_allocated_size) {
@@ -2549,7 +2640,8 @@ int RealClient::unmountAndFreeSegment(
     std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, AllocatedSegmentRecord>> to_cleanup;
     {
-        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        std::lock_guard<std::mutex> lock(
+            dynamic_segment_cleanup_->allocated_mutex);
         for (const auto &segment_id : segment_ids) {
             UUID id;
             if (!StringToUuid(segment_id, id)) {
@@ -2558,8 +2650,8 @@ int RealClient::unmountAndFreeSegment(
                 continue;
             }
 
-            auto it = allocated_segment_records_.find(segment_id);
-            if (it == allocated_segment_records_.end()) {
+            auto it = dynamic_segment_cleanup_->allocated.find(segment_id);
+            if (it == dynamic_segment_cleanup_->allocated.end()) {
                 LOG(ERROR) << "segment_id not found in allocated records: "
                            << segment_id;
                 if (first_error == 0) first_error = -1;
@@ -2573,9 +2665,10 @@ int RealClient::unmountAndFreeSegment(
     for (auto &entry : to_unmount) {
         std::function<void(const UUID &)> cleanup_callback;
         if (grace_period_ms != 0) {
-            cleanup_callback = [this](const UUID &cleanup_id) {
-                ReleaseAllocatedSegmentRecord(UuidToString(cleanup_id));
-            };
+            cleanup_callback =
+                [cleanup = dynamic_segment_cleanup_](const UUID &cleanup_id) {
+                    cleanup->ReleaseAllocated(UuidToString(cleanup_id));
+                };
         }
         auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
                                                   std::move(cleanup_callback));
@@ -2588,11 +2681,13 @@ int RealClient::unmountAndFreeSegment(
         }
 
         if (grace_period_ms == 0) {
-            std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
-            auto it = allocated_segment_records_.find(entry.segment_id);
-            if (it != allocated_segment_records_.end()) {
+            std::lock_guard<std::mutex> lock(
+                dynamic_segment_cleanup_->allocated_mutex);
+            auto it =
+                dynamic_segment_cleanup_->allocated.find(entry.segment_id);
+            if (it != dynamic_segment_cleanup_->allocated.end()) {
                 to_cleanup.emplace_back(entry.segment_id, it->second);
-                allocated_segment_records_.erase(it);
+                dynamic_segment_cleanup_->allocated.erase(it);
             }
         }
     }

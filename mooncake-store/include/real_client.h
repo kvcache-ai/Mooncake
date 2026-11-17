@@ -1069,7 +1069,7 @@ class RealClient : public PyClient {
         std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
 
-    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+    static void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_write_from_cuda_ipc_dummy_helper(
@@ -1466,21 +1466,31 @@ class RealClient : public PyClient {
     bool can_use_direct_dfs_read(const Replica::Descriptor &replica,
                                  const std::vector<void *> &buffers) const;
 
-    std::unordered_map<std::string, MountedSegmentRecord>
-        mounted_segment_records_;
-    std::mutex mounted_segment_records_mutex_;
-
-    std::unordered_map<std::string, AllocatedSegmentRecord>
-        allocated_segment_records_;
-    std::mutex allocated_segment_records_mutex_;
+    // Callbacks may outlive RealClient. This owner contains no Client
+    // reference, so releasing it on a timer thread cannot destroy/join that
+    // same Client.
+    struct DynamicSegmentCleanup {
+        std::unordered_map<std::string, MountedSegmentRecord> mounted;
+        std::mutex mounted_mutex;
+        std::unordered_map<std::string, AllocatedSegmentRecord> allocated;
+        std::mutex allocated_mutex;
+        // Guarded by both map mutexes when changed. A callback may confirm
+        // unmount during task-pool stop, but cannot release its backing yet.
+        bool release_deferred = false;
+        std::unordered_set<std::string> confirmed_mounted;
+        std::unordered_set<std::string> confirmed_allocated;
+        void DeferRelease();
+        void FinishDrain();
+        void ReleaseMounted(const std::string &segment_id);
+        void ReleaseAllocated(const std::string &segment_id);
+    };
+    std::shared_ptr<DynamicSegmentCleanup> dynamic_segment_cleanup_ =
+        std::make_shared<DynamicSegmentCleanup>();
 
     // Owners awaiting teardown, including mounts without a Client record.
     std::vector<std::unique_ptr<NvlinkHostNumaAllocation>> egm_segment_ptrs_;
 
-    void ReleaseMountedSegmentRecord(const std::string &segment_id);
-    void ReleaseAllMountedSegmentRecords();
-    void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
-    void ReleaseAllAllocatedSegmentRecords();
+    ErrorCode CleanupDynamicSegments();
 
     // MappedShm whose spdk_mem_unregister() (spdk_registered) or transfer
     // engine unregisterLocalMemory() (te_unregister_pending) failed during

@@ -343,6 +343,38 @@ add_store_test(real_client_uninitialized_test
                real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
+# Cleanup fault injection requires GNU --wrap across static Store/TE archives.
+# It is independently runnable, CPU-only, and needs no Python interpreter.
+get_target_property(_cleanup_store_type mooncake_store TYPE)
+get_target_property(_cleanup_te_type transfer_engine TYPE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND _cleanup_store_type STREQUAL "STATIC_LIBRARY"
+   AND _cleanup_te_type STREQUAL "STATIC_LIBRARY"
+   AND NOT USE_TENT
+   AND NOT USE_CUDA
+   AND NOT USE_NOF)
+  add_executable(
+    store_segment_cleanup_test
+    store_segment_cleanup_test.cpp store_segment_cleanup_runtime.cpp
+    store_segment_cleanup_wrappers.cpp store_segment_cleanup_worker_test.cpp
+    store_segment_cleanup_lifecycle_test.cpp)
+  target_link_libraries(
+    store_segment_cleanup_test PRIVATE mooncake_store transfer_engine
+                                       gtest_main pthread)
+  target_link_options(
+    store_segment_cleanup_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake14TransferEngine21unregisterLocalMemoryEPvb"
+    "-Wl,--wrap=_ZN8mooncake12MasterClient14UnmountSegmentERKSt4pairImmE"
+    "-Wl,--wrap=_ZN8mooncake21MetadataStoragePlugin6CreateERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE"
+    "-Wl,--wrap=_ZN8mooncake11free_memoryERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPvPNS_18DmaBufferAllocatorE"
+    "-Wl,--wrap=munmap"
+    "-Wl,--wrap=free"
+    "-Wl,--wrap=_ZN8mooncake17TransferSubmitter6submitERKNS_7Replica10DescriptorERSt6vectorINS_5SliceESaIS6_EENS_9Transport15TransferRequest6OpCodeEPvmNS_14TransferIntentE"
+    "-Wl,--wrap=_ZNSt6thread4joinEv")
+  add_test(NAME store_segment_cleanup_test COMMAND store_segment_cleanup_test)
+  set_tests_properties(store_segment_cleanup_test PROPERTIES TIMEOUT 180)
+endif()
 add_store_test(standalone_client_test standalone_client_test.cpp)
 add_store_test(embedded_master_test embedded_master_test.cpp)
 if(USE_TENT)
