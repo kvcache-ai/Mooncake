@@ -309,4 +309,6 @@ pub trait RouteMembershipProvider: Send + Sync {
         quarantine_until: Instant,
         observed: Option<&ClientLease>,
     );
+
+    fn clear_suspect(&self, runtime: &ClientRuntimeId);
 }
