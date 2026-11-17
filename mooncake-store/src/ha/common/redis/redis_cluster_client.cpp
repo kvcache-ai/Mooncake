@@ -265,7 +265,8 @@ bool RedisClusterClient::ParseShards(const redisReply* reply) {
                 port->type != REDIS_REPLY_INTEGER || port->integer < 1 ||
                 port->integer > 65535 ||
                 (role != "master" && role != "replica") ||
-                (health != "online" && health != "loading" && health != "fail"))
+                (health != "online" && health != "failed" &&
+                 health != "loading"))
                 return false;
             // Keep unhealthy replicas in the configured membership. WAIT
             // must still acknowledge all N; health is not a reason to lower N.
