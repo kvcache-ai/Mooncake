@@ -221,6 +221,9 @@ class DummyClient : public PyClient {
     tl::expected<UUID, ErrorCode> create_drain_job(
         const CreateDrainJobRequest &request) override;
 
+    tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) override;
+
     tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
         const UUID &job_id) override;
 

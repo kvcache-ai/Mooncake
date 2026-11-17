@@ -358,6 +358,11 @@ struct RpcNameTraits<&WrappedMasterService::CreateDrainJob> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::CreateTimedDrainJob> {
+    static constexpr const char* value = "CreateTimedDrainJob";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::QueryDrainJob> {
     static constexpr const char* value = "QueryDrainJob";
 };
@@ -1476,6 +1481,15 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateDrainJob(
         invoke_rpc<&WrappedMasterService::CreateDrainJob, UUID>(request);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateTimedDrainJob(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return CreateDrainJob(request);
+    }
+    return invoke_rpc<&WrappedMasterService::CreateTimedDrainJob, UUID>(
+        request, timeout_ms);
 }
 
 tl::expected<QueryJobResponse, ErrorCode> MasterClient::QueryDrainJob(

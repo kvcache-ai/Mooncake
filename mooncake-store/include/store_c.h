@@ -226,7 +226,8 @@ enum mooncake_store_drain_job_status {
     MOONCAKE_STORE_DRAIN_SUCCEEDED = 3,
     MOONCAKE_STORE_DRAIN_FAILED = 4,
     MOONCAKE_STORE_DRAIN_CANCELED = 5,
-    MOONCAKE_STORE_DRAIN_CANCELING = 6
+    MOONCAKE_STORE_DRAIN_CANCELING = 6,
+    MOONCAKE_STORE_DRAIN_TIMED_OUT = 7
 };
 
 typedef struct mooncake_store_drain_job_request {
@@ -299,15 +300,23 @@ int mooncake_store_create_drain_job(
     mooncake_store_t store, const mooncake_store_drain_job_request_t *request,
     mooncake_store_uuid_t *job_id_out);
 
+/* timeout_ms is measured from creation; 0 means no timeout is set. At the
+ * deadline the job requests cancellation and keeps source segments draining.
+ * It reaches TIMED_OUT after in-flight tasks and their cleanup have finished.
+ * The request and output ownership rules are the same as create_drain_job. */
+int mooncake_store_create_timed_drain_job(
+    mooncake_store_t store, const mooncake_store_drain_job_request_t *request,
+    uint64_t timeout_ms, mooncake_store_uuid_t *job_id_out);
+
 int mooncake_store_query_drain_job(
     mooncake_store_t store, mooncake_store_uuid_t job_id,
     mooncake_store_drain_job_info_t **result_out);
 
 /* Request cancellation of a nonterminal job. In-flight moves may finish;
- * query until the status changes from CANCELING to CANCELED. Repeating a
- * cancellation is safe. CANCELING can persist if an executor cannot report
- * completion or its replication cleanup is pending. A succeeded or failed
- * job returns -1010. */
+ * query until the job becomes CANCELED, or TIMED_OUT if its deadline triggered
+ * first. Repeating a cancellation is safe. CANCELING can persist if an
+ * executor cannot report completion or its replication cleanup is pending.
+ * A succeeded, failed or timed-out job returns -1010. */
 int mooncake_store_cancel_drain_job(mooncake_store_t store,
                                     mooncake_store_uuid_t job_id);
 

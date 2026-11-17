@@ -2092,6 +2092,12 @@ tl::expected<UUID, ErrorCode> DummyClient::create_drain_job(
     return invoke_rpc<&RealClient::create_drain_job, UUID>(request);
 }
 
+tl::expected<UUID, ErrorCode> DummyClient::create_timed_drain_job(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return invoke_rpc<&RealClient::create_timed_drain_job, UUID>(request,
+                                                                 timeout_ms);
+}
+
 tl::expected<QueryJobResponse, ErrorCode> DummyClient::query_drain_job(
     const UUID& job_id) {
     return invoke_rpc<&RealClient::query_drain_job, QueryJobResponse>(job_id);

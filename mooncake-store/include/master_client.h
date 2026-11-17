@@ -750,6 +750,8 @@ class MasterClient {
 
     [[nodiscard]] tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
     [[nodiscard]] tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
         const UUID& job_id);
     [[nodiscard]] tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(

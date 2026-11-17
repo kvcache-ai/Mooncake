@@ -653,6 +653,9 @@ class PyClient {
     virtual tl::expected<UUID, ErrorCode> create_drain_job(
         const CreateDrainJobRequest &request) = 0;
 
+    virtual tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) = 0;
+
     virtual tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
         const UUID &job_id) = 0;
 

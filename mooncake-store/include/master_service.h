@@ -895,6 +895,11 @@ class MasterService {
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
+    /** Start a drain with a relative timeout in milliseconds; zero disables it.
+     */
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
     /**
      * @brief Query the status of a drain job.
      */
@@ -2140,18 +2145,21 @@ class MasterService {
         std::string unit_key;
     };
 
+    enum class DrainStopReason { NONE, USER, TIMEOUT };
+
     struct DrainJob {
         // Caller holds mutex.
         QueryJobResponse ToResponse() const;
 
         mutable std::mutex mutex;
-        // Set without mutex so a long planning walk can observe cancellation
-        // while the caller is waiting to acquire the job lock.
-        std::atomic<bool> cancellation_requested{false};
+        // Set without mutex so a long planning walk can observe a stop while
+        // the caller or deadline scheduler is waiting for the job lock.
+        std::atomic<DrainStopReason> stop_reason{DrainStopReason::NONE};
         UUID id;
         JobType type{JobType::DRAIN};
         JobStatus status{JobStatus::CREATED};
         CreateDrainJobRequest request;
+        std::optional<std::chrono::steady_clock::time_point> deadline;
         std::chrono::system_clock::time_point created_at;
         std::chrono::system_clock::time_point last_updated_at;
         std::string message;
@@ -2168,6 +2176,8 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
+    static bool IsDrainJobTerminal(JobStatus status);
+    static bool DrainJobStopRequested(const DrainJob& job);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
@@ -2176,6 +2186,8 @@ class MasterService {
         const std::string& source, const std::string& target,
         bool retained_by_drain);
     void ProcessDrainJobs();
+    void ProcessDrainJobStop(DrainJob& job);
+    void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);
     void RefreshDrainJobTasks(DrainJob& job);
     void RequestDrainTaskCancellation(DrainJob& job);
     bool FinishDrainJobCancellation(DrainJob& job);
@@ -2190,6 +2202,7 @@ class MasterService {
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
+    DeadlineScheduler<std::weak_ptr<DrainJob>> drain_job_deadline_scheduler_;
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
     std::mutex job_mutex_;
     std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_

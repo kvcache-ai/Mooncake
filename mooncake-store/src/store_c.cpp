@@ -679,6 +679,12 @@ int mooncake_store_query_task(mooncake_store_t store,
 int mooncake_store_create_drain_job(
     mooncake_store_t store, const mooncake_store_drain_job_request_t *request,
     mooncake_store_uuid_t *job_id_out) {
+    return mooncake_store_create_timed_drain_job(store, request, 0, job_id_out);
+}
+
+int mooncake_store_create_timed_drain_job(
+    mooncake_store_t store, const mooncake_store_drain_job_request_t *request,
+    uint64_t timeout_ms, mooncake_store_uuid_t *job_id_out) {
     return with_migration_output(store, job_id_out, [&](auto &client) {
         mooncake::CreateDrainJobRequest native;
         if (!request || request->segment_count == 0 ||
@@ -690,7 +696,10 @@ int mooncake_store_create_drain_job(
             return ErrorCode::INVALID_PARAMS;
         }
         native.max_concurrency = request->max_concurrency;
-        return write_id(client.create_drain_job(native), job_id_out);
+        auto result = timeout_ms == 0
+                          ? client.create_drain_job(native)
+                          : client.create_timed_drain_job(native, timeout_ms);
+        return write_id(result, job_id_out);
     });
 }
 
@@ -722,7 +731,7 @@ int mooncake_store_list_drain_jobs(
         if (filter) {
             if (filter->has_status) {
                 if (filter->status < MOONCAKE_STORE_DRAIN_CREATED ||
-                    filter->status > MOONCAKE_STORE_DRAIN_CANCELING) {
+                    filter->status > MOONCAKE_STORE_DRAIN_TIMED_OUT) {
                     return ErrorCode::INVALID_PARAMS;
                 }
                 request.status =

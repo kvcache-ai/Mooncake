@@ -108,6 +108,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::create_drain_job>(&real_client);
+    server.register_handler<&RealClient::create_timed_drain_job>(&real_client);
     server.register_handler<&RealClient::query_drain_job>(&real_client);
     server.register_handler<&RealClient::cancel_drain_job>(&real_client);
     server.register_handler<&RealClient::list_drain_jobs>(&real_client);

@@ -2374,7 +2374,8 @@ PYBIND11_MODULE(_store, m) {
         .value("SUCCEEDED", JobStatus::SUCCEEDED)
         .value("FAILED", JobStatus::FAILED)
         .value("CANCELED", JobStatus::CANCELED)
-        .value("CANCELING", JobStatus::CANCELING);
+        .value("CANCELING", JobStatus::CANCELING)
+        .value("TIMED_OUT", JobStatus::TIMED_OUT);
 
     py::class_<QueryJobResponse>(m, "QueryJobResponse")
         .def_readonly("id", &QueryJobResponse::id)
@@ -3600,25 +3601,41 @@ PYBIND11_MODULE(_store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &segments,
                const std::vector<std::string> &target_segments,
-               int64_t max_concurrency) -> py::tuple {
+               int64_t max_concurrency, int64_t timeout_ms) -> py::tuple {
                 if (!self.is_client_initialized() || max_concurrency <= 0 ||
-                    max_concurrency > std::numeric_limits<uint32_t>::max()) {
+                    max_concurrency > std::numeric_limits<uint32_t>::max() ||
+                    timeout_ms < 0) {
                     return py::make_tuple(UUID{},
                                           toInt(ErrorCode::INVALID_PARAMS));
                 }
                 py::gil_scoped_release release;
-                auto result = self.store_->create_drain_job(
-                    {segments, target_segments,
-                     static_cast<uint32_t>(max_concurrency)});
+                CreateDrainJobRequest request{
+                    segments, target_segments,
+                    static_cast<uint32_t>(max_concurrency)};
+                auto result =
+                    timeout_ms == 0
+                        ? self.store_->create_drain_job(request)
+                        : self.store_->create_timed_drain_job(
+                              request, static_cast<uint64_t>(timeout_ms));
                 py::gil_scoped_acquire acquire;
                 return py::make_tuple(result.value_or(UUID{}),
                                       result ? 0 : toInt(result.error()));
             },
             py::arg("segments"),
             py::arg("target_segments") = std::vector<std::string>{},
-            py::arg("max_concurrency") = 4,
-            "Start draining mounted memory segments. Returns (job_id, "
-            "error_code).")
+            py::arg("max_concurrency") = 4, py::arg("timeout_ms") = 0,
+            "Start draining mounted memory segments.\n\n"
+            "Args:\n"
+            "    segments: Source segment names.\n"
+            "    target_segments: Target segment names; an empty list lets "
+            "the master choose.\n"
+            "    max_concurrency: Maximum concurrent tasks (default: 4).\n"
+            "    timeout_ms: Timeout in milliseconds from job creation. "
+            "Defaults to 0, which means no timeout is set.\n\n"
+            "On timeout, the job cancels in-flight tasks and keeps "
+            "unfinished sources DRAINING.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (job ID, error code; 0 on success).")
         .def(
             "query_drain_job",
             [](MooncakeStorePyWrapper &self, const UUID &job_id) -> py::tuple {
@@ -3648,8 +3665,9 @@ PYBIND11_MODULE(_store, m) {
             },
             py::arg("job_id"),
             "Request cancellation. In-flight moves may finish; query until "
-            "the job reaches CANCELED. Cancellation may wait for an executor "
-            "or replication cleanup. Returns an error code.")
+            "the job reaches CANCELED, or TIMED_OUT if its deadline triggered "
+            "first. Cancellation may wait for an executor or replication "
+            "cleanup. Returns an error code.")
         .def(
             "list_drain_jobs",
             [](MooncakeStorePyWrapper &self, std::optional<JobStatus> status,

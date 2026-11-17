@@ -16,8 +16,11 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+MOONCAKE_STORE_DRAIN_RUNNING = 2
+MOONCAKE_STORE_DRAIN_SUCCEEDED = 3
 MOONCAKE_STORE_DRAIN_CANCELED = 5
 MOONCAKE_STORE_DRAIN_CANCELING = 6
+MOONCAKE_STORE_DRAIN_TIMED_OUT = 7
 
 
 def address():
@@ -130,6 +133,12 @@ class CStore:
             ctypes.POINTER(DrainRequest),
             ctypes.POINTER(Uuid),
         ]
+        self.lib.mooncake_store_create_timed_drain_job.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(DrainRequest),
+            ctypes.c_uint64,
+            ctypes.POINTER(Uuid),
+        ]
         self.lib.mooncake_store_query_drain_job.argtypes = [
             ctypes.c_void_p,
             Uuid,
@@ -160,17 +169,20 @@ class CStore:
     def close(self):
         self.lib.mooncake_store_destroy(self.store)
 
-    def create(self, source, target):
+    def create(self, source, target, timeout_ms=None):
         sources = (ctypes.c_char_p * 1)(source.encode())
         targets = (ctypes.c_char_p * 1)(target.encode())
         request = DrainRequest(sources, 1, targets, 1, 1)
         job_id = Uuid()
-        assert (
-            self.lib.mooncake_store_create_drain_job(
+        if timeout_ms is not None:
+            result = self.lib.mooncake_store_create_timed_drain_job(
+                self.store, ctypes.byref(request), timeout_ms, ctypes.byref(job_id)
+            )
+        else:
+            result = self.lib.mooncake_store_create_drain_job(
                 self.store, ctypes.byref(request), ctypes.byref(job_id)
             )
-            == 0
-        )
+        assert result == 0
         return job_id
 
     def status(self, job_id):
@@ -186,13 +198,24 @@ class CStore:
         finally:
             self.libc.free(info)
 
+    def assert_invalid_timeout(self, source, target):
+        sources = (ctypes.c_char_p * 1)(source.encode())
+        targets = (ctypes.c_char_p * 1)(target.encode())
+        request = DrainRequest(sources, 1, targets, 1, 1)
+        job_id = Uuid(1, 1)
+        assert (
+            self.lib.mooncake_store_create_timed_drain_job(
+                self.store, ctypes.byref(request), (1 << 64) - 1, ctypes.byref(job_id)
+            )
+            == -600
+        )
+        assert job_id.high == 0 and job_id.low == 0
+
     def cancel(self, job_id):
         assert self.lib.mooncake_store_cancel_drain_job(self.store, job_id) == 0
 
-    def assert_canceling_is_listed(self, job_id, source):
-        filt = DrainFilter(
-            1, MOONCAKE_STORE_DRAIN_CANCELING, source.encode(), None, 100
-        )
+    def assert_status_is_listed(self, job_id, source, status):
+        filt = DrainFilter(1, status, source.encode(), None, 100)
         page = ctypes.POINTER(DrainPage)()
         assert (
             self.lib.mooncake_store_list_drain_jobs(
@@ -221,13 +244,19 @@ def c_worker(library, master, metadata):
             if operation == "create":
                 job_id = store.create(command[1], command[2])
                 result = [job_id.high, job_id.low]
+            elif operation == "create_timed":
+                job_id = store.create(command[1], command[2], command[3])
+                result = [job_id.high, job_id.low]
+            elif operation == "invalid_timed":
+                store.assert_invalid_timeout(command[1], command[2])
+                result = True
             elif operation == "status":
                 result = store.status(Uuid(*command[1]))
             elif operation == "cancel":
                 store.cancel(Uuid(*command[1]))
                 result = True
             elif operation == "list":
-                store.assert_canceling_is_listed(Uuid(*command[1]), command[2])
+                store.assert_status_is_listed(Uuid(*command[1]), command[2], command[3])
                 result = True
             else:
                 raise ValueError(operation)
@@ -381,7 +410,9 @@ def main(master_binary, c_library):
             if use_c_api:
                 assert c_store.call("cancel", job_id)
                 assert c_store.call("status", job_id) == MOONCAKE_STORE_DRAIN_CANCELING
-                assert c_store.call("list", job_id, source_name)
+                assert c_store.call(
+                    "list", job_id, source_name, MOONCAKE_STORE_DRAIN_CANCELING
+                )
             else:
                 assert store.cancel_drain_job(job_id) == 0
                 assert store.query_drain_job(job_id)[0].status == JobStatus.CANCELING
@@ -402,7 +433,100 @@ def main(master_binary, c_library):
                 )
             assert store.query_task(task.id)[0].status == TaskStatus.CANCELED
             assert_value_and_remove(key)
-        print("Python and C DrainJob cancellation passed")
+
+        assert (
+            store.create_drain_job([source_name], [target_name], timeout_ms=-1)[1]
+            == -600
+        )
+        assert (
+            store.create_drain_job(
+                [source_name], [target_name], timeout_ms=(1 << 63) - 1
+            )[1]
+            == -600
+        )
+        assert c_store.call("invalid_timed", source_name, target_name)
+        put("timeout-zero")
+        source.send_signal(signal.SIGSTOP)
+        no_timeout = c_store.call("create_timed", source_name, target_name, 0)
+        wait_until(
+            lambda: c_store.call("status", no_timeout) == MOONCAKE_STORE_DRAIN_RUNNING
+        )
+        time.sleep(1.1)
+        assert c_store.call("status", no_timeout) == MOONCAKE_STORE_DRAIN_RUNNING
+        assert c_store.call("cancel", no_timeout)
+        assert c_store.call("status", no_timeout) == MOONCAKE_STORE_DRAIN_CANCELED
+        source.send_signal(signal.SIGCONT)
+        assert_value_and_remove("timeout-zero")
+        put("timeout-python")
+        source.send_signal(signal.SIGSTOP)
+        job_id, error = store.create_drain_job(
+            [source_name], [target_name], 1, timeout_ms=1000
+        )
+        assert error == 0
+        wait_until(
+            lambda: store.query_drain_job(job_id)[0].status == JobStatus.TIMED_OUT
+        )
+        page, error = store.list_drain_jobs(
+            status=JobStatus.TIMED_OUT, segment=source_name
+        )
+        assert error == 0 and any(entry.id == job_id for entry in page.jobs)
+        # A replacement job can claim the still-draining segment. Canceling
+        # that new job restores the segment for the next scenario.
+        retry_id, error = store.create_drain_job([source_name], [target_name], 1)
+        assert error == 0 and retry_id != job_id
+        wait_until(lambda: store.query_drain_job(retry_id)[0].active_units == 1)
+        assert store.cancel_drain_job(retry_id) == 0
+        assert store.query_drain_job(retry_id)[0].status == JobStatus.CANCELED
+        source.send_signal(signal.SIGCONT)
+        assert_value_and_remove("timeout-python")
+
+        put("timeout-c")
+        target.send_signal(signal.SIGSTOP)
+        c_job = c_store.call("create_timed", source_name, target_name, 5000)
+
+        def processing_timeout_task():
+            page, error = store.list_tasks(
+                key="timeout-c", status=TaskStatus.PROCESSING
+            )
+            assert error == 0
+            return page.tasks[0] if page.tasks else None
+
+        task = wait_until(processing_timeout_task)
+        wait_until(
+            lambda: "action=replica_move_start, key=timeout-c" in source_log.read_text()
+        )
+        wait_until(
+            lambda: c_store.call("status", c_job) == MOONCAKE_STORE_DRAIN_CANCELING
+        )
+        assert store.create_drain_job([source_name], [target_name], 1)[1] == -1010
+        target.send_signal(signal.SIGCONT)
+        wait_until(
+            lambda: c_store.call("status", c_job) == MOONCAKE_STORE_DRAIN_TIMED_OUT
+        )
+        assert c_store.call("list", c_job, source_name, MOONCAKE_STORE_DRAIN_TIMED_OUT)
+        assert store.query_task(task.id)[0].status == TaskStatus.CANCELED
+        assert store.get("timeout-c") == b"data" * 8192
+        replicas = store.get_replica_desc("timeout-c")
+        assert len(replicas) == 1
+        assert (
+            replicas[0].get_memory_descriptor().buffer_descriptor.transport_endpoint
+            == source_name
+        )
+
+        retry_c = c_store.call("create", source_name, target_name)
+        assert retry_c != c_job
+        wait_until(
+            lambda: c_store.call("status", retry_c) == MOONCAKE_STORE_DRAIN_SUCCEEDED
+        )
+        assert store.get("timeout-c") == b"data" * 8192
+        replicas = store.get_replica_desc("timeout-c")
+        assert len(replicas) == 1
+        assert (
+            replicas[0].get_memory_descriptor().buffer_descriptor.transport_endpoint
+            == target_name
+        )
+        assert store.remove("timeout-c", True) == 0
+        print("Python and C DrainJob cancellation and timeout passed")
 
 
 if __name__ == "__main__":

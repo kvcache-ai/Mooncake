@@ -9500,6 +9500,14 @@ tl::expected<UUID, ErrorCode> RealClient::create_drain_job(
     return client_->CreateDrainJob(request);
 }
 
+tl::expected<UUID, ErrorCode> RealClient::create_timed_drain_job(
+    const CreateDrainJobRequest &request, uint64_t timeout_ms) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CreateTimedDrainJob(request, timeout_ms);
+}
+
 tl::expected<QueryJobResponse, ErrorCode> RealClient::query_drain_job(
     const UUID &job_id) {
     if (!client_) {

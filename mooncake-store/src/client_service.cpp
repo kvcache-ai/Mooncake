@@ -4844,6 +4844,11 @@ tl::expected<UUID, ErrorCode> Client::CreateDrainJob(
     return master_client_.CreateDrainJob(request);
 }
 
+tl::expected<UUID, ErrorCode> Client::CreateTimedDrainJob(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return master_client_.CreateTimedDrainJob(request, timeout_ms);
+}
+
 tl::expected<QueryJobResponse, ErrorCode> Client::QueryDrainJob(
     const UUID& job_id) {
     return master_client_.QueryDrainJob(job_id);
@@ -5710,6 +5715,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                          << ", error_code=" << completion.error();
             if (!task_running_.load() ||
                 (completion.error() != ErrorCode::RPC_FAIL &&
+                 completion.error() != ErrorCode::RPC_TIMEOUT &&
                  completion.error() !=
                      ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)) {
                 return;

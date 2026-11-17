@@ -1908,6 +1908,11 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     return master_service_.CreateDrainJob(request);
 }
 
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateTimedDrainJob(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return master_service_.CreateTimedDrainJob(request, timeout_ms);
+}
+
 tl::expected<QueryJobResponse, ErrorCode> WrappedMasterService::QueryDrainJob(
     const UUID& job_id) {
     return master_service_.QueryDrainJob(job_id);
@@ -2161,6 +2166,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
         &WrappedMasterService::CreateDrainJob,
+        &WrappedMasterService::CreateTimedDrainJob,
         &WrappedMasterService::QueryDrainJob,
         &WrappedMasterService::CancelDrainJob, &WrappedMasterService::ListTasks,
         &WrappedMasterService::ListDrainJobs, &WrappedMasterService::CancelTask,

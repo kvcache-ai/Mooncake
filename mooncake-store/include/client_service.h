@@ -633,6 +633,9 @@ class Client {
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
     tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
 
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);

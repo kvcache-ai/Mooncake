@@ -197,6 +197,7 @@ enum class JobStatus {
     FAILED,
     CANCELED,
     CANCELING,
+    TIMED_OUT,
 };
 
 inline std::ostream& operator<<(std::ostream& os, const JobStatus& status) {
@@ -221,6 +222,9 @@ inline std::ostream& operator<<(std::ostream& os, const JobStatus& status) {
             break;
         case JobStatus::CANCELING:
             os << "CANCELING";
+            break;
+        case JobStatus::TIMED_OUT:
+            os << "TIMED_OUT";
             break;
         default:
             os << "UNKNOWN_JOB_STATUS";

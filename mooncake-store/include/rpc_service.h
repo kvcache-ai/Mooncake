@@ -292,6 +292,9 @@ class WrappedMasterService {
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
     tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
 
     tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
