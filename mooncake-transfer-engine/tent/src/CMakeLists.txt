@@ -16,6 +16,16 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
     INTERFACE ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator)
 endif()
 
+# On tent_interface rather than tent_metrics, so that every TENT translation
+# unit sees the same TentMetrics layout and the same record macros.
+if(TENT_METRICS_ENABLED)
+  target_compile_definitions(tent_interface INTERFACE TENT_METRICS_ENABLED=1)
+  message(STATUS "TENT metrics: ENABLED")
+else()
+  target_compile_definitions(tent_interface INTERFACE TENT_METRICS_ENABLED=0)
+  message(STATUS "TENT metrics: DISABLED (zero overhead)")
+endif()
+
 if(TARGET asio_shared)
   target_link_libraries(tent_interface INTERFACE asio_shared)
 endif()

@@ -1,4 +1,3 @@
-# TENT_METRICS_ENABLED option is declared in tent/CMakeLists.txt.
 file(GLOB TENT_METRICS_SOURCES "*.cpp")
 # Build as a SHARED library so the TentMetrics singleton (the function-local
 # `static TentMetrics instance` in TentMetrics::instance()) is not duplicated
@@ -35,15 +34,6 @@ target_link_libraries(
 target_compile_definitions(
   tent_metrics PRIVATE TENT_BUILD_VERSION="${TENT_BUILD_VERSION}"
                        TENT_GIT_COMMIT="${TENT_GIT_COMMIT}")
-
-# Pass compile definition based on option
-if(TENT_METRICS_ENABLED)
-  target_compile_definitions(tent_metrics PUBLIC TENT_METRICS_ENABLED=1)
-  message(STATUS "TENT metrics: ENABLED")
-else()
-  target_compile_definitions(tent_metrics PUBLIC TENT_METRICS_ENABLED=0)
-  message(STATUS "TENT metrics: DISABLED (zero overhead)")
-endif()
 
 # Install to lib/ for libtent_shared.so / system consumers. The python C
 # extensions (engine.so, store.so) resolve it via $ORIGIN, so a second install
