@@ -58,11 +58,23 @@ class ObjectPart {
                          std::move_iterator(replicas.end()));
     }
 
+    // Inserts a newly registered LOCAL_DISK replica ahead of the existing
+    // ones. A restarted client registers under a new UUID while the old
+    // owner's replica stays until its lifecycle cleanup; readers take the
+    // first LOCAL_DISK replica, so the newest registration must come first.
+    void AddLocalDiskReplicaFirst(Replica&& replica) {
+        auto pos = std::find_if(replicas_.begin(), replicas_.end(),
+                                &Replica::fn_is_local_disk_replica);
+        replicas_.insert(pos, std::move(replica));
+    }
+
     // What comes back is out of the part: the caller owns those replicas and
     // decides how to isolate, defer or release them.
     template <typename Pred>
     [[nodiscard]] std::vector<Replica> PopReplicas(Pred&& pred) {
-        auto partition_point = std::partition(
+        // Stable, so the remaining replicas keep their order (see
+        // AddLocalDiskReplicaFirst).
+        auto partition_point = std::stable_partition(
             replicas_.begin(), replicas_.end(),
             [&pred](const Replica& replica) { return !pred(replica); });
 

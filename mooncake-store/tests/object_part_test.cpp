@@ -145,6 +145,39 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
     EXPECT_TRUE(part.replicas().empty());
 }
 
+// A newly registered LOCAL_DISK replica goes ahead of the existing ones (after
+// any other medium), and removing an unrelated replica keeps that order:
+// readers take the first LOCAL_DISK replica, so a reorder would hand them the
+// old owner of a restarted client again.
+TEST(ObjectPartTest, NewLocalDiskReplicaStaysAheadOfOlderOnes) {
+    const UUID old_owner{4, 1};
+    const UUID new_owner{4, 2};
+    ObjectPart part(kObjectLength, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+    std::vector<Replica> old_disk;
+    old_disk.emplace_back(old_owner, kObjectLength, "ssd-node:50052",
+                          ReplicaStatus::COMPLETE);
+    part.AddReplicas(std::move(old_disk));
+    part.AddLocalDiskReplicaFirst(Replica(
+        new_owner, kObjectLength, "ssd-node:50052", ReplicaStatus::COMPLETE));
+
+    auto owners = [&part]() {
+        std::vector<UUID> result;
+        for (const auto& replica : part.replicas()) {
+            if (auto owner = replica.get_local_disk_client_id()) {
+                result.push_back(*owner);
+            }
+        }
+        return result;
+    };
+    ASSERT_EQ(part.replicas().size(), 3u);
+    EXPECT_TRUE(part.replicas().front().is_disk_replica());
+    EXPECT_EQ(owners(), (std::vector<UUID>{new_owner, old_owner}));
+
+    auto popped = part.PopReplicas(&Replica::fn_is_disk_replica);
+    ASSERT_EQ(popped.size(), 1u);
+    EXPECT_EQ(owners(), (std::vector<UUID>{new_owner, old_owner}));
+}
+
 // The first replica lives in the part itself, so the common one-replica part
 // needs no allocation of its own.
 TEST(ObjectPartTest, OneReplicaStaysInsideThePart) {
