@@ -1638,8 +1638,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         }
 
         Replica::Descriptor replica;
-        ErrorCode err =
-            MakeReadReplicaSelector()(candidates, slices, replica);
+        ErrorCode err = MakeReadReplicaSelector()(candidates, slices, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -1745,8 +1744,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         }
 
         Replica::Descriptor replica;
-        ErrorCode err =
-            MakeReadReplicaSelector()(candidates, slices, replica);
+        ErrorCode err = MakeReadReplicaSelector()(candidates, slices, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << object_key;

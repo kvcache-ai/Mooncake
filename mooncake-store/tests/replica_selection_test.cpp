@@ -521,12 +521,12 @@ TEST_F(ReplicaSelectionTest, RetainMemorySiblingsWithoutAffinity) {
     const std::vector<Replica::Descriptor> replicas{first, second};
     const auto kept = RetainMemoryReadCandidates(replicas, first, false);
     ASSERT_EQ(kept.size(), 2);
-    EXPECT_EQ(kept[0].get_memory_descriptor()
-                  .buffer_descriptor.transport_endpoint_,
-              "store-a");
-    EXPECT_EQ(kept[1].get_memory_descriptor()
-                  .buffer_descriptor.transport_endpoint_,
-              "store-b");
+    EXPECT_EQ(
+        kept[0].get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "store-a");
+    EXPECT_EQ(
+        kept[1].get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "store-b");
     EXPECT_EQ(PeerReplicaEndpoint(first), "store-a");
     EXPECT_TRUE(PeerReplicaEndpoint(MakeDisk("file")).empty());
 }
