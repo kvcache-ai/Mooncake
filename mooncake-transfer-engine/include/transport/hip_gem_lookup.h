@@ -37,13 +37,17 @@ struct HipGemBuffer {
 // True when addr lies in a buffer of hip_gem_allocator.so. The allocator is
 // found at run time (mooncake.allocator.HipGemAllocator loads it with
 // RTLD_GLOBAL), so the transfer engine has no link-time dependency on it.
+// Finding it is a dlsym() over every loaded library, so per-transfer paths
+// pass resolve = false and only use an allocator an earlier call found: a
+// buffer is registered, and looked up there, before it is transferred.
 // With want_fd, out.fd receives a new descriptor the caller must close.
 inline bool lookupHipGemBuffer(const void *addr, HipGemBuffer &out,
-                               bool want_fd) {
+                               bool want_fd, bool resolve = true) {
     using LookupFn = int (*)(const void *, void **, size_t *, int *, int *);
     static std::atomic<LookupFn> cached{nullptr};
     LookupFn fn = cached.load(std::memory_order_acquire);
     if (!fn) {
+        if (!resolve) return false;
         fn = reinterpret_cast<LookupFn>(
             dlsym(RTLD_DEFAULT, "mc_hip_gem_lookup"));
         if (!fn) return false;
@@ -57,9 +61,11 @@ inline bool lookupHipGemBuffer(const void *addr, HipGemBuffer &out,
 // hipPointerGetAttributes reported. HIP reports memory imported with
 // hipImportExternalMemory as device 0's whichever device imported it, so for a
 // hip_gem_allocator.so buffer this is the device it was allocated on.
-inline int hipDeviceOfPointer(const void *addr, int reported_device) {
+inline int hipDeviceOfPointer(const void *addr, int reported_device,
+                              bool resolve = true) {
     HipGemBuffer gem;
-    return lookupHipGemBuffer(addr, gem, false) ? gem.device : reported_device;
+    return lookupHipGemBuffer(addr, gem, false, resolve) ? gem.device
+                                                         : reported_device;
 }
 
 }  // namespace mooncake

@@ -248,10 +248,10 @@ else
 fi
 
 # Copy hip_gem_allocator.so to mooncake directory (ROCm builds only)
-if [ -f ${BUILD_DIR}/mooncake-transfer-engine/hip-gem-allocator/hip_gem_allocator.so ]; then
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/hip-gem-allocator/hip_gem_allocator.so" ]; then
     echo "Copying hip_gem_allocator.so..."
-    cp ${BUILD_DIR}/mooncake-transfer-engine/hip-gem-allocator/hip_gem_allocator.so mooncake-wheel/mooncake/hip_gem_allocator.so
-    cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
+    cp "${BUILD_DIR}/mooncake-transfer-engine/hip-gem-allocator/hip_gem_allocator.so" "mooncake-wheel/mooncake/hip_gem_allocator.so"
+    cp "mooncake-integration/allocator.py" "mooncake-wheel/mooncake/allocator.py"
 fi
 
 # Copy ubshmem_fabric_allocator.so to mooncake directory (only if it exists - NPU builds only)

@@ -212,7 +212,7 @@ static int getDeviceFromPointer(void* ptr) {
 
     if (attributes.type == hipMemoryTypeDevice) {
         // GPU memory - return device ID
-        return hipDeviceOfPointer(ptr, attributes.device);
+        return hipDeviceOfPointer(ptr, attributes.device, false);
     } else if (attributes.type == hipMemoryTypeHost ||
                attributes.type == hipMemoryTypeUnregistered) {
         // Host memory - return -1 to indicate CPU memory

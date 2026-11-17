@@ -56,6 +56,9 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
+
+#include "hip_gem_pin.h"
 
 namespace {
 
@@ -95,8 +98,10 @@ struct GemBuffer {
 std::mutex g_mutex;
 std::map<uintptr_t, GemBuffer> g_buffers;  // by base address
 std::map<int, int> g_render_fds;           // HIP device -> render node fd
-ibv_context *g_pin_ctx = nullptr;
-ibv_pd *g_pin_pd = nullptr;
+ibv_device **g_ibv_devices = nullptr;
+int g_ibv_count = 0;
+std::vector<ibv_pd *> g_pin_pds;  // by RDMA device, opened on first use
+int g_pin_device = -1;            // the device that pinned the last buffer
 
 void logError(const char *what, int device, size_t size, const char *detail) {
     fprintf(stderr, "[hip_gem_allocator] %s (device %d, %zu bytes): %s\n", what,
@@ -112,7 +117,7 @@ int renderFd(int device) {
     for (char *c = bus; *c; ++c)
         if (*c >= 'A' && *c <= 'F') *c += 'a' - 'A';
     std::string pattern =
-        std::string("/sys/bus/pci/devices/") + bus + "/drm/renderD*";
+        std::string("/sys/bus/pci/devices/") + bus + "/drm/render*";
     glob_t g;
     if (glob(pattern.c_str(), 0, nullptr, &g) != 0 || g.gl_pathc < 1) {
         globfree(&g);
@@ -127,24 +132,41 @@ int renderFd(int device) {
 }
 
 // Caller holds g_mutex.
-ibv_pd *pinPd() {
-    if (g_pin_pd) return g_pin_pd;
-    int n = 0;
-    ibv_device **devs = ibv_get_device_list(&n);
-    if (!devs) return nullptr;
-    const char *want = getenv("MC_HIP_GEM_PIN_NIC");
-    for (int i = 0; i < n && !g_pin_pd; ++i) {
-        if (want && strcmp(ibv_get_device_name(devs[i]), want) != 0) continue;
-        ibv_context *ctx = ibv_open_device(devs[i]);
-        if (!ctx) continue;
-        g_pin_pd = ibv_alloc_pd(ctx);
-        if (g_pin_pd)
-            g_pin_ctx = ctx;
-        else
-            ibv_close_device(ctx);
+ibv_pd *pinPd(int device) {
+    if (!g_pin_pds[device]) {
+        ibv_context *ctx = ibv_open_device(g_ibv_devices[device]);
+        if (!ctx) return nullptr;
+        g_pin_pds[device] = ibv_alloc_pd(ctx);
+        if (!g_pin_pds[device]) ibv_close_device(ctx);
     }
-    ibv_free_device_list(devs);
-    return g_pin_pd;
+    return g_pin_pds[device];
+}
+
+// Caller holds g_mutex. A one-page dma-buf MR on the buffer at ptr, through
+// MC_HIP_GEM_PIN_NIC or else the first RDMA device that accepts one; errno is
+// left from the last attempt.
+ibv_mr *pinPage(void *ptr, int dmabuf_fd) {
+    if (!g_ibv_devices) {
+        g_ibv_devices = ibv_get_device_list(&g_ibv_count);
+        if (!g_ibv_devices) return nullptr;
+        g_pin_pds.assign(g_ibv_count, nullptr);
+    }
+    const char *want = getenv("MC_HIP_GEM_PIN_NIC");
+    ibv_mr *mr = nullptr;
+    errno = ENODEV;
+    const int device =
+        mooncake::pickPinDevice(g_ibv_count, g_pin_device, [&](int i) {
+            if (want && strcmp(ibv_get_device_name(g_ibv_devices[i]), want))
+                return false;
+            ibv_pd *pd = pinPd(i);
+            mr = pd ? ibv_reg_dmabuf_mr(pd, 0, getpagesize(),
+                                        reinterpret_cast<uintptr_t>(ptr),
+                                        dmabuf_fd, IBV_ACCESS_LOCAL_WRITE)
+                    : nullptr;
+            return mr != nullptr;
+        });
+    if (device >= 0) g_pin_device = device;
+    return mr;
 }
 
 void destroy(void *ptr, GemBuffer &b) {
@@ -174,6 +196,7 @@ extern "C" {
 
 void *mc_hip_gem_malloc(ssize_t size, int device, hipStream_t stream) {
     (void)stream;
+    if (size <= 0) return nullptr;
     std::lock_guard<std::mutex> lock(g_mutex);
     DeviceGuard guard(device);
     const size_t sz = (static_cast<size_t>(size) + kAlign - 1) & ~(kAlign - 1);
@@ -228,14 +251,9 @@ void *mc_hip_gem_malloc(ssize_t size, int device, hipStream_t stream) {
         destroy(ptr, b);
         return nullptr;
     }
-    ibv_pd *pd = pinPd();
-    b.pin = pd ? ibv_reg_dmabuf_mr(pd, 0, getpagesize(),
-                                   reinterpret_cast<uintptr_t>(ptr),
-                                   b.dmabuf_fd, IBV_ACCESS_LOCAL_WRITE)
-               : nullptr;
+    b.pin = pinPage(ptr, b.dmabuf_fd);
     if (!b.pin) {
-        logError("one-page dma-buf pin", device, sz,
-                 pd ? strerror(errno) : "no RDMA device");
+        logError("one-page dma-buf pin", device, sz, strerror(errno));
         destroy(ptr, b);
         return nullptr;
     }

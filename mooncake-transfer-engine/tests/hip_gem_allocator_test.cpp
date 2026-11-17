@@ -27,11 +27,13 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cuda_alike.h"
@@ -209,12 +211,15 @@ TEST_F(HipGemAllocatorTest, RdmaWriteLandsInGemBuffer) {
     entry.length = kCopySize;
     ASSERT_TRUE(engine_->submitTransfer(batch, {entry}).ok());
     TransferStatus status;
-    for (int i = 0; i < 20000000; ++i) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    do {
         ASSERT_TRUE(engine_->getTransferStatus(batch, 0, status).ok());
         if (status.s == TransferStatusEnum::COMPLETED ||
             status.s == TransferStatusEnum::FAILED)
             break;
-    }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
     ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
     engine_->freeBatchID(batch);
 

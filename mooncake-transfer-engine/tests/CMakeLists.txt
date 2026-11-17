@@ -225,8 +225,9 @@ if(USE_HIP)
 
   # Needs an AMD GPU and an RDMA NIC that takes dma-buf MRs.
   add_executable(hip_gem_allocator_test ${WORKSPACE}/hip_gem_allocator_test.cpp)
-  target_link_libraries(hip_gem_allocator_test PUBLIC transfer_engine gtest
-                                                      gtest_main ${CMAKE_DL_LIBS})
+  target_link_libraries(
+    hip_gem_allocator_test PUBLIC transfer_engine gtest gtest_main
+                                  ${CMAKE_DL_LIBS})
   target_compile_definitions(
     hip_gem_allocator_test
     PRIVATE
@@ -234,6 +235,14 @@ if(USE_HIP)
   )
   add_dependencies(hip_gem_allocator_test build_hip_gem_allocator)
 endif()
+
+# hip_gem_allocator.so's choice of RDMA device for its one-page pin (no GPU or
+# RDMA device required).
+add_executable(hip_gem_pin_test ${WORKSPACE}/hip_gem_pin_test.cpp)
+target_include_directories(
+  hip_gem_pin_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../hip-gem-allocator)
+target_link_libraries(hip_gem_pin_test PUBLIC gtest gtest_main)
+add_test(NAME hip_gem_pin_test COMMAND hip_gem_pin_test)
 
 # Ctrl frame codec + sender credit ledger unit tests (no RDMA device required).
 add_executable(ctrl_frame_test ${WORKSPACE}/ctrl_frame_test.cpp)

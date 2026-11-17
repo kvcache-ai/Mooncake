@@ -63,7 +63,7 @@ static int getCudaDeviceId(void* addr) {
     if (status != cudaSuccess) return -1;
 #ifdef USE_HIP
     if (attributes.type == cudaMemoryTypeDevice)
-        return hipDeviceOfPointer(addr, attributes.device);
+        return hipDeviceOfPointer(addr, attributes.device, false);
 #else
     if (attributes.type == cudaMemoryTypeDevice) return attributes.device;
 #endif
