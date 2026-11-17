@@ -267,6 +267,11 @@ void updateGlobalConfig(ibv_device_attr& device_attr);
 
 GlobalConfig& globalConfig();
 
+// Parses an all|local NIC selection, ignoring case, as MC_RDMA_NIC_SELECTION
+// and MC_EFA_NIC_SELECTION do. Returns false and leaves `output` unchanged for
+// any other value.
+bool parseNicSelection(const char* value, NicSelection& output);
+
 uint16_t getDefaultHandshakePort();
 
 // Validates a port range. Returns {default_min, default_max} on invalid input.

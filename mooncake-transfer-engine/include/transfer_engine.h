@@ -376,6 +376,13 @@ class TransferEngine {
     void setAutoDiscover(bool auto_discover);
     void setAutoDiscover(const AutoDiscoverConfig& config);
 
+    // Overrides MC_RDMA_NIC_SELECTION and MC_EFA_NIC_SELECTION for the RDMA,
+    // RDMA two-sided and EFA transports of this engine; without a call, they
+    // follow the variables. Other transports do no NIC selection and are not
+    // affected. Must be called before init(); a later call logs an error and
+    // changes nothing. TENT ignores it with a warning.
+    void setNicSelection(NicSelection selection);
+
     void* getBaseAddr();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);

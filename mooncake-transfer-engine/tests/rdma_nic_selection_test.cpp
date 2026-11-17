@@ -27,8 +27,10 @@
 
 #include "config.h"
 #include "error.h"
+#include "rdma_test_peers.h"
 #include "topology.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
 
 namespace mooncake {
 namespace {
@@ -96,6 +98,54 @@ TEST_F(RdmaNicSelectionEnvTest, InvalidValuesPreserveCurrentPolicy) {
         loadGlobalConfig(config);
         EXPECT_EQ(config.rdma_nic_selection, NicSelection::LOCAL);
     }
+}
+
+TEST(NicSelectionParseTest, AcceptsAllAndLocalOnly) {
+    NicSelection selection = NicSelection::ALL;
+    EXPECT_TRUE(parseNicSelection("LOCAL", selection));
+    EXPECT_EQ(selection, NicSelection::LOCAL);
+    EXPECT_TRUE(parseNicSelection("all", selection));
+    EXPECT_EQ(selection, NicSelection::ALL);
+    for (const char *value : {"", "1", "topology", "local "}) {
+        selection = NicSelection::LOCAL;
+        EXPECT_FALSE(parseNicSelection(value, selection)) << value;
+        EXPECT_EQ(selection, NicSelection::LOCAL) << value;
+    }
+    EXPECT_FALSE(parseNicSelection(nullptr, selection));
+}
+
+// An engine override wins over MC_RDMA_NIC_SELECTION in both directions,
+// including for the two-sided transport; without one, the transport reads the
+// variable when it applies the policy, not when it is constructed.
+TEST(RdmaNicSelectionOverrideTest, OverrideWinsAndUnsetFollowsConfig) {
+    auto &config = globalConfig();
+    struct Restore {
+        GlobalConfig &config;
+        NicSelection selection;
+        ~Restore() { config.rdma_nic_selection = selection; }
+    } restore{config, config.rdma_nic_selection};
+    config.rdma_nic_selection = NicSelection::LOCAL;
+    // ~RdmaTransport() needs metadata, which install() normally binds.
+    auto bind = [](RdmaTransport &transport) {
+        RdmaTransportTestPeer::bindMetadata(
+            transport, std::make_shared<TransferMetadata>(P2PHANDSHAKE),
+            "nic-selection-override-test");
+    };
+    RdmaTransport all;
+    all.setNicSelection(NicSelection::ALL);
+    RdmaTwoSidedTransport two_sided;
+    two_sided.setNicSelection(NicSelection::ALL);
+    RdmaTransport unset;
+    config.rdma_nic_selection = NicSelection::ALL;
+    RdmaTransport local;
+    local.setNicSelection(NicSelection::LOCAL);
+    for (RdmaTransport *transport : {&all, &unset, &local}) bind(*transport);
+    bind(two_sided);
+    EXPECT_EQ(RdmaTransportTestPeer::nicSelection(all), NicSelection::ALL);
+    EXPECT_EQ(RdmaTransportTestPeer::nicSelection(two_sided),
+              NicSelection::ALL);
+    EXPECT_EQ(RdmaTransportTestPeer::nicSelection(local), NicSelection::LOCAL);
+    EXPECT_EQ(RdmaTransportTestPeer::nicSelection(unset), NicSelection::ALL);
 }
 
 // A segment with three HCAs whose single buffer starts with no keys at all;

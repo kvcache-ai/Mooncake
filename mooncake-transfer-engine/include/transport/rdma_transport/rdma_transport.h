@@ -236,7 +236,9 @@ class RdmaTransport : public Transport {
         ClassicCongestionControlMode::kUninitialized};
 #endif
     std::shared_ptr<Topology> local_topology_;
-    // MC_RDMA_NIC_SELECTION=local: GPU location (e.g. "cuda:0") -> indices into
+    // The engine override if set, otherwise MC_RDMA_NIC_SELECTION.
+    NicSelection nicSelection() const;
+    // LOCAL NIC selection: GPU location (e.g. "cuda:0") -> indices into
     // context_list_ of its topology-preferred HCAs that opened. Built once in
     // initializeRdmaResources() and read-only afterwards, so registration
     // reads it without a lock. Empty in the default ALL mode.
