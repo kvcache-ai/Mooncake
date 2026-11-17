@@ -40,6 +40,30 @@ namespace mooncake {
 
 namespace {
 
+constexpr std::string_view kObjectNotFoundPrefix = "S3 object not found: ";
+
+std::string FormatObjectReadError(
+    std::string_view operation,
+    const Aws::Client::AWSError<Aws::S3::S3Errors> &error) {
+    const auto type = error.GetErrorType();
+    const auto status = error.GetResponseCode();
+    // HEAD errors have no response body: message and exception name may not
+    // identify the error even though the SDK retains the HTTP status/type.
+    // A missing bucket is a configuration failure, not a missing snapshot.
+    // An explicit HTTP failure (e.g. 403/503) takes precedence over XML codes.
+    const bool not_found =
+        type != Aws::S3::S3Errors::NO_SUCH_BUCKET &&
+        (status == Aws::Http::HttpResponseCode::NOT_FOUND ||
+         (status == Aws::Http::HttpResponseCode::REQUEST_NOT_MADE &&
+          (type == Aws::S3::S3Errors::NO_SUCH_KEY ||
+           type == Aws::S3::S3Errors::RESOURCE_NOT_FOUND)));
+    return fmt::format("{}{} failed: HTTP {}; error_type={}; exception={}; {}",
+                       not_found ? kObjectNotFoundPrefix : std::string_view{},
+                       operation, static_cast<int>(status),
+                       static_cast<int>(type), error.GetExceptionName(),
+                       error.GetMessage());
+}
+
 const S3ClientConfig &GetS3ClientConfig() {
     static const S3ClientConfig config = S3ClientConfig::FromEnvironment();
     return config;
@@ -76,6 +100,10 @@ std::string EncodeCrc32c(uint32_t checksum) {
 
 bool S3Helper::aws_initialized = false;
 Aws::SDKOptions S3Helper::options_;
+
+bool S3Helper::IsNotFoundError(std::string_view error) {
+    return error.starts_with(kObjectNotFoundPrefix);
+}
 
 void S3Helper::InitAPI() {
     options_.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Error;
@@ -231,8 +259,8 @@ tl::expected<void, std::string> S3Helper::InspectObject(
 
     auto outcome = s3_client_.HeadObject(request);
     if (!outcome.IsSuccess()) {
-        return tl::make_unexpected(fmt::format(
-            "HeadObject failed: {}", outcome.GetError().GetMessage()));
+        return tl::make_unexpected(
+            FormatObjectReadError("HeadObject", outcome.GetError()));
     }
     const auto content_length = outcome.GetResult().GetContentLength();
     if (content_length < 0) {
@@ -273,8 +301,8 @@ tl::expected<void, std::string> S3Helper::DownloadBuffer(
 
     auto outcome = s3_client_.GetObject(request);
     if (!outcome.IsSuccess()) {
-        return tl::make_unexpected(fmt::format(
-            "Download failed: {}", outcome.GetError().GetMessage()));
+        return tl::make_unexpected(
+            FormatObjectReadError("GetObject", outcome.GetError()));
     }
 
     auto &result_stream = outcome.GetResult().GetBody();
@@ -306,8 +334,8 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(
 
     auto head_outcome = s3_client_.HeadObject(head_request);
     if (!head_outcome.IsSuccess()) {
-        return tl::make_unexpected(fmt::format(
-            "HeadObject failed: {}", head_outcome.GetError().GetMessage()));
+        return tl::make_unexpected(
+            FormatObjectReadError("HeadObject", head_outcome.GetError()));
     }
 
     const int64_t total_size = head_outcome.GetResult().GetContentLength();
@@ -392,10 +420,10 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(
                         if (retry == max_retries - 1) {
                             std::lock_guard<std::mutex> lock(error_mutex);
                             has_error = true;
-                            error_message = fmt::format(
-                                "Part {} download failed after {} retries: {}",
-                                part_num, max_retries,
-                                part_outcome.GetError().GetMessage());
+                            error_message = FormatObjectReadError(
+                                fmt::format("Part {} download after {} retries",
+                                            part_num, max_retries),
+                                part_outcome.GetError());
                         } else {
                             std::this_thread::sleep_for(std::chrono::seconds(
                                 1 << retry));  // Exponential backoff
@@ -722,8 +750,8 @@ tl::expected<void, std::string> S3Helper::DownloadString(const std::string &key,
         data = buffer.str();
         return {};
     } else {
-        return tl::make_unexpected(fmt::format(
-            "GetObject failed: {}", outcome.GetError().GetMessage()));
+        return tl::make_unexpected(
+            FormatObjectReadError("GetObject", outcome.GetError()));
     }
 }
 

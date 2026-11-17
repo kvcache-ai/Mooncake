@@ -257,7 +257,11 @@ class OssFaultHttpServer {
             request_keys_.push_back(key);
         }
         condition_.notify_all();
-        const auto response = routes_.find(key);
+        // Full targets distinguish snapshot generations; method routes allow
+        // HEAD to succeed before a subsequent GET observes a missing object.
+        auto response = routes_.find(request.substr(0, second_space));
+        if (response == routes_.end()) response = routes_.find(target);
+        if (response == routes_.end()) response = routes_.find(key);
         if (response == routes_.end()) {
             SetError("unexpected request target");
             SendReply(client, Reply(404, "unknown").wire);
