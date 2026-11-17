@@ -7,6 +7,8 @@
 #include <gtest/gtest.h>
 
 #include "tent/common/types.h"
+#include "tent/runtime/control_plane.h"
+#include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
 namespace tent {
@@ -37,6 +39,9 @@ struct MergeResult {
 MergeResult mergeRequests(const std::vector<Request>& requests,
                           const std::vector<RequestBoundaryInfo>& boundaries,
                           bool do_merge);
+std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
+    ControlService* metadata, const std::vector<Request>& requests,
+    const HpTcpTransportConfig& hp_tcp_config);
 
 namespace {
 
@@ -49,6 +54,68 @@ Request makeWriteRequest(char* base, size_t source_offset,
 
 BufferKey makeBufferKey(uint64_t addr, uint64_t length) {
     return BufferKey{addr, length};
+}
+
+TEST(RequestMergeTest, CachedBoundariesMatchFirstCoveringMr) {
+    ControlService metadata("p2p", "", nullptr);
+    const auto max = std::numeric_limits<uint64_t>::max();
+    ASSERT_TRUE(metadata.segmentManager()
+                    .updateLocal([&](SegmentDesc& desc) {
+                        desc.type = SegmentType::Memory;
+                        auto& buffers =
+                            std::get<MemorySegmentDesc>(desc.detail).buffers;
+                        for (const auto& [addr, length] :
+                             std::vector<std::pair<uint64_t, uint64_t>>{
+                                 {1000, 64},
+                                 {1064, 64},
+                                 {2048, 16},
+                                 {2048, 128},
+                                 {max - 7, 16},
+                                 {max - 64, 32}}) {
+                            BufferDesc buffer;
+                            buffer.addr = addr;
+                            buffer.length = length;
+                            buffers.push_back(buffer);
+                        }
+                        return Status::OK();
+                    })
+                    .ok());
+    auto request = [](uint64_t addr, size_t length) {
+        Request r{};
+        r.source = reinterpret_cast<void*>(static_cast<uintptr_t>(addr));
+        r.target_id = LOCAL_SEGMENT_ID;
+        r.target_offset = addr;
+        r.length = length;
+        return r;
+    };
+    // Repeated hits, transition to an adjacent MR, a zero-length boundary,
+    // and a shorter range that changes the winning overlapping registration.
+    std::vector<Request> requests{request(1008, 8), request(1024, 8),
+                                  request(1064, 8), request(1072, 8),
+                                  request(1064, 0), request(2048, 64),
+                                  request(2048, 8), request(max - 64, 8)};
+    auto boundaries = resolveRequestBoundaries(&metadata, requests, {});
+    auto snapshot = metadata.segmentManager().getLocal();
+    ASSERT_EQ(boundaries.size(), requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto* expected =
+            snapshot->findBuffer(requests[i].target_offset, requests[i].length);
+        ASSERT_NE(expected, nullptr);
+        EXPECT_EQ(
+            boundaries[i].source_key,
+            std::make_optional(BufferKey{expected->addr, expected->length}));
+        EXPECT_EQ(boundaries[i].target_key, boundaries[i].source_key);
+    }
+    // A range crossing adjacent MRs is still invalid. One missing remote
+    // range wipes the entire tentative target group before refresh/retry.
+    for (const auto& invalid : {request(1056, 16), request(max - 4, 8)}) {
+        auto crossing = requests;
+        crossing.push_back(invalid);
+        auto result = resolveRequestBoundaries(&metadata, crossing, {});
+        EXPECT_FALSE(result.back().source_key.has_value());
+        for (const auto& boundary : result)
+            EXPECT_FALSE(boundary.target_key.has_value());
+    }
 }
 
 TEST(RequestMergeTest, KeepsRequestsSplitAcrossRegisteredBufferBoundaries) {
