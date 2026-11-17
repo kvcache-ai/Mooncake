@@ -83,6 +83,9 @@ struct Task {
     uint32_t max_retry_attempts;
 
     bool cancellation_requested = false;
+    // A drain must observe the final result before this task can be pruned.
+    // In particular, a processing timeout is not proof that its worker stopped.
+    bool retained_by_drain = false;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -203,9 +206,10 @@ class ScopedTaskWriteAccess {
     template <TaskType Type>
     tl::expected<UUID, ErrorCode> submit_task_typed(
         const UUID& client_id,
-        const typename TaskPayloadTraits<Type>::type& payload) {
+        const typename TaskPayloadTraits<Type>::type& payload,
+        bool retained_by_drain = false) {
         std::string json = serialize_payload(payload);
-        return submit_task(client_id, Type, json);
+        return submit_task(client_id, Type, json, retained_by_drain);
     }
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
@@ -214,6 +218,8 @@ class ScopedTaskWriteAccess {
                             TaskStatus status, const std::string& message);
 
     ErrorCode cancel_task(const UUID& task_id, const TenantId& tenant_id);
+
+    void release_drain_task(const UUID& task_id);
 
     ErrorCode fail_task_if_pending(const UUID& task_id,
                                    const std::string& message);
@@ -225,7 +231,8 @@ class ScopedTaskWriteAccess {
    private:
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
-                                              const std::string& payload);
+                                              const std::string& payload,
+                                              bool retained_by_drain);
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;

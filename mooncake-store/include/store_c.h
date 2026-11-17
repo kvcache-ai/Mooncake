@@ -225,7 +225,8 @@ enum mooncake_store_drain_job_status {
     MOONCAKE_STORE_DRAIN_RUNNING = 2,
     MOONCAKE_STORE_DRAIN_SUCCEEDED = 3,
     MOONCAKE_STORE_DRAIN_FAILED = 4,
-    MOONCAKE_STORE_DRAIN_CANCELED = 5
+    MOONCAKE_STORE_DRAIN_CANCELED = 5,
+    MOONCAKE_STORE_DRAIN_CANCELING = 6
 };
 
 typedef struct mooncake_store_drain_job_request {
@@ -302,7 +303,11 @@ int mooncake_store_query_drain_job(
     mooncake_store_t store, mooncake_store_uuid_t job_id,
     mooncake_store_drain_job_info_t **result_out);
 
-/* Cancel a nonterminal job with no active moves. Otherwise returns -1010. */
+/* Request cancellation of a nonterminal job. In-flight moves may finish;
+ * query until the status changes from CANCELING to CANCELED. Repeating a
+ * cancellation is safe. CANCELING can persist if an executor cannot report
+ * completion or its replication cleanup is pending. A succeeded or failed
+ * job returns -1010. */
 int mooncake_store_cancel_drain_job(mooncake_store_t store,
                                     mooncake_store_uuid_t job_id);
 

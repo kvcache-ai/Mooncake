@@ -900,7 +900,8 @@ class MasterService {
     tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
 
     /**
-     * @brief Cancel an in-flight drain job and restore draining segments to OK.
+     * @brief Request cancellation; in-flight moves settle before segments are
+     * restored and the job becomes CANCELED.
      */
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
 
@@ -2167,6 +2168,9 @@ class MasterService {
         QueryJobResponse ToResponse() const;
 
         mutable std::mutex mutex;
+        // Set without mutex so a long planning walk can observe cancellation
+        // while the caller is waiting to acquire the job lock.
+        std::atomic<bool> cancellation_requested{false};
         UUID id;
         JobType type{JobType::DRAIN};
         JobStatus status{JobStatus::CREATED};
@@ -2190,8 +2194,14 @@ class MasterService {
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
+    tl::expected<UUID, ErrorCode> CreateMoveTaskInternal(
+        const std::string& key, const TenantId& tenant_id,
+        const std::string& source, const std::string& target,
+        bool retained_by_drain);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);
+    void RequestDrainTaskCancellation(DrainJob& job);
+    bool FinishDrainJobCancellation(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
     std::optional<std::string> SelectDrainTargetForKey(

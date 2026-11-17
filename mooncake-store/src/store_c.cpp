@@ -722,7 +722,7 @@ int mooncake_store_list_drain_jobs(
         if (filter) {
             if (filter->has_status) {
                 if (filter->status < MOONCAKE_STORE_DRAIN_CREATED ||
-                    filter->status > MOONCAKE_STORE_DRAIN_CANCELED) {
+                    filter->status > MOONCAKE_STORE_DRAIN_CANCELING) {
                     return ErrorCode::INVALID_PARAMS;
                 }
                 request.status =

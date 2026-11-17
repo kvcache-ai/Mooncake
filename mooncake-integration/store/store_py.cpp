@@ -2359,7 +2359,8 @@ PYBIND11_MODULE(_store, m) {
         .value("RUNNING", JobStatus::RUNNING)
         .value("SUCCEEDED", JobStatus::SUCCEEDED)
         .value("FAILED", JobStatus::FAILED)
-        .value("CANCELED", JobStatus::CANCELED);
+        .value("CANCELED", JobStatus::CANCELED)
+        .value("CANCELING", JobStatus::CANCELING);
 
     py::class_<QueryJobResponse>(m, "QueryJobResponse")
         .def_readonly("id", &QueryJobResponse::id)
@@ -3632,8 +3633,9 @@ PYBIND11_MODULE(_store, m) {
                 return result ? 0 : toInt(result.error());
             },
             py::arg("job_id"),
-            "Cancel a nonterminal job with no active moves. Returns an error "
-            "code.")
+            "Request cancellation. In-flight moves may finish; query until "
+            "the job reaches CANCELED. Cancellation may wait for an executor "
+            "or replication cleanup. Returns an error code.")
         .def(
             "list_drain_jobs",
             [](MooncakeStorePyWrapper &self, std::optional<JobStatus> status,

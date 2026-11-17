@@ -145,7 +145,8 @@ size_t ScopedTaskReadAccess::size() const {
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
-    const UUID& client_id, TaskType type, const std::string& payload) {
+    const UUID& client_id, TaskType type, const std::string& payload,
+    bool retained_by_drain) {
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -165,7 +166,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .last_updated_at = now,
                  .message = "",
                  .assigned_client = client_id,
-                 .max_retry_attempts = manager_->max_retry_attempts_};
+                 .max_retry_attempts = manager_->max_retry_attempts_,
+                 .retained_by_drain = retained_by_drain};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push_back(task.id);
@@ -278,10 +280,18 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
+    size_t examined = 0;
+    const size_t initial_size = manager_->finished_task_history_.size();
     while (manager_->finished_task_history_.size() >
-           manager_->max_total_finished_tasks_) {
+               manager_->max_total_finished_tasks_ &&
+           examined++ < initial_size) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
         manager_->finished_task_history_.pop_front();
+        auto it = manager_->all_tasks_.find(oldest_task_id);
+        if (it != manager_->all_tasks_.end() && it->second.retained_by_drain) {
+            manager_->finished_task_history_.push_back(oldest_task_id);
+            continue;
+        }
         manager_->all_tasks_.erase(oldest_task_id);
     }
 }
@@ -360,6 +370,12 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                 }
 
                 if (now - task.last_updated_at > processing_timeout) {
+                    if (task.retained_by_drain) {
+                        // A timeout cannot prove the worker stopped. Ask it
+                        // to cancel and wait for acknowledgment before retry.
+                        task.cancellation_requested = true;
+                        continue;
+                    }
                     task.mark_complete(TaskStatus::FAILED,
                                        "processing timeout");
                     to_remove.push_back(task_id);
@@ -401,6 +417,13 @@ ErrorCode ScopedTaskWriteAccess::cancel_task(const UUID& task_id,
             return ErrorCode::OK;
         default:
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+}
+
+void ScopedTaskWriteAccess::release_drain_task(const UUID& task_id) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it != manager_->all_tasks_.end()) {
+        it->second.retained_by_drain = false;
     }
 }
 

@@ -333,6 +333,45 @@ TEST_F(ClientTaskManagerTest, CancelProcessingTaskWaitsForExecutorResult) {
         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
+TEST_F(ClientTaskManagerTest, DrainTasksAwaitCompletionAndObservation) {
+    ClientTaskManager manager({0, 10, 10, 0, 1, 3});
+    const UUID client = generate_uuid();
+    const ReplicaMovePayload payload{
+        .key = "key", .source = "source", .target = "target"};
+    auto task =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client, payload, true);
+    ASSERT_TRUE(task);
+    ASSERT_EQ(manager.get_write_access().pop_tasks(client, 1).size(), 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    manager.get_write_access().prune_expired_tasks();
+    auto observed = manager.get_read_access().find_task_by_id(*task);
+    ASSERT_TRUE(observed);
+    EXPECT_EQ(observed->status, TaskStatus::PROCESSING);
+    EXPECT_TRUE(manager.get_read_access()
+                    .is_cancellation_requested(client, *task)
+                    .value());
+    EXPECT_EQ(
+        manager.get_write_access().cancel_task(*task, TenantId::Default()),
+        ErrorCode::OK);
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client, *task, TaskStatus::CANCELED, "canceled"),
+              ErrorCode::OK);
+    auto ordinary =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client, payload);
+    ASSERT_TRUE(ordinary);
+    EXPECT_EQ(
+        manager.get_write_access().cancel_task(*ordinary, TenantId::Default()),
+        ErrorCode::OK);
+    manager.get_write_access().prune_finished_tasks();
+    ASSERT_TRUE(manager.get_read_access().find_task_by_id(*task));
+    EXPECT_FALSE(manager.get_read_access().find_task_by_id(*ordinary));
+    manager.get_write_access().release_drain_task(*task);
+    manager.get_write_access().prune_finished_tasks();
+    EXPECT_FALSE(manager.get_read_access().find_task_by_id(*task));
+}
+
 TEST_F(ClientTaskManagerTest, FailPendingTaskSkipsQueuedAssignment) {
     ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();

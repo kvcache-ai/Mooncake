@@ -4589,6 +4589,20 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
                          << ", error_code=" << revoke_result.error();
         }
     };
+    auto cancel_and_revoke = [&]() -> tl::expected<void, ErrorCode> {
+        auto result = revoke_fn();
+        if (!result &&
+            result.error() != ErrorCode::OBJECT_NO_REPLICATION_TASK &&
+            result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(WARNING) << "action=replica_" << action_name
+                         << "_cancel_revoke_failed, key=" << key
+                         << ", error_code=" << result.error();
+            // Do not report a successful cancellation, or retry the transfer,
+            // when the master's cleanup has not been confirmed.
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    };
 
     std::vector<Slice> slices;
     if (!targets.empty()) {
@@ -4620,16 +4634,14 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     for (const auto& target : targets) {
         if (IsTaskCancellationRequested(task_id)) {
-            revoke_lambda();
-            return tl::unexpected(ErrorCode::TASK_CANCELED);
+            return cancel_and_revoke();
         }
         if (task_id && slices.size() > 1 && target.is_memory_replica()) {
             uint64_t offset = 0;
             std::vector<Slice> chunk(1);
             for (const auto& slice : slices) {
                 if (offset != 0 && IsTaskCancellationRequested(task_id)) {
-                    revoke_lambda();
-                    return tl::unexpected(ErrorCode::TASK_CANCELED);
+                    return cancel_and_revoke();
                 }
                 chunk.front() = slice;
                 if (TransferWriteRange(target, chunk, offset,
@@ -4649,8 +4661,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // A cancellation observed before commit can safely revoke the allocation.
     if (IsTaskCancellationRequested(task_id)) {
-        revoke_lambda();
-        return tl::unexpected(ErrorCode::TASK_CANCELED);
+        return cancel_and_revoke();
     }
     auto end_result = end_fn();
     if (!end_result.has_value()) {
@@ -5644,6 +5655,25 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
+    auto report_completion = [&](const TaskCompleteRequest& request) {
+        for (;;) {
+            auto completion = master_client_.MarkTaskToComplete(request);
+            if (completion) {
+                return;
+            }
+            LOG(WARNING) << "action=task_complete_failed"
+                         << ", task_id=" << assignment.id
+                         << ", error_code=" << completion.error();
+            if (!task_running_.load() ||
+                (completion.error() != ErrorCode::RPC_FAIL &&
+                 completion.error() !=
+                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    };
+
     if (result == ErrorCode::OK || result == ErrorCode::TASK_CANCELED) {
         TaskCompleteRequest complete_request;
         complete_request.id = assignment.id;
@@ -5653,13 +5683,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         complete_request.message = result == ErrorCode::OK
                                        ? "Task completed successfully"
                                        : "Task canceled";
-        auto complete_result =
-            master_client_.MarkTaskToComplete(complete_request);
-        if (!complete_result.has_value()) {
-            LOG(WARNING) << "action=task_complete_failed"
-                         << ", task_id=" << assignment.id
-                         << ", error_code=" << complete_result.error();
-        }
+        report_completion(complete_request);
     } else {
         uint32_t current_retry_count = client_task.retry_count;
         // Only retry on allocation failures (NO_AVAILABLE_HANDLE)
@@ -5699,13 +5723,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             complete_request.message =
                 toString(result) + " (max retries reached: " +
                 std::to_string(assignment.max_retry_attempts) + ")";
-            auto complete_result =
-                master_client_.MarkTaskToComplete(complete_request);
-            if (!complete_result.has_value()) {
-                LOG(WARNING) << "action=task_complete_failed"
-                             << ", task_id=" << assignment.id
-                             << ", error_code=" << complete_result.error();
-            }
+            report_completion(complete_request);
         }
     }
 }
