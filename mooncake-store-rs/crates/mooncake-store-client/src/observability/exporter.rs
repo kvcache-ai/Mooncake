@@ -3,18 +3,20 @@ use super::registry::{
     MetadataInflightKey, MetadataOperationKey, MetricsSnapshot, PhaseKey, PhaseResultKey,
     PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey, RequestInflightKey,
     RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey, TransportBytesKey,
-    TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS, EVICTION_DURATION,
-    EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS,
-    MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL, METADATA_OPERATION_DURATION,
-    METADATA_OPERATION_INFLIGHT, METADATA_OPERATION_TOTAL, OBJECT_ROUTES,
-    PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
-    RECLAIM_RELEASE_TOTAL, REPLICATION_PUBLISH_DURATION, REPLICATION_PUBLISH_TOTAL,
-    REPLICA_DISTRIBUTION, REQUEST_BYTES, REQUEST_DURATION, REQUEST_DURATION_BUCKETS,
-    REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL, RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS,
-    SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL, SEGMENT_USED_BYTES,
-    TENANT_LOCAL_EVICTION_TOTAL, TENANT_QUOTA_ABORT_TOTAL, TENANT_QUOTA_FINALIZE_TOTAL,
-    TENANT_QUOTA_RECONCILE_TOTAL, TENANT_QUOTA_RESERVATION_TOTAL, TRANSPORT_BYTES_TOTAL,
-    TRANSPORT_OPERATION_TOTAL,
+    TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS,
+    DELETE_MARKER_BUDGET_BYTES, DELETE_MARKER_BYTES, DELETE_MARKER_ENTRIES,
+    DELETE_MARKER_EVENT_TOTAL, EVICTED_BYTES_TOTAL, EVICTED_REPLICAS_TOTAL, EVICTION_DURATION,
+    EVICTION_GUARD_EVENT_TOTAL, EVICTION_GUARD_PENDING_TOTAL, EVICTION_TOTAL,
+    HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION,
+    MEMBERSHIP_REFRESH_TOTAL, METADATA_OPERATION_DURATION, METADATA_OPERATION_INFLIGHT,
+    METADATA_OPERATION_TOTAL, OBJECT_ROUTES, PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL,
+    REBALANCE_ROUTES_TOTAL, RECLAIM_RELEASE_TOTAL, REPLICATION_PUBLISH_DURATION,
+    REPLICATION_PUBLISH_TOTAL, REPLICA_DISTRIBUTION, REQUEST_BYTES, REQUEST_DURATION,
+    REQUEST_DURATION_BUCKETS, REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL,
+    RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS, SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL,
+    SEGMENT_USED_BYTES, TENANT_LOCAL_EVICTION_TOTAL, TENANT_QUOTA_ABORT_TOTAL,
+    TENANT_QUOTA_FINALIZE_TOTAL, TENANT_QUOTA_RECONCILE_TOTAL, TENANT_QUOTA_RESERVATION_TOTAL,
+    TRANSPORT_BYTES_TOTAL, TRANSPORT_OPERATION_TOTAL,
 };
 
 pub(crate) fn render_prometheus_metrics(snapshot: &MetricsSnapshot) -> String {
@@ -378,6 +380,45 @@ fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
 
 fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     let tenant = escape(&snapshot.tenant);
+    gauge_family(
+        output,
+        DELETE_MARKER_ENTRIES,
+        "Retained delete markers in the local route authority.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        DELETE_MARKER_ENTRIES, tenant, snapshot.delete_marker_entries
+    ));
+    gauge_family(
+        output,
+        DELETE_MARKER_BYTES,
+        "Accounted bytes retained by the bounded delete marker FIFO.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        DELETE_MARKER_BYTES, tenant, snapshot.delete_marker_bytes
+    ));
+    gauge_family(
+        output,
+        DELETE_MARKER_BUDGET_BYTES,
+        "Configured delete marker FIFO byte budget.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        DELETE_MARKER_BUDGET_BYTES, tenant, snapshot.delete_marker_budget_bytes
+    ));
+    counter_family(
+        output,
+        DELETE_MARKER_EVENT_TOTAL,
+        "Delete marker lifecycle and propagation events.",
+    );
+    for_result_counter(
+        output,
+        DELETE_MARKER_EVENT_TOTAL,
+        &tenant,
+        &snapshot.delete_marker_events,
+    );
+
     counter_family(output, ROUTE_CAS_TOTAL, "Route CAS outcomes.");
     for_result_counter(output, ROUTE_CAS_TOTAL, &tenant, &snapshot.route_cas);
 
@@ -549,6 +590,39 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         ));
     }
 
+    counter_family(
+        output,
+        EVICTION_GUARD_EVENT_TOTAL,
+        "Eviction guard lifecycle events by source and outcome.",
+    );
+    for CounterSample { key, value } in &snapshot.eviction_guard_events {
+        let PhaseResultKey { phase, result } = key;
+        output.push_str(&format!(
+            "{}{{tenant=\"{}\",source=\"{}\",outcome=\"{}\"}} {}\n",
+            EVICTION_GUARD_EVENT_TOTAL,
+            tenant,
+            escape(phase),
+            escape(result),
+            value
+        ));
+    }
+
+    gauge_family(
+        output,
+        EVICTION_GUARD_PENDING_TOTAL,
+        "Pending eviction guard tokens by phase.",
+    );
+    for GaugeSample { key, value } in &snapshot.eviction_guard_pending {
+        let PhaseKey { phase } = key;
+        output.push_str(&format!(
+            "{}{{tenant=\"{}\",phase=\"{}\"}} {}\n",
+            EVICTION_GUARD_PENDING_TOTAL,
+            tenant,
+            escape(phase),
+            value
+        ));
+    }
+
     counter_family(output, EVICTION_TOTAL, "Eviction loop outcomes.");
     for_result_counter(output, EVICTION_TOTAL, &tenant, &snapshot.eviction);
 
@@ -560,6 +634,25 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for sample in &snapshot.eviction_duration {
         render_result_histogram(output, EVICTION_DURATION, &tenant, sample);
     }
+
+    counter_family(
+        output,
+        EVICTED_REPLICAS_TOTAL,
+        "Successfully evicted DRAM replicas.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        EVICTED_REPLICAS_TOTAL, tenant, snapshot.evicted_replicas
+    ));
+    counter_family(
+        output,
+        EVICTED_BYTES_TOTAL,
+        "Successfully evicted DRAM replica bytes.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        EVICTED_BYTES_TOTAL, tenant, snapshot.evicted_bytes
+    ));
 
     counter_family(
         output,

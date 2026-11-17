@@ -39,15 +39,16 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **Nov 8, 2026**: [AMD ATOM integrated Mooncake](https://kvcache.ai/blog/atom-meets-mooncake/) for shared KV cache pooling and efficient KV transfer. In collaboration with NeuroSpark AI, the integration achieved over 95% prefix reuse and up to 2× higher throughput.
 - **Oct 10, 2026**: TensorRT-LLM merged a native [Mooncake Store connector](https://github.com/NVIDIA/TensorRT-LLM/pull/19171) into KVCMv2, enabling content-addressed KV cache pooling and prefix reuse across serving instances.
 - **Oct 6, 2026**: [TokenSpeed v0.1.1](https://github.com/lightseekorg/tokenspeed/releases/tag/v0.1.1) includes Mooncake Store as an L3 KV cache backend beneath its host cache, alongside Mooncake Transfer Engine support for PD and EPD disaggregation.
 - **Sept 17, 2026**: vLLM added [cross-encoder embedding reuse](https://github.com/vllm-project/vllm/pull/56242) through Mooncake Store, complementing its [encoder-cache transfer connector](https://github.com/vllm-project/vllm/pull/41567) for multimodal disaggregated serving. Both capabilities are included in [vLLM v0.31.0](https://github.com/vllm-project/vllm/releases/tag/v0.31.0).
 - **Aug 28, 2026**: LMDeploy merged [Mooncake Store support](https://github.com/InternLM/lmdeploy/pull/4903), enabling shared KV cache pooling and prefix reuse across PyTorch inference instances. Included in [LMDeploy v0.18.0](https://github.com/InternLM/lmdeploy/releases/tag/v0.18.0).
-- **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 
 :::{dropdown} More
 :animate: fade-in
 
+- **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 - **Aug 20, 2026**: Mooncake is integrated into [Miles](https://github.com/radixark/miles) as a rollout data-transfer backend for the fragmented, heterogeneous data moving between rollout and training in disaggregated RL. Blogs: [KVCache.AI](https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/), [lmsys](https://www.lmsys.org/blog/2026-08-20-miles-mooncake-rollout-data-transfer).
 - **Aug 17, 2026**: Mooncake is integrated into [Speculators](https://github.com/vllm-project/speculators) as a distributed backend for multi-node online training, efficiently moves hidden-state between vLLM inference workers and Speculators trainers through RDMA, eliminating the need for massive hidden-state storage in offline training. [Benchmark on GB300 NVL72](https://x.com/mgoin_/status/2072785822231728363).
 - **Aug 5, 2026**: llm-d added a [Mooncake PD deployment guide](https://github.com/llm-d/llm-d/pull/1511), complementing its [Mooncake Store tiered offloading integration](https://github.com/llm-d/llm-d/pull/1826) for vLLM serving on Kubernetes.
@@ -101,6 +102,16 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 :gutter: 2
 :class-container: latest-blogs
 
+:::{grid-item-card} ATOM Meets Mooncake: A Shared KV Pool for Agentic Serving on AMD Instinct GPUs
+:img-top: https://kvcache.ai/blog/atom-meets-mooncake/featured.png
+:img-alt: ATOM with Mooncake Store and Transfer Engine on AMD Instinct MI355X
+:link: https://kvcache.ai/blog/atom-meets-mooncake/
+:link-alt: ATOM Meets Mooncake: A Shared KV Pool for Agentic Serving on AMD Instinct GPUs
+:class-body: blog-card-date
+
+November 8, 2026
+:::
+
 :::{grid-item-card} Over One Trillion Tokens per Day: How Mooncake Powers Approaching.AI’s Token Factory
 :img-top: https://kvcache.ai/blog/mooncake-in-approaching-ai/featured_hue86b549ecdd836b0c6b3aa760df33338_1244829_2a2b63e1a97ff4921bf0e665a65e1403.webp
 :img-alt: The HiCache + Mooncake Store Architecture within a PD Group
@@ -139,6 +150,16 @@ July 15, 2026
 :class-body: blog-card-date
 
 June 26, 2026
+:::
+
+:::{grid-item-card} Mooncake Joins the PyTorch Ecosystem
+:img-top: https://kvcache.ai/blog/mooncake-joins-pytorch-ecosystem/featured.png
+:img-alt: Mooncake joins the PyTorch Ecosystem
+:link: https://kvcache.ai/blog/mooncake-joins-pytorch-ecosystem/
+:link-alt: Mooncake Joins the PyTorch Ecosystem
+:class-body: blog-card-date
+
+February 12, 2026
 :::
 
 ::::

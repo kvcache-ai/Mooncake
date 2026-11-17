@@ -7,6 +7,63 @@ from datetime import timedelta
 from typing import Any, Iterator, List, Tuple
 
 
+def clone_tcp_store(store: Any) -> Any:
+    """Give a buffer its own TCPStore client while preserving lightweight test stores."""
+    clone = getattr(type(store), "clone", None)
+    return clone(store) if callable(clone) else store
+
+
+def resolve_membership_transition(
+    old_members: List[int], new_members: List[int], capacity_ranks: int
+) -> Tuple[List[int], List[int], List[int], List[int], List[int]]:
+    """Return ordered old/new members and their survivor/leave/join partitions."""
+    old = [int(rank) for rank in old_members]
+    new = [int(rank) for rank in new_members]
+    for label, members in (("old_members", old), ("active_members", new)):
+        if len(set(members)) != len(members):
+            raise ValueError(f"{label} must not contain duplicate stable slots.")
+        if any(rank < 0 or rank >= capacity_ranks for rank in members):
+            raise ValueError(f"{label} contains a slot outside buffer capacity.")
+    if not new:
+        raise ValueError("active_members must not be empty.")
+
+    old_set = set(old)
+    new_set = set(new)
+    return (
+        old,
+        new,
+        [rank for rank in new if rank in old_set],
+        [rank for rank in old if rank not in new_set],
+        [rank for rank in new if rank not in old_set],
+    )
+
+
+def membership_peers_to_disconnect(
+    old_members: List[int], new_members: List[int], local_rank: int
+) -> List[int]:
+    """Select only departing peers, or every old peer when the local rank leaves."""
+    if local_rank not in old_members:
+        raise ValueError("local stable slot is outside old membership.")
+    if local_rank not in new_members:
+        return [rank for rank in old_members if rank != local_rank]
+    new_set = set(new_members)
+    return [rank for rank in old_members if rank not in new_set]
+
+
+def slice_peer_qp_row(
+    qpns: List[int], capacity_ranks: int, local_rank: int, max_qp_count: int
+) -> List[int]:
+    """Select the remote peer's QPN row addressed to one stable capacity slot."""
+    if capacity_ranks <= 0 or not 0 <= local_rank < capacity_ranks:
+        raise ValueError("local stable slot must be within positive capacity.")
+    qps_per_slot = max_qp_count // capacity_ranks
+    expected_qps = qps_per_slot * capacity_ranks
+    if expected_qps <= 0 or len(qpns) != expected_qps:
+        raise ValueError("peer QPN metadata does not match the capacity layout.")
+    start = local_rank * qps_per_slot
+    return [int(qpn) for qpn in qpns[start : start + qps_per_slot]]
+
+
 @contextmanager
 def fetch_peer_metadata(
     store: Any,
