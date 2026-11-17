@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -32,7 +33,7 @@ DEFINE_bool(run_all, false,
 // Scale-Out workload flags
 DEFINE_string(workload, "fillup",
               "Workload type: fillup (default), scaleout, dsa, "
-              "size_class_churn");
+              "size_class_churn, rl_offload");
 DEFINE_int32(
     scale_out_trigger_pct, 50,
     "Pre-fill cluster to this utilization % before injecting new nodes "
@@ -1906,6 +1907,177 @@ static void runSizeClassChurnMatrix() {
     }
 }
 
+DEFINE_int32(rl_segments, 8, "Number of segments in rl_offload mode");
+DEFINE_int64(rl_segment_mib, 147, "Per-segment capacity in rl_offload mode");
+DEFINE_int32(rl_steps, 400, "Training steps replayed per rl_offload case");
+DEFINE_int32(rl_lifetime_steps, 2,
+             "Steps an rl_offload object stays live before it is removed");
+DEFINE_int64(rl_payload_min_kib, 10223, "Smallest rl_offload payload, in KiB");
+DEFINE_int64(rl_payload_max_kib, 12075, "Largest rl_offload payload, in KiB");
+DEFINE_string(rl_target_utils, "70,80,85,90,95",
+              "Comma-separated live-byte targets, in percent of capacity, "
+              "swept in rl_offload mode");
+DEFINE_int32(rl_seeds, 5, "Seeds run, and summed, per rl_offload case");
+
+// One RL data-plane bundle as captured from a GRPO trainer offloading through
+// the object store: three data-dependent payloads plus 31 small Arrow buffers
+// (validity bitmaps, offsets, shapes, meta and manifest) of fixed size.
+static constexpr int kRlPayloadsPerBundle = 3;
+static constexpr std::pair<size_t, int> kRlBundleSmallObjects[] = {
+    {256, 11}, {512, 3},  {1024, 1}, {2048, 9},
+    {2056, 4}, {2994, 1}, {8960, 1}, {9896, 1},
+};
+
+struct RlOffloadResult {
+    double live_pct = 0.0;     // requested bytes live / capacity, step average
+    double charged_pct = 0.0;  // bytes the allocator reserved / capacity
+    int puts = 0;
+    int failed = 0;
+    double free_mb_at_fail = 0.0;     // summed over failures
+    double largest_mb_at_fail = 0.0;  // summed over failures
+};
+
+// Replays training steps of bundles. Every object is removed explicitly
+// --rl_lifetime_steps later and nothing is ever evicted, so a failed put is
+// lost data rather than a cache miss. The bundle count per step is derived so
+// that the live set sits at `target_pct` of capacity once warmed up.
+static RlOffloadResult runRlOffloadBenchmark(AllocationStrategyType type,
+                                             int target_pct, uint32_t seed) {
+    AllocatorManager manager =
+        createCluster(FLAGS_rl_segments,
+                      static_cast<size_t>(FLAGS_rl_segment_mib) * MiB, false);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(type, local_ssd);
+    const double capacity = static_cast<double>(computeTotalCapacity(manager));
+    const int lifetime = std::max(1, FLAGS_rl_lifetime_steps);
+
+    std::uniform_int_distribution<size_t> payload_size(
+        static_cast<size_t>(FLAGS_rl_payload_min_kib) * KiB,
+        static_cast<size_t>(FLAGS_rl_payload_max_kib) * KiB);
+    double bundle_bytes =
+        kRlPayloadsPerBundle * (payload_size.a() + payload_size.b()) / 2.0;
+    for (const auto& [size, count] : kRlBundleSmallObjects) {
+        bundle_bytes += static_cast<double>(size * count);
+    }
+    const double bundles_per_step =
+        target_pct / 100.0 * capacity / (lifetime * bundle_bytes);
+
+    struct Step {
+        std::vector<std::vector<Replica>> objects;
+        size_t bytes = 0;
+    };
+    std::deque<Step> live;
+    size_t live_bytes = 0;
+    std::mt19937 rng(seed);
+    RlOffloadResult res;
+    int samples = 0;
+    double carry = 0.0;
+    for (int s = 0; s < FLAGS_rl_steps; ++s) {
+        if (static_cast<int>(live.size()) == lifetime) {
+            live_bytes -= live.front().bytes;
+            live.pop_front();  // Replica destructors free the memory.
+        }
+        std::vector<size_t> sizes;
+        for (carry += bundles_per_step; carry >= 1.0; carry -= 1.0) {
+            for (int i = 0; i < kRlPayloadsPerBundle; ++i) {
+                sizes.push_back(payload_size(rng));
+            }
+            for (const auto& [size, count] : kRlBundleSmallObjects) {
+                sizes.insert(sizes.end(), count, size);
+            }
+        }
+        std::shuffle(sizes.begin(), sizes.end(), rng);
+
+        Step step;
+        for (size_t size : sizes) {
+            ++res.puts;
+            auto result = strategy->Allocate(manager, size, 1);
+            if (result.has_value() && !result->empty()) {
+                step.objects.push_back(std::move(result.value()));
+                step.bytes += size;
+                continue;
+            }
+            ++res.failed;
+            auto snapshot = computeFragmentationSnapshot(manager);
+            res.free_mb_at_fail +=
+                static_cast<double>(snapshot.total_free_space) / MiB;
+            res.largest_mb_at_fail +=
+                static_cast<double>(snapshot.largest_free_region) / MiB;
+        }
+        live_bytes += step.bytes;
+        live.push_back(std::move(step));
+
+        if (s < lifetime) continue;  // Live set not at steady state yet.
+        auto snapshot = computeFragmentationSnapshot(manager);
+        res.live_pct += 100.0 * live_bytes / capacity;
+        res.charged_pct +=
+            100.0 * (snapshot.capacity - snapshot.total_free_space) / capacity;
+        ++samples;
+    }
+    if (samples > 0) {
+        res.live_pct /= samples;
+        res.charged_pct /= samples;
+    }
+    return res;
+}
+
+static void runRlOffloadMatrix() {
+    std::vector<int> targets;
+    std::stringstream list(FLAGS_rl_target_utils);
+    for (std::string item; std::getline(list, item, ',');) {
+        targets.push_back(std::stoi(item));
+    }
+
+    std::cout
+        << "\n=== RL Data-Plane Offload Benchmark ===\n"
+        << "Workload: bundles of " << kRlPayloadsPerBundle << " payloads ["
+        << FLAGS_rl_payload_min_kib << ", " << FLAGS_rl_payload_max_kib
+        << "] KiB plus 31 small buffers (256 B..9896 B), removed "
+        << FLAGS_rl_lifetime_steps
+        << " steps after they are written; no eviction.\n"
+        << "Config: segments=" << FLAGS_rl_segments
+        << ", segment_capacity=" << FLAGS_rl_segment_mib
+        << " MB, steps=" << FLAGS_rl_steps << ", seeds=" << FLAGS_rl_seeds
+        << "\nLive% = requested bytes live / capacity; Charged% = bytes "
+           "the allocator reserved for them (size-class round-up "
+           "included). Free/Largest@Fail = cluster free space and largest "
+           "contiguous free region when a put failed, averaged.\n"
+        << std::endl;
+    std::cout << std::left << std::setw(18) << "Strategy" << std::right
+              << std::setw(9) << "Target%" << std::setw(9) << "Live%"
+              << std::setw(10) << "Charged%" << std::setw(16) << "Failed/Puts"
+              << std::setw(14) << "FreeMB@Fail" << std::setw(17)
+              << "LargestMB@Fail" << std::endl;
+
+    for (auto type : {AllocationStrategyType::RANDOM,
+                      AllocationStrategyType::FREE_RATIO_FIRST}) {
+        for (int target : targets) {
+            RlOffloadResult sum;
+            for (int seed = 0; seed < FLAGS_rl_seeds; ++seed) {
+                auto r = runRlOffloadBenchmark(type, target, 42 + seed);
+                sum.live_pct += r.live_pct / FLAGS_rl_seeds;
+                sum.charged_pct += r.charged_pct / FLAGS_rl_seeds;
+                sum.puts += r.puts;
+                sum.failed += r.failed;
+                sum.free_mb_at_fail += r.free_mb_at_fail;
+                sum.largest_mb_at_fail += r.largest_mb_at_fail;
+            }
+            const int failed = std::max(sum.failed, 1);
+            std::cout << std::left << std::setw(18) << strategyName(type)
+                      << std::right << std::fixed << std::setprecision(1)
+                      << std::setw(9) << target << std::setw(9) << sum.live_pct
+                      << std::setw(10) << sum.charged_pct << std::setw(16)
+                      << (std::to_string(sum.failed) + "/" +
+                          std::to_string(sum.puts))
+                      << std::setw(14)
+                      << (sum.failed ? sum.free_mb_at_fail / failed : 0.0)
+                      << std::setw(17)
+                      << (sum.failed ? sum.largest_mb_at_fail / failed : 0.0)
+                      << std::endl;
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
         "AllocationStrategy performance benchmark.\n"
@@ -1926,10 +2098,13 @@ int main(int argc, char* argv[]) {
         runDsaMatrix();
     } else if (FLAGS_workload == "size_class_churn") {
         runSizeClassChurnMatrix();
+    } else if (FLAGS_workload == "rl_offload") {
+        runRlOffloadMatrix();
     } else {
         std::cout << "Invalid workload type: " << FLAGS_workload
                   << ". Use --workload=fillup, --workload=scaleout, "
-                     "--workload=dsa, or --workload=size_class_churn."
+                     "--workload=dsa, --workload=size_class_churn, or "
+                     "--workload=rl_offload."
                   << std::endl;
     }
 
