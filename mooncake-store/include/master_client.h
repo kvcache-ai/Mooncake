@@ -168,7 +168,6 @@ class MasterClient {
 
     /**
      * @brief Calculate Store-observed cache reuse metrics
-     * @param object_keys None
      * @return Map containing metrics. Legacy hit-rate keys describe cumulative
      * Store-side hits normalized by current cached object counts, not
      * end-to-end request/token hit ratios.
@@ -204,8 +203,8 @@ class MasterClient {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @param object_info Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
+     * @return The replica descriptors for the object, or an ErrorCode on
+     * failure
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
@@ -227,8 +226,8 @@ class MasterClient {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_keys Keys to query
-     * @param object_infos Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
+     * @return Per-key replica descriptors in input order, or an ErrorCode on
+     * failure
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
@@ -263,7 +262,6 @@ class MasterClient {
      * @brief Starts a put operation
      * @param key Object key
      * @param slice_lengths Vector of slice lengths
-     * @param value_length Total value length
      * @param config Replication configuration
      * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
      * indicating success/failure
@@ -275,7 +273,6 @@ class MasterClient {
     /**
      * @brief Starts a batch of put operations for N objects
      * @param keys Vector of object key
-     * @param value_lengths Vector of total value lengths
      * @param slice_lengths Vector of vectors of slice lengths
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
@@ -297,7 +294,8 @@ class MasterClient {
 
     /**
      * @brief Ends a put operation for a batch of objects
-     * @param keys Vector of object keys
+     * @param object_metas Vector of object metadata to end
+     * @param replica_type Type of replica to end
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(

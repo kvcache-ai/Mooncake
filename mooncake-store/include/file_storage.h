@@ -127,6 +127,9 @@ class FileStorage {
 
     FileStorageConfig config_;
 
+    using PrefetchKeyCallback =
+        std::function<void(const std::string& key, bool success)>;
+
     /**
      * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
      *
@@ -145,11 +148,10 @@ class FileStorage {
      *        eviction/offload reclaim memory. Never reset to false here;
      *        the caller initializes it.
      * @param on_key_done Optional per-key completion callback.
+     * @param tenant_id Tenant whose keys are promoted; empty means the
+     *        existing tenant-scoped lookup fallback.
      * @return void on success, ErrorCode on critical (pre-loop) failure
      */
-    using PrefetchKeyCallback =
-        std::function<void(const std::string& key, bool success)>;
-
     tl::expected<void, ErrorCode> PrefetchKeys(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         bool* dram_pressure = nullptr,
