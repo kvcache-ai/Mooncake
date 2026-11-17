@@ -11,7 +11,7 @@ Mooncake Store provides low-level object storage and management capabilities, in
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
 - **Optional object grouping**: Related objects can carry an optional group ID so that the Master applies best-effort shared lifecycle behavior. Object routing stays decoupled from groups (always `hash(tenant, key)`); grouping only carries a shared group TTL.
-- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
+- **Multi-replica support**. Mooncake Store can place complete copies of an object on multiple segments to spread read traffic. The requested storage tiers and replica counts determine the {ref}`store-put-start-replica-allocation`.
 - **Strong consistency**: Mooncake Store guarantees that `Get` operations always return correct and complete data. Once an object has been successfully `Put`, it remains immutable until removal, ensuring that all subsequent `Get` requests retrieve the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
@@ -166,22 +166,27 @@ AllocationStrategy is used in conjunction with the Master Service and the underl
 
 ### APIs
 
-`Allocate`: Finds suitable storage segments from available storage resources to allocate space of a specified size for multiple replicas. Uses best-effort semantics, meaning it allocates as many replicas as possible even if the full requested count cannot be satisfied.
+`Allocate` reserves space for replicas on distinct segments within the selected
+storage tier. It may return a partial allocation. The Master applies the
+{ref}`store-put-start-replica-allocation` to decide whether it can proceed with
+the write.
 
 ```C++
 virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments = std::vector<std::string>(),
-        const std::set<std::string> excluded_segments = std::set<std::string>()) = 0;
+        const std::set<std::string>& excluded_segments = std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) = 0;
 ```
 
 - **Input Parameters**:
   - `allocator_manager`: The allocator manager that manages the allocators to use
-  - `slice_length`: Length of the slice to be allocated
+  - `slice_length`: Bytes to reserve per replica. `PutStart` passes the total object size.
   - `replica_num`: Number of replicas to allocate (default: 1)
   - `preferred_segments`: Preferred segments to allocate buffers from (default: empty vector)
   - `excluded_segments`: Excluded segments that should not allocate buffers from (default: empty set)
+  - `replica_type`: Storage tier of the returned replicas (default: `ReplicaType::MEMORY`)
 - **Output**: Returns tl::expected containing either:
   - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
   - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
@@ -227,7 +232,7 @@ For benchmark data comparing `random` and `free_ratio_first` across segment coun
 Pure random allocation with preferred segment support. The allocation process for N replicas is:
 
 1. **Preferred segment phase**: If preferred segments are specified in the `ReplicateConfig`, they are tried first in order. Each successful allocation consumes one replica slot. If all replicas are satisfied, the process finishes early.
-2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. Segments already used for a previous replica of the same slice, as well as explicitly excluded segments, are skipped to guarantee that each replica resides on a different segment.
+2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. It skips segments already used for a replica of the object and any explicitly excluded segments.
 3. **Retry limit**: The iteration is capped at `min(100, total_segments)` to avoid excessive scanning when most segments are full.
 4. **Best-effort result**: If fewer than N replicas are allocated but at least one succeeds, the partial result is returned. The call fails only if zero replicas can be allocated.
 
@@ -683,15 +688,35 @@ std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
     const std::string& tenant_id = "default");
 ```
 
-`PutStart` allocates replicas and returns descriptors for the client to write.
-At this RPC boundary, `slice_length` is the total object size in bytes. The
-batch request carries one total per key. The client computes each total from
-its input slices before issuing the RPC.
+(store-put-start-replica-allocation)=
+##### PutStart replica allocation rules
 
-For memory-only configurations, allocation can succeed with fewer replicas
-than requested if it finds at least one. For a flexible request with one
-memory and one NoF replica, either can satisfy the allocation requirement.
-Other requests involving NoF or DFS require the requested counts.
+The client sums the sizes of an object's input slices before calling
+`PutStart`. The RPC's `slice_length` is that total in bytes. `BatchPutStart`
+carries one total length per key. Each allocated replica holds the complete
+object, and segment placement applies to replicas within each tier.
+
+| Requested replicas | Allocation required to proceed |
+|---|---|
+| Memory only (`nof_replica_num=0`, `dfs_replica_num=0`) | At least one memory replica. A request for three memory replicas can proceed with one or two. |
+| Flexible dual replica (`replica_num=1`, `nof_replica_num=1`, `dfs_replica_num=0`) | At least one of the two replicas. Either memory or NoF alone is sufficient. |
+| All other requests involving NoF or DFS | The exact requested memory and NoF counts, plus a DFS allocation if requested. |
+
+If the required memory or NoF allocation falls short, `PutStart` returns
+`NO_AVAILABLE_HANDLE`. A DFS allocation failure also fails the request if it
+persists after any applicable retry. If allocation proceeds with fewer memory
+or NoF replicas than requested, the Master logs
+`action=put_start_partial_allocation` and increments
+`master_put_start_partial_allocations_total`.
+
+##### Write completion
+
+The client writes to the descriptors returned by `PutStart`. For ordinary
+`Put` and `BatchPut` operations, all allocated memory, NoF, and DFS replicas
+must be written successfully, including when a memory-only request was
+allocated fewer replicas than requested. In flexible dual-replica mode, the
+client can complete the write with one successful replica and revoke a failed
+replica on the other tier.
 
 After transferring the data, the writer calls `PutEnd` with the key and optional
 checksum in [`ObjectMeta`](gh-file:mooncake-store/include/rpc_types.h).
