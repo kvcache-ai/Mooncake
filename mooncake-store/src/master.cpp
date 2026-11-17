@@ -143,6 +143,9 @@ DEFINE_string(metrics_host,
               std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
+DEFINE_string(metrics_key_groups, "",
+              "Break key count and value bytes down by key, e.g. "
+              "\"kv:suffix:_k,state:prefix:state_\"; empty disables it");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -1486,6 +1489,8 @@ int main(int argc, char* argv[]) {
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
+        mooncake::MasterMetricManager::instance().configure_key_groups(
+            FLAGS_metrics_key_groups);
     } catch (const std::exception& error) {
         LOG(ERROR) << "Invalid metrics bootstrap configuration: "
                    << error.what();

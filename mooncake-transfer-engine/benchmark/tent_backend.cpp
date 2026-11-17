@@ -148,7 +148,14 @@ static int resolveSegTypeParams(const std::string& seg_type,
                                 int& num_buffers) {
     if (seg_type == "DRAM" || seg_type == "dram") {
         device_prefix = "cpu";
-        num_buffers = numa_num_configured_nodes();
+        std::string error;
+        if (!XferBenchConfig::resolveDramNumaRange(start_idx, num_buffers,
+                                                   error)) {
+            LOG(ERROR) << error;
+            return -1;
+        }
+        if (XferBenchConfig::local_numa_id >= 0)
+            LOG(INFO) << "TENT DRAM allocation restricted to cpu:" << start_idx;
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (seg_type == "VRAM" || seg_type == "vram") {
         device_prefix = "cuda";
@@ -457,7 +464,11 @@ void TENTBenchRunner::pinThread(int thread_id) {
         return;
     }
 #endif
-    uint64_t addr = getLocalBufferBase(thread_id, 0, 0);
+    // The layout is validated before the run, so a missing region only means
+    // there is nothing to pin this worker to.
+    const auto base = getLocalBufferBase(thread_id, 0);
+    if (!base) return;
+    const uint64_t addr = *base;
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
     if (result.empty()) return;
     LocationParser location(result[0].location);
@@ -538,40 +549,7 @@ double TENTBenchRunner::runSingleTransfer(
                                 : intent_type;
         requests.emplace_back(entry);
     }
-    if (!splitOutputEnabled()) {
-        XferBenchTimer timer;
-        Status submitted;
-        if (XferBenchConfig::notifi) {
-            Notification notifi{"benchmark", std::to_string(target_addr)};
-            submitted = engine_->submitTransfer(batch_id, requests, notifi);
-        } else {
-            submitted = engine_->submitTransfer(batch_id, requests);
-        }
-        if (!submitted.ok()) {
-            LOG(ERROR) << "Failed to submit transfer: " << submitted.ToString();
-            noteTransferFailed();
-            return finish(-1.0);
-        }
-        TransferStatus overall_status;
-        uint64_t polls = 0;
-        auto polled = waitForBatch(batch_id, overall_status, polls);
-        if (!polled.ok()) {
-            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
-            noteTransferFailed();
-            return finish(-1.0);
-        }
-        if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            return finish(timer.lap_us());
-        }
-        if (overall_status.s == TransferStatusEnum::PENDING) {
-            return finish(-1.0);  // stopped and abandoned
-        }
-        LOG(ERROR) << "Failed transfer detected";
-        noteTransferFailed();
-        return finish(-1.0);
-    }
-
-    XferBenchTimer submit_timer;
+    XferBenchTimer timer;
     Status submitted;
     if (XferBenchConfig::notifi) {
         Notification notifi{"benchmark", std::to_string(target_addr)};
@@ -584,8 +562,7 @@ double TENTBenchRunner::runSingleTransfer(
         noteTransferFailed();
         return finish(-1.0);
     }
-    const uint64_t submit_us = submit_timer.lap_us();
-    XferBenchTimer wait_timer;
+    const uint64_t submit_ns = splitOutputEnabled() ? timer.lap_ns(false) : 0;
     uint64_t polls = 0;
     TransferStatus overall_status;
     auto polled = waitForBatch(batch_id, overall_status, polls);
@@ -595,9 +572,13 @@ double TENTBenchRunner::runSingleTransfer(
         return finish(-1.0);
     }
     if (overall_status.s == TransferStatusEnum::COMPLETED) {
-        const uint64_t wait_us = wait_timer.lap_us();
-        logSplitXfer({batch_size, submit_us, wait_us, polls});
-        return finish(static_cast<double>(submit_us + wait_us));
+        const uint64_t total_ns = timer.lap_ns(false);
+        if (splitOutputEnabled()) {
+            logSplitXfer({block_size, batch_size, splitWarmup(), submit_ns,
+                          total_ns - submit_ns, polls});
+        }
+        return finish(static_cast<double>(total_ns) /
+                      kNanosecondsPerMicrosecond);
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         return finish(-1.0);  // stopped and abandoned

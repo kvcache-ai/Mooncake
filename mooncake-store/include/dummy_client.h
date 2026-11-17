@@ -239,6 +239,8 @@ class DummyClient : public PyClient {
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
+    friend class DummyClientTeardownTestPeer;
+
     struct PreparedBuffer {
         void *original = nullptr;
         void *dummy = nullptr;

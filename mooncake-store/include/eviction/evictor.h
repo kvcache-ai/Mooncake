@@ -5,7 +5,7 @@
 //
 // Namespaces do not share their cache, so a run holds each to its own share of
 // the goal: it walks one namespace's EvictionIndex cursor at a time, objects
-// whose lease ran out first, until that namespace has given up its share, and
+// preferring older lease age bands, until it has given up its share, and
 // then comes back to the objects the policy deferred while the namespace is
 // short of its share of the minimum. What one namespace cannot give up is not
 // made up by another, so each namespace's outcome is told by its own objects
@@ -28,14 +28,22 @@
 // entry deferred together and asks whether the goal is met only between
 // entries, so it never stops halfway through a group's deferred members.
 //
-// Locks: the evictor holds at most one key lock at a time and no lock of its
-// own, and frees the replicas it took only once that key lock is let go. What
-// the caller holds across Run, it holds for the whole run.
+// Serial execution holds at most one key lock at a time. Range workers hold
+// one per worker; callbacks must support parallel execution. All
+// replicas are freed outside their key lock and workers join before fallback.
+// Parallel runs serialize access to their persistent pool. What the caller
+// holds across Run, it holds for the whole run.
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <memory>
+#include <mutex>
+
+namespace mooncake {
+class ThreadPool;
+}
 
 #include "eviction/observer.h"
 #include "eviction/policy.h"
@@ -71,7 +79,9 @@ class Evictor {
    public:
     // Everything given outlives the evictor.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
-            Reclaimer& reclaimer, std::vector<EvictionObserver*> observers);
+            Reclaimer& reclaimer, std::vector<EvictionObserver*> observers,
+            uint32_t worker_threads = 0);
+    ~Evictor();
     Evictor(const Evictor&) = delete;
     Evictor& operator=(const Evictor&) = delete;
 
@@ -83,16 +93,26 @@ class Evictor {
 
    private:
     struct Aim;
+    struct NamespaceScan;
     class Pass;
 
     Report RunFor(const Scope& scope, const Aim& aim);
+    std::vector<metadata::Namespace*> CollectNamespaces(
+        const Scope& scope) const;
+    ThreadPool* EnsureWorkerPool(uint32_t worker_count, uint64_t filed_keys);
 
     metadata::NamespaceTable& namespaces_;
     const EvictionPolicy& policy_;
     Reclaimer& reclaimer_;
     const std::vector<EvictionObserver*> observers_;
+    const bool parallel_safe_;
     // Where the next run starts among the namespaces it visits.
     std::atomic<size_t> next_start_{0};
+    // 0 = ceil(filed keys / 16M), capped at 64. Explicit values aid local
+    // scaling tests. Policy/reclaimer/observers must permit parallel callbacks.
+    const uint32_t worker_threads_;
+    std::unique_ptr<ThreadPool> workers_;
+    std::mutex run_mutex_;
 };
 
 }  // namespace eviction

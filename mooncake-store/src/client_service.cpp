@@ -32,6 +32,7 @@
 #include <vector>
 #include <ylt/struct_json/json_reader.h>
 
+#include "common.h"
 #include "transfer_engine.h"
 #include "topology.h"
 #include "transfer_task.h"
@@ -96,7 +97,13 @@ int GetCurrentNumaSocketId() {
     if (cpu < 0) {
         return 0;
     }
-    int node = numa_node_of_cpu(cpu);
+    // numa_node_of_cpu() fills libnuma's per-node cpumask cache on first use;
+    // see numaNodeCpuCacheMutex().
+    int node;
+    {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        node = numa_node_of_cpu(cpu);
+    }
     return node < 0 ? 0 : node;
 #else
     // libnuma is Linux-only; default to socket 0 elsewhere.
@@ -1116,11 +1123,30 @@ ErrorCode Client::InitTransferEngine(
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxi") {
+            // Auto-discovery is RDMA-only, so populate the topology with the
+            // CXI NICs before installing the transport (an empty device list
+            // means "all NICs"); otherwise CxiTransport finds no devices.
+            std::vector<std::string> devices;
+            if (device_names.has_value() && !device_names->empty()) {
+                devices = ParseDeviceNames(device_names.value());
+            }
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete for CXI. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "cxi_transport_install_failed error_message=\""
                            << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXI transport";
+                return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
@@ -1592,6 +1618,9 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    if (query_result.IsLeaseExpired()) {
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
     // Select a complete replica for this request's destination.
     Replica::Descriptor replica;
     ErrorCode err =
@@ -1673,6 +1702,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
+    if (query_result.IsLeaseExpired()) {
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
     Replica::Descriptor replica;
     ErrorCode err =
         MakeReadReplicaSelector()(query_result.replicas, slices, replica);
@@ -1794,7 +1826,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-
         // Select a complete replica for this key's destination.
         Replica::Descriptor replica;
         ErrorCode err =
@@ -1804,6 +1835,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
             }
             results[i] = tl::unexpected(err);
+            continue;
+        }
+
+        // Validate the requested length without accessing the replica's
+        // buffer. A malformed request keeps its transfer error even when the
+        // lease has expired.
+        if (replica.is_memory_replica() &&
+            CalculateSliceSize(slices_it->second) !=
+                replica.get_memory_descriptor().buffer_descriptor.size_) {
+            LOG(ERROR) << "Transfer length mismatch for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            continue;
+        }
+        if (query_result.IsLeaseExpired()) {
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
             continue;
         }
 
@@ -1844,12 +1890,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 replica, slices_it->second, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size,
                 TransferIntent::kForegroundGet);
-        } else if (group_by_target && replica.is_memory_replica() &&
-                   CalculateSliceSize(slices_it->second) ==
-                       replica.get_memory_descriptor()
-                           .buffer_descriptor.size_) {
-            // A size mismatch would fail the whole group in submit_batch, so
-            // such a key stays on the per-key path and fails alone.
+        } else if (group_by_target && replica.is_memory_replica()) {
             auto& group =
                 target_groups[replica.get_memory_descriptor()
                                   .buffer_descriptor.transport_endpoint_];
@@ -4665,9 +4706,9 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     }
     auto end_result = end_fn();
     if (!end_result.has_value()) {
-        if (!targets.empty()) {
-            revoke_lambda();
-        }
+        // Start creates a replication task even when the target already
+        // exists, so a failed end must release the source reservation.
+        revoke_lambda();
         return tl::unexpected(end_result.error());
     }
 
@@ -4779,6 +4820,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     std::vector<Replica::Descriptor> targets;
     if (response.target) {
         targets.push_back(*response.target);
+    } else {
+        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
+                  << ", info=target_replica_already_exists";
     }
 
     auto result = ExecuteReplicaTransfer(
