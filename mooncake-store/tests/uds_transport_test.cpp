@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -258,5 +259,61 @@ TEST(UdsTransportTest, StartRequiresRegisteredHandler) {
     ASSERT_FALSE(start_result);
     EXPECT_NE(start_result.error().find("handler"), std::string::npos);
 }
+
+// Hold the first handshake so every later client must fit in the listen queue.
+class UdsBacklogTest : public ::testing::TestWithParam<const char *> {};
+
+TEST_P(UdsBacklogTest, QueuesConcurrentConnectionsBehindBlockedHandshake) {
+    const char *previous = std::getenv("MOONCAKE_UDS_LISTEN_BACKLOG");
+    const bool was_set = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    if (GetParam()) {
+        setenv("MOONCAKE_UDS_LISTEN_BACKLOG", GetParam(), 1);
+    } else {
+        unsetenv("MOONCAKE_UDS_LISTEN_BACKLOG");
+    }
+    std::atomic<bool> entered{false};
+    UdsAcceptor acceptor(testSocketPath("backlog"));
+    acceptor.registerHandler([&](UdsConnection &connection) {
+        entered = true;
+        char marker;
+        (void)connection.recvRaw(&marker, 1);
+    });
+    auto started = acceptor.start();
+    if (was_set) {
+        setenv("MOONCAKE_UDS_LISTEN_BACKLOG", saved.c_str(), 1);
+    } else {
+        unsetenv("MOONCAKE_UDS_LISTEN_BACKLOG");
+    }
+    ASSERT_TRUE(started);
+    UdsConnector connector(testSocketPath("backlog"),
+                           std::chrono::milliseconds(100));
+    auto first = connector.connect();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(waitForFlag(entered));
+    std::vector<std::unique_ptr<UdsConnection>> queued;
+    for (int peer = 0; peer < 8; ++peer) {
+        auto result = connector.connect();
+        if (result) {
+            char marker = 1;
+            EXPECT_EQ((*result)->sendRaw(&marker, 1), 0);
+            queued.push_back(std::move(*result));
+        }
+    }
+    // Setting 5 must still select the old, insufficient queue size.
+    const bool old_limit = GetParam() && std::string(GetParam()) == "5";
+    if (old_limit) {
+        EXPECT_LT(queued.size(), 8u);
+    } else {
+        EXPECT_EQ(queued.size(), 8u);
+    }
+    char marker = 1;
+    EXPECT_EQ((*first)->sendRaw(&marker, 1), 0);
+    acceptor.stop();
+}
+
+INSTANTIATE_TEST_SUITE_P(Environment, UdsBacklogTest,
+                         ::testing::Values(nullptr, "8", "5", "0", "-1", "bad",
+                                           "8junk", "2147483648", ""));
 
 }  // namespace mooncake

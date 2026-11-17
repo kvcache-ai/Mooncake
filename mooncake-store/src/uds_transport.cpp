@@ -1,10 +1,13 @@
 #include "uds_transport.h"
 
+#include "environment_value_parser.h"
+
 #include <glog/logging.h>
 
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <utility>
 
@@ -299,7 +302,17 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         return tl::make_unexpected(error);
     }
 
-    if (listen(listen_fd_, 5) < 0) {
+    int backlog = 128;
+    if (const char *value = std::getenv("MOONCAKE_UDS_LISTEN_BACKLOG")) {
+        auto parsed = TryParseEnvironmentValue<int>(value);
+        if (parsed && *parsed > 0) {
+            backlog = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MOONCAKE_UDS_LISTEN_BACKLOG; using "
+                         << backlog;
+        }
+    }
+    if (listen(listen_fd_, backlog) < 0) {
         auto error = errnoMessage("Failed to listen on UDS socket '" +
                                   socket_name_ + "'");
         ::close(listen_fd_);
