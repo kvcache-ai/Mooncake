@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string_view>
+#include <utility>
 
 #include "types.h"
 
@@ -70,9 +71,17 @@ class ClientLivenessRecord {
         return state() != ClientLivenessState::OFFLINE;
     }
 
-    // Reports only the liveness effect: refresh, recovery, or rejection of
-    // an OFFLINE record. Session readiness and RPC status belong to the
-    // registry.
+    // Fast pre-check under the leaf transition lock: true only when the
+    // current state has reached its TTL deadline at `now`.
+    [[nodiscard]] bool IsExpiredAt(TimePoint now, Clock::duration active_ttl,
+                                   Clock::duration suspicion_ttl) const {
+        if (!ShouldRetainResources()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(transition_mutex_);
+        return IsExpiredLocked(now, active_ttl, suspicion_ttl);
+    }
+
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
         std::lock_guard<std::mutex> lock(transition_mutex_);
         const auto current_state = state_.load(std::memory_order_relaxed);
@@ -91,33 +100,54 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition Evaluate(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl) {
+        return Evaluate(now, active_ttl, suspicion_ttl, [] {});
+    }
+
+    template <typename ReserveRetirement>
+    [[nodiscard]] ClientLivenessTransition Evaluate(
+        TimePoint now, Clock::duration active_ttl,
+        Clock::duration suspicion_ttl, ReserveRetirement&& reserve_retirement) {
         std::lock_guard<std::mutex> lock(transition_mutex_);
+        if (!IsExpiredLocked(now, active_ttl, suspicion_ttl)) {
+            return ClientLivenessTransition::NONE;
+        }
         switch (state_.load(std::memory_order_relaxed)) {
             case ClientLivenessState::ACTIVE:
-                if (now - last_liveness_at_ >= active_ttl) {
-                    suspected_since_ = now;
-                    state_.store(ClientLivenessState::SUSPECTED,
-                                 std::memory_order_release);
-                    return ClientLivenessTransition::BECAME_SUSPECTED;
-                }
-                break;
+                suspected_since_ = now;
+                state_.store(ClientLivenessState::SUSPECTED,
+                             std::memory_order_release);
+                return ClientLivenessTransition::BECAME_SUSPECTED;
             case ClientLivenessState::SUSPECTED:
-                if (now - suspected_since_ >= suspicion_ttl) {
-                    state_.store(ClientLivenessState::OFFLINE,
-                                 std::memory_order_release);
-                    return ClientLivenessTransition::BECAME_OFFLINE;
-                }
-                break;
+                // Publish the external barrier before OFFLINE so a concurrent
+                // snapshot cannot miss terminal work.
+                std::forward<ReserveRetirement>(reserve_retirement)();
+                state_.store(ClientLivenessState::OFFLINE,
+                             std::memory_order_release);
+                return ClientLivenessTransition::BECAME_OFFLINE;
             case ClientLivenessState::OFFLINE:
-                break;
+                return ClientLivenessTransition::NONE;
         }
         return ClientLivenessTransition::NONE;
     }
 
    private:
+    [[nodiscard]] bool IsExpiredLocked(TimePoint now,
+                                       Clock::duration active_ttl,
+                                       Clock::duration suspicion_ttl) const {
+        switch (state_.load(std::memory_order_relaxed)) {
+            case ClientLivenessState::ACTIVE:
+                return now - last_liveness_at_ >= active_ttl;
+            case ClientLivenessState::SUSPECTED:
+                return now - suspected_since_ >= suspicion_ttl;
+            case ClientLivenessState::OFFLINE:
+                return false;
+        }
+        return false;
+    }
+
     const UUID client_id_;
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
-    std::mutex transition_mutex_;
+    mutable std::mutex transition_mutex_;
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };

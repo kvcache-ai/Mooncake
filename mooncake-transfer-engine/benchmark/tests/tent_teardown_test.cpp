@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <unistd.h>
 
@@ -40,8 +41,6 @@ class TransferEngineImplTestPeer {
 
 namespace tent {
 
-extern std::atomic<bool> g_tent_running;
-
 class TENTBenchRunnerTestPeer {
    public:
     static std::unique_ptr<TENTBenchRunner> make(
@@ -54,6 +53,11 @@ class TENTBenchRunnerTestPeer {
     }
     static uint64_t abandoned(const TENTBenchRunner& runner) {
         return runner.abandoned_batches_.load();
+    }
+    // What a failed worker or a stop signal does to a running transfer.
+    static void stop(TENTBenchRunner& runner) { runner.noteTransferFailed(); }
+    static bool running(const TENTBenchRunner& runner) {
+        return runner.running();
     }
 };
 
@@ -73,6 +77,7 @@ class NoQuiesceTransport : public Transport {
     Mode mode = Mode::Completed;
     int polls = 0, freed_batches = 0, removed_buffers = 0, freed_buffers = 0;
     Batch* pending = nullptr;
+    std::function<void()> on_stop;
 
     Status allocateSubBatch(SubBatchRef& batch, size_t) override {
         batch = new Batch;
@@ -109,7 +114,7 @@ class NoQuiesceTransport : public Transport {
             status = {TransferStatusEnum::COMPLETED,
                       static_cast<Batch*>(batch)->requests.at(task).length};
         } else {
-            g_tent_running.store(false);
+            if (on_stop) on_stop();
             status = {TransferStatusEnum::PENDING, 0};
         }
         return Status::OK();
@@ -167,7 +172,9 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
             std::string error;
             ASSERT_TRUE(openSplitOutput(path_, &error)) << error;
         }
-        g_tent_running.store(true);
+        transport_->on_stop = [this] {
+            if (runner_) TENTBenchRunnerTestPeer::stop(*runner_);
+        };
     }
     void TearDown() override {
         runner_.reset();
@@ -190,7 +197,6 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
             setenv("MC_TENT_CONF", saved_env_->c_str(), 1);
         else
             unsetenv("MC_TENT_CONF");
-        g_tent_running.store(true);
     }
     double transfer() {
         return runner_->runSingleTransfer(
@@ -246,7 +252,7 @@ TEST_P(TENTTeardownTest, CompletedBatchReleasesEngineAndBuffer) {
 TEST_P(TENTTeardownTest, BatchDrainedAfterStopReleasesEngineAndBuffer) {
     transport_->mode = NoQuiesceTransport::Mode::CompleteAfterStop;
     EXPECT_GE(transfer(), 0);
-    EXPECT_FALSE(g_tent_running.load());
+    EXPECT_FALSE(TENTBenchRunnerTestPeer::running(*runner_));
     EXPECT_EQ(TENTBenchRunnerTestPeer::abandoned(*runner_), 0u);
     runner_.reset();
     EXPECT_TRUE(metadata_.expired());

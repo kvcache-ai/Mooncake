@@ -39,10 +39,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <set>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace mooncake;
@@ -73,6 +76,7 @@ static std::map<const void*, aclrtMemLocation> g_memory_locations;
 // signal handling thread looks like when it tears the client down.
 static bool g_thread_context_bound = true;
 static std::mutex g_acl_mutex;
+static std::atomic<bool> g_null_recent_error{false};
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
 static size_t g_malloc_physical_max_success = 0;
 static int g_malloc_physical_call_count = 0;
@@ -131,6 +135,7 @@ int DeviceForContext(aclrtContext context) {
 namespace mock_acl {
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_null_recent_error = false;
     g_device_id = 0;
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
@@ -450,7 +455,9 @@ aclError aclrtPointerGetAttributes(const void* ptr,
     return ACL_ERROR_NONE;
 }
 
-const char* aclGetRecentErrMsg() { return "mock acl error message"; }
+const char* aclGetRecentErrMsg() {
+    return g_null_recent_error ? nullptr : "mock acl error message";
+}
 
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
@@ -565,6 +572,8 @@ static adxl::TransferStatus g_transfer_status_enum =
     adxl::TransferStatus::COMPLETED;
 static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
+static std::deque<adxl::Status> g_initialize_results;
+static std::vector<std::string> g_initialize_names;
 static std::vector<uintptr_t> g_registered_mem_handles;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
 static std::set<std::string> g_connected;
@@ -597,6 +606,8 @@ void reset() {
     g_transfer_status_enum = adxl::TransferStatus::COMPLETED;
     g_transfer_results.clear();
     g_transfer_async_results.clear();
+    g_initialize_results.clear();
+    g_initialize_names.clear();
     g_registered_mem_handles.clear();
     g_deregistered_mem_handles.clear();
     g_connected.clear();
@@ -663,6 +674,16 @@ void set_transfer_status_enum(adxl::TransferStatus status) {
 void set_initialize_result(adxl::Status status) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_initialize_result = status;
+}
+
+void set_initialize_sequence(const std::vector<adxl::Status>& statuses) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_initialize_results.assign(statuses.begin(), statuses.end());
+}
+
+std::vector<std::string> get_initialize_names() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_initialize_names;
 }
 
 void set_register_mem_result(adxl::Status status) {
@@ -755,12 +776,18 @@ AdxlEngine::~AdxlEngine() = default;
 Status AdxlEngine::Initialize(
     const AscendString& name,
     const std::map<AscendString, AscendString>& options) {
-    (void)name;
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_was_initialize_called = true;
+    g_initialize_names.emplace_back(name.GetString());
     g_last_init_options.clear();
     for (const auto& kv : options) {
         g_last_init_options[std::string(kv.first.GetString())] =
             std::string(kv.second.GetString());
+    }
+    if (!g_initialize_results.empty()) {
+        auto result = g_initialize_results.front();
+        g_initialize_results.pop_front();
+        return result;
     }
     return g_initialize_result;
 }
@@ -1183,6 +1210,69 @@ TEST_F(AscendDirectTransportTest, Basic_InstallFailsWhenAdxlInitializeFails) {
 
     int ret = transport->install(local_server_name, metadata, topology);
     EXPECT_NE(ret, 0);
+    EXPECT_EQ(adxl_mock::get_initialize_names().size(), 4u);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Basic_InstallRetriesPortCollisionAndPublishesSuccessfulEndpoint) {
+    adxl_mock::set_initialize_sequence(
+        {adxl::FAILED, adxl::FAILED, adxl::SUCCESS});
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto names = adxl_mock::get_initialize_names();
+    ASSERT_EQ(names.size(), 3u);
+    EXPECT_NE(names[0], names[1]);
+    EXPECT_NE(names[0], names[2]);
+    EXPECT_NE(names[1], names[2]);
+
+    auto local_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local_desc, nullptr);
+    ASSERT_EQ(local_desc->rank_info.endpoints.size(), 1u);
+    EXPECT_EQ(local_desc->rank_info.endpoints[0], names[2]);
+}
+
+TEST_F(AscendDirectTransportTest,
+       FindAdxlListenPort_DoesNotShareAdjacentDeviceBoundary) {
+    constexpr int kPortsPerDevice = 100;
+    std::vector<int> sockets;
+    int base_port = 0;
+    for (int candidate = 30000; candidate < 50000; candidate += 1000) {
+        bool complete = true;
+        for (int offset = 0; offset < kPortsPerDevice; ++offset) {
+            const int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                complete = false;
+                break;
+            }
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(candidate + offset);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&address),
+                     sizeof(address)) != 0) {
+                close(fd);
+                complete = false;
+                break;
+            }
+            sockets.push_back(fd);
+        }
+        if (complete) {
+            base_port = candidate;
+            break;
+        }
+        for (const int fd : sockets) close(fd);
+        sockets.clear();
+    }
+    if (base_port == 0) {
+        FAIL() << "Could not reserve a consecutive test port range";
+    }
+
+    // Device 0 owns [base, base + 100). Leaving base + 100 free must not
+    // let it fall through into device 1's range.
+    const auto selected = FindAdxlListenPort(base_port, 0);
+    for (const int fd : sockets) close(fd);
+    EXPECT_EQ(selected, 0);
 }
 
 TEST_F(AscendDirectTransportTest,
@@ -2607,6 +2697,49 @@ TEST_F(AscendDirectTransportTest,
     ASSERT_TRUE(result.finished);
     EXPECT_TRUE(result.failed)
         << "Transfer should have failed due to GetTransferStatus failure";
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_GetStatusFailureWithoutAclErrorMessage) {
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::FAILED);
+    g_null_recent_error = true;
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    initTestData(kTransferBufSize);
+    const auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_FailedStatusWithoutAclErrorMessage) {
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::FAILED);
+    g_null_recent_error = true;
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    initTestData(kTransferBufSize);
+    const auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
 }
 
 TEST_F(AscendDirectTransportTest, RemoteTransfer_Async_TransferTimeout) {

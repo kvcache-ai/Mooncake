@@ -52,27 +52,25 @@ class SegmentAllocatorRegistration;
 // This is the state a buffer carries: which incarnation it belongs to and
 // whether that incarnation is still alive. Whether the segment currently
 // accepts new allocations belongs to SegmentAllocatorRegistration instead.
+// Default construction yields an unbound lifetime with no heap allocation for
+// standalone buffers whose validity follows their allocator alone.
 class SegmentLifetime {
    public:
-    explicit SegmentLifetime(ClientSessionSharedPtr session = nullptr);
+    SegmentLifetime() noexcept = default;
+    explicit SegmentLifetime(ClientSessionSharedPtr session);
 
     // Resource validity is independent of whether the owner currently serves.
     // SUSPECTED sessions retain valid resources for recovery.
-    [[nodiscard]] bool isValid() const;
-    [[nodiscard]] bool isServing() const;
-    [[nodiscard]] bool operator==(const SegmentLifetime& other) const;
+    [[nodiscard]] bool isValid() const noexcept;
+    [[nodiscard]] bool isServing() const noexcept;
 
    private:
     friend class AllocatedBuffer;
     friend class SegmentAllocatorRegistration;
-    [[nodiscard]] ClientSessionSharedPtr getClientSession() const;
-    // Only a registration's local snapshot is rebound under the segment lock.
-    // Published buffers keep their State; invalidation and the one-time owner
-    // binding after restore are safe to observe concurrently.
-    void BindSession(ClientSessionSharedPtr session);
-    void Invalidate();
     struct State;
-    explicit SegmentLifetime(std::shared_ptr<State> state);
+    [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
+        const noexcept;
+    void Invalidate() noexcept;
     std::shared_ptr<State> state_;
 };
 
@@ -125,7 +123,8 @@ class AllocatedBuffer {
     // Preserve the owning session's identity for replica affiliation checks
     // and source admission; a client UUID alone cannot distinguish
     // re-registers.
-    [[nodiscard]] ClientSessionSharedPtr getClientSession() const {
+    [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
+        const noexcept {
         return segment_lifetime_.getClientSession();
     }
 
@@ -158,8 +157,8 @@ class AllocatedBuffer {
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    // A fixed generation; its validity and initial owner publication are
-    // atomic.
+    // Set before publication; its validity is atomic and its owner session is
+    // immutable.
     SegmentLifetime segment_lifetime_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};

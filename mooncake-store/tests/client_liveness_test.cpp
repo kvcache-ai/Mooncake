@@ -32,13 +32,18 @@ TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     ClientLivenessRecord record(UUID{1, 2}, initial);
 
+    EXPECT_FALSE(record.IsExpiredAt(initial + 9s, 10s, 20s));
+    EXPECT_TRUE(record.IsExpiredAt(initial + 10s, 10s, 20s));
     EXPECT_EQ(record.Evaluate(initial + 30s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
     EXPECT_EQ(record.state(), ClientLivenessState::SUSPECTED);
+    EXPECT_FALSE(record.IsExpiredAt(initial + 49s, 10s, 20s));
     EXPECT_EQ(record.Evaluate(initial + 49s, 10s, 20s),
               ClientLivenessTransition::NONE);
+    EXPECT_TRUE(record.IsExpiredAt(initial + 50s, 10s, 20s));
     EXPECT_EQ(record.Evaluate(initial + 50s, 10s, 20s),
               ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_FALSE(record.IsExpiredAt(initial + 100s, 10s, 20s));
 }
 
 TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
@@ -93,6 +98,24 @@ TEST(ClientLivenessRecordTest, DelayedObservationCannotMoveHeartbeatBackwards) {
               ClientLivenessTransition::BECAME_SUSPECTED);
 }
 
+TEST(ClientLivenessRecordTest, RetirementIsReservedBeforeOfflineIsPublished) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(UUID{}, initial);
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+
+    bool reserved = false;
+    EXPECT_EQ(record.Evaluate(initial + 30s, 10s, 20s,
+                              [&] {
+                                  EXPECT_EQ(record.state(),
+                                            ClientLivenessState::SUSPECTED);
+                                  reserved = true;
+                              }),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_TRUE(reserved);
+    EXPECT_EQ(record.state(), ClientLivenessState::OFFLINE);
+}
+
 }  // namespace
 TEST(ClientLivenessRecordTest, ResourceIdentityDistinguishesSameUuidSessions) {
     const UUID client_id = generate_uuid();
@@ -126,6 +149,7 @@ TEST(ClientLivenessRecordTest, LocalDiskCleanupUsesBoundIncarnation) {
     EXPECT_FALSE(new_replica.has_stale_local_disk_client());
     Replica unbound(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE);
     EXPECT_TRUE(unbound.has_stale_local_disk_client());
+    EXPECT_FALSE(unbound.isAffiliatedWith(nullptr));
 }
 
 }  // namespace mooncake::test

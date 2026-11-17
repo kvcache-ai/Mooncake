@@ -139,12 +139,10 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Bind restored segment resources to their owner session.
-     *        Segment snapshots intentionally do not persist session state.
+     * @brief Bind all segments of the owner's client ID to `owner_session`.
      */
     void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
-    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -168,6 +166,15 @@ class ScopedSegmentAccess {
      */
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
+
+    /**
+     * @brief Check whether the named segment still has allocated memory,
+     * including when it no longer accepts new allocations.
+     * @param segment_name Name of the mounted segment to check.
+     * @return True if the segment has allocated memory. False if the segment
+     * is missing or has no allocated memory.
+     */
+    bool HasAllocatedMemory(const std::string& segment_name) const;
 
     /**
      * @brief Get all segments that are not ready (not in OK status)

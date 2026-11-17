@@ -14,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "client_liveness.h"
 #include "client_session_event_dispatcher.h"
@@ -91,7 +92,8 @@ class ClientSessionRegistry {
     // A missing session is provisionally created; OFFLINE rejects admission.
     // The registry must outlive these scopes.
     class Registration;
-    // Successful registration renews liveness (and recovers SUSPECTED).
+    // Successful registration renews liveness at commit time (and recovers
+    // SUSPECTED). An explicit observed_at overrides the clock for tests.
     [[nodiscard]] std::optional<Registration> BeginRegistration(
         const UUID& client_id,
         std::optional<Clock::time_point> observed_at = std::nullopt);
@@ -144,23 +146,125 @@ class ClientSessionRegistry {
     friend class test::ClientSessionRegistryTestPeer;
 
     static constexpr std::chrono::seconds kExpiryScanInterval{1};
+    // A std::shared_mutex may prefer readers (the default on glibc), which
+    // would let overlapping operations postpone a state transition forever.
+    // Exclusive acquirers increment waiting_writers_ while queuing for mutex_,
+    // and overdue expiry scans close the turnstile via expiry_draining_ without
+    // blocking the shared scanner thread so in-flight operations drain in
+    // bounded time.
+    class TurnstileSharedMutex {
+       public:
+        TurnstileSharedMutex() = default;
+        TurnstileSharedMutex(const TurnstileSharedMutex&) = delete;
+        TurnstileSharedMutex& operator=(const TurnstileSharedMutex&) = delete;
+
+        void lock() {
+            {
+                const std::lock_guard<std::mutex> gate(gate_mutex_);
+                ++waiting_writers_;
+            }
+            mutex_.lock();
+            {
+                const std::lock_guard<std::mutex> gate(gate_mutex_);
+                if (--waiting_writers_ == 0 && !expiry_draining_) {
+                    gate_cv_.notify_all();
+                }
+            }
+        }
+        bool try_lock() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            if (closed_ || waiting_writers_ > 0 || !mutex_.try_lock()) {
+                return false;
+            }
+            if (expiry_draining_) {
+                expiry_draining_ = false;
+                gate_cv_.notify_all();
+            }
+            return true;
+        }
+        bool try_lock_or_drain() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            if (closed_) {
+                return false;
+            }
+            if (waiting_writers_ == 0 && mutex_.try_lock()) {
+                if (expiry_draining_) {
+                    expiry_draining_ = false;
+                    gate_cv_.notify_all();
+                }
+                return true;
+            }
+            expiry_draining_ = true;
+            return false;
+        }
+        void cancel_drain() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            if (expiry_draining_) {
+                expiry_draining_ = false;
+                if (waiting_writers_ == 0) {
+                    gate_cv_.notify_all();
+                }
+            }
+        }
+        void close_permanently() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            closed_ = true;
+            expiry_draining_ = false;
+            gate_cv_.notify_all();
+        }
+        void unlock() { mutex_.unlock(); }
+
+        void lock_shared() {
+            {
+                std::unique_lock<std::mutex> gate(gate_mutex_);
+                gate_cv_.wait(gate, [this] {
+                    return closed_ ||
+                           (waiting_writers_ == 0 && !expiry_draining_);
+                });
+            }
+            mutex_.lock_shared();
+        }
+        bool try_lock_shared() {
+            const std::lock_guard<std::mutex> gate(gate_mutex_);
+            return !closed_ && waiting_writers_ == 0 && !expiry_draining_ &&
+                   mutex_.try_lock_shared();
+        }
+        void unlock_shared() { mutex_.unlock_shared(); }
+
+       private:
+        std::mutex gate_mutex_;
+        std::condition_variable gate_cv_;
+        size_t waiting_writers_{0};
+        bool expiry_draining_{false};
+        bool closed_{false};
+        std::shared_mutex mutex_;
+    };
+
+    using SharedOperation = std::shared_lock<TurnstileSharedMutex>;
+    using ExclusiveOperation = std::unique_lock<TurnstileSharedMutex>;
 
     // A replaceable registry entry, not a permanent per-UUID allocation.
     // Scopes retain the slot so its mutex and liveness outlive their guards.
     struct ClientSlot {
         explicit ClientSlot(Record record) : liveness(std::move(record)) {}
 
+        // Empty if erased, or busy when try_lock is requested; validates slot
+        // identity only, not liveness admission.
+        std::optional<SharedOperation> AcquireShared();
+        std::optional<ExclusiveOperation> AcquireExclusive(
+            bool try_lock = false);
+        std::optional<ExclusiveOperation> AcquireExclusiveForExpiry(
+            bool drain_if_busy);
+        void CancelExpiryDrain();
+
         const Record liveness;
-        // Exclusive acquirers hold this while they queue for operation_mutex,
-        // and shared acquirers pass through it first. A shared_mutex may
-        // prefer readers (the default on glibc), so without the gate a stream
-        // of overlapping operations could postpone a transition forever.
-        std::mutex admission_gate;
-        // Shared by operations, exclusive for registration, removal and
-        // expiry.
-        std::shared_mutex operation_mutex;
-        // Consecutive expiry passes that found this slot busy. Monitoring
-        // reads and writes it while scanning; nothing else touches it.
+        // Shared by operations; exclusive for registration, removal and expiry.
+        TurnstileSharedMutex operation_mutex;
+        // Set under exclusive operation_mutex in EraseSlot; once erased, a
+        // slot never re-enters the registry.
+        bool erased{false};
+        // Consecutive expiry passes that found this slot busy while expired.
+        // Reset on expiry evaluation or liveness observation.
         std::atomic<unsigned> busy_expiry_passes{0};
         // Protected by the registry mutex, not operation_mutex: Ping and host
         // hints must not wait for long registration/resource work.
@@ -169,21 +273,15 @@ class ClientSessionRegistry {
     };
     using Slot = std::shared_ptr<ClientSlot>;
     using Slots = std::unordered_map<UUID, Slot, boost::hash<UUID>>;
-    using SharedOperation = std::shared_lock<std::shared_mutex>;
-    using ExclusiveOperation = std::unique_lock<std::shared_mutex>;
+    using SlotSnapshot = std::vector<std::pair<UUID, Slot>>;
 
-    // Lock order: admission gate -> slot operation -> registry -> transition.
+    // Lock order: lifecycle -> slot operation -> registry -> transition.
     // Never acquire an operation under the registry lock. A record's
-    // transition lock and the event queue are leaves. The caller retains slot
-    // until the returned operation is released. Empty means missing/replaced,
-    // or busy when try_lock is requested; these validate slot identity only,
-    // not liveness admission.
-    std::optional<SharedOperation> AcquireSharedOperation(
-        const UUID& client_id, const Slot& slot) const;
-    std::optional<ExclusiveOperation> AcquireExclusiveOperation(
-        const UUID& client_id, const Slot& slot, bool try_lock = false) const;
+    // transition lock is a leaf.
+    std::optional<SessionGuard> TryAcquireSession(const UUID& client_id,
+                                                  bool require_serving) const;
     Slot FindSlot(const UUID& client_id) const;
-    Slots SnapshotSlots() const;
+    SlotSnapshot SnapshotSlots() const;
     std::optional<Registration> Begin(
         const UUID& client_id, RegistrationKind kind,
         std::optional<Clock::time_point> observed_at);
@@ -191,17 +289,19 @@ class ClientSessionRegistry {
     // These helpers require the registry lock on entry.
     Slot FindSlotLocked(const UUID& client_id) const;
     void AdoptSlot(const UUID& client_id, const Slot& slot);
-    void ClearRemountState(const Slot& slot);
+    void SetSlotHostIdLocked(const Slot& slot, std::string host_id);
+    void ClearSlotStateLocked(const Slot& slot);
     // Requires exclusive lifecycle access.
     void AdoptRecords(const Records& records);
     // Requires a validated current slot operation and lifecycle access.
     void EraseSlot(const UUID& client_id, const Slot& slot,
                    const ExclusiveOperation& operation);
-    void ClearSlots();
 
     // Ping at an explicit time.
     ClientStatus Observe(const UUID& client_id, Clock::time_point now);
-    // Gauges and delivery for a transition this registry just caused. The
+    bool ObserveSlot(const UUID& client_id, const Slot& slot,
+                     Clock::time_point now);
+    // Gauges for a transition this registry just caused. The
     // caller excludes EraseSlot, through the slot's exclusive operation or the
     // registry lock, so a removed session is counted in exactly one state.
     void PublishTransition(const UUID& client_id, const Slot& slot,
@@ -209,8 +309,8 @@ class ClientSessionRegistry {
                            ClientLivenessState current);
     // One deterministic expiry pass. Applies the TTLs to every session,
     // excluding its operations for the evaluation. A busy session is retried
-    // on the next pass; one that stays busy is eventually waited for, so
-    // continuous admission cannot postpone it forever. The whole pass is
+    // on the next pass; a persistently busy slot closes its admission gate
+    // without blocking the scanner. The whole pass is
     // skipped while restore/reset holds the lifecycle barrier -- expiry is
     // frozen there, heartbeats and lookups are not.
     void ExpireSessions(Clock::time_point now);
@@ -270,8 +370,10 @@ class ClientSessionRegistry::Registration {
     // Whether this incarnation still owes a successful remount handshake.
     // Independent of ACTIVE/SUSPECTED: a suspected session may need no remount.
     bool NeedsRemount() const;
-    // Updates immediately; empty hints preserve the previous value. The hint
-    // goes with the session, so rolling back a provisional one drops it.
+    // Stages a non-empty host hint before Commit() (or applies it directly if
+    // already committed while the scope is still held). Empty hints preserve
+    // the previous value. Rolling back a provisional scope or abandoning an
+    // uncommitted update discards the staged hint.
     void UpdateHostId(const std::string& host_id);
     // Exactly one commit, with semantics fixed by the Begin* call.
     // Destruction without Commit removes only a provisional session, not
@@ -281,18 +383,20 @@ class ClientSessionRegistry::Registration {
 
    private:
     friend class ClientSessionRegistry;
-    Registration(ClientSessionRegistry& registry, const UUID& client_id,
-                 RegistrationKind kind,
-                 std::optional<Clock::time_point> observed_at);
+    Registration(ClientSessionRegistry& registry,
+                 std::shared_lock<std::shared_mutex> lifecycle_lock,
+                 const UUID& client_id, RegistrationKind kind,
+                 std::optional<Clock::time_point> observed_at, Slot slot,
+                 ExclusiveOperation operation, bool provisional);
 
     ClientSessionRegistry& registry_;
     std::shared_lock<std::shared_mutex> lifecycle_lock_;
     UUID client_id_;
     const RegistrationKind kind_;
-    Clock::time_point observed_at_;
+    const std::optional<Clock::time_point> observed_at_;
+    std::optional<std::string> pending_host_id_;
     Slot slot_;
     ExclusiveOperation operation_;
-    bool admitted_{false};
     bool provisional_{false};
     bool committed_{false};
 };

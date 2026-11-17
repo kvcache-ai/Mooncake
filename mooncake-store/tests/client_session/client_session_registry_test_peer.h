@@ -67,18 +67,13 @@ class ClientSessionRegistryTestPeer {
         return registry.FindSlot(client_id);
     }
 
-    static bool AcquireExclusiveOperation(const ClientSessionRegistry& registry,
-                                          const UUID& client_id,
-                                          const Slot& slot,
+    static bool AcquireExclusiveOperation(const Slot& slot,
                                           bool try_lock = false) {
-        return registry.AcquireExclusiveOperation(client_id, slot, try_lock)
-            .has_value();
+        return slot ? slot->AcquireExclusive(try_lock).has_value() : false;
     }
 
-    static bool AcquireSharedOperation(const ClientSessionRegistry& registry,
-                                       const UUID& client_id,
-                                       const Slot& slot) {
-        return registry.AcquireSharedOperation(client_id, slot).has_value();
+    static bool AcquireSharedOperation(const Slot& slot) {
+        return slot ? slot->AcquireShared().has_value() : false;
     }
 };
 
