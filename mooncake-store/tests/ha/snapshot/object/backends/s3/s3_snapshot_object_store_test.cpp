@@ -165,7 +165,7 @@ class S3SnapshotObjectStoreTest : public ::testing::Test {
                 }
             }
         }
-        for (int status : {403, 503}) {
+        for (int status : {403, 404, 503}) {
             const auto root = "snapshots/misleading-" + std::to_string(status);
             AddSnapshots(routes, root);
             const auto latest = MakeSnapshot(root, 2);
@@ -173,6 +173,18 @@ class S3SnapshotObjectStoreTest : public ::testing::Test {
                 Server::Reply(status,
                               "<Error><Code>NoSuchKey</Code>"
                               "<Message>missing</Message></Error>");
+        }
+        const std::string absent_root = "snapshots/absent-bucket";
+        AddSnapshots(routes, absent_root);
+        for (uint64_t batch : {1, 2}) {
+            for (const auto& key : MakeSnapshot(absent_root, batch).keys) {
+                routes["HEAD " + Target(key)] = Server::Reply(404, "");
+                routes["GET " + Target(key)] = Server::Reply(
+                    404,
+                    "<Error><Code>NoSuchBucket</Code>"
+                    "<Message>The specified bucket does not exist</Message>"
+                    "</Error>");
+            }
         }
         routes["missing"] = Server::Reply(404, "");
         routes["host-not-found"] = Server::Reply(403, "host not found 404");
@@ -219,6 +231,14 @@ class S3SnapshotObjectStoreTest : public ::testing::Test {
     static std::string Endpoint() {
         return "127.0.0.1:" + std::to_string(server_->port());
     }
+
+    static void SetBucketResponse(int status) {
+        const auto target = "HEAD /" + std::string(kBucket);
+        server_->SetResponse(target, Server::Reply(status, ""));
+        server_->SetResponse(target + "/", Server::Reply(status, ""));
+    }
+
+    void SetUp() override { SetBucketResponse(200); }
 
     static void PrepareBackend(MemoryBackend& backend, const std::string& root,
                                bool suffix_present = true) {
@@ -283,6 +303,88 @@ TEST_F(S3SnapshotObjectStoreTest, KeepsMissingBucketAsInfrastructure) {
     auto result = store_->DownloadBuffer("bucket-missing", bytes);
     ASSERT_FALSE(result);
     EXPECT_FALSE(store_->IsNotFoundError(result.error())) << result.error();
+}
+
+TEST_F(S3SnapshotObjectStoreTest, KeepsMissingBucketHead404AsInfrastructure) {
+    SetBucketResponse(404);
+    const auto key = MakeSnapshot("snapshots/absent-bucket", 2).keys[0];
+    auto inspection = store_->InspectObject(key);
+    ASSERT_FALSE(inspection);
+    EXPECT_FALSE(store_->IsNotFoundError(inspection.error()))
+        << inspection.error();
+
+    std::vector<uint8_t> bytes;
+    auto download = store_->DownloadBuffer(key, bytes);
+    ASSERT_FALSE(download);
+    EXPECT_FALSE(store_->IsNotFoundError(download.error())) << download.error();
+
+    S3Helper helper(Endpoint(), kBucket);
+    auto simple_download = helper.DownloadBuffer(key, bytes);
+    ASSERT_FALSE(simple_download);
+    EXPECT_FALSE(store_->IsNotFoundError(simple_download.error()))
+        << simple_download.error();
+}
+
+TEST_F(S3SnapshotObjectStoreTest, RechecksBucketAfterItDisappears) {
+    auto missing_object = store_->InspectObject("missing");
+    ASSERT_FALSE(missing_object);
+    EXPECT_TRUE(store_->IsNotFoundError(missing_object.error()));
+    SetBucketResponse(404);
+    auto missing_bucket = store_->InspectObject("missing");
+    ASSERT_FALSE(missing_bucket);
+    EXPECT_FALSE(store_->IsNotFoundError(missing_bucket.error()))
+        << missing_bucket.error();
+}
+
+TEST_F(S3SnapshotObjectStoreTest, KeepsBucketCheck503AsInfrastructure) {
+    SetBucketResponse(503);
+    auto result = store_->InspectObject("missing");
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(store_->IsNotFoundError(result.error())) << result.error();
+}
+
+TEST_F(S3SnapshotObjectStoreTest, BucketHeadFailuresDoNotFallBack) {
+    const std::string root = "snapshots/absent-bucket";
+    for (int status : {403, 404}) {
+        SetBucketResponse(status);
+        for (const std::string floor : {"0", "1"}) {
+            SCOPED_TRACE("bucket status=" + std::to_string(status) +
+                         "; compaction floor=" + floor);
+            MemoryBackend backend;
+            PrepareBackend(backend, root);
+            backend.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey(kCluster),
+                        floor);
+            BatchOpLogSnapshotProvider provider(kCluster, backend, *store_,
+                                                root);
+            StandbyMetadataStore metadata;
+            StandbySegmentRegistry registry;
+            auto result = provider.RestoreBaseline(metadata, registry);
+            ASSERT_FALSE(result);
+            EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
+            EXPECT_EQ(0u, metadata.GetKeyCount());
+        }
+    }
+    const auto fallback = MakeSnapshot(root, 1);
+    for (const auto& request : server_->requests()) {
+        EXPECT_EQ(std::string::npos,
+                  request.find("HEAD " + Target(fallback.keys[0]) + " "));
+    }
+}
+
+TEST_F(S3SnapshotObjectStoreTest, ExplicitMissingKeyDoesNotRequireBucketCheck) {
+    SetBucketResponse(403);
+    const std::string root = "snapshots/misleading-404";
+    MemoryBackend backend;
+    PrepareBackend(backend, root);
+    BatchOpLogSnapshotProvider provider(kCluster, backend, *store_, root);
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+    auto result = provider.RestoreBaseline(metadata, registry);
+    ASSERT_TRUE(result) << toString(result.error());
+    EXPECT_EQ(1u, result->last_included_batch_id);
+    EXPECT_EQ(2u, result->last_applied_batch_id);
+    EXPECT_TRUE(metadata.Exists("tenant", "surviving"));
+    EXPECT_FALSE(metadata.Exists("tenant", "removed-by-suffix"));
 }
 
 TEST_F(S3SnapshotObjectStoreTest, DoesNotClassifyFreeTextAsNotFound) {

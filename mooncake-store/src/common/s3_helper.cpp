@@ -2,6 +2,7 @@
 
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/HeadBucketRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
@@ -42,14 +43,21 @@ namespace {
 
 constexpr std::string_view kObjectNotFoundPrefix = "S3 object not found: ";
 
-std::string FormatObjectReadError(
+std::string FormatS3Error(
     std::string_view operation,
     const Aws::Client::AWSError<Aws::S3::S3Errors> &error) {
+    return fmt::format("{} failed: HTTP {}; error_type={}; exception={}; {}",
+                       operation, static_cast<int>(error.GetResponseCode()),
+                       static_cast<int>(error.GetErrorType()),
+                       error.GetExceptionName(), error.GetMessage());
+}
+
+std::string ClassifyObjectReadError(
+    std::string_view operation,
+    const Aws::Client::AWSError<Aws::S3::S3Errors> &error,
+    const Aws::S3::S3Client &client, const std::string &bucket) {
     const auto type = error.GetErrorType();
     const auto status = error.GetResponseCode();
-    // HEAD errors have no response body: message and exception name may not
-    // identify the error even though the SDK retains the HTTP status/type.
-    // A missing bucket is a configuration failure, not a missing snapshot.
     // An explicit HTTP failure (e.g. 403/503) takes precedence over XML codes.
     const bool not_found =
         type != Aws::S3::S3Errors::NO_SUCH_BUCKET &&
@@ -57,11 +65,23 @@ std::string FormatObjectReadError(
          (status == Aws::Http::HttpResponseCode::REQUEST_NOT_MADE &&
           (type == Aws::S3::S3Errors::NO_SUCH_KEY ||
            type == Aws::S3::S3Errors::RESOURCE_NOT_FOUND)));
-    return fmt::format("{}{} failed: HTTP {}; error_type={}; exception={}; {}",
+    const auto message = FormatS3Error(operation, error);
+    if (not_found && type != Aws::S3::S3Errors::NO_SUCH_KEY) {
+        // A bodyless HEAD 404 cannot distinguish a missing object from a
+        // missing bucket. Only classify it as object absence after confirming
+        // bucket access. Do not cache success: the bucket can later disappear.
+        // On AWS, HeadObject's missing-key 404 already requires ListBucket.
+        Aws::S3::Model::HeadBucketRequest request;
+        request.SetBucket(bucket.c_str());
+        const auto outcome = client.HeadBucket(request);
+        if (!outcome.IsSuccess()) {
+            return fmt::format("{}; bucket access check: {}", message,
+                               FormatS3Error("HeadBucket", outcome.GetError()));
+        }
+    }
+    return fmt::format("{}{}",
                        not_found ? kObjectNotFoundPrefix : std::string_view{},
-                       operation, static_cast<int>(status),
-                       static_cast<int>(type), error.GetExceptionName(),
-                       error.GetMessage());
+                       message);
 }
 
 const S3ClientConfig &GetS3ClientConfig() {
@@ -259,8 +279,8 @@ tl::expected<void, std::string> S3Helper::InspectObject(
 
     auto outcome = s3_client_.HeadObject(request);
     if (!outcome.IsSuccess()) {
-        return tl::make_unexpected(
-            FormatObjectReadError("HeadObject", outcome.GetError()));
+        return tl::make_unexpected(ClassifyObjectReadError(
+            "HeadObject", outcome.GetError(), s3_client_, bucket_));
     }
     const auto content_length = outcome.GetResult().GetContentLength();
     if (content_length < 0) {
@@ -301,8 +321,8 @@ tl::expected<void, std::string> S3Helper::DownloadBuffer(
 
     auto outcome = s3_client_.GetObject(request);
     if (!outcome.IsSuccess()) {
-        return tl::make_unexpected(
-            FormatObjectReadError("GetObject", outcome.GetError()));
+        return tl::make_unexpected(ClassifyObjectReadError(
+            "GetObject", outcome.GetError(), s3_client_, bucket_));
     }
 
     auto &result_stream = outcome.GetResult().GetBody();
@@ -334,8 +354,8 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(
 
     auto head_outcome = s3_client_.HeadObject(head_request);
     if (!head_outcome.IsSuccess()) {
-        return tl::make_unexpected(
-            FormatObjectReadError("HeadObject", head_outcome.GetError()));
+        return tl::make_unexpected(ClassifyObjectReadError(
+            "HeadObject", head_outcome.GetError(), s3_client_, bucket_));
     }
 
     const int64_t total_size = head_outcome.GetResult().GetContentLength();
@@ -420,10 +440,10 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(
                         if (retry == max_retries - 1) {
                             std::lock_guard<std::mutex> lock(error_mutex);
                             has_error = true;
-                            error_message = FormatObjectReadError(
+                            error_message = ClassifyObjectReadError(
                                 fmt::format("Part {} download after {} retries",
                                             part_num, max_retries),
-                                part_outcome.GetError());
+                                part_outcome.GetError(), s3_client_, bucket_);
                         } else {
                             std::this_thread::sleep_for(std::chrono::seconds(
                                 1 << retry));  // Exponential backoff
@@ -750,8 +770,8 @@ tl::expected<void, std::string> S3Helper::DownloadString(const std::string &key,
         data = buffer.str();
         return {};
     } else {
-        return tl::make_unexpected(
-            FormatObjectReadError("GetObject", outcome.GetError()));
+        return tl::make_unexpected(ClassifyObjectReadError(
+            "GetObject", outcome.GetError(), s3_client_, bucket_));
     }
 }
 
