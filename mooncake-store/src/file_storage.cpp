@@ -91,10 +91,6 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
-    if (config_.offload_write_workers > 1) {
-        offload_write_pool_ =
-            std::make_unique<ThreadPool>(config_.offload_write_workers);
-    }
 
     if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
@@ -177,7 +173,7 @@ FileStorage::~FileStorage() {
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
-    offload_write_pool_.reset();
+    storage_backend_->StopOffloadWorkers();
     client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
@@ -827,7 +823,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return false;
     };
     try {
-        ExecuteOffloadBuckets(buckets_keys.size(), process_bucket);
+        storage_backend_->ExecuteOffloadBatches(buckets_keys.size(),
+                                                process_bucket);
     } catch (const std::exception& error) {
         LOG(ERROR) << "Offload worker dispatch failed: " << error.what();
         abort_error = ErrorCode::INTERNAL_ERROR;
@@ -1135,53 +1132,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                      << disk_eviction_result.error();
     }
     return {};
-}
-
-void FileStorage::ExecuteOffloadBuckets(
-    size_t count, const std::function<bool(size_t)>& process) {
-    if (!offload_write_pool_) {
-        for (size_t i = 0; i < count; ++i)
-            if (!process(i)) break;
-        return;
-    }
-    std::atomic<size_t> next{0};
-    std::atomic<bool> abort{false};
-    std::vector<std::future<void>> jobs;
-    jobs.reserve(std::min<size_t>(count, config_.offload_write_workers));
-    std::exception_ptr error;
-    try {
-        for (size_t w = 0;
-             w < std::min<size_t>(count, config_.offload_write_workers); ++w) {
-            auto job = std::make_shared<std::packaged_task<void()>>([&] {
-                try {
-                    while (!abort.load()) {
-                        const size_t index = next.fetch_add(1);
-                        if (index >= count || abort.load()) break;
-                        if (!process(index)) abort.store(true);
-                    }
-                } catch (...) {
-                    abort.store(true);
-                    throw;  // packaged_task captures it; the pool thread
-                            // survives.
-                }
-            });
-            auto future = job->get_future();
-            offload_write_pool_->enqueue([job] { (*job)(); });
-            jobs.push_back(std::move(future));
-        }
-    } catch (...) {
-        abort.store(true);
-        error = std::current_exception();
-    }
-    // Never unwind captured state while a worker still uses it.
-    for (auto& job : jobs) {
-        try {
-            job.get();
-        } catch (...) {
-            if (!error) error = std::current_exception();
-        }
-    }
-    if (error) std::rethrow_exception(error);
 }
 
 void FileStorage::NotifyFailedOffloads(

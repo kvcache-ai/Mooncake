@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <barrier>
 #include <cerrno>
 #include <atomic>
 #include <condition_variable>
@@ -898,10 +899,14 @@ class FileStorageTest : public ::testing::Test {
     static void ExecuteBuckets(FileStorage& storage, size_t count,
                                const std::function<bool(size_t)>& process) {
         std::lock_guard<std::mutex> lock(storage.offload_cycle_mutex_);
-        storage.ExecuteOffloadBuckets(count, process);
+        storage.storage_backend_->ExecuteOffloadBatches(count, process);
     }
     static void StopWritePool(FileStorage& storage) {
-        storage.offload_write_pool_->stop();
+        storage.storage_backend_->StopOffloadWorkers();
+    }
+
+    static auto GetBackend(FileStorage& storage) {
+        return storage.storage_backend_;
     }
 
     static bool CallIsPerBucketSoftOffloadError(ErrorCode error) {
@@ -2805,6 +2810,33 @@ TEST_F(FileStorageTest, OffloadWriteWorkersBoundedAndExactlyOnce) {
     EXPECT_NO_THROW(ExecuteBuckets(storage, 1, [](size_t) { return true; }));
 }
 
+TEST_F(FileStorageTest, ShutdownJoinsBackendWorkersWhileBackendIsRetained) {
+    struct ExitSignal {
+        std::shared_ptr<std::atomic<size_t>> exited;
+        ~ExitSignal() { ++*exited; }
+    };
+    auto exited = std::make_shared<std::atomic<size_t>>(0);
+    std::shared_ptr<StorageBackendInterface> backend;
+    {
+        auto storage = MakeOffloadStorage(4);
+        backend = GetBackend(storage);
+        std::barrier ready(4);
+        ExecuteBuckets(storage, 4, [&](size_t) {
+            thread_local std::unique_ptr<ExitSignal> signal;
+            signal.reset(new ExitSignal{exited});
+            ready.arrive_and_wait();
+            return true;
+        });
+        EXPECT_EQ(exited->load(), 0u);
+    }
+    // FileStorage must stop the threads even when another owner retains the
+    // backend, before its own registered staging buffer can be released.
+    EXPECT_EQ(exited->load(), 4u);
+    EXPECT_THROW(backend->ExecuteOffloadBatches(1, [](size_t) { return true; }),
+                 std::runtime_error);
+    EXPECT_NO_THROW(backend->StopOffloadWorkers());
+}
+
 TEST_F(FileStorageTest, OffloadWriteFailureJoinsWorkersBeforeClear) {
     auto storage = MakeOffloadStorage(2);
     std::promise<void> first_started, second_finished, release_first;
@@ -2871,13 +2903,13 @@ TEST_F(FileStorageTest, OffloadCapacityRetriesAreBoundedAndReleaseTasks) {
 }
 
 #ifdef USE_URING
-TEST_F(FileStorageTest, UringReadsWithParallelPosixOffload) {
+TEST_F(FileStorageTest, UringReadsWithParallelOffloadModes) {
     struct io_uring ring;
     if (io_uring_queue_init(2, &ring, 0) < 0)
         GTEST_SKIP() << "io_uring is unavailable";
     io_uring_queue_exit(&ring);
     for (uint32_t workers : {4u, 16u}) {
-        for (const char* mode : {"0", "aligned"}) {
+        for (const char* mode : {"0", "aligned", "packed", "true", "1"}) {
             ASSERT_NO_FATAL_FAILURE(
                 RunSkippedOffloadScenario(0, false, StorageBackendType::kBucket,
                                           workers, false, true, mode));

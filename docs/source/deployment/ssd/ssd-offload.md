@@ -166,9 +166,9 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
 
-Bucket-level parallel offload supports io_uring reads alongside POSIX writes.
-Use `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=0` (buffered) or `aligned` (POSIX
-O_DIRECT writes). For example:
+The bucket backend owns the offload worker pool; other backends execute batches
+serially. Parallel workers support buffered and aligned POSIX writes, and packed
+io_uring writes when io_uring is enabled. For example:
 
 ```bash
 export MOONCAKE_OFFLOAD_USE_URING=true
@@ -177,9 +177,10 @@ export MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=0
 ```
 
 With `MOONCAKE_OFFLOAD_USE_URING=true`, `packed` direct writes (`true`/`1`
-are aliases) require `MOONCAKE_OFFLOAD_WRITE_WORKERS=1`. Combining packed
-io_uring writes with multiple offload workers is rejected during backend
-initialization, before storage files are created.
+are aliases) also support multiple offload workers. Each worker uses its own
+packing buffer and io_uring ring. A cycle waits for all in-flight batches before
+releasing source references, and shutdown joins the workers before unregistering
+staging memory.
 
 Capacity admission counts all in-flight write reservations on the selected
 disk. With eviction disabled (`none`), writes must also fit the node-wide

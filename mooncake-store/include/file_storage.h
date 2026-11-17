@@ -422,9 +422,6 @@ class FileStorage {
 
     // The coordinator joins every worker before releasing the cycle lock.
     std::mutex offload_cycle_mutex_;
-    std::unique_ptr<ThreadPool> offload_write_pool_;
-    void ExecuteOffloadBuckets(size_t count,
-                               const std::function<bool(size_t)>& process);
     void NotifyFailedOffloads(const std::vector<OffloadTaskItem>& tasks);
     void CancelDeferredOffloads();  // Caller holds offload_cycle_mutex_.
 

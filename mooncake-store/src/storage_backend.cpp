@@ -19,6 +19,7 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "thread_pool.h"
 #include "nvme_kv/backend.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
@@ -1622,6 +1624,14 @@ BucketStorageBackend::BucketStorageBackend(
     // pointing at the wrong roots.
     disk_paths_ =
         ResolveOffloadDiskPaths(file_storage_config_.storage_filepath);
+    if (file_storage_config_.offload_write_workers < 1 ||
+        file_storage_config_.offload_write_workers > 16) {
+        throw std::invalid_argument("Invalid bucket offload worker count");
+    }
+    if (file_storage_config_.offload_write_workers > 1) {
+        offload_write_pool_ = std::make_unique<ThreadPool>(
+            file_storage_config_.offload_write_workers);
+    }
     const auto& per_disk = bucket_backend_config_.max_total_size_per_disk;
     disks_.resize(disk_paths_.size());
     // Init() rejects a per-disk list of the wrong length; guard the indexing
@@ -1634,10 +1644,65 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    StopOffloadWorkers();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
     ReleaseDiskOwnerLocks();
+}
+
+void BucketStorageBackend::ExecuteOffloadBatches(
+    size_t count, const std::function<bool(size_t)>& process) {
+    if (!offload_write_pool_) {
+        for (size_t i = 0; i < count; ++i)
+            if (!process(i)) break;
+        return;
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> abort{false};
+    std::vector<std::future<void>> jobs;
+    jobs.reserve(
+        std::min<size_t>(count, file_storage_config_.offload_write_workers));
+    std::exception_ptr error;
+    try {
+        for (size_t w = 0;
+             w < std::min<size_t>(count,
+                                  file_storage_config_.offload_write_workers);
+             ++w) {
+            auto job = std::make_shared<std::packaged_task<void()>>([&] {
+                try {
+                    while (!abort.load()) {
+                        const size_t index = next.fetch_add(1);
+                        if (index >= count || abort.load()) break;
+                        if (!process(index)) abort.store(true);
+                    }
+                } catch (...) {
+                    abort.store(true);
+                    throw;  // packaged_task captures it; the pool thread
+                            // survives.
+                }
+            });
+            auto future = job->get_future();
+            offload_write_pool_->enqueue([job] { (*job)(); });
+            jobs.push_back(std::move(future));
+        }
+    } catch (...) {
+        abort.store(true);
+        error = std::current_exception();
+    }
+    // Never unwind captured state while a worker still uses it.
+    for (auto& job : jobs) {
+        try {
+            job.get();
+        } catch (...) {
+            if (!error) error = std::current_exception();
+        }
+    }
+    if (error) std::rethrow_exception(error);
+}
+
+void BucketStorageBackend::StopOffloadWorkers() {
+    if (offload_write_pool_) offload_write_pool_->stop();
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AcquireDiskOwnerLocks() {
@@ -2166,14 +2231,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             bucket_backend_config_.aligned_direct_write) {
             LOG(ERROR) << "aligned_direct_write is set, but "
                           "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE selects packed";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (direct_write.value() && file_storage_config_.use_uring &&
-            file_storage_config_.offload_write_workers > 1) {
-            LOG(ERROR) << "Parallel offload supports io_uring reads with POSIX "
-                          "writes; set MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=0 "
-                          "or MOONCAKE_OFFLOAD_WRITE_WORKERS=1 for packed "
-                          "io_uring writes";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (direct_write.value()) {
