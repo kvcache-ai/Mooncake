@@ -8702,8 +8702,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
                     py_results.push_back(to_py_ret(item));
                 }
                 client_->ObserveTransferOperation(
-                    TransferOperationKind::kRead,
-                    "batch_get_into_multi_buffers",
+                    TransferOperationKind::kRead, BatchGetMultiBuffersOpName(),
                     sum_positive_results(py_results), latency_us);
             });
     std::vector<int> results;
@@ -8773,8 +8772,24 @@ RealClient::batch_get_into_multi_buffers_internal(
     if (num_keys == 0) {
         return results;
     }
+    const bool metrics_enabled = client_->MetricsEnabled();
+    std::chrono::steady_clock::time_point query_start{};
+    if (metrics_enabled) {
+        query_start = std::chrono::steady_clock::now();
+    }
     // Query metadata for all keys
     const auto query_results = client_->BatchQuery(keys);
+    std::chrono::steady_clock::time_point post_query_start{};
+    uint64_t metadata_us = 0;
+    if (metrics_enabled) {
+        // Use a single timestamp for metadata end and post_query start so the
+        // two stages partition all work from BatchQuery onward with zero gap.
+        post_query_start = std::chrono::steady_clock::now();
+        metadata_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                post_query_start - query_start)
+                .count());
+    }
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
@@ -9190,6 +9205,28 @@ RealClient::batch_get_into_multi_buffers_internal(
             FanOutDuplicates(dup_jobs, results);
             // temp_handles: BufferHandle RAII releases allocator memory
         }
+    }
+
+    if (metrics_enabled) {
+        const auto post_query_end = std::chrono::steady_clock::now();
+        const uint64_t post_query_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                post_query_end - post_query_start)
+                .count());
+        size_t ok_count = 0;
+        for (const auto &result : results) {
+            if (result.has_value()) {
+                ++ok_count;
+            }
+        }
+        OperationOutcome outcome = OperationOutcome::kError;
+        if (ok_count == results.size()) {
+            outcome = OperationOutcome::kOk;
+        } else if (ok_count > 0) {
+            outcome = OperationOutcome::kPartial;
+        }
+        client_->ObserveReadOperationBreakdown(
+            BatchGetMultiBuffersOpName(), outcome, metadata_us, post_query_us);
     }
 
     return results;
