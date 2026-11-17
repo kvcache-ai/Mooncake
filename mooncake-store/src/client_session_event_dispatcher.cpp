@@ -35,12 +35,7 @@ void ClientSessionEventDispatcher::Start() {
         listeners_frozen_ = true;
         stopped_ = false;
     }
-    try {
-        thread_ = std::thread(&ClientSessionEventDispatcher::ThreadFunc, this);
-    } catch (...) {
-        Stop();
-        throw;
-    }
+    thread_ = std::thread(&ClientSessionEventDispatcher::ThreadFunc, this);
 }
 
 void ClientSessionEventDispatcher::Stop() {
