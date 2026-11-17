@@ -107,6 +107,22 @@ TEST(StandbyControllerTest, PromotionReportsStandbyStartFailure) {
     EXPECT_EQ(start_error, failed.error());
 }
 
+TEST(StandbyControllerTest, ShutdownPredicatePreventsStandbyStartup) {
+    ha::HABackendSpec spec{};
+    spec.type = ha::HABackendType::ETCD;
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = true;
+    config.cluster_id = "cancelled-standby-start";
+    auto controller =
+        ha::CreateStandbyController(spec, config, {}, [] { return true; });
+    ASSERT_NE(nullptr, controller);
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED,
+              controller->StartStandby(std::nullopt));
+    EXPECT_EQ(ha::MasterRuntimeState::kStandby,
+              controller->GetStandbyRuntimeState());
+    controller->StopStandby();
+}
+
 TEST(StandbyControllerTest, BatchSnapshotDependencyFailureThrowsBeforeStart) {
     ha::HABackendSpec spec{};
     spec.type = ha::HABackendType::ETCD;

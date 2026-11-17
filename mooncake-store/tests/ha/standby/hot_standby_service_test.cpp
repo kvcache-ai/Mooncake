@@ -5,6 +5,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -324,6 +329,167 @@ class HotStandbyServiceTest : public ::testing::Test {
     std::string oplog_endpoints_;
     std::string cluster_id_;
 };
+
+class BootstrapCancellationTest : public HotStandbyServiceTest,
+                                  public ::testing::WithParamInterface<bool> {
+   protected:
+    class LaggingBackend final : public FakeHaKvBackend {
+       public:
+        ErrorCode RangeSerializable(std::string_view begin,
+                                    std::string_view end, size_t limit,
+                                    std::vector<KvPair>& output) override {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (lagging_) {
+                    output.clear();
+                    read_observed_ = true;
+                    cv_.notify_all();
+                    return ErrorCode::OK;
+                }
+            }
+            return FakeHaKvBackend::RangeSerializable(begin, end, limit,
+                                                      output);
+        }
+
+        bool WaitForLaggingRead() {
+            std::unique_lock<std::mutex> lock(mutex_);
+            return cv_.wait_for(lock, std::chrono::seconds(2),
+                                [this] { return read_observed_; });
+        }
+
+        void CatchUp() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            lagging_ = false;
+        }
+
+       private:
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool lagging_{true};
+        bool read_observed_{false};
+    };
+
+    void SetUp() override {
+        HotStandbyServiceTest::SetUp();
+        char pattern[] = "/tmp/mooncake-bootstrap-cancel-XXXXXX";
+        const char* root = mkdtemp(pattern);
+        ASSERT_NE(nullptr, root);
+        root_ = root;
+        objects_ = std::make_unique<LocalFileSnapshotObjectStore>(root_);
+        backend_ = std::make_shared<LaggingBackend>();
+        ASSERT_EQ(ErrorCode::OK,
+                  backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+        ASSERT_EQ(
+            ErrorCode::OK,
+            backend_->Put(BuildDurablePrefixKey(cluster_id_),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+        config_.enable_snapshot_bootstrap = true;
+        config_.enable_oplog_following = GetParam();
+        config_.oplog_poll_interval_ms = 2000;
+        config_.batch_oplog_retry_timeout_sec = 2;
+        service_ = std::make_unique<HotStandbyService>(config_);
+        service_->SetCatchUpBatchKvBackendForTesting(backend_);
+        service_->SetBatchOpLogSnapshotProvider(
+            std::make_unique<BatchOpLogSnapshotProvider>(
+                cluster_id_, *backend_, *objects_, "snapshots", 2,
+                std::chrono::seconds(2), std::chrono::seconds(2)));
+    }
+
+    void TearDown() override {
+        service_.reset();
+        objects_.reset();
+        if (!root_.empty()) std::filesystem::remove_all(root_);
+        HotStandbyServiceTest::TearDown();
+    }
+
+    std::shared_ptr<LaggingBackend> backend_;
+    std::unique_ptr<LocalFileSnapshotObjectStore> objects_;
+    std::string root_;
+};
+
+TEST_P(BootstrapCancellationTest, StopCancelsSuffixWaitAndAllowsRestart) {
+    auto started = std::async(std::launch::async, [this] {
+        return service_->Start("", "", cluster_id_);
+    });
+    EXPECT_TRUE(backend_->WaitForLaggingRead());
+    // Leave the restore inside its long suffix wait before requesting stop.
+    EXPECT_EQ(std::future_status::timeout,
+              started.wait_for(std::chrono::milliseconds(50)));
+    auto stopped = std::async(std::launch::async, [this] { service_->Stop(); });
+
+    EXPECT_EQ(std::future_status::ready,
+              stopped.wait_for(std::chrono::milliseconds(500)));
+    stopped.get();
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, started.get());
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(0u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+
+    backend_->CatchUp();
+    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
+    service_->Stop();
+}
+
+TEST_P(BootstrapCancellationTest,
+       ShutdownPredicateCancelsSuffixWaitWithoutStop) {
+    std::atomic<bool> shutdown{false};
+    auto started = std::async(std::launch::async, [this, &shutdown] {
+        return service_->Start("", "", cluster_id_,
+                               [&shutdown] { return shutdown.load(); });
+    });
+    EXPECT_TRUE(backend_->WaitForLaggingRead());
+    EXPECT_EQ(std::future_status::timeout,
+              started.wait_for(std::chrono::milliseconds(50)));
+    shutdown.store(true);
+
+    EXPECT_EQ(std::future_status::ready,
+              started.wait_for(std::chrono::milliseconds(500)));
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, started.get());
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(0u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+    EXPECT_FALSE(service_->GetLastAppliedBatchOpLogSnapshotPrefix());
+}
+
+INSTANTIATE_TEST_SUITE_P(OplogFollowing, BootstrapCancellationTest,
+                         ::testing::Bool());
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+TEST_P(BootstrapCancellationTest, PendingStopRejectsNewBootstrap) {
+    const char* previous = std::getenv("MOONCAKE_TEST_FAILPOINT_DIR");
+    const std::optional<std::string> previous_directory =
+        previous ? std::optional<std::string>(previous) : std::nullopt;
+    setenv("MOONCAKE_TEST_FAILPOINT_DIR", root_.c_str(), 1);
+    const auto point = root_ + "/standby_stop_before_lock";
+    std::ofstream(point + ".arm");
+    auto stopped = std::async(std::launch::async, [this] { service_->Stop(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!std::filesystem::exists(point + ".hit") &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(std::filesystem::exists(point + ".hit"));
+    auto started = std::async(std::launch::async, [this] {
+        return service_->Start("", "", cluster_id_);
+    });
+    EXPECT_EQ(std::future_status::ready,
+              started.wait_for(std::chrono::milliseconds(500)));
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, started.get());
+    std::ofstream(point + ".release");
+    stopped.get();
+    if (previous_directory) {
+        setenv("MOONCAKE_TEST_FAILPOINT_DIR", previous_directory->c_str(), 1);
+    } else {
+        unsetenv("MOONCAKE_TEST_FAILPOINT_DIR");
+    }
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+}
+#endif
 
 namespace {
 

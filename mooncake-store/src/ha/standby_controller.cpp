@@ -117,12 +117,14 @@ class CapabilityDrivenStandbyController final : public StandbyController {
    public:
     CapabilityDrivenStandbyController(
         const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-        StartErrorInjector start_error_injector)
+        StartErrorInjector start_error_injector,
+        std::function<bool()> startup_cancelled)
         : spec_(spec),
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
           standby_service_(CreateStandbyService(config, capabilities_)),
-          start_error_injector_(std::move(start_error_injector)) {
+          start_error_injector_(std::move(start_error_injector)),
+          startup_cancelled_(std::move(startup_cancelled)) {
         if (config_.enable_oplog_snapshot) {
             try {
                 if (spec_.type != HABackendType::ETCD ||
@@ -226,7 +228,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         ErrorCode err = standby_service_->Start(
             observed_leader.has_value() ? observed_leader->leader_address : "",
-            oplog_connstring_, config_.cluster_id);
+            oplog_connstring_, config_.cluster_id, startup_cancelled_);
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -460,6 +462,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         batch_oplog_snapshot_coordinator_;
     ErrorCode dependency_init_error_{ErrorCode::OK};
     StartErrorInjector start_error_injector_;
+    std::function<bool()> startup_cancelled_;
     std::string oplog_connstring_;
 
     mutable std::mutex state_mutex_;
@@ -476,12 +479,14 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
 std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-    StandbyController::StartErrorInjector start_error_injector) {
+    StandbyController::StartErrorInjector start_error_injector,
+    std::function<bool()> startup_cancelled) {
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {
         return std::make_unique<CapabilityDrivenStandbyController>(
-            spec, config, std::move(start_error_injector));
+            spec, config, std::move(start_error_injector),
+            std::move(startup_cancelled));
     }
 
     LOG(INFO) << "HA standby controller falls back to noop, backend_type="

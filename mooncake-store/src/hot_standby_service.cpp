@@ -63,8 +63,16 @@ HotStandbyService::~HotStandbyService() {
 
 ErrorCode HotStandbyService::Start(const std::string& primary_address,
                                    const std::string& oplog_endpoints,
-                                   const std::string& cluster_id) {
+                                   const std::string& cluster_id,
+                                   std::function<bool()> cancelled) {
+    const auto generation = stop_generation_.load(std::memory_order_acquire);
+    const auto bootstrap_cancelled = [this, generation, &cancelled] {
+        return stops_in_progress_.load(std::memory_order_acquire) != 0 ||
+               stop_generation_.load(std::memory_order_acquire) != generation ||
+               (cancelled && cancelled());
+    };
     std::lock_guard<std::mutex> lock(mutex_);
+    if (bootstrap_cancelled()) return ErrorCode::ETCD_CTX_CANCELLED;
 
     // Use state machine to check if already running
     if (IsRunning()) {
@@ -146,7 +154,14 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
 
     uint64_t baseline_seq_id = 0;
-    auto baseline_err = PrepareBootstrapBaselineLocked(baseline_seq_id);
+    auto baseline_err =
+        PrepareBootstrapBaselineLocked(baseline_seq_id, bootstrap_cancelled);
+    std::lock_guard<std::mutex> cancellation_lock(restore_cancel_mutex_);
+    if (bootstrap_cancelled() ||
+        baseline_err == ErrorCode::ETCD_CTX_CANCELLED) {
+        state_machine_.ProcessEvent(StandbyEvent::STOP);
+        return ErrorCode::ETCD_CTX_CANCELLED;
+    }
     if (baseline_err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return baseline_err;
@@ -169,7 +184,7 @@ uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
 }
 
 ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
-    uint64_t& baseline_seq_id) {
+    uint64_t& baseline_seq_id, const std::function<bool()>& cancelled) {
     const uint64_t local_last_seq_id = GetLocalLastAppliedSequenceIdLocked();
     const bool has_local_metadata =
         metadata_store_ && metadata_store_->GetKeyCount() > 0;
@@ -211,7 +226,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
             return ErrorCode::OK;
         }
         preserve_promotion_baseline_ = false;
-        return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
+        return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id, cancelled);
     }
     if (has_recoverable_local_state) {
         LOG(INFO) << "Standby warm start: reuse local metadata (keys="
@@ -242,17 +257,23 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
 }
 
 ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
-    uint64_t& baseline_seq_id) {
+    uint64_t& baseline_seq_id, const std::function<bool()>& cancelled) {
     baseline_seq_id = 0;
     auto temporary_metadata = std::make_unique<StandbyMetadataStore>();
     auto temporary_applier =
         std::make_unique<OpLogApplier>(temporary_metadata.get(), cluster_id_);
     StandbySegmentRegistry temporary_registry;
     auto restored = batch_oplog_snapshot_provider_->RestoreBaseline(
-        *temporary_metadata, temporary_registry, temporary_applier.get());
+        *temporary_metadata, temporary_registry, temporary_applier.get(), 0,
+        cancelled, [this, &cancelled](std::chrono::milliseconds delay) {
+            return WaitForRestoreCancellation(delay, cancelled);
+        });
     if (!restored) {
         return restored.error();
     }
+    // Serialize candidate installation with publication of a Stop request.
+    std::lock_guard<std::mutex> cancellation_lock(restore_cancel_mutex_);
+    if (cancelled()) return ErrorCode::ETCD_CTX_CANCELLED;
 
     LOG(INFO) << "Batch snapshot bootstrap complete: snapshot_seq="
               << restored->last_included_seq
@@ -351,7 +372,11 @@ void HotStandbyService::SetOpLogBackendType(ha::HABackendType type) {
 
 void HotStandbyService::StopReplicationLoop() {
     CancelSnapshotCapture();
-    replication_loop_running_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(restore_cancel_mutex_);
+        replication_loop_running_.store(false, std::memory_order_release);
+    }
+    restore_cancel_cv_.notify_all();
     replication_loop_cv_.notify_all();
     if (replication_thread_.joinable()) {
         replication_thread_.join();
@@ -359,6 +384,21 @@ void HotStandbyService::StopReplicationLoop() {
 }
 
 void HotStandbyService::Stop() {
+    // Keep later Starts cancelled until this Stop has finished, even if they
+    // reach mutex_ before this caller does. Balance concurrent Stops
+    // separately.
+    struct StopRequest {
+        std::atomic<uint32_t>& count;
+        ~StopRequest() { count.fetch_sub(1, std::memory_order_release); }
+    };
+    {
+        std::lock_guard<std::mutex> lock(restore_cancel_mutex_);
+        stops_in_progress_.fetch_add(1, std::memory_order_acq_rel);
+        stop_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    const StopRequest request{stops_in_progress_};
+    restore_cancel_cv_.notify_all();
+    TestFailPoint::Wait("standby_stop_before_lock");
     std::lock_guard<std::mutex> lock(mutex_);
 
     StandbyState current_state = GetState();
@@ -380,6 +420,22 @@ void HotStandbyService::Stop() {
 
     LOG(INFO) << "HotStandbyService stopped, final_state="
               << StandbyStateToString(GetState());
+}
+
+bool HotStandbyService::WaitForRestoreCancellation(
+    std::chrono::milliseconds delay, const std::function<bool()>& cancelled) {
+    const auto deadline = std::chrono::steady_clock::now() + delay;
+    std::unique_lock<std::mutex> lock(restore_cancel_mutex_);
+    while (!cancelled()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        // The supervisor's shutdown predicate has no notification channel.
+        // Check it at least every 100 ms, even with a long OpLog poll interval.
+        restore_cancel_cv_.wait_until(
+            lock, std::min(deadline, now + std::chrono::milliseconds(100)),
+            cancelled);
+    }
+    return true;
 }
 
 std::optional<DurablePrefix>
@@ -1151,9 +1207,13 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     auto metadata = std::make_unique<StandbyMetadataStore>();
     auto applier = std::make_unique<OpLogApplier>(metadata.get(), cluster_id_);
     StandbySegmentRegistry registry;
+    const auto cancelled = [this] {
+        return !replication_loop_running_.load(std::memory_order_acquire);
+    };
     auto restored = provider->RestoreBaseline(
-        *metadata, registry, applier.get(), floor, [this] {
-            return !replication_loop_running_.load(std::memory_order_acquire);
+        *metadata, registry, applier.get(), floor, cancelled,
+        [this, &cancelled](std::chrono::milliseconds delay) {
+            return WaitForRestoreCancellation(delay, cancelled);
         });
     if (!restored) return restored.error();
     auto reader = std::make_unique<OpLogBatchStandbyReader>(
