@@ -250,7 +250,7 @@ impl RedisMetadataBackend {
         filter: &NofBackingRouteFilter,
     ) -> Result<Vec<ObjectRoute>> {
         let Some(index) = self.nof_backing_filter_index(filter) else {
-            return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
+            return self.scan_object_routes_by_nof_backing(filter);
         };
         let keys =
             self.query_readonly("redis list object routes by nof backing", |connection| {
@@ -289,9 +289,23 @@ impl RedisMetadataBackend {
                 .map_err(|error| metadata_error("redis srem nof backing route index", error))?;
         }
         if routes.is_empty() {
-            return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
+            return self.scan_object_routes_by_nof_backing(filter);
         }
         Ok(routes
+            .into_iter()
+            .filter(|route| route_matches_nof_backing_filter(route, filter))
+            .take(filter.limit.unwrap_or(usize::MAX))
+            .collect())
+    }
+
+    fn scan_object_routes_by_nof_backing(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        // A qualified trait call would re-enter the Redis override rather than
+        // invoke the trait's default implementation.
+        Ok(self
+            .list_object_routes()?
             .into_iter()
             .filter(|route| route_matches_nof_backing_filter(route, filter))
             .take(filter.limit.unwrap_or(usize::MAX))

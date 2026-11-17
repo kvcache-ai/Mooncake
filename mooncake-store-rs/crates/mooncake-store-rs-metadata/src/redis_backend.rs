@@ -3416,6 +3416,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn redis_backing_scan_fallback_returns_empty_without_recursion() {
+        use mooncake_store_core::{ColdBackingRouteFilter, NofBackingRouteFilter};
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url()))
+            .expect("redis backend");
+        for with_hot_route in [false, true] {
+            if with_hot_route {
+                let route = sample_route(1);
+                assert!(
+                    backend
+                        .compare_and_swap_object_route(&route.key, None, Some(&route))
+                        .unwrap()
+                        .applied
+                );
+            }
+            assert!(backend
+                .list_object_routes_by_cold_backing(&ColdBackingRouteFilter::default())
+                .unwrap()
+                .is_empty());
+            for target_id in [None, Some("missing".to_string())] {
+                assert!(backend
+                    .list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                        target_id,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn redis_backing_scan_fallback_filters_routes_and_honors_limits() {
+        use mooncake_store_core::{
+            ColdBackingRoute, ColdBackingRouteFilter, ColdBackingState, NofBackingReplica,
+            NofBackingRoute, NofBackingRouteFilter,
+        };
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url()))
+            .expect("redis backend");
+        let backing = ColdBackingRoute {
+            owner: sample_runtime(),
+            cold_tier_id: "ssd".to_string(),
+            object_locator: "locator".to_string(),
+            length: 12,
+            checksum: Some(7),
+            state: ColdBackingState::Materialized,
+            replicas: Vec::new(),
+        };
+        let mut cold = sample_route(1);
+        cold.key = ObjectKey::new("cold");
+        cold.cold_backing = Some(backing.clone());
+        let mut nof = sample_route(1);
+        nof.key = ObjectKey::new("nof");
+        let mut nof_backing = NofBackingRoute::from_cold(&backing);
+        nof_backing.target_id = "nof-a".to_string();
+        nof_backing.replicas = vec![NofBackingReplica {
+            target_id: "nof-b".to_string(),
+            owner: sample_runtime(),
+            object_locator: "replica".to_string(),
+        }];
+        nof.nof_backing = Some(nof_backing);
+        for route in [&cold, &nof, &sample_route(1)] {
+            assert!(
+                backend
+                    .compare_and_swap_object_route(&route.key, None, Some(route))
+                    .unwrap()
+                    .applied
+            );
+        }
+        assert_eq!(
+            backend
+                .list_object_routes_by_cold_backing(&ColdBackingRouteFilter::default())
+                .unwrap(),
+            vec![cold]
+        );
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&NofBackingRouteFilter::default())
+                .unwrap(),
+            vec![nof.clone()]
+        );
+        // Force the indexed query through the legacy/missing-index fallback.
+        backend
+            .connection("test remove NoF index")
+            .unwrap()
+            .del::<_, ()>(backend.keyspace.object_nof_target_index("nof-b"))
+            .unwrap();
+        let filter = NofBackingRouteFilter {
+            target_id: Some("nof-b".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            backend.list_object_routes_by_nof_backing(&filter).unwrap(),
+            vec![nof]
+        );
+        assert!(backend
+            .list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                state: Some(ColdBackingState::PendingOffload),
+                ..filter
+            })
+            .unwrap()
+            .is_empty());
+        assert!(backend
+            .list_object_routes_by_cold_backing(&ColdBackingRouteFilter {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        assert!(backend
+            .list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+    }
+
     struct EnvLockGuard;
 
     impl Drop for EnvLockGuard {
