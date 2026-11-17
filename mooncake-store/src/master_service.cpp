@@ -2538,6 +2538,11 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 }
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+    std::unordered_set<UUID, boost::hash<UUID>> prepared_segment_ids;
+    prepared_segment_ids.reserve(job.prepared_segments.size());
+    for (const auto& prepared : job.prepared_segments) {
+        prepared_segment_ids.insert(prepared.segment_id);
+    }
     bool quota_recompute_needed = false;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
@@ -2555,11 +2560,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
             }
             bool unprepared_segment = false;
             for (const auto& segment : segments) {
-                if (std::any_of(job.prepared_segments.begin(),
-                                job.prepared_segments.end(),
-                                [&segment](const auto& prepared) {
-                                    return prepared.segment_id == segment.id;
-                                })) {
+                if (prepared_segment_ids.contains(segment.id)) {
                     continue;
                 }
                 size_t metrics_dec_capacity = 0;
@@ -2571,6 +2572,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                          .segment_name = segment.name,
                          .transport_endpoint = segment.te_endpoint,
                          .metrics_dec_capacity = metrics_dec_capacity});
+                    prepared_segment_ids.insert(segment.id);
                     continue;
                 }
                 if (err == ErrorCode::SEGMENT_NOT_FOUND) {
