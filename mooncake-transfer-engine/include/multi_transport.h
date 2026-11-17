@@ -228,7 +228,11 @@ class MultiTransport {
 
     void beginQuiescePublish(BatchID batch_id);
     void commitQuiesceSpans(BatchID batch_id,
-                            std::vector<BatchDesc::QuiesceSpan> spans);
+                            const BatchDesc::QuiesceSpan *spans,
+                            size_t span_count);
+    // Marks tasks whose submit has returned. One release store per task,
+    // on the submit thread, after post. Not on the completion path.
+    void settleQuiesceTasks(BatchID batch_id, size_t task_base);
     void cancelQuiescePublish(BatchID batch_id);
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>

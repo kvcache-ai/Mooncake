@@ -549,6 +549,10 @@ class Transport {
         volatile uint64_t completion_state = Slice::kCompletionSealBit;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Submit stores 1 with __atomic_store_n after post returns. Unregister
+        // loads it with __atomic_load_n. Status paths assign is_finished
+        // directly; reading that from the unregister thread races.
+        volatile uint64_t quiesce_settled = 0;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
