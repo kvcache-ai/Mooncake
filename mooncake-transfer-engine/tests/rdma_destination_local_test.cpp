@@ -165,5 +165,17 @@ TEST(DestinationNicConfig, YieldsToHcaPeerAffinity) {
     EXPECT_FALSE(config.enable_dest_device_affinity);
     EXPECT_TRUE(config.enable_hca_peer_affinity);
 }
+
+TEST(DestinationNicConfig, AllThreeKeepTheAffinityClashAsIs) {
+    // The option yields to HCA peer affinity first; the existing clash between
+    // the two affinities then turns both off, as without the option.
+    EnvVar affinity("MC_ENABLE_DEST_DEVICE_AFFINITY", "1");
+    EnvVar peer_affinity("MC_ENABLE_HCA_PEER_AFFINITY", "1");
+    EnvVar knob("MC_RDMA_WRITE_PREFER_DEST_NIC", "1");
+    const auto config = loadedConfig();
+    EXPECT_FALSE(config.rdma_write_prefer_dest_nic);
+    EXPECT_FALSE(config.enable_dest_device_affinity);
+    EXPECT_FALSE(config.enable_hca_peer_affinity);
+}
 }  // namespace
 }  // namespace mooncake

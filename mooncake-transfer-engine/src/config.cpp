@@ -601,15 +601,9 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
-    if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
-        LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
-                      "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
-                      "the same time; falling back to default peer device "
-                      "selection.";
-        config.enable_hca_peer_affinity = false;
-        config.enable_dest_device_affinity = false;
-    }
-
+    // Resolved before the clash below, so that next to
+    // MC_ENABLE_HCA_PEER_AFFINITY the option is ignored whatever
+    // MC_ENABLE_DEST_DEVICE_AFFINITY says, and that clash then applies as is.
     if (const char* value = std::getenv("MC_RDMA_WRITE_PREFER_DEST_NIC")) {
         parseBoolConfigEnv(value, "MC_RDMA_WRITE_PREFER_DEST_NIC",
                            config.rdma_write_prefer_dest_nic);
@@ -628,6 +622,15 @@ void loadGlobalConfig(GlobalConfig& config) {
             // operation rather than WRITEs alone.
             config.enable_dest_device_affinity = true;
         }
+    }
+
+    if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
+        LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
+                      "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
+                      "the same time; falling back to default peer device "
+                      "selection.";
+        config.enable_hca_peer_affinity = false;
+        config.enable_dest_device_affinity = false;
     }
 
     const char* log_rdma_slice_affinity_env =
