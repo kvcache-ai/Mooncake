@@ -57,7 +57,7 @@ The cluster's available resources are viewed as a large resource pool, managed c
 
 ### Snapshot & Restore
 
-HA recovery uses standby-generated batch OpLog snapshots. The standby captures
+With batch OpLog recovery enabled, the standby captures
 object metadata, segment state, and weight metadata at a durable OpLog cursor,
 writes immutable chunk and manifest artifacts to the configured object store,
 and publishes `latest` and `fallback` control pointers. A standby or a newly
@@ -103,14 +103,17 @@ Mooncake Store remains an object-oriented KV cache: objects are still put, queri
 
 For single-object writes, `group_ids` contains one entry. For batch writes, it must have the same length as the key list, and entry `i` is the group ID for key `i`. An empty string stores that key as ungrouped, and leaving the field unset preserves the legacy ungrouped behavior. For an existing object, group membership is immutable: `Upsert` may preserve the existing group, but it cannot move the object to another group or clear its group while the object exists.
 
-On the Master side, objects are always routed by `hash(tenant, key)` — group membership is an annotation, not a routing key. Group state is tenant-scoped and kept in a separate, single group domain (`group_domain_`) keyed by `scoped(tenant, group_id)`; it holds only the current member key list plus one shared group TTL. Existing key-based APIs locate grouped objects via `hash(tenant, key)` as usual; there is no object-to-group routing index. The Master tracks only the current member set of each group; it does not require an expected member count, a member index, or a commit protocol for group completeness.
+The Master locates an object by key in its tenant's `ObjectRoute`. Each route
+keeps a separate group index keyed by `group_id`, with the current member keys
+and one shared lease per group. Publishing or removing an object updates its
+group membership.
 
 Group metadata affects lifecycle behavior on a best-effort basis:
 
-- `ExistKey` and `GetReplicaList` refresh the group's shared read TTL. A read of any member extends the same group TTL, so the whole group is protected together; a grouped object's own per-member lease is not authoritative. Object soft-pin deadlines are independent and are not extended.
-- Memory eviction first consults the group's single shared TTL: if the group was read recently it is skipped as a whole; otherwise the group's current members are evicted all-or-none, applying the existing per-object safety checks (hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, unavailable replica states) on a best-effort basis. The number of evicted objects is bounded by the requested eviction ratio.
+- `ExistKey` and `GetReplicaList` extend the shared read lease when any member is found readable. Each object's soft-pin deadline is independent of the shared lease.
+- Memory eviction visits the group as one entry and checks each member under its own key lock. The shared lease protects all members while it is active. Members can also survive because of individual pins, ongoing work, or replica state. The eviction target is checked between groups, so processing a group can exceed the target.
 - Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group membership metadata is cleaned up when objects are removed.
-- On standby restore, each grouped object rejoins its group from the group id in its metadata. The standby snapshot carries no leases, so, as for a newly created group, the shared TTL is unset until a member is read.
+- On standby restore, the Master rebuilds membership from each object's stored group ID. It constructs fresh leases for the restored objects.
 
 This design is intentionally lightweight and backward compatible. Grouping should be treated as a lifecycle hint for related objects, not as a transactional guarantee that all members are created, made visible, or evicted atomically.
 
@@ -118,7 +121,9 @@ This design is intentionally lightweight and backward compatible. Grouping shoul
 
 The buffer allocator serves as a low-level memory management component within the Mooncake Store system, primarily responsible for efficient memory allocation and deallocation. It builds upon underlying memory allocators to perform its functions.
 
-Importantly, the memory managed by the buffer allocator does not reside within the `Master Service` itself. Instead, it operates on memory segments registered by `Clients`. When the `Master Service` receives a `MountSegment` request to register a contiguous memory region, it creates a corresponding buffer allocator via the `AddSegment` interface.
+The allocator manages memory contributed by clients. On a `MountSegment`
+request, the Master creates an allocator for the registered segment and adds it
+to the allocator manager.
 
 Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
 
@@ -128,23 +133,26 @@ For measured utilization and allocation latency across LLM-style workloads, see 
 
 **CachelibBufferAllocator (deprecated)**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios. However, in our modified version, it does not handle workloads with highly variable object sizes effectively, so it is currently marked as deprecated.
 
-Users can choose the allocator that best matches their performance and memory usage requirements through the `--memory-allocator` startup parameter of `master_service`.
+Set `--memory_allocator=offset` or `--memory_allocator=cachelib` when starting
+`mooncake_master`. The default is `offset`.
 
 Both allocators implement the same interface as `BufferAllocatorBase`. The main interfaces of the `BufferAllocatorBase` class are as follows:
 
 ```C++
 class BufferAllocatorBase {
+public:
     virtual ~BufferAllocatorBase() = default;
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
 };
 ```
 
-1. **Constructor**: When a `BufferAllocator` instance is created, the upstream component must provide the base address and size of the memory region to be managed. This information is used to initialize the internal allocator, enabling unified memory management.
-
-2. **`allocate` Function**: When the upstream issues read or write requests, it needs a memory region to operate on. The `allocate` function invokes the internal allocator to reserve a memory block and returns metadata such as the starting address and size. The status of the newly allocated memory is initialized as `BufStatus::INIT`.
-
-3. **`deallocate` Function**: This function is automatically triggered by the `BufHandle` destructor. It calls the internal allocator to release the associated memory and updates the handle’s status to `BufStatus::UNREGISTERED`.
+The segment's base address and size define the region managed by the allocator.
+`allocate` returns an `AllocatedBuffer` that owns the reservation and can
+describe its address, size, and transport. The `AllocatedBuffer` destructor
+calls `deallocate` while its allocator is still available. The owning
+`Replica` tracks the write lifecycle and is created in `PROCESSING` state by
+the allocation strategy.
 
 ### Client Local Buffer and Python BufferPool
 
@@ -233,10 +241,10 @@ Pure random allocation with preferred segment support. The allocation process fo
 
 1. **Preferred segment phase**: If preferred segments are specified in the `ReplicateConfig`, they are tried first in order. Each successful allocation consumes one replica slot. If all replicas are satisfied, the process finishes early.
 2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. It skips segments already used for a replica of the object and any explicitly excluded segments.
-3. **Retry limit**: The iteration is capped at `min(100, total_segments)` to avoid excessive scanning when most segments are full.
+3. **Retry limit**: The random phase visits at most 100 serving candidates. Non-serving segments are skipped before counting against that budget.
 4. **Best-effort result**: If fewer than N replicas are allocated but at least one succeeds, the partial result is returned. The call fails only if zero replicas can be allocated.
 
-All random state uses a thread-local Mersenne Twister (`std::mt19937`), so no locks or shared mutable data are involved.
+Random draws use the shared random helpers with a thread-local `std::mt19937_64` engine.
 
 **`free_ratio_first` — FreeRatioFirstAllocationStrategy (Best-of-N)**
 
@@ -351,13 +359,21 @@ For grouped objects, memory eviction resolves the current group membership and a
 
 ## Lease
 
-To avoid data conflicts, a per-object lease is granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. While the lease is active, the object is protected from `Remove`, `RemoveAll`, and `Eviction` operations. Specifically, a `Remove` request targeting a leased object will fail, and a `RemoveAll` request will only delete objects without an active lease. This ensures that the object’s data can be safely read as long as the lease has not expired.
+A readable hit from `ExistKey` or `GetReplicaList` extends the object's read
+lease. Grouped objects share a lease, so a hit on one member extends protection
+for the group. `PutEnd` updates the lease deadline with a zero TTL and preserves
+any later deadline already in effect.
 
-For grouped objects, a successful `ExistKey` or `GetReplicaList` refreshes the lease for the current members of the group, so recently accessed members are less likely to be separated by memory eviction.
+Active leases protect objects during Master-managed memory eviction and
+ordinary removal. Passing `force=true` to `Remove`, `RemoveByRegex`, or
+`RemoveAll` bypasses the lease check. These operations still enforce replica
+completion and replication-task checks.
 
-However, if the lease expires before a `Get` operation finishes reading the data, the operation will be considered failed, and no data will be returned, in order to prevent potential data corruption.
+The client checks the lease after the transfer and reports `LEASE_EXPIRED`
+when a `Get` outlasts it.
 
-The default lease TTL is 10 seconds and is configurable via a startup parameter of `master_service`.
+The default read lease TTL is 10 seconds. Set `--default_kv_lease_ttl` on
+`mooncake_master` to change it.
 
 ## Soft Pin
 
@@ -382,15 +398,13 @@ Notably, soft pinned objects can still be removed using APIs such as `Remove` or
 
 ## Hard Pin
 
-For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
+The Master skips hard-pinned objects during capacity-driven memory eviction.
+Set `ReplicateConfig::with_hard_pin` when creating an object. An in-place
+`Upsert` keeps the current pin. An `Upsert` that allocates a replacement
+preserves an existing pin and can enable one through `with_hard_pin`.
 
-Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
-
-Key differences from soft pin:
-
-- Hard pin never expires. Soft pin expires at a fixed deadline that starts when the first replica becomes readable, regardless of later accesses.
-- Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
-- Hard pin is immutable once set. Soft pin can be explicitly preserved, enabled, or disabled by write requests; reads do not refresh or reactivate it.
+A hard pin has no expiry. Explicit removal of a hard-pinned object follows the
+normal removal rules, including the lease and replica-state checks.
 
 ## Zombie Object Cleanup
 
@@ -408,32 +422,26 @@ Replica space allocated during a `PutStart` is considered releasable by the Mast
 
 Mooncake Store provides a **preferred segment allocation** feature that allows users to specify a preferred storage segment (node) for object allocation. This feature is particularly useful for optimizing data locality and reducing network overhead in distributed scenarios.
 
-The preferred segment allocation feature is implemented through the
-`AllocationStrategy` system. The following excerpt shows the legacy
-single-segment field and the memory-replica count used by this path; other
-`ReplicateConfig` fields are omitted:
+`ReplicateConfig::preferred_segments` lists preferred memory segments in order.
+The legacy `preferred_segment` field takes precedence if it is nonempty.
+`preferred_nof_segments` supplies the preferences for NoF replicas.
 
 ```cpp
 struct ReplicateConfig {
     size_t replica_num{1};                    // Number of memory replicas
-    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
-    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE override; omitted uses the Master default
-    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
-    std::string preferred_segment{};         // Preferred segment for allocation
-    // Other fields, including nof_replica_num and dfs_replica_num, are omitted.
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};         // Legacy single-segment preference
+    std::vector<std::string> preferred_nof_segments{};
+    // Other fields are omitted.
 };
 ```
 
-When a `Put` operation is initiated with a non-empty `preferred_segment` value, the allocation strategy follows this process:
-
-1. **Preferred Allocation Attempt**: The system first attempts to allocate space from the specified preferred segment. If the preferred segment has sufficient available space, the allocation succeeds immediately.
-
-2. **Fallback to Random Allocation**: If the preferred segment is unavailable, full, or doesn't exist, the system automatically falls back to the standard random allocation strategy among all available segments.
-
-3. **Retry Logic**: The allocation strategy includes built-in retry mechanisms with up to 10 attempts to find suitable storage space across different segments.
-
-- **Data Locality**: By preferring local segments, applications can reduce network traffic and improve access performance for frequently used data.
-- **Load Balancing**: Applications can distribute data across specific nodes to achieve better load distribution.
+Successful preferred allocations fill replica slots. The selected strategy
+determines how to place the remaining replicas. `random` uses its random
+candidate scan, and the free-ratio strategies rank candidates first. For a
+single memory replica, `local_first` adds a host-ordered list after the
+explicit preferences.
+`cxl` uses the first preferred segment as its allocation target.
 
 ## Multi-layer Storage Support
 
@@ -525,10 +533,16 @@ fallback to POSIX. See the [HF3FS USRBIO adapter guide](../../getting_started/pl
 for build prerequisites and configuration.
 
 ## Builtin Metadata Server
-Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
+
+The built-in HTTP metadata server provides a key-value endpoint for Transfer
+Engine peer discovery and connection metadata. It can replace an external
+etcd or Redis service used for that purpose. The Master keeps Store object
+metadata in its tenant routes and configures any HA election and OpLog backend
+separately.
+
 ### Configuration Parameters
 The HTTP metadata server can be configured using the following parameters:
-- **`enable_http_metadata_server`** (boolean, default: `false`): Enables the built-in HTTP metadata server instead of using etcd. When set to `true`, the master service will start an embedded HTTP server that handles metadata operations.
+- **`enable_http_metadata_server`** (boolean, default `false`) starts the embedded Transfer Engine metadata endpoint.
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 ### Environment Variables
@@ -550,8 +564,11 @@ To start the master service with the HTTP metadata server enabled:
     --http_metadata_server_port=8080 \
     --http_metadata_server_host=0.0.0.0
 ```
-When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
-Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
+Point each client's Transfer Engine `metadata_server` at
+`http://<master-host>:8080/metadata`. For Master HA, configure
+`--enable_ha` and the `--ha_backend_type` and `--ha_backend_connstring`
+settings as described in the
+[deployment guide](../../deployment/mooncake-store-deployment-guide.md).
 
 For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../../getting_started/observability.md).
 
