@@ -1166,6 +1166,11 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     master_config.put_start_discard_timeout_sec = 1;
     master_config.put_start_release_timeout_sec = 2;
     MasterService service(master_config);
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
     const UUID writer = generate_uuid();
     const UUID other = generate_uuid();
 
@@ -1211,10 +1216,16 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     EXPECT_EQ(leased.error(), ErrorCode::OBJECT_HAS_LEASE);
     ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
 
-    // An abandoned write is reaped after the release timeout.
+    // Drive expiry explicitly rather than racing the eviction worker's cadence.
     ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
                                  DfsOnlyConfig()));
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    const auto now = std::chrono::system_clock::now();
+    peer.DiscardExpiredProcessingReplicas(TenantId::Default(), now);
+    auto pending = service.GetReplicaList("c", TenantId::Default());
+    ASSERT_FALSE(pending.has_value());
+    EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    peer.DiscardExpiredProcessingReplicas(TenantId::Default(),
+                                          now + std::chrono::seconds(3));
     auto reaped = service.GetReplicaList("c", TenantId::Default());
     ASSERT_FALSE(reaped.has_value());
     EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
