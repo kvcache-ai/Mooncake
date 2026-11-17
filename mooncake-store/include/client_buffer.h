@@ -9,6 +9,7 @@
 #include "types.h"
 #include "replica.h"
 #include "nof/dma_buffer_allocator.h"
+#include "pinned_host_buffer.h"
 
 namespace mooncake {
 
@@ -28,7 +29,7 @@ class BufferHandle;
 class ClientBufferAllocator
     : public std::enable_shared_from_this<ClientBufferAllocator> {
    public:
-    // Create for heap-allocated memory
+    // Create for owned memory
     static std::shared_ptr<ClientBufferAllocator> create(
         size_t size, const std::string& protocol = "",
         bool use_hugepage = false,
@@ -67,6 +68,7 @@ class ClientBufferAllocator
                           bool use_hugepage,
                           std::shared_ptr<DmaBufferAllocator> dma_allocator);
 
+    PinnedHostBuffer pinned_host_;
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;
