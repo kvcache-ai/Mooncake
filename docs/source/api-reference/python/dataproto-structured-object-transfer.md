@@ -170,6 +170,55 @@ result = transfer.get_dataproto(
 
 The destination owner or lease must remain alive for as long as the materialized data may be used.
 
+## Payload-only tensor destinations
+
+Declare `FieldSchema(codec="torch_tensor", direct_alignment=A)` for the specific member, then use `tensor_destination` to read directly into a caller-owned, registered CPU or CUDA tensor. Unlike `tensor_object_buffer`, this destination contains only tensor elements; Mooncake skips the serialized tensor header. The returned field is the exact tensor passed by the caller.
+
+```python
+from mooncake.structured_object_store import FieldSchema, tensor_destination
+
+ref = transfer.put_dataproto(data, field_schemas={
+    "selection": FieldSchema(codec="torch_tensor", direct_alignment=4),
+})
+
+# Allocate on the consuming device. Provide a stronger address alignment with
+# your allocator when required by the consumer or transport.
+target = torch.empty((batch_size, width), dtype=torch.int32, device="cuda")
+nbytes = target.numel() * target.element_size()
+assert store.register_buffer(target.data_ptr(), nbytes) == 0
+try:
+    result = transfer.get_dataproto(
+        ref,
+        batch_fields=["selection"],
+        destinations={
+            "selection": tensor_destination(
+                target, alignment=target.element_size(), pre_registered=True,
+            ),
+        },
+    )
+    assert result["batch"]["selection"] is target
+finally:
+    assert store.unregister_buffer(target.data_ptr()) == 0
+```
+
+Direct reads are enabled only by the stored member schema. Members without `direct_alignment` retain the ordinary path; passing a `TensorDestination` alone does not enable it. Declared members require a registered tensor destination whose alignment is at least the schema value. `StructuredObjectPayload(field_schemas={...})` declares the same contract for Direct Bundle members.
+
+Declared direct members require the native tensor payload codec and a non-scalar strided tensor with resolved negative/conjugate flags. Unsupported sources fail before publication, including in `copy` and `auto` modes. Destinations and their allocation roots must also have resolved flags; raw DMA cannot apply PyTorch's logical view transformations.
+
+This wrapper always requires a direct read. It validates contiguous layout, dtype, selected shape, address alignment, unchanged tensor storage, and non-overlapping field destinations. Native range reads verify the destination registration. Unsupported paths fail rather than return a replacement tensor or stage the payload through host memory. Both full reads and row selections are supported; `batch_slices` matrix reads require the existing destination interface.
+
+PUT `copy_mode` and GET guarantees are independent: `copy`, `auto`, and registered tensor-object `zero_copy` sources can all be read into this destination. Legacy tensor-object schema is inspected from its metadata prefix without materializing the payload.
+
+Strict reads currently require a RealClient and a memory replica. CUDA destinations use supported homogeneous classic-TE RDMA or NVLink segments; CUDA TCP, mixed-protocol segments, DummyClient, and TENT strict reads are rejected. TENT needs an explicit physical-drain guarantee before strict destinations can be safely reused after a timeout.
+
+The check uses the active transfer engine. A TENT-enabled build running the classic engine retains classic strict-read support.
+
+For scatter fragments, pass `allocation=output_tensor` to `tensor_destination`. The full output allocation satisfies schema alignment; the fragment must lie within it, share its dtype/device, and satisfy natural dtype alignment. Both memory contracts are checked for mutation.
+
+Default `BufferPool(store)` preserves ordinary local-arena allocation without additional alignment padding. Explicit pool `alignment=A` requests aligned allocation, but never enables direct reads without a member schema.
+
+The caller owns the tensor and registration through synchronous physical completion, including failures. Before an external CUDA write, Mooncake waits for preceding work on the calling CUDA stream; submit consuming CUDA work after GET returns. Keep the tensor alive until its last GPU consumer finishes. Registration can be released after the transfer has physically ended. Do not pass process-local pointers to a client in another process.
+
 ## Copy policy
 
 Control-plane metadata and manifests are small and always use the copy path. Tensor and ndarray payloads use the configured payload policy:
