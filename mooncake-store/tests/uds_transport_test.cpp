@@ -1,10 +1,12 @@
 #include "uds_transport.h"
+#include "real_client.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -260,10 +262,66 @@ TEST(UdsTransportTest, StartRequiresRegisteredHandler) {
     EXPECT_NE(start_result.error().find("handler"), std::string::npos);
 }
 
-// Hold the first handshake so every later client must fit in the listen queue.
-class UdsBacklogTest : public ::testing::TestWithParam<const char *> {};
+// The first connection sends no request, keeping the serial handler busy.
+// All connections stay alive until the queue-pressure measurement finishes.
+size_t queuedConnections(const std::string &socket_name) {
+    UdsConnector connector(socket_name, std::chrono::milliseconds(100));
+    auto first = connector.connect();
+    EXPECT_TRUE(first);
+    if (!first) return 0;
+    std::vector<std::unique_ptr<UdsConnection>> queued;
+    for (int peer = 0; peer < 8; ++peer) {
+        auto result = connector.connect();
+        if (result) queued.push_back(std::move(*result));
+    }
+    return queued.size();
+}
 
-TEST_P(UdsBacklogTest, QueuesConcurrentConnectionsBehindBlockedHandshake) {
+class UdsBacklogTest : public ::testing::TestWithParam<std::optional<int>> {};
+
+TEST_P(UdsBacklogTest, UsesExplicitOrDefaultParameterInsteadOfEnvironment) {
+    const char *previous = std::getenv("MOONCAKE_UDS_LISTEN_BACKLOG");
+    const bool was_set = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    setenv("MOONCAKE_UDS_LISTEN_BACKLOG", "5", 1);
+    UdsAcceptor acceptor(testSocketPath("backlog_parameter"));
+    acceptor.registerHandler([](UdsConnection &connection) {
+        char marker;
+        (void)connection.recvRaw(&marker, 1);
+    });
+    auto started = GetParam() ? acceptor.start(*GetParam()) : acceptor.start();
+    if (was_set) {
+        setenv("MOONCAKE_UDS_LISTEN_BACKLOG", saved.c_str(), 1);
+    } else {
+        unsetenv("MOONCAKE_UDS_LISTEN_BACKLOG");
+    }
+    ASSERT_TRUE(started);
+    const auto queued = queuedConnections(testSocketPath("backlog_parameter"));
+    if (GetParam() == 5) {
+        EXPECT_LT(queued, 8u);
+    } else {
+        EXPECT_EQ(queued, 8u);
+    }
+    acceptor.stop();
+}
+
+INSTANTIATE_TEST_SUITE_P(Parameters, UdsBacklogTest,
+                         ::testing::Values(std::optional<int>{},
+                                           std::optional<int>{8},
+                                           std::optional<int>{5}));
+
+TEST(UdsTransportTest, RejectsNonPositiveBacklogWithoutStarting) {
+    UdsAcceptor acceptor(testSocketPath("invalid_backlog"));
+    acceptor.registerHandler([](UdsConnection &) {});
+    EXPECT_FALSE(acceptor.start(0));
+    EXPECT_FALSE(acceptor.start(-1));
+    EXPECT_TRUE(acceptor.start(8));
+    acceptor.stop();
+}
+
+class RealClientBacklogTest : public ::testing::TestWithParam<const char *> {};
+
+TEST_P(RealClientBacklogTest, PassesEnvironmentBacklogToAcceptor) {
     const char *previous = std::getenv("MOONCAKE_UDS_LISTEN_BACKLOG");
     const bool was_set = previous != nullptr;
     const std::string saved = previous ? previous : "";
@@ -272,47 +330,25 @@ TEST_P(UdsBacklogTest, QueuesConcurrentConnectionsBehindBlockedHandshake) {
     } else {
         unsetenv("MOONCAKE_UDS_LISTEN_BACKLOG");
     }
-    std::atomic<bool> entered{false};
-    UdsAcceptor acceptor(testSocketPath("backlog"));
-    acceptor.registerHandler([&](UdsConnection &connection) {
-        entered = true;
-        char marker;
-        (void)connection.recvRaw(&marker, 1);
-    });
-    auto started = acceptor.start();
+    RealClient client;
+    client.ipc_socket_path_ = testSocketPath("backlog_environment");
+    const auto started = client.start_ipc_server();
     if (was_set) {
         setenv("MOONCAKE_UDS_LISTEN_BACKLOG", saved.c_str(), 1);
     } else {
         unsetenv("MOONCAKE_UDS_LISTEN_BACKLOG");
     }
-    ASSERT_TRUE(started);
-    UdsConnector connector(testSocketPath("backlog"),
-                           std::chrono::milliseconds(100));
-    auto first = connector.connect();
-    ASSERT_TRUE(first);
-    ASSERT_TRUE(waitForFlag(entered));
-    std::vector<std::unique_ptr<UdsConnection>> queued;
-    for (int peer = 0; peer < 8; ++peer) {
-        auto result = connector.connect();
-        if (result) {
-            char marker = 1;
-            EXPECT_EQ((*result)->sendRaw(&marker, 1), 0);
-            queued.push_back(std::move(*result));
-        }
-    }
-    // Setting 5 must still select the old, insufficient queue size.
-    const bool old_limit = GetParam() && std::string(GetParam()) == "5";
-    if (old_limit) {
-        EXPECT_LT(queued.size(), 8u);
+    ASSERT_EQ(started, 0);
+    const auto queued = queuedConnections(client.ipc_socket_path_);
+    if (GetParam() && std::string(GetParam()) == "5") {
+        EXPECT_LT(queued, 8u);
     } else {
-        EXPECT_EQ(queued.size(), 8u);
+        EXPECT_EQ(queued, 8u);
     }
-    char marker = 1;
-    EXPECT_EQ((*first)->sendRaw(&marker, 1), 0);
-    acceptor.stop();
+    client.stop_ipc_server();
 }
 
-INSTANTIATE_TEST_SUITE_P(Environment, UdsBacklogTest,
+INSTANTIATE_TEST_SUITE_P(Environment, RealClientBacklogTest,
                          ::testing::Values(nullptr, "8", "5", "0", "-1", "bad",
                                            "8junk", "2147483648", ""));
 

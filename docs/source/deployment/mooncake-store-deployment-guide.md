@@ -1394,8 +1394,9 @@ mooncake_client \
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
 
-The UDS acceptor queues shared-memory registration connections while serving
-another client. `MOONCAKE_UDS_LISTEN_BACKLOG` sets its pending connection backlog
+The real client queues shared-memory registration connections while serving
+another client. It reads `MOONCAKE_UDS_LISTEN_BACKLOG` to configure its UDS
+acceptor's pending connection backlog
 (default `128`, replacing the previous fixed value `5`). It accepts a positive
 integer; an empty, invalid, or nonpositive value logs a warning and uses `128`.
 The kernel may cap this value at `net.core.somaxconn`. This setting does not
