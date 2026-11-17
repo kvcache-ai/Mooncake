@@ -1655,6 +1655,23 @@ TEST(VllmObjectKeyParser, AcceptsCompactAscendLayerwiseLayouts) {
     EXPECT_EQ(parsed.prefix.value, 0x000000000000002fULL);
 }
 
+TEST(VllmObjectKeyParser, AcceptsHybridLayerwiseGroupAndRankNamespaces) {
+    const auto head = "model-a@mooncake_hybrid_v1:" + std::string(64, 'a');
+    const std::string hash = "0123456789abcdef000000000000002f";
+    ParsedSglangObjectKey parsed;
+    ASSERT_TRUE(
+        ParseVllmObjectKey(head + "@group:2@block:128@" + hash + "@3", &parsed)
+            .empty());
+    EXPECT_EQ(parsed.full_hash, hash);
+    EXPECT_EQ(parsed.prefix.value, 47u);
+    for (const auto& tail : {"@group:2@block:0@", "@group:-1@block:128@"})
+        EXPECT_FALSE(
+            ParseVllmObjectKey(head + tail + hash + "@3", &parsed).empty());
+    EXPECT_FALSE(
+        ParseVllmObjectKey(head + "@group:2@block:128@" + hash + "@-1", &parsed)
+            .empty());
+}
+
 TEST(VllmObjectKeyParser, RejectsMalformedNumericMetadata) {
     const std::string hash = "0123456789abcdef000000000000002e";
     ParsedSglangObjectKey parsed;

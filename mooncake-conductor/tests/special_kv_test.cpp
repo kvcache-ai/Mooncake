@@ -799,7 +799,7 @@ TEST(SpecialKVEvents, MooncakeMinimalRemoveRetractsOneRequiredObject) {
     EXPECT_EQ(Query(*manager.GetIndexer()).cpu_share, 0);
 }
 
-Json::Value AscendDeployment() {
+Json::Value AscendDeployment(bool layerwise = false) {
     Json::Value root;
     root["format"] = "ascend-store-v1";
     root["model_name"] = "GLM-5.3-Flash";
@@ -807,6 +807,7 @@ Json::Value AscendDeployment() {
     root["alignment_tokens"] = 64;
     root["storage_domain"] = "ascend://master:1";
     root["transient_alignment_tokens"] = 4;
+    if (layerwise) root["object_key_format"] = "mooncake-layerwise-v1";
     root["groups"] = Json::arrayValue;
     for (int id = 0; id < 2; ++id) {
         Json::Value group;
@@ -815,21 +816,33 @@ Json::Value AscendDeployment() {
         group["block_tokens"] = id == 0 ? 16 : 64;
         if (id == 1) group["mamba_cache_mode"] = "align";
         group["key_prefixes"] = Json::arrayValue;
-        for (int rank = 0; rank < (id == 0 ? 1 : 2); ++rank)
-            group["key_prefixes"].append(
-                "GLM-5.3-Flash@dcp:0@head_or_tp_rank:" + std::to_string(rank) +
-                "@pp_rank:0@group:" + std::to_string(id) +
-                "@cache_role:kv@cache_family:c1@");
+        for (int rank = 0; rank < (id == 0 ? 1 : 2); ++rank) {
+            if (layerwise) {
+                group["key_prefixes"].append(
+                    "GLM-5.3-Flash@mooncake_hybrid_v1:" + std::string(64, 'a') +
+                    "@group:" + std::to_string(id) +
+                    "@block:" + std::to_string(id == 0 ? 16 : 64) + "@");
+                group["key_suffixes"].append("@" + std::to_string(rank));
+            } else {
+                group["key_prefixes"].append(
+                    "GLM-5.3-Flash@dcp:0@head_or_tp_rank:" +
+                    std::to_string(rank) + "@pp_rank:0@group:" +
+                    std::to_string(id) + "@cache_role:kv@cache_family:c1@");
+            }
+        }
         root["groups"].append(group);
     }
     return root;
 }
 
-TEST(SpecialKVDeployment, CompleteDeclarationIsValidatedBeforeActivation) {
+class SpecialKVDeploymentFormats : public ::testing::TestWithParam<bool> {};
+
+TEST_P(SpecialKVDeploymentFormats,
+       CompleteDeclarationIsValidatedBeforeActivation) {
     auto service = Service(PublisherKind::kVllm);
     service.model_name = "GLM-5.3-Flash";
     SourceLayout binding;
-    const auto valid = AscendDeployment();
+    const auto valid = AscendDeployment(GetParam());
     ASSERT_EQ(ResolveVllmDeployment(service, valid.toStyledString(), &binding),
               "");
     EXPECT_EQ(binding.layout->groups.size(), 2u);
@@ -852,9 +865,29 @@ TEST(SpecialKVDeployment, CompleteDeclarationIsValidatedBeforeActivation) {
     invalid = valid;
     invalid["groups"][1]["key_prefixes"][1] =
         invalid["groups"][1]["key_prefixes"][0];
+    if (GetParam()) invalid["groups"][1]["key_suffixes"][1] = "@0";
     EXPECT_FALSE(
         ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
             .empty());
+    if (GetParam()) {
+        for (const auto& suffix : {Json::Value("@2"), Json::Value(0)}) {
+            invalid = valid;
+            invalid["groups"][1]["key_suffixes"][1] = suffix;
+            EXPECT_FALSE(ResolveVllmDeployment(
+                             service, invalid.toStyledString(), &binding)
+                             .empty());
+        }
+        invalid = valid;
+        invalid["groups"][1].removeMember("key_suffixes");
+        EXPECT_FALSE(
+            ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
+                .empty());
+        invalid = valid;
+        invalid.removeMember("object_key_format");
+        EXPECT_FALSE(
+            ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
+                .empty());
+    }
     invalid = valid;
     invalid["groups"].resize(1);
     EXPECT_FALSE(
@@ -879,8 +912,8 @@ TEST(SpecialKVDeployment, UnrelatedStoreCannotInheritAnotherPoolsReadDomain) {
     EXPECT_EQ(kvevent::EventManagerTestPeer::ActiveConfigCount(manager), 1u);
 }
 
-TEST(SpecialKVDeployment,
-     EarlyObjectEventsReplayAndRequiredStateShardRemovalRetractsHit) {
+TEST_P(SpecialKVDeploymentFormats,
+       EarlyObjectEventsReplayAndRequiredStateShardRemovalRetractsHit) {
     auto service = Service(PublisherKind::kVllm);
     service.model_name = "GLM-5.3-Flash";
     const ContextKey context{"default", service.model_name, "", 16};
@@ -907,10 +940,13 @@ TEST(SpecialKVDeployment,
     ASSERT_NE(strategy, nullptr) << error;
     std::vector<HashBlock> hashes;
     ASSERT_EQ(strategy->Compute(context, Tokens(), std::nullopt, &hashes), "");
-    const auto declaration = AscendDeployment();
+    const auto declaration = AscendDeployment(GetParam());
     auto object_key = [&](int group, int part, size_t index) {
         return declaration["groups"][group]["key_prefixes"][part].asString() +
-               DigestToHex(hashes.at(index).digest);
+               DigestToHex(hashes.at(index).digest) +
+               (GetParam() ? declaration["groups"][group]["key_suffixes"][part]
+                                 .asString()
+                           : "");
     };
     auto send = [&](auto event) {
         zmq::MooncakeEventBatch batch;
@@ -974,6 +1010,9 @@ TEST(SpecialKVDeployment,
     EXPECT_FALSE(engine.HandleBatch(batch, Metadata(service)).empty());
     EXPECT_EQ(hit(), 0);
 }
+
+INSTANTIATE_TEST_SUITE_P(StoreKeyFormats, SpecialKVDeploymentFormats,
+                         ::testing::Bool());
 
 }  // namespace
 }  // namespace mooncake::conductor

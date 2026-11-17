@@ -8,6 +8,24 @@
 #include <string>
 
 namespace mooncake::conductor::prefixindex {
+namespace {
+
+bool IsLayerwiseNamespace(std::string_view prefix, const std::string& model,
+                          const std::string& group, int64_t block_tokens) {
+    const auto head = model + "@mooncake_hybrid_v1:";
+    const auto tail =
+        "@group:" + group + "@block:" + std::to_string(block_tokens) + "@";
+    if (prefix.size() != head.size() + 64 + tail.size() ||
+        !prefix.starts_with(head) || !prefix.ends_with(tail))
+        return false;
+    const auto digest = prefix.substr(head.size(), 64);
+    return std::all_of(digest.begin(), digest.end(), [](char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+               (ch >= 'A' && ch <= 'F');
+    });
+}
+
+}  // namespace
 
 std::string ResolveVllmDeployment(const common::ServiceConfig& service,
                                   std::string_view declaration,
@@ -45,6 +63,9 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
         !root["groups"].isArray() || root["groups"].empty() ||
         root["groups"].size() > 128)
         return "invalid deployment identity or geometry";
+    const bool layerwise = root.isMember("object_key_format");
+    if (layerwise && root["object_key_format"] != "mooncake-layerwise-v1")
+        return "unsupported deployment object key format";
     auto layout = std::make_shared<CacheLayout>();
     layout->id = std::string(model->name);
     layout->hash_unit_tokens = service.block_size;
@@ -60,7 +81,7 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
     binding.storage_domain = root["storage_domain"].asString();
     binding.readable_domains.insert(binding.storage_domain);
     bool checkpoint = false, dense = false;
-    std::set<std::string> prefixes;
+    std::set<std::pair<std::string, std::string>> namespaces;
     for (const auto& item : root["groups"]) {
         if (!item.isObject() || !item["group_idx"].isInt64() ||
             item["group_idx"].asInt64() < 0 || !item["kind"].isString() ||
@@ -90,19 +111,37 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
             return "unsupported group recovery policy";
         }
         group.parts.clear();
-        for (const auto& part : item["key_prefixes"]) {
+        const auto& suffixes = item["key_suffixes"];
+        if (layerwise ? (!suffixes.isArray() ||
+                         suffixes.size() != item["key_prefixes"].size())
+                      : item.isMember("key_suffixes"))
+            return "object suffixes conflict with deployment key format";
+        for (Json::ArrayIndex part_id = 0;
+             part_id < item["key_prefixes"].size(); ++part_id) {
+            const auto& part = item["key_prefixes"][part_id];
             if (!part.isString()) return "invalid object namespace";
             const auto prefix = part.asString();
+            if (layerwise && !suffixes[part_id].isString())
+                return "invalid layerwise object suffix";
+            const auto suffix = layerwise ? suffixes[part_id].asString() : "";
+            const bool valid_namespace =
+                layerwise
+                    ? IsLayerwiseNamespace(prefix,
+                                           root["model_name"].asString(),
+                                           group.id, group.block_tokens) &&
+                          suffix == "@" + std::to_string(part_id)
+                    : prefix.find("@group:" + group.id + "@") !=
+                              std::string::npos &&
+                          prefix.find("@cache_role:kv@") != std::string::npos;
             if (prefix.size() > 1024 || !prefix.ends_with('@') ||
                 !prefix.starts_with(root["model_name"].asString() + "@") ||
-                prefix.find("@group:" + group.id + "@") == std::string::npos ||
-                prefix.find("@cache_role:kv@") == std::string::npos ||
-                !prefixes.insert(prefix).second)
+                !valid_namespace || !namespaces.emplace(prefix, suffix).second)
                 return "invalid or duplicate object namespace";
             binding.objects.push_back({.key_prefix = prefix,
+                                       .key_suffix = suffix,
                                        .group = slot,
                                        .part = group.parts.size()});
-            group.parts.push_back(prefix);
+            group.parts.push_back(prefix + suffix);
         }
         layout->groups.push_back(std::move(group));
     }
