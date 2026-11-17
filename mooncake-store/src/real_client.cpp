@@ -947,9 +947,8 @@ RealClient::~RealClient() {
     stop_http_server();
     // A destructor cannot propagate errors, but a teardown failure (e.g.
     // unconfirmed NoF cleanup) must still leave a trace.
-    if (!tearDownAll_internal()) {
-        LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
-                      "some buffers must stay mapped until process exit";
+    if (!tearDownAll_internal(/*final_teardown=*/true)) {
+        LOG(ERROR) << "RealClient teardown completed with cleanup failures";
     }
 }
 
@@ -1925,7 +1924,8 @@ int RealClient::initAll(const std::string &protocol_,
         initAll_internal(protocol_, device_name, mount_segment_size));
 }
 
-tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
+    bool final_teardown) {
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
@@ -1977,21 +1977,23 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             cleanup_error = real_result;
         }
     }
-    if (cleanup_error != ErrorCode::OK) {
+    if (cleanup_error != ErrorCode::OK && !final_teardown) {
         // Retain Client, reservations, and mappings so an uncertain revoke
-        // can be retried instead of losing its ownership information.
+        // can be retried by an explicit close. Destruction cannot retry:
+        // it must stop Client workers before derived segment owners die.
         closed_.store(false, std::memory_order_release);
         return tl::unexpected(cleanup_error);
     }
+    // Callers must quiesce in-flight requests before close. FileStorage owns
+    // Client and workers that access segments; drop that reference before
+    // client_.reset(), including clients without EGM segments.
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
+    file_storage_.reset();
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
-            // Callers must quiesce in-flight requests before close. FileStorage
-            // owns a Client reference and workers that access segments.
-            if (offload_rpc_server_) {
-                offload_rpc_server_->stop();
-                offload_rpc_server_.reset();
-            }
-            file_storage_.reset();
             for (auto it = egm_segment_ptrs_.rbegin();
                  it != egm_segment_ptrs_.rend(); ++it) {
                 auto &owner = *it;

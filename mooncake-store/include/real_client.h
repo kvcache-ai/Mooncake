@@ -41,6 +41,7 @@ class RealClient;
 
 namespace test {
 class PrefetchTeardownTest;
+class RealClientTeardownTest;
 }  // namespace test
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
@@ -879,7 +880,8 @@ class RealClient : public PyClient {
     std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
         const std::vector<std::string> &keys, bool force = false);
 
-    tl::expected<void, ErrorCode> tearDownAll_internal();
+    tl::expected<void, ErrorCode> tearDownAll_internal(
+        bool final_teardown = false);
 
     // Idempotently releases this client's NoF registrations for all recorded
     // user buffers; failures keep their records and latch
@@ -1512,6 +1514,7 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class test::RealClientTeardownTest;
     friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
