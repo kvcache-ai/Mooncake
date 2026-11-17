@@ -114,8 +114,7 @@ class RdmaTransport : public Transport {
 
     // Add notification directly to queue (called from endpoint
     // handleNotifyRecv)
-    void addNotificationToQueue(const std::string& name,
-                                const std::string& msg);
+    void addNotificationToQueue(const Notification& notifi);
 
    public:
     int onSetupRdmaConnections(const BootstrapDesc& peer_desc,
