@@ -852,10 +852,9 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
                 addr, static_cast<size_t>(region_length),
                 /*timeout_ms=*/5000);
             if (st.IsBatchBusy()) {
-                LOG(ERROR)
-                    << "unregisterLocalMemory: buffer still in flight, "
-                       "refusing deregister addr="
-                    << addr;
+                LOG(ERROR) << "unregisterLocalMemory: buffer still in flight, "
+                              "refusing deregister addr="
+                           << addr;
                 return ERR_BATCH_BUSY;
             }
             if (!st.ok()) {
