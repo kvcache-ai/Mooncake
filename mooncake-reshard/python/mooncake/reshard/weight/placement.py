@@ -352,7 +352,12 @@ def _placement_fragment_identity(fragment: PlacementFragment) -> dict[str, objec
         "global_offset": fragment.global_offset,
         "local_shape": fragment.local_shape,
         "nbytes": fragment.nbytes,
-        "rank": asdict(fragment.rank),
+        "rank": {
+            "dp": fragment.rank.dp,
+            "tp": fragment.rank.tp,
+            "pp": fragment.rank.pp,
+            "ep": fragment.rank.ep,
+        },
         "aliases": fragment.aliases,
     }
     # Keep the pre-virtual-stage canonical payload byte-for-byte stable. A

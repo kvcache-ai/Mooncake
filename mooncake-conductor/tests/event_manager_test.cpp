@@ -114,7 +114,8 @@ EngineRegistration RegistrationFor(const ServiceConfig& service) {
             .instance_id = service.instance_id,
             .dp_rank = service.dp_rank,
             .effective_block_size = service.block_size,
-            .cache_group = service.cache_group};
+            .cache_group = service.cache_group,
+            .publisher_kind = service.publisher_kind};
 }
 
 ServiceConfig VllmService(const std::string& instance_id = "instance-1",
@@ -666,7 +667,7 @@ class QueryHttpTest : public ::testing::Test {
     std::vector<int32_t> tokens_;
 };
 
-TEST_F(QueryHttpTest, FourTierResponseSeparatesLocalAndSharedCpu) {
+TEST_F(QueryHttpTest, VllmSharedCpuSuppressesLocalInHttpResponse) {
     const auto context = ContextFor(instance_one_);
     const auto prefixes =
         ProjectedFor(context, instance_one_.hash_profile, tokens_);
@@ -685,6 +686,9 @@ TEST_F(QueryHttpTest, FourTierResponseSeparatesLocalAndSharedCpu) {
     const auto result = ParseMsgpackResponse(response);
     const auto& one = result["instances"]["1"];
     const auto& two = result["instances"]["2"];
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Presence(*manager_->GetIndexer(),
+                                                   context, prefixes[2])
+                    ->cpu_local_owners.empty());
     for (const auto* value : {&one, &two}) {
         EXPECT_FALSE(value->isMember("gpu"));
         EXPECT_FALSE(value->isMember("cpu"));
@@ -694,9 +698,9 @@ TEST_F(QueryHttpTest, FourTierResponseSeparatesLocalAndSharedCpu) {
         EXPECT_EQ((*value)["cpu_share"].asInt64(), 48);
         EXPECT_EQ((*value)["disk"].asInt64(), 48);
     }
-    EXPECT_EQ(one["cpu_local"].asInt64(), 48);
+    EXPECT_EQ(one["cpu_local"].asInt64(), 32);
     EXPECT_EQ(two["cpu_local"].asInt64(), 0);
-    EXPECT_EQ(one["rank_matches"]["0"]["cpu_local"].asInt64(), 48);
+    EXPECT_EQ(one["rank_matches"]["0"]["cpu_local"].asInt64(), 32);
     EXPECT_EQ(two["rank_matches"]["1"]["cpu_share"].asInt64(), 48);
 }
 
@@ -2207,7 +2211,7 @@ TEST(KVEventHandlerTest, VllmBinaryHashUsesFinalEightBytesWithoutRehashing) {
               4);
 }
 
-TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
+TEST(KVEventHandlerTest, VllmCpuAndGpuAreIndexedWhileDiskIsIgnored) {
     EventManager manager({}, 0);
     const auto service = VllmService("engine", "default", 0, 4);
     ASSERT_TRUE(
@@ -2217,28 +2221,21 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
     const auto prefixes =
         ProjectedFor(ContextFor(service), TestProfile(), tokens);
 
-    const std::array<std::string, 4> ignored_media = {"CPU", "cpu", "DISK",
-                                                      "disk"};
-    std::vector<VllmEvent> events;
+    const std::array<std::string, 2> ignored_media = {"DISK", "disk"};
+    std::vector<VllmEvent> events{VllmStored(prefixes[0].value, 4, "CPU"),
+                                  VllmStored(prefixes[0].value, 4, "cpu"),
+                                  VllmStored(prefixes[0].value, 4, "GPU")};
     for (const auto& medium : ignored_media) {
         events.emplace_back(VllmStored(prefixes[0].value, 4, medium));
     }
-    events.emplace_back(VllmStored(prefixes[0].value, 4, "GPU"));
-    for (const auto& medium : ignored_media) {
-        events.emplace_back(
-            VllmRemovedEvent{.block_hashes = {prefixes[0].value},
-                             .medium = medium,
-                             .group_idx = 0});
-    }
 
-    // Expected non-GPU traffic is traced at VLOG(1) (reported to sinks as
-    // GLOG_INFO), not at WARNING: this test would emit eight warnings.
     InfoSink info;
     WarningSink warnings;
     EXPECT_TRUE(DispatchVllm(handler, service, std::move(events), 0).empty());
-    const auto result =
+    auto result =
         manager.GetIndexer()->Query(ContextFor(service), tokens).at("engine");
     EXPECT_EQ(result.device, 4);
+    EXPECT_EQ(result.cpu_local, 4);
     EXPECT_EQ(result.cpu_share, 4);
     EXPECT_EQ(result.disk, 4);
 
@@ -2247,8 +2244,31 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
     const auto& presence =
         snapshot.contexts.at(ContextFor(service)).blocks.at(prefixes[0]);
     EXPECT_FALSE(presence.device_owners.empty());
+    EXPECT_EQ(presence.cpu_local_owners.size(), 1u);
     EXPECT_TRUE(presence.cpu_share_owners.empty());
     EXPECT_TRUE(presence.disk_owners.empty());
+
+    std::vector<VllmEvent> removals{
+        VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                         .medium = "CPU",
+                         .group_idx = 0},
+        VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                         .medium = "cpu",
+                         .group_idx = 0}};
+    for (const auto& medium : ignored_media) {
+        removals.emplace_back(
+            VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                             .medium = medium,
+                             .group_idx = 0});
+    }
+    EXPECT_TRUE(DispatchVllm(handler, service, std::move(removals), 0).empty());
+    result =
+        manager.GetIndexer()->Query(ContextFor(service), tokens).at("engine");
+    EXPECT_EQ(result.device, 4);
+    EXPECT_EQ(result.cpu_local, 4);
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Presence(
+                    *manager.GetIndexer(), ContextFor(service), prefixes[0])
+                    ->cpu_local_owners.empty());
     if (VLOG_IS_ON(1)) {
         EXPECT_TRUE(info.Contains("endpoint=" + service.endpoint));
         EXPECT_TRUE(info.Contains("publisher_kind=vLLM"));
@@ -2262,13 +2282,76 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
         }
         EXPECT_TRUE(info.Contains("hash_count=1"));
     }
-    // Non-GPU events never reach the tier-ignore warning path.
     for (const auto& medium : ignored_media) {
         EXPECT_FALSE(
             warnings.Contains("event_type=BlockStored medium=" + medium));
         EXPECT_FALSE(
             warnings.Contains("event_type=BlockRemoved medium=" + medium));
     }
+}
+
+TEST(KVEventHandlerTest, VllmCpuLocalYieldsToMooncakeAndClearPreservesShared) {
+    EventManager manager({}, 0);
+    const auto engine_a = VllmService("engine-a", "default", 0, 4);
+    const auto engine_b = VllmService("engine-b", "default", 0, 4);
+    for (const auto& service : {engine_a, engine_b}) {
+        ASSERT_TRUE(manager.GetIndexer()
+                        ->Register(RegistrationFor(service))
+                        .error.empty());
+    }
+    KVEventHandler handler_a(&manager, engine_a);
+    KVEventHandler handler_b(&manager, engine_b);
+    const auto pool = MooncakeService(engine_a);
+    KVEventHandler pool_handler(&manager, pool);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine_a), TestProfile(), tokens).front();
+    const auto local = VllmStored(prefix.value, 4, "CPU");
+    const auto shared = MooncakeStored(engine_a, prefix.value, "shared-object");
+
+    ASSERT_TRUE(DispatchVllm(handler_a, engine_a,
+                             {local, VllmStored(prefix.value, 4)}, 0)
+                    .empty());
+    ASSERT_TRUE(DispatchVllm(handler_b, engine_b, {local}, 0).empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-b")
+                  .cpu_local,
+              4);
+    ASSERT_TRUE(DispatchMooncake(pool_handler, pool, {shared}).empty());
+    auto presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), ContextFor(engine_a), prefix);
+    ASSERT_TRUE(presence.has_value());
+    EXPECT_TRUE(presence->cpu_local_owners.empty());
+    EXPECT_EQ(presence->device_owners.size(), 1u);
+    EXPECT_EQ(presence->cpu_share_owners.size(), 1u);
+
+    ASSERT_TRUE(DispatchVllm(handler_b, engine_b, {local}, 0).empty());
+    ASSERT_TRUE(
+        DispatchVllm(handler_a, engine_a, {VllmClearedEvent{}}, 0).empty());
+    auto hits = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    EXPECT_EQ(hits.at("engine-a").device, 0);
+    EXPECT_EQ(hits.at("engine-a").cpu_local, 0);
+    EXPECT_EQ(hits.at("engine-b").cpu_local, 0);
+    EXPECT_EQ(hits.at("engine-b").cpu_share, 4);
+
+    ASSERT_TRUE(DispatchMooncake(pool_handler, pool, {MooncakeRemoved(shared)})
+                    .empty());
+    hits = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    EXPECT_EQ(hits.at("engine-b").cpu_local, 0);
+    EXPECT_EQ(hits.at("engine-b").cpu_share, 0);
+    ASSERT_TRUE(DispatchVllm(handler_b, engine_b, {local}, 0).empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-b")
+                  .cpu_local,
+              4);
+    handler_b.OnSourceStale("test", MetadataFor(engine_b), "source stale");
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-b")
+                  .cpu_local,
+              0);
 }
 
 TEST(KVEventHandlerTest, VllmClearPreservesOtherEngineAndSharedOwners) {

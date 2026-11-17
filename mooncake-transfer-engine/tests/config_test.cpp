@@ -482,11 +482,11 @@ class EfaNicSelectionEnvTest : public ::testing::Test {
     void TearDown() override { ::unsetenv("MC_EFA_NIC_SELECTION"); }
 };
 
-TEST_F(EfaNicSelectionEnvTest, DefaultsToAll) {
+TEST_F(EfaNicSelectionEnvTest, DefaultsToLocal) {
     ::unsetenv("MC_EFA_NIC_SELECTION");
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, LocalIsApplied) {
@@ -516,16 +516,16 @@ TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
     // NIC set is a correctness-adjacent surprise, not a perf knob.
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "topology", 1), 0);
     GlobalConfig config;
-    config.efa_nic_selection = EfaNicSelection::LOCAL;
+    config.efa_nic_selection = EfaNicSelection::ALL;  // a non-default value
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
 }
 
 class HipKfdPinFixEnvTest : public ::testing::Test {

@@ -97,6 +97,39 @@ def session_store(request, tmp_path):
             context.term()
 
 
+def test_memory_eviction_retracts_last_replica(session_store):
+    msgpack = pytest.importorskip("msgpack")
+    store, _, subscriber = session_store
+    keys = [f"eviction-{i}" for i in range(31)]
+    value = bytes(1024 * 1024)
+    for key in keys:
+        assert store.put(key, value) == 0
+
+    # 31 MiB crosses the 32 MiB pool's default high watermark. Observe
+    # actual metadata removal before checking its asynchronous event.
+    deadline = time.monotonic() + 10
+    while all(store.batch_is_exist(keys)):
+        assert time.monotonic() < deadline, "Memory eviction did not run"
+        time.sleep(0.2)  # Existence queries must not keep the 100 ms lease alive.
+
+    stored, removed = set(), set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if subscriber.poll(50):
+            for event in msgpack.unpackb(subscriber.recv_multipart()[2], raw=False)[1]:
+                assert event["medium"] == "cpu"
+                if event["event_type"] == "stored":
+                    stored.add(event["object_key"])
+                elif event["event_type"] == "removed":
+                    removed.add(event["object_key"])
+    evicted = {
+        key for key, exists in zip(keys, store.batch_is_exist(keys)) if not exists
+    }
+    assert stored == set(keys)
+    assert evicted
+    assert removed == evicted
+
+
 def tagged(*ids):
     from mooncake.store import ReplicateConfig
 
@@ -244,12 +277,20 @@ def test_tensor_filtering_and_tp_session_and_hca_mapping(session_store):
         assert receive(1)[0]["event_type"] == "removed"
 
     config = tagged("tp-session")
+    config.residency_affinity_ids = ["tp-affinity"]
     config.group_ids = ["tp-left", "tp-right"]
     config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"]]
     assert store.pub_tensor_with_tp("tp", tensor, config, tp_size=2) == 0
     events = receive(2)
     assert [e["session_id"] for e in events] == ["tp-session"] * 2
     assert sorted(e["group_id"] for e in events) == ["tp-left", "tp-right"]
+    assert config.residency_affinity_ids == ["tp-affinity"]
+    assert config.session_ids == ["tp-session"]
+    assert config.group_ids == ["tp-left", "tp-right"]
+    assert config.per_key_preferred_hca_names == [["mlx5_0"], ["mlx5_1"]]
+    for rank in range(2):
+        shard = store.get_tensor(f"tp_tp_{rank}")
+        assert torch.equal(shard, tensor[rank : rank + 1])
     config = tagged("wrong", "a", "b")
     config.group_ids = ["wrong-group", "a-group", "b-group"]
     config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"], []]
@@ -262,6 +303,21 @@ def test_tensor_filtering_and_tp_session_and_hca_mapping(session_store):
         for key in ("a", "b")
         for rank in range(2)
     }
+    assert not subscriber.poll(300)
+
+
+@pytest.mark.parametrize("affinity_ids", [[], ["left", "right"]])
+def test_single_tp_affinity_count_is_validated_before_writing(
+    session_store, affinity_ids
+):
+    torch = pytest.importorskip("torch")
+    store, _, subscriber = session_store
+    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    config = tagged("tp-session")
+    config.residency_affinity_ids = affinity_ids
+    assert store.pub_tensor_with_tp("invalid-affinity", tensor, config, tp_size=2) != 0
+    assert store.is_exist("invalid-affinity_tp_0") == 0
+    assert store.is_exist("invalid-affinity_tp_1") == 0
     assert not subscriber.poll(300)
 
 

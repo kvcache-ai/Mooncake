@@ -161,15 +161,17 @@ int CUFileDescPool::submitBatch(int idx) {
     }
 
     auto* desc = descs_[idx];
-    if (desc->io_params.empty()) {
+    if (desc->submitted_params == desc->io_params.size()) {
         LOG(WARNING) << "Submitting empty batch for descriptor " << idx;
         return 0;
     }
 
-    // Submit all params in this descriptor
-    CUFILE_CHECK(cuFileBatchIOSubmit(desc->batch_handle->handle,
-                                     desc->io_params.size(),
-                                     desc->io_params.data(), 0));
+    // Submit only the suffix not previously accepted by cuFile.
+    CUFILE_CHECK(cuFileBatchIOSubmit(
+        desc->batch_handle->handle,
+        desc->io_params.size() - desc->submitted_params,
+        desc->io_params.data() + desc->submitted_params, 0));
+    desc->submitted_params = desc->io_params.size();
     return 0;
 }
 

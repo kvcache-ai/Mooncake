@@ -97,10 +97,18 @@ def bench(buffer, cpu_group, rank, world, args, num_tokens, use_fp8):
             **({"topk_weights": topk_w} if args.weights_at_dispatch else {}),
         )
 
+    stand_in = []
+
     def combine(recv, handle):
-        recv_x = recv[0] if use_fp8 else recv
-        # Stand-in expert output with the combine input's shape and dtype.
-        expert_out = recv_x.to(torch.bfloat16) if use_fp8 else recv_x
+        if use_fp8:
+            # Stand-in expert output with the combine input's shape and dtype.
+            # Cast once, in warmup: casting the whole receive buffer costs
+            # milliseconds and is not EP work.
+            if not stand_in:
+                stand_in.append(recv[0].to(torch.bfloat16))
+            expert_out = stand_in[0]
+        else:
+            expert_out = recv
         buffer.combine(
             expert_out, topk_idx, topk_w, active, args.timeout_us, handle, out=out
         )

@@ -15,6 +15,7 @@
 #include "utils.h"
 #include "split_output.h"
 #include "common.h"
+#include "bench_config.h"
 
 #include "bench_runner.h"
 #include "qos_metrics_adapter.h"
@@ -27,6 +28,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <random>
 #include <thread>
 
 using namespace mooncake::tent;
@@ -41,38 +43,21 @@ double gbPerSecond(uint64_t bytes, double duration_us) {
     return static_cast<double>(bytes) / (1000.0 * duration_us);
 }
 
+uint64_t pickTargetSlot(std::mt19937_64& rng, uint64_t slots, uint64_t prev) {
+    if (prev == slots) return rng() % slots;
+    const uint64_t slot = rng() % (slots - 1);
+    return slot >= prev ? slot + 1 : slot;
+}
+
 int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
-    const std::vector<QosClassConfig>& qos_classes,
+    const OpMode& op_mode, const std::vector<QosClassConfig>& qos_classes,
     const std::vector<WorkloadClassConfig>& workload_classes = {}) {
-    bool mixed_opcode = false;
-    bool write_seed = false;
-    bool read_verify = false;
-    OpCode opcode = READ;
-    if (XferBenchConfig::check_consistency &&
-        (XferBenchConfig::op_type == "write_seed" ||
-         XferBenchConfig::op_type == "read_verify")) {
-        LOG(ERROR) << "--check_consistency cannot be combined with "
-                      "write_seed/read_verify";
-        exit(EXIT_FAILURE);
-    }
-    if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
-        mixed_opcode = true;
-    else if (XferBenchConfig::op_type == "read")
-        opcode = READ;
-    else if (XferBenchConfig::op_type == "write")
-        opcode = WRITE;
-    else if (XferBenchConfig::op_type == "write_seed") {
-        opcode = WRITE;
-        write_seed = true;
-    } else if (XferBenchConfig::op_type == "read_verify") {
-        opcode = READ;
-        read_verify = true;
-    } else {
-        LOG(ERROR) << "Invalid args: workload only support "
-                      "read|write|mix|write_seed|read_verify";
-        exit(EXIT_FAILURE);
-    }
+    const bool mixed_opcode = op_mode.mixed_opcode;
+    const bool write_seed = op_mode.write_seed;
+    const bool read_verify = op_mode.read_verify;
+    const OpCode opcode = op_mode.opcode;
+    const bool random_access = op_mode.random_access;
 
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
@@ -107,6 +92,16 @@ int processBatchSizes(
                                     "workload address stride"));
         }
     }
+    const size_t target_window_bytes = XferBenchConfig::target_window_size != 0
+                                           ? XferBenchConfig::target_window_size
+                                           : address_stride_bytes;
+    if (target_window_bytes < address_stride_bytes) {
+        LOG(ERROR) << "--target_window_size (" << target_window_bytes
+                   << ") must be at least the largest operation size, "
+                      "max_block_size x max_batch_size ("
+                   << address_stride_bytes << ")";
+        exit(EXIT_FAILURE);
+    }
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
         auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
@@ -117,7 +112,7 @@ int processBatchSizes(
         uint64_t local_addr = runner.getLocalBufferBase(
             local_gpu_offset + thread_id, address_stride_bytes, 1);
         uint64_t target_addr = runner.getTargetBufferBase(
-            target_thread_id, address_stride_bytes, 1);
+            target_thread_id, target_window_bytes, 1);
         uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
         const size_t target_index = runner.getTargetIndex(target_thread_id);
         const bool qos_enabled = !qos_classes.empty();
@@ -131,6 +126,17 @@ int processBatchSizes(
             workload ? workload->batch_size : batch_size;
         const IntentType intent_type =
             workload ? workload->intent_type : IntentType::INTENT_UNSPEC;
+        const uint64_t op_bytes = checkedMul(
+            thread_block_size, thread_batch_size, "operation payload size");
+        const uint64_t target_slots = target_window_bytes / op_bytes;
+        uint64_t prev_slot = target_slots;  // none yet
+        std::mt19937_64 rng(thread_id + 1);
+        // A window holding a single operation stays at a fixed offset.
+        auto nextTargetAddr = [&]() -> uint64_t {
+            if (!random_access || target_slots < 2) return target_addr;
+            prev_slot = pickTargetSlot(rng, target_slots, prev_slot);
+            return target_addr + prev_slot * op_bytes;
+        };
         const bool tight = XferBenchConfig::deadline_us > 0 &&
                            thread_id < XferBenchConfig::deadline_tight_threads;
         auto deadlineNs = [&]() -> uint64_t {
@@ -151,13 +157,16 @@ int processBatchSizes(
         };
 
         XferBenchTimer timer;
-        while (timer.lap_us(false) < 1000000ull) {
+        setSplitWarmup(true);
+        while (timer.lap_ns(false) < 1000ull * 1000 * 1000) {  // 1 s
             if (runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
+                setSplitWarmup(false);
                 return failTask();
             }
         }
+        setSplitWarmup(false);
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
             measurement_started.store(true, std::memory_order_release);
@@ -179,18 +188,24 @@ int processBatchSizes(
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
                     pattern = fillData((void*)local_addr, bytes);
+                // Read back from where this iteration wrote.
+                const uint64_t op_target_addr = nextTargetAddr();
                 paceRequest();
                 auto val = runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 transfer_duration.push_back(val);
-                fillData((void*)local_addr, bytes);
+                // Clobber the local copy so the READ must bring the data
+                // back; a value distinct from pattern keeps a no-op READ
+                // from passing verification.
+                if (XferBenchConfig::check_consistency)
+                    fillData((void*)local_addr, bytes, pattern ^ 0xFF);
                 paceRequest();
                 val = runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
@@ -215,7 +230,7 @@ int processBatchSizes(
                 }
                 paceRequest();
                 auto val = runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
@@ -308,6 +323,11 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
+    std::string numa_error;
+    if (!XferBenchConfig::validateLocalNuma(numa_error)) {
+        LOG(ERROR) << numa_error;
+        return EXIT_FAILURE;
+    }
     if (!XferBenchConfig::split_output_jsonl.empty()) {
         std::string error;
         if (!openSplitOutput(XferBenchConfig::split_output_jsonl, &error)) {
@@ -315,130 +335,14 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
     }
-    if (XferBenchConfig::use_hugepage) {
-        if (XferBenchConfig::backend != "classic" ||
-            (XferBenchConfig::xport_type != "shm" &&
-             XferBenchConfig::xport_type != "rdma")) {
-            LOG(ERROR) << "--use_hugepage requires --backend=classic and "
-                          "--xport_type=shm or rdma";
-            return EXIT_FAILURE;
-        }
-        if (XferBenchConfig::hugepage_size == static_cast<size_t>(-1)) {
-            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
-                          "count (2097152, 536870912, 1073741824)";
-            return EXIT_FAILURE;
-        }
-        const size_t hp = XferBenchConfig::hugepage_size == 0
-                              ? mooncake::SharedMemoryOptions::kHugepage2MB
-                              : XferBenchConfig::hugepage_size;
-        if (!mooncake::SharedMemoryOptions::isSupportedHugepageSize(hp)) {
-            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
-                          "count (2097152, 536870912, 1073741824)";
-            return EXIT_FAILURE;
-        }
-        if (XferBenchConfig::total_buffer_size % hp != 0) {
-            LOG(ERROR) << "--total_buffer_size must be a multiple of "
-                          "hugepage_size";
-            return EXIT_FAILURE;
-        }
-    }
-    std::vector<WorkloadClassConfig> workload_classes;
-    std::vector<QosClassConfig> qos_classes;
-    if (!XferBenchConfig::workload_classes_json.empty() &&
-        (!XferBenchConfig::qos_classes.empty() ||
-         !XferBenchConfig::qos_classes_json.empty())) {
-        LOG(ERROR)
-            << "Use --workload_classes_json or QoS class flags, not both";
+    BenchConfig config;
+    std::string config_error;
+    if (!validateConfig(&config, &config_error)) {
+        LOG(ERROR) << config_error;
         return EXIT_FAILURE;
     }
-    if (!XferBenchConfig::qos_classes.empty() &&
-        !XferBenchConfig::qos_classes_json.empty()) {
-        LOG(ERROR) << "Use only one of --qos_classes or --qos_classes_json";
-        return EXIT_FAILURE;
-    }
-    if (!XferBenchConfig::workload_classes_json.empty()) {
-        std::string error;
-        if (!parseWorkloadClassesJson(XferBenchConfig::workload_classes_json,
-                                      &workload_classes, &error)) {
-            LOG(ERROR) << "Invalid --workload_classes_json: " << error;
-            return EXIT_FAILURE;
-        }
-        qos_classes = qosClassesFromWorkload(workload_classes);
-    } else if (!XferBenchConfig::qos_classes_json.empty()) {
-        std::string error;
-        if (!parseQosClassesJson(XferBenchConfig::qos_classes_json,
-                                 &qos_classes, &error)) {
-            LOG(ERROR) << "Invalid --qos_classes_json: " << error;
-            return EXIT_FAILURE;
-        }
-    } else if (!XferBenchConfig::qos_classes.empty()) {
-        std::string error;
-        if (!parseQosClasses(XferBenchConfig::qos_classes, &qos_classes,
-                             &error)) {
-            LOG(ERROR) << "Invalid --qos_classes: " << error;
-            return EXIT_FAILURE;
-        }
-    }
-    if (!qos_classes.empty()) {
-        std::string error;
-        if (XferBenchConfig::start_num_threads !=
-            XferBenchConfig::max_num_threads) {
-            LOG(ERROR)
-                << "QoS metrics require start_num_threads == max_num_threads";
-            return EXIT_FAILURE;
-        }
-        if (!validateQosClasses(qos_classes, XferBenchConfig::start_num_threads,
-                                &error)) {
-            LOG(ERROR) << "Invalid QoS classes: " << error;
-            return EXIT_FAILURE;
-        }
-        if (!workload_classes.empty() &&
-            !validateWorkloadClasses(
-                workload_classes, XferBenchConfig::start_num_threads,
-                XferBenchConfig::total_buffer_size, &error)) {
-            LOG(ERROR) << "Invalid workload classes: " << error;
-            return EXIT_FAILURE;
-        }
-    }
-    if (XferBenchConfig::qos_link_capacity_gbps < 0.0 ||
-        !std::isfinite(XferBenchConfig::qos_link_capacity_gbps)) {
-        LOG(ERROR) << "qos_link_capacity_gbps must be finite and non-negative";
-        return EXIT_FAILURE;
-    }
-    if (XferBenchConfig::deadline_tight_threads < 0 ||
-        XferBenchConfig::deadline_tight_threads >
-            XferBenchConfig::max_num_threads) {
-        LOG(ERROR) << "deadline_tight_threads must be in [0, max_num_threads]";
-        return EXIT_FAILURE;
-    }
-    if (XferBenchConfig::deadline_us > 0 &&
-        XferBenchConfig::backend != "tent") {
-        LOG(ERROR) << "deadline tagging is supported only by the tent backend";
-        return EXIT_FAILURE;
-    }
-    if (!workload_classes.empty() &&
-        XferBenchConfig::tent_intent_type != "unspec") {
-        LOG(ERROR) << "--tent_intent_type cannot be combined with per-class "
-                      "intent_type";
-        return EXIT_FAILURE;
-    }
-    if (!workload_classes.empty() &&
-        (XferBenchConfig::deadline_us != 0 ||
-         XferBenchConfig::deadline_tight_threads != 0)) {
-        LOG(ERROR) << "--deadline_us and --deadline_tight_threads cannot be "
-                      "combined with per-class workload deadlines";
-        return EXIT_FAILURE;
-    }
-    if (!workload_classes.empty() && XferBenchConfig::backend != "tent") {
-        for (const auto& config : workload_classes) {
-            if (config.deadline_us != 0 ||
-                config.intent_type != IntentType::INTENT_UNSPEC) {
-                LOG(ERROR) << "per-class deadline_us and intent_type require "
-                              "the tent backend";
-                return EXIT_FAILURE;
-            }
-        }
-    }
+    const auto& qos_classes = config.qos_classes;
+    const auto& workload_classes = config.workload_classes;
     std::unique_ptr<BenchRunner> runner;
     if (XferBenchConfig::backend == "classic") {
         runner = std::make_unique<TEBenchRunner>();
@@ -464,8 +368,9 @@ int main(int argc, char* argv[]) {
     if (!workload_classes.empty()) {
         const int num_threads = XferBenchConfig::start_num_threads;
         if (runner->startInitiator(num_threads) != 0) return EXIT_FAILURE;
-        const int rc = processBatchSizes(*runner, 0, 0, num_threads,
-                                         qos_classes, workload_classes);
+        const int rc =
+            processBatchSizes(*runner, 0, 0, num_threads, config.op_mode,
+                              qos_classes, workload_classes);
         runner->stopInitiator();
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -498,7 +403,8 @@ int main(int argc, char* argv[]) {
                               << " batch_size " << batch_size;
                 } else {
                     if (processBatchSizes(*runner, block_size, batch_size,
-                                          num_threads, qos_classes) != 0)
+                                          num_threads, config.op_mode,
+                                          qos_classes) != 0)
                         interrupted = true;
                 }
             }

@@ -38,6 +38,7 @@ struct DispatchKernelArgs {
     int* packed_recv_src_info;
     int64_t* packed_recv_layout_range;
     int* packed_recv_count;
+    int* cumulative_local_expert_recv_stats;
     int32_t* active_ranks;
     void* mxa_buffer;
     int* rdma_send_signal_buffer;
@@ -60,6 +61,7 @@ struct DispatchKernelArgs {
     int num_experts;
     int rank;
     int num_ranks;
+    int qp_num_ranks;
     int64_t timeout_ticks;
     int phases;
     int active_qps_per_rank;
@@ -76,6 +78,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     int* packed_recv_src_info = args.packed_recv_src_info;
     int64_t* packed_recv_layout_range = args.packed_recv_layout_range;
     int* packed_recv_count = args.packed_recv_count;
+    int* cumulative_local_expert_recv_stats =
+        args.cumulative_local_expert_recv_stats;
     int32_t* active_ranks = args.active_ranks;
     void* mxa_buffer = args.mxa_buffer;
     int* rdma_send_signal_buffer = args.rdma_send_signal_buffer;
@@ -100,6 +104,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     int num_experts = args.num_experts;
     int rank = args.rank;
     int num_ranks = args.num_ranks;
+    int qp_num_ranks = args.qp_num_ranks;
     int64_t timeout_ticks = args.timeout_ticks;
     int phases = args.phases;
     int active_qps_per_rank = args.active_qps_per_rank;
@@ -152,7 +157,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         make_comm_ctx(mxa_buffer, nvlink_available, ipc_peer_ptrs, raddrs,
                       rkeys, qp_devctxs, rdma_send_signal_buffer,
                       rdma_recv_signal_buffer, rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    const size_t num_qp_per_rank = MAX_QP_COUNT / qp_num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_DISPATCH_RECV;
@@ -240,61 +245,65 @@ __device__ __forceinline__ void dispatch_kernel_impl(
 
             // Issue sends
             if (dst_expert_idx >= 0) {
-                int slot_idx =
-                    lane_id == 0
-                        ? atomicAdd(atomic_counter_per_expert + dst_expert_idx,
-                                    1)
-                        : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx =
                     dst_expert_idx % num_local_experts;
-                const auto src_ptr =
-                    reinterpret_cast<const void*>(rdma_x_src_idx);
-                const auto dst_ptr = reinterpret_cast<void*>(
-                    reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
-                    dst_expert_local_idx * num_ranks *
-                        num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
-                    rank * num_max_dispatch_tokens_per_rank *
-                        num_bytes_per_msg +
-                    slot_idx * num_bytes_per_msg);
+                if (active_ranks[dst_rank]) {
+                    int slot_idx =
+                        lane_id == 0
+                            ? atomicAdd(
+                                  atomic_counter_per_expert + dst_expert_idx, 1)
+                            : 0;
+                    slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                    const auto src_ptr =
+                        reinterpret_cast<const void*>(rdma_x_src_idx);
+                    const auto dst_ptr = reinterpret_cast<void*>(
+                        reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
+                        dst_expert_local_idx * num_ranks *
+                            num_max_dispatch_tokens_per_rank *
+                            num_bytes_per_msg +
+                        rank * num_max_dispatch_tokens_per_rank *
+                            num_bytes_per_msg +
+                        slot_idx * num_bytes_per_msg);
 
-                void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
-                if (write_dst != nullptr) {
-                    // Local or P2P path — warp-cooperative copy
-                    const auto* src_int4_ptr =
-                        reinterpret_cast<const int4*>(src_ptr);
-                    const auto* dst_int4_ptr =
-                        reinterpret_cast<int4*>(write_dst);
+                    void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
+                    if (write_dst != nullptr) {
+                        // Local or P2P path — warp-cooperative copy
+                        const auto* src_int4_ptr =
+                            reinterpret_cast<const int4*>(src_ptr);
+                        const auto* dst_int4_ptr =
+                            reinterpret_cast<int4*>(write_dst);
 #ifndef MOONCAKE_EP_USE_MUSA
-                    mc_fence();
+                        mc_fence();
 #endif
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg,
-                                       dst_int4_ptr, src_int4_ptr, mc_ld_nc,
-                                       mc_st_na);
+                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg,
+                                           dst_int4_ptr, src_int4_ptr, mc_ld_nc,
+                                           mc_st_na);
 #ifndef MOONCAKE_EP_USE_MUSA
-                    mc_fence();
+                        mc_fence();
 #endif
-                } else {
-                    // IBGDA path — send directly from source buffer
-                    mc_fence();
+                    } else {
+                        // IBGDA path — send directly from source buffer
+                        mc_fence();
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
-                    // MACA and MUSA execute two 32-lane sub-warps in one
-                    // hardware warp; serialize posts sharing one QP.
-                    for (int half = 0; half < 2; ++half) {
-                        if ((sub_warp_id & 1) == half) {
+                        // MACA and MUSA execute two 32-lane sub-warps in one
+                        // hardware warp; serialize posts sharing one QP.
+                        for (int half = 0; half < 2; ++half) {
+                            if ((sub_warp_id & 1) == half) {
 #endif
-                            mc_rdma_put(comm_ctx,
-                                        ep_qp_channel(dst_expert_local_idx,
-                                                      num_qp_per_rank,
-                                                      active_qps_per_rank),
-                                        dst_rank, num_qp_per_rank, src_ptr,
-                                        dst_ptr, num_bytes_per_msg, lane_id);
+                                mc_rdma_put(comm_ctx,
+                                            ep_qp_channel(dst_expert_local_idx,
+                                                          num_qp_per_rank,
+                                                          active_qps_per_rank),
+                                            dst_rank, num_qp_per_rank, src_ptr,
+                                            dst_ptr, num_bytes_per_msg,
+                                            lane_id);
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+                            }
+                            __syncwarp();
                         }
-                        __syncwarp();
-                    }
 #endif
+                    }
                 }
 
                 // Increase counter after finishing
@@ -331,7 +340,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
         if (sm_id == 0) {
 // The first SM is also responsible for cleaning the next buffer
 #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
+            for (int i = lane_id; i < qp_num_ranks * num_local_experts; i += 32)
                 next_clean_buffer[i] = 0;
 
             // Notify before executing `int_p`
@@ -413,21 +422,23 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                              responsible_expert_idx) != FINISHED_SUM_TAG * 2) {
         }
 #endif
-        if (dst_rank != rank) {
+        if (active_ranks[dst_rank]) {
+            if (dst_rank != rank) {
 #ifdef MOONCAKE_EP_USE_MUSA
-            mc_fence();
+                mc_fence();
 #endif
-            int* signal_ptr = rdma_recv_signal_buffer +
-                              dst_expert_local_idx * num_ranks + rank;
-            mc_red_add(comm_ctx, dst_rank,
-                       ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
-                                     active_qps_per_rank),
-                       num_qp_per_rank, signal_ptr,
-                       static_cast<int32_t>(-num_tokens_sent - 1));
-        } else {
-            mc_st_release(rdma_recv_signal_buffer +
-                              dst_expert_local_idx * num_ranks + rank,
-                          -num_tokens_sent - 1);
+                int* signal_ptr = rdma_recv_signal_buffer +
+                                  dst_expert_local_idx * num_ranks + rank;
+                mc_red_add(comm_ctx, dst_rank,
+                           ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
+                                         active_qps_per_rank),
+                           num_qp_per_rank, signal_ptr,
+                           static_cast<int32_t>(-num_tokens_sent - 1));
+            } else {
+                mc_st_release(rdma_recv_signal_buffer +
+                                  dst_expert_local_idx * num_ranks + rank,
+                              -num_tokens_sent - 1);
+            }
         }
 
         // Clean workspace for next use
@@ -482,22 +493,29 @@ LOW_LATENCY_DISPATCH_RECV:
                          "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
             unsigned long long start_time = clock64();
-            while ((num_recv_tokens = mc_ld_acquire(
-                        rdma_recv_signal_buffer + local_expert_idx * num_ranks +
-                        src_rank)) == 0) {
-                unsigned long long end_time = clock64();
-                if (timeout_ticks != -1 &&
-                    end_time - start_time > timeout_ticks) {
-                    active_ranks[src_rank] = 0;
+            if (active_ranks[src_rank]) {
+                while ((num_recv_tokens = mc_ld_acquire(
+                            rdma_recv_signal_buffer +
+                            local_expert_idx * num_ranks + src_rank)) == 0) {
+                    unsigned long long end_time = clock64();
+                    if (timeout_ticks != -1 &&
+                        end_time - start_time > timeout_ticks) {
+                        active_ranks[src_rank] = 0;
+                    }
+                    if (!active_ranks[src_rank]) {
+                        num_recv_tokens = -1;
+                        break;
+                    }
                 }
-                if (!active_ranks[src_rank]) {
-                    num_recv_tokens = -1;
-                    break;
-                }
+            } else {
+                num_recv_tokens = -1;
             }
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(
                 packed_recv_count + local_expert_idx, num_recv_tokens);
+            if (cumulative_local_expert_recv_stats != nullptr)
+                atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx,
+                          num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] =

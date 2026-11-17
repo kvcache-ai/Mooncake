@@ -35,8 +35,8 @@ adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
 with `nvcc`, and Ninja.
 
 On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
-(TENT and Mooncake PG are not needed). It supports ranks on one node; see
-{ref}`Intel XPU <mooncake-ep-intel-xpu>` in the EP design notes:
+(TENT and Mooncake PG are not needed); see {ref}`Intel XPU
+<mooncake-ep-intel-xpu>` in the EP design notes:
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
@@ -158,7 +158,7 @@ Arguments:
 
 | Function | Purpose | Notes |
 | --- | --- | --- |
-| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. |
+| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. Single-node (`MASTER_ADDR` unset or loopback, including the whole `127.0.0.0/8` range such as Debian/Ubuntu `127.0.1.1`) keeps the default `127.0.0.1`. On multi-node jobs (`MASTER_ADDR` is a non-loopback host or hostname) Mooncake PG derives a routable address toward `MASTER_ADDR` (hostname fallback only when that result is also non-loopback); if derivation fails, call `set_host_ip(<node IP>)` or `set_transfer_engine(...)` or initialization fails fast instead of hanging on rank 0. |
 | `pg.set_device_filter(filters)` | Restrict NIC/HCA selection. | Call before `init_process_group()`. |
 | `pg.set_transfer_engine(engine)` | Reuse an external `TransferEngine`. | The engine must outlive all process groups. |
 | `pg.get_active_ranks(backend)` | Return the backend active-rank tensor. | Used by EP fallback and recovery paths. |
@@ -460,7 +460,9 @@ NCCL Device API and the inferred EP topology is supported by the compiled NCCL
 kernels. Existing constructor calls require no changes. If NCCL cannot be
 used, auto mode falls back to IPC + IBGDA and retains the previous backend
 behavior. As before, the requested workload must have a compiled elastic kernel
-shape.
+shape. On Intel XPU, `ElasticBuffer` uses Level Zero IPC instead, and RDMA
+for ranks on other nodes; see
+{ref}`ElasticBuffer on Intel XPU <mooncake-ep-intel-xpu-elastic>`.
 
 NCCL support is opt-in. Build with
 `-DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON`; the option defaults to

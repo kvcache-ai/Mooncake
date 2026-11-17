@@ -112,6 +112,11 @@ class MasterClient {
     ~MasterClient();
 
     void EnableHaConnectionPolicy();
+    tl::expected<void, ErrorCode> PublishGatherEndpoint(
+        const std::string& owner, const std::string& endpoint,
+        bool remove = false);
+    tl::expected<std::string, ErrorCode> ResolveGatherEndpoint(
+        const std::string& owner);
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 
@@ -766,7 +771,8 @@ class MasterClient {
      * was never enforced.
      * @param key The object key whose disk replica was evicted
      * @param tenant_id The tenant scope of the object
-     * @param replica_type DISK or LOCAL_DISK
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
      * @param expected_replica_id The replica id the caller failed on
      * @return true if evicted, false if the current record is a different
      * replica (left untouched)

@@ -298,9 +298,29 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return impl_->getTransferStatus(batch_id, task_id, status);
 }
 
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+int TransferEngine::completionFd() const { return impl_->completionFd(); }
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
+Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
+    return impl_->drainCompletions(out);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
@@ -392,7 +412,7 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "config.h"
 #endif
 
@@ -686,6 +706,25 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                              "use TCP";
             }
         }
+        if (protocol == "efa") {
+            if (std::getenv("MC_FORCE_TCP")) {
+                mooncake::tent::ConfigHelper::forceTcp(*config);
+                LOG(INFO) << "MC_FORCE_TCP overrides protocol=efa, forcing "
+                             "TENT TCP";
+            } else {
+#ifdef USE_FABRIC
+                mooncake::tent::ConfigHelper::forceFabric(*config, "efa");
+                if (!tent_device_filter_.empty()) {
+                    config->set("transports/fabric/devices",
+                                tent_device_filter_);
+                }
+                LOG(INFO) << "protocol=efa, requiring TENT Fabric EFA";
+#else
+                LOG(ERROR) << "protocol=efa requires a TENT build with Fabric";
+                return ERR_NOT_IMPLEMENTED;
+#endif
+            }
+        }
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
         // Store still constructs TENT through this classic init() shim, not
         // tent::TransferEngine(Config) directly. Copy Dummy-real flags until
@@ -699,6 +738,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                 config->set("transports/ascend_direct/fabric_mem", true);
             }
         }
+#endif
+#ifdef USE_MEMFABRIC
+        config->set("transports/memfabric/store_te_init",
+                    globalConfig().ascend_store_te_init);
 #endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         if (!impl_tent_->available()) return ERR_CONTEXT;
@@ -1051,6 +1094,32 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 }
 
+template <typename Output>
+static Status unsupportedTaskCongestionQuery(BatchID batch_id, Output& output,
+                                             const Output& reset) {
+    output = reset;
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    return Status::NotImplemented(
+        "Task congestion queries are not supported by the TENT backend");
+}
+
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (use_tent_)
+        return unsupportedTaskCongestionQuery(batch_id, state,
+                                              TaskCongestionState::kUnknown);
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (use_tent_)
+        return unsupportedTaskCongestionQuery(batch_id, detail,
+                                              TaskCongestionDetail{});
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     if (use_tent_) {
@@ -1064,6 +1133,30 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+int TransferEngine::completionFd() const {
+    // TENT batches do not use classic BatchDesc, so the eventfd stays off
+    // until that runtime publishes through its own progress path.
+    if (use_tent_) return -1;
+    return impl_->completionFd();
+}
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    if (use_tent_) {
+        return Status::CompletionNotificationUnsupported(
+            "completion notification is not available for the TENT runtime");
+    }
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
+Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
+    if (use_tent_) {
+        out.clear();
+        return Status::CompletionNotificationUnsupported(
+            "completion eventfd is not available for the TENT runtime");
+    }
+    return impl_->drainCompletions(out);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

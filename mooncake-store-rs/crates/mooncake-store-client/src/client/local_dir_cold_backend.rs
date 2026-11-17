@@ -1745,6 +1745,7 @@ mod tests {
         replacement
             .replicas
             .push(mooncake_store_core::ReplicaRoute {
+                allocation_id: None,
                 owner: nof.owner.clone(),
                 segment_name: mooncake_store_core::SegmentName::new("replacement"),
                 offset: None,

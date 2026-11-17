@@ -3,6 +3,8 @@
 #include "config/replica_selection_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_driver.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -75,6 +77,252 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> previous_value_;
 };
+
+struct KvcsWatermarkDriverState {
+    std::vector<ObjectKey> deleted_keys;
+    bool fail_delete{false};
+};
+
+class KvcsWatermarkDriver final : public KvcsDriver {
+   public:
+    explicit KvcsWatermarkDriver(
+        std::shared_ptr<KvcsWatermarkDriverState> state)
+        : state_(std::move(state)) {}
+
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    uint64_t MaxValueSize() const override { return 4 * 1024 * 1024; }
+    tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
+    GetMountpointStats() override {
+        return std::vector<KvcsMountpointStat>{{.index = 1,
+                                                .id = "target-mp",
+                                                .total_bytes = 100,
+                                                .used_bytes = 95}};
+    }
+    KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
+        KvcsIoResults results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) {
+            state_->deleted_keys.push_back(key);
+            if (state_->fail_delete) {
+                results.emplace_back(tl::make_unexpected(ErrorCode::RPC_FAIL));
+            } else {
+                results.emplace_back();
+            }
+        }
+        return results;
+    }
+
+   private:
+    static KvcsIoResults Errors(size_t count, ErrorCode error) {
+        return KvcsIoResults(count, tl::make_unexpected(error));
+    }
+
+    std::shared_ptr<KvcsWatermarkDriverState> state_;
+};
+
+TEST_F(MasterServiceTest,
+       KvcsStorageModeSkipsFilesystemAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+    EXPECT_TRUE(MasterServiceTestPeer::EnableDfs(service));
+    EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service), nullptr);
+    EXPECT_TRUE(MasterServiceTestPeer::UsesKvcs(service));
+}
+
+TEST_F(MasterServiceTest,
+       KvcsCapacityWatermarkEvictsDfsReplicaAndProviderData) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar clear_adapter("MOONCAKE_DFS_FS_ADAPTER");
+
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 1;
+    config.default_kv_soft_pin_ttl = 1;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
+
+    auto driver_state = std::make_shared<KvcsWatermarkDriverState>();
+    peer.ConfigureKvcsCapacityForTesting(
+        std::make_unique<KvcsCapacityProvider>(
+            1, "target-mp",
+            std::make_unique<KvcsWatermarkDriver>(driver_state)),
+        true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    constexpr std::string_view key = "kvcs-watermark";
+    ASSERT_TRUE(service.PutStart(context.client_id, std::string(key),
+                                 TenantId::Default(), 64, replicate));
+    ASSERT_TRUE(service.PutEnd(context.client_id, std::string(key),
+                               TenantId::Default(), ReplicaType::ALL));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    driver_state->fail_delete = true;
+    peer.RefreshKvcsDfsUsageForTesting();
+    auto unchanged =
+        service.GetReplicaList(std::string(key), TenantId::Default());
+    ASSERT_TRUE(unchanged);
+    ASSERT_EQ(unchanged->replicas.size(), 2u);
+    ASSERT_EQ(driver_state->deleted_keys.size(), 1u);
+
+    driver_state->fail_delete = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    peer.RefreshKvcsDfsUsageForTesting();
+
+    auto remaining =
+        service.GetReplicaList(std::string(key), TenantId::Default());
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+    ASSERT_EQ(driver_state->deleted_keys.size(), 2u);
+    EXPECT_EQ(driver_state->deleted_keys.back(), EncodeKvcsKey(key));
+
+    const auto usage = service.GetStorageUsageSnapshot().dfs;
+    EXPECT_TRUE(usage.enabled);
+    EXPECT_EQ(usage.used_bytes, 95u);
+    EXPECT_EQ(usage.capacity_bytes, 100u);
+}
+
+TEST_F(MasterServiceTest,
+       FilesystemStorageModeRetainsAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_recovery_restriction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+    std::filesystem::remove_all(dfs_root);
+}
+
+TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+
+    constexpr uint64_t kObjectSize = 128;
+    DistributedFSDescriptor dfs_descriptor;
+    dfs_descriptor.object_size = kObjectSize;
+    dfs_descriptor.aligned_size = kObjectSize;
+    dfs_descriptor.shard_idx = -1;
+    Replica replica(std::move(dfs_descriptor), ReplicaStatus::COMPLETE);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = kObjectSize;
+    metadata.replicas.push_back(replica.get_descriptor());
+
+    const std::string key = "restored-kvcs-dfs-object";
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
+
+    auto response = service.GetReplicaListForAdmin(key, TenantId::Default());
+    ASSERT_TRUE(response);
+    ASSERT_EQ(response->replicas.size(), 1u);
+    ASSERT_TRUE(response->replicas[0].is_dfs_replica());
+    const auto& restored = response->replicas[0].get_dfs_descriptor();
+    EXPECT_EQ(restored.object_size, kObjectSize);
+}
+
+TEST_F(MasterServiceTest, KvcsMissEvictsOnlyTheObservedDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+
+    MasterService service;
+    const UUID client_id = generate_uuid();
+    const std::string key = "missing-kvcs-value";
+    DistributedFSDescriptor descriptor;
+    descriptor.object_size = 128;
+    descriptor.aligned_size = 128;
+    descriptor.shard_idx = -1;
+    Replica first(descriptor, ReplicaStatus::COMPLETE);
+    Replica second(descriptor, ReplicaStatus::COMPLETE);
+    const ReplicaID first_id = first.id();
+    const ReplicaID second_id = second.id();
+    ASSERT_NE(first_id, second_id);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = client_id;
+    metadata.size = descriptor.object_size;
+    metadata.replicas = {first.get_descriptor(), second.get_descriptor()};
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
+
+    auto unconditional = service.EvictDiskReplica(
+        client_id, key, TenantId::Default(), ReplicaType::DFS);
+    ASSERT_FALSE(unconditional.has_value());
+    EXPECT_EQ(unconditional.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicaID missing_id = 0;
+    while (missing_id == first_id || missing_id == second_id) ++missing_id;
+    auto stale = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, missing_id);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(*stale);
+    ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+
+    auto current = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, first_id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    auto remaining = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(remaining.has_value());
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_EQ(remaining->replicas.front().id, second_id);
+
+    current = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, second_id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    auto missing = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
@@ -171,6 +419,21 @@ TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
     EXPECT_EQ(buffer.size_, 24 * mib);
     EXPECT_GE(buffer.buffer_address_, original.base);
     EXPECT_LT(buffer.buffer_address_, original.base + original.size);
+}
+
+TEST_F(MasterServiceTest, ReplicaDescriptorCarriesTheMountedProtocol) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto segment = MakeSegment("nvlink-provider");
+    segment.protocol = "nvlink";
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    const auto result =
+        service.PutStart(owner, "nvlink-object", TenantId::Default(), 1024, {});
+    ASSERT_TRUE(result) << toString(result.error());
+    EXPECT_EQ((*result)[0].get_memory_descriptor().buffer_descriptor.protocol_,
+              "nvlink");
 }
 
 TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
@@ -1709,6 +1972,32 @@ TEST_F(MasterServiceTest, StandbyRemountFindsSameEndpointRangeByAddress) {
     }
 }
 
+TEST_F(MasterServiceTest,
+       RemountedReplicaAdvertisesTheSegmentsCurrentProtocol) {
+    // A snapshot taken before the segment changed protocol, or by a master
+    // that stamped every replica "tcp", must not outlive the remount.
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    auto segment = MakeSegment("egm-provider");
+    segment.protocol = "nvlink";
+    auto entry =
+        MakeStandbyEntry("egm-object", 1024, segment.base, segment.te_endpoint);
+    std::get<MemoryDescriptor>(entry.metadata.replicas[0].descriptor_variant)
+        .buffer_descriptor.protocol_ = "tcp";
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {entry}, 1,
+        {MakeStandbySegment(segment.name, segment.te_endpoint, segment.size)}));
+    ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()));
+
+    auto result = service.GetReplicaList("egm-object", TenantId::Default());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.protocol_,
+              "nvlink");
+}
+
 TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
     // #3760: one bad descriptor must not cost the whole index.
     MasterService service(MakeStrictTenantConfig({"default"}));
@@ -1883,6 +2172,210 @@ TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
     MasterServiceConfig service_config(wrapped_config);
     EXPECT_EQ(service_config.allocation_strategy_type,
               AllocationStrategyType::LOCAL_FIRST);
+}
+
+namespace {
+class PreferredSequenceRecorder final : public RandomAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& manager, size_t length, size_t replicas,
+        const std::vector<std::string>& preferred,
+        const std::set<std::string>& excluded, ReplicaType type) override {
+        names = preferred;
+        return RandomAllocationStrategy::Allocate(manager, length, replicas,
+                                                  preferred, excluded, type);
+    }
+
+    std::vector<std::string> names;
+};
+}  // namespace
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitPriorityAndFirstOccurrence) {
+    for (bool use_hint : {false, true}) {
+        SCOPED_TRACE(use_hint);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            use_hint ? AllocationStrategyType::RANDOM
+                     : AllocationStrategyType::LOCAL_FIRST;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        size_t index = 0;
+        for (const auto& [name, host] :
+             std::vector<std::pair<std::string, std::string>>{
+                 {"A", "host-a"},
+                 {"B", "host-b"},
+                 {"A", "host-c"},
+                 {"C", "host-c"}}) {
+            auto segment =
+                MakeSegment(name, kDefaultSegmentBase + index++ * 65536, 65536);
+            segment.host_id = host;
+            ASSERT_TRUE(service.MountSegment(segment, owner));
+        }
+        ReplicateConfig incoming;
+        incoming.host_id = "host-b";
+        incoming.prefer_alloc_in_same_node = use_hint;
+        incoming.preferred_segments = {"", "C", "C", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "array", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "array", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        // The singular preference takes precedence over the array, and its
+        // remote host stays ahead of the automatically preferred local host.
+        incoming.preferred_segment = "C";
+        ASSERT_TRUE(service.PutStart(owner, "single", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "B", "A"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "single", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        incoming.preferred_segment.clear();
+        incoming.preferred_segments.clear();
+        const std::string key = "cross-host-duplicate";
+        ASSERT_TRUE(
+            service.PutStart(owner, key, TenantId::Default(), 4096, incoming));
+        // host-b comes first, then host-c's rotated A/C, then host-a's A.
+        // The final A must not be appended again.
+        const bool c_first = std::hash<std::string>{}(key) % 2 != 0;
+        EXPECT_EQ(recorder->names,
+                  (c_first ? std::vector<std::string>{"B", "C", "A"}
+                           : std::vector<std::string>{"B", "A", "C"}));
+        ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                      ReplicaType::MEMORY));
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitNamesAcrossManyAppends) {
+    for (bool use_hint : {false, true}) {
+        for (size_t prefix_length : {0U, 96U}) {
+            SCOPED_TRACE(use_hint);
+            SCOPED_TRACE(prefix_length);
+            MasterServiceConfig config;
+            config.memory_allocator = BufferAllocatorType::OFFSET;
+            config.allocation_strategy_type =
+                use_hint ? AllocationStrategyType::RANDOM
+                         : AllocationStrategyType::LOCAL_FIRST;
+            MasterService service(config);
+            auto recorder = std::make_shared<PreferredSequenceRecorder>();
+            MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+            const UUID owner{1, 1};
+            const std::string prefix(prefix_length, 'x');
+            const std::string explicit_name = prefix + "preferred";
+            std::vector<std::string> expected{explicit_name};
+            size_t index = 0;
+            auto mount = [&](const std::string& name, const std::string& host) {
+                auto segment = MakeSegment(
+                    name, kDefaultSegmentBase + index++ * 65536, 65536);
+                segment.host_id = host;
+                return service.MountSegment(segment, owner);
+            };
+            for (size_t i = 0; i < 64; ++i) {
+                const auto name = prefix + "s" + std::to_string(i);
+                ASSERT_TRUE(mount(name, "host-" + std::to_string(100 + i)));
+                expected.push_back(name);
+            }
+            // These duplicates arrive after enough appends to relocate an
+            // unreserved vector. Short explicit names exercise SSO storage;
+            // the automatic duplicate has equal content in another string.
+            ASSERT_TRUE(mount(explicit_name, "host-z"));
+            ASSERT_TRUE(mount(expected[1], "host-zz"));
+            ReplicateConfig incoming;
+            incoming.host_id = "host-100";
+            incoming.prefer_alloc_in_same_node = use_hint;
+            incoming.preferred_segments = {"", explicit_name, explicit_name,
+                                           ""};
+            for (size_t request = 0; request < 2; ++request) {
+                const auto key = "many-appends-" + std::to_string(request);
+                ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(),
+                                             4096, incoming));
+                EXPECT_EQ(recorder->names, expected);
+                ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                              ReplicaType::MEMORY));
+            }
+        }
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesUnknownHostAndUnavailableSegmentFallback) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+    MasterService service(config);
+    auto recorder = std::make_shared<PreferredSequenceRecorder>();
+    MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+    const UUID owner{1, 1};
+    std::vector<Segment> segments;
+    for (size_t i = 0; i < 3; ++i) {
+        auto segment = MakeSegment(std::string(1, 'A' + i),
+                                   kDefaultSegmentBase + i * 65536, 65536);
+        segment.host_id = "host-" + std::string(1, 'a' + i);
+        ASSERT_TRUE(service.MountSegment(segment, owner));
+        segments.push_back(segment);
+    }
+    ReplicateConfig incoming;
+    incoming.host_id = "host-bb";
+    ASSERT_TRUE(service.PutStart(owner, "unknown", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "unknown", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    incoming.host_id = "host-z";
+    ASSERT_TRUE(
+        service.PutStart(owner, "wrap", TenantId::Default(), 4096, incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A", "B", "C"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "wrap", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName("B", SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    incoming.host_id = "host-b";
+    ASSERT_TRUE(service.PutStart(owner, "draining", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "draining", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    ASSERT_TRUE(service.UnmountSegment(segments[2].id, owner));
+    ASSERT_TRUE(service.PutStart(owner, "unmounted", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesPreferencesWithoutAutomaticCandidates) {
+    for (bool local_first : {false, true}) {
+        SCOPED_TRACE(local_first);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            local_first ? AllocationStrategyType::LOCAL_FIRST
+                        : AllocationStrategyType::RANDOM;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        // No host identity is registered, so local-first has no automatic
+        // candidates; ordinary placement must not add any either.
+        ASSERT_TRUE(service.MountSegment(MakeSegment("A"), owner));
+        ReplicateConfig incoming;
+        incoming.host_id = "unknown";
+        incoming.preferred_segments = {"", "A", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "no-host", TenantId::Default(),
+                                     4096, incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+    }
 }
 
 TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
@@ -2456,6 +2949,38 @@ TEST_F(MasterServiceTest, MoveEndReleasesSourceRefcountWhenTargetGone) {
         GetReplicaRefcntBySegmentName(*service, "refcnt_key", "refcnt_source");
     ASSERT_TRUE(source_refcnt.has_value());
     EXPECT_EQ(0, source_refcnt.value());
+}
+
+TEST_F(MasterServiceTest, PutStartPartialMemoryAllocationDoesNotArmEviction) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.eviction_ratio = 0;
+    service_config.eviction_high_watermark_ratio = 1;
+    MasterService service(service_config);
+    const auto full = PrepareSimpleSegment(service, "full");
+    PrepareSimpleSegment(service, "available",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig fill;
+    fill.replica_num = 1;
+    fill.preferred_segment = "full";
+    ASSERT_TRUE(service.PutStart(full.client_id, "fill", TenantId::Default(),
+                                 kDefaultSegmentSize, fill));
+    ASSERT_TRUE(service.PutEnd(full.client_id, "fill", TenantId::Default(),
+                               ReplicaType::MEMORY));
+    ASSERT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
+        EXPECT_TRUE(access.getAllocatorManager().hasEnoughServingNames(2));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto result = service.PutStart(full.client_id, "partial",
+                                   TenantId::Default(), 1024, config);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
 }
 
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
@@ -4048,6 +4573,84 @@ TEST_F(MasterServiceTest, ClientOffboardingRetryPolicy) {
     EXPECT_TRUE(ClientOffboardingShouldAlertForTest(11));
 }
 
+TEST_F(MasterServiceTest,
+       UnmountInvalidatesRetainedSnapshotWithSameNameSurvivor) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto retired = MakeSegment("retained_same_name_unmount");
+    retired.protocol = "tcp";
+    ASSERT_TRUE(service.MountSegment(retired, owner));
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < 4; ++i) {
+        keys.push_back(PutObjectOnSegment(service, owner, retired.name));
+    }
+    auto survivor = retired;
+    survivor.id = generate_uuid();
+    survivor.base += 2 * survivor.size;
+    ASSERT_TRUE(service.MountSegment(survivor, owner));
+    PauseReplicaCleanup(service);
+
+    std::shared_ptr<BufferAllocatorBase> retired_allocator;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        retired_allocator = access.GetAllocator(retired.id);
+    }
+    AllocatorManager retained;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
+        retained = access.SnapshotAllocatorManager();
+    }
+    const auto* registrations = retained.getAllocators(retired.name);
+    ASSERT_NE(registrations, nullptr);
+    ASSERT_EQ(registrations->size(), 2u);
+    const auto found = std::find_if(
+        registrations->begin(), registrations->end(),
+        [&](const auto& registration) {
+            return registration->GetAllocator() == retired_allocator;
+        });
+    ASSERT_NE(found, registrations->end());
+    const auto retired_registration = *found;
+    auto old_buffer = retired_registration->Allocate(1024);
+    ASSERT_NE(old_buffer, nullptr);
+    ASSERT_TRUE(old_buffer->isAvailable());
+    ASSERT_TRUE(service.UnmountSegment(retired.id, owner));
+    // Retirement invalidates old snapshots before metadata cleanup.
+    EXPECT_EQ(service.GetKeyCount(), keys.size());
+    EXPECT_FALSE(retired_registration->IsAllocatable());
+    EXPECT_EQ(retired_registration->Allocate(1024), nullptr);
+    EXPECT_FALSE(old_buffer->isAvailable());
+    for (const auto& key : keys) {
+        const auto read = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(read);
+        EXPECT_EQ(read.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+    RandomAllocationStrategy strategy;
+    const auto allocated = strategy.AllocateFrom(retained, 1024, retired.name);
+    ASSERT_TRUE(allocated);
+    const auto descriptor = allocated->get_descriptor();
+    const auto& buffer = descriptor.get_memory_descriptor().buffer_descriptor;
+    EXPECT_GE(buffer.buffer_address_, survivor.base);
+    EXPECT_LE(buffer.buffer_address_ + buffer.size_,
+              survivor.base + survivor.size);
+    EXPECT_EQ(retained.getServingNames().size(), 1u);
+    const auto new_key = PutObjectOnSegment(service, owner, survivor.name);
+    const auto read = service.GetReplicaList(new_key, TenantId::Default());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->replicas.size(), 1u);
+    const auto& fresh =
+        read->replicas.front().get_memory_descriptor().buffer_descriptor;
+    EXPECT_GE(fresh.buffer_address_, survivor.base);
+    EXPECT_LE(fresh.buffer_address_ + fresh.size_,
+              survivor.base + survivor.size);
+
+    ASSERT_TRUE(service.UnmountSegment(survivor.id, owner));
+    EXPECT_TRUE(retained.getServingNames().empty());
+}
+
 TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
     MasterService service;
     auto segment = MakeSegment("suspected_remount_segment");
@@ -4066,6 +4669,41 @@ TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
     EXPECT_EQ(liveness->state(), ClientLivenessState::SUSPECTED);
     EXPECT_EQ(service.Ping(client_id)->client_status, ClientStatus::OK);
     EXPECT_EQ(liveness->state(), ClientLivenessState::ACTIVE);
+}
+
+TEST_F(MasterServiceTest, FailedRemountPreservesCommittedClientHostId) {
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build());
+    const UUID local_owner = generate_uuid();
+    const UUID remote_owner = generate_uuid();
+
+    auto local_seg = MakeSegment("local_host_seg", /*base=*/0x100000000);
+    local_seg.host_id = "host-a";
+    auto remote_seg = MakeSegment("remote_host_seg", /*base=*/0x200000000);
+    remote_seg.host_id = "host-b";
+    ASSERT_TRUE(service.MountSegment(local_seg, local_owner).has_value());
+    ASSERT_TRUE(service.MountSegment(remote_seg, remote_owner).has_value());
+
+    auto invalid_remount = local_seg;
+    invalid_remount.size *= 2;
+    invalid_remount.host_id = "host-b";
+    auto remount = service.ReMountSegment({invalid_remount}, local_owner);
+    ASSERT_FALSE(remount.has_value());
+    EXPECT_EQ(remount.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put = service.PutStart(local_owner, "local_after_failed_remount",
+                                TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put.has_value()) << toString(put.error());
+    ASSERT_EQ(put->size(), 1u);
+    const auto addr =
+        (*put)[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_GE(addr, local_seg.base);
+    EXPECT_LT(addr, local_seg.base + local_seg.size);
 }
 
 TEST_F(MasterServiceTest,
