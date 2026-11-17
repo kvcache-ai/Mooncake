@@ -198,7 +198,17 @@ ObjectsSpec<> Objects(std::initializer_list<std::string> keys) {
 }
 
 ReadableObjectCountSpec ReadableCount(ObjectsSpec<> objects, size_t expected) {
-    return {.objects = std::move(objects), .expected = expected};
+    return {.objects = std::move(objects),
+            .min_expected = expected,
+            .max_expected = expected};
+}
+
+ReadableObjectCountSpec ReadableCountBetween(ObjectsSpec<> objects,
+                                             size_t min_expected,
+                                             size_t max_expected) {
+    return {.objects = std::move(objects),
+            .min_expected = min_expected,
+            .max_expected = max_expected};
 }
 
 KeyExistsSpec KeyExists(std::string key) { return {.key = std::move(key)}; }
@@ -1835,9 +1845,15 @@ MasterScenario& MasterScenario::Then(ReadableObjectCountSpec objects) {
                  " failed: " + toString(result.error()));
         }
     }
-    if (readable != objects.expected) {
-        Fail("ReadableCount is " + std::to_string(readable) + "; expected " +
-             std::to_string(objects.expected));
+    if (readable < objects.min_expected || readable > objects.max_expected) {
+        if (objects.min_expected == objects.max_expected) {
+            Fail("ReadableCount is " + std::to_string(readable) +
+                 "; expected " + std::to_string(objects.min_expected));
+        } else {
+            Fail("ReadableCount is " + std::to_string(readable) +
+                 "; expected in [" + std::to_string(objects.min_expected) +
+                 ", " + std::to_string(objects.max_expected) + "]");
+        }
     }
     return *this;
 }
@@ -1889,8 +1905,8 @@ MasterScenario& MasterScenario::Then(BatchProbeSpec batch_probe) {
         return *this;
     }
 
-    const auto result = service_->BatchProbeKey({}, batch_probe.keys,
-                                                TenantId(batch_probe.tenant));
+    const auto result = service_->BatchProbeKey(
+        batch_probe.policy, batch_probe.keys, TenantId(batch_probe.tenant));
     if (result.size() != batch_probe.expected.size()) {
         Fail("BatchProbe returned " + std::to_string(result.size()) +
              " results; expected " +

@@ -5,6 +5,8 @@
 #include <limits>
 #include <mutex>
 
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+
 namespace mooncake::test {
 
 ErrorCode MasterServiceTestPeer::SetBatchOpLogBackendForTesting(
@@ -27,12 +29,6 @@ std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
     return service.SerializeMetadataForOpLog(metadata);
 }
 
-std::string
-MasterServiceTestPeer::SerializeMetadataForOpLogWithoutMemReplicasForTesting(
-    MasterService& service, const ObjectMetadata& metadata) {
-    return service.SerializeMetadataForOpLogWithoutMemReplicas(metadata);
-}
-
 std::string MasterServiceTestPeer::
     SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
         MasterService& service, const ObjectMetadata& metadata,
@@ -53,6 +49,22 @@ void MasterServiceTestPeer::RunNoFBatchEvictForTesting(
 
 void MasterServiceTestPeer::RunDfsEvictionForTesting() {
     service_.RunDfsEviction();
+}
+
+void MasterServiceTestPeer::ConfigureKvcsCapacityForTesting(
+    std::unique_ptr<KvcsCapacityProvider> provider, bool eviction_enabled,
+    double high_watermark, double low_watermark) {
+    service_.enable_dfs_ = true;
+    service_.use_kvcs_ = true;
+    service_.dfs_kvcs_capacity_provider_ = std::move(provider);
+    service_.dfs_kvcs_eviction_enabled_ = eviction_enabled;
+    service_.dfs_kvcs_eviction_high_watermark_ = high_watermark;
+    service_.dfs_kvcs_eviction_low_watermark_ = low_watermark;
+    service_.InitKvcsDfsEviction();
+}
+
+void MasterServiceTestPeer::RefreshKvcsDfsUsageForTesting() {
+    service_.RefreshKvcsDfsUsage();
 }
 
 void MasterServiceTestPeer::CleanupHttpMetadataForTesting(

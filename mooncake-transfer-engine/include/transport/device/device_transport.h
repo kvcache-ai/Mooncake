@@ -45,6 +45,27 @@ namespace device {
 // Manages intra-node GPU P2P IPC handles and the device-visible peer pointer
 // table used by the EP kernel.
 // ---------------------------------------------------------------------------
+// One imported peer allocation. Stop GPU accesses before destroying it.
+// Destruction selects the import device and restores the caller's device.
+class P2pMapping {
+   public:
+    virtual ~P2pMapping() = default;
+    virtual void* address() const = 0;
+};
+
+// Export caller-owned memory on the current device.
+// For FABRIC VMM, ptr must be the allocation base. bytes must be a multiple of
+// the minimum allocation granularity and must not exceed the allocation size.
+// The caller must keep the allocation alive until all peers release their
+// mappings.
+// Returns type-tagged metadata, or an empty vector if export is unavailable.
+std::vector<int32_t> exportP2pMemory(void* ptr, size_t bytes);
+
+// Import metadata from exportP2pMemory() on the current device.
+// Returns nullptr for invalid or inaccessible peer memory.
+std::unique_ptr<P2pMapping> importP2pMemory(
+    const std::vector<int32_t>& metadata);
+
 class P2pTransport {
    public:
     virtual ~P2pTransport() = default;
@@ -72,6 +93,16 @@ class P2pTransport {
         void* local_ptr, int rank, int num_ranks,
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask) = 0;
+
+    // Elastic EP connects one fixed global-rank slot at a time. Staging opens
+    // the mapping without publishing it to device kernels; publish is called
+    // only after local users of the old slot have quiesced.
+    virtual int stagePeerHandle(void*, int, int, const std::vector<int32_t>&) {
+        return -1;
+    }
+    virtual int publishStagedPeer(int) { return -1; }
+    virtual void discardStagedPeer(int) {}
+    virtual int disconnectPeer(int) { return -1; }
 
     // Device pointer to int32_t[num_ranks]: 1 if P2P is available to rank i.
     virtual int32_t* availableTablePtr() = 0;

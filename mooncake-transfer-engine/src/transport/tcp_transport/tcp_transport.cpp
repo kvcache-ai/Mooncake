@@ -46,6 +46,12 @@
 
 #include "cuda_alike.h"
 
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_UBSHMEM)
+#define MOONCAKE_TCP_ASCEND
+#include <acl/acl.h>
+#endif
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 
@@ -74,7 +80,7 @@ std::atomic<size_t> staging_device_query_count{0};
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(MOONCAKE_TCP_ASCEND)
 void recordStagingBufferAllocationForTest() noexcept {
     staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
 }
@@ -486,7 +492,18 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    // Remove only the descs this transport published. Under multi-protocol
+    // the protocol field is authoritative; otherwise ours are the entries
+    // without a serialized IPC handle.
+    static const std::function<bool(const BufferDesc&)> own_desc =
+        [](const BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            return desc.protocol == "tcp";
+#else
+            return desc.shm_name.empty();
+#endif
+        };
+    return metadata_->removeLocalMemoryBuffer(addr, own_desc, update_metadata);
 }
 
 int TcpTransport::registerLocalMemoryBatch(

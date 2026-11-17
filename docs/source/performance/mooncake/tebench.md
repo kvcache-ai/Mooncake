@@ -80,6 +80,12 @@ On the initiator machine:
 Use `--request_interval_us=<N>` to add a per-thread delay before each
 transfer batch. The value is in microseconds; `0` disables pacing.
 
+Pacing is closed loop: each thread waits the interval after its previous
+transfer completes, then issues the next one. The per-thread request rate is
+therefore at most `1 / (interval + transfer latency)`, not `1 / interval`, and
+it drops as latency grows. The wait spins with `yield`, so each paced thread
+keeps a CPU core busy, which can compete with transport polling threads.
+
 When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
@@ -160,6 +166,13 @@ Each output row corresponds to one benchmark configuration.
 | `Avg Tx (us)`  | Average per-transfer execution time, excluding gaps |
 | `P99 Tx (us)`  | P99 transfer latency                                |
 | `P999 Tx (us)` | P999 transfer latency                               |
+
+`BW` is the throughput of the requested workload: total bytes divided by the
+pooled average worker duration of the measurement phase. It therefore includes
+work done inside the loop on request, such as `--request_interval_us` pacing
+and the data fill and verify of `--check_consistency`. `Avg Tx`, `P99 Tx`,
+`P999 Tx`, and `Avg Inst GB/s` time only the transfer itself, from submit to
+completion.
 
 A short (~1 second) warmup phase is executed before measurements begin.
 
@@ -282,17 +295,20 @@ empty: the transfer loop is unchanged, with no extra clocks or I/O.
 When set, each completed transfer appends one JSON line:
 
 ```json
-{"batch_size":207360,"submit_us":66874,"wait_us":556363,"polls":201}
+{"block_size":4096,"batch_size":1,"warmup":false,"submit_us":2.613,"wait_us":10.874,"polls":901}
 ```
 
 | Field | Meaning |
 | ----- | ------- |
-| `submit_us` | Time in `submitTransfer` |
-| `wait_us` | Time from submit return until the batch reports COMPLETED |
+| `block_size`, `batch_size` | Shape of the transfer, identifying the sweep point |
+| `warmup` | `true` for transfers in the 1 s warmup before measurement |
+| `submit_us` | Time in `submitTransfer`, in microseconds with ns precision |
+| `wait_us` | Time from submit return until the batch reports COMPLETED, in microseconds with ns precision |
 | `polls` | Number of status polls in that wait |
 
-The file is opened once as `std::ofstream` and written with stream buffering. Skip the first
-couple of lines when summarizing; they include warmup. This log is for
+The file is opened once as `std::ofstream` and written with stream buffering.
+Filter on `warmup` when summarizing; warmup includes one-time costs such as
+connection setup. This log is for
 control-path analysis. Do not treat `wait_us` or table `BW` as a substitute
 for an application poll interval.
 
@@ -426,6 +442,35 @@ buffer.
 
 # Initiator 1 uses [512MiB, 1GiB)
 ./tebench --target_seg_name=<SEG> --target_offset=536870912 --target_range_size=536870912
+```
+
+By default every operation of a thread uses the same target offset. That
+suits memory targets and isolating transport overhead, but on file targets
+the results depend heavily on the storage device: repeated writes to the
+same blocks can hit a device rewrite penalty, and repeated reads can be
+served from the device's cache. Use `--target_access=random` for results
+comparable with storage benchmarks that use random offsets. It cannot be
+combined with `write_seed` / `read_verify`.
+
+Each thread owns its own region of the target, its window. Thread `i`'s
+window starts at `i x window size`, so threads never touch each other's
+blocks. With `random`, each operation (block size x batch size bytes) goes
+to a random operation-aligned offset in the window, never the same one twice
+in a row. Set the window with `--target_window_size`, normally the file size
+divided by the thread count; it must be a multiple of 4096 (file targets
+use `O_DIRECT`), at least `max_block_size x max_batch_size`, and is accepted
+only with `random`.
+Without it, the window is `max_block_size x max_batch_size` bytes, which at
+the largest block and batch size holds a single operation, so the offset
+stays fixed. `fixed` mode is unchanged: one offset per thread, spaced
+`max_block_size x max_batch_size` apart.
+
+```bash
+# 8 threads, random 4 KiB writes across a 1 GiB file:
+# window = 1 GiB / 8 = 128 MiB = 134217728 bytes, 32768 slots of 4 KiB
+./tebench --target_seg_name=file:///path/to/file --op_type=write \
+  --start_num_threads=8 --max_num_threads=8 --start_block_size=4096 \
+  --max_block_size=4096 --target_access=random --target_window_size=134217728
 ```
 
 For read-only verification with multiple readers, first write deterministic data

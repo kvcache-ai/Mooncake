@@ -59,6 +59,18 @@ def get_config_dict(global_segment_size, local_buffer_size):
 class TestReplicateConfig(unittest.TestCase):
     """Test ReplicateConfig bindings without a running store service."""
 
+    def test_residency_affinity_optional_conversion(self):
+        from mooncake.store import ReplicateConfig
+
+        config = ReplicateConfig()
+        self.assertIsNone(config.residency_affinity_ids)
+        config.residency_affinity_ids = ["tensor-a", "tensor-b"]
+        self.assertEqual(config.residency_affinity_ids, ["tensor-a", "tensor-b"])
+        config.residency_affinity_ids = []
+        self.assertEqual(config.residency_affinity_ids, [])
+        config.residency_affinity_ids = None
+        self.assertIsNone(config.residency_affinity_ids)
+
     def test_soft_pin_ttl_optional_conversion(self):
         from mooncake.store import ReplicateConfig
 

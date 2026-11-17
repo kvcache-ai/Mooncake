@@ -117,6 +117,7 @@ class UbTransport : public Transport {
     std::vector<std::shared_ptr<UbContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
     UB_ENDPOINT_TYPE endpoint_type_;
+    bool urma_initialized_ = false;
 };
 }  // namespace mooncake
 

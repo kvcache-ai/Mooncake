@@ -19,10 +19,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <thread>
 
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/os.h"
@@ -244,11 +246,51 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     return Status::OK();
 }
 
+// Reaps the completions of `outstanding` requests before the ring is
+// destroyed: io_uring_queue_exit() does not wait for in-flight I/O. SQEs
+// still in the SQ ring were never submitted and never run, so they are not
+// waited for. If io_uring_wait_cqe() fails, the CQ ring is polled instead:
+// it is mapped into this process and still receives completions, so the
+// requests are reaped either way.
+static void waitForInFlight(struct io_uring* ring, size_t outstanding) {
+    const size_t unsubmitted = io_uring_sq_ready(ring);
+    size_t in_flight =
+        outstanding > unsubmitted ? outstanding - unsubmitted : 0;
+    bool polling = false;
+    while (in_flight) {
+        struct io_uring_cqe* cqe = nullptr;
+        int rc = polling ? io_uring_peek_cqe(ring, &cqe)
+                         : io_uring_wait_cqe(ring, &cqe);
+        if (rc < 0 && polling) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        if (rc == -EINTR) continue;
+        if (rc < 0) {
+            LOG(ERROR) << "IOUringTransport: io_uring_wait_cqe failed: "
+                       << strerror(-rc) << "; polling for " << in_flight
+                       << " in-flight completions";
+            polling = true;
+            continue;
+        }
+        io_uring_cqe_seen(ring, cqe);
+        --in_flight;
+    }
+}
+
 Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
-    io_uring_queue_exit(&io_uring_batch->ring);
+    auto& ring = io_uring_batch->ring;
+    // io_uring_queue_exit() does not wait for in-flight I/O, which would then
+    // land in staging buffers freed below, or in caller memory reused once the
+    // batch is freed: reap it first.
+    size_t outstanding = 0;
+    for (auto& task : io_uring_batch->task_list)
+        if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
+    waitForInFlight(&ring, outstanding);
+    io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;
     return Status::OK();
@@ -286,6 +328,10 @@ IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
 
     tl_file_context_map = file_context_map_;
     return tl_file_context_map[target_id].get();
+}
+
+Status IOUringTransport::copyMemory(void* dst, void* src, size_t length) {
+    return Platform::getLoader().copy(dst, src, length);
 }
 
 Status IOUringTransport::submitTransferTasks(
@@ -347,6 +393,20 @@ Status IOUringTransport::submitTransferTasks(
         return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
     }
 
+    // Finish every staged WRITE copy before the commit phase. A failed copy
+    // must leave the task list, SQ ring and file untouched so failover cannot
+    // submit uninitialized staging contents or replay an accepted WRITE.
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        const auto& request = request_list[i];
+        if (!staging_buffers[i] || request.opcode != Request::WRITE) continue;
+        auto copy_status =
+            copyMemory(staging_buffers[i], request.source, request.length);
+        if (!copy_status.ok()) {
+            releaseStagingBuffers(staging_pool_.get(), staging_buffers);
+            return copy_status;
+        }
+    }
+
     // Phase 2: commit. Tasks are appended and SQEs prepared; from here on
     // this call must not return an error. A positive short io_uring_submit()
     // means part of the batch is already in flight, and an error return
@@ -377,9 +437,6 @@ Status IOUringTransport::submitTransferTasks(
             io_uring_prep_readv(sqe, contexts[i]->getHandle(), &task.iov, 1,
                                 request.target_offset);
         } else {
-            if (task.buffer)
-                Platform::getLoader().copy(task.buffer, request.source,
-                                           request.length);
             io_uring_prep_writev(sqe, contexts[i]->getHandle(), &task.iov, 1,
                                  request.target_offset);
         }
@@ -432,18 +489,27 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             } else {
                 const size_t completed_bytes = static_cast<size_t>(cqe->res);
                 // A nonnegative CQE may still be short, including EOF. Only
-                // copy the prefix actually read from the file.
+                // copy the prefix actually read from the file. The file I/O is
+                // complete, but a failed copyback means the caller cannot
+                // consume the requested data as a successful read.
+                Status copy_status;
                 if (cqe_task->buffer && completed_bytes != 0 &&
                     cqe_task->request.opcode == Request::READ) {
-                    Platform::getLoader().copy(cqe_task->request.source,
-                                               cqe_task->buffer,
-                                               completed_bytes);
+                    copy_status = copyMemory(cqe_task->request.source,
+                                             cqe_task->buffer, completed_bytes);
                 }
-                cqe_task->transferred_bytes = completed_bytes;
-                cqe_task->status_word =
-                    completed_bytes == cqe_task->request.length
-                        ? TransferStatusEnum::COMPLETED
-                        : TransferStatusEnum::FAILED;
+                if (!copy_status.ok()) {
+                    LOG(WARNING) << "IOUringTransport: READ copyback failed: "
+                                 << copy_status.ToString();
+                    cqe_task->transferred_bytes = 0;
+                    cqe_task->status_word = TransferStatusEnum::FAILED;
+                } else {
+                    cqe_task->transferred_bytes = completed_bytes;
+                    cqe_task->status_word =
+                        completed_bytes == cqe_task->request.length
+                            ? TransferStatusEnum::COMPLETED
+                            : TransferStatusEnum::FAILED;
+                }
             }
             cqe_task->releaseBuffer();
         }

@@ -71,38 +71,33 @@ struct RdmaRoute::State {
     uint32_t qps_per_rank = 0;
     uint32_t num_qps = 0;
     std::vector<PeerConnection> peers;
+    std::vector<std::optional<DeviceTransferEndpoint>> endpoints;
 };
 
 RdmaRoute::RdmaRoute(GlobalRank self_rank, uint32_t max_world_size,
-                     RdmaRouteOptions options)
-    : self_rank_(self_rank),
+                     std::unique_ptr<State> state)
+    : RouteProvider(DeviceRouteType::Rdma, kRouteKey, kEndpointVersion),
+      self_rank_(self_rank),
       max_world_size_(max_world_size),
-      options_(std::move(options)) {}
+      state_(std::move(state)) {}
 
-RdmaRoute::~RdmaRoute() noexcept {
-    auto result = shutdown();
-    if (!result.has_value()) {
-        LOG(ERROR) << "RDMA route shutdown failed during destruction: "
-                   << result.error().message;
-    }
-}
-
-PGResult<void> RdmaRoute::initialize(int device_index, cudaStream_t stream) {
+PGResult<std::unique_ptr<RdmaRoute>> RdmaRoute::create(
+    int device_index, cudaStream_t stream, GlobalRank self_rank,
+    uint32_t max_world_size, const RdmaRouteOptions& options) {
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
     auto state = std::make_unique<State>();
     state->device_index = device_index;
     state->stream = stream;
-    state->qps_per_rank = qpsPerRank(max_world_size_);
-    state->num_qps = max_world_size_ * state->qps_per_rank;
-    state->peers.resize(max_world_size_);
+    state->qps_per_rank = qpsPerRank(max_world_size);
+    state->num_qps = max_world_size * state->qps_per_rank;
+    state->peers.resize(max_world_size);
     state->transport =
-        device::createIbgdaDeviceTransport(options_.device_filter);
+        device::createIbgdaDeviceTransport(options.device_filter);
     if (!state->transport) {
         return makePGError(PGErrorCode::NotSupported,
                            "device-initiated RDMA transport is unavailable");
     }
-    PG_TRY_TE(state->transport->initialize("",
-                                           static_cast<int>(max_world_size_),
+    PG_TRY_TE(state->transport->initialize("", static_cast<int>(max_world_size),
                                            static_cast<int>(state->num_qps)));
     PG_TRY_TE(state->transport->allocateControlBuffer());
     PG_TRY_TE(state->transport->createQueuePairs(stream));
@@ -112,37 +107,19 @@ PGResult<void> RdmaRoute::initialize(int device_index, cudaStream_t stream) {
                            atomic_sink_bytes));
     PG_TRY_TE(state->transport->registerMemory(
         state->atomic_sink, atomic_sink_bytes, state->atomic_sink_region));
-    state_ = std::move(state);
     LOG(INFO) << "[PG] Device-initiated RDMA route initialized with "
-              << state_->qps_per_rank << " QPs per rank";
-    return {};
+              << state->qps_per_rank << " QPs per rank";
+    return std::unique_ptr<RdmaRoute>(
+        new RdmaRoute(self_rank, max_world_size, std::move(state)));
 }
 
-DeviceRdmaContext RdmaRoute::deviceContext() const noexcept {
-    if (!state_) return {};
-    return DeviceRdmaContext{
-        .qp_devctxs = state_->transport->qpDevCtxsPtr(),
-        .peer_accessible_region =
-            {
-                .addr = state_->peer_accessible_region.addr,
-                .size = state_->peer_accessible_region.size,
-            },
-        .local_staging_region =
-            {
-                .addr = state_->local_staging_region.addr,
-                .size = state_->local_staging_region.size,
-            },
-        .peer_accessible_lkey = state_->peer_accessible_region.lkey,
-        .local_staging_lkey = state_->local_staging_region.lkey,
-        .qps_per_rank = state_->qps_per_rank,
-        .atomic_sink = state_->atomic_sink,
-        .atomic_sink_lkey = state_->atomic_sink_region.lkey,
-    };
+RdmaRoute::~RdmaRoute() noexcept {
+    auto result = shutdown();
+    if (!result.has_value()) {
+        LOG(ERROR) << "RDMA route shutdown failed during destruction: "
+                   << result.error().message;
+    }
 }
-
-std::string_view RdmaRoute::routeKey() const noexcept { return kRouteKey; }
-
-uint32_t RdmaRoute::routeVersion() const noexcept { return kEndpointVersion; }
 
 PGResult<void> RdmaRoute::registerRegion(DeviceRegionKind kind, void* addr,
                                          size_t size) {
@@ -184,10 +161,16 @@ std::optional<RouteEndpoint> RdmaRoute::localEndpoint() {
     };
 }
 
-PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
-    std::span<const std::optional<DeviceTransferEndpoint>> endpoints) {
+PGResult<void> RdmaRoute::installEndpoints(
+    const DeviceTransferSnapshot& snapshot, uint64_t) {
+    if (state_) state_->endpoints = snapshot.endpoints;
+    return {};
+}
+
+PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::updateRoutes() {
     std::vector<DeviceTransferRoute> routes(max_world_size_);
     if (!state_) return routes;
+    const auto& endpoints = state_->endpoints;
 
     const auto local_metadata =
         state_->transport->localMetadata(state_->peer_accessible_region);
@@ -283,6 +266,28 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
     }
 
     return routes;
+}
+
+void RdmaRoute::fillDeviceContext(DeviceRouteContext& context) const noexcept {
+    if (!state_) return;
+    context.rdma = DeviceRdmaContext{
+        .qp_devctxs = state_->transport->qpDevCtxsPtr(),
+        .peer_accessible_region =
+            {
+                .addr = state_->peer_accessible_region.addr,
+                .size = state_->peer_accessible_region.size,
+            },
+        .local_staging_region =
+            {
+                .addr = state_->local_staging_region.addr,
+                .size = state_->local_staging_region.size,
+            },
+        .peer_accessible_lkey = state_->peer_accessible_region.lkey,
+        .local_staging_lkey = state_->local_staging_region.lkey,
+        .qps_per_rank = state_->qps_per_rank,
+        .atomic_sink = state_->atomic_sink,
+        .atomic_sink_lkey = state_->atomic_sink_region.lkey,
+    };
 }
 
 PGResult<void> RdmaRoute::shutdown() {

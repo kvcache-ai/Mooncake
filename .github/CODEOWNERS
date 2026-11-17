@@ -44,9 +44,22 @@
 /python/tests/ssd/ @ykwd @stmatengss
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc
-/mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov
+/mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @staryxchen @amd-arozanov
 /mooncake-transfer-engine/*/transport/ascend_transport/ @alogfans @ascend-direct-dev
 /mooncake-transfer-engine/*/transport/efa_transport/ @alogfans @whn09
+/mooncake-transfer-engine/tent/src/transport/hp_tcp/ @alogfans @staryxchen @jacklin78911-collab
+/mooncake-transfer-engine/tent/include/tent/transport/hp_tcp/ @alogfans @staryxchen @jacklin78911-collab
+/mooncake-transfer-engine/tent/src/runtime/hp_tcp_transport_config.cpp @alogfans @staryxchen @jacklin78911-collab
+/mooncake-transfer-engine/tent/include/tent/runtime/hp_tcp_transport_config.h @alogfans @staryxchen @jacklin78911-collab
+/mooncake-transfer-engine/tent/tests/hp_tcp_* @alogfans @staryxchen @jacklin78911-collab
+/mooncake-transfer-engine/*/transport/nvlink_transport/ @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/*/transport/intranode_nvlink_transport/ @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/tent/src/transport/nvlink/ @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/tent/include/tent/transport/nvlink/ @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/nvlink-allocator/ @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/include/gpu_vendor/intra_nvlink.h @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/tests/nvlink_* @alogfans @staryxchen @TTThanos
+/mooncake-transfer-engine/tent/tests/nvlink_* @alogfans @staryxchen @TTThanos
 /mooncake-wheel @ShangmingCai @stmatengss @zxpdemonio
 /scripts/tone_tests @luketong777
 /scripts/rocm_tests @andyluo7

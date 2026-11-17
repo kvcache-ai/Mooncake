@@ -372,6 +372,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ctx.segments = std::move(snapshot.segments);
         ctx.weight_metadata =
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
+        ctx.object_storage =
+            snapshot.object_storage.value_or(ObjectReplicaSnapshot{});
 
         return ctx;
     }

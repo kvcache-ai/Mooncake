@@ -293,8 +293,8 @@ DynamicReplicationController::SelectPlan(
     std::unordered_set<std::string> existing_segments;
     std::unordered_set<std::string> existing_hosts;
     std::vector<std::string> source_segments;
-    std::unordered_map<std::string, std::shared_ptr<ClientLivenessRecord>>
-        source_liveness_by_segment;
+    std::unordered_map<std::string, ClientSessionSharedPtr>
+        source_session_by_segment;
     size_t memory_replicas = 0;
 
     std::vector<std::pair<Segment, UUID>> segments;
@@ -313,14 +313,14 @@ DynamicReplicationController::SelectPlan(
         },
         [&](const Replica& replica) {
             memory_replicas++;
-            const auto liveness = replica.getClientLiveness();
+            const auto session = replica.getClientSession();
             for (const auto& segment_name : replica.get_segment_names()) {
                 if (!segment_name.has_value()) {
                     continue;
                 }
                 existing_segments.insert(*segment_name);
                 source_segments.push_back(*segment_name);
-                source_liveness_by_segment[*segment_name] = liveness;
+                source_session_by_segment[*segment_name] = session;
                 auto segment_it = segments_by_name.find(*segment_name);
                 if (segment_it != segments_by_name.end() &&
                     !segment_it->second.host_id.empty()) {
@@ -416,17 +416,16 @@ DynamicReplicationController::SelectPlan(
     if (!target_segment.has_value()) {
         return std::nullopt;
     }
-    const auto source_liveness =
-        source_liveness_by_segment.find(source_segment);
-    if (source_liveness == source_liveness_by_segment.end() ||
-        !source_liveness->second) {
+    const auto source_session = source_session_by_segment.find(source_segment);
+    if (source_session == source_session_by_segment.end() ||
+        !source_session->second) {
         return std::nullopt;
     }
     return Plan{
         .source_segment = source_segment,
         .target_segment = *target_segment,
         .target_domain = std::move(target_domain),
-        .source_liveness = source_liveness->second,
+        .source_session = source_session->second,
     };
 }
 
