@@ -867,6 +867,10 @@ class Client {
         return transfer_engine_ && !transfer_engine_->isUsingTent();
     }
 
+    [[nodiscard]] bool SupportsExternalBufferRegistration() const {
+        return owns_transfer_engine_ && SupportsStrictDirectRead();
+    }
+
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
         return SupportsStrictDirectRead() &&
                transfer_engine_->getTransport(protocol) != nullptr;
@@ -1210,6 +1214,7 @@ class Client {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
+    bool owns_transfer_engine_ = true;
     std::unique_ptr<store::GatherReadService> gather_service_;
     // Protects only gather_endpoint_; never held across an RPC.
     std::mutex gather_endpoint_mutex_;

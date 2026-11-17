@@ -1354,6 +1354,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             return std::nullopt;
         }
     } else {
+        client->owns_transfer_engine_ = false;
         client->transfer_engine_ = transfer_engine;
         LOG(INFO) << "Use existing transfer engine instance. Skip its "
                      "initialization.";

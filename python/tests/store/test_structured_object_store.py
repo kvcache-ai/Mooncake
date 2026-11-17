@@ -5525,3 +5525,16 @@ def test_dataproto_indexed_copy_fallback_handles_binary_int16_bytearray_and_shor
     store.objects[truncated_key] = store.objects[truncated_key][:-1]
     with pytest.raises(RuntimeError, match="expected 4 bytes, got 3"):
         transfer.get_dataproto(ref, rows=[0, 0])
+
+
+def test_bundle_buffer_pool_exposes_existing_transport_pool_readonly():
+    sentinel = object()
+    transfer = MooncakeBundleTransfer(object(), buffer_pool=sentinel)
+    assert transfer.buffer_pool is sentinel
+    with pytest.raises(AttributeError):
+        transfer.buffer_pool = None
+
+
+def test_bundle_buffer_pool_without_native_support_keeps_fallback():
+    transfer = MooncakeBundleTransfer(object())
+    assert transfer.buffer_pool is None

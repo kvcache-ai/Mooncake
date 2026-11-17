@@ -125,6 +125,11 @@ class RealClient : public PyClient {
 
     int register_buffer(void *buffer, size_t size);
 
+    bool supports_external_buffer_registration() const {
+        return client_ && client_->SupportsExternalBufferRegistration() &&
+               !nof_runtime_.initiator;
+    }
+
     int unregister_buffer(void *buffer);
 
     struct WritableBufferRegion {

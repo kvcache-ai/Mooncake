@@ -1,14 +1,18 @@
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 
 #include "buffer_pool.h"
 #include "python_buffer.h"
 
+#include <algorithm>
 #include <atomic>
+#include <vector>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -71,10 +75,31 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
     return unwrap_pyclient_capsule(store_obj.attr(kPyClientCapsuleMethod)());
 }
 
+struct ExternalOwner {
+    explicit ExternalOwner(const py::object &value)
+        : object(value.inc_ref().ptr()) {}
+    ExternalOwner(const ExternalOwner &) = delete;
+    ExternalOwner &operator=(const ExternalOwner &) = delete;
+    ~ExternalOwner() {
+        if (pinned || !Py_IsInitialized()) return;
+#if PY_VERSION_HEX >= 0x030D0000
+        if (Py_IsFinalizing()) return;
+#else
+        if (_Py_IsFinalizing()) return;
+#endif
+        py::gil_scoped_acquire gil;
+        Py_DECREF(object);
+    }
+    PyObject *object;
+    bool pinned =
+        false;  // Failure-only keepalive when an MR cannot be retired.
+};
+
 }  // namespace
 
 class BufferPoolNative;
 class BufferLeaseNative;
+class BufferBorrowNative;
 
 class BufferLeaseViewNative {
    public:
@@ -97,7 +122,8 @@ class BufferLeaseNative
    public:
     BufferLeaseNative(std::shared_ptr<BufferPoolNative> pool,
                       std::shared_ptr<BufferHandle> handle,
-                      size_t requested_size);
+                      size_t requested_size,
+                      std::shared_ptr<ExternalOwner> owner = {});
     ~BufferLeaseNative();
 
     BufferLeaseNative(const BufferLeaseNative &) = delete;
@@ -106,6 +132,10 @@ class BufferLeaseNative
     uintptr_t ptr() const;
     size_t size() const { return requested_size_; }
     py::object buffer();
+    py::object owner() const;
+    py::object store() const;
+    std::shared_ptr<BufferBorrowNative> borrow(size_t offset,
+                                               std::optional<size_t> size);
     void add_export();
     void release_export();
     BufferLeaseNative &enter() { return *this; }
@@ -115,13 +145,52 @@ class BufferLeaseNative
     void release();
 
    private:
-    void release_lease(bool check_exported_views);
+    friend class BufferPoolNative;
+    enum class State { Closed, Open, Releasing, CleanupPending };
 
     std::shared_ptr<BufferPoolNative> pool_;
     std::shared_ptr<BufferHandle> handle_;
     size_t requested_size_ = 0;
-    bool closed_ = false;
+    std::shared_ptr<ExternalOwner> owner_;
+    State state_ = State::Closed;
     std::atomic<size_t> exports_{0};
+};
+
+// Opaque byte range: unlike CPU lease views, it exposes no buffer protocol.
+class BufferBorrowNative {
+   public:
+    BufferBorrowNative(std::shared_ptr<BufferLeaseNative> lease, size_t offset,
+                       size_t size)
+        : lease_(std::move(lease)), offset_(offset), size_(size) {
+        lease_->add_export();
+    }
+    ~BufferBorrowNative() { release(); }
+    BufferBorrowNative(const BufferBorrowNative &) = delete;
+    BufferBorrowNative &operator=(const BufferBorrowNative &) = delete;
+    uintptr_t ptr() const { return parent()->ptr() + offset_; }
+    size_t size() const { return size_; }
+    py::object owner() const { return parent()->owner(); }
+    py::object store() const { return parent()->store(); }
+    void release() {
+        auto lease = std::move(lease_);
+        if (lease) lease->release_export();
+    }
+    BufferBorrowNative &enter() {
+        (void)parent();
+        return *this;
+    }
+    void exit(const py::object &, const py::object &, const py::object &) {
+        release();
+    }
+
+   private:
+    const std::shared_ptr<BufferLeaseNative> &parent() const {
+        if (!lease_) throw std::runtime_error("buffer borrow is closed");
+        return lease_;
+    }
+    std::shared_ptr<BufferLeaseNative> lease_;
+    size_t offset_;
+    size_t size_;
 };
 
 class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
@@ -134,6 +203,8 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
         try {
             close();
         } catch (...) {
+            for (const auto &[ptr, region] : regions_)
+                if (region.owner) region.owner->pinned = true;
         }
     }
 
@@ -144,6 +215,9 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
         return acquire(size, block, timeout);
     }
     void prewarm(size_t size, size_t count);
+    std::shared_ptr<BufferLeaseNative> register_external_region(
+        uintptr_t ptr, size_t size, py::object owner);
+    void retry_pending_external_registrations();
     void close();
 
    private:
@@ -151,6 +225,10 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
         std::shared_ptr<BufferHandle> handle;
         size_t size = 0;
         bool overflow_registered = false;
+        std::shared_ptr<ExternalOwner> owner;
+        std::weak_ptr<BufferLeaseNative> lease;
+        bool uncertain = false;
+        bool releasing = false;
     };
 
     friend class BufferLeaseNative;
@@ -161,7 +239,8 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
                                              size_t requested_size);
     std::shared_ptr<BufferHandle> allocate_overflow_unlocked(size_t size);
     void unregister_overflow_unlocked(const Region &region);
-    void release_internal(std::shared_ptr<BufferHandle> &handle);
+    void release_internal(const std::shared_ptr<BufferHandle> &handle);
+    void check_external_client() const;
     void reserve_locked(size_t size_class);
     void unreserve_locked(size_t size_class);
     std::pair<size_t, bool> allocation_size(size_t size) const;
@@ -189,6 +268,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
     size_t total_bytes_ = 0;
     size_t reserved_bytes_ = 0;
     size_t reserved_regions_ = 0;
+    size_t external_registering_ = 0;
     size_t acquire_count_ = 0;
     size_t allocate_count_ = 0;
     size_t oversize_allocate_count_ = 0;
@@ -217,30 +297,59 @@ int BufferLeaseViewNative::export_buffer(PyObject *self, Py_buffer *view,
 
 BufferLeaseNative::BufferLeaseNative(std::shared_ptr<BufferPoolNative> pool,
                                      std::shared_ptr<BufferHandle> handle,
-                                     size_t requested_size)
+                                     size_t requested_size,
+                                     std::shared_ptr<ExternalOwner> owner)
     : pool_(std::move(pool)),
       handle_(std::move(handle)),
-      requested_size_(requested_size) {}
+      requested_size_(requested_size),
+      owner_(std::move(owner)) {}
 
 BufferLeaseNative::~BufferLeaseNative() {
     try {
-        release_lease(false);
+        release();
     } catch (...) {
     }
 }
 
 uintptr_t BufferLeaseNative::ptr() const {
-    if (!handle_) throw std::runtime_error("buffer lease is closed");
+    if (state_ == State::Releasing)
+        throw std::runtime_error("buffer lease release is in progress");
+    if (state_ != State::Open)
+        throw std::runtime_error(
+            "buffer lease is closed or cleanup is pending");
     return reinterpret_cast<uintptr_t>(handle_->ptr());
 }
 
 py::object BufferLeaseNative::buffer() {
+    (void)ptr();
+    if (owner_) throw py::type_error("external buffer leases are opaque");
     auto view = std::make_shared<BufferLeaseViewNative>(shared_from_this(),
                                                         requested_size_);
     return py::memoryview(py::cast(view));
 }
 
+py::object BufferLeaseNative::owner() const {
+    return owner_ ? py::borrow<py::object>(owner_->object) : py::none();
+}
+
+py::object BufferLeaseNative::store() const {
+    return pool_ ? pool_->store_obj_ : py::none();
+}
+
+std::shared_ptr<BufferBorrowNative> BufferLeaseNative::borrow(
+    size_t offset, std::optional<size_t> size) {
+    if (owner_) pool_->check_external_client();
+    if (offset > requested_size_)
+        throw std::invalid_argument("borrow offset exceeds lease");
+    const size_t count = size.value_or(requested_size_ - offset);
+    if (count > requested_size_ - offset)
+        throw std::invalid_argument("borrow range exceeds lease");
+    return std::make_shared<BufferBorrowNative>(shared_from_this(), offset,
+                                                count);
+}
+
 void BufferLeaseNative::add_export() {
+    (void)ptr();
     exports_.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -248,20 +357,26 @@ void BufferLeaseNative::release_export() {
     exports_.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void BufferLeaseNative::release() { release_lease(true); }
-
-void BufferLeaseNative::release_lease(bool check_exported_views) {
-    if (closed_) return;
-    if (check_exported_views && exports_.load(std::memory_order_acquire) != 0) {
+void BufferLeaseNative::release() {
+    if (state_ == State::Closed) return;
+    if (state_ == State::Releasing)
+        throw std::runtime_error("buffer lease release is already in progress");
+    if (exports_.load(std::memory_order_acquire))
         throw std::runtime_error(
             "cannot release buffer while exported views exist");
-    }
     auto pool = pool_;
-    if (pool && handle_) {
-        pool->release_internal(handle_);
+    auto handle = handle_;
+    state_ = State::Releasing;
+    try {
+        pool->release_internal(handle);
+    } catch (...) {
+        state_ = State::CleanupPending;
+        throw;
     }
+    handle_.reset();
+    owner_.reset();
     pool_.reset();
-    closed_ = true;
+    state_ = State::Closed;
 }
 
 BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
@@ -359,6 +474,87 @@ void BufferPoolNative::prewarm(size_t size, size_t count) {
     (void)count;
 }
 
+void BufferPoolNative::check_external_client() const {
+    auto real = std::dynamic_pointer_cast<RealClient>(py_client_);
+    if (!real || unwrap_store(store_obj_) != py_client_ ||
+        !real->supports_external_buffer_registration())
+        throw std::runtime_error(
+            "external registration requires the original open private classic "
+            "Store");
+}
+
+std::shared_ptr<BufferLeaseNative> BufferPoolNative::register_external_region(
+    uintptr_t ptr, size_t size, py::object owner) {
+    check_external_client();
+    if (!ptr || !size || size > UINTPTR_MAX - ptr || owner.is_none())
+        throw std::invalid_argument(
+            "external registration requires a valid region and owner");
+    auto backing = std::make_shared<ExternalOwner>(owner);
+    auto handle = std::make_shared<BufferHandle>(reinterpret_cast<void *>(ptr),
+                                                 size, [backing] {});
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        raise_if_open_locked();
+        for (const auto &[base, existing] : regions_)
+            if (ptr <= base ? size > base - ptr : existing.size > ptr - base)
+                throw std::invalid_argument(
+                    "external region overlaps a pool region");
+        Region region{handle, size, true, backing};
+        region.uncertain = true;
+        regions_.emplace(ptr, std::move(region));
+        ++external_registering_;
+    }
+    int status = -1;
+    std::exception_ptr failure;
+    std::shared_ptr<BufferLeaseNative> lease;
+    try {
+        status = py::cast<int>(store_obj_.attr("register_buffer")(ptr, size));
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status == 0) {
+            auto &region = regions_.at(ptr);
+            region.uncertain = false;
+            if (!closed_ && !closing_) lease = make_lease_locked(region, size);
+        }
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    if (!lease) {
+        if (status == 0) {
+            try {
+                release_internal(handle);
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
+        } else {
+            // Failed registration can be ambiguous. Never unregister a
+            // possibly foreign MR; keep this allocation alive until exit.
+            backing->pinned = true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --external_registering_;
+        condition_.notify_all();
+    }
+    if (lease) return lease;
+    if (failure) std::rethrow_exception(failure);
+    throw std::runtime_error("external registration failed or pool closed: " +
+                             std::to_string(status));
+}
+
+void BufferPoolNative::retry_pending_external_registrations() {
+    std::vector<std::shared_ptr<BufferHandle>> pending;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (external_registering_)
+            throw std::runtime_error("external registration is in progress");
+        for (const auto &[ptr, region] : regions_)
+            if (region.owner && region.lease.expired())
+                pending.push_back(region.handle);
+    }
+    for (const auto &handle : pending) release_internal(handle);
+}
+
 void BufferPoolNative::close() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (closed_) return;
@@ -367,11 +563,25 @@ void BufferPoolNative::close() {
     {
         py::gil_scoped_release release_gil;
         lock.lock();
-        condition_.wait(lock, [&] { return reserved_regions_ == 0; });
+        condition_.wait(lock, [&] {
+            return reserved_regions_ == 0 && external_registering_ == 0;
+        });
         lock.unlock();
     }
+    try {
+        retry_pending_external_registrations();
+    } catch (...) {
+        lock.lock();
+        closing_ = false;
+        condition_.notify_all();
+        throw;
+    }
     lock.lock();
-    if (!in_use_.empty()) {
+    const bool external_in_use =
+        std::any_of(regions_.begin(), regions_.end(), [](const auto &entry) {
+            return entry.second.owner && !entry.second.lease.expired();
+        });
+    if (!in_use_.empty() || external_in_use) {
         closing_ = false;
         condition_.notify_all();
         throw std::runtime_error("cannot close buffer pool with active leases");
@@ -384,10 +594,15 @@ void BufferPoolNative::close() {
 std::shared_ptr<BufferLeaseNative> BufferPoolNative::make_lease_locked(
     Region region, size_t requested_size) {
     auto lease = std::make_shared<BufferLeaseNative>(
-        shared_from_this(), region.handle, requested_size);
+        shared_from_this(), region.handle, requested_size, region.owner);
     uintptr_t ptr = reinterpret_cast<uintptr_t>(region.handle->ptr());
-    in_use_.insert(ptr);
-    ++acquire_count_;
+    if (region.owner)
+        regions_.at(ptr).lease = lease;
+    else {
+        in_use_.insert(ptr);
+        ++acquire_count_;
+    }
+    lease->state_ = BufferLeaseNative::State::Open;
     return lease;
 }
 
@@ -490,6 +705,7 @@ std::shared_ptr<BufferHandle> BufferPoolNative::allocate_overflow_unlocked(
 
 void BufferPoolNative::unregister_overflow_unlocked(const Region &region) {
     py::gil_scoped_acquire acquire_gil;
+    if (region.owner) check_external_client();
     int ret = py::cast<int>(store_obj_.attr("unregister_buffer")(
         reinterpret_cast<uintptr_t>(region.handle->ptr())));
     if (ret != 0) {
@@ -497,26 +713,37 @@ void BufferPoolNative::unregister_overflow_unlocked(const Region &region) {
     }
 }
 
-void BufferPoolNative::release_internal(std::shared_ptr<BufferHandle> &handle) {
-    if (!handle) throw std::runtime_error("buffer lease is closed");
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
+void BufferPoolNative::release_internal(
+    const std::shared_ptr<BufferHandle> &handle) {
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
     Region region;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!in_use_.count(ptr)) {
-            throw std::runtime_error("buffer lease is not active");
+        auto found = regions_.find(ptr);
+        if (found == regions_.end() || found->second.releasing)
+            throw std::runtime_error("buffer region is closed or releasing");
+        if (found->second.uncertain)
+            throw std::runtime_error(
+                "external registration is uncertain; owner remains pinned");
+        found->second.releasing = true;
+        region = found->second;
+    }
+    try {
+        if (region.overflow_registered) unregister_overflow_unlocked(region);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        regions_.at(ptr).releasing = false;
+        throw;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!region.owner) {
+            total_bytes_ -= region.size;
+            in_use_.erase(ptr);
+            ++release_count_;
         }
-        region = regions_.at(ptr);
         regions_.erase(ptr);
-        if (total_bytes_ >= region.size) total_bytes_ -= region.size;
-        in_use_.erase(ptr);
-        ++release_count_;
     }
-    if (region.overflow_registered) {
-        unregister_overflow_unlocked(region);
-    }
-    region.handle.reset();
-    handle.reset();
     condition_.notify_all();
 }
 
@@ -578,11 +805,24 @@ void bind_buffer_pool(py::module_ &m) {
         .def_prop_ro("buffer", [](const py::object &self) {
             return py::memoryview(self);
         });
-
+    py::class_<BufferBorrowNative>(m, "BufferBorrow")
+        .def_prop_ro("ptr", &BufferBorrowNative::ptr)
+        .def_prop_ro("size", &BufferBorrowNative::size)
+        .def_prop_ro("owner", &BufferBorrowNative::owner)
+        .def_prop_ro("store", &BufferBorrowNative::store)
+        .def("release", &BufferBorrowNative::release)
+        .def("__enter__", &BufferBorrowNative::enter,
+             py::rv_policy::reference_internal)
+        .def("__exit__", &BufferBorrowNative::exit, py::arg("exc_type").none(),
+             py::arg("exc_value").none(), py::arg("traceback").none());
     py::class_<BufferLeaseNative>(m, "BufferLease")
         .def_prop_ro("ptr", &BufferLeaseNative::ptr)
         .def_prop_ro("size", &BufferLeaseNative::size)
         .def_prop_ro("buffer", &BufferLeaseNative::buffer)
+        .def_prop_ro("owner", &BufferLeaseNative::owner)
+        .def_prop_ro("store", &BufferLeaseNative::store)
+        .def("borrow", &BufferLeaseNative::borrow, py::arg("offset") = 0,
+             py::arg("size").none() = py::none())
         .def("release", &BufferLeaseNative::release)
         .def("__enter__", &BufferLeaseNative::enter,
              py::rv_policy::reference_internal)
@@ -623,6 +863,14 @@ void bind_buffer_pool(py::module_ &m) {
              py::arg("timeout").none() = py::none())
         .def("prewarm", &BufferPoolNative::prewarm, py::arg("size"),
              py::arg("count"))
+        .def("register_external_region",
+             &BufferPoolNative::register_external_region, py::arg("ptr"),
+             py::arg("size"), py::arg("owner"),
+             "Register caller-owned memory until lease release. Drain borrows "
+             "and release leases before closing the Store; do not "
+             "raw-register/unregister managed regions.")
+        .def("retry_pending_external_registrations",
+             &BufferPoolNative::retry_pending_external_registrations)
         .def("close", &BufferPoolNative::close);
 
     m.attr("RegisteredBufferPool") = py::object(m.attr("BufferPool"));
