@@ -34,6 +34,8 @@
 
 #if defined(USE_CUDA)
 #include <cuda_runtime.h>
+#elif defined(USE_MACA)
+#include "cuda_alike.h"
 #endif
 
 using mooncake::DmabufExport;
@@ -230,6 +232,81 @@ TEST(ExportDmabuf, GpuWholeAllocationWithUnalignedSize) {
     }
     RdmaContext::closeDmabufExport(exp);
     cudaFree(base);
+}
+
+#endif
+
+#if defined(USE_MACA)
+// MACA fine-grained allocations are GPU-backed but are reported as unified
+// memory. They must still use dma-buf registration, including the exporter
+// supplied offset required by ibv_reg_dmabuf_mr().
+static void check_maca_dmabuf_export(bool finegrained) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "no MACA device";
+
+    int original_device = 0;
+    ASSERT_EQ(mcGetDevice(&original_device), mcSuccess);
+
+    constexpr size_t kAlloc = 64ULL << 20;
+    void *base = nullptr;
+    const mcError_t alloc_status =
+        finegrained
+            ? mcExtMallocWithFlags(&base, kAlloc, mcDeviceMallocFinegrained)
+            : mcMalloc(&base, kAlloc);
+    ASSERT_EQ(alloc_status, mcSuccess);
+
+    const int caller_device =
+        devices > 1 ? (original_device + 1) % devices : original_device;
+    const mcError_t select_status = mcSetDevice(caller_device);
+    if (select_status != mcSuccess) {
+        EXPECT_EQ(mcSetDevice(original_device), mcSuccess);
+        EXPECT_EQ(mcFree(base), mcSuccess);
+        FAIL() << "failed to select caller device: " << select_status;
+    }
+
+    struct Range {
+        size_t offset;
+        size_t length;
+    };
+    const Range ranges[] = {
+        {0, kAlloc}, {16ULL << 20, 16ULL << 20}, {123, (4ULL << 20) + 12345}};
+    for (const auto &range : ranges) {
+        SCOPED_TRACE(::testing::Message() << "finegrained=" << finegrained
+                                          << " offset=" << range.offset
+                                          << " length=" << range.length);
+        DmabufExport exp;
+        const int ret = RdmaContext::exportDmabuf(
+            static_cast<char *>(base) + range.offset, range.length, exp);
+        int device_after_export = -1;
+        const mcError_t query_status = mcGetDevice(&device_after_export);
+        const off_t exported = exp.fd >= 0 ? lseek(exp.fd, 0, SEEK_END) : -1;
+        RdmaContext::closeDmabufExport(exp);
+
+        EXPECT_EQ(ret, 0);
+        EXPECT_EQ(exp.method, DmabufExport::Method::kDmabufReg);
+        EXPECT_GE(exported, 0);
+        if (exported >= 0) {
+            const auto size = static_cast<uint64_t>(exported);
+            EXPECT_LE(exp.offset, size);
+            if (exp.offset <= size) {
+                EXPECT_LE(range.length, size - exp.offset);
+            }
+        }
+        EXPECT_EQ(query_status, mcSuccess);
+        EXPECT_EQ(device_after_export, caller_device);
+    }
+
+    EXPECT_EQ(mcSetDevice(original_device), mcSuccess);
+    EXPECT_EQ(mcFree(base), mcSuccess);
+}
+
+TEST(ExportDmabuf, MacaDeviceAllocationExportsDmabuf) {
+    check_maca_dmabuf_export(false);
+}
+
+TEST(ExportDmabuf, MacaFinegrainedAllocationExportsDmabuf) {
+    check_maca_dmabuf_export(true);
 }
 #endif
 
