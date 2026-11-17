@@ -75,7 +75,7 @@ run() {
         --security-opt no-new-privileges \
         --security-opt "seccomp=$run_directory/output/seccomp.json" \
         --network none --ipc private --shm-size 2g \
-        --pids-limit 1024 --ulimit core=0 \
+        --pids-limit 2048 --ulimit core=0 \
         "${device_args[@]}" \
         --mount "type=bind,src=$run_directory/bundle,dst=/bundle,readonly" \
         --mount "type=bind,src=$source_directory,dst=/source,readonly" \
@@ -95,6 +95,35 @@ run() {
         --env HOME=/tmp/home --workdir /tmp \
         --entrypoint /bin/bash "$XPU_IMAGE" -c '
           set -eo pipefail
+                    collect_pid_diagnostics() {
+                        local counter path line
+                        {
+                            printf "logical_cpus="
+                            getconf _NPROCESSORS_ONLN || true
+                            printf "process_limit="
+                            ulimit -u
+                            for counter in pids.current pids.peak pids.events pids.max; do
+                                path="/sys/fs/cgroup/$counter"
+                                if [[ ! -r "$path" ]]; then
+                                    path="/sys/fs/cgroup/pids/$counter"
+                                fi
+                                printf "%s:\n" "$counter"
+                                if [[ -r "$path" ]]; then
+                                    while IFS= read -r line || [[ -n "$line" ]]; do
+                                        printf "%s\n" "$line"
+                                    done < "$path"
+                                else
+                                    printf "unavailable\n"
+                                fi
+                            done
+                        } > /output/pids.log
+                    }
+                    finish() {
+                        local status=$?
+                        collect_pid_diagnostics || true
+                        exit "$status"
+                    }
+                    trap finish EXIT
           mkdir -p "$HOME"
           python3 /control/e2e/python/verify_xpu_ci.py run /bundle /source /output
         ')

@@ -1301,6 +1301,7 @@ class ShellLifecycleTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             args = (run_directory / "docker.arguments").read_text().splitlines()
             self.assertEqual(args[args.index("--network") + 1], "none")
+            self.assertEqual(args[args.index("--pids-limit") + 1], "2048")
             for variable in (
                 "MOONCAKE_LOCAL_HOSTNAME=127.0.0.1",
                 "CCL_KVS_IFACE=lo",
@@ -1338,6 +1339,64 @@ class ShellLifecycleTest(unittest.TestCase):
                 "python3 /control/e2e/python/verify_xpu_ci.py run /bundle /source /output",
                 "\n".join(args),
             )
+
+    def test_pid_diagnostics_preserve_suite_status(self):
+        for layout in ("v2", "v1", "missing"):
+            for suite_status in (0, 7):
+                with (
+                    self.subTest(layout=layout, suite_status=suite_status),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    root = Path(temporary)
+                    environment = self.prepare_host(root)
+                    run_directory = Path(environment["RUN_DIRECTORY"])
+                    subprocess.run(
+                        ["bash", str(CORE_SCRIPT), "run"],
+                        cwd=root,
+                        env=environment,
+                        check=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    arguments = (run_directory / "docker.arguments").read_text()
+                    entrypoint = arguments.split("\n-c\n", 1)[1]
+                    cgroup = root / "cgroup"
+                    counters = cgroup / "pids" if layout == "v1" else cgroup
+                    counters.mkdir(parents=True)
+                    if layout != "missing":
+                        for name, value in (
+                            ("pids.current", "2"),
+                            ("pids.peak", "1134"),
+                            ("pids.events", "max 0"),
+                            ("pids.max", "2048"),
+                        ):
+                            (counters / name).write_text(value + "\n")
+                    output = run_directory / "output"
+                    entrypoint = entrypoint.replace("/sys/fs/cgroup", str(cgroup))
+                    entrypoint = entrypoint.replace(
+                        "/output/pids.log", str(output / "pids.log")
+                    )
+                    entrypoint = entrypoint.replace(
+                        "python3 /control/e2e/python/verify_xpu_ci.py run /bundle /source /output",
+                        f"exit {suite_status}",
+                    )
+                    result = subprocess.run(
+                        ["bash", "-c", entrypoint],
+                        env={**os.environ, "HOME": str(root / "home")},
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, suite_status, result.stderr)
+                    report = (output / "pids.log").read_text()
+                    self.assertIn("logical_cpus=", report)
+                    self.assertIn("process_limit=", report)
+                    if layout == "missing":
+                        self.assertEqual(report.count("unavailable"), 4)
+                    else:
+                        self.assertIn("pids.peak:\n1134\n", report)
+                        self.assertIn("pids.events:\nmax 0\n", report)
+                        self.assertIn("pids.max:\n2048\n", report)
 
     def test_fixed_runner_masks_need_no_lock_or_profile_variables(self):
         for mask, valid in (
