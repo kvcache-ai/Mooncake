@@ -608,12 +608,13 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
-    if (cuda_ipc_persistent_registration_ && ping_running_.exchange(false) &&
-        ping_thread_.joinable()) {
-        // Do not let reconnect replay a CUDA mapping after unmap has removed
-        // the daemon's entire context.
+    // Reconnection iterates SHM and CUDA registrations. Join it before
+    // unregistering buffers or releasing their mappings and FDs.
+    ping_running_ = false;
+    if (ping_thread_.joinable()) {
         ping_thread_.join();
     }
+
     void* local_buffer_base = local_buffer_base_;
     const auto unmap_result = unregister_shm();
     if (unmap_result == 0) {
@@ -638,12 +639,6 @@ int DummyClient::tearDownAll() {
         hot_cache_fd_ = -1;
     }
 
-    if (ping_running_) {
-        ping_running_ = false;
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
-        }
-    }
     connected_.store(false);
     last_ping_healthy_.store(false);
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);

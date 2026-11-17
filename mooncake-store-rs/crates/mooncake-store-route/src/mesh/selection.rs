@@ -74,6 +74,30 @@ pub(crate) fn authority_candidates(
     ))
 }
 
+pub(crate) fn owner_scan_authority_candidates(
+    membership: &dyn RouteMembershipProvider,
+    observer: &ClientLease,
+) -> Result<Vec<ClientLease>> {
+    let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
+    let leases = membership.live_clients(false, "owner_route_scan")?;
+    membership.reconcile_suspects(&leases);
+    Ok(deduplicate_authority_candidates(
+        leases
+            .into_iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active && route_capable(lease))
+            .filter(|lease| compatibility_matches(observer, lease))
+            .filter(|lease| {
+                route_scope.as_ref().is_none_or(|scope| {
+                    lease
+                        .endpoints
+                        .labels
+                        .get(ROUTE_SCOPE_LABEL)
+                        .is_some_and(|candidate| candidate == scope)
+                })
+            }),
+    ))
+}
+
 pub(crate) fn retained_authority_candidates(
     membership: &dyn RouteMembershipProvider,
     observer: &ClientLease,
@@ -242,6 +266,8 @@ mod tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, runtime: &ClientRuntimeId) -> bool {
             self.suspects.contains(runtime)
         }
@@ -376,6 +402,25 @@ mod tests {
         let result = authority_candidates(&membership, &observer, false).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].runtime.stable_id.0, "healthy-node");
+    }
+
+    #[test]
+    fn owner_scan_candidates_keep_active_suspect_authorities() {
+        let suspect = make_lease("suspect-node");
+        let healthy = make_lease("healthy-node");
+        let membership = TestMembership {
+            leases: vec![suspect.clone(), healthy.clone()],
+            suspects: vec![suspect.runtime.clone()],
+        };
+        let observer = make_lease("observer");
+        let result = owner_scan_authority_candidates(&membership, &observer).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|lease| lease.runtime.stable_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["healthy-node", "suspect-node"]
+        );
     }
 
     #[test]

@@ -666,6 +666,7 @@ class TransferEngineImpl {
    private:
     std::shared_ptr<Config> conf_;
     HpTcpTransportConfig hp_tcp_transport_config_;
+    MnnvlConfig mnnvl_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;
