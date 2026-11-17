@@ -179,6 +179,53 @@ TEST_F(RedisHaKvProtocolTest, ShardsIsPreferredAndConfirmsOnWriteConnection) {
     EXPECT_EQ("WAIT", peer.commands()[3][0]);
 }
 
+TEST_F(RedisHaKvProtocolTest, ShardsResolvesUnknownNodeEndpointsPerContract) {
+    using Client = ha::common::redis::RedisClusterClient;
+    const auto rewrite = [](std::string topology, const std::string& from,
+                            const std::string& to) {
+        for (auto at = topology.find(from); at != std::string::npos;) {
+            topology.replace(at, from.size(), to);
+            at = topology.find(from, at + to.size());
+        }
+        return topology;
+    };
+    // A NULL endpoint (and an absent ip/hostname) resolves to the endpoint
+    // that answered the request, keeping each node's own port.
+    const auto unknown =
+        rewrite(ShardsTopology(), "$9\r\n127.0.0.1\r\n", "$-1\r\n");
+    {
+        ScriptedRedisPeer peer(
+            {unknown, unknown, "*1\r\n:1\r\n", ":2\r\n", unknown}, {}, false,
+            true);
+        RedisHaKvBackend backend({.replicas_required = 2});
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Connect("redis+cluster://" + peer.endpoint()));
+        EXPECT_EQ(KvWriteStatus::kCommitted,
+                  backend.PutWithResult("/oplog/bar/key", "value").status);
+        peer.Join();
+        ASSERT_EQ(5u, peer.commands().size());
+        EXPECT_EQ("EVAL", peer.commands()[2][0]);
+        EXPECT_EQ("WAIT", peer.commands()[3][0]);
+    }
+    // "?" marks an unknown node, so it must not alias the queried endpoint.
+    const auto marker =
+        rewrite(ShardsTopology(), "$9\r\n127.0.0.1\r\n", "$1\r\n?\r\n");
+    {
+        ScriptedRedisPeer peer({marker, Topology()}, {}, false, true);
+        {
+            Client client;
+            const auto result =
+                client.ConnectDetailed("redis+cluster://" + peer.endpoint(), 2);
+            EXPECT_NE(ErrorCode::OK, result.error);
+            EXPECT_EQ(Client::RoutingError::InvalidTopology,
+                      result.routing_error);
+        }
+        // The client closed its socket; no need to wait out the peer timeout.
+        peer.Join();
+        ASSERT_EQ(1u, peer.commands().size());
+    }
+}
+
 TEST_F(RedisHaKvProtocolTest, ShardsIncludesSlotlessAskTarget) {
     ScriptedRedisPeer target({"+OK\r\n", "*1\r\n:1\r\n", ":2\r\n"}, {}, false,
                              true);

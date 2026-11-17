@@ -229,10 +229,15 @@ RedisReplyPtr RedisClusterClient::Run(redisContext* context,
 #endif
 }
 
-bool RedisClusterClient::ParseShards(const redisReply* reply) {
+bool RedisClusterClient::ParseShards(const redisReply* reply,
+                                     std::string_view discovery_endpoint) {
 #ifdef STORE_USE_REDIS
     if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements == 0)
         return false;
+    // A NULL or empty advertised endpoint means "the endpoint that answered
+    // this request, with this node's own port"; "?" means an unknown node and
+    // must not be resolved that way.
+    const auto discovery = ParseRedisEndpoint(discovery_endpoint);
     std::array<Shard, 16384> next;
     std::map<std::string, Shard> shards;
     std::set<std::string> ids, addresses;
@@ -258,8 +263,12 @@ bool RedisClusterClient::ParseShards(const redisReply* reply) {
             const auto role = Bytes(node["role"]);
             const auto health = Bytes(node["health"]);
             auto host = Bytes(node["endpoint"]);
+            const bool endpoint_unknown = host.empty();
             if (host.empty() || host == "?") host = Bytes(node["ip"]);
             if (host.empty() || host == "?") host = Bytes(node["hostname"]);
+            // "?" must stay unknown instead of aliasing the queried node.
+            if (host.empty() && endpoint_unknown && discovery)
+                host = discovery->host;
             const auto* port = node["port"];
             if (id.empty() || host.empty() || host == "?" || !port ||
                 port->type != REDIS_REPLY_INTEGER || port->integer < 1 ||
@@ -316,6 +325,7 @@ bool RedisClusterClient::ParseShards(const redisReply* reply) {
     return true;
 #else
     (void)reply;
+    (void)discovery_endpoint;
     return false;
 #endif
 }
@@ -342,7 +352,7 @@ ErrorCode RedisClusterClient::Refresh() {
     for (const auto& endpoint : candidates) {
         if (!slots_only_endpoints_.count(endpoint)) {
             auto reply = Run(Connection(endpoint), {"CLUSTER", "SHARDS"});
-            if (ParseShards(reply.get())) return ErrorCode::OK;
+            if (ParseShards(reply.get(), endpoint)) return ErrorCode::OK;
             // Malformed topology, ACL errors and transport failures must not
             // silently switch to a weaker discovery protocol.
             if (!ShardsUnsupported(reply.get())) {

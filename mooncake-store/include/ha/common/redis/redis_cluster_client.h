@@ -73,7 +73,8 @@ class RedisClusterClient {
     ErrorCode Refresh();
     ErrorCode ConnectLocked(std::string connstring, size_t expected_replicas,
                             bool read_only);
-    bool ParseShards(const redisReply* reply);
+    bool ParseShards(const redisReply* reply,
+                     std::string_view discovery_endpoint);
     // CLUSTER SLOTS omits primaries without slots. Verify ASK targets through
     // CLUSTER NODES before permitting a write on such a primary.
     std::optional<Shard> SlotlessShard(const std::string& endpoint);
