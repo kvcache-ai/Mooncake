@@ -29,6 +29,7 @@ import numpy as np
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
 from mooncake._tensor_destination import (
     TensorDestination,
+    _validate_direct_alignment,
     tensor_destination as tensor_destination,
     validate_schema_destination,
     validate_tensor_destinations,
@@ -109,16 +110,7 @@ class FieldSchema:
     def __post_init__(self) -> None:
         if self.direct_alignment is None:
             return
-        alignment = self.direct_alignment
-        if (
-            isinstance(alignment, bool)
-            or not isinstance(alignment, int)
-            or alignment <= 0
-            or alignment & (alignment - 1)
-        ):
-            raise ValueError(
-                "FieldSchema direct_alignment must be a positive power of two"
-            )
+        _validate_direct_alignment(self.direct_alignment)
         if self.codec != "torch_tensor":
             raise ValueError("direct_alignment requires the torch_tensor codec")
 
@@ -604,6 +596,11 @@ class MooncakeBundleTransfer:
             default_chunk_bytes=self.default_chunk_bytes,
         )
         self._structured_store = _StructuredObjectLayer(self._bundle_store)
+
+    @property
+    def buffer_pool(self) -> Any:
+        """The existing transport pool, or None when the store has no pool support."""
+        return self._transport._ensure_buffer_pool()
 
     def _new_storage_group_id(self, config: Any) -> str | None:
         raw_group_ids = getattr(config, "group_ids", None)
@@ -1232,7 +1229,9 @@ class MooncakeBundleTransfer:
     ) -> Any:
         manifest = self._bundle_store.resolve_manifest(stage_ref)
         metadata = _decode_structured_metadata(
-            self._bundle_store.read_payload(manifest["meta"])
+            self._bundle_store.read_payload(
+                manifest["meta"], prefer_pool=isinstance(destination, TensorDestination)
+            )
         )
         field_spec = _structured_field_specs(metadata).get(
             member, {"encoding": "bytes"}
@@ -1337,7 +1336,7 @@ class MooncakeBundleTransfer:
     ) -> Any:
         if isinstance(destination, TensorDestination):
             return self._structured_store._read_tensor_destination(
-                name, payload_spec, field_spec, destination, indices
+                payload_spec, field_spec, destination, indices
             )
         if payload_spec.get("format") == "torch_save":
             if destination is not None:
@@ -1359,14 +1358,13 @@ class MooncakeBundleTransfer:
             raise ValueError(
                 "structured tensor indexed read requires at least one dimension"
             )
-        row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
-        data_length = len(indices) * row_width
+        output_shape, data_length, ranges = _plan_tensor_rows(
+            shape, element_size, metadata_bytes, indices
+        )
         metadata = self._bundle_store.read_payload_range(
             payload_spec, 0, metadata_bytes
         )
-        sliced_metadata = _slice_tensor_metadata(
-            metadata, (len(indices), *shape[1:]), data_length
-        )
+        sliced_metadata = _slice_tensor_metadata(metadata, output_shape, data_length)
         if destination is not None:
             if not isinstance(
                 destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)
@@ -1381,30 +1379,24 @@ class MooncakeBundleTransfer:
                 )
             ctypes.memmove(destination.ptr, sliced_metadata, metadata_bytes)
             if data_length:
-                ranges = [
-                    (
-                        metadata_bytes + row * row_width,
-                        metadata_bytes + out * row_width,
-                        row_width,
-                    )
-                    for out, row in enumerate(indices)
-                ]
                 if (
                     isinstance(destination, _RawDestinationBuffer)
                     and destination.pre_registered
                 ):
                     self._bundle_store.read_payload_ranges_into_raw_destination(
-                        payload_spec, destination.ptr, ranges
+                        payload_spec,
+                        destination.ptr,
+                        [
+                            (source, metadata_bytes + target, size)
+                            for source, target, size in ranges
+                        ],
                     )
                 else:
                     data = bytearray(data_length)
                     self._bundle_store.read_payload_ranges_into_bytearray(
                         payload_spec,
                         data,
-                        [
-                            (source_offset, destination_offset - metadata_bytes, size)
-                            for source_offset, destination_offset, size in ranges
-                        ],
+                        ranges,
                     )
                     ctypes.memmove(
                         destination.ptr + metadata_bytes, bytes(data), data_length
@@ -1416,10 +1408,7 @@ class MooncakeBundleTransfer:
             self._bundle_store.read_payload_ranges_into_bytearray(
                 payload_spec,
                 data,
-                [
-                    (metadata_bytes + row * row_width, out * row_width, row_width)
-                    for out, row in enumerate(indices)
-                ],
+                ranges,
             )
         return _deserialize_tensor_payload(sliced_metadata + data)
 
@@ -3770,9 +3759,15 @@ class _StructuredObjectLayer:
         spec: StructuredObjectReadSpec,
         destinations: Optional[Mapping[str, Any]],
     ) -> StructuredObjectResult:
-        metadata, buffers, selected = self._resolve_structured_read(spec)
-        field_specs = _structured_field_specs(metadata)
         destination_map = destinations or {}
+        metadata, buffers, selected = self._resolve_structured_read(
+            spec,
+            prefer_pool=any(
+                isinstance(value, TensorDestination)
+                for value in destination_map.values()
+            ),
+        )
+        field_specs = _structured_field_specs(metadata)
         validate_tensor_destinations(destination_map)
         member_slices = dict(spec.member_slices)
         objects = {
@@ -3868,12 +3863,14 @@ class _StructuredObjectLayer:
     def _resolve_structured_read(
         self,
         spec: StructuredObjectReadSpec,
+        *,
+        prefer_pool: bool = False,
     ) -> tuple[dict[str, Any], Mapping[str, Any], list[str]]:
         if spec.member_names is not None and not spec.member_names:
             raise ValueError("structured read spec selected no members")
         manifest = self._bundle_store.resolve_manifest(spec.ref)
         metadata = _decode_structured_metadata(
-            self._bundle_store.read_payload(manifest["meta"])
+            self._bundle_store.read_payload(manifest["meta"], prefer_pool=prefer_pool)
         )
         buffers = manifest["buffers"]
         selected = (
@@ -3925,7 +3922,7 @@ class _StructuredObjectLayer:
     ) -> Any:
         if isinstance(destination, TensorDestination):
             return self._read_tensor_destination(
-                name, payload_spec, field_spec, destination, member_slice
+                payload_spec, field_spec, destination, member_slice
             )
         if field_spec.get("nested"):
             if destination is not None:
@@ -3970,7 +3967,6 @@ class _StructuredObjectLayer:
 
     def _read_tensor_destination(
         self,
-        name: str,
         payload_spec: Mapping[str, Any],
         field_spec: Mapping[str, Any],
         destination: TensorDestination,
@@ -4012,22 +4008,15 @@ class _StructuredObjectLayer:
             indices = range(*_normalized_member_slice(indices, shape[0]))
         if indices is not None and not shape:
             raise ValueError("direct indexed tensor read requires a batch dimension")
-        output_shape = shape if indices is None else [len(indices), *shape[1:]]
-        nbytes = destination.validate(field_spec, output_shape)
+        if indices is not None and any(row < 0 or row >= shape[0] for row in indices):
+            raise ValueError("direct tensor row index is out of bounds")
+        output_shape, _, ranges = _plan_tensor_rows(
+            shape, destination.tensor.element_size(), metadata_bytes, indices
+        )
+        destination.validate(field_spec, output_shape)
         stored_bytes = math.prod(shape) * destination.tensor.element_size()
         if int(payload_spec["bytes"]) != metadata_bytes + stored_bytes:
             raise ValueError("direct tensor payload byte length differs from schema")
-        if indices is None:
-            ranges = [(metadata_bytes, 0, nbytes)] if nbytes else []
-        else:
-            row_bytes = math.prod(shape[1:]) * destination.tensor.element_size()
-            if any(row < 0 or row >= shape[0] for row in indices):
-                raise ValueError("direct tensor row index is out of bounds")
-            ranges = [
-                (metadata_bytes + row * row_bytes, out * row_bytes, row_bytes)
-                for out, row in enumerate(indices)
-                if row_bytes
-            ]
         transport = self._bundle_store._transport
         if not callable(transport._get_into_ranges):
             raise RuntimeError(
@@ -4084,15 +4073,14 @@ class _StructuredObjectLayer:
         start, end, step = _normalized_member_slice(member_slice, int(shape[0]))
         if step != 1:
             raise ValueError("structured tensor slicing currently requires step=1")
-        row_width = element_size * int(np.prod(shape[1:], dtype=np.int64))
-        data_offset = metadata_bytes + start * row_width
-        data_length = (end - start) * row_width
+        output_shape, data_length, ranges = _plan_tensor_rows(
+            shape, element_size, metadata_bytes, range(start, end)
+        )
+        data_offset = ranges[0][0] if ranges else metadata_bytes
         metadata = self._bundle_store.read_payload_range(
             payload_spec, 0, metadata_bytes
         )
-        sliced_metadata = _slice_tensor_metadata(
-            metadata, (end - start, *shape[1:]), data_length
-        )
+        sliced_metadata = _slice_tensor_metadata(metadata, output_shape, data_length)
         if destination is not None:
             if not isinstance(
                 destination, (_TensorObjectBufferPayload, _RawDestinationBuffer)
@@ -4438,8 +4426,10 @@ class _BundleManifestStore:
         self._validate_manifest(manifest)
         return manifest
 
-    def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
-        return self._transport.read_payload(payload_spec)
+    def read_payload(
+        self, payload_spec: Mapping[str, Any], *, prefer_pool: bool = False
+    ) -> bytes:
+        return self._transport.read_payload(payload_spec, prefer_pool=prefer_pool)
 
     def read_payload_range(
         self, payload_spec: Mapping[str, Any], byte_offset: int, byte_length: int
@@ -5030,10 +5020,21 @@ class _MooncakePayloadTransport:
             config,
         )
 
-    def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
+    def read_payload(
+        self, payload_spec: Mapping[str, Any], *, prefer_pool: bool = False
+    ) -> bytes:
         expected_bytes = int(payload_spec["bytes"])
         if expected_bytes == 0:
             return b""
+        if prefer_pool and callable(self._get_into_ranges):
+            # Direct destinations read metadata through this bytes path. Reuse pool memory
+            # instead of registering a fresh bytearray for every small GET.
+            pooled = self.read_payload_ranges_batch(
+                [(payload_spec, [(0, 0, expected_bytes)])],
+                max_fragments=len(payload_spec["chunks"]),
+            )
+            if pooled is not None:
+                return pooled[0]
         data = bytearray(expected_bytes)
         self.read_payload_into(payload_spec, data)
         return bytes(data)
@@ -7077,6 +7078,25 @@ def _nested_tensor_from_parts(
         min_seqlen=min_seqlen,
         max_seqlen=max_seqlen,
     )
+
+
+def _plan_tensor_rows(shape, element_size, metadata_bytes, rows):
+    """Plan payload ranges; encoded destinations add their header offset later."""
+    output_shape = tuple(shape) if rows is None else (len(rows), *shape[1:])
+    nbytes = math.prod(output_shape) * element_size
+    row_bytes = math.prod(shape[1:]) * element_size
+    if not nbytes:
+        ranges = []
+    elif rows is None:
+        ranges = [(metadata_bytes, 0, nbytes)]
+    elif isinstance(rows, range) and rows.step == 1:
+        ranges = [(metadata_bytes + rows.start * row_bytes, 0, nbytes)]
+    else:
+        ranges = [
+            (metadata_bytes + row * row_bytes, out * row_bytes, row_bytes)
+            for out, row in enumerate(rows)
+        ]
+    return output_shape, nbytes, ranges
 
 
 def _slice_tensor_metadata(

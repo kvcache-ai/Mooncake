@@ -13,20 +13,39 @@ from mooncake.structured_object_store import (  # noqa: E402
 from test_structured_object_store import NoTensorFastPathStore, make_transfer  # noqa: E402
 
 
+DIRECT_SCHEMA = {"value": FieldSchema(codec="torch_tensor", direct_alignment=64)}
+
+
 class DirectStore(NoTensorFastPathStore):
     def get_into_ranges(self, *args, require_direct=False):
         assert require_direct is True
         return super().get_into_ranges(*args)
 
 
-def aligned_tensor(shape, alignment=64):
-    size = torch.empty([], dtype=torch.int32).element_size()
-    count = 1
-    for dim in shape:
-        count *= dim
+def put_direct(transfer, value, **options):
+    return transfer.put(
+        {"value": value}, type="dict", field_schemas=DIRECT_SCHEMA, **options
+    )
+
+
+def read_direct(transfer, ref, target, **options):
+    result = transfer.get(
+        ref,
+        type="dict",
+        destinations={
+            "value": tensor_destination(target, alignment=64, pre_registered=True)
+        },
+        **options,
+    )
+    assert result["value"] is target
+
+
+def aligned_tensor(shape, alignment=64, dtype=torch.int32):
+    size = torch.empty([], dtype=dtype).element_size()
+    count = torch.Size(shape).numel()
     backing = torch.empty(count * size + alignment, dtype=torch.uint8)
     offset = -backing.data_ptr() % alignment
-    return backing[offset : offset + count * size].view(torch.int32).view(shape)
+    return backing[offset : offset + count * size].view(dtype).view(shape)
 
 
 @pytest.mark.parametrize("mode", ["copy", "auto"])
@@ -37,27 +56,14 @@ def test_direct_tensor_payload_uses_caller_tensor_without_deserialization(
     store, transfer = make_transfer(DirectStore())
     source = torch.full((3, 2, 16), -1, dtype=torch.int32)
     source[..., :9] = torch.arange(54, dtype=torch.int32).view(3, 2, 9)
-    ref = transfer.put(
-        {"value": source},
-        type="dict",
-        policy=BundleTransferPolicy(copy_mode=mode),
-        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=64)},
-    )
+    ref = put_direct(transfer, source, policy=BundleTransferPolicy(copy_mode=mode))
     expected = source if rows is None else source[rows]
     target = aligned_tensor(expected.shape)
     monkeypatch.setattr(
         "mooncake.structured_object_store._deserialize_tensor_payload",
         lambda *_: pytest.fail("direct payload must not be deserialized"),
     )
-    result = transfer.get(
-        ref,
-        type="dict",
-        rows=rows,
-        destinations={
-            "value": tensor_destination(target, alignment=64, pre_registered=True)
-        },
-    )
-    assert result["value"] is target
+    read_direct(transfer, ref, target, rows=rows)
     torch.testing.assert_close(target, expected)
     assert target.data_ptr() % 64 == 0
     assert store.get_tensor_calls == 0
@@ -101,11 +107,11 @@ def test_direct_tensor_read_fails_without_staging(change):
     assert store.get_into_ranges_calls == 0
 
 
-def test_tensor_destination_rejects_mutation_after_registration():
+def test_tensor_destination_revalidates_current_layout():
     target = aligned_tensor((2, 16))
     destination = tensor_destination(target, alignment=64, pre_registered=True)
     target.as_strided_((2, 16), (1, 2))
-    with pytest.raises(ValueError, match="changed since registration"):
+    with pytest.raises(ValueError, match="contiguous"):
         destination.validate(
             {"encoding": "torch_tensor", "dtype": "torch.int32", "element_size": 4},
             (2, 16),
@@ -154,13 +160,7 @@ def test_only_declared_schema_enables_direct_reads(monkeypatch):
             },
         )
     torch.testing.assert_close(transfer.get(plain, type="dict")["value"], source)
-    special = transfer.put(
-        {"value": source},
-        type="dict",
-        field_schemas={
-            "value": FieldSchema(codec="torch_tensor", direct_alignment=64),
-        },
-    )
+    special = put_direct(transfer, source)
     with pytest.raises(ValueError, match="registered tensor destination"):
         transfer.get(special, type="dict")
     with pytest.raises(ValueError, match="weaker than its schema"):
@@ -187,9 +187,7 @@ def test_structured_schema_requires_dense_tensors():
         transfer.put_structured_object(
             StructuredObjectPayload(
                 buffers={"value": b"abc"},
-                field_schemas={
-                    "value": FieldSchema(codec="torch_tensor", direct_alignment=64)
-                },
+                field_schemas=DIRECT_SCHEMA,
             )
         )
 
@@ -197,13 +195,7 @@ def test_structured_schema_requires_dense_tensors():
 def test_direct_scatter_keeps_schema_alignment_on_output_allocation():
     store, transfer = make_transfer(DirectStore())
     source = torch.arange(6, dtype=torch.int32).view(3, 2)
-    ref = transfer.put(
-        {"value": source},
-        type="dict",
-        field_schemas={
-            "value": FieldSchema(codec="torch_tensor", direct_alignment=64),
-        },
-    )
+    ref = put_direct(transfer, source)
     allocation = aligned_tensor((3, 2))
     destination = tensor_destination(
         allocation[1:], alignment=64, pre_registered=True, allocation=allocation
@@ -252,12 +244,12 @@ def test_direct_destination_rejects_logical_allocation_root():
         )
 
 
-def test_direct_destination_detects_logical_flag_mutation():
+def test_direct_destination_revalidates_logical_flags():
     root = aligned_tensor((2, 4))
     destination = tensor_destination(root, alignment=64, pre_registered=True)
     torch._C._set_neg(root, True)
     try:
-        with pytest.raises(ValueError, match="changed since registration"):
+        with pytest.raises(ValueError, match="unresolved"):
             destination.validate(
                 {
                     "encoding": "torch_tensor",
@@ -300,9 +292,7 @@ def test_direct_writer_rejects_unreadable_payload_before_publishing(
         transfer.put_structured_object(
             StructuredObjectPayload(
                 buffers={"value": value},
-                field_schemas={
-                    "value": FieldSchema(codec="torch_tensor", direct_alignment=64)
-                },
+                field_schemas=DIRECT_SCHEMA,
             ),
             policy=BundleTransferPolicy(copy_mode=mode),
         )
@@ -318,13 +308,11 @@ def test_direct_schema_empty_dimensions_and_dtypes(dtype, shape):
         {"batch": {"value": source}},
         type="dataproto",
         policy=BundleTransferPolicy(copy_mode="copy"),
-        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=64)},
+        field_schemas=DIRECT_SCHEMA,
     )
     rows = list(range(shape[0] - 1, -1, -1))
     count = source.numel() * source.element_size()
-    backing = torch.empty(count + 64, dtype=torch.uint8)
-    offset = -backing.data_ptr() % 64
-    target = backing[offset : offset + count].view(dtype).view(shape)
+    target = aligned_tensor(shape, dtype=dtype)
     result = transfer.get(
         ref,
         type="dataproto",
@@ -390,12 +378,11 @@ def test_large_direct_schema_respects_chunk_bytes(
     if direct_device:
         store.device_source = (source, source.cpu())
         assert store.register_buffer(source.data_ptr(), source.nbytes) == 0
-    ref = transfer.put(
-        {"value": source},
-        type="dict",
+    ref = put_direct(
+        transfer,
+        source,
         chunk_bytes=chunk_bytes,
         policy=BundleTransferPolicy(copy_mode=mode),
-        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=64)},
     )
     if direct_device:
         assert store.unregister_buffer(source.data_ptr()) == 0
@@ -407,15 +394,7 @@ def test_large_direct_schema_respects_chunk_bytes(
     assert max(chunk["bytes"] for chunk in chunks) <= chunk_bytes
     expected = (source if rows is None else source[rows]).cpu()
     target = aligned_tensor(expected.shape)
-    result = transfer.get(
-        ref,
-        type="dict",
-        rows=rows,
-        destinations={
-            "value": tensor_destination(target, alignment=64, pre_registered=True)
-        },
-    )
-    assert result["value"] is target
+    read_direct(transfer, ref, target, rows=rows)
     torch.testing.assert_close(target, expected)
     assert store.get_tensor_calls == 0
 
@@ -428,14 +407,11 @@ def test_registered_gpu_source_rejects_missing_registration_and_cleans_header():
     store.device_source = (source, source.cpu())
     store.strict_put_calls = 0
     with pytest.raises(RuntimeError, match="require_direct=True"):
-        transfer.put(
-            {"value": source},
-            type="dict",
+        put_direct(
+            transfer,
+            source,
             chunk_bytes=128,
             policy=BundleTransferPolicy(copy_mode="auto"),
-            field_schemas={
-                "value": FieldSchema(codec="torch_tensor", direct_alignment=64)
-            },
         )
     assert not store.objects
     assert not store.registered

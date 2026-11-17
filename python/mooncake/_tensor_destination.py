@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from mooncake._structured_ranges import _nonoverlap
+
+
+def _validate_direct_alignment(value: int) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value & (value - 1)
+    ):
+        raise ValueError("direct_alignment must be a positive power of two")
 
 
 @dataclass(frozen=True)
@@ -24,9 +34,11 @@ class TensorDestination:
     alignment: int = 1
     pre_registered: bool = False
     allocation: Any = None
-    _contract: tuple[Any, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._validate_layout()
+
+    def _validate_layout(self) -> None:
         import torch
 
         if not isinstance(self.tensor, torch.Tensor):
@@ -39,15 +51,7 @@ class TensorDestination:
             raise ValueError(
                 "tensor destination cannot use unresolved negative or conjugate views"
             )
-        if (
-            isinstance(self.alignment, bool)
-            or not isinstance(self.alignment, int)
-            or self.alignment <= 0
-            or self.alignment & (self.alignment - 1)
-        ):
-            raise ValueError(
-                "tensor destination alignment must be a positive power of two"
-            )
+        _validate_direct_alignment(self.alignment)
         if self.pre_registered is not True:
             raise ValueError("tensor destination requires pre_registered=True")
         if self.tensor.numel() and self.tensor.data_ptr() % self.tensor.element_size():
@@ -75,32 +79,10 @@ class TensorDestination:
             raise ValueError("tensor destination must lie inside its allocation")
         if allocation.numel() and allocation.data_ptr() % self.alignment:
             raise ValueError("tensor destination data pointer is not aligned")
-        object.__setattr__(self, "_contract", self._memory_contract())
-
-    def _memory_contract(self) -> tuple[Any, ...]:
-        def contract(value):
-            return (
-                value.data_ptr(),
-                tuple(value.shape),
-                tuple(value.stride()),
-                value.dtype,
-                value.device,
-                value.layout,
-                value.numel(),
-                value.is_neg(),
-                value.is_conj(),
-            )
-
-        return contract(self.tensor), contract(
-            self.tensor if self.allocation is None else self.allocation
-        )
 
     def validate(self, spec: Mapping[str, Any], shape: Sequence[int]) -> int:
-        if self._memory_contract() != self._contract:
-            raise ValueError("tensor destination changed since registration")
+        self._validate_layout()
         validate_schema_destination(spec, self)
-        if spec.get("encoding") != "torch_tensor" or spec.get("nested"):
-            raise ValueError("tensor destination requires a dense torch tensor member")
         if str(self.tensor.dtype) != spec.get("dtype"):
             raise ValueError("tensor destination dtype differs from stored member")
         if tuple(self.tensor.shape) != tuple(shape):
@@ -132,13 +114,7 @@ def validate_schema_destination(spec: Mapping[str, Any], destination: Any) -> No
                 "tensor destination requires a schema with direct_alignment"
             )
         return
-    if (
-        isinstance(required, bool)
-        or not isinstance(required, int)
-        or required <= 0
-        or required & (required - 1)
-    ):
-        raise ValueError("invalid schema direct_alignment")
+    _validate_direct_alignment(required)
     if spec.get("encoding") != "torch_tensor" or spec.get("nested"):
         raise ValueError("schema direct_alignment requires a dense torch tensor member")
     if not isinstance(destination, TensorDestination):
@@ -154,8 +130,7 @@ def validate_tensor_destinations(destinations: Mapping[str, Any]) -> None:
     for destination in destinations.values():
         if not isinstance(destination, TensorDestination):
             continue
-        if destination._memory_contract() != destination._contract:
-            raise ValueError("tensor destination changed since registration")
+        destination._validate_layout()
         tensor = destination.tensor
         size = tensor.numel() * tensor.element_size()
         if size:

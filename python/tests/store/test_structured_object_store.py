@@ -5417,3 +5417,17 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
         _config_for_grouped_keys(
             SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
         )
+
+
+def test_bundle_buffer_pool_exposes_existing_transport_pool_readonly():
+    sentinel = object()
+    transfer = MooncakeBundleTransfer(object(), buffer_pool=sentinel)
+    assert transfer.buffer_pool is sentinel
+    assert transfer.buffer_pool is sentinel
+    with pytest.raises(AttributeError):
+        transfer.buffer_pool = None
+
+
+def test_bundle_buffer_pool_without_native_support_keeps_fallback():
+    transfer = MooncakeBundleTransfer(object())
+    assert transfer.buffer_pool is None
