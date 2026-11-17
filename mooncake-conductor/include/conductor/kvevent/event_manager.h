@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <compare>
 #include <map>
@@ -16,6 +17,7 @@
 
 #include "conductor/common/types.h"
 #include "conductor/prefixindex/prefix_indexer.h"
+#include "conductor/prefixindex/cache_layout.h"
 #include "conductor/zmq/event_type.h"
 #include "conductor/zmq/zmq_client.h"
 
@@ -44,7 +46,8 @@ class ConductorService;
 // KVEventHandler adapts the generic EventHandler interface for EventManager.
 class KVEventHandler : public zmq::EventHandler {
    public:
-    KVEventHandler(EventManager* manager, common::ServiceConfig svc);
+    KVEventHandler(EventManager* manager, common::ServiceConfig svc,
+                   prefixindex::SourceLayout layout = {});
 
     std::string HandleBatch(const zmq::DecodedBatch& batch,
                             const zmq::MessageMetadata& metadata) override;
@@ -64,6 +67,8 @@ class KVEventHandler : public zmq::EventHandler {
 
     // Called only after the subscriber has stopped and joined.
     std::string InvalidateEndpoint();
+    // Wake a Store subscription whose initial events preceded the declaration.
+    void RefreshDeployment();
 
    private:
     friend class KVEventHandlerTestPeer;
@@ -122,8 +127,21 @@ class KVEventHandler : public zmq::EventHandler {
         const std::optional<std::string>& backend_id,
         const std::optional<std::string>& tenant_id);
 
+    std::string HandleGroupedVllmStored(const zmq::VllmStoredEvent& event);
+    std::string HandleGroupedVllmRemoved(const zmq::VllmRemovedEvent& event);
+    std::string HandleGroupedSglangStored(const zmq::SglangStoredEvent& event);
+    std::string HandleGroupedSglangRemoved(
+        const zmq::SglangRemovedEvent& event);
+    std::string HandleGroupedMooncakeStored(
+        const zmq::MooncakeStoredEvent& event);
+    std::string HandleGroupedMooncakeRemoved(
+        const zmq::MooncakeRemovedEvent& event);
+
     bool BeginDispatch();
     void EndDispatch();
+    std::string QueuePending(const zmq::DecodedBatch& batch,
+                             const zmq::MessageMetadata& metadata);
+    void DrainPending();
 
     class DispatchLease {
        public:
@@ -138,6 +156,13 @@ class KVEventHandler : public zmq::EventHandler {
 
     EventManager* manager_;
     common::ServiceConfig service_;
+    prefixindex::SourceLayout layout_;
+    const bool grouped_context_;
+    std::mutex grouped_dispatch_mu_;
+    std::string deployment_declaration_;
+    std::deque<std::pair<zmq::DecodedBatch, zmq::MessageMetadata>> pending_;
+    size_t pending_event_count_ = 0;
+    size_t pending_bytes_ = 0;
     std::mutex lifecycle_mu_;
     std::condition_variable lifecycle_cv_;
     bool available_ = true;
@@ -188,6 +213,7 @@ class EventManager {
     // True once Stop() has begun; checked by KVEventHandler::HandleBatch
     // under mu_ (read).
     bool IsStopped();
+    void RefreshMooncakeDeployments(const prefixindex::ContextKey& context);
 
    private:
     friend class KVEventHandler;
