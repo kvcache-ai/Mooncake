@@ -2381,11 +2381,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 disk.fifo_index.insert(bucket_id);
                 disk.lru_index.emplace(0LL, bucket_id);
                 for (size_t i = 0; i < meta.keys.size(); i++) {
-                    object_bucket_map_.insert(
-                        meta.keys[i], StorageObjectMetadata{
-                                          bucket_id, meta.metadatas[i].offset,
-                                          meta.metadatas[i].key_size,
-                                          meta.metadatas[i].data_size, ""});
+                    const StorageObjectMetadata object_metadata{
+                        bucket_id, meta.metadatas[i].offset,
+                        meta.metadatas[i].key_size, meta.metadatas[i].data_size,
+                        ""};
+                    if (!object_bucket_map_.insert(meta.keys[i],
+                                                   object_metadata) &&
+                        object_bucket_map_.find(meta.keys[i])->bucket_id <
+                            bucket_id) {
+                        object_bucket_map_.insert_or_assign(meta.keys[i],
+                                                            object_metadata);
+                    }
                 }
                 buckets_.emplace(bucket_id, std::move(metadata));
             }
@@ -2669,15 +2675,22 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+        std::vector<size_t> mapped;
+        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            const auto* object =
+                object_bucket_map_.find(bucket_it->second->keys[i]);
+            if (object != nullptr && object->bucket_id == bucket_it->first) {
+                mapped.push_back(i);
+            }
+        }
+        if (static_cast<int64_t>(mapped.size()) > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
-                       << ", current_size=" << bucket_it->second->keys.size()
+                       << ", current_size=" << mapped.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
-            limit) {
+        if (static_cast<int64_t>(mapped.size() + keys.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
@@ -2688,7 +2701,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
             // registers its keys with the master.
             pins->emplace_back(bucket_it->second);
         }
-        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+        for (size_t i : mapped) {
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
@@ -4168,6 +4181,93 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
               << ", keys_removed=" << keys_to_remove.size();
     return {};
+}
+
+std::vector<std::pair<int64_t, std::vector<std::string>>>
+BucketStorageBackend::GetReclaimCandidates(int64_t after_bucket_id,
+                                           size_t max_keys,
+                                           int64_t& next_cursor) const {
+    std::vector<std::pair<int64_t, std::vector<std::string>>> candidates;
+    next_cursor = after_bucket_id;
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    auto it = buckets_.upper_bound(after_bucket_id);
+    size_t num_keys = 0;
+    for (size_t n = 0; n < buckets_.size() && num_keys < max_keys; ++n, ++it) {
+        if (it == buckets_.end()) {
+            it = buckets_.begin();
+        }
+        const auto& [bucket_id, bucket] = *it;
+        std::vector<std::string> mapped_keys;
+        for (const auto& key : bucket->keys) {
+            const auto* mapped = object_bucket_map_.find(key);
+            if (mapped != nullptr && mapped->bucket_id == bucket_id) {
+                mapped_keys.push_back(key);
+            }
+        }
+        num_keys += mapped_keys.size();
+        candidates.emplace_back(bucket_id, std::move(mapped_keys));
+        next_cursor = bucket_id;
+    }
+    return candidates;
+}
+
+size_t BucketStorageBackend::RemoveDeadBuckets(
+    const std::unordered_map<int64_t, std::vector<std::string>>&
+        dead_keys_by_bucket) {
+    std::vector<int64_t> dead_buckets;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        for (const auto& [bucket_id, dead_keys] : dead_keys_by_bucket) {
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it == buckets_.end()) {
+                continue;
+            }
+            const std::unordered_set<std::string> dead(dead_keys.begin(),
+                                                       dead_keys.end());
+            const auto& keys = bucket_it->second->keys;
+            if (std::all_of(keys.begin(), keys.end(), [&](const auto& key) {
+                    const auto* mapped = object_bucket_map_.find(key);
+                    return mapped == nullptr ||
+                           mapped->bucket_id != bucket_id || dead.contains(key);
+                })) {
+                dead_buckets.push_back(bucket_id);
+            }
+        }
+    }
+    size_t deleted = 0;
+    for (int64_t bucket_id : dead_buckets) {
+        if (DeleteBucket(bucket_id)) {
+            ++deleted;
+        }
+    }
+    if (deleted != 0) {
+        LOG(INFO) << "RemoveDeadBuckets: deleted_buckets=" << deleted;
+        SharedMutexLocker lock(&mutex_);
+        for (auto& disk : disks_) {
+            disk.cached_disk_bytes = -1;
+        }
+    }
+    return deleted;
+}
+
+void BucketStorageBackend::UnmapKeys(
+    const std::unordered_map<int64_t, std::vector<std::string>>&
+        keys_by_bucket) {
+    SharedMutexLocker lock(&mutex_);
+    for (const auto& [bucket_id, keys] : keys_by_bucket) {
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            continue;
+        }
+        auto& disk = disks_[bucket_it->second->disk_index];
+        for (const auto& key : keys) {
+            object_bucket_map_.erase_if(key, [&](const auto& mapped) {
+                if (mapped.bucket_id != bucket_id) return false;
+                disk.total_size -= mapped.data_size + mapped.key_size;
+                return true;
+            });
+        }
+    }
 }
 
 void BucketStorageBackend::RemoveAll() {
