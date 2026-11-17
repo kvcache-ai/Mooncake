@@ -109,9 +109,10 @@ Workers::Workers(RdmaTransport* transport)
     // Core Scheduling Configuration
     // ============================================================
 
-    // Enable/disable smart scheduling (false = simple round-robin)
+    // Keep smart scheduling opt-in while platform-specific scheduling issues
+    // are investigated (false = simple round-robin).
     bool enable_smart_scheduling =
-        conf->get("transports/rdma/enable_smart_scheduling", true);
+        conf->get("transports/rdma/enable_smart_scheduling", false);
     device_selector_->setSmartSelection(enable_smart_scheduling);
 
     // ============================================================
@@ -131,6 +132,12 @@ Workers::Workers(RdmaTransport* transport)
 
     params.strict_local_numa =
         conf->get("transports/rdma/strict_local_numa", false);
+    dest_device_affinity_ =
+        conf->get("transports/rdma/dest_device_affinity", false);
+    if (dest_device_affinity_) {
+        LOG(INFO) << "RDMA dest device affinity enabled: remote NIC follows "
+                     "the same-name direct rail";
+    }
 
     // ============================================================
     // Bandwidth Estimation (EWMA)
@@ -375,8 +382,11 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
+    // A worker may finish immediately after queue publication.
+    const auto previous =
+        worker.inflight_slices.fetch_add(slice_list.num_slices);
     worker.queues[priority].push(slice_list);
-    if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
+    if (!previous) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
     }
@@ -703,6 +713,8 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
 void Workers::asyncPostSend() {
     auto& worker = worker_context_[tl_wid];
     std::vector<RdmaSliceList> result;
+    const size_t slice_budget = transport_->params_->endpoint.max_qp_wr;
+    size_t new_slices = 0;
 
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
@@ -716,8 +728,11 @@ void Workers::asyncPostSend() {
     auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
-        for (auto it = overflow.begin(); it != overflow.end();) {
+        for (auto it = overflow.begin();
+             it != overflow.end() &&
+             (deadline_bw_arbitration_ || new_slices < slice_budget);) {
             if (it->first == prio) {
+                new_slices += it->second.num_slices;
                 result.push_back(it->second);
                 it = overflow.erase(it);
             } else {
@@ -725,7 +740,18 @@ void Workers::asyncPostSend() {
             }
         }
         if (!result.empty()) break;
-        worker.queues[prio].pop(result);
+        if (deadline_bw_arbitration_) {
+            worker.queues[prio].pop(result);
+        } else {
+            // Prepare one QP window, then post and return to CQ polling. Do
+            // not wait for a full window when the producer has less ready.
+            while (new_slices < slice_budget) {
+                auto list = worker.queues[prio].pop();
+                if (!list.num_slices) break;
+                new_slices += list.num_slices;
+                result.push_back(list);
+            }
+        }
         if (!result.empty()) break;
     }
 
@@ -1749,7 +1775,28 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    if (slice->target_dev_id < 0) {
+    // Use the same-name direct rail and skip the memory-tier check. Without
+    // a same-name peer, keep the existing selection path.
+    bool affinity_pinned = false;
+    if (dest_device_affinity_) {
+        int direct = rail.directRemoteDevice(slice->source_dev_id);
+        if (direct >= 0) {
+            slice->target_dev_id = direct;
+            affinity_pinned = true;
+        } else if (!affinity_miss_warned_.exchange(true)) {
+            // The switch only pins a rail when both ends have a NIC with the
+            // same name. Say so once instead of silently falling back, which
+            // otherwise looks like the switch did nothing.
+            const auto* local_nic =
+                source.topo->getNicEntry(slice->source_dev_id);
+            LOG(WARNING) << "MC_ENABLE_DEST_DEVICE_AFFINITY is set, but peer "
+                         << target.segment->machine_id << " has no NIC named "
+                         << (local_nic ? local_nic->name : "<unknown>")
+                         << " that matches local NIC; keeping the normal "
+                            "selection path";
+        }
+    }
+    if (!affinity_pinned && slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
@@ -1828,9 +1875,19 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
             << "Optimal device pair not available: source_dev_id "
             << slice->source_dev_id << ", target_dev_id "
             << slice->target_dev_id;
+        // Stay on the pinned NIC instead of falling back to another rail.
+        if (affinity_pinned) {
+            return Status::DeviceNotFound(
+                "Same-name remote NIC is not available" LOC_MARK);
+        }
         return selectFallbackDevice(source, target, slice);
     }
 
+    // A retry released its charge before coming back here. allocate() does
+    // not run again when the local NIC is already chosen, so recharge the
+    // device this attempt will actually use. The first attempt already set
+    // charged_dev, and rechargeSlice is a no-op in that case.
+    rechargeSlice(slice, slice->source_dev_id);
     slice->rail_monitor = std::move(rail_monitor);
     slice->rail_probe_token = probe_token;
     return Status::OK();
@@ -1981,7 +2038,24 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
                               slice->length));
 
-    if (slice->retry_count == 0)
+    // Stay on the optimal path for a retry only when this local NIC is
+    // actually pinned to a same-name peer. The affinity switch alone must
+    // not stop the original rotation.
+    bool same_name_pinned = false;
+    if (slice->retry_count != 0 && dest_device_affinity_ &&
+        slice->source_dev_id >= 0 && target.segment) {
+        auto& worker = worker_context_[tl_wid];
+        auto rail = getOrCreateRail(worker.rails, target.segment->machine_id);
+        if (!rail->ready() || source.topo != rail->local() ||
+            target.topo != rail->remote()) {
+            CHECK_STATUS(rail->load(
+                std::shared_ptr<const Topology>(source.pin, source.topo),
+                std::shared_ptr<const Topology>(target.pin, target.topo),
+                rail_topo_json_, transport_->conf_.get()));
+        }
+        same_name_pinned = rail->directRemoteDevice(slice->source_dev_id) >= 0;
+    }
+    if (slice->retry_count == 0 || same_name_pinned)
         CHECK_STATUS(selectOptimalDevice(source, target, slice));
     else
         CHECK_STATUS(selectFallbackDevice(source, target, slice));

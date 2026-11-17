@@ -123,6 +123,7 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
+    int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
 
     // OpLog store configuration
     bool enable_oplog = false;
@@ -1202,6 +1203,10 @@ struct TaskManagerConfig {
 
 class MasterServiceConfig {
    public:
+    // Parallel eviction workers. Callbacks that do not support concurrent
+    // execution stay serial. Default 0 = ceil(filed keys / 16M), clamped
+    // to [1, 64] each round; explicit counts [1, 64] override automatic sizing.
+    uint32_t eviction_worker_threads = 0;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;

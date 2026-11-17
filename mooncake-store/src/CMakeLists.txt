@@ -34,10 +34,12 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
+    client_session_registry.cpp
     dynamic_replication_controller.cpp
     eviction/evictor.cpp
     eviction/offloading_reclaimer.cpp
     eviction/report_observers.cpp
+    metadata/lease_eviction_index.cpp
     master_service.cpp
     promotion_candidate_tracker.cpp
     master_store_backend.cpp
@@ -109,6 +111,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    gather_read.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -125,6 +128,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_codec.cpp
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
+    nvme_kv/object_store.cpp
     transfer_task.cpp
     config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp
@@ -172,6 +176,24 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
+  add_executable(store_gather_read_test ../tests/gather_read_test.cpp)
+  target_link_libraries(store_gather_read_test PRIVATE mooncake_store gtest
+                                                       gtest_main)
+  add_test(NAME store_gather_read_test COMMAND store_gather_read_test)
+  # Intercept calls from the static Store archive for deterministic transport
+  # failures. ELF wrappers do not intercept calls inside a shared Store.
+  if(UNIX
+     AND NOT APPLE
+     AND NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(store_gather_read_test
+                               PRIVATE MOONCAKE_GATHER_TEST_WRAPPED_SUBMIT)
+    target_link_options(
+      store_gather_read_test
+      PRIVATE
+      "-Wl,--wrap=_ZN8mooncake14TransferEngine14submitTransferEmRKSt6vectorINS_9Transport15TransferRequestESaIS3_EE"
+      "-Wl,--wrap=_ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_9Transport14TransferStatusE"
+    )
+  endif()
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -780,6 +802,26 @@ if(USE_SUNRISE)
   target_link_libraries(
     mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+
+if(BUILD_UNIT_TESTS AND USE_MLU)
+  # --wrap cannot intercept CNRT calls inside a shared mooncake_store. Reuse its
+  # objects in a test-only archive so those calls reach the final link. Keep
+  # this target here so directory-scoped dependency targets are visible.
+  add_library(
+    mooncake_store_mlu_test STATIC
+    $<TARGET_OBJECTS:mooncake_store_shared_objects>
+    $<TARGET_OBJECTS:mooncake_store_master_objects>
+    $<TARGET_OBJECTS:mooncake_store_client_objects>)
+  target_include_directories(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_COMPILE_DEFINITIONS>)
+  get_target_property(mlu_test_store_dependencies mooncake_store LINK_LIBRARIES)
+  target_link_libraries(mooncake_store_mlu_test
+                        PUBLIC ${mlu_test_store_dependencies})
 endif()
 
 if(BUILD_SHARED_LIBS)

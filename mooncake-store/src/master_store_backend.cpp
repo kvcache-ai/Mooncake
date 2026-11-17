@@ -92,6 +92,7 @@ MasterStoreBackend::SnapshotWeightGroup(
         }
         members.push_back(WeightGroupMemberSnapshot{
             .key = key,
+            .residency_affinity_id = metadata.residency_affinity_id,
             .size = metadata.TotalLength(),
             .data_type = metadata.data_type,
             .readable = master_.HasReadableReplica(metadata),

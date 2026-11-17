@@ -18,11 +18,13 @@
 #include <hip/hip_runtime.h>
 
 #include <array>
-#include <atomic>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "tent/common/concurrent/ticket_lock.h"
@@ -35,7 +37,7 @@ namespace tent {
 // TENT hylink transport for Hygon DCU memory over HSL (Hygon Scale-up
 // Link). HSL connects DCUs directly, including across machines, and does
 // not use an IB/RoCE NIC. By default peers exchange a DTK VMM fabric
-// handle (allocation type 0x8, 512-byte blob). Set MC_HYLINK_USE_VMM=0 on
+// handle (handle type 0x8, 512-byte blob). Set MC_HYLINK_USE_VMM=0 on
 // both sides to use HIP IPC instead. IPC cannot cross machines.
 constexpr auto kDtkFabricHandleType =
     static_cast<hipMemAllocationHandleType>(0x8);
@@ -111,11 +113,14 @@ class HylinkTransport : public Transport {
         DtkFabricHandle fabric{};
     };
 
+    // DTK fabric compatibility: keep a distinct, stable handle blob for
+    // each imported mapping until that mapping is closed.
     struct OpenedMapping {
         void* shm_addr = nullptr;
         uint64_t length = 0;
         HylinkHandleKind kind = HylinkHandleKind::kNone;
         hipMemGenericAllocationHandle_t fabric_handle = nullptr;
+        std::unique_ptr<DtkFabricHandle> shareable;
     };
 
     // Per-device copy streams, created lazily on first use (mirrors the
@@ -133,7 +138,7 @@ class HylinkTransport : public Transport {
                               HylinkTask& task);
 
     Status relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
-                                       uint64_t target_id, int device_id,
+                                       uint64_t target_id,
                                        HylinkHandleKind* kind = nullptr);
 
     Status setPeerAccess();
@@ -153,17 +158,19 @@ class HylinkTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Config> conf_;
 
-    // target -> remote buffer -> local device. Fabric uses device_id so
-    // each GPU imports and maps its own VA. IPC uses key -1.
-    using RelocateMap = std::unordered_map<
-        SegmentID,
-        std::unordered_map<uint64_t, std::unordered_map<int, OpenedMapping>>>;
+    struct RelocateKeyHash {
+        std::size_t operator()(
+            const std::pair<SegmentID, uint64_t>& key) const {
+            std::size_t h1 = std::hash<SegmentID>{}(key.first);
+            std::size_t h2 = std::hash<uint64_t>{}(key.second);
+            return h1 ^ (h2 << 1);
+        }
+    };
+    using RelocateMap = std::unordered_map<std::pair<SegmentID, uint64_t>,
+                                           OpenedMapping, RelocateKeyHash>;
 
     RWSpinlock relocate_lock_;
     RelocateMap relocate_map_;
-    // Bumped on uninstall so per-thread copies of relocate_map_ drop mappings
-    // whose HIP handles have already been closed.
-    std::atomic<uint64_t> relocate_epoch_{1};
 
     static constexpr int kStreamsPerDevice = 8;
     std::mutex stream_pool_mutex_;

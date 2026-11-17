@@ -1392,6 +1392,26 @@ mod tests {
     }
 
     #[test]
+    fn eviction_guard_metrics_are_exported_before_any_candidate_is_seen() {
+        let _guard = metrics_test_lock().lock();
+        registry::reset_metrics();
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains(
+            "# HELP mooncake_store_eviction_guard_event_total Eviction guard lifecycle events by source and outcome."
+        ));
+        assert!(metrics.contains(
+            "# HELP mooncake_store_eviction_guard_pending_total Pending eviction guard tokens by phase."
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"route_cas\",outcome=\"outcome_unknown\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_eviction_guard_pending_total{tenant=\"default\",phase=\"pending_confirmation\"} 0"
+        ));
+    }
+
+    #[test]
     fn sparse_operational_counters_render_zero_baselines() {
         let _guard = metrics_test_lock().lock();
         registry::reset_metrics();

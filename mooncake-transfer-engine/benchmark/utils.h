@@ -15,6 +15,8 @@
 #ifndef XFER_UTILS_H
 #define XFER_UTILS_H
 
+#include "split_output.h"
+
 #include <string>
 #include <unordered_map>
 #include <cmath>
@@ -59,6 +61,9 @@ namespace mooncake {
 namespace tent {
 struct XferBenchConfig {
     static void loadFromFlags();
+    static bool validateLocalNuma(std::string& error);
+    static bool resolveDramNumaRange(int& start_idx, int& num_buffers,
+                                     std::string& error);
 
     static std::string seg_name;
     static std::string seg_type;
@@ -106,6 +111,8 @@ struct XferBenchConfig {
     static std::string tent_intent_type;
 
     static int local_gpu_id;
+    // TENT DRAM allocation: -1 retains all configured nodes, >=0 selects one.
+    static int local_numa_id;
     static int target_gpu_id;
 };
 
@@ -127,13 +134,15 @@ struct XferMetricStats {
         return sum / samples.size();
     }
 
-    double p90() { return percentile(90.0); }
+    double p90() const { return percentile(90.0); }
 
-    double p95() { return percentile(95.0); }
+    double p95() const { return percentile(95.0); }
 
-    double p99() { return percentile(99.0); }
+    double p99() const { return percentile(99.0); }
 
-    double p999() { return percentile(99.9); }
+    double p999() const { return percentile(99.9); }
+
+    double percentile(double p) const;
 
     double fractionAtOrBelow(double threshold) const {
         if (samples.empty()) return 0.0;
@@ -143,21 +152,34 @@ struct XferMetricStats {
         return static_cast<double>(count) / samples.size();
     }
 
-    void add(double value) { samples.push_back(value); }
+    void add(double value) {
+        samples.push_back(value);
+        sorted_valid = false;
+    }
 
     void add(const std::vector<double>& values) {
         samples.insert(samples.end(), values.begin(), values.end());
+        sorted_valid = false;
     }
 
-    void clear() { samples.clear(); }
+    void clear() {
+        samples.clear();
+        sorted_samples.clear();
+        sorted_valid = false;
+    }
 
-    size_t count() { return samples.size(); }
+    size_t count() const { return samples.size(); }
 
    private:
-    double percentile(double p);
+    const std::vector<double>& sortedSamples() const;
 
    private:
     std::vector<double> samples;
+    // Sorted copy of samples, built on the first percentile() call and
+    // invalidated by every mutator. Not synchronized: stats are filled under
+    // the caller's mutex and only read from a single thread afterwards.
+    mutable std::vector<double> sorted_samples;
+    mutable bool sorted_valid = false;
 };
 
 struct XferBenchStats {
@@ -172,11 +194,15 @@ class XferBenchTimer {
 
     void reset() { start_ts_ = getCurrentTimeNs(); }
 
-    uint64_t lap_us(bool reset = true) {
+    uint64_t lap_ns(bool reset = true) {
         auto now_ts = getCurrentTimeNs();
         auto duration = now_ts - start_ts_;
         if (reset) start_ts_ = now_ts;
-        return duration / 1000;
+        return duration;
+    }
+
+    uint64_t lap_us(bool reset = true) {
+        return lap_ns(reset) / kNanosecondsPerMicrosecond;
     }
 
    private:
@@ -191,11 +217,11 @@ class XferBenchTimer {
 
 void printStatsHeader();
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
-                int num_threads);
+void printStats(size_t block_size, size_t batch_size,
+                const XferBenchStats& stats, int num_threads);
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
-                             size_t batch_size, XferBenchStats& stats,
+                             size_t batch_size, const XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us);
 
 std::vector<std::string> splitCommaSeparated(const std::string& value);

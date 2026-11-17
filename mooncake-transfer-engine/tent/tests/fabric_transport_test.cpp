@@ -107,11 +107,7 @@ std::shared_ptr<Config> makeFabricConfig(uint64_t max_mr_size,
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
     config->set("metadata_servers", "P2PHANDSHAKE");
-    config->set("transports/tcp/enable", false);
-    config->set("transports/rdma/enable", false);
-    config->set("transports/shm/enable", false);
-    config->set("transports/fabric/enable", true);
-    config->set("transports/fabric/provider", testProvider());
+    ConfigHelper::forceFabric(*config, testProvider());
     config->set("transports/fabric/slice_size", 256 * 1024);
     config->set("transports/fabric/max_mr_size", max_mr_size);
     config->set("transports/fabric/post_timeout_ms", 5000);
@@ -332,6 +328,18 @@ class FabricTransportTest : public ::testing::Test {
     SegmentID segment_ = 0;
     uint64_t remote_base_ = 0;
 };
+
+TEST_F(FabricTransportTest, SameAddressDifferentLengthPreservesRegistration) {
+    connect(0, 0);
+    auto status =
+        client_->registerLocalMemory(buffer_.data(), kBufferLength / 2);
+    EXPECT_FALSE(status.ok()) << status.ToString();
+    SegmentInfo info;
+    ASSERT_TRUE(client_->getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    EXPECT_EQ(info.buffers.front().length, kBufferLength);
+    roundTrip(0, 0, 4096, 1, 4096);
+}
 
 TEST_F(FabricTransportTest, WriteThenRead) {
     connect(0, 0);

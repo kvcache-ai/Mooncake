@@ -110,6 +110,7 @@ fn legacy_backend_object_route_is_not_restored_on_read_miss() {
         replicas: vec![ReplicaRoute {
             owner: cold_backing.owner.clone(),
             segment_name: SegmentName::new("__legacy_backend_object__"),
+            allocation_id: None,
             offset: None,
             segment_offset: 0,
             length: cold_backing.length,
@@ -570,6 +571,91 @@ fn debug_evict_all_waits_for_pending_offload_claim_race() {
         mooncake_store_core::ColdBackingState::Materialized
     );
     assert_eq!(client.get("debug-evict-race").expect("cold get"), payload);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn debug_evict_all_completes_while_delete_reclaim_is_pending() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("debug-evict-all-pending-delete");
+    let client = Arc::new(
+        StoreClientBuilder::new(metadata, "debug-evict-all-pending-delete")
+            .state(ClientLifecycleState::Active)
+            .label("storage", "true")
+            .transport(Arc::new(TestTransport::new(
+                "debug-evict-all-pending-delete-segment",
+            )))
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .numa_aware(false)
+                    .storage_bytes(512)
+                    .scratch_bytes(4096)
+                    .alignment(1)
+                    // Keep reclamation pending after route removal so the
+                    // allocation remains live in the DeletePending state.
+                    .reclaim_grace_ms(60_000)
+                    .eviction_poll_interval(Duration::ZERO),
+            )
+            .cold_tier_target(ColdTierTargetConfig::directory(
+                "debug-evict-all-pending-delete",
+                ColdTierKind::Ssd,
+                root.clone(),
+            ))
+            .build(test_future_expiry_ms())
+            .expect("client build should succeed"),
+    );
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("pending-delete-key", b"pending-delete-payload")
+        .expect("put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+    wait_for_materialized_cold_backing(&client, "pending-delete-key");
+
+    client
+        .remove("pending-delete-key", true)
+        .expect("remove should publish the logical delete");
+    assert!(
+        client
+            .query_route("pending-delete-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "delete must become externally visible before local reclaim finishes"
+    );
+    assert_eq!(
+        client.storage_owner.pending_deletes.lock().entries.len(),
+        1,
+        "the allocator owner must retain the exact generation until its grace expires"
+    );
+
+    let evictions = (0..2)
+        .map(|_| {
+            let client = client.clone();
+            std::thread::spawn(move || client.debug_evict_all())
+        })
+        .collect::<Vec<_>>();
+
+    for eviction in evictions {
+        let result = eviction
+            .join()
+            .expect("concurrent evict-all worker should join")
+            .expect("evict-all should handle a delete pending entry");
+        assert!(
+            result.completed,
+            "logically deleted replicas must not block evict-all: {result:?}"
+        );
+        assert_eq!(result.remaining_hot_replicas, 0);
+    }
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        route.replicas[0].length,
+        "evict-all must not release a DeletePending allocation before its grace expires"
+    );
+    assert_eq!(client.storage_owner.pending_deletes.lock().entries.len(), 1);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1294,7 +1380,7 @@ fn cold_restore_large_checkpoint_batch_uses_caller_buffers_without_cross_object_
 }
 
 #[test]
-fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
+fn pending_offload_materialization_pins_and_borrows_hot_payload() {
     let _cold_guard = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let root = cold_tier_test_root("pending-offload-snapshot-after-prepare");
@@ -1351,7 +1437,6 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
         .expect("pending offload should prepare");
     assert_eq!(prepared.len(), 1);
 
-    let replacement = vec![0xA5u8; original.len()];
     let addr = {
         let state = client.state.lock();
         state
@@ -1360,20 +1445,29 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
             .storage_address(&replica.segment_name, replica.segment_offset as usize)
             .expect("replica address should resolve")
     };
-    unsafe {
-        std::ptr::copy_nonoverlapping(replacement.as_ptr(), addr.cast::<u8>(), replacement.len());
-    }
     assert_eq!(
-        prepared[0].payload.as_slice(),
-        original.as_slice(),
-        "prepared offload payload must not observe later hot-slot mutation"
+        prepared[0].payload.as_slice().as_ptr(),
+        addr.cast::<u8>(),
+        "pending offload must borrow the hot allocation without copying"
     );
+    let allocation_identity = AllocationIdentity {
+        segment_name: replica.segment_name.clone(),
+        offset_bytes: replica.segment_offset,
+        length_bytes: replica.length,
+        allocation_id: replica
+            .allocation_id
+            .expect("local hot replica should have an allocation generation"),
+    };
+    assert!(client
+        .allocator
+        .lock()
+        .allocation_is_pinned(&allocation_identity));
 
     let mut first_error = None;
     let materialized = client
         .storage_owner
         .materialize_prepared_pending_offload_batch(&prepared, &mut first_error)
-        .expect("prepared offload should materialize from owned snapshot");
+        .expect("prepared offload should materialize from pinned hot memory");
     assert_eq!(materialized, 1, "unexpected offload error: {first_error:?}");
 
     let route = client
@@ -1388,6 +1482,11 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
         materialized.state,
         mooncake_store_core::ColdBackingState::Materialized
     );
+    drop(prepared);
+    assert!(!client
+        .allocator
+        .lock()
+        .allocation_is_pinned(&allocation_identity));
     let backend = client
         .storage_owner
         .cold_tier_devices
@@ -1401,6 +1500,109 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
     assert_eq!(bytes, original.len());
     assert_eq!(restored, original);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pending_offloads_balance_and_write_distinct_targets_concurrently() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root_a = cold_tier_test_root("parallel-offload-a");
+    let root_b = cold_tier_test_root("parallel-offload-b");
+    let probe = Arc::new(ConcurrentColdWriteProbe::default());
+    let rate_limits = ColdTierRateLimitConfig {
+        offload_runtime_max_in_flight: 16,
+        offload_device_max_in_flight: 8,
+        offload_runtime_ops_per_sec: 10_000,
+        offload_device_ops_per_sec: 10_000,
+        ..ColdTierRateLimitConfig::default()
+    };
+    let client = StoreClientBuilder::new(metadata, "parallel-offload")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(Arc::new(TestTransport::new("parallel-offload-segment")))
+        .local_memory(storage_config_with_bytes(4096))
+        .cold_tier_targets([
+            ColdTierTargetConfig::directory(
+                "parallel-offload-a",
+                ColdTierKind::Ssd,
+                root_a.clone(),
+            )
+            .capacity_override_bytes(1 << 30),
+            ColdTierTargetConfig::directory(
+                "parallel-offload-b",
+                ColdTierKind::Ssd,
+                root_b.clone(),
+            )
+            .capacity_override_bytes(1 << 30),
+        ])
+        .cold_tier_backend_override(
+            "parallel-offload-a",
+            Arc::new(ProbedStorageBackend::new(probe.clone())),
+        )
+        .cold_tier_backend_override(
+            "parallel-offload-b",
+            Arc::new(ProbedStorageBackend::new(probe.clone())),
+        )
+        .cold_tier_rate_limits(rate_limits)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    assert_eq!(
+        client.storage_owner.cold_tier_devices.offload_parallelism(),
+        16,
+        "offload worker parallelism must follow the runtime admission limit"
+    );
+
+    let payload_sizes = [512, 128, 128, 128, 128];
+    for (index, payload_size) in payload_sizes.into_iter().enumerate() {
+        client
+            .put(
+                &format!("parallel-offload-{index}"),
+                &vec![0x5au8; payload_size],
+            )
+            .expect("put should publish pending cold backing");
+    }
+
+    let selected = client
+        .storage_owner
+        .cold_tier_devices
+        .accumulated_write_bytes
+        .lock()
+        .clone();
+    let selected_a = selected
+        .get("parallel-offload-a")
+        .copied()
+        .unwrap_or_default();
+    let selected_b = selected
+        .get("parallel-offload-b")
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(selected_a + selected_b, 1024);
+    assert_eq!(
+        selected_a, selected_b,
+        "different object sizes should balance by bytes, got {selected_a} and {selected_b}"
+    );
+
+    for _ in 0..20 {
+        let _ = client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32);
+        if probe.max_active() >= 2 {
+            break;
+        }
+        sleep(Duration::from_millis(25));
+    }
+    assert!(
+        probe.max_active() >= 2,
+        "distinct cold targets should execute writes concurrently"
+    );
+
+    drop(client);
+    let _ = std::fs::remove_dir_all(root_a);
+    let _ = std::fs::remove_dir_all(root_b);
 }
 
 #[test]
@@ -2500,4 +2702,262 @@ fn cold_tier_data_readable_after_restart_new_epoch() {
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cold_delete_reclaims_used_bytes_via_owner_pending_queue() {
+    // Regression for https://project.aone.alibaba-inc.com/issue/87337500:
+    // deleting a cold-backed object must release the cold device used_bytes.
+    // The cold backing delete now rides the same durable owner-local
+    // pending-delete queue used for DRAM allocations; the owner-side drain is a
+    // point lookup by route key (no metadata scan, no Redis pending-delete
+    // index), so it works under EmbeddedWrh and for short-lived writers.
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("cold-delete-owner-queue");
+    let device_id = "cold-delete-owner-queue";
+    let client = StoreClientBuilder::new(metadata.clone(), device_id)
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "cold-delete-owner-queue-segment",
+        )))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(512)
+                .scratch_bytes(4096)
+                .alignment(1)
+                // grace 0 keeps the queued cold reclaim immediately due.
+                .reclaim_grace_ms(0)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(ColdTierTargetConfig::directory(
+            device_id,
+            ColdTierKind::Ssd,
+            root.clone(),
+        ))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let payload = b"cold-delete-payload";
+    let route = client
+        .put("cold-delete-key", payload)
+        .expect("put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+    let backing = wait_for_materialized_cold_backing(&client, "cold-delete-key");
+
+    let scoped = metadata
+        .for_tenant("default")
+        .expect("for_tenant should return Some");
+    let device_before = scoped
+        .get_cold_tier_device(device_id)
+        .expect("device lookup should succeed")
+        .expect("cold device should exist");
+    assert!(
+        device_before.used_bytes >= backing.length,
+        "cold used_bytes should include the materialized backing: used={} length={}",
+        device_before.used_bytes,
+        backing.length
+    );
+
+    client
+        .remove("cold-delete-key", true)
+        .expect("remove should publish the logical delete");
+
+    // Drive the owner-local cold reclaim queue until used_bytes is released.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let device_after = loop {
+        let _ = client.storage_owner.process_cold_pending_deletes(64);
+        let device = scoped
+            .get_cold_tier_device(device_id)
+            .expect("device lookup should succeed")
+            .expect("cold device should exist");
+        if device.used_bytes + backing.length <= device_before.used_bytes {
+            break device;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cold used_bytes was not released after delete: used={}",
+            device.used_bytes
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        device_after.used_bytes + backing.length,
+        device_before.used_bytes,
+        "cold used_bytes must be released after reclaim (this was the leak)"
+    );
+    assert!(
+        client
+            .storage_owner
+            .pending_cold_deletes
+            .lock()
+            .entries
+            .is_empty(),
+        "cold pending queue should be drained after reclaim"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn cold_restore_unknown_cas_preserves_modern_remote_owner_allocation() {
+    let _metrics_guard = metrics_test_lock().lock();
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("restore-unknown-modern-owner");
+    let owner_transport = Arc::new(TestTransport::new("restore-unknown-owner-segment"));
+    let reader_transport = Arc::new(owner_transport.peer("restore-unknown-reader-segment"));
+    let target =
+        ColdTierTargetConfig::directory("restore-unknown-device", ColdTierKind::Ssd, root.clone());
+    let mut reader = StoreClientBuilder::new(metadata.clone(), "restore-unknown-reader")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "false")
+        .transport(reader_transport)
+        .local_memory(storage_config_with_bytes(0))
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .cold_tier_target(target.clone())
+        .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
+        .build(test_future_expiry_ms())
+        .expect("reader should build");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    let owner = StoreClientBuilder::new(metadata.clone(), "restore-unknown-owner")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(owner_transport)
+        .local_memory(storage_config_with_bytes(64))
+        .cold_tier_target(target)
+        .cold_tier_offload_mode(ColdTierOffloadMode::Passthrough)
+        .build(test_future_expiry_ms())
+        .expect("owner should build");
+    owner
+        .register_local_memory()
+        .expect("owner memory should register");
+    wait_for_membership_convergence(&[&owner, &reader]);
+    assert!(owner
+        .lease()
+        .compatibility
+        .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY));
+    assert!(reader
+        .lease()
+        .compatibility
+        .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY));
+    assert_ne!(owner.runtime_id(), reader.runtime_id());
+
+    let payload = b"0123456789abcdef";
+    owner
+        .put("restore-unknown-key", payload)
+        .expect("public seed put should succeed");
+    wait_for_materialized_cold_backing(&owner, "restore-unknown-key");
+    let evicted = owner
+        .debug_evict_all()
+        .expect("public eviction should preserve the materialized backing");
+    assert_eq!(evicted.dropped_without_cold, 0);
+    let route = owner
+        .query_route("restore-unknown-key")
+        .expect("cold route query")
+        .expect("public seed route should exist");
+    assert!(
+        route.replicas.is_empty(),
+        "public eviction must produce a cold-only route"
+    );
+    assert_eq!(
+        route
+            .cold_backing
+            .as_ref()
+            .expect("cold backing must exist")
+            .state,
+        mooncake_store_core::ColdBackingState::Materialized
+    );
+    let lost_reply = Arc::new(ApplyThenFailRouteDirectory {
+        inner: reader.route_directory.clone(),
+        fail_once: AtomicBool::new(true),
+        confirmation_fails: AtomicBool::new(false),
+    });
+    reader.route_directory = lost_reply.clone();
+    let reserve_calls = || {
+        snapshot_metrics()
+            .operations
+            .iter()
+            .filter(|metric| {
+                metric
+                    .operation
+                    .starts_with("control_allocator_batch_reserve")
+            })
+            .map(|metric| metric.calls_total)
+            .sum::<u64>()
+    };
+    let reserves_before_get = reserve_calls();
+    assert_eq!(
+        reader
+            .get("restore-unknown-key")
+            .expect("public cold get should succeed"),
+        payload
+    );
+    reader.wait_for_restore_promotions();
+    let remote_reserves = reserve_calls().saturating_sub(reserves_before_get);
+    eprintln!("PUBLIC_REPRO remote_owner_reservation_rpc_calls={remote_reserves}");
+    assert!(
+        remote_reserves > 0,
+        "public cold get must reserve through the production allocator RPC"
+    );
+    assert!(
+        !lost_reply.fail_once.load(Ordering::SeqCst),
+        "promotion must apply CAS before reply loss"
+    );
+    let promoted = reader
+        .query_route("restore-unknown-key")
+        .expect("promoted route query")
+        .expect("applied promotion route must exist");
+    let hot = promoted
+        .replicas
+        .first()
+        .expect("promotion must publish a hot allocation");
+    assert_eq!(
+        &hot.owner,
+        owner.runtime_id(),
+        "promotion must reserve through the distinct owner RPC"
+    );
+    assert!(hot.allocation_id.is_some_and(|id| id != 0));
+
+    let replacement = b"abcdefghijklmnop";
+    reader
+        .put("restore-unknown-next", replacement)
+        .expect("public routed put should succeed");
+    let next = reader
+        .query_route("restore-unknown-next")
+        .expect("new route query")
+        .expect("new public put route must exist");
+    let fresh = next
+        .replicas
+        .first()
+        .expect("new route must have a replica");
+    let reread = reader.get("restore-unknown-key");
+    eprintln!("PUBLIC_REPRO applied_generation={:?} applied_offset={} fresh_generation={:?} fresh_offset={} reread={:?}",
+        hot.allocation_id, hot.segment_offset, fresh.allocation_id, fresh.segment_offset, reread);
+    assert_ne!((&fresh.owner, &fresh.segment_name, fresh.segment_offset),
+        (&hot.owner, &hot.segment_name, hot.segment_offset),
+        "unknown promotion CAS must retain the modern owner allocation instead of reusing its hot range");
+    assert_eq!(
+        reread.expect("public get must keep reading the promoted allocation"),
+        payload
+    );
+    assert_eq!(
+        reader
+            .get("restore-unknown-next")
+            .expect("new public object should read"),
+        replacement
+    );
+    drop(reader);
+    drop(owner);
+    let _ = std::fs::remove_dir_all(root);
 }

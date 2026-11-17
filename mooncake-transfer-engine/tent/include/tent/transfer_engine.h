@@ -354,6 +354,17 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    // Blocks until every task in the batch terminates. status_list gets one
+    // entry per request; with a null status_list, a task that did not complete
+    // fails the call. On timeout the queued tasks are canceled and in-flight
+    // tasks are asked to stop; without status_list the call returns TimedOut,
+    // so the caller must confirm the tasks stopped before reusing the buffers.
+    // A PENDING entry means the engine may still touch that request's memory
+    // (0 waits forever). The batch stays owned by the caller.
+    Status waitTransfer(BatchID batch_id,
+                        std::vector<TransferStatus>* status_list = nullptr,
+                        uint64_t timeout_ms = 0);
+
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit
     // regardless of enable_auto_failover_on_poll. The call is non-blocking and

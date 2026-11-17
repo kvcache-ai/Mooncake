@@ -1216,6 +1216,15 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void SetSupportsFdReopen(bool v) { supports_reopen_ = v; }
     bool SupportsFdReopen() const override { return supports_reopen_; }
 
+    // Models an adapter that keeps the "posix" name but constrains read
+    // buffers (e.g. an O_DIRECT mode).
+    void SetSupportsArbitraryHostReadBuffers(bool v) {
+        arbitrary_host_read_buffers_ = v;
+    }
+    bool SupportsArbitraryHostReadBuffers() const override {
+        return arbitrary_host_read_buffers_;
+    }
+
     std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
         std::span<const FdIoRequest> requests) override {
         ADD_FAILURE() << "POSIX shard writes must retain per-request I/O";
@@ -1281,6 +1290,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int64_t short_read_offset_ = -1;
     std::atomic<int64_t> fail_write_offset_once_{-1};
     bool supports_reopen_ = true;
+    bool arbitrary_host_read_buffers_ = true;
 };
 
 // Builds a backend backed by a ControlledPosixFsAdapter pointed at an existing
@@ -1353,6 +1363,22 @@ class BlockingShardFsAdapter : public PosixFsAdapter {
     std::promise<void> release_signal_;
     std::shared_future<void> released_{release_signal_.get_future().share()};
 };
+
+TEST_F(DfsBackendTest, PosixAdapterAcceptsArbitraryHostReadBuffers) {
+    EXPECT_TRUE(PosixFsAdapter().SupportsArbitraryHostReadBuffers());
+    EXPECT_TRUE(backend_->SupportsArbitraryHostReadBuffers());
+}
+
+TEST_F(DfsBackendTest, HostReadBufferCapabilityIgnoresAdapterName) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+    ASSERT_STREQ(controlled->GetName(), "posix");
+    EXPECT_TRUE(backend->SupportsArbitraryHostReadBuffers());
+
+    controlled->SetSupportsArbitraryHostReadBuffers(false);
+    EXPECT_FALSE(backend->SupportsArbitraryHostReadBuffers());
+}
 
 TEST_F(DfsBackendTest, SlowShardInitializationDoesNotBlockOtherShards) {
     for (bool block_file_size : {false, true}) {
