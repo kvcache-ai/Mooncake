@@ -1630,18 +1630,27 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     ErrorCode last_err = ErrorCode::INVALID_REPLICA;
 
     for (int attempt = 0; attempt <= kMaxPeerRetries; ++attempt) {
-        std::vector<Replica::Descriptor> candidates;
-        candidates.reserve(query_result.replicas.size());
-        for (const auto& replica : query_result.replicas) {
-            const std::string endpoint = PeerReplicaEndpoint(replica);
-            if (!endpoint.empty() && excluded_endpoints.count(endpoint)) {
-                continue;
+        // The first attempt reads the query in place. Copying every replica
+        // descriptor is only needed after a peer has failed.
+        const std::vector<Replica::Descriptor>* candidates =
+            &query_result.replicas;
+        std::vector<Replica::Descriptor> filtered;
+        if (!excluded_endpoints.empty()) {
+            filtered.reserve(query_result.replicas.size());
+            for (const auto& replica : query_result.replicas) {
+                const std::string endpoint = PeerReplicaEndpoint(replica);
+                if (!endpoint.empty() &&
+                    excluded_endpoints.count(endpoint)) {
+                    continue;
+                }
+                filtered.push_back(replica);
             }
-            candidates.push_back(replica);
+            candidates = &filtered;
         }
 
         Replica::Descriptor replica;
-        ErrorCode err = MakeReadReplicaSelector()(candidates, slices, replica);
+        ErrorCode err =
+            MakeReadReplicaSelector()(*candidates, slices, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -1739,18 +1748,27 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     ErrorCode last_err = ErrorCode::INVALID_REPLICA;
 
     for (int attempt = 0; attempt <= kMaxPeerRetries; ++attempt) {
-        std::vector<Replica::Descriptor> candidates;
-        candidates.reserve(query_result.replicas.size());
-        for (const auto& replica : query_result.replicas) {
-            const std::string endpoint = PeerReplicaEndpoint(replica);
-            if (!endpoint.empty() && excluded_endpoints.count(endpoint)) {
-                continue;
+        // The first attempt reads the query in place. Copying every replica
+        // descriptor is only needed after a peer has failed.
+        const std::vector<Replica::Descriptor>* candidates =
+            &query_result.replicas;
+        std::vector<Replica::Descriptor> filtered;
+        if (!excluded_endpoints.empty()) {
+            filtered.reserve(query_result.replicas.size());
+            for (const auto& replica : query_result.replicas) {
+                const std::string endpoint = PeerReplicaEndpoint(replica);
+                if (!endpoint.empty() &&
+                    excluded_endpoints.count(endpoint)) {
+                    continue;
+                }
+                filtered.push_back(replica);
             }
-            candidates.push_back(replica);
+            candidates = &filtered;
         }
 
         Replica::Descriptor replica;
-        ErrorCode err = MakeReadReplicaSelector()(candidates, slices, replica);
+        ErrorCode err =
+            MakeReadReplicaSelector()(*candidates, slices, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << object_key;

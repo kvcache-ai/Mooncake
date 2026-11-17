@@ -531,6 +531,22 @@ TEST_F(ReplicaSelectionTest, RetainMemorySiblingsWithoutAffinity) {
     EXPECT_TRUE(PeerReplicaEndpoint(MakeDisk("file")).empty());
 }
 
+TEST_F(ReplicaSelectionTest, AffinityOffKeepsOneSibling) {
+    auto first = MakeMemory("store-a", "rdma");
+    auto second = MakeMemory("store-b", "rdma");
+    second.id = 1;
+    auto third = MakeMemory("store-c", "rdma");
+    third.id = 2;
+    const std::vector<Replica::Descriptor> replicas{first, second, third};
+    const auto kept = RetainMemoryReadCandidates(replicas, first, false);
+    ASSERT_EQ(kept.size(), 2u);
+    EXPECT_EQ(
+        kept[1].get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "store-b");
+    EXPECT_EQ(RetainMemoryReadCandidates(replicas, first, true).size(), 3u);
+    EXPECT_EQ(RetainMemoryReadCandidates({first}, first, false).size(), 1u);
+}
+
 TEST_F(ReplicaSelectionTest, HcaReadPreferenceKeepsLocalityAndUsableFallbacks) {
     auto wrong = MakeMemory("local", "rdma");
     wrong.get_memory_descriptor().locality = SegmentLocality{0, {"mlx5_1"}};

@@ -206,16 +206,18 @@ inline std::string PeerReplicaEndpoint(const Replica::Descriptor &replica) {
     return {};
 }
 
-// Keep the original winner first. Other complete MEMORY copies of the same
-// size stay available so a TRANSFER_FAIL against one peer can fall back to a
-// sibling without a second Query (Type-1). affinity_enabled is retained for
-// call-site compatibility; MEMORY siblings are always kept.
+// Keep the original winner first. With affinity on, every same-size MEMORY
+// sibling stays so a later read can reselect. With affinity off, keep at most
+// one extra sibling: Get retries a TRANSFER_FAIL once, and the common
+// single-replica query does not copy anything beyond the winner.
 inline std::vector<Replica::Descriptor> RetainMemoryReadCandidates(
     const std::vector<Replica::Descriptor> &replicas,
-    const Replica::Descriptor &chosen, bool /*affinity_enabled*/) {
+    const Replica::Descriptor &chosen, bool affinity_enabled) {
     std::vector<Replica::Descriptor> result{chosen};
     if (!chosen.is_memory_replica()) return result;
+    if (!affinity_enabled && replicas.size() <= 1) return result;
     const auto &original = chosen.get_memory_descriptor().buffer_descriptor;
+    size_t extras = 0;
     for (const auto &replica : replicas) {
         if (replica.status != ReplicaStatus::COMPLETE ||
             !replica.is_memory_replica())
@@ -227,6 +229,7 @@ inline std::vector<Replica::Descriptor> RetainMemoryReadCandidates(
              buffer.transport_endpoint_ == original.transport_endpoint_))
             continue;
         result.push_back(replica);
+        if (!affinity_enabled && ++extras >= 1) break;
     }
     return result;
 }
