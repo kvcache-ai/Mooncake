@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "client_service.h"
+#include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
@@ -188,10 +189,18 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
 
     struct AllocatedBatch;
+    struct ColdReadInvalidation;
 
     tl::expected<BatchGetResult, ErrorCode> BatchGetOnce(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatchShared(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        std::shared_ptr<AllocatedBatch>* staging_out = nullptr);
+        bool prefer_pinned, std::string flight_key);
+    static tl::expected<std::vector<uint64_t>, ErrorCode>
+    StagingPointersInOrder(const AllocatedBatch& batch,
+                           const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes);
 
     /**
      * @brief Hands a singleflight waiter its own batch id and pointer order for
@@ -227,14 +236,10 @@ class FileStorage {
         ~AllocatedBatch() = default;
     };
 
-    // What a cold-read flight publishes to its waiters: the leader's result
-    // plus a strong reference to the staging batch behind it. The reference is
-    // what lets a waiter alias the buffer even after the leader released its
-    // own id, instead of falling back to a redundant read.
-    struct ColdReadOutcome {
-        tl::expected<BatchGetResult, ErrorCode> result;
-        std::shared_ptr<AllocatedBatch> staging;
-    };
+    // Shared staging stays alive independently of each remote alias lease or
+    // local reader's RAII owner. The flight itself retains no completed value.
+    using ColdReadOutcome =
+        tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode>;
 
     /**
      * @brief Offload object data and metadata.
@@ -473,13 +478,12 @@ class FileStorage {
 
     // Singleflight for cold reads. The first reader of an exact batch becomes
     // the leader and does the SSD I/O; readers that request the same key/size
-    // pairs, in any order, wait on its shared_future and then take an alias
-    // batch id for the leader's staging buffer. Waiting on a future wakes only
-    // that batch's waiters, and if the leader unwinds, the destroyed promise
-    // reports a broken promise instead of parking the waiters forever.
-    std::mutex singleflight_mutex_;
-    std::unordered_map<std::string, std::shared_future<ColdReadOutcome>>
-        inflight_cold_reads_;  // Guarded by singleflight_mutex_.
+    // pairs, in any order, share the staging owner. Remote readers take an
+    // independent alias lease; local readers retain a request-scoped owner.
+    // Waiting on a future wakes only that batch's waiters, and if the leader
+    // unwinds, the destroyed promise reports a broken promise instead of
+    // parking the waiters forever.
+    ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

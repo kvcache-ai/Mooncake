@@ -431,8 +431,7 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 }
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-    std::shared_ptr<AllocatedBatch>* staging_out) {
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto lease_timeout =
         start_time + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
@@ -442,12 +441,6 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
     auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
-    if (staging_out != nullptr) {
-        // Hand the caller a strong reference to the staging batch, so
-        // singleflight waiters can still alias it after this batch is
-        // released below.
-        *staging_out = allocated_batch;
-    }
 
     auto& shard = ShardFor(batch_id);
     MutexLocker locker(&shard.mutex);
@@ -512,86 +505,61 @@ void FileStorage::PartitionUnbucketedTasks(
     }
 }
 
+// Source replacement must not let a later read join pre-mutation staging.
+struct FileStorage::ColdReadInvalidation {
+    FileStorage& storage;
+    explicit ColdReadInvalidation(FileStorage& owner) : storage(owner) {
+        storage.inflight_cold_reads_.Clear();
+    }
+    ~ColdReadInvalidation() { storage.inflight_cold_reads_.Clear(); }
+};
+
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadBatchShared(const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& sizes,
+                             bool prefer_pinned, std::string flight_key) {
+    // Pinned and ordinary staging are separate source-buffer contracts.
+    flight_key.push_back(prefer_pinned ? '\1' : '\0');
+    auto flight = inflight_cold_reads_.Acquire(flight_key);
+    if (!flight.IsLeader()) {
+        try {
+            return flight.Result().get();
+        } catch (const std::future_error&) {
+            // Preserve the existing abandoned-producer fallback.
+            return LoadBatch(keys, sizes, prefer_pinned);
+        }
+    }
+    auto result = LoadBatch(keys, sizes, prefer_pinned);
+    flight.Publish(result);
+    return result;
+}
+
+tl::expected<std::vector<uint64_t>, ErrorCode>
+FileStorage::StagingPointersInOrder(const AllocatedBatch& batch,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<int64_t>& sizes) {
+    std::vector<uint64_t> pointers;
+    pointers.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto slice = batch.slices.find(keys[i]);
+        if (sizes[i] < 0 || slice == batch.slices.end() ||
+            slice->second.size != static_cast<size_t>(sizes[i]))
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        pointers.push_back(reinterpret_cast<uintptr_t>(slice->second.ptr));
+    }
+    return pointers;
+}
+
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    auto flight_key = BuildColdReadFlightKey(keys, sizes);
-    if (!flight_key) {
-        // Keep validation and duplicate-key behavior on the ordinary path.
-        return BatchGetOnce(keys, sizes);
-    }
-
-    std::shared_future<ColdReadOutcome> inflight;
-    // Only the leader needs a promise, so allocate it on that branch instead
-    // of building a shared state every caller then throws away.
-    std::shared_ptr<std::promise<ColdReadOutcome>> promise;
-    {
-        std::lock_guard<std::mutex> lock(singleflight_mutex_);
-        auto it = inflight_cold_reads_.find(*flight_key);
-        if (it == inflight_cold_reads_.end()) {
-            promise = std::make_shared<std::promise<ColdReadOutcome>>();
-            inflight_cold_reads_.emplace(*flight_key,
-                                         promise->get_future().share());
-        } else {
-            inflight = it->second;
-        }
-    }
-
-    if (inflight.valid()) {
-        // Waiter: another reader is already pulling this batch off SSD.
-        // get() returns a reference into the shared state, which lives as long
-        // as this future, so the waiter reads the leader's outcome in place
-        // instead of copying it.
-        const ColdReadOutcome* leader = nullptr;
-        try {
-            leader = &inflight.get();
-        } catch (const std::future_error&) {
-            // The leader unwound without publishing a result, so its promise
-            // is gone. Read the batch ourselves rather than fail the caller
-            // for somebody else's error.
-            VLOG(1) << "Cold read flight abandoned for " << keys.size()
-                    << " key(s)";
-            return BatchGetOnce(keys, sizes);
-        }
-        if (!leader->result) {
-            // Propagate the leader's failure: retrying would repeat the same
-            // SSD read for the same error.
-            return leader->result;
-        }
-
-        std::vector<uint64_t> pointers;
-        pointers.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto slice = leader->staging->slices.find(keys[i]);
-            if (sizes[i] < 0 || slice == leader->staging->slices.end() ||
-                slice->second.size != static_cast<size_t>(sizes[i])) {
-                // The canonical key should make this impossible. Fall back
-                // defensively rather than return pointers in the wrong order.
-                return BatchGetOnce(keys, sizes);
-            }
-            pointers.push_back(reinterpret_cast<uintptr_t>(slice->second.ptr));
-        }
-        return ShareStagingBuffer(leader->staging, std::move(pointers));
-    }
-
-    // Leader: do the SSD IO, then publish it to the waiters.
-    auto forget_flight = [this, &flight_key] {
-        std::lock_guard<std::mutex> lock(singleflight_mutex_);
-        inflight_cold_reads_.erase(*flight_key);
-    };
-
-    ColdReadOutcome outcome;
-    try {
-        outcome.result = BatchGetOnce(keys, sizes, &outcome.staging);
-    } catch (...) {
-        // Unregister before unwinding: the destroyed promise then reports a
-        // broken promise to the waiters, instead of leaving them parked on a
-        // key whose flight will never finish.
-        forget_flight();
-        throw;
-    }
-    forget_flight();
-    promise->set_value(outcome);
-    return outcome.result;
+    auto key = BuildColdReadFlightKey(keys, sizes);
+    if (!key) return BatchGetOnce(keys, sizes);
+    auto loaded = LoadBatchShared(keys, sizes, false, std::move(*key));
+    if (!loaded) return tl::make_unexpected(loaded.error());
+    auto pointers = StagingPointersInOrder(**loaded, keys, sizes);
+    if (!pointers) return BatchGetOnce(keys, sizes);
+    // Register only the actual consumer's alias, not a hidden producer id.
+    return ShareStagingBuffer(*loaded, std::move(*pointers));
 }
 
 FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
@@ -618,13 +586,20 @@ FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
-    auto load_result = LoadBatch(keys, sizes, true);
-    if (!load_result) return tl::make_unexpected(load_result.error());
-
-    auto batch = std::move(load_result.value());
+    auto key = BuildColdReadFlightKey(keys, sizes);
+    auto loaded = key ? LoadBatchShared(keys, sizes, true, *key)
+                      : LoadBatch(keys, sizes, true);
+    if (!loaded) return tl::make_unexpected(loaded.error());
     LocalBatchResult result;
-    result.pointers = std::move(batch->pointers);
-    result.owner = std::move(batch);
+    if (key) {
+        auto pointers = StagingPointersInOrder(**loaded, keys, sizes);
+        if (!pointers) return tl::make_unexpected(pointers.error());
+        result.pointers = std::move(*pointers);
+    } else {
+        result.pointers = (*loaded)->pointers;
+    }
+    // Shared metadata must remain immutable for the other readers.
+    result.owner = std::move(*loaded);
     return result;
 }
 
@@ -902,11 +877,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
-        auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler,
-            [this](const std::vector<std::string>& evicted_keys) {
-                return NotifyEvictedDiskReplicas(evicted_keys);
-            });
+        auto offload_res = [&] {
+            ColdReadInvalidation invalidate(*this);
+            return storage_backend_->BatchOffload(
+                host_batch_object, bucket_complete_handler,
+                [this](const std::vector<std::string>& evicted_keys) {
+                    return NotifyEvictedDiskReplicas(evicted_keys);
+                });
+        }();
 
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
@@ -1056,12 +1034,15 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
         return {};
     }
 
-    auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
-        config_.disk_eviction_high_watermark_ratio,
-        config_.disk_eviction_low_watermark_ratio,
-        [this](const std::vector<std::string>& evicted_keys) {
-            return NotifyEvictedDiskReplicas(evicted_keys);
-        });
+    auto eviction_result = [&] {
+        ColdReadInvalidation invalidate(*this);
+        return storage_backend_->EvictAboveDiskWatermark(
+            config_.disk_eviction_high_watermark_ratio,
+            config_.disk_eviction_low_watermark_ratio,
+            [this](const std::vector<std::string>& evicted_keys) {
+                return NotifyEvictedDiskReplicas(evicted_keys);
+            });
+    }();
     if (!eviction_result) {
         return tl::make_unexpected(eviction_result.error());
     }
@@ -1242,6 +1223,7 @@ void FileStorage::RemoveAll() {
     // must not request it; callers must ensure no live object depends on the
     // files being removed.
     if (storage_backend_) {
+        ColdReadInvalidation invalidate(*this);
         storage_backend_->RemoveAll();
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";

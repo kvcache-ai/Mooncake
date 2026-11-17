@@ -7,12 +7,14 @@
 #include <barrier>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -122,6 +124,20 @@ class FailingReadBackend : public BucketStorageBackend {
    private:
     int read_errno_;
     DiskErrorObserver observer_;
+};
+
+class DelayedReadBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& slices) override {
+        ++loads;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return BucketStorageBackend::BatchLoad(slices);
+    }
+
+    std::atomic<size_t> loads{0};
 };
 
 class FileStorageTest : public ::testing::Test {
@@ -780,6 +796,16 @@ class FileStorageTest : public ::testing::Test {
                                size_t size) {
         fileStorage.pinned_restore_arena_allocator_ =
             ClientBufferAllocator::create(address, size);
+    }
+
+    std::shared_ptr<DelayedReadBackend> InstallDelayedReadBackend(
+        FileStorage& storage, const FileStorageConfig& config) {
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 10;
+        auto backend =
+            std::make_shared<DelayedReadBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        return backend;
     }
 
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
@@ -2836,6 +2862,116 @@ TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBatchSucceeds) {
     auto result = fileStorage.BatchGet(keys, sizes);
     ASSERT_TRUE(result) << "Multi-key BatchGet should succeed";
     fileStorage.ReleaseBuffer(result->batch_id);
+}
+
+TEST_F(FileStorageTest, BatchGetLocalSharesOwnerAndPreservesPointerOrder) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.use_uring = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = InstallDelayedReadBackend(storage, config);
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, data));
+    ASSERT_GE(keys.size(), 3u);
+    keys.resize(3);
+    sizes.resize(3);
+
+    constexpr size_t kReaders = 8;
+    std::barrier start(static_cast<std::ptrdiff_t>(kReaders));
+    std::vector<std::optional<FileStorage::LocalBatchResult>> results(kReaders);
+    std::vector<std::thread> readers;
+    for (size_t i = 0; i < kReaders; ++i) {
+        readers.emplace_back([&, i] {
+            auto requested_keys = keys;
+            auto requested_sizes = sizes;
+            if (i % 2) {
+                std::reverse(requested_keys.begin(), requested_keys.end());
+                std::reverse(requested_sizes.begin(), requested_sizes.end());
+            }
+            start.arrive_and_wait();
+            auto result =
+                storage.BatchGetLocal(requested_keys, requested_sizes);
+            if (result) results[i] = std::move(*result);
+        });
+    }
+    for (auto& reader : readers) reader.join();
+
+    EXPECT_EQ(backend->loads.load(), 1u);
+    ASSERT_TRUE(results[0]);
+    for (size_t reader = 0; reader < kReaders; ++reader) {
+        ASSERT_TRUE(results[reader]);
+        ASSERT_EQ(results[reader]->pointers.size(), keys.size());
+        for (size_t index = 0; index < keys.size(); ++index) {
+            const size_t key_index =
+                reader % 2 ? keys.size() - index - 1 : index;
+            const auto pointer = results[reader]->pointers[index];
+            EXPECT_EQ(pointer, results[0]->pointers[key_index]);
+            EXPECT_EQ(std::string(reinterpret_cast<const char*>(pointer),
+                                  sizes[key_index]),
+                      data.at(keys[key_index]));
+        }
+    }
+    // Retaining consumers keeps their bytes alive, but does not cache reads.
+    auto later = storage.BatchGetLocal(keys, sizes);
+    ASSERT_TRUE(later);
+    EXPECT_EQ(backend->loads.load(), 2u);
+    EXPECT_NE(later->pointers.front(), results[0]->pointers.front());
+}
+
+TEST_F(FileStorageTest, LocalAndRpcReadsKeepSeparateStagingContracts) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.use_uring = false;
+    std::vector<char> arena(64 * 1024 + 4096);
+    const auto arena_begin =
+        (reinterpret_cast<uintptr_t>(arena.data()) + 4095) & ~4095ULL;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = InstallDelayedReadBackend(storage, config);
+    SetPinnedRestoreArena(storage, reinterpret_cast<void*>(arena_begin),
+                          64 * 1024);
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, data));
+    ASSERT_GE(keys.size(), 3u);
+    keys.resize(3);
+    sizes.resize(3);
+    std::optional<FileStorage::LocalBatchResult> local;
+    std::optional<FileStorage::BatchGetResult> rpc;
+    std::barrier start(2);
+    std::thread local_reader([&] {
+        start.arrive_and_wait();
+        auto result = storage.BatchGetLocal(keys, sizes);
+        if (result) local = std::move(*result);
+    });
+    std::thread rpc_reader([&] {
+        start.arrive_and_wait();
+        auto result = storage.BatchGet(keys, sizes);
+        if (result) rpc = std::move(*result);
+    });
+    local_reader.join();
+    rpc_reader.join();
+    ASSERT_TRUE(local);
+    ASSERT_TRUE(rpc);
+    EXPECT_EQ(backend->loads.load(), 2u);
+    ASSERT_EQ(local->pointers.size(), keys.size());
+    ASSERT_EQ(rpc->pointers.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_GE(local->pointers[i], arena_begin);
+        EXPECT_LT(local->pointers[i], arena_begin + 64 * 1024);
+        EXPECT_TRUE(rpc->pointers[i] < arena_begin ||
+                    rpc->pointers[i] >= arena_begin + 64 * 1024);
+        for (const auto pointer : {local->pointers[i], rpc->pointers[i]}) {
+            EXPECT_EQ(
+                std::string(reinterpret_cast<const char*>(pointer), sizes[i]),
+                data.at(keys[i]));
+        }
+    }
+    EXPECT_TRUE(storage.ReleaseBuffer(rpc->batch_id));
 }
 
 TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
