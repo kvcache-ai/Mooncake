@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "tent/runtime/transport.h"
+#include "tent/runtime/transfer_trace.h"
 #include "tent/runtime/slab.h"
 
 namespace mooncake {
@@ -97,6 +98,7 @@ using RdmaSliceStorage = Slab<RdmaSlice>;
 using RdmaTaskStorage = Slab<RdmaTask>;
 
 struct RdmaTask {
+    std::shared_ptr<TransferTrace> transfer_trace;
     int num_slices;
     Request request;
     // Resolved by TransportSelector and copied from RdmaSubBatch. The

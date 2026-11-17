@@ -38,6 +38,7 @@
 #include "tent/runtime/progress_worker.h"
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
+#include "tent/runtime/transfer_trace.h"
 #include "tent/runtime/topology.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
@@ -93,6 +94,7 @@ struct Batch {
     // `finished` so getBatchStatus can skip the owner walk (TE #4199) while
     // maybeFireSubmitHooks still fires per interval (TENT #4001).
     struct SubmitInterval {
+        std::shared_ptr<TransferTrace> transfer_trace;
         size_t start_task_id{0};
         size_t end_task_id{0};  // [start, end)
         uint64_t expected_owners{0};
@@ -147,6 +149,7 @@ void bindIntervalPublishCounter(Transport::SubBatchRef sub_batch,
     if (!sub_batch) return;
     sub_batch->publish_finished_counter =
         interval ? &interval->finished : nullptr;
+    sub_batch->transfer_trace = interval ? interval->transfer_trace : nullptr;
 }
 
 struct PreservedTentConfigOverrides {
@@ -3268,6 +3271,8 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind,
     bool require_post_submit_cancellation) {
+    auto trace =
+        TransferTrace::enabled() ? std::make_shared<TransferTrace>() : nullptr;
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
@@ -3278,10 +3283,13 @@ Status TransferEngineImpl::submitTransfer(
         std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
         const size_t start_task_id = batch_ref.get()->task_list.size();
         PreparedSubmit prepared;
+        if (trace) trace->prepare_start = TransferTrace::now();
         CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
                                    require_post_submit_cancellation));
+        if (trace) trace->prepare_end = TransferTrace::now();
 
         auto interval = std::make_unique<Batch::SubmitInterval>();
+        interval->transfer_trace = std::move(trace);
         interval->start_task_id = start_task_id;
         interval->end_task_id = start_task_id + request_list.size();
         if (notifi) {
@@ -4120,7 +4128,18 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                                              TransferStatus& overall_status) {
-    return getBatchStatus(batch_id, overall_status, false);
+    if (!TransferTrace::enabled())
+        return getBatchStatus(batch_id, overall_status, false);
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    CHECK_STATUS(getBatchStatus(batch_id, overall_status, false));
+    if (overall_status.s != PENDING) {
+        const auto complete = TransferTrace::now();
+        for (auto& interval :
+             reinterpret_cast<Batch*>(batch_id)->submit_intervals)
+            if (interval->transfer_trace)
+                interval->transfer_trace->finish(complete, overall_status.s);
+    }
+    return Status::OK();
 }
 
 Status TransferEngineImpl::progressBatch(BatchID batch_id,

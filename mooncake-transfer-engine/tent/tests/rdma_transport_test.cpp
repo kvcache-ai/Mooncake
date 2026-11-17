@@ -809,6 +809,7 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     params->workers.num_workers = 2;
     params->workers.block_size = 256;
     params->endpoint.max_qp_wr = 4;
+    params->workers.submit_chunk_size = 16;
     RdmaTransportTestPeer::makeWorkerContexts(*workers_, 2, true);
     ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
@@ -854,6 +855,7 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     auto& params = RdmaTransportTestPeer::params(transport_);
     params->workers.block_size = 256;
     params->endpoint.max_qp_wr = 4;
+    params->workers.submit_chunk_size = 16;
     ASSERT_TRUE(transport_.allocateSubBatch(batch_, 2).ok());
     batch_->device_mask = 1ULL << 0;
     auto* batch = static_cast<RdmaSubBatch*>(batch_);
@@ -966,6 +968,136 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
     ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
     EXPECT_EQ(batch_, nullptr);
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       FirstChunkCompletesBeforeTailConstruction) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.block_size = 256;
+    params->workers.submit_chunk_size = 4;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    std::atomic<uint64_t> completed{0};
+    batch_->publish_finished_counter = &completed;
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto* batch = static_cast<RdmaSubBatch*>(batch_);
+    // submit publishes before taking the wakeup mutex. Holding it stops the
+    // producer inside its first flush, before the tail slices even exist.
+    std::unique_lock<std::mutex> gate(worker.mutex);
+    Status result;
+    std::thread caller(
+        [&] { result = transport_.submitTransferTasks(batch_, {request_}); });
+    RdmaSliceList first;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!first.first && std::chrono::steady_clock::now() < deadline) {
+        first = worker.queues[PRIO_HIGH].pop();
+        if (!first.first) std::this_thread::yield();
+    }
+    EXPECT_NE(first.first, nullptr);
+    if (first.first) {
+        auto* task = first.first->task;
+        EXPECT_EQ(first.num_slices, 4);
+        EXPECT_EQ(task->num_slices, 16);
+        EXPECT_EQ(task->ref_count.load(), 5);
+        for (auto* slice = first.first; slice; slice = slice->next) {
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, COMPLETED);
+        }
+        EXPECT_EQ(task->resolved_slices.load(), 4);
+        EXPECT_EQ(task->status_word, PENDING);
+        EXPECT_EQ(completed.load(), 0u);
+        TransferStatus status;
+        EXPECT_TRUE(transport_.getTransferStatus(batch_, 0, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+    }
+    gate.unlock();
+    caller.join();
+    EXPECT_TRUE(result.ok());
+    std::vector<RdmaSliceList> tail;
+    worker.queues[PRIO_HIGH].pop(tail);
+    for (auto chunk : tail) {
+        EXPECT_LE(chunk.num_slices, 4);
+        auto* slice = chunk.first;
+        for (int i = 0; i < chunk.num_slices; ++i) {
+            auto* next = slice->next;
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, COMPLETED);
+            slice = next;
+        }
+    }
+    EXPECT_EQ(completed.load(), 1u);
+    EXPECT_EQ(batch->task_list[0]->status_word, COMPLETED);
+    EXPECT_EQ(batch->task_list[0]->ref_count.load(), 1);
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       RejectedTailSettlesAnAlreadyPublishedTask) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.block_size = 256;
+    params->workers.submit_chunk_size = 4;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    std::atomic<uint64_t> completed{0};
+    batch_->publish_finished_counter = &completed;
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    std::unique_lock<std::mutex> gate(worker.mutex);
+    Status result;
+    std::thread caller(
+        [&] { result = transport_.submitTransferTasks(batch_, {request_}); });
+    RdmaSliceList first;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!first.first && std::chrono::steady_clock::now() < deadline) {
+        first = worker.queues[PRIO_HIGH].pop();
+        if (!first.first) std::this_thread::yield();
+    }
+    RdmaTransportTestPeer::stopAcceptingSubmits(*workers_);
+    gate.unlock();
+    caller.join();
+    ASSERT_NE(first.first, nullptr);
+    EXPECT_TRUE(result.ok());
+    auto* task = first.first->task;
+    EXPECT_EQ(task->resolved_slices.load(), 12);
+    EXPECT_EQ(task->status_word, PENDING);
+    for (auto* slice = first.first; slice; slice = slice->next) {
+        RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+        RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+        updateSliceStatus(slice, COMPLETED);
+        updateSliceStatus(slice, COMPLETED);  // duplicate resolution is inert
+    }
+    EXPECT_EQ(task->resolved_slices.load(), 16);
+    EXPECT_EQ(task->status_word, FAILED);
+    EXPECT_EQ(task->ref_count.load(), 1);
+    EXPECT_EQ(completed.load(), 0u);
+    EXPECT_TRUE(batch_->has_failure.load());
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest, WorkerBoundsAnOversizedDequeuedChain) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.block_size = 256;
+    params->workers.submit_chunk_size = 32;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* task = static_cast<RdmaSubBatch*>(batch_)->task_list[0];
+    // Cancellation avoids requiring a NIC while driving the real worker
+    // dequeue/cursor path. Only one bounded prefix may resolve per round.
+    task->cancel_requested.store(true);
+    params->workers.submit_chunk_size = 4;
+    for (int resolved = 4; resolved <= 16; resolved += 4) {
+        RdmaTransportTestPeer::postSend(*workers_, 0);
+        EXPECT_EQ(task->resolved_slices.load(), resolved);
+        EXPECT_EQ(task->status_word, resolved == 16 ? CANCELED : PENDING);
+    }
+    EXPECT_EQ(task->ref_count.load(), 1);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
 }
 
 TEST_F(RdmaSliceMetadataLifetimeTest,
@@ -4326,6 +4458,31 @@ TEST_F(RdmaWorkersSharedQpTest,
         EXPECT_EQ(task->transferred_bytes, buffer.size());
         EXPECT_EQ(task->ref_count.load(), 1);
     }
+}
+
+TEST_F(RdmaWorkersSharedQpTest, TransferTraceRecordsOnlyAcceptedDataWrPosts) {
+    fake.post_send_rc = EIO;
+    fake.post_send_bad_wr_index = 2;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    auto accepted = std::make_shared<TransferTrace>();
+    auto rejected = std::make_shared<TransferTrace>();
+    std::vector<RdmaSlice*> slices;
+    for (int index = 0; index < 4; ++index) {
+        auto* slice = makeSlice();
+        slice->task->transfer_trace = index < 2 ? accepted : rejected;
+        slices.push_back(slice);
+    }
+    const auto before = TransferTrace::now();
+    ASSERT_EQ(endpoint_->submitSlices(slices, 0, nullptr), 4);
+    if (TransferTrace::enabled()) {
+        EXPECT_GE(accepted->first_post.load(), before);
+        EXPECT_EQ(accepted->first_post.load(), accepted->last_post.load());
+    } else {
+        EXPECT_EQ(accepted->first_post.load(), 0u);
+        EXPECT_EQ(accepted->last_post.load(), 0u);
+    }
+    EXPECT_EQ(rejected->first_post.load(), 0u);
+    EXPECT_EQ(rejected->last_post.load(), 0u);
 }
 
 TEST_F(RdmaWorkersSharedQpTest,

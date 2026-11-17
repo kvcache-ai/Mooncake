@@ -884,6 +884,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         // acknowledge on this QP.
         std::lock_guard<TicketLock> qp_guard(queue_lock_list_[qp_index]);
         rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+        const uint64_t trace_post_ts =
+            TransferTrace::enabled() ? TransferTrace::now() : 0;
         if (rc) {
             // A provider normally returns the first failed WR, but retain no
             // quota if it cannot identify the boundary: none is known posted.
@@ -899,6 +901,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
             auto current = slice_list[wr_idx];
             if (current->failed) continue;  // never reached the hardware
+            if (trace_post_ts && current->task->transfer_trace)
+                current->task->transfer_trace->posted(trace_post_ts);
             queue.push(current);
             current->completions_owed.fetch_add(1, std::memory_order_acq_rel);
         }
