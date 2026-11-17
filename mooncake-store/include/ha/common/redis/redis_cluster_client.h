@@ -75,6 +75,17 @@ class RedisClusterClient {
                             bool read_only);
     bool ParseShards(const redisReply* reply,
                      std::string_view discovery_endpoint);
+    // A MOVED target remembered per slot so the next request starts there
+    // instead of taking the same redirect again. Hints never replace slots_ or
+    // shards_ as the authority: they only choose the first endpoint, are
+    // validated against shards_ when used, expire with the topology refresh
+    // interval, and are capped.
+    struct RedirectHint {
+        std::string endpoint;
+        std::chrono::steady_clock::time_point expires_at;
+    };
+    std::string HintForSlot(uint16_t slot) const;
+    void RememberRedirect(uint16_t slot, const std::string& endpoint);
     // CLUSTER SLOTS omits primaries without slots. Verify ASK targets through
     // CLUSTER NODES before permitting a write on such a primary.
     std::optional<Shard> SlotlessShard(const std::string& endpoint);
@@ -94,6 +105,7 @@ class RedisClusterClient {
     std::map<std::string, RedisContextPtr> connections_;
     std::array<Shard, 16384> slots_;
     std::map<std::string, Shard> shards_;
+    std::map<uint16_t, RedirectHint> redirect_hints_;
     std::set<std::string> slots_only_endpoints_;
     bool shards_snapshot_ = false;
 };

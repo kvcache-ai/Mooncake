@@ -15,6 +15,7 @@
 namespace mooncake::ha::common::redis {
 namespace {
 constexpr auto kError = ErrorCode::ETCD_OPERATION_ERROR;
+constexpr size_t kMaxRedirectHints = 64;
 
 std::string Address(const RedisEndpoint& endpoint) {
     return (endpoint.host.find(':') == std::string::npos
@@ -154,6 +155,7 @@ ErrorCode RedisClusterClient::ConnectLocked(std::string connstring,
     connections_.clear();
     slots_only_endpoints_.clear();
     shards_.clear();
+    redirect_hints_.clear();
     shards_snapshot_ = false;
     topology_valid_ = false;
     deadline_ = std::chrono::steady_clock::time_point::max();
@@ -547,6 +549,41 @@ std::optional<RedisClusterClient::Shard> RedisClusterClient::SlotlessShard(
 #endif
 }
 
+std::string RedisClusterClient::HintForSlot(uint16_t slot) const {
+    const auto hint = redirect_hints_.find(slot);
+    if (hint == redirect_hints_.end()) return {};
+    if (hint->second.expires_at <= std::chrono::steady_clock::now()) return {};
+    // Converged discovery wins over a stale hint.
+    if (hint->second.endpoint == slots_[slot].primary) return {};
+    // Only a currently validated primary may receive the request; a target
+    // that lost its shard falls back to the authoritative owner.
+    if (shards_.find(hint->second.endpoint) == shards_.end()) return {};
+    return hint->second.endpoint;
+}
+
+void RedisClusterClient::RememberRedirect(uint16_t slot,
+                                          const std::string& endpoint) {
+    if (endpoint == slots_[slot].primary) {
+        redirect_hints_.erase(slot);
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (redirect_hints_.size() >= kMaxRedirectHints) {
+        for (auto it = redirect_hints_.begin(); it != redirect_hints_.end();) {
+            if (it->second.expires_at <= now) {
+                it = redirect_hints_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Still full: drop the lowest slot so the cache stays bounded.
+        if (redirect_hints_.size() >= kMaxRedirectHints)
+            redirect_hints_.erase(redirect_hints_.begin());
+    }
+    redirect_hints_[slot] = {
+        endpoint, now + std::chrono::milliseconds(topology_refresh_ms_)};
+}
+
 RedisClusterClient::Lease RedisClusterClient::Execute(
     const std::vector<std::string>& command, std::string_view key, bool write,
     std::chrono::steady_clock::time_point deadline) {
@@ -582,6 +619,12 @@ RedisClusterClient::Lease RedisClusterClient::Execute(
         return lease;
     }
     std::string endpoint = cluster_ ? slots_[slot].primary : seeds_[0];
+    // A recently accepted MOVED target shortens the stale-owner detour; the
+    // authoritative map still decides ownership in the shard checks below.
+    if (cluster_) {
+        const auto hinted = HintForSlot(slot);
+        if (!hinted.empty()) endpoint = hinted;
+    }
     bool asking = false;
     std::set<std::string> visited;
     lease.routing_error = RoutingError::Transport;
@@ -666,6 +709,10 @@ RedisClusterClient::Lease RedisClusterClient::Execute(
             shards_.find(endpoint) == shards_.end()) {
             break;
         }
+        // Accepted MOVED target: start later requests here instead of taking
+        // the same redirect until discovery catches up. ASK is temporary and
+        // is never cached.
+        if (!asking) RememberRedirect(slot, endpoint);
     }
     lease.reply.reset();
     topology_valid_ = false;
