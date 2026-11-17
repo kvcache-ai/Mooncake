@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "crc32c.h"
+#include "ha/common/advancing_suffix_lag_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/snapshot/batch_oplog/codec.h"
@@ -142,11 +143,15 @@ class RebootstrapTest : public ::testing::Test {
         config.enable_snapshot_bootstrap = true;
         config.enable_verification = false;
         config.oplog_poll_interval_ms = 10;
+        config.batch_oplog_retry_timeout_sec = 1;
+        config.oplog_standby_max_batches_per_poll = 2;
         service_ = std::make_unique<HotStandbyService>(config);
-        service_->SetCatchUpBatchKvBackendForTesting(backend_);
+        lag_backend_ =
+            std::make_shared<AdvancingSuffixLagBackend>("n09", backend_);
+        service_->SetCatchUpBatchKvBackendForTesting(lag_backend_);
         service_->SetBatchOpLogSnapshotProvider(
             std::make_unique<BatchOpLogSnapshotProvider>(
-                "n09", *backend_, *objects_, "snapshots"));
+                "n09", *lag_backend_, *objects_, "snapshots"));
         Publish(1, "old", false);
         OpLogEntry initial;
         initial.sequence_id = 1;
@@ -279,6 +284,7 @@ class RebootstrapTest : public ::testing::Test {
     std::shared_ptr<MemoryBackend> backend_{std::make_shared<MemoryBackend>()};
     std::unique_ptr<LocalFileSnapshotObjectStore> objects_;
     std::unique_ptr<HotStandbyService> service_;
+    std::shared_ptr<AdvancingSuffixLagBackend> lag_backend_;
 };
 
 TEST_F(RebootstrapTest, SnapshotBootstrapWithoutSuffixSetsAppliedMetric) {
@@ -377,6 +383,23 @@ TEST_F(RebootstrapTest, WaitsBetweenPagesWhileSerializableRangeLags) {
     const auto range_times = backend_->SerializableRangeTimes();
     ASSERT_GE(range_times.size(), 5u);
     EXPECT_GE(range_times[4] - range_times[1], std::chrono::milliseconds(20));
+}
+
+TEST_F(RebootstrapTest,
+       RevalidatesPostRestoreSuffixDespiteContinuousBatchProgress) {
+    Publish(3, "new", false);
+    lag_backend_->LagAfterRangeContaining(BuildBatchRecordKey("n09", 4), 5, 3);
+    Compact();
+
+    ASSERT_TRUE(WaitUntil([&] {
+        return service_->GetLatestAppliedSequenceId() >= 6 &&
+               !service_->GetSyncStatus().is_recovering;
+    }));
+    EXPECT_TRUE(service_->IsReadyForPromotion());
+    StandbySnapshot snapshot;
+    ASSERT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    ASSERT_EQ(1u, snapshot.segments.size());
+    EXPECT_EQ("new", snapshot.segments[0].segment_name);
 }
 
 TEST_F(RebootstrapTest, NoEligibleSnapshotPreservesStateAndRetriesOnline) {

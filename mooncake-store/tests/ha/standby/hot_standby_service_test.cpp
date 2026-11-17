@@ -19,10 +19,13 @@
 #include "ha_metric_manager.h"
 #include "master_service.h"
 #include "metadata_store.h"
+#include "ha/common/advancing_suffix_lag_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
+#include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -922,6 +925,62 @@ TEST_F(HotStandbyServiceTest,
     EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
               service->GetSyncStatus().last_error);
     service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest,
+       RevalidatesSuffixLagDespiteContinuousBatchProgress) {
+    auto backend = std::make_shared<AdvancingSuffixLagBackend>(
+        cluster_id_, std::make_shared<FakeHaKvBackend>());
+    backend->StartLagging(1, std::chrono::seconds(5), 3);
+    config_.enable_snapshot_bootstrap = false;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 1;
+    config_.oplog_standby_max_batches_per_poll = 2;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((service_->GetSyncStatus().applied_seq_id < 2 ||
+            service_->GetSyncStatus().lag_entries != 0) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GE(service_->GetLatestAppliedSequenceId(), 2u);
+    EXPECT_EQ(0u, service_->GetSyncStatus().lag_entries);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+}
+
+TEST_F(HotStandbyServiceTest,
+       PromotionRevalidatesSuffixLagDespiteContinuousBatchProgress) {
+    auto backend = std::make_shared<AdvancingSuffixLagBackend>(
+        cluster_id_, std::make_shared<FakeHaKvBackend>());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    config_.enable_snapshot_bootstrap = false;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 1;
+    config_.oplog_standby_max_batches_per_poll = 2;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+    LocalFileSnapshotObjectStore objects("/tmp/mooncake-suffix-lag-promotion");
+    service_->SetBatchOpLogSnapshotProvider(
+        std::make_unique<BatchOpLogSnapshotProvider>(cluster_id_, *backend,
+                                                     objects, "snapshots"));
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    auto capture = service_->BeginBatchOpLogSnapshotCapture();
+    ASSERT_TRUE(capture);
+    backend->StartLagging(1, std::chrono::seconds(5), 3);
+
+    auto handoff = service_->PromoteAndDetachBatchOpLogStore();
+
+    ASSERT_TRUE(handoff.has_value());
+    EXPECT_GE(handoff->applied_cursor.batch_id, 2u);
+    EXPECT_EQ(handoff->applied_cursor.batch_id,
+              handoff->applied_cursor.last_seq);
 }
 
 TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {

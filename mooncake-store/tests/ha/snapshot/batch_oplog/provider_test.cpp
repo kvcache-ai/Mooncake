@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "ha/common/advancing_suffix_lag_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_applier.h"
@@ -396,6 +397,44 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     EXPECT_EQ(2u, result->last_applied_batch_id);
     EXPECT_EQ(1, backend.serializable_range_calls());
     EXPECT_GT(backend.range_calls(), 0);
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
+       RevalidatesSuffixLagDespiteContinuousBatchProgress) {
+    auto storage = std::make_shared<EmptyBackend>();
+    AdvancingSuffixLagBackend backend("clusterA", storage);
+    backend.StartLagging(1);
+    LocalFileSnapshotObjectStore objects(root_);
+    BatchOpLogSnapshotProvider provider(
+        "clusterA", backend, objects, "snapshots", 1024,
+        std::chrono::milliseconds(1), std::chrono::milliseconds(30));
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+
+    auto result = provider.RestoreBaseline(metadata, registry);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GE(result->last_applied_batch_id, 2u);
+    EXPECT_EQ(result->last_applied_batch_id, result->last_applied_seq);
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
+       KeepsStrongRevalidationAcrossCatchUpPages) {
+    auto storage = std::make_shared<EmptyBackend>();
+    AdvancingSuffixLagBackend backend("clusterA", storage);
+    backend.StartLagging(1, std::chrono::seconds(5), 3);
+    LocalFileSnapshotObjectStore objects(root_);
+    BatchOpLogSnapshotProvider provider(
+        "clusterA", backend, objects, "snapshots", 2,
+        std::chrono::milliseconds(1), std::chrono::milliseconds(30));
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+
+    auto result = provider.RestoreBaseline(metadata, registry);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GE(result->last_applied_batch_id, 4u);
+    EXPECT_EQ(result->last_applied_batch_id, result->last_applied_seq);
 }
 
 }  // namespace mooncake::test

@@ -150,15 +150,17 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
 
     HAMetricManager::instance().update_snapshot_runtime(
         [](auto& metrics) { metrics.suffix_batches = 0; });
-    std::optional<std::chrono::steady_clock::time_point> no_progress_since;
+    // Partial progress and full pages do not resolve a pending suffix wait.
+    // Preserve its age so strong revalidation can finish across pages.
+    std::optional<std::chrono::steady_clock::time_point> suffix_wait_since;
     for (;;) {
         if (cancelled && cancelled()) {
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
         const auto poll_started = std::chrono::steady_clock::now();
         const auto read_mode =
-            no_progress_since &&
-                    poll_started - *no_progress_since >= no_progress_timeout
+            suffix_wait_since &&
+                    poll_started - *suffix_wait_since >= no_progress_timeout
                 ? OpLogBatchStandbyReadMode::LINEARIZABLE
                 : OpLogBatchStandbyReadMode::SERIALIZABLE;
         auto poll = reader.PollOnce(max_batches_per_poll, read_mode);
@@ -190,13 +192,13 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
         }
         if (poll.disposition ==
             OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
-            if (poll.applied_batches != 0 || !no_progress_since) {
-                no_progress_since = std::chrono::steady_clock::now();
+            if (!suffix_wait_since) {
+                suffix_wait_since = std::chrono::steady_clock::now();
             }
             auto delay = poll_interval;
             if (no_progress_timeout > std::chrono::milliseconds::zero()) {
                 const auto elapsed =
-                    std::chrono::steady_clock::now() - *no_progress_since;
+                    std::chrono::steady_clock::now() - *suffix_wait_since;
                 const auto remaining =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         no_progress_timeout - elapsed);
@@ -209,7 +211,9 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
             }
             continue;
         }
-        if (poll.error == ErrorCode::OK) no_progress_since.reset();
+        if (poll.error == ErrorCode::OK && !poll.has_more_pages) {
+            suffix_wait_since.reset();
+        }
         if (poll.applied_entries == 0) {
             return Invalid(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
         }
