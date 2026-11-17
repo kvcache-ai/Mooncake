@@ -8,6 +8,7 @@ import pytest
 from mooncake.reshard.weight import (
     ParallelRank,
     PlacementFragment,
+    TiledCOODenseFragment,
     TiledCOOLayout,
     plan_tiled_coo_read,
 )
@@ -270,6 +271,64 @@ def test_sdk_binding_preserves_arbitrary_precision_integer_offsets():
     assert bound.counts == (10**40,)
     assert bound.entry_count == 10**40
     assert bound.payload_ranges[0].source_entry == 10**40
+
+
+def test_dense_binding_keeps_unowned_prefix_and_publisher_order():
+    layout = TiledCOOLayout.build(
+        ("other", "w", "w"),
+        ((3, 4), (2, 4), (2, 4)),
+        ((0, 0), (0, 0), (2, 0)),
+    )
+    target = _target(0, "w", (0, 1), (4, 2))
+    plan = plan_tiled_coo_read(layout, (target,))
+    target_id = target.placement_fragment_id
+
+    assert plan.bind_dense(None, 2) == (
+        TiledCOODenseFragment(24, 32, 4, 4, target_id, 0, 0, 1, 2),
+    )
+    assert plan.bind_dense((2, 0, 1), 2) == (
+        TiledCOODenseFragment(0, 16, 2, 4, target_id, 2, 0, 1, 2),
+        TiledCOODenseFragment(40, 16, 2, 4, target_id, 0, 0, 1, 2),
+    )
+    assert plan.bind_dense((), 2) == ()
+
+
+def test_dense_binding_clips_rows_without_changing_source_stride():
+    layout = TiledCOOLayout.build(("w",), ((8, 16),), ((10, 20),))
+    target = _target(0, "w", (12, 24), (3, 5))
+    plan = plan_tiled_coo_read(layout, (target,))
+
+    assert plan.bind_dense((0,), 4) == (
+        TiledCOODenseFragment(
+            128,
+            192,
+            3,
+            16,
+            target.placement_fragment_id,
+            0,
+            0,
+            4,
+            5,
+        ),
+    )
+
+
+@pytest.mark.parametrize("itemsize", [0, -1, False, 1.0])
+def test_dense_binding_rejects_invalid_itemsize(itemsize):
+    layout = TiledCOOLayout.build(("w",), ((2, 2),), ((0, 0),))
+    plan = plan_tiled_coo_read(layout, (_target(0, "w", (0, 0), (2, 2)),))
+
+    with pytest.raises(ValueError, match="itemsize"):
+        plan.bind_dense((0,), itemsize)
+
+
+@pytest.mark.parametrize("records", [(-1,), (1,), (False,), (0.0,)])
+def test_dense_binding_rejects_invalid_record_indices(records):
+    layout = TiledCOOLayout.build(("w",), ((2, 2),), ((0, 0),))
+    plan = plan_tiled_coo_read(layout, (_target(0, "w", (0, 0), (2, 2)),))
+
+    with pytest.raises(ValueError, match="record index"):
+        plan.bind_dense(records, 2)
 
 
 @pytest.mark.parametrize(

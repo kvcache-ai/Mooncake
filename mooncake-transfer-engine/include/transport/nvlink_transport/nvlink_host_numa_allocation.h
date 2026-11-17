@@ -114,6 +114,8 @@ class NvlinkHostNumaAllocation {
         std::function<CUresult(void*, CUmemGenericAllocationHandle,
                                CUmemAllocationHandleType, unsigned long long)>
             mem_export_to_shareable_handle;
+        std::function<CUresult(CUcontext*, CUdevice)> device_primary_ctx_retain;
+        std::function<CUresult(CUdevice)> device_primary_ctx_release;
     };
     struct OwnedRangeRegistry;
 
@@ -125,6 +127,9 @@ class NvlinkHostNumaAllocation {
     static Status GetAllocationGranularityWithDriverApi(int numa_node,
                                                         const DriverApi& api,
                                                         size_t& granularity);
+    // The first visible GPU attached to `numa_node`, or -1 when none is.
+    static CUdevice GpuLocalToNode(int numa_node, const DriverApi& api,
+                                   const std::vector<CUdevice>& devices);
     static Status CreateWithDriverApi(
         int numa_node, size_t requested_length, size_t required_va_alignment,
         const DriverApi& api,
@@ -156,6 +161,10 @@ class NvlinkHostNumaAllocation {
     uint64_t allocation_handle_ = 0;
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
     bool owned_range_registered_ = false;
+    // A GPU on the allocation's socket whose primary context stays retained
+    // until the handle is released.
+    CUdevice local_gpu_ = -1;
+    bool context_retained_ = false;
     DriverApi driver_api_;
 #endif
 };

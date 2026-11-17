@@ -109,9 +109,12 @@ class Status final {
         kRpcServiceError = 132,
         kMalformedJson = 133,
         kRpcConnectionError = 134,  // Failed before dispatching the request.
+        // The peer rejected the numeric RPC id before entering a handler.
+        kRpcFunctionNotFound = 135,
         kInternalError = 199,
 
         kNotImplemented = 200,
+        kTimedOut = 201,
         kMaxCode
     };
 
@@ -163,6 +166,7 @@ class Status final {
     TYPE_CHECK(CudaError);
     TYPE_CHECK(MetadataError);
     TYPE_CHECK(RpcConnectionError);
+    TYPE_CHECK(RpcFunctionNotFound);
     [[nodiscard]] bool IsRpcServiceError() const {
         return code_ == Code::kRpcServiceError || IsRpcConnectionError();
     }
@@ -173,6 +177,7 @@ class Status final {
     TYPE_CHECK(InternalError);
 
     TYPE_CHECK(NotImplemented);
+    TYPE_CHECK(TimedOut);
 
     // Return a combination of the error code name and message.
     std::string ToString() const;

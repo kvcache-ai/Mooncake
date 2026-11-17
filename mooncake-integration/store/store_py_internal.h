@@ -538,8 +538,8 @@ std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
     py::object torch_tensor = py::reinterpret_borrow<py::object>(tensor);
     const auto [start, size] =
         calculate_shard_range(shape[split_dim], rank, shard_count);
-    return torch_tensor.attr("narrow")(split_dim, start, size)
-        .attr("contiguous")();
+    return materialize_contiguous_tensor(
+        torch_tensor.attr("narrow")(split_dim, start, size));
 }
 
 [[maybe_unused]] std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(

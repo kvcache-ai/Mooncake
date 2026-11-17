@@ -71,6 +71,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return UsesObjectStorage() && distributed_config_.UsesKvcs();
     }
 
+    // True when reads go through a filesystem adapter that can read straight
+    // into arbitrary host memory without an intermediate buffer.
+    bool SupportsArbitraryHostReadBuffers() const;
+
     tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(

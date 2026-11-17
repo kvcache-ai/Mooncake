@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <unistd.h>
 #ifdef USE_CUDA
 #include <dlfcn.h>
@@ -902,11 +901,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
+        // Capture errno before PLOG touches it: the transport needs to tell
+        // the HugeTLB sub-view EINVAL apart from every other failure so it can
+        // retry with a widened range (see
+        // RdmaTransport::registerLocalMemoryInternal).
+        const int saved_errno = errno;
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
                     << globalConfig().rdma_data_direct;
-        return ERR_CONTEXT;
+        return saved_errno == EINVAL ? ERR_CONTEXT_EINVAL : ERR_CONTEXT;
     }
     return 0;
 }
@@ -975,22 +979,14 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         memory_region_map_.erase(iter);
         return 0;
     }
-    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
-    // reading mr->length (or the cached region length) afterwards is a use-
-    // after-free. We restore fork state on the same range to undo the
-    // MADV_DONTFORK applied at register time (see issue #3639).
-    size_t region_length = iter->second.mr->length;
-    void *region_addr = static_cast<char *>(iter->second.addr) -
-                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // No MADV_DOFORK here (reverted #3660): libibverbs already restores the
+    // fork state of a plain host MR inside ibv_dereg_mr(), while dma-buf and
+    // device ranges never carried MADV_DONTFORK and madvise() on them only
+    // fails with EINVAL/ENOMEM (see issue #3639).
     memory_region_map_.erase(iter);
     return 0;
 }
@@ -1009,6 +1005,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     // safe and does not affect the subsequent dereg.
     closeDmabufExport(exp);
     if (ret != 0) {
+        // Propagates ERR_CONTEXT_EINVAL unchanged: the fault-in attempt runs
+        // before any MR is recorded, so the transport can retry it widened.
         return ret;
     }
     if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC

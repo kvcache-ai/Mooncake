@@ -18,7 +18,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef USE_SHCA
@@ -717,16 +716,9 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     // dma-buf MRs pin no host pages: rdma-core stores the dma-buf offset in
     // `addr`, not a host VMA, so there is no fork state to restore.
     if (is_dmabuf) return 0;
-    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
-    // madvise(MADV_DONTFORK) on the registered range when fork protection
-    // is active; failing to undo this on unregister leaves VMAs permanently
-    // split, exhausting vm.max_map_count under high register/unregister churn.
-    // See issue #3639.
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // No MADV_DOFORK here (reverted #3660): ibv_dereg_mr() already restores the
+    // fork state of a plain host MR through ibv_dofork_range(), and the extra
+    // call only failed with EINVAL/ENOMEM on dma-buf and device ranges.
 
     return 0;
 }

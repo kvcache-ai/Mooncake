@@ -13,7 +13,8 @@ if(USE_ASCEND
   endif()
   if(USE_ASCEND_DIRECT OR USE_UBSHMEM)
     # adxl::AdxlEngine::MallocMem / FreeMem live in llm_datadist (weak in
-    # adxl_compat.h). Keep this dependency out of classic USE_ASCEND builds.
+    # adxl_compat.h); the Ascend Direct builds (USE_ASCEND_DIRECT or the
+    # equivalent USE_ASCEND) need that dependency.
     target_link_libraries(platform_ascend PRIVATE llm_datadist)
 
     set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")

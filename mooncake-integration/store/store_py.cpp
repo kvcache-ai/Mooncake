@@ -13,6 +13,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "common.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -148,6 +149,23 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
+py::object materialize_contiguous_tensor(const py::handle &tensor) {
+    py::object contiguous = tensor.attr("contiguous")();
+#ifdef USE_MLU
+    if (!contiguous.is(tensor) &&
+        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        // CNRT copies do not wait for work on PyTorch's current MLU stream.
+        // The caller can synchronize its input, but this new copy is ours.
+        // Wait before exposing its pointer to Store, including for TP shards.
+        py::module_::import("torch")
+            .attr("mlu")
+            .attr("current_stream")(contiguous.attr("device"))
+            .attr("synchronize")();
+    }
+#endif
+    return contiguous;
+}
+
 PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                       const std::string &key_name,
                                       bool require_contiguous,
@@ -172,7 +190,7 @@ PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         }
 
         py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
+            require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
         info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = inspected.attr("numel")().cast<size_t>();
@@ -511,12 +529,13 @@ class RangedReadSnapshotPy {
    public:
     RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
                          std::vector<std::string> keys)
-        : store_(std::move(store)), keys_(std::move(keys)) {
-        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+        : store_(store), keys_(std::move(keys)) {
+        snapshot_ = store->prepare_get_into_ranges_snapshot(keys_);
     }
 
     bool belongs_to(const std::shared_ptr<PyClient> &store) const {
-        return store_.get() == store.get();
+        const auto owner = store_.lock();
+        return owner && owner.get() == store.get();
     }
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
@@ -526,16 +545,28 @@ class RangedReadSnapshotPy {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (snapshot_.should_refresh()) {
-            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        // A snapshot must not keep a closed Store and its segments alive;
+        // reject use after close instead of reading through a torn-down
+        // client.
+        auto store = store_.lock();
+        if (!store) {
+            throw std::runtime_error(
+                "RangedReadSnapshot is no longer usable: the Store was "
+                "closed");
         }
-        return store_->get_into_ranges_from_snapshot(
+        if (snapshot_.should_refresh()) {
+            store->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store->get_into_ranges_from_snapshot(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
             snapshot_);
     }
 
    private:
-    std::shared_ptr<PyClient> store_;
+    // Weak by design: an idle snapshot must not extend the native client's
+    // lifetime beyond close(), otherwise its segments stay published and a
+    // later reader can observe a stale MEMORY replica (issue #5464).
+    std::weak_ptr<PyClient> store_;
     std::vector<std::string> keys_;
     PyClient::RangedReadSnapshot snapshot_;
     std::mutex mutex_;
@@ -3545,7 +3576,15 @@ PYBIND11_MODULE(_store, m) {
                              << ". Valid range: 0-" << max_node;
             }
 
-            if (numa_run_on_node(node) != 0) {
+            int rc;
+            {
+                // numa_run_on_node() fills libnuma's per-node cpumask cache
+                // on first use; see numaNodeCpuCacheMutex().
+                std::lock_guard<std::mutex> guard(
+                    mooncake::numaNodeCpuCacheMutex());
+                rc = numa_run_on_node(node);
+            }
+            if (rc != 0) {
                 LOG(WARNING) << "numa_run_on_node failed for node " << node;
             }
 
