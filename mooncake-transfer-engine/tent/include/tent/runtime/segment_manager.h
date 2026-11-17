@@ -55,6 +55,9 @@ class SegmentManager {
 
     Status closeRemote(SegmentID handle);
 
+    // The name a remote handle was opened with; empty if it is not open.
+    std::string remoteName(SegmentID handle);
+
     // Use `withCachedSegment()` when you want automatic
     // cache invalidation and retry on stale segment cache.
     Status getRemoteCached(SegmentDesc *&desc, SegmentID handle);
@@ -134,6 +137,12 @@ class SegmentManager {
         }
         return res;
     }
+
+    // Runs `call` on the rpc_server_addr and returns an RPC failure as is,
+    // keeping the desc; a registry that can move the address is asked once.
+    Status withPeerRpcAddr(
+        SegmentID segment_id,
+        const std::function<Status(const std::string &)> &call);
 
    public:
     // Returns the current immutable snapshot of the local SegmentDesc.
