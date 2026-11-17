@@ -124,13 +124,13 @@ class KVCacheKindPolicy {
         return controls_[index];
     }
 
-    // "MAMBA=PROTECT,INDEXER=DEFER". Empty is a valid policy. Names are
-    // case-sensitive. A kind may appear once.
+    // "MAMBA=PROTECT,INDEXER=DEFER". Empty or whitespace-only is a valid
+    // policy. Names are case-sensitive. A kind may appear once.
     [[nodiscard]] static std::optional<KVCacheKindPolicy> Parse(
         std::string_view spec, std::string* error) {
         KVCacheKindPolicy policy;
         std::array<bool, kKindCount> seen{};
-        std::string_view rest = spec;
+        std::string_view rest = Trim(spec);
         while (!rest.empty()) {
             const auto comma = rest.find(',');
             auto token = Trim(rest.substr(0, comma));

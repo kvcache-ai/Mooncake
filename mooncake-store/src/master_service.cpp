@@ -178,7 +178,10 @@ struct MasterService::MemoryEviction {
                     eviction::SkipReason::kExternalEvict);
             }
             const auto kind_control =
-                service_.EvictControlForKind(candidate.metadata.kv_cache_kind);
+                candidate.metadata.data_type == ObjectDataType::KVCACHE
+                    ? service_.EvictControlForKind(
+                          candidate.metadata.kv_cache_kind)
+                    : KVCacheEvictControl::NORMAL;
             if (kind_control == KVCacheEvictControl::PROTECT) {
                 return tl::make_unexpected(
                     eviction::SkipReason::kKindProtected);

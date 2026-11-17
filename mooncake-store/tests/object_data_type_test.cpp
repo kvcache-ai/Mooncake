@@ -7,7 +7,11 @@
 #include <gtest/gtest.h>
 #include <ylt/struct_pack.hpp>
 
+#include <chrono>
 #include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace mooncake::test {
 
@@ -137,11 +141,26 @@ TEST_F(ObjectDataTypeTest, KVCacheKindPolicyParsesAndRejects) {
     EXPECT_EQ(policy->ControlFor(KVCacheKind::UNSPECIFIED),
               KVCacheEvictControl::NORMAL);
 
-    EXPECT_TRUE(KVCacheKindPolicy::Parse("", &error));
     EXPECT_FALSE(KVCacheKindPolicy::Parse("SWA=PIN", &error));
     EXPECT_FALSE(KVCacheKindPolicy::Parse("NOPE=NORMAL", &error));
     EXPECT_FALSE(KVCacheKindPolicy::Parse("SWA=NORMAL,SWA=DEFER", &error));
     EXPECT_FALSE(KVCacheKindPolicy::Parse("MAMBA=PROTECT,", &error));
+    EXPECT_FALSE(KVCacheKindPolicy::Parse("MAMBA=PROTECT, \t\n", &error));
+    EXPECT_FALSE(KVCacheKindPolicy::Parse(" , ", &error));
+    EXPECT_FALSE(KVCacheKindPolicy::Parse("SWA=DEFER, ,MAMBA=PROTECT", &error));
+}
+
+TEST_F(ObjectDataTypeTest, EmptyKVCacheKindPoliciesKeepNormalEviction) {
+    for (const auto* spec : {"", "   ", " \t\r\n\f\v "}) {
+        std::string error;
+        auto policy = KVCacheKindPolicy::Parse(spec, &error);
+        ASSERT_TRUE(policy) << error;
+        for (uint8_t value = 0;
+             value <= static_cast<uint8_t>(KVCacheKind::LINEAR); ++value) {
+            EXPECT_EQ(policy->ControlFor(static_cast<KVCacheKind>(value)),
+                      KVCacheEvictControl::NORMAL);
+        }
+    }
 }
 
 TEST_F(ObjectDataTypeTest, PerKeyKindsSplitWithTheBatch) {
@@ -239,6 +258,82 @@ TEST_F(ObjectDataTypeTest, MasterAppliesKindEvictionPolicy) {
     EXPECT_EQ(service.EvictControlForKind(KVCacheKind::UNSPECIFIED),
               KVCacheEvictControl::NORMAL);
 }
+
+class KVCacheKindEvictionTest
+    : public ObjectDataTypeTest,
+      public ::testing::WithParamInterface<KVCacheEvictControl> {};
+
+TEST_P(KVCacheKindEvictionTest, ControlsOnlyApplyToKVCacheObjects) {
+    const auto control = GetParam();
+    const std::string control_name(KVCacheEvictControlName(control));
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.kv_cache_kind_evict =
+        "UNSPECIFIED=" + control_name + ",MAMBA=" + control_name;
+    MasterService service(config);
+    MasterServiceTestPeer::EvictionRunning(service) = false;
+    MasterServiceTestPeer::EvictionThread(service).join();
+    ASSERT_TRUE(
+        service.MountSegment(MakeSegment(), generate_uuid()).has_value());
+
+    const auto expired =
+        std::chrono::system_clock::now() - std::chrono::hours(1);
+    std::vector<std::pair<std::string, ObjectDataType>> objects;
+    for (const auto kind : {KVCacheKind::UNSPECIFIED, KVCacheKind::MAMBA}) {
+        for (const auto data_type :
+             {ObjectDataType::UNKNOWN, ObjectDataType::KVCACHE,
+              ObjectDataType::TENSOR, ObjectDataType::WEIGHT,
+              ObjectDataType::SAMPLE, ObjectDataType::ACTIVATION,
+              ObjectDataType::GRADIENT, ObjectDataType::OPTIMIZER_STATE,
+              ObjectDataType::METADATA, ObjectDataType::GENERAL}) {
+            const auto key = "kind-eviction-" + std::to_string(objects.size());
+            ReplicateConfig replicate_config;
+            replicate_config.data_type = data_type;
+            if (kind != KVCacheKind::UNSPECIFIED) {
+                replicate_config.kv_cache_kinds =
+                    std::vector<KVCacheKind>{kind};
+            }
+            const auto client_id = generate_uuid();
+            ASSERT_TRUE(service
+                            .PutStart(client_id, key, TenantId::Default(), 1024,
+                                      replicate_config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(client_id, key, TenantId::Default(),
+                                    ReplicaType::MEMORY)
+                            .has_value());
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service, {TenantId::Default(), key});
+            ASSERT_TRUE(hold);
+            auto& metadata = hold->metadata();
+            SpinLocker locker(&metadata.lock);
+            metadata.lease_->SetDeadline(expired);
+            objects.emplace_back(key, data_type);
+        }
+    }
+
+    // With no fallback quota, only KV objects may be protected or deferred.
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 0.0);
+    for (const auto& [key, data_type] : objects) {
+        auto exists = service.ProbeKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value()) << key;
+        EXPECT_EQ(*exists, data_type == ObjectDataType::KVCACHE) << key;
+    }
+
+    // The fallback pass can reclaim DEFER objects, but never PROTECT ones.
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    for (const auto& [key, data_type] : objects) {
+        auto exists = service.ProbeKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value()) << key;
+        EXPECT_EQ(*exists, data_type == ObjectDataType::KVCACHE &&
+                               control == KVCacheEvictControl::PROTECT)
+            << key;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(KVCacheKindControls, KVCacheKindEvictionTest,
+                         ::testing::Values(KVCacheEvictControl::PROTECT,
+                                           KVCacheEvictControl::DEFER));
 
 TEST_F(ObjectDataTypeTest, PutStartRecordsTheKVCacheKind) {
     MasterService service;
