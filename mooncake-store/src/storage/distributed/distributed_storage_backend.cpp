@@ -1061,12 +1061,18 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     if (bucket_mode) {
         pool_workers = std::min(pool_workers, kMaxOpenBucketsPerBatch - 1);
     }
-    // Helper jobs are bounded across calls: at most dfs_read_threads_ are
-    // queued or running at once, and each releases its slot when it finishes.
-    // A job may still start after this call returns, but busy workers cannot
-    // accumulate jobs from repeated calls. Without a free slot, or once the
-    // pool is stopped and enqueue() throws, the caller reads the rest itself.
-    const auto job_limit = static_cast<size_t>(dfs_read_threads_);
+    // Helper jobs waiting in the pool queue are bounded across calls, and a
+    // job frees its slot as soon as a worker picks it up. The bound is a
+    // safeguard rather than a scheduling knob: once it is reached, later calls
+    // get no helpers and their tail latency rises, so it is set high enough
+    // (kQueuedJobsPerThread times dfs_read_threads_) that up to that many
+    // concurrent calls can each queue a full set of helpers. A job may still
+    // start after this call returns, but busy workers cannot accumulate jobs
+    // without limit. Without a free slot, or once the pool is stopped and
+    // enqueue() throws, the caller reads the rest itself.
+    constexpr size_t kQueuedJobsPerThread = 64;
+    const auto job_limit =
+        kQueuedJobsPerThread * static_cast<size_t>(dfs_read_threads_);
     for (size_t t = 0; t < pool_workers; ++t) {
         size_t jobs = dfs_read_jobs_.load(std::memory_order_relaxed);
         while (jobs < job_limit &&
@@ -1076,8 +1082,8 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         if (jobs >= job_limit) break;
         try {
             dfs_read_pool_->enqueue([this, drain]() {
-                drain();
                 dfs_read_jobs_.fetch_sub(1, std::memory_order_relaxed);
+                drain();
             });
         } catch (...) {
             dfs_read_jobs_.fetch_sub(1, std::memory_order_relaxed);
