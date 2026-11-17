@@ -40,6 +40,49 @@ class SimpleDataProto:
         return cls(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
 
+def test_tensor_byte_copy_snapshots_device_storage_before_host_dereference(monkeypatch):
+    torch = pytest.importorskip("torch")
+    cpu = torch.arange(16, dtype=torch.int32)
+
+    class DeviceTensor:
+        device = type("Device", (), {"type": "cuda"})()
+        copies = 0
+
+        def cpu(self):
+            self.copies += 1
+            return cpu
+
+    source = DeviceTensor()
+
+    def serialize(tensor):
+        assert tensor is cpu, "a device pointer reached the host byte-copy codec"
+        return b"header", cpu.data_ptr(), cpu.nbytes, cpu
+
+    monkeypatch.setattr(sos, "_tensor_codec_helper", lambda name: serialize)
+    data, header = sos._tensor_payload_bytes(sos._TensorPayload(source))
+    assert source.copies == 1
+    assert header == len(b"header")
+    assert data == b"header" + cpu.numpy().tobytes()
+
+
+def test_native_tensor_parts_preserve_device_source(monkeypatch):
+    class DeviceTensor:
+        device = type("Device", (), {"type": "cuda"})()
+
+        def cpu(self):
+            raise AssertionError("the native tensor path must retain its device source")
+
+    source = DeviceTensor()
+
+    def serialize(tensor):
+        assert tensor is source
+        return b"header", 0xDEADBEEF, 64, source
+
+    monkeypatch.setattr(sos, "_tensor_codec_helper", lambda name: serialize)
+    metadata, ptr, size, owner = sos._tensor_payload_parts(sos._TensorPayload(source))
+    assert (metadata, ptr, size, owner) == (b"header", 0xDEADBEEF, 64, source)
+
+
 class BadDataProto:
     def __init__(self) -> None:
         pass
@@ -2032,6 +2075,87 @@ def test_bundle_partial_put_failure_cleans_payloads() -> None:
     assert store.objects == {}
 
 
+class PostCommitFailureStore(InMemoryStore):
+    """A negative return can arrive after the write became visible."""
+
+    def __init__(self, point):
+        super().__init__()
+        self.point = point
+        self.failed = False
+
+    def _finish(self, key, status):
+        matches = (
+            (self.point == "meta" and key.endswith("/meta"))
+            or (
+                self.point == "chunk" and "/buffer/" in key and key.endswith("/chunk/1")
+            )
+            or (self.point == "small" and key.endswith("/buffer/batch.payload"))
+            or (self.point == "manifest" and key.endswith("/manifest"))
+        )
+        if matches and not self.failed:
+            assert status == 0 and self.is_exist(key) == 1
+            self.failed = True
+            return -9876
+        return status
+
+    def put(self, key, value, config=None):
+        return self._finish(key, super().put(key, value, config))
+
+    def put_tensor(self, key, value):
+        return self._finish(key, super().put_tensor(key, value))
+
+    def pub_tensor(self, key, value, config=None):
+        return self._finish(key, super().pub_tensor(key, value, config))
+
+
+@pytest.mark.parametrize("mode", ["copy", "auto"])
+@pytest.mark.parametrize("point", ["meta", "chunk", "small", "manifest"])
+def test_dataproto_post_commit_failure_removes_attempted_keys(mode, point):
+    torch = pytest.importorskip("torch")
+    store = PostCommitFailureStore(point)
+    _, transfer = make_transfer(
+        store=store, default_chunk_bytes=2048, buffer_pool=FakeBufferPool()
+    )
+    value = torch.arange(16 if point == "small" else 2048, dtype=torch.int32).reshape(
+        1, -1
+    )
+
+    with pytest.raises(RuntimeError, match="-9876"):
+        transfer.put(
+            SimpleDataProto(batch={"payload": value}),
+            type="dataproto",
+            policy=BundleTransferPolicy(copy_mode=mode),
+            field_schemas={
+                "payload": FieldSchema(codec="torch_tensor", direct_alignment=4096)
+            },
+        )
+
+    assert store.failed
+    assert store.objects == {}
+    assert store.tensor_objects == {}
+
+
+@pytest.mark.parametrize("mode", ["copy", "auto"])
+def test_new_manifest_post_commit_failure_preserves_borrowed_buffers(mode):
+    store = PostCommitFailureStore("disabled")
+    _, transfer = make_transfer(store=store)
+    original = transfer.put_bundle(b"base", {"data": b"borrowed"})
+    before = dict(store.objects)
+    store.point = "manifest"
+
+    with pytest.raises(RuntimeError, match="-9876"):
+        transfer._bundle_store.put_bundle_manifest(
+            b"next",
+            original.manifest["buffers"],
+            partition="default",
+            chunk_bytes=None,
+            policy=BundleTransferPolicy(copy_mode="auto"),
+        )
+
+    assert store.failed
+    assert store.objects == before
+
+
 def test_bundle_cleanup_failure_preserves_put_error() -> None:
     _store, transfer = make_transfer(FailingRemoveStore(fail_on_put=2))
 
@@ -2295,18 +2419,23 @@ def test_structured_object_direct_torch_tensor_materialize_into_uses_real_store(
     destination = ctypes.create_string_buffer(total_bytes)
 
     try:
-        result = transfer.materialize_into(
-            transfer.read_spec(ref),
-            {
-                "tensor": tensor_object_buffer(
-                    ctypes.addressof(destination),
-                    total_bytes,
-                    destination,
-                    batch_size=3,
-                )
-            },
-        )
-        assert torch.equal(result.objects["tensor"], tensor)
+        destination_ptr = ctypes.addressof(destination)
+        assert store.register_buffer(destination_ptr, total_bytes) == 0
+        try:
+            result = transfer.materialize_into(
+                transfer.read_spec(ref),
+                {
+                    "tensor": tensor_object_buffer(
+                        destination_ptr,
+                        total_bytes,
+                        destination,
+                        batch_size=3,
+                    )
+                },
+            )
+            assert torch.equal(result.objects["tensor"], tensor)
+        finally:
+            assert store.unregister_buffer(destination_ptr) == 0
     finally:
         transfer.remove_bundle(ref)
 

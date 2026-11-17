@@ -316,6 +316,13 @@ class Client {
                                       std::vector<Slice>& slices,
                                       const ReplicateConfig& config);
 
+    // Strict registered-source writes use classic RDMA and physically drain
+    // before returning, including errors. The ordinary Put ABI is unchanged.
+    tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                      std::vector<Slice>& slices,
+                                      const ReplicateConfig& config,
+                                      bool require_direct);
+
     /**
      * @brief Batch put data with replication
      * @param keys Object keys
@@ -856,10 +863,19 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool SupportsStrictDirectRead() const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent();
+    }
+
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
-        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+        return SupportsStrictDirectRead() &&
                transfer_engine_->getTransport(protocol) != nullptr;
     }
+
+    // Check the TE segment used for routing, not the Store allocator's
+    // protocol hint (which may still contain its historical TCP default).
+    [[nodiscard]] bool CanReadDirectToDevice(const Replica::Descriptor& replica,
+                                             bool destination_registered) const;
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
@@ -1031,6 +1047,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    bool CanTransferDirectMemory(const Replica::Descriptor& replica,
+                                 bool registered, bool allow_nvlink) const;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1085,7 +1103,7 @@ class Client {
     // result of each such replica, in order.
     std::vector<std::pair<ReplicaType, ErrorCode>> WriteMemoryAndNofReplicas(
         const std::vector<Replica::Descriptor>& replicas,
-        std::vector<Slice>& slices);
+        std::vector<Slice>& slices, bool require_direct = false);
     ErrorCode TransferRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,

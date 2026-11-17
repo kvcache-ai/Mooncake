@@ -293,6 +293,32 @@ py::tuple serialize_tensor_metadata(py::object tensor) {
 
 size_t tensor_metadata_size() { return sizeof(TensorMetadata); }
 
+py::dict tensor_metadata_spec(py::bytes prefix, size_t object_size) {
+    const std::string bytes(prefix.c_str(), prefix.size());
+    if (bytes.size() < sizeof(TensorMetadata)) {
+        throw py::value_error("tensor metadata prefix is too short");
+    }
+    auto parsed = ParseTensorMetadata(bytes.data(), object_size);
+    if (!parsed) {
+        throw py::value_error("invalid tensor metadata");
+    }
+    const auto &metadata = parsed->metadata;
+    auto dtype = tensor_dtype_to_torch_dtype(
+        static_cast<TensorDtype>(metadata.header.dtype));
+    auto element_size = TensorDtypeElementSize(metadata.header.dtype);
+    if (dtype.is_none() || !element_size) {
+        throw py::value_error("unsupported tensor metadata dtype");
+    }
+    py::dict spec;
+    spec["encoding"] = "torch_tensor";
+    spec["dtype"] = py::str(dtype);
+    spec["shape"] =
+        TensorShapeToVector(metadata.layout.local_shape, metadata.header.ndim);
+    spec["element_size"] = *element_size;
+    spec["metadata_bytes"] = parsed->data_offset;
+    return spec;
+}
+
 bool tensor_destination_matches_metadata(const PyTensorInfo &target,
                                          const ParsedTensorMetadata &stored,
                                          const std::string &key,
@@ -2231,6 +2257,8 @@ NB_MODULE(_store, m) {
           "size, and owner.");
     m.def("_tensor_metadata_size", &tensor_metadata_size,
           "Return the serialized Mooncake tensor metadata size.");
+    m.def("_tensor_metadata_spec", &tensor_metadata_spec,
+          "Validate a tensor metadata prefix without reading its payload.");
     m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
           "Deserialize Mooncake tensor metadata plus payload bytes.");
 
@@ -3241,11 +3269,23 @@ NB_MODULE(_store, m) {
                    &all_dst_offsets,
                const std::vector<std::vector<std::vector<size_t>>>
                    &all_src_offsets,
-               const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+               const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+               bool require_direct) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                if (require_direct) {
+                    if (!self.real_client_ || self.use_dummy_client_) {
+                        throw std::runtime_error(
+                            "direct ranged reads require an in-process "
+                            "RealClient");
+                    }
+                    py::gil_scoped_release release;
+                    return self.real_client_->get_into_ranges_direct(
+                        buffers, all_keys, all_dst_offsets, all_src_offsets,
+                        all_sizes);
                 }
                 py::gil_scoped_release release;
                 return self.store_->get_into_ranges(buffers, all_keys,
@@ -3254,7 +3294,7 @@ NB_MODULE(_store, m) {
             },
             py::arg("buffer_ptrs"), py::arg("all_keys"),
             py::arg("all_dst_offsets"), py::arg("all_src_offsets"),
-            py::arg("all_sizes"),
+            py::arg("all_sizes"), py::arg("require_direct") = false,
             "Get multiple byte ranges from multiple objects into multiple "
             "pre-allocated buffers")
         .def(
@@ -3332,19 +3372,30 @@ NB_MODULE(_store, m) {
         .def(
             "put_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-               uintptr_t buffer_ptr, size_t size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               uintptr_t buffer_ptr, size_t size, const ReplicateConfig &config,
+               bool require_direct) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                if (require_direct) {
+                    if (!self.real_client_ || self.use_dummy_client_) {
+                        throw std::runtime_error(
+                            "direct writes require an in-process RealClient");
+                    }
+                    py::gil_scoped_release release;
+                    return self.real_client_->put_from_direct(key, buffer, size,
+                                                              config);
+                }
                 py::gil_scoped_release release;
                 return self.store_->put_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             py::arg("config") = ReplicateConfig{},
-            "Put object data directly from a pre-allocated buffer")
+            py::arg("require_direct") = false,
+            "Put data from a buffer; require_direct enforces registered-source "
+            "classic RDMA with physical completion and no staging")
         .def(
             "put_from_with_metadata",
             [](MooncakeStorePyWrapper &self, const std::string &key,

@@ -2382,8 +2382,9 @@ TEST_F(TransportTest, GroupedScatterDrainPreservesFragmentResults) {
     EXPECT_EQ(fragment_ok, (std::vector<bool>{true, false}));
 }
 
-void expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure failure,
-                                              bool physical_success = false) {
+void expectLegacyScatterDrainAfterPollFailure(
+    ScatterPollFailure failure, bool physical_success = false,
+    TransferRequest::OpCode opcode = TransferRequest::READ) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
     auto transport = std::make_shared<ScatterDrainProbeTransport>(failure);
@@ -2405,7 +2406,7 @@ void expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure failure,
     std::atomic<bool> callback_ok{true};
     std::atomic<bool> callback_before_batch_release{false};
     TransferEngine::ScatterTransferRange range{
-        .opcode = TransferRequest::READ,
+        .opcode = opcode,
         .remote_segment = "scatter-drain-remote",
         .remote_base_offset = 0,
         .remote_size = buffer.size(),
@@ -2464,6 +2465,16 @@ TEST_F(TransportTest, LegacyScatterDrainsAfterTimeout) {
 TEST_F(TransportTest, LegacyScatterDrainPreservesSingleRequestSuccess) {
     expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kStatusError,
                                              true);
+}
+
+TEST_F(TransportTest, StrictWriteScatterDrainsAfterStatusQueryFailure) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kStatusError,
+                                             false, TransferRequest::WRITE);
+}
+
+TEST_F(TransportTest, StrictWriteScatterDrainsAfterTimeout) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kTimeout,
+                                             false, TransferRequest::WRITE);
 }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION

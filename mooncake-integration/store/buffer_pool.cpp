@@ -128,7 +128,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
    public:
     BufferPoolNative(const py::object &store, size_t max_bytes,
                      size_t min_size_class, py::object max_size_class,
-                     size_t alignment, bool block_on_exhaustion,
+                     std::optional<size_t> alignment, bool block_on_exhaustion,
                      py::object default_timeout, py::object max_regions);
     ~BufferPoolNative() {
         try {
@@ -175,6 +175,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
     size_t min_size_class_ = 0;
     size_t max_size_class_ = 0;
     size_t alignment_ = 0;
+    bool align_local_ = false;
     bool block_on_exhaustion_ = true;
     std::optional<double> default_timeout_;
     std::optional<size_t> max_regions_;
@@ -265,7 +266,8 @@ void BufferLeaseNative::release_lease(bool check_exported_views) {
 
 BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
                                    size_t min_size_class,
-                                   py::object max_size_class, size_t alignment,
+                                   py::object max_size_class,
+                                   std::optional<size_t> alignment,
                                    bool block_on_exhaustion,
                                    py::object default_timeout,
                                    py::object max_regions)
@@ -273,7 +275,8 @@ BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
       py_client_(unwrap_store(store)),
       max_bytes_(max_bytes),
       min_size_class_(min_size_class),
-      alignment_(alignment),
+      alignment_(alignment.value_or(8 * 1024 * 1024)),
+      align_local_(alignment.has_value()),
       block_on_exhaustion_(block_on_exhaustion) {
     if (store_obj_.is_none() || !py_client_) {
         throw std::runtime_error("MooncakeDistributedStore is not initialized");
@@ -390,21 +393,46 @@ std::shared_ptr<BufferLeaseNative> BufferPoolNative::make_lease_locked(
 
 std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     std::unique_lock<std::mutex> &lock, size_t requested_size) {
-    const size_t allocation_size = std::max<size_t>(requested_size, 1);
-    if (!has_capacity_for_locked(allocation_size)) {
+    const size_t payload_size = std::max<size_t>(requested_size, 1);
+    if (!has_capacity_for_locked(payload_size)) {
         return std::nullopt;
+    }
+    // The local arena's base is only cache-line aligned. Reserve the padding
+    // as well, then retain the original allocation behind the aligned view.
+    // When padding cannot fit, the existing overflow path allocates an exact
+    // size region with posix_memalign instead.
+    size_t allocation_size = payload_size;
+    bool try_local = !align_local_;
+    if (align_local_ &&
+        payload_size <= std::numeric_limits<size_t>::max() - (alignment_ - 1)) {
+        const size_t padded_size = payload_size + alignment_ - 1;
+        if (padded_size <= local_buffer_capacity_ &&
+            has_capacity_for_locked(padded_size)) {
+            allocation_size = padded_size;
+            try_local = true;
+        }
     }
     reserve_locked(allocation_size);
     lock.unlock();
     std::shared_ptr<BufferHandle> handle;
     bool overflow_registered = false;
     try {
-        if (auto alloc_result =
-                py_client_->client_buffer_allocator_->allocate(allocation_size);
-            alloc_result.has_value()) {
+        auto alloc_result =
+            try_local ? py_client_->client_buffer_allocator_->allocate(
+                            allocation_size)
+                      : std::optional<BufferHandle>{};
+        if (alloc_result.has_value() && align_local_) {
+            auto backing =
+                std::make_shared<BufferHandle>(std::move(*alloc_result));
+            const uintptr_t base = reinterpret_cast<uintptr_t>(backing->ptr());
+            const size_t offset = (alignment_ - base % alignment_) % alignment_;
+            handle = std::make_shared<BufferHandle>(
+                reinterpret_cast<void *>(base + offset), payload_size,
+                [backing = std::move(backing)]() mutable { backing.reset(); });
+        } else if (alloc_result.has_value()) {
             handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
         } else {
-            handle = allocate_overflow_unlocked(allocation_size);
+            handle = allocate_overflow_unlocked(payload_size);
             overflow_registered = handle != nullptr;
         }
     } catch (...) {
@@ -427,6 +455,7 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
         lock.lock();
         throw std::runtime_error("buffer pool is closing");
     }
+    if (overflow_registered) allocation_size = payload_size;
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
     Region region{handle, allocation_size, overflow_registered};
     regions_.emplace(ptr, region);
@@ -563,9 +592,10 @@ void bind_buffer_pool(py::module_ &m) {
     py::class_<BufferPoolNative>(m, "BufferPool")
         .def(py::new_([](const py::object &store, size_t max_bytes,
                          size_t min_size_class, py::object max_size_class,
-                         size_t alignment, bool block_on_exhaustion,
-                         py::object default_timeout, py::object max_regions,
-                         py::object prewarm_size, size_t prewarm_count) {
+                         std::optional<size_t> alignment,
+                         bool block_on_exhaustion, py::object default_timeout,
+                         py::object max_regions, py::object prewarm_size,
+                         size_t prewarm_count) {
                  auto pool = std::make_shared<BufferPoolNative>(
                      store, max_bytes, min_size_class, max_size_class,
                      alignment, block_on_exhaustion, default_timeout,
@@ -579,7 +609,7 @@ void bind_buffer_pool(py::module_ &m) {
              py::arg("store"), py::arg("max_bytes") = 0,
              py::arg("min_size_class") = 64 * 1024,
              py::arg("max_size_class").none() = py::none(),
-             py::arg("alignment") = 8 * 1024 * 1024,
+             py::arg("alignment") = py::none(),
              py::arg("block_on_exhaustion") = true,
              py::arg("default_timeout").none() = py::none(),
              py::arg("max_regions").none() = py::none(),

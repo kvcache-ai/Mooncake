@@ -1762,6 +1762,29 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+bool Client::CanReadDirectToDevice(const Replica::Descriptor& replica,
+                                   bool destination_registered) const {
+    return CanTransferDirectMemory(replica, destination_registered, true);
+}
+
+bool Client::CanTransferDirectMemory(const Replica::Descriptor& replica,
+                                     bool registered, bool allow_nvlink) const {
+    if (!replica.is_memory_replica() || !transfer_engine_ ||
+        transfer_engine_->isUsingTent()) {
+        return false;
+    }
+    const auto& endpoint =
+        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    auto metadata = transfer_engine_->getMetadata();
+    auto segment = metadata->getSegmentDescByName(endpoint);
+    // Only homogeneous transports with a direct device-memory path qualify.
+    // Mixed-protocol selection is address-dependent; do not guess its route.
+    return segment &&
+           ((allow_nvlink && segment->protocol == "nvlink") ||
+            (segment->protocol == "rdma" && registered)) &&
+           HasClassicTransport(segment->protocol);
+}
+
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers,
     TransferIntent intent) {
@@ -2142,6 +2165,17 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    return Put(key, slices, config, false);
+}
+
+tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
+                                          std::vector<Slice>& slices,
+                                          const ReplicateConfig& config,
+                                          bool require_direct) {
+    if (require_direct &&
+        (object_checksum_enabled_ || !HasClassicTransport("rdma"))) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2192,6 +2226,18 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicaTransferSummary transfer_summary;
+    if (require_direct &&
+        std::any_of(start_result->begin(), start_result->end(),
+                    [this](const auto& replica) {
+                        return !CanTransferDirectMemory(replica, true, false);
+                    })) {
+        auto revoked = master_client_.PutRevoke(key, ReplicaType::ALL);
+        if (!revoked) {
+            LOG(ERROR) << "Strict direct put revoke failed for key=" << key
+                       << ": " << toString(revoked.error());
+        }
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
     }
@@ -2214,8 +2260,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
-    for (const auto& [replica_type, transfer_err] :
-         WriteMemoryAndNofReplicas(start_result.value(), slices)) {
+    for (const auto& [replica_type, transfer_err] : WriteMemoryAndNofReplicas(
+             start_result.value(), slices, require_direct)) {
         if (transfer_err != ErrorCode::OK) {
             transfer_summary.RecordFailure(replica_type, transfer_err);
             continue;
@@ -5379,7 +5425,29 @@ ErrorCode Client::TransferReadInternal(
 std::vector<std::pair<ReplicaType, ErrorCode>>
 Client::WriteMemoryAndNofReplicas(
     const std::vector<Replica::Descriptor>& replicas,
-    std::vector<Slice>& slices) {
+    std::vector<Slice>& slices, bool require_direct) {
+    if (require_direct) {
+        std::vector<uint64_t> offsets;
+        offsets.reserve(slices.size());
+        uint64_t offset = 0;
+        for (const auto& slice : slices) {
+            offsets.push_back(offset);
+            offset += slice.size;
+        }
+        std::vector<std::pair<ReplicaType, ErrorCode>> results;
+        results.reserve(replicas.size());
+        for (const auto& replica : replicas) {
+            // The strict Put preflight accepts only direct MEMORY replicas.
+            // This existing scatter WRITE waits for physical completion even
+            // on errors; TransferFuture's ordinary logical timeout cannot.
+            auto transferred =
+                BatchTransferWriteRanges({{replica}}, {slices}, {offsets});
+            results.emplace_back(
+                ReplicaType::MEMORY,
+                transferred[0] ? ErrorCode::OK : transferred[0].error());
+        }
+        return results;
+    }
     // Submit all before waiting, as BatchPut does, so the writes overlap.
     std::vector<std::pair<ReplicaType, tl::expected<TransferFuture, ErrorCode>>>
         pending;

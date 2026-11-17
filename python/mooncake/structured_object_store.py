@@ -5,6 +5,7 @@ import ctypes
 import importlib
 import io
 import json
+import math
 import sys
 import uuid
 from bisect import bisect_right
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
+    Iterable,
     Iterator,
     Literal,
     Mapping,
@@ -26,6 +28,12 @@ from typing import (
 import numpy as np
 
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
+from mooncake._tensor_destination import (
+    TensorDestination,
+    tensor_destination as tensor_destination,
+    validate_schema_destination,
+    validate_tensor_destinations,
+)
 from mooncake._structured_ranges import (
     PreparedRangeLayoutChanged as PreparedRangeLayoutChanged,
     PreparedStructuredMemberRanges,
@@ -82,15 +90,38 @@ class BundleTransferPolicy:
 
 @dataclass(frozen=True)
 class FieldSchema:
-    """Schema hint for DataProto fields.
+    """Codec and optional materialization requirements for structured fields.
 
     ``metadata["section"]`` may pin a field to ``batch``,
     ``non_tensor_batch``, or ``meta_info``.
+    ``direct_alignment`` opts a dense tensor member into strict direct reads;
+    omitting it preserves ordinary materialization. With ``copy_mode="auto"``,
+    a contiguous CUDA source uses strict registered-source RDMA PUT. The caller
+    must register its complete source range and keep it unmodified and alive
+    through PUT. Unsupported native backends fail rather than staging it.
+    Non-contiguous device sources and ``copy`` may use a host snapshot.
     """
 
     codec: str
     nullable: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    direct_alignment: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.direct_alignment is None:
+            return
+        alignment = self.direct_alignment
+        if (
+            isinstance(alignment, bool)
+            or not isinstance(alignment, int)
+            or alignment <= 0
+            or alignment & (alignment - 1)
+        ):
+            raise ValueError(
+                "FieldSchema direct_alignment must be a positive power of two"
+            )
+        if self.codec != "torch_tensor":
+            raise ValueError("direct_alignment requires the torch_tensor codec")
 
 
 @dataclass
@@ -107,16 +138,19 @@ class StructuredObjectPayload:
 
     metadata: Mapping[str, Any]
     buffers: Mapping[str, Any]
+    field_schemas: Mapping[str, FieldSchema]
 
     def __init__(
         self,
         metadata: Optional[Mapping[str, Any]] = None,
         buffers: Optional[Mapping[str, Any]] = None,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
     ) -> None:
         if buffers is None:
             raise TypeError("StructuredObjectPayload requires buffers")
         object.__setattr__(self, "metadata", {} if metadata is None else metadata)
         object.__setattr__(self, "buffers", buffers)
+        object.__setattr__(self, "field_schemas", dict(field_schemas or {}))
 
 
 @dataclass
@@ -154,6 +188,7 @@ class MooncakeDataProtoRef:
 @dataclass(frozen=True)
 class _TensorPayload:
     tensor: Any
+    direct_alignment: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1002,6 +1037,7 @@ class MooncakeBundleTransfer:
         matrix_slices = dict(batch_slices or {})
         non_tensor_batch: dict[str, Any] = {}
         destination_map = destinations or {}
+        validate_tensor_destinations(destination_map)
         batch, matrix_reads = (
             self._read_dataproto_matrices(
                 ref, batch_names, row_slice, row_indices, matrix_slices, destination_map
@@ -1164,6 +1200,13 @@ class MooncakeBundleTransfer:
                 raise ValueError(f"DataProto matrix field {name!r} is not selected")
         names = [name for name in batch_names if include_rows or name in slices]
         for name in names:
+            if isinstance(destinations.get(name), TensorDestination):
+                if name in slices:
+                    raise ValueError(
+                        "direct tensor destinations do not support batch_slices"
+                    )
+                # The payload-only tensor reader handles row gathers directly.
+                continue
             columns = slices.get(name, slice(None))
             if not isinstance(columns, slice):
                 raise TypeError(f"DataProto batch_slices for {name!r} must be a slice")
@@ -1195,6 +1238,7 @@ class MooncakeBundleTransfer:
         field_spec = _structured_field_specs(metadata).get(
             member, {"encoding": "bytes"}
         )
+        validate_schema_destination(field_spec, destination)
         payload_spec = manifest["buffers"][member]
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "ndarray":
@@ -1292,6 +1336,10 @@ class MooncakeBundleTransfer:
         indices: Sequence[int],
         destination: Any,
     ) -> Any:
+        if isinstance(destination, TensorDestination):
+            return self._structured_store._read_tensor_destination(
+                name, payload_spec, field_spec, destination, indices
+            )
         if payload_spec.get("format") == "torch_save":
             if destination is not None:
                 raise ValueError(
@@ -1982,6 +2030,13 @@ class MooncakeBundleTransfer:
                 },
             },
             buffers=buffers,
+            field_schemas={
+                f"batch.{name}": schema
+                for name in batch
+                if (schema := _schema_for_section(field_schemas, name, "batch"))
+                is not None
+                and schema.direct_alignment is not None
+            },
         )
         existing_stage_ref = ref.stage_refs.get(stage) if ref is not None else None
         if existing_stage_ref is not None and not overwrite:
@@ -2575,6 +2630,14 @@ def _validate_dataproto_schema_sections(
         for name in fields:
             actual_sections.setdefault(name, set()).add(section)
     for name, schema in field_schemas.items():
+        if (
+            schema.direct_alignment is not None
+            and name in actual_sections
+            and actual_sections[name] != {"batch"}
+        ):
+            raise ValueError(
+                "direct_alignment requires a dense tensor in the batch section"
+            )
         declared = _schema_section(name, schema)
         if declared is None:
             continue
@@ -3592,7 +3655,9 @@ class _StructuredObjectLayer:
         max_inflight_put: Optional[int],
         config: Any = None,
     ) -> RemoteBundleRef:
-        metadata, buffers = _encode_structured_fields(payload.metadata, payload.buffers)
+        metadata, buffers = _encode_structured_fields(
+            payload.metadata, payload.buffers, payload.field_schemas
+        )
         transfer_policy = self._bundle_store._policy(
             policy, max_inflight_put=max_inflight_put
         )
@@ -3627,7 +3692,14 @@ class _StructuredObjectLayer:
             raise TypeError(
                 "structured ranged destinations must map members to raw_destination"
             )
-        return self._resolve_structured_read(spec)
+        resolved = self._resolve_structured_read(spec)
+        fields = _structured_field_specs(resolved[0])
+        for member in resolved[2]:
+            if fields.get(member, {}).get("direct_alignment") is not None:
+                raise ValueError(
+                    "schema direct_alignment requires typed tensor materialization"
+                )
+        return resolved
 
     def materialize_ranges_into(
         self,
@@ -3702,6 +3774,7 @@ class _StructuredObjectLayer:
         metadata, buffers, selected = self._resolve_structured_read(spec)
         field_specs = _structured_field_specs(metadata)
         destination_map = destinations or {}
+        validate_tensor_destinations(destination_map)
         member_slices = dict(spec.member_slices)
         objects = {
             name: self._read_structured_member(
@@ -3734,6 +3807,7 @@ class _StructuredObjectLayer:
             buffers, fields = stage_cache[manifest_key]
             payload_spec = buffers[member]
             field_spec = fields.get(member, {"encoding": "bytes"})
+            validate_schema_destination(field_spec, destination)
             is_matrix = (
                 field_spec.get("encoding") in {"ndarray", "torch_tensor"}
                 and not field_spec.get("nested")
@@ -3821,6 +3895,7 @@ class _StructuredObjectLayer:
         *,
         use_buffer_pool: bool = True,
     ) -> Any:
+        validate_schema_destination(field_spec, destination)
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "bytes":
             return self._read_bytes_member(
@@ -3849,6 +3924,10 @@ class _StructuredObjectLayer:
         member_slice: StructuredMemberSlice | None,
         destination: Any,
     ) -> Any:
+        if isinstance(destination, TensorDestination):
+            return self._read_tensor_destination(
+                name, payload_spec, field_spec, destination, member_slice
+            )
         if field_spec.get("nested"):
             if destination is not None:
                 raise ValueError(
@@ -3889,6 +3968,84 @@ class _StructuredObjectLayer:
         return _deserialize_tensor_payload(
             self._bundle_store.read_payload(payload_spec)
         )
+
+    def _read_tensor_destination(
+        self,
+        name: str,
+        payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
+        destination: TensorDestination,
+        indices: Sequence[int] | StructuredMemberSlice | None,
+    ) -> Any:
+        if payload_spec.get("format") == "torch_save":
+            raise ValueError("direct tensor reads do not support torch_save payloads")
+        # Existing zero-copy tensor-object buffers carry their schema in the
+        # native header rather than the structured manifest. Fetch only that
+        # prefix and reuse the native codec's validation, never deserialize the
+        # payload into a temporary host tensor.
+        if "shape" not in field_spec or "metadata_bytes" not in payload_spec:
+            prefix = self._bundle_store.read_payload_range(
+                payload_spec, 0, _tensor_metadata_size()
+            )
+            schema = _tensor_codec_helper("_tensor_metadata_spec")(
+                prefix, int(payload_spec["bytes"])
+            )
+            field_spec = {**field_spec, **schema}
+            payload_spec = {**payload_spec, "metadata_bytes": schema["metadata_bytes"]}
+        shape = field_spec.get("shape")
+        metadata_bytes = payload_spec.get("metadata_bytes")
+        if (
+            not isinstance(shape, list)
+            or any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim < 0
+                for dim in shape
+            )
+            or isinstance(metadata_bytes, bool)
+            or not isinstance(metadata_bytes, int)
+            or metadata_bytes < 0
+        ):
+            raise ValueError(
+                "direct tensor read requires typed shape and metadata size"
+            )
+        if isinstance(indices, StructuredMemberSlice):
+            if indices.axis != 0 or not shape:
+                raise ValueError("direct tensor slicing requires axis=0")
+            indices = range(*_normalized_member_slice(indices, shape[0]))
+        if indices is not None and not shape:
+            raise ValueError("direct indexed tensor read requires a batch dimension")
+        output_shape = shape if indices is None else [len(indices), *shape[1:]]
+        nbytes = destination.validate(field_spec, output_shape)
+        stored_bytes = math.prod(shape) * destination.tensor.element_size()
+        if int(payload_spec["bytes"]) != metadata_bytes + stored_bytes:
+            raise ValueError("direct tensor payload byte length differs from schema")
+        if indices is None:
+            ranges = [(metadata_bytes, 0, nbytes)] if nbytes else []
+        else:
+            row_bytes = math.prod(shape[1:]) * destination.tensor.element_size()
+            if any(row < 0 or row >= shape[0] for row in indices):
+                raise ValueError("direct tensor row index is out of bounds")
+            ranges = [
+                (metadata_bytes + row * row_bytes, out * row_bytes, row_bytes)
+                for out, row in enumerate(indices)
+                if row_bytes
+            ]
+        transport = self._bundle_store._transport
+        if not callable(transport._get_into_ranges):
+            raise RuntimeError(
+                "direct tensor read requires get_into_ranges; staging is disabled"
+            )
+        tensor = destination.tensor
+        if tensor.device.type == "cuda":
+            # Finish prior CUDA work before an external device writes the tensor.
+            _torch.cuda.current_stream(tensor.device).synchronize()
+        if ranges and not transport.read_payload_ranges_into_raw_destination(
+            payload_spec, tensor.data_ptr(), ranges, require_direct=True
+        ):
+            raise RuntimeError("direct tensor read is unavailable; staging is disabled")
+        # Native strict reads return after physical drain. The caller submits
+        # consumer CUDA work after this return, establishing the required host
+        # work-submission ordering without synchronizing unrelated GPU streams.
+        return tensor
 
     def _read_sliced_torch_tensor_member(
         self,
@@ -4100,10 +4257,14 @@ class _BundleManifestStore:
             for name, value in buffers.items():
                 _validate_key_segment(name, "buffer name")
                 payload_key = f"{base_key}/buffer/{name}"
+                # A failed return may follow a committed single-object write.
+                # This root belongs to the new bundle, never a borrowed buffer.
+                written_keys.append(payload_key)
                 if isinstance(value, (_TensorPayload, _TensorObjectBufferPayload)):
                     payload_spec, payload_keys = self._put_tensor_payload(
                         payload_key,
                         value,
+                        target_chunk_bytes,
                         transfer_policy,
                         config=config,
                     )
@@ -4141,6 +4302,7 @@ class _BundleManifestStore:
                 "buffers": buffer_specs,
             }
             manifest_blob = _encode_manifest(manifest)
+            written_keys.append(manifest_key)
             _check_status(
                 _put_with_optional_config(
                     self._store, manifest_key, manifest_blob, config
@@ -4148,7 +4310,6 @@ class _BundleManifestStore:
                 "put",
                 manifest_key,
             )
-            written_keys.append(manifest_key)
         except Exception:
             _cleanup_keys(self._store, written_keys, strict=False)
             raise
@@ -4204,6 +4365,7 @@ class _BundleManifestStore:
                 manifest["cleanup_keys"] = cleanup_key_list
             self._validate_manifest(manifest)
             manifest_blob = _encode_manifest(manifest)
+            written_keys.append(manifest_key)
             _check_status(
                 _put_with_optional_config(
                     self._store, manifest_key, manifest_blob, config
@@ -4211,7 +4373,6 @@ class _BundleManifestStore:
                 "put",
                 manifest_key,
             )
-            written_keys.append(manifest_key)
         except Exception:
             _cleanup_keys(self._store, written_keys, strict=False)
             raise
@@ -4379,6 +4540,7 @@ class _BundleManifestStore:
         self,
         key: str,
         value: _TensorPayload | _TensorObjectBufferPayload,
+        chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
         config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
@@ -4389,6 +4551,40 @@ class _BundleManifestStore:
                 "bytes": total_bytes,
                 "chunks": [{"key": key, "bytes": total_bytes}],
             }, [key]
+        if (
+            value.direct_alignment is not None
+            and transfer_policy.copy_mode == "auto"
+            and value.tensor.device.type == "cuda"
+            and value.tensor.is_contiguous()
+        ):
+            # The caller owns the device allocation and its registration.
+            return self._transport.put_registered_device_tensor(
+                key, value, chunk_bytes, config
+            )
+        if (
+            value.direct_alignment is not None
+            and transfer_policy.copy_mode != "zero_copy"
+            and value.tensor.nbytes + _tensor_metadata_size() > chunk_bytes
+        ):
+            # Host byte chunks need a CPU snapshot for device sources. Retain
+            # the codec owner, including any contiguous copy, through the PUT.
+            # This bounds storage objects without concatenating the tensor.
+            metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(
+                value, host_access=True
+            )
+            data = (ctypes.c_ubyte * tensor_nbytes).from_address(data_ptr)
+            payload_spec, payload_keys = self._put_multi_buffer_payload(
+                key,
+                _MultiBufferPayload(
+                    buffers=(memoryview(metadata), memoryview(data).cast("B")),
+                    owners=(owner, data),
+                ),
+                chunk_bytes,
+                transfer_policy,
+                config=config,
+            )
+            payload_spec["metadata_bytes"] = len(metadata)
+            return payload_spec, payload_keys
         if transfer_policy.copy_mode != "copy":
             if transfer_policy.copy_mode == "zero_copy":
                 raise ValueError(
@@ -4405,6 +4601,7 @@ class _BundleManifestStore:
                     "key": key,
                     "bytes": total_bytes,
                     "chunks": [{"key": key, "bytes": total_bytes}],
+                    "metadata_bytes": _tensor_metadata_size(),
                 }, [key]
             except RuntimeError:
                 pass
@@ -4809,7 +5006,7 @@ class _MooncakePayloadTransport:
         config: Any = None,
     ) -> list[str]:
         def fallback_to_direct_put() -> list[str]:
-            chunks = [memoryview(b"".join(group)) for group in chunk_groups]
+            chunks = (memoryview(b"".join(group)) for group in chunk_groups)
             return self._put_chunks_direct(chunk_keys, chunks, config)
 
         if transfer_policy.copy_mode == "zero_copy":
@@ -4986,9 +5183,14 @@ class _MooncakePayloadTransport:
         payload_spec: Mapping[str, Any],
         destination_ptr: int,
         ranges: Sequence[tuple[int, int, int]],
+        *,
+        require_direct: bool = False,
     ) -> bool:
         return self._read_payload_ranges_into_raw_destination(
-            payload_spec["chunks"], destination_ptr, ranges
+            payload_spec["chunks"],
+            destination_ptr,
+            ranges,
+            require_direct=require_direct,
         )
 
     def read_payload_ranges_batch(
@@ -5072,6 +5274,57 @@ class _MooncakePayloadTransport:
         _ = value.owner
         return value.size
 
+    def put_registered_device_tensor(
+        self,
+        key: str,
+        value: _TensorPayload,
+        chunk_bytes: int,
+        config: Any = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        put_from = getattr(self._store, "put_from", None)
+        if not callable(put_from):
+            raise RuntimeError("registered device PUT requires native put_from")
+        metadata, ptr, nbytes, owner = _tensor_payload_parts(value)
+        if ptr != value.tensor.data_ptr() or nbytes != value.tensor.nbytes:
+            raise ValueError(
+                "registered device PUT requires the original contiguous source"
+            )
+        # Complete producer work, including any caller-side contiguous copy,
+        # before the external RDMA reader accesses the source allocation.
+        _torch.cuda.current_stream(value.tensor.device).synchronize()
+        headers = _split_view(memoryview(metadata), chunk_bytes)
+        sizes = [len(part) for part in headers]
+        sizes.extend(
+            min(chunk_bytes, nbytes - offset)
+            for offset in range(0, nbytes, chunk_bytes)
+        )
+        keys = [f"{key}/chunk/{index}" for index in range(len(sizes))]
+        options = {"require_direct": True}
+        if config is not None:
+            options["config"] = _config_for_grouped_keys(config, 1)
+        try:
+            self._put_chunks_direct(keys[: len(headers)], headers, config)
+            offset = 0
+            for chunk_key, size in zip(keys[len(headers) :], sizes[len(headers) :]):
+                _check_status(
+                    put_from(chunk_key, ptr + offset, size, **options),
+                    "put_from(require_direct=True)",
+                    chunk_key,
+                )
+                offset += size
+        except BaseException:
+            _cleanup_keys(self._store, keys, strict=False)
+            raise
+        # The native strict call drains on success and failure. Registration
+        # remains the caller's; keep the actual codec owner through all calls.
+        _ = owner
+        return {
+            "key": key,
+            "bytes": len(metadata) + nbytes,
+            "metadata_bytes": len(metadata),
+            "chunks": [{"key": k, "bytes": size} for k, size in zip(keys, sizes)],
+        }, keys
+
     def put_tensor_payload_direct(
         self,
         key: str,
@@ -5119,7 +5372,9 @@ class _MooncakePayloadTransport:
         put_from = getattr(self._store, "put_from", None)
         if not callable(put_tensor_from) and not callable(put_from):
             raise RuntimeError("put_from is unavailable")
-        metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(value)
+        metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(
+            value, host_access=True
+        )
         total_bytes = len(metadata) + tensor_nbytes
         lease = self._buffer_pool.acquire(total_bytes)
         view = None
@@ -5189,10 +5444,9 @@ class _MooncakePayloadTransport:
     def _put_chunks_direct(
         self,
         chunk_keys: Sequence[str],
-        chunks: Sequence[memoryview],
+        chunks: Iterable[memoryview],
         config: Any = None,
     ) -> list[str]:
-        written_keys: list[str] = []
         try:
             for chunk_key, chunk in zip(chunk_keys, chunks):
                 _check_status(
@@ -5200,9 +5454,10 @@ class _MooncakePayloadTransport:
                     "put",
                     chunk_key,
                 )
-                written_keys.append(chunk_key)
         except Exception:
-            _cleanup_keys(self._store, written_keys, strict=False)
+            # The failed call's result is uncertain. All keys are allocated in
+            # this write's new namespace, so include attempted chunks too.
+            _cleanup_keys(self._store, chunk_keys, strict=False)
             raise
         return list(chunk_keys)
 
@@ -5343,6 +5598,8 @@ class _MooncakePayloadTransport:
         chunks: Sequence[Mapping[str, Any]],
         base_ptr: int,
         ranges: Sequence[tuple[int, int, int]],
+        *,
+        require_direct: bool = False,
     ) -> bool:
         get_into_ranges = self._get_into_ranges
         if not callable(get_into_ranges):
@@ -5372,8 +5629,11 @@ class _MooncakePayloadTransport:
             [size]
             for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
         ]
-        results = get_into_ranges(
-            [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
+        arguments = ([base_ptr], [keys], [dst_offsets], [src_offsets], [sizes])
+        results = (
+            get_into_ranges(*arguments, require_direct=True)
+            if require_direct
+            else get_into_ranges(*arguments)
         )
         if len(results) != 1 or len(results[0]) != len(keys):
             raise RuntimeError(
@@ -6037,13 +6297,43 @@ def _normalize_structured_metadata(metadata: Mapping[str, Any]) -> dict[str, Any
 def _encode_structured_fields(
     metadata: Mapping[str, Any],
     fields: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     normalized_metadata = _normalize_structured_metadata(metadata)
     field_specs: dict[str, Any] = {}
     encoded_fields: dict[str, Any] = {}
+    schemas = field_schemas or {}
+    if unknown := set(schemas) - set(fields):
+        raise ValueError(
+            f"schemas reference unknown structured members: {sorted(unknown)}"
+        )
     for name, value in fields.items():
         _validate_key_segment(name, "buffer name")
         spec, encoded_value = _encode_structured_field(value)
+        schema = schemas.get(name)
+        if schema is not None and schema.direct_alignment is not None:
+            if spec.get("encoding") != "torch_tensor" or spec.get("nested"):
+                raise ValueError(
+                    "direct_alignment requires a dense torch tensor member"
+                )
+            if isinstance(encoded_value, _TensorPayload):
+                tensor = encoded_value.tensor
+                if (
+                    tensor.layout != _torch.strided
+                    or tensor.is_neg()
+                    or tensor.is_conj()
+                ):
+                    raise ValueError(
+                        "direct_alignment requires a strided tensor without unresolved view flags"
+                    )
+                if tensor.dim() == 0 or not _has_tensor_codec_helpers():
+                    raise ValueError(
+                        "direct_alignment requires the native tensor payload codec; torch_save fallback is unsupported"
+                    )
+                encoded_value = _TensorPayload(
+                    tensor=tensor, direct_alignment=schema.direct_alignment
+                )
+            spec["direct_alignment"] = schema.direct_alignment
         field_specs[name] = spec
         encoded_fields[name] = encoded_value
     if field_specs:
@@ -6109,10 +6399,18 @@ def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
     }, _TensorPayload(tensor=value)
 
 
-def _tensor_payload_parts(value: _TensorPayload) -> tuple[bytes, int, int, Any]:
+def _tensor_payload_parts(
+    value: _TensorPayload, *, host_access: bool = False
+) -> tuple[bytes, int, int, Any]:
+    tensor = value.tensor
+    if host_access and tensor.device.type != "cpu":
+        # Host memcpy/string_at cannot dereference a CUDA device address.
+        # Only copy fallbacks request this snapshot; native tensor PUT keeps
+        # the original device tensor and its existing transport path.
+        tensor = tensor.cpu()
     metadata, data_ptr, tensor_nbytes, owner = _tensor_codec_helper(
         "_serialize_tensor"
-    )(value.tensor)
+    )(tensor)
     return bytes(metadata), int(data_ptr), int(tensor_nbytes), owner
 
 
@@ -6833,7 +7131,9 @@ def _slice_tensor_metadata(
 
 
 def _tensor_payload_bytes(value: _TensorPayload) -> tuple[bytes, int]:
-    metadata, data_ptr, tensor_nbytes, _owner = _tensor_payload_parts(value)
+    metadata, data_ptr, tensor_nbytes, _owner = _tensor_payload_parts(
+        value, host_access=True
+    )
     if tensor_nbytes == 0:
         return metadata, len(metadata)
     return metadata + ctypes.string_at(data_ptr, tensor_nbytes), len(metadata)
