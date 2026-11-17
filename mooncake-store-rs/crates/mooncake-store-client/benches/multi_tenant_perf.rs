@@ -22,11 +22,12 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use mooncake_store_client::{
-    LocalMemoryConfig, MooncakeCompatibilityFacade, PutRequest, StoreClient, StoreClientBuilder,
+    AllocationLifecycleConfig, LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner,
+    PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 use mooncake_store_core::{
-    ClientLifecycleState, MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaPolicy,
+    ClientLifecycleState, CompatibilityDescriptor, MetadataBackend, TenantPolicy,
+    TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
 };
 use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::fixtures::test_future_expiry_ms;
@@ -45,12 +46,45 @@ fn bench_storage_config() -> LocalMemoryConfig {
         .reclaim_grace_ms(0)
 }
 
+fn remote_bench_storage_config() -> LocalMemoryConfig {
+    LocalMemoryConfig::new()
+        .numa_aware(false)
+        .storage_bytes(16 * 1024 * 1024)
+        .scratch_bytes(4 * 1024)
+        .alignment(1)
+        .reclaim_grace_ms(0)
+}
+
 fn build_active_client(
     metadata: Arc<dyn MetadataBackend>,
     transport: Arc<TestTransport>,
     stable_id: &str,
     tenant: &str,
 ) -> StoreClient {
+    build_active_client_with_lifecycle(
+        metadata,
+        transport,
+        stable_id,
+        tenant,
+        true,
+        AllocationLifecycleConfig::default(),
+    )
+}
+
+fn build_active_client_with_lifecycle(
+    metadata: Arc<dyn MetadataBackend>,
+    transport: Arc<TestTransport>,
+    stable_id: &str,
+    tenant: &str,
+    lifecycle_enabled: bool,
+    lifecycle: AllocationLifecycleConfig,
+) -> StoreClient {
+    let mut compatibility = CompatibilityDescriptor::mooncake_v1();
+    if !lifecycle_enabled {
+        compatibility
+            .capabilities
+            .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    }
     let client = StoreClientBuilder::new(metadata, stable_id)
         .state(ClientLifecycleState::Active)
         .tenant(tenant)
@@ -59,12 +93,63 @@ fn build_active_client(
         .segment_name(format!("{stable_id}-segment"))
         .transport(transport)
         .local_memory(bench_storage_config())
+        .compatibility(compatibility)
+        .allocation_lifecycle(lifecycle)
         .build(test_future_expiry_ms())
         .expect("bench client build should succeed");
     client
         .register_local_memory()
         .expect("bench local memory registration should succeed");
     client
+}
+
+fn build_remote_lifecycle_pair(lifecycle_enabled: bool) -> (StoreClient, StoreClient) {
+    let metadata: Arc<InMemoryMetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+    let owner_transport = Arc::new(TestTransport::new("allocation-lifecycle-remote-owner"));
+    let writer_transport = Arc::new(owner_transport.peer("allocation-lifecycle-remote-writer"));
+    let mut owner_compatibility = CompatibilityDescriptor::mooncake_v1();
+    if !lifecycle_enabled {
+        owner_compatibility
+            .capabilities
+            .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    }
+    let owner = StoreClientBuilder::new(
+        metadata.clone() as Arc<dyn MetadataBackend>,
+        "allocation-lifecycle-remote-owner",
+    )
+    .state(ClientLifecycleState::Active)
+    .tenant("tenant-allocation-lifecycle-remote")
+    .label("pool", "bench-pool")
+    .label("storage", "true")
+    .segment_name("allocation-lifecycle-remote-owner-segment")
+    .transport(owner_transport)
+    .local_memory(remote_bench_storage_config())
+    .compatibility(owner_compatibility)
+    .build(test_future_expiry_ms())
+    .expect("remote lifecycle owner should build");
+    owner
+        .register_local_memory()
+        .expect("remote lifecycle owner should register memory");
+
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(
+        metadata as Arc<dyn MetadataBackend>,
+        "allocation-lifecycle-remote-writer",
+    )
+    .state(ClientLifecycleState::Active)
+    .tenant("tenant-allocation-lifecycle-remote")
+    .label("pool", "bench-pool")
+    .label("storage", "false")
+    .segment_name("allocation-lifecycle-remote-writer-segment")
+    .transport(writer_transport)
+    .local_memory(remote_bench_storage_config())
+    .routed_writes(planner, 1)
+    .build(test_future_expiry_ms())
+    .expect("remote lifecycle writer should build");
+    writer
+        .register_local_memory()
+        .expect("remote lifecycle writer should register memory");
+    (owner, writer)
 }
 
 fn install_generous_quota_policy(metadata: &Arc<InMemoryMetadataBackend>, tenant: &str) {
@@ -134,6 +219,112 @@ fn bench_put_baseline_single_tenant_default_scope(c: &mut Criterion) {
                 .expect("baseline put should succeed");
         });
     });
+    group.finish();
+}
+
+// Sequence measurement recipes and smoke checks only: TestTransport does not
+// measure TENT network latency. Each iteration creates fresh metadata, clients,
+// and allocator, then runs the same warmup sequence in both capability modes.
+// Warmup readback/removal does not prove asynchronous publication finalization
+// has drained: that work may overlap the timed put. These groups therefore do
+// not establish isolated put cost or qualify as independent strategy comparisons.
+// Preflight and warmup assertions run outside timing. Both arms time put,
+// Result::expect, black_box, and route destruction; fixture teardown is excluded.
+// Any future comparison requires observable finalize completion plus source,
+// lockfile, executable hashes, full argv, toolchain, config, and window records.
+fn verify_local_lifecycle_admission() {
+    for enabled in [false, true] {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("allocation-lifecycle-admission"));
+        let client = build_active_client_with_lifecycle(
+            metadata,
+            transport,
+            "allocation-lifecycle-admission",
+            "tenant-allocation-lifecycle",
+            enabled,
+            AllocationLifecycleConfig::default().max_pending_publication_bytes(63),
+        );
+        let result = client.put_in_tenant(
+            "tenant-allocation-lifecycle",
+            "admission-probe",
+            &[0xAB; 64],
+        );
+        if enabled {
+            let error = result.expect_err("lifecycle put must enforce pending publication bytes");
+            assert!(error.to_string().contains("pending publication"), "{error}");
+        } else {
+            result.expect("legacy put must bypass pending publication byte admission");
+        }
+    }
+}
+
+fn bench_allocation_lifecycle_single_put(c: &mut Criterion) {
+    verify_local_lifecycle_admission();
+    let value = small_payload(64);
+    let mut group = c.benchmark_group("put_allocation_lifecycle");
+    group.throughput(Throughput::Bytes(value.len() as u64));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(50);
+    for (name, enabled) in [("legacy", false), ("lifecycle", true)] {
+        group.bench_function(BenchmarkId::new("put_64B", name), |b| {
+            b.iter_batched_ref(
+                || {
+                    let metadata = Arc::new(InMemoryMetadataBackend::new());
+                    let transport = Arc::new(TestTransport::new("allocation-lifecycle"));
+                    let client = build_active_client_with_lifecycle(
+                        metadata,
+                        transport,
+                        "allocation-lifecycle",
+                        "tenant-allocation-lifecycle",
+                        enabled,
+                        AllocationLifecycleConfig::default(),
+                    );
+                    warm_up_client(&client, "tenant-allocation-lifecycle");
+                    client
+                },
+                |client| {
+                    let route = client
+                        .put_in_tenant("tenant-allocation-lifecycle", "measured-key", &value)
+                        .expect("allocation lifecycle put should succeed");
+                    criterion::black_box(route);
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn bench_allocation_lifecycle_remote_put(c: &mut Criterion) {
+    let value = small_payload(64);
+    let policy = ReplicationPolicy::new().prefer_local(false);
+    let mut group = c.benchmark_group("put_allocation_lifecycle_remote");
+    group.throughput(Throughput::Bytes(value.len() as u64));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(50);
+    for (name, enabled) in [("legacy", false), ("lifecycle", true)] {
+        group.bench_function(BenchmarkId::new("put_64B", name), |b| {
+            b.iter_batched_ref(
+                || {
+                    let pair = build_remote_lifecycle_pair(enabled);
+                    let route = pair
+                        .1
+                        .put_with_policy("__bench_remote_warmup__", b"warm", &policy)
+                        .expect("remote lifecycle warmup should succeed");
+                    assert_eq!(route.replicas[0].owner, *pair.0.runtime_id());
+                    assert_eq!(pair.1.get("__bench_remote_warmup__").unwrap(), b"warm");
+                    pair
+                },
+                |(_owner, client)| {
+                    let route = client
+                        .put_with_policy("measured-key", &value, &policy)
+                        .expect("remote allocation lifecycle put should succeed");
+                    criterion::black_box(route);
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
     group.finish();
 }
 
@@ -329,6 +520,8 @@ fn bench_get_multi_tenant_with_policy(c: &mut Criterion) {
 criterion_group!(
     multi_tenant_perf,
     bench_put_baseline_single_tenant_default_scope,
+    bench_allocation_lifecycle_single_put,
+    bench_allocation_lifecycle_remote_put,
     bench_put_single_tenant_non_default_scope,
     bench_put_multi_tenant_strict_quota_hot_cache,
     bench_batch_put_multi_tenant,

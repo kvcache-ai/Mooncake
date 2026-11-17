@@ -115,6 +115,9 @@ option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+option(USE_ENFLAME
+       "option for enabling gpu features for Enflame GCU with TopsRider runtime"
+       OFF)
 option(
   USE_TPU
   "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
@@ -492,6 +495,27 @@ if(USE_SUNRISE)
   add_compile_definitions(USE_SUNRISE)
   message(STATUS "Sunrise (Tang runtime) support is enabled")
   include_directories(${MC_TANGRT_ROOT}/include)
+endif()
+
+if(NOT DEFINED MC_TOPS_PATH OR MC_TOPS_PATH STREQUAL "")
+  if(DEFINED ENV{TOPS_PATH} AND NOT "$ENV{TOPS_PATH}" STREQUAL "")
+    set(MC_TOPS_PATH
+        "$ENV{TOPS_PATH}"
+        CACHE PATH "Path to Enflame TopsRider SDK" FORCE)
+  else()
+    set(MC_TOPS_PATH
+        "/opt/tops"
+        CACHE PATH "Path to Enflame TopsRider SDK" FORCE)
+  endif()
+endif()
+
+if(USE_ENFLAME)
+  add_compile_definitions(USE_ENFLAME)
+  message(STATUS "Enflame GCU (TopsRider) support is enabled")
+  # tops_runtime_api.h / driver_types.h / efdrv.h 均平铺在 <tops>/include 下。
+  # Runtime libs: libtopsrt.so (tops*) + libefrt.so (efdrv*)。
+  include_directories(${MC_TOPS_PATH}/include)
+  link_directories(${MC_TOPS_PATH}/lib)
 endif()
 
 if(USE_MUSA)

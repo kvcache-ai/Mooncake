@@ -2070,6 +2070,9 @@ void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         WrappedMasterService& wrapped_master_service,
                         RpcWorkerPool* worker_pool) {
+    server.register_handler<&store::GatherReadDirectory::Publish,
+                            &store::GatherReadDirectory::Resolve>(
+        &wrapped_master_service.gather_directory);
     server.register_handler<&WrappedMasterService::Ping,
                             &WrappedMasterService::ServiceReady>(
         &wrapped_master_service);

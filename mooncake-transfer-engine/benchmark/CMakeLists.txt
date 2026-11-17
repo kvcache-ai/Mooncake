@@ -73,7 +73,7 @@ if(BUILD_UNIT_TESTS)
   if(USE_TENT)
     add_executable(
       tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
-                               split_output.cpp utils.cpp)
+                               bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
       tebench_tent_config_test PRIVATE transfer_engine tent_link_group gtest
                                        gtest_main)
@@ -83,7 +83,7 @@ if(BUILD_UNIT_TESTS)
 
     add_executable(
       tebench_tent_teardown_test tests/tent_teardown_test.cpp tent_backend.cpp
-                                 split_output.cpp utils.cpp)
+                                 bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
       tebench_tent_teardown_test
       PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
@@ -131,11 +131,43 @@ if(BUILD_UNIT_TESTS)
     PROPERTIES PASS_REGULAR_EXPRESSION
                "Mooncake Transfer Engine Benchmarking Tool" TIMEOUT 10)
 
+  # Bad flags are rejected before anything connects. The message is only
+  # printed by the validation path, which then exits with a failure.
+  add_test(
+    NAME tebench_reject_zero_sweep_start
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --start_block_size=0)
+  set_tests_properties(
+    tebench_reject_zero_sweep_start
+    PROPERTIES PASS_REGULAR_EXPRESSION "--start_block_size must be positive"
+               TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_sweep_overflow
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --max_block_size=18446744073709551615)
+  set_tests_properties(
+    tebench_reject_sweep_overflow
+    PROPERTIES PASS_REGULAR_EXPRESSION "--max_block_size .* must be at most"
+               TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_zero_duration
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --duration=0)
+  set_tests_properties(
+    tebench_reject_zero_duration
+    PROPERTIES PASS_REGULAR_EXPRESSION "--duration must be positive" TIMEOUT 10)
+
   if(WITH_METRICS AND USE_TCP)
     add_executable(
       tebench_metrics_integration_test
-      tests/metrics_integration_test.cpp te_backend.cpp utils.cpp
-      split_output.cpp numa_first_touch.cpp)
+      tests/metrics_integration_test.cpp te_backend.cpp bench_runner.cpp
+      utils.cpp split_output.cpp numa_first_touch.cpp)
     # Use the same backend dependencies as tebench, including device runtimes.
     target_link_libraries(
       tebench_metrics_integration_test
@@ -180,6 +212,19 @@ if(BUILD_UNIT_TESTS)
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
   add_test(NAME tebench_target_metrics_test COMMAND tebench_target_metrics_test)
+
+  add_executable(tebench_bench_runner_test tests/bench_runner_test.cpp
+                                           bench_runner.cpp utils.cpp)
+  target_link_libraries(tebench_bench_runner_test PRIVATE transfer_engine gtest
+                                                          gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_bench_runner_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_bench_runner_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_bench_runner_test COMMAND tebench_bench_runner_test)
 
   add_executable(tebench_split_output_test tests/split_output_test.cpp
                                            split_output.cpp)

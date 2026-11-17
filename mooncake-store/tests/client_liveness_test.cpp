@@ -1,4 +1,5 @@
 #include "client_liveness.h"
+#include "replica.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -14,7 +15,7 @@ using namespace std::chrono_literals;
 
 TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{}, initial);
 
     EXPECT_EQ(record.Evaluate(initial + 30s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -27,7 +28,7 @@ TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
 
 TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{}, initial);
 
     ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -46,7 +47,7 @@ TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
 
 TEST(ClientLivenessRecordTest, FailedOperationDoesNotRecoverOrRefresh) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{}, initial);
 
     ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -59,7 +60,7 @@ TEST(ClientLivenessRecordTest, FailedOperationDoesNotRecoverOrRefresh) {
 
 TEST(ClientLivenessRecordTest, RetireCallbackRunsAfterTransitionGuardRelease) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{}, initial);
     ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
 
@@ -95,7 +96,7 @@ TEST(ClientLivenessRecordTest, RetireCallbackRunsAfterTransitionGuardRelease) {
 
 TEST(ClientLivenessRecordTest, RetirementIsReservedBeforeOfflineIsPublished) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{}, initial);
     ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
 
@@ -114,4 +115,39 @@ TEST(ClientLivenessRecordTest, RetirementIsReservedBeforeOfflineIsPublished) {
 }
 
 }  // namespace
+TEST(ClientLivenessRecordTest, ResourceIdentityDistinguishesSameUuidSessions) {
+    const UUID client_id = generate_uuid();
+    auto old_session = std::make_shared<ClientLivenessRecord>(
+        client_id, ClientLivenessRecord::TimePoint{});
+    auto new_session = std::make_shared<ClientLivenessRecord>(
+        client_id, ClientLivenessRecord::TimePoint{});
+    ClientSessionSharedPtr identity = old_session;
+    EXPECT_EQ(identity->ClientId(), new_session->ClientId());
+    EXPECT_NE(identity, new_session);
+}
+
+TEST(ClientLivenessRecordTest, LocalDiskCleanupUsesBoundIncarnation) {
+    const UUID client_id = generate_uuid();
+    const auto now = ClientLivenessRecord::TimePoint{};
+    auto old_session = std::make_shared<ClientLivenessRecord>(client_id, now);
+    auto new_session = std::make_shared<ClientLivenessRecord>(client_id, now);
+    Replica old_replica(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE,
+                        old_session);
+    Replica new_replica(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE,
+                        new_session);
+    EXPECT_FALSE(old_replica.has_stale_local_disk_client());
+    EXPECT_EQ(old_session->Evaluate(now, std::chrono::seconds::zero(),
+                                    std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_FALSE(old_replica.has_stale_local_disk_client());
+    EXPECT_EQ(old_session->Evaluate(now, std::chrono::seconds::zero(),
+                                    std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_TRUE(old_replica.has_stale_local_disk_client());
+    EXPECT_FALSE(new_replica.has_stale_local_disk_client());
+    Replica unbound(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE);
+    EXPECT_TRUE(unbound.has_stale_local_disk_client());
+    EXPECT_FALSE(unbound.isAffiliatedWith(nullptr));
+}
+
 }  // namespace mooncake::test
