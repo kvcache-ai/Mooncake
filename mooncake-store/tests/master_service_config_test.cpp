@@ -183,6 +183,23 @@ TEST(MasterServiceConfigTest, OplogSnapshotDefaultsAndOverridesPropagate) {
     EXPECT_EQ(17u, service_config.snapshot_chunk_object_count);
 }
 
+TEST(MasterServiceConfigTest,
+     WeightImportTimeoutPropagatesThroughConfiguration) {
+    MasterConfig master_config{};
+    EXPECT_EQ(300'000u, master_config.weight_import_idle_timeout_ms);
+    master_config.weight_import_idle_timeout_ms = 1234;
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(1234u, service_config.weight_import_idle_timeout_ms);
+    EXPECT_EQ(1234u, WrappedMasterServiceConfig(master_config, 1)
+                         .weight_import_idle_timeout_ms);
+    EXPECT_EQ(2345u, MasterServiceConfig::builder()
+                         .set_weight_import_idle_timeout_ms(2345)
+                         .build()
+                         .weight_import_idle_timeout_ms);
+}
+
 TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     MasterConfig config{};
     EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());

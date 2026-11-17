@@ -17,6 +17,8 @@
 #include <cassert>
 #include <filesystem>
 #include <set>
+#include <unordered_map>
+#include <utility>
 
 #include "tent/common/status.h"
 #include "tent/runtime/platform.h"
@@ -42,14 +44,20 @@ bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
     }
     return false;
 }
+
+struct BufferRangeHash {
+    size_t operator()(const std::pair<uint64_t, size_t>& range) const noexcept {
+        return std::hash<uint64_t>()(range.first) ^
+               (std::hash<size_t>()(range.second) << 1);
+    }
+};
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
                            std::function<Status(BufferDesc&)> callback) {
-    // Read-only pre-scan on the current snapshot: the common miss path pays
-    // no clone/publication. A hit is re-verified under the writer mutex; a
-    // racing insert of the same range degenerates to today's benign
-    // duplicate-registration behavior.
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
+    // Skip the ref-count publication when the current snapshot has no match.
+    // The tracker mutex serializes registration and removal across callbacks.
     if (containsBuffer(*manager_.getLocal(), base, length)) {
         bool found = false;
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
@@ -70,6 +78,8 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     new_desc.addr = base;
     new_desc.length = length;
     auto entries = Platform::getLoader().getLocation((void*)base, length);
+    if (entries.empty())
+        return Status::InternalError("Unable to determine buffer location");
     if (entries.size() == 1)
         new_desc.location = entries[0].location;
     else {
@@ -91,8 +101,22 @@ Status SegmentTracker::add(uint64_t base, size_t length,
 Status SegmentTracker::addInBatch(
     std::vector<BufferDesc>& desc_list,
     std::function<Status(std::vector<BufferDesc>&)> callback,
-    std::function<void(BufferDesc&)> on_removed) {
+    std::function<Status(BufferDesc&)> on_removed) {
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
     std::vector<BufferDesc> new_desc_list;
+    new_desc_list.reserve(desc_list.size());
+    std::unordered_map<std::pair<uint64_t, size_t>, size_t, BufferRangeHash>
+        new_desc_indices;
+    new_desc_indices.reserve(desc_list.size());
+    auto appendNewDescriptor = [&](BufferDesc& entry) {
+        auto [it, inserted] = new_desc_indices.emplace(
+            std::make_pair(entry.addr, entry.length), new_desc_list.size());
+        if (!inserted) {
+            new_desc_list[it->second].ref_count++;
+            return;
+        }
+        new_desc_list.push_back(std::move(entry));
+    };
     // Read-only pre-scan (see add()): skip the ref-count publication when no
     // entry duplicates an already-registered range.
     bool any_dup = false;
@@ -105,11 +129,8 @@ Status SegmentTracker::addInBatch(
             }
         }
     }
-    // Ranges whose ref_count we bumped; used to roll back if the callback
-    // fails. The bump must happen under the writer mutex *before* the
-    // callback: it is what pins the duplicate entry (ref_count >= 2) so a
-    // concurrent unregister cannot erase it out from under this
-    // registration.
+    // Record added references so a failed callback can roll them back.
+    // Publish them before the callback, which may reenter the tracker.
     std::vector<std::pair<uint64_t, uint64_t>> bumped;
     if (any_dup) {
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
@@ -127,47 +148,24 @@ Status SegmentTracker::addInBatch(
                 if (found) {
                     bumped.emplace_back(entry.addr, entry.length);
                 } else {
-                    new_desc_list.push_back(std::move(entry));
+                    appendNewDescriptor(entry);
                 }
             }
             return Status::OK();
         }));
     } else {
-        new_desc_list = std::move(desc_list);
+        for (auto& entry : desc_list) appendNewDescriptor(entry);
     }
     auto status = callback(new_desc_list);
     if (!status.ok()) {
         // Roll back the duplicate ref-counts so a failed registration does
         // not leave buffers pinned forever.
-        if (!bumped.empty()) {
-            std::vector<BufferDesc> removed;
-            auto rollback_status =
-                manager_.updateLocal([&](SegmentDesc& desc) -> Status {
-                    auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-                    for (auto& range : bumped) {
-                        for (auto it = detail.buffers.begin();
-                             it != detail.buffers.end(); ++it) {
-                            if (it->addr == range.first &&
-                                it->length == range.second) {
-                                it->ref_count--;
-                                // The original owner unregistered while we held
-                                // the extra reference; drop the entry so it is
-                                // no longer advertised.
-                                if (it->ref_count == 0) {
-                                    removed.push_back(*it);
-                                    detail.buffers.erase(it);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    return Status::OK();
+        for (const auto& range : bumped) {
+            auto rollback =
+                remove(range.first, range.second, [&](BufferDesc& desc) {
+                    return on_removed ? on_removed(desc) : Status::OK();
                 });
-            if (!rollback_status.ok()) {
-                LOG(WARNING) << rollback_status.ToString();
-            } else if (on_removed) {
-                for (auto& buffer : removed) on_removed(buffer);
-            }
+            if (!rollback.ok()) LOG(WARNING) << rollback.ToString();
         }
         return status;
     }
@@ -184,6 +182,7 @@ Status SegmentTracker::addInBatch(
 
 Status SegmentTracker::remove(uint64_t base, size_t length,
                               std::function<Status(BufferDesc&)> callback) {
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
     bool removed = false;
     BufferDesc removed_desc;
     CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
@@ -203,8 +202,20 @@ Status SegmentTracker::remove(uint64_t base, size_t length,
         }
         return Status::OK();
     }));
-    if (removed) return callback(removed_desc);
-    return Status::OK();
+    if (!removed) return Status::OK();
+    auto status = callback(removed_desc);
+    if (!status.ok()) {
+        // Successful transport removals may have scrubbed their keys. Keep
+        // the remaining registrations and one reference for a safe retry.
+        removed_desc.ref_count = 1;
+        CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) {
+            auto& buffers = std::get<MemorySegmentDesc>(desc.detail).buffers;
+            buffers.push_back(std::move(removed_desc));
+            sortBuffers(buffers);
+            return Status::OK();
+        }));
+    }
+    return status;
 }
 
 Status SegmentTracker::forEach(

@@ -27,18 +27,12 @@
 //   4. PutEnd (or any op constructing   (ctor cleanup: erases invalid replicas
 //      MetadataAccessorRW for the key)   -> !IsValid() -> Erase())
 //
-// Two scenario details matter for a deterministic repro:
-//   * Step 3 must NOT use MasterService::UnmountSegment: it internally runs
-//     ClearInvalidHandles(), which would erase the crafted object through the
-//     SAFE path (EraseMetadata) before step 4 can hit the buggy accessor path.
-//     Production had the same window: the expiry thread unmounts the ghost
-//     segment and only THEN slowly sweeps 23M keys in ClearInvalidHandles —
-//     any RPC landing in that window hits the buggy accessor cleanup first.
-//   * A second live key ON THE SAME METADATA SHARD must keep the TenantState
-//     non-empty. Otherwise MaybeEraseEmptyTenant() erases the tenant and
-//     nulls tenant_state_, masking the bug (the buggy branch is guarded by
-//     tenant_state_ != nullptr). Production tenants hold millions of keys,
-//     so the buggy branch always executed.
+// Step 3 must NOT use MasterService::UnmountSegment: it internally runs
+// ClearInvalidHandles(), which would erase the crafted object through the SAFE
+// path (EraseMetadata) before step 4 can hit the buggy accessor path.
+// Production had the same window: the expiry thread unmounts the ghost segment
+// and only THEN slowly sweeps 23M keys in ClearInvalidHandles — any RPC landing
+// in that window hits the buggy accessor cleanup first.
 //
 // On the buggy code step 4 segfaults; the forked-child assertion below turns
 // that into a clean test failure. After the fix the child exits 0 (PutEnd
@@ -76,24 +70,6 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitPutStartFailed = 3;  // scenario setup broken
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
-    // Friend access: find a key that routes to the SAME metadata shard as
-    // `key` (getShardIndex hashes tenant+key, so a naive second key
-    // lands in a different shard's TenantState and cannot keep THIS shard's
-    // tenant non-empty).
-    std::string FindKeyOnSameShard(MasterService& service,
-                                   const std::string& key) {
-        const size_t target = MasterServiceTestPeer(service).getShardIndex(
-            TenantId::Default(), key);
-        for (int i = 0; i < 100000; ++i) {
-            std::string candidate = key + "_keepalive_" + std::to_string(i);
-            if (MasterServiceTestPeer(service).getShardIndex(
-                    TenantId::Default(), candidate) == target) {
-                return candidate;
-            }
-        }
-        return key + "_keepalive_fallback";
-    }
-
     // Builds the incident state and fires the trigger. Only returns on
     // fixed code; on buggy code it dies with SIGSEGV inside the
     // MetadataAccessorRW constructor invoked by PutEnd.
@@ -119,20 +95,6 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         config.preferred_segment = segment.name;
         const std::string key = "orphan_processing_key";
         if (!service.PutStart(client_id, key, TenantId::Default(), 1024, config)
-                 .has_value()) {
-            ::_exit(kExitPutStartFailed);
-        }
-
-        // 2b. A second, completed key on the SAME shard keeps the TenantState
-        //     non-empty in step 4 (see file header for why this is required).
-        const std::string keepalive_key = FindKeyOnSameShard(service, key);
-        if (!service
-                 .PutStart(client_id, keepalive_key, TenantId::Default(), 1024,
-                           config)
-                 .has_value() ||
-            !service
-                 .PutEnd(client_id, keepalive_key, TenantId::Default(),
-                         ReplicaType::MEMORY)
                  .has_value()) {
             ::_exit(kExitPutStartFailed);
         }

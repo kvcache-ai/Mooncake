@@ -11,7 +11,7 @@ class DirectGpuReadTest : public ::testing::Test {
     }
 
     void RegisterRange(void *buffer, size_t size) {
-        client_.registered_buffer_sizes_[buffer] = size;
+        client_.registered_buffer_sizes_[buffer] = {size};
     }
 
     static Replica::Descriptor MemoryReplica(const std::string &protocol) {

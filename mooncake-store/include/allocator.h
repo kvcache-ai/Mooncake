@@ -47,24 +47,31 @@ class BufferAllocatorBase;
 class Replica;
 class SegmentAllocatorRegistration;
 
+// Shared ownership of a segment incarnation, including its client session.
+// Copies retain the current generation, not future session replacements.
+// This is the state a buffer carries: which incarnation it belongs to and
+// whether that incarnation is still alive. Whether the segment currently
+// accepts new allocations belongs to SegmentAllocatorRegistration instead.
+// Default construction yields an unbound lifetime with no heap allocation for
+// standalone buffers whose validity follows their allocator alone.
 class SegmentLifetime {
    public:
-    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+    SegmentLifetime() noexcept = default;
+    explicit SegmentLifetime(ClientSessionSharedPtr session);
 
-    [[nodiscard]] bool isAvailable() const {
-        return available_->load(std::memory_order_acquire);
-    }
-
-    void setAvailable(bool available) const {
-        available_->store(available, std::memory_order_release);
-    }
-
-    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
-        return available_ == other.available_;
-    }
+    // Resource validity is independent of whether the owner currently serves.
+    // SUSPECTED sessions retain valid resources for recovery.
+    [[nodiscard]] bool isValid() const noexcept;
+    [[nodiscard]] bool isServing() const noexcept;
 
    private:
-    std::shared_ptr<std::atomic<bool>> available_;
+    friend class AllocatedBuffer;
+    friend class SegmentAllocatorRegistration;
+    struct State;
+    [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
+        const noexcept;
+    void Invalidate() noexcept;
+    std::shared_ptr<State> state_;
 };
 
 class AllocatedBuffer {
@@ -74,14 +81,12 @@ class AllocatedBuffer {
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
+    // A buffer carved from an allocator advertises the allocator's transport
+    // protocol.
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt)
-        : allocator_(std::move(allocator)),
-          buffer_ptr_(buffer_ptr),
-          size_(size),
-          offset_handle_(std::move(offset_handle)) {}
+                        offset_handle = std::nullopt);
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     const Descriptor& descriptor);
@@ -98,7 +103,7 @@ class AllocatedBuffer {
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired() && segment_lifetime_.isAvailable();
+        return !allocator_.expired() && segment_lifetime_.isValid();
     }
 
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
@@ -106,34 +111,32 @@ class AllocatedBuffer {
     }
 
     [[nodiscard]] bool isAvailable() const {
-        if (!isAllocatorValid()) {
-            return false;
-        }
-        const ClientLivenessRecord* record = client_liveness_.get();
-        return record == nullptr || record->IsServing();
+        return !allocator_.expired() && segment_lifetime_.isServing();
     }
 
-    void bindClientLiveness(
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        client_liveness_ = std::move(client_liveness);
-    }
-
+    // Bind before publication, or while excluding readers of this buffer.
+    // Later session changes update the registration, not this fixed snapshot.
     void bindSegmentLifetime(SegmentLifetime lifetime) {
         segment_lifetime_ = std::move(lifetime);
     }
 
-    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
-        const {
-        return client_liveness_;
+    // Preserve the owning session's identity for replica affiliation checks
+    // and source admission; a client UUID alone cannot distinguish
+    // re-registers.
+    [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
+        const noexcept {
+        return segment_lifetime_.getClientSession();
     }
 
     // Serialize the buffer into a descriptor for transfer
-    [[nodiscard]] Descriptor get_descriptor() const;
+    [[nodiscard]] Descriptor get_descriptor(
+        std::optional<SegmentLocality>* locality = nullptr) const;
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
     // The endpoint a reader transfers from, as get_descriptor() reports it.
-    [[nodiscard]] std::string getTransportEndpoint() const;
+    [[nodiscard]] std::string getTransportEndpoint(
+        std::optional<SegmentLocality>* locality = nullptr) const;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -153,25 +156,20 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
-    bool copyTransferProtocolFrom(const AllocatedBuffer& source);
-
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    // Both bindings are set before the buffer is published to readers and not
-    // changed while readers can see it, so neither needs atomic access. The
-    // one rebind of a published buffer is the snapshot restore pass
-    // (RebuildClientLivenessAfterSnapshotRestore), which runs inside the
-    // MasterService constructor, before any reader.
+    // Set before publication; its validity is atomic and its owner session is
+    // immutable.
     SegmentLifetime segment_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
-    std::string protocol{"tcp"};
+    // The protocol a reader routes by, as get_descriptor() reports it: the
+    // mounted segment's protocol, or "cxl" once change_to_cxl() ran.
+    std::string protocol;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
 
-    friend class Serializer<AllocatedBuffer>;
     friend class Replica;
     friend class SegmentAllocatorRegistration;
 };
@@ -191,6 +189,30 @@ class BufferAllocatorBase {
     virtual uintptr_t base() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
+    // The protocol the segment was mounted with; every buffer allocated from
+    // this allocator advertises it to readers.
+    virtual std::string getTransportProtocol() const = 0;
+
+    // Publish an immutable value; legacy remounts may enrich unknown locality.
+    void SetLocality(std::optional<SegmentLocality> locality) {
+        std::atomic_store_explicit(
+            &locality_,
+            locality
+                ? std::make_shared<const SegmentLocality>(std::move(*locality))
+                : nullptr,
+            std::memory_order_release);
+        // Monotonic: a concurrent clear must not hide a later publication.
+        if (locality) has_locality_.store(true, std::memory_order_release);
+    }
+    std::shared_ptr<const SegmentLocality> GetLocalityHandle() const {
+        if (!has_locality_.load(std::memory_order_acquire)) return nullptr;
+        return std::atomic_load_explicit(&locality_, std::memory_order_acquire);
+    }
+    std::optional<SegmentLocality> GetLocality() const {
+        const auto locality = GetLocalityHandle();
+        return locality ? std::optional<SegmentLocality>(*locality)
+                        : std::nullopt;
+    }
 
     /**
      * Returns the largest free region available in this allocator.
@@ -224,6 +246,8 @@ class BufferAllocatorBase {
    private:
     std::atomic_size_t cur_size_{0};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
+    std::shared_ptr<const SegmentLocality> locality_;
+    std::atomic<bool> has_locality_{false};
 };
 
 /**
@@ -252,6 +276,9 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    // Never allocates, so its replicas keep the protocol of the descriptors
+    // they were restored from.
+    std::string getTransportProtocol() const override { return {}; }
 
    private:
     std::string segment_name_;
@@ -281,7 +308,7 @@ class CachelibBufferAllocator
    public:
     static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
     Create(std::string segment_name, size_t base, size_t size,
-           std::string transport_endpoint,
+           std::string transport_endpoint, std::string transport_protocol,
            ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
@@ -297,6 +324,9 @@ class CachelibBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    std::string getTransportProtocol() const override {
+        return transport_protocol_;
+    }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -310,6 +340,7 @@ class CachelibBufferAllocator
    private:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
+                            std::string transport_protocol,
                             ReplicaType replica_type);
 
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
@@ -319,6 +350,7 @@ class CachelibBufferAllocator
     const size_t base_;
     const size_t total_size_;
     const std::string transport_endpoint_;
+    const std::string transport_protocol_;
     const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
@@ -333,7 +365,7 @@ class CachelibBufferAllocator
     friend std::optional<struct RestoredCachelibBufferAllocator>
     ImportCachelibBufferAllocator(
         std::string segment_name, size_t base, size_t size,
-        std::string transport_endpoint,
+        std::string transport_endpoint, std::string transport_protocol,
         const std::vector<LiveAllocation>& allocations,
         ReplicaType replica_type);
 };
@@ -345,29 +377,9 @@ struct RestoredCachelibBufferAllocator {
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
-
-// A detached capture of host-memory allocator metadata; owns no live allocator
-// and contributes neither usage nor capacity metrics.
-struct OffsetBufferAllocatorSnapshot {
-    std::string segment_name;
-    size_t base;
-    size_t capacity;
-    size_t used_bytes;
-    std::string transport_endpoint;
-    offset_allocator::OffsetAllocatorSnapshot allocation_state;
-
-    // Validate the detached snapshot without publishing resources or metrics.
-    [[nodiscard]] tl::expected<void, std::string> Validate() const;
-
-   private:
-    tl::expected<void, std::string> ValidateMetadata() const;
-    // Restore composes this cheap outer check with OffsetAllocator::Restore's
-    // mandatory layout validation, avoiding two graph scans in one factory.
-    friend class OffsetBufferAllocator;
-};
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -380,21 +392,10 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
+                          std::string transport_protocol,
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
-
-    // Restore an unpublished allocator from decoded state. Installs the
-    // allocation layout and accounts usage before returning a runtime-ready
-    // object; capacity accounting remains the owning pool's responsibility.
-    // Consumes the snapshot and rejects inconsistent state with
-    // ErrorCode::INVALID_PARAMS.
-    static tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
-    Restore(OffsetBufferAllocatorSnapshot snapshot);
-
-    // Requires a forked snapshot child or externally quiesced state. Does not
-    // acquire inherited runtime locks; copies all state needed by the codec.
-    OffsetBufferAllocatorSnapshot CaptureSnapshot() const;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 
@@ -406,6 +407,9 @@ class OffsetBufferAllocator
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
+    }
+    std::string getTransportProtocol() const override {
+        return transport_protocol_;
     }
 
     /**
@@ -420,15 +424,12 @@ class OffsetBufferAllocator
     }
 
    private:
-    OffsetBufferAllocator(
-        OffsetBufferAllocatorSnapshot snapshot,
-        std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator);
-
     // metadata
     const std::string segment_name_;
     const size_t base_;
     const size_t total_size_;
     const std::string transport_endpoint_;
+    const std::string transport_protocol_;
     const ReplicaType replica_type_;
 
     // offset allocator implementation
@@ -445,7 +446,7 @@ struct RestoredOffsetBufferAllocator {
 // validation or allocation failure.
 std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
@@ -453,6 +454,7 @@ tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
+                      std::string transport_protocol,
                       ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while

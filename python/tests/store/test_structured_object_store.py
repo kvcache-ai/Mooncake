@@ -1505,6 +1505,45 @@ def test_append_rejects_conflicting_group_before_write() -> None:
     assert len(store.put_configs) == before_puts
 
 
+@pytest.mark.parametrize("direct_value", [False, True])
+def test_put_object_preserves_zero_dimensional_ndarray(direct_value) -> None:
+    _store, transfer = make_transfer()
+    array = np.array(1.5, dtype=np.float32)
+    value = array if direct_value else {"value": array}
+
+    result = transfer.get_object(transfer.put_object(value))
+    result = result if direct_value else result["value"]
+
+    assert result.shape == ()
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+
+@pytest.mark.parametrize("use_pool", [False, True])
+@pytest.mark.parametrize(
+    "array",
+    [
+        pytest.param(np.array(1.5, dtype=np.float32), id="scalar-float"),
+        pytest.param(np.array(7, dtype=np.int64), id="scalar-int"),
+        pytest.param(np.array(True), id="scalar-bool"),
+    ],
+)
+def test_structured_object_preserves_zero_dimensional_ndarray(array, use_pool) -> None:
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool() if use_pool else None)
+    ref = transfer.put_structured_object(structured_payload(value=array), chunk_bytes=3)
+    spec = transfer.read_spec(ref)
+
+    result = transfer.materialize(spec).objects["value"]
+    assert result.shape == array.shape
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+    destination = np.empty_like(array, order="C")
+    result = transfer.materialize_into(spec, {"value": destination}).objects["value"]
+    assert result is destination
+    np.testing.assert_array_equal(destination, array)
+
+
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()
@@ -4587,6 +4626,32 @@ def test_dataproto_helper_bool_list_rows_with_empty_row_keep_bool_values() -> No
     assert all(isinstance(item, bool) for row in values for item in row)
 
 
+@pytest.mark.parametrize("explicit_schema", [False, True])
+@pytest.mark.parametrize(
+    "values",
+    [
+        [{1: "one", -2: {3: "nested"}}, {4: "four"}],
+        [{1: "one", -2: {3: "nested"}}, None],
+        [{"outer": {1: "one"}}, {"outer": {2: "two"}}],
+    ],
+)
+def test_dataproto_msgpack_preserves_integer_map_keys(values, explicit_schema) -> None:
+    _store, transfer = make_transfer()
+    rows = np.empty(len(values), dtype=object)
+    rows[:] = values
+    schemas = (
+        {"mapping": FieldSchema(codec="msgpack_ragged")} if explicit_schema else None
+    )
+    ref = transfer.put_dataproto(
+        SimpleDataProto(non_tensor_batch={"mapping": rows}),
+        field_schemas=schemas,
+    )
+
+    assert ref.encoded_non_tensor["mapping"]["codec"] == "msgpack_ragged"
+    result = transfer.get_dataproto(ref)
+    assert result["non_tensor_batch"]["mapping"].tolist() == values
+
+
 def test_msgpack_ragged_decode_validates_row_count() -> None:
     payload, _metadata = sos._encode_msgpack_ragged_values("json", [{"a": 1}, {"b": 2}])
 
@@ -5197,13 +5262,29 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
     from types import SimpleNamespace
     from mooncake.structured_object_store import _config_for_grouped_keys
 
-    config = SimpleNamespace(group_ids=["group"], session_ids=["session"])
+    config = SimpleNamespace(
+        group_ids=["group"],
+        session_ids=["session"],
+        preferred_hca_names=["mlx5_0"],
+        per_key_preferred_hca_names=[["mlx5_1"]],
+    )
     expanded = _config_for_grouped_keys(config, 3)
     assert expanded.group_ids == ["group"] * 3
     assert expanded.session_ids == ["session"] * 3
+    assert expanded.preferred_hca_names == ["mlx5_0"]
+    assert expanded.per_key_preferred_hca_names == [["mlx5_1"]] * 3
+    expanded.per_key_preferred_hca_names[0].append("mlx5_2")
+    assert expanded.per_key_preferred_hca_names[1:] == [["mlx5_1"]] * 2
     assert config.group_ids == ["group"]
     assert config.session_ids == ["session"]
+    assert config.per_key_preferred_hca_names == [["mlx5_1"]]
     session_only = SimpleNamespace(session_ids=["session"])
     assert _config_for_grouped_keys(session_only, 2).session_ids == ["session"] * 2
     with pytest.raises(ValueError, match="session_ids"):
         _config_for_grouped_keys(SimpleNamespace(session_ids=["a", "b"]), 2)
+    hca_only = SimpleNamespace(per_key_preferred_hca_names=[[]])
+    assert _config_for_grouped_keys(hca_only, 2).per_key_preferred_hca_names == [[], []]
+    with pytest.raises(ValueError, match="per_key_preferred_hca_names"):
+        _config_for_grouped_keys(
+            SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
+        )

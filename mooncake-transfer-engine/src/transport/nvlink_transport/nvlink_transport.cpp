@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "common.h"
+#include "cuda_memcpy_batch_compat.h"
 #include "common/serialization.h"
 #include "config.h"
 #include "transfer_engine.h"
@@ -302,8 +304,13 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         LOG(INFO) << "NvlinkTransport: using cudaMemcpyBatchAsync "
                   << "(CUDA >= 13.0 path)";
 #elif CUDART_VERSION >= 12080
-        LOG(INFO) << "NvlinkTransport: using cudaMemcpyBatchAsync "
-                  << "(CUDA >= 12.8 path)";
+        if (loadCudaMemcpyBatchAsync()) {
+            LOG(INFO) << "NvlinkTransport: using cudaMemcpyBatchAsync "
+                      << "(CUDA >= 12.8 path)";
+        } else {
+            LOG(INFO) << "NvlinkTransport: using per-slice cudaMemcpyAsync "
+                      << "(libcudart.so.12 older than 12.8)";
+        }
 #else
         LOG(INFO) << "NvlinkTransport: using per-slice cudaMemcpyAsync "
                   << "(CUDA < 12.8 fallback path)";
@@ -351,10 +358,10 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         }
     }
 #elif CUDART_VERSION >= 12080
-    err = cudaMemcpyBatchAsync(const_cast<void **>(dsts.data()),
-                               const_cast<void **>(srcs.data()),
-                               mutable_sizes.data(), static_cast<size_t>(count),
-                               &attr, &attrs_idx, 1, &fail_idx, stream);
+    err = cudaMemcpyBatchAsyncCompat(
+        const_cast<void **>(dsts.data()), const_cast<void **>(srcs.data()),
+        mutable_sizes.data(), static_cast<size_t>(count), &attr, &attrs_idx, 1,
+        &fail_idx, stream);
     if (err != cudaSuccess) {
         if (fail_idx < count) {
             LOG(ERROR) << "NvlinkTransport: cudaMemcpyBatchAsync "
@@ -568,7 +575,11 @@ static int getNumDevices() {
 }
 
 static bool supportFabricMem() {
-    if (getenv("MC_USE_NVLINK_IPC")) return false;
+    // MC_USE_NVLINK_IPC=0 selects fabric memory and any other value selects
+    // IPC, as in the Device API P2P transport, PG and the HIP transport.
+    // Unset keeps this transport's default: fabric memory when supported.
+    const char *nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+    if (nvlink_ipc && strcmp(nvlink_ipc, "0") != 0) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);

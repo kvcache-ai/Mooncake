@@ -1,5 +1,6 @@
 {
   "include": [
+    "python/mooncake/reshard/weight/tiled_coo.py",
     "python/mooncake/reshard/contracts",
     "python/mooncake/reshard/weight/types.py",
     "python/mooncake/reshard/weight/topology.py",

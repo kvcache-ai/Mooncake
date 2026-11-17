@@ -232,34 +232,120 @@ TEST(AdaptiveCongestionControlTest, ConcurrentOversizedSlicesAdmitOnlyOne) {
     EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
 }
 
-TEST(AdaptiveCongestionControlTest,
-     PressureUsesHysteresisAndAdditiveIncreaseMultiplicativeDecrease) {
-    DomainState domain(testConfig());
-    Signals low;
-    low.backlog_bytes = 1;
-    low.delivery_rate_bytes_per_sec = 10'000'000;
-    low.completed_bytes = 64;
-    low.successful_completions = 1;
-    recordCurrent(domain, low);
-    controlTick(domain, 1'000);
-    recordCurrent(domain, low);
-    controlTick(domain, 2'000);
-    EXPECT_EQ(snapshot(domain).state, PathState::kHealthy);
-    EXPECT_GT(snapshot(domain).window_bytes, 64u);
-    EXPECT_LE(snapshot(domain).window_bytes, 256u);
+TEST(AdaptiveCongestionControlTest, SuccessGrowsWithHighDrainOrNoRateSample) {
+    for (bool has_rate : {false, true}) {
+        DomainState domain(testConfig());
+        Signals signals;
+        signals.backlog_bytes = 256;
+        if (has_rate) signals.delivery_rate_bytes_per_sec = 1;
+        signals.successful_completions = 1;
+        recordCurrent(domain, signals);
+        controlTick(domain, 1);
+        EXPECT_EQ(snapshot(domain).window_bytes, 80u);
+        EXPECT_EQ(snapshot(domain).state, PathState::kHealthy);
+    }
+}
 
-    Signals high;
-    high.backlog_bytes = 256;
-    high.delivery_rate_bytes_per_sec = 1'000'000;
-    high.completed_bytes = 64;
-    high.successful_completions = 1;
-    recordCurrent(domain, high);
-    controlTick(domain, 3'000);
-    EXPECT_EQ(snapshot(domain).state, PathState::kHealthy);
-    recordCurrent(domain, high);
-    controlTick(domain, 4'000);
+TEST(AdaptiveCongestionControlTest, BacklogWithoutSuccessPreservesWindow) {
+    DomainState domain(testConfig());
+    Signals success;
+    success.successful_completions = 1;
+    recordCurrent(domain, success);
+    controlTick(domain, 1);
+    Signals backlog;
+    backlog.backlog_bytes = std::numeric_limits<uint64_t>::max();
+    backlog.delivery_rate_bytes_per_sec = 1;
+    for (uint64_t epoch = 2; epoch < 6; ++epoch) {
+        recordCurrent(domain, backlog);
+        controlTick(domain, epoch);
+        EXPECT_EQ(snapshot(domain).window_bytes, 80u);
+    }
+}
+
+TEST(AdaptiveCongestionControlTest, ReceiverPressureHalvesOnceBeforeErrorVeto) {
+    DomainState domain(testConfig());
+    Signals signals;
+    signals.successful_completions = 1;
+    for (uint64_t epoch = 1; epoch <= 8; ++epoch) {
+        recordCurrent(domain, signals);
+        controlTick(domain, epoch);
+    }
+    ASSERT_EQ(snapshot(domain).window_bytes, 192u);
+    signals.receiver_pressure = 100;
+    signals.fatal_failures = 1;
+    recordCurrent(domain, signals);
+    controlTick(domain, 9);
+    EXPECT_EQ(snapshot(domain).window_bytes, 96u);
     EXPECT_EQ(snapshot(domain).state, PathState::kCongested);
-    EXPECT_EQ(snapshot(domain).window_bytes, 64u);
+    controlTick(domain, 10);
+    EXPECT_EQ(snapshot(domain).window_bytes, 96u);
+}
+
+TEST(AdaptiveCongestionControlTest, RootErrorVetoUsesFailureScopeForOneEpoch) {
+    for (OutcomeClass outcome :
+         {OutcomeClass::kRouteTimeout, OutcomeClass::kFatal,
+          OutcomeClass::kLocalConfiguration, OutcomeClass::kRemoteMetadata}) {
+        for (FailureScope scope :
+             {FailureScope::kOperation, FailureScope::kQp, FailureScope::kCq,
+              FailureScope::kRoute, FailureScope::kPort,
+              FailureScope::kDevice}) {
+            DomainState device(testConfig()), route(testConfig()),
+                sibling(testConfig());
+            Permit failed, successful;
+            ASSERT_EQ(tryAcquire(pathFor(device, route), 8, failed),
+                      Decision::kAllow);
+            ASSERT_EQ(tryAcquire(pathFor(device, sibling), 8, successful),
+                      Decision::kAllow);
+            ASSERT_TRUE(complete(successful, OutcomeClass::kSuccess,
+                                 FailureScope::kOperation));
+            Signals success;
+            success.successful_completions = 1;
+            recordCurrent(route, success);
+            ASSERT_TRUE(complete(failed, outcome, scope));
+            controlTick(device, 1);
+            controlTick(route, 1);
+            controlTick(sibling, 1);
+            const bool shared = scope == FailureScope::kCq ||
+                                scope == FailureScope::kPort ||
+                                scope == FailureScope::kDevice;
+            EXPECT_EQ(snapshot(device).window_bytes, shared ? 64u : 80u);
+            EXPECT_EQ(snapshot(route).window_bytes, 64u);
+            EXPECT_EQ(snapshot(sibling).window_bytes, 80u);
+            recordCurrent(device, success);
+            recordCurrent(route, success);
+            controlTick(device, 2);
+            controlTick(route, 2);
+            EXPECT_EQ(snapshot(device).window_bytes, shared ? 80u : 96u);
+            EXPECT_EQ(snapshot(route).window_bytes, 80u);
+        }
+    }
+}
+
+TEST(AdaptiveCongestionControlTest, PolicyModesPreserveOffAndObserveAdmission) {
+    for (Mode mode : {Mode::kOff, Mode::kObserve}) {
+        DomainState domain(testConfig(mode));
+        Signals signals;
+        signals.successful_completions = 1;
+        recordCurrent(domain, signals);
+        controlTick(domain, 1);
+        EXPECT_EQ(snapshot(domain).window_bytes,
+                  mode == Mode::kOff ? 64u : 80u);
+        signals.hard_errors = 1;
+        recordCurrent(domain, signals);
+        controlTick(domain, 2);
+        EXPECT_EQ(snapshot(domain).window_bytes,
+                  mode == Mode::kOff ? 64u : 80u);
+        signals.receiver_pressure = 1;
+        recordCurrent(domain, signals);
+        controlTick(domain, 3);
+        EXPECT_EQ(snapshot(domain).window_bytes, 64u);
+        Permit permit;
+        ASSERT_EQ(
+            tryAcquire({nullptr, &domain, 0, generation(domain)}, 1024, permit),
+            Decision::kAllow);
+        EXPECT_TRUE(complete(permit, OutcomeClass::kDerivedFlush,
+                             FailureScope::kOperation));
+    }
 }
 
 TEST(AdaptiveCongestionControlTest, PollerStallDoesNotBecomeRouteFailure) {
@@ -352,8 +438,8 @@ TEST(AdaptiveCongestionControlTest, AdmissionEvidenceIdentifiesBlockingDomain) {
               Decision::kDefer);
     EXPECT_EQ(evidence.domain, AdmissionDomain::kDevice);
     EXPECT_EQ(evidence.reason, AdmissionReason::kWindow);
-    EXPECT_EQ(evidence.snapshot.inflight_bytes, 64u);
-    EXPECT_EQ(evidence.snapshot.deferred_bytes, 8u);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 64u);
+    EXPECT_EQ(snapshot(device).deferred_bytes, 8u);
     EXPECT_EQ(snapshot(route).deferred_bytes, 0u);
     ASSERT_TRUE(complete(occupied, OutcomeClass::kDerivedFlush,
                          FailureScope::kOperation));
@@ -363,8 +449,8 @@ TEST(AdaptiveCongestionControlTest, AdmissionEvidenceIdentifiesBlockingDomain) {
               Decision::kDefer);
     EXPECT_EQ(evidence.domain, AdmissionDomain::kRoute);
     EXPECT_EQ(evidence.reason, AdmissionReason::kWindow);
-    EXPECT_EQ(evidence.snapshot.inflight_bytes, 64u);
-    EXPECT_EQ(evidence.snapshot.deferred_bytes, 8u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 64u);
+    EXPECT_EQ(snapshot(route).deferred_bytes, 8u);
     EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
     ASSERT_TRUE(complete(occupied, OutcomeClass::kDerivedFlush,
                          FailureScope::kOperation));
@@ -376,12 +462,10 @@ TEST(AdaptiveCongestionControlTest, EvidenceChangesOnlyOnRejection) {
     AdmissionEvidence evidence;
     evidence.domain = AdmissionDomain::kRoute;
     evidence.reason = AdmissionReason::kStaleGeneration;
-    evidence.snapshot.generation = 99;
     ASSERT_EQ(tryAcquire(pathFor(device, route), 8, permit, &evidence),
               Decision::kAllow);
     EXPECT_EQ(evidence.domain, AdmissionDomain::kRoute);
     EXPECT_EQ(evidence.reason, AdmissionReason::kStaleGeneration);
-    EXPECT_EQ(evidence.snapshot.generation, 99u);
     EXPECT_EQ(tryAcquire(pathFor(device, route), 8, permit, &evidence),
               Decision::kDefer);
     EXPECT_EQ(evidence.domain, AdmissionDomain::kNone);
@@ -519,7 +603,7 @@ TEST(AdaptiveCongestionControlTest, StalePathHandleIsRejected) {
     EXPECT_EQ(tryAcquire(stale, 8, permit, &evidence), Decision::kAvoid);
     EXPECT_EQ(evidence.domain, AdmissionDomain::kRoute);
     EXPECT_EQ(evidence.reason, AdmissionReason::kStaleGeneration);
-    EXPECT_EQ(evidence.snapshot.generation, stale.route_generation + 1);
+    EXPECT_EQ(snapshot(route).generation, stale.route_generation + 1);
     resetGeneration(device, stale.device_generation + 1);
     EXPECT_EQ(tryAcquire(stale, 8, permit, &evidence), Decision::kAvoid);
     EXPECT_EQ(evidence.domain, AdmissionDomain::kDevice);

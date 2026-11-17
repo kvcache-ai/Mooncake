@@ -1,4 +1,5 @@
 #include "common/client_buffer_allocation.h"
+#include "common.h"
 
 #include "config/hugepage_config.h"
 #include "config/mmap_arena_config.h"
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <numa.h>
 #include <numaif.h>
+#include <string>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -86,9 +88,21 @@ size_t touch_thread_count(size_t page_count) {
 
 void touch_page_range(volatile char *data, size_t page_size, size_t begin_page,
                       size_t end_page, int numa_node) {
-    if (numa_node >= 0 && numa_run_on_node(numa_node) != 0) {
-        LOG(WARNING) << "Failed to bind HugeTLB population worker to NUMA node "
-                     << numa_node << ": " << std::strerror(errno);
+    if (numa_node >= 0) {
+        // numa_run_on_node() fills libnuma's per-node cpumask cache on first
+        // use, and these workers start together; see numaNodeCpuCacheMutex().
+        int rc;
+        int err;
+        {
+            std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+            rc = numa_run_on_node(numa_node);
+            err = errno;
+        }
+        if (rc != 0) {
+            LOG(WARNING)
+                << "Failed to bind HugeTLB population worker to NUMA node "
+                << numa_node << ": " << std::strerror(err);
+        }
     }
     for (size_t page = begin_page; page < end_page; ++page) {
         data[page * page_size] = 0;
@@ -296,6 +310,107 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
     }
 }
 
+namespace {
+
+// MPOL_MODE_FLAGS from <linux/mempolicy.h>, which clashes with <numaif.h>.
+// get_mempolicy() returns these OR'ed into the mode.
+constexpr int kMempolicyModeFlags = (1 << 15) | (1 << 14) | (1 << 13);
+
+std::vector<int> BitmaskNodes(const struct bitmask *mask) {
+    std::vector<int> nodes;
+    for (unsigned long node = 0; node < mask->size; ++node) {
+        if (numa_bitmask_isbitset(mask, node)) {
+            nodes.push_back(static_cast<int>(node));
+        }
+    }
+    return nodes;
+}
+
+bool Contains(const std::vector<int> &nodes, int node) {
+    return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
+}
+
+// Private anonymous mapping of exactly [ptr, ptr + size), advised for THP. ptr
+// is slab-aligned (16MB, a multiple of 2MB), so every PMD in it can be backed
+// by a THP and a cachelib master accepts it. Over-reserves by one slab and
+// trims. Returns MAP_FAILED on failure, like mmap().
+void *mmap_thp_aligned(size_t size) {
+    constexpr size_t kAlign = facebook::cachelib::Slab::kSize;
+    const size_t reserve_size = size + kAlign;
+    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return MAP_FAILED;
+    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+    const uintptr_t addr = align_up(raw_addr, kAlign);
+    if (addr > raw_addr) {
+        munmap(raw, addr - raw_addr);
+    }
+    const uintptr_t tail = addr + size;
+    if (raw_addr + reserve_size > tail) {
+        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
+    }
+    void *ptr = reinterpret_cast<void *>(addr);
+
+    // Request THP explicitly instead of relying on the system default or on
+    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
+    // backed segment needs 512x more NIC page-table entries: EFA reg_mr runs
+    // out of them (ENOMEM) once several ranks register large segments, and on
+    // ionic a single MR over 2 GiB of 4 KiB pages already fails.
+    if (madvise(ptr, size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
+                     << strerror(errno) << "); segment may be 4KB backed";
+    }
+    return ptr;
+}
+
+}  // namespace
+
+std::vector<int> FilterNumaNodesToAllowed(const std::vector<int> &nodes) {
+    if (nodes.empty()) return {};
+    struct bitmask *mask = numa_allocate_nodemask();
+    if (mask == nullptr) return nodes;
+    if (get_mempolicy(nullptr, mask->maskp, mask->size + 1, nullptr,
+                      MPOL_F_MEMS_ALLOWED) != 0) {
+        const int err = errno;
+        numa_bitmask_free(mask);
+        LOG(WARNING) << "Cannot read this process's allowed NUMA nodes, errno="
+                     << err << " (" << strerror(err)
+                     << "); NIC NUMA nodes are used as is";
+        return nodes;
+    }
+    std::vector<int> allowed = BitmaskNodes(mask);
+
+    int mode = MPOL_DEFAULT;
+    numa_bitmask_clearall(mask);
+    if (get_mempolicy(&mode, mask->maskp, mask->size + 1, nullptr, 0) == 0 &&
+        (mode & ~kMempolicyModeFlags) == MPOL_BIND) {
+        const std::vector<int> bound = BitmaskNodes(mask);
+        allowed.erase(
+            std::remove_if(allowed.begin(), allowed.end(),
+                           [&](int node) { return !Contains(bound, node); }),
+            allowed.end());
+    }
+    numa_bitmask_free(mask);
+
+    std::vector<int> kept;
+    std::string dropped;
+    for (int node : nodes) {
+        if (Contains(allowed, node)) {
+            kept.push_back(node);
+        } else {
+            if (!dropped.empty()) dropped += ",";
+            dropped += std::to_string(node);
+        }
+    }
+    if (!dropped.empty()) {
+        LOG(INFO) << "NIC NUMA nodes [" << dropped
+                  << "] are outside this process's allowed memory nodes "
+                     "(cpuset.mems or an MPOL_BIND task policy); the global "
+                     "segment is not placed there";
+    }
+    return kept;
+}
+
 // NUMA-segmented buffer allocation
 void *allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int> &numa_nodes,
@@ -308,6 +423,13 @@ void *allocate_buffer_numa_segments(size_t total_size,
 
     if (page_size == 0) page_size = getpagesize();
     size_t n = numa_nodes.size();
+    // A THP cannot straddle two regions bound to different nodes.
+    const bool thp = page_size == static_cast<size_t>(getpagesize());
+    if (thp && total_size % (SZ_2MB * n) != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a multiple of " << SZ_2MB * n;
+        return nullptr;
+    }
     size_t region_size = align_up(total_size / n, page_size);
     size_t map_size = region_size * n;
 
@@ -319,10 +441,12 @@ void *allocate_buffer_numa_segments(size_t total_size,
         flags |= MAP_HUGETLB | MAP_HUGE_512MB;
     } else if (page_size == SZ_1GB) {
         flags |= MAP_HUGETLB | MAP_HUGE_1GB;
-    } else if (page_size != static_cast<size_t>(getpagesize())) {
+    } else if (!thp) {
         flags |= MAP_HUGETLB;
     }
-    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    void *ptr =
+        thp ? mmap_thp_aligned(map_size)
+            : mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
         LOG(ERROR) << "mmap failed (hugepage="
                    << ((flags & MAP_HUGETLB) ? "yes" : "no")
@@ -353,7 +477,8 @@ void *allocate_buffer_numa_segments(size_t total_size,
     // get_user_pages(), whose faults respect the mbind policy.
 
     LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size << " bytes, "
-              << n << " regions, page_size=" << page_size << ", nodes=[" <<
+              << n << " regions, page_size=" << page_size
+              << (thp ? ", thp=madvise" : "") << ", nodes=[" <<
         [&]() {
             std::string s;
             for (size_t i = 0; i < n; ++i) {
@@ -365,44 +490,25 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
-void *allocate_buffer_thp_interleaved(size_t total_size) {
-    constexpr size_t kThpSize = SZ_2MB;
-    if (total_size == 0 || total_size % kThpSize != 0) {
+void *allocate_buffer_thp(size_t total_size, ThpNumaPolicy numa_policy) {
+    if (total_size == 0 || total_size % SZ_2MB != 0) {
         LOG(ERROR) << "Invalid THP segment size " << total_size
-                   << ", must be a non-zero multiple of " << kThpSize;
+                   << ", must be a non-zero multiple of " << SZ_2MB;
         return nullptr;
     }
 
-    // Over-reserve by one huge page and trim, so the returned range is
-    // 2MB-aligned and every PMD in it can be backed by a THP. The trimmed
-    // mapping is exactly [ptr, ptr + total_size), which is what
+    // The mapping is exactly [ptr, ptr + total_size), which is what
     // free_buffer_mmap_memory() unmaps.
-    const size_t reserve_size = total_size + kThpSize;
-    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (raw == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << reserve_size
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+    void *ptr = mmap_thp_aligned(total_size);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << total_size << ", errno=" << errno
+                   << " (" << strerror(errno) << ")";
         return nullptr;
     }
-    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
-    const uintptr_t addr = align_up(raw_addr, kThpSize);
-    if (addr > raw_addr) {
-        munmap(raw, addr - raw_addr);
-    }
-    const uintptr_t tail = addr + total_size;
-    if (raw_addr + reserve_size > tail) {
-        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
-    }
-    void *ptr = reinterpret_cast<void *>(addr);
-
-    // Request THP explicitly instead of relying on the system default or on
-    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
-    // backed segment needs 512x more NIC page-table entries, and EFA reg_mr
-    // runs out of them (ENOMEM) once several ranks register large segments.
-    if (madvise(ptr, total_size, MADV_HUGEPAGE) != 0) {
-        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
-                     << strerror(errno) << "); segment may be 4KB backed";
+    if (numa_policy == ThpNumaPolicy::kInheritTask) {
+        LOG(INFO) << "Allocated THP buffer: " << total_size << " bytes at "
+                  << ptr;
+        return ptr;
     }
 
     // Interleave across all allowed NUMA nodes. Under the default local

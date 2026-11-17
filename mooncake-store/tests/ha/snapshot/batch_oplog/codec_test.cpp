@@ -65,6 +65,8 @@ TEST(BatchOpLogSnapshotCodecTest, ObjectChunkRoundTripsAndChecksEnvelope) {
     metadata.group_id = "group";
     metadata.hard_pinned = true;
     metadata.session_id = "session-snapshot";
+    metadata.object_checksum = 0;
+    metadata.residency_affinity_id = "snapshot-affinity";
     std::vector<StandbyObjectEntry> objects{
         {.tenant_id = "tenant", .key = "key", .metadata = metadata}};
     auto encoded = EncodeBatchOpLogSnapshotObjectChunk(7, std::move(objects));
@@ -82,6 +84,10 @@ TEST(BatchOpLogSnapshotCodecTest, ObjectChunkRoundTripsAndChecksEnvelope) {
     EXPECT_TRUE(decoded->objects[0].metadata.hard_pinned.value_or(false));
     EXPECT_EQ(decoded->objects[0].metadata.session_id.value_or(""),
               "session-snapshot");
+    ASSERT_TRUE(decoded->objects[0].metadata.object_checksum.has_value());
+    EXPECT_EQ(decoded->objects[0].metadata.object_checksum.value(), 0U);
+    EXPECT_EQ(decoded->objects[0].metadata.residency_affinity_id.value_or(""),
+              "snapshot-affinity");
 
     EXPECT_FALSE(DecodeBatchOpLogSnapshotObjectChunk(encoded, 8, 1));
     EXPECT_FALSE(DecodeBatchOpLogSnapshotObjectChunk(encoded, 7, 300000000));
@@ -98,6 +104,7 @@ TEST(BatchOpLogSnapshotCodecTest, OldObjectChunkDefaultsHardPinnedToFalse) {
     ASSERT_TRUE(decoded) << decoded.error();
     EXPECT_FALSE(decoded->objects[0].metadata.hard_pinned.value_or(false));
     EXPECT_FALSE(decoded->objects[0].metadata.session_id.has_value());
+    EXPECT_FALSE(decoded->objects[0].metadata.object_checksum.has_value());
 }
 
 TEST(BatchOpLogSnapshotCodecTest, RejectsTruncatedArtifacts) {

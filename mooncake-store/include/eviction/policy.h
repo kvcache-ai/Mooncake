@@ -51,12 +51,18 @@ enum class SkipReason : uint8_t {
     kDeferred,
     // The policy never takes it while soft pinned.
     kSoftPinned,
+    // Another component evicts it, such as a managed weight's lifecycle.
+    kExternalEvict,
     // No replica the policy would release.
     kNothingToRelease,
 };
 
 class EvictionPolicy {
    public:
+    // const Decide() alone does not imply thread safety: custom policies may
+    // maintain mutable state. Opt in only for independent concurrent keys.
+    virtual bool SupportsParallel() const { return false; }
+
     // The replicas to release from `candidate`, or why it is skipped. It may
     // not change the object.
     [[nodiscard]] virtual tl::expected<Plan, SkipReason> Decide(

@@ -23,47 +23,34 @@ A `Get` therefore consists of two steps: a metadata query against the Master
 (which returns replica descriptors plus a read lease), followed by a data
 transfer that the Client performs on its own using those descriptors.
 
-## Master-Side Index: Sharded Tenant/Key Hash Tables
+## Master-Side Index: Per-Tenant Object Routes
 
-Object metadata is organized as a three-level hash index
-(`master_service.h`):
+Object metadata is organized per tenant (`master_service.h`,
+`metadata/namespace_table.h`, `metadata/object_route.h`):
 
 ```text
-shard_idx = hash(tenant_id, key) % 1024      // default tenant: hash(key) only
-   -> MetadataShard.tenants[tenant_id]       // level 1: tenant
-   -> TenantState.metadata[key]              // level 2: user key
-   -> ObjectMetadata                         // level 3: the metadata record
+namespaces_.Lookup(tenant_id)                // level 1: one namespace per tenant
+   -> Namespace.objects (route::ObjectRoute)
+   -> stripe = hash(key) % 1024              // a stripe of the route's slot map
+   -> KeySlot{lock, record}                  // level 2: one slot per key
+   -> {generation, ObjectMetadata, ObjectState}  // level 3: the publication
 ```
 
-```cpp
-static constexpr size_t kNumShards = 1024;
+A namespace is created on a tenant's first write and stays for as long as the
+service runs. Its route keeps one `KeySlot` per key, holding that key's lock
+and, while the key holds an object, the object's record. The lock belongs to
+the key, not to a shard of keys: a stripe lock is held only to find, create or
+drop a slot. Each publication gets a generation, so code that lets go of a key
+and comes back later (a scan that evicts afterwards, a durable OpLog callback)
+names the object with an `ObjectRef` and acts only while that same publication
+is still there.
 
-struct MetadataShard {
-    SharedMutex mutex;
-    std::unordered_map<TenantId, TenantState, TenantIdHash> tenants;
-    long disk_object_count;  // objects with a completed LOCAL_DISK replica
-};
-
-struct TenantState {
-    std::unordered_map<std::string, ObjectMetadata> metadata;
-    std::unordered_set<std::string> processing_keys;
-    std::unordered_map<std::string, ReplicationTask> replication_tasks;
-    std::unordered_map<std::string, PromotionTask> promotion_tasks;
-    // ... dynamic-replication and promotion-candidate state
-};
-
-std::array<MetadataShard, kNumShards> metadata_shards_;
-```
-
-Sharding keeps lock contention low: each shard has its own `SharedMutex`, and
-all lookups go through RAII accessors (`MetadataAccessorRO` /
-`MetadataAccessorRW`) that compute the shard index, take the appropriate
-shared/exclusive lock, and resolve the tenant and key iterators in one shot.
-Batch interfaces (`BatchExistKey`, `BatchGetReplicaList`, `BatchPutEnd`, ...)
-first group keys by shard so each shard is locked only once per batch.
-
-An additional stripe of 4096 object-operation mutexes serializes multi-step
-write operations (e.g. `PutStart`) for the same key.
+All lookups go through RAII accessors (`MetadataAccessorRO` /
+`MetadataAccessorRW`) that resolve the namespace and hold the key for their
+scope; a thread holds one key at a time. Walks over a tenant's objects use the
+route's cursors (`ReadCursor()` / `WriteCursor()`), which hold one key at a
+time too. Next to the route, each namespace keeps the keys whose object has
+work in flight and the eviction index eviction walks.
 
 ## ObjectMetadata and Replica Descriptors
 
@@ -75,7 +62,6 @@ Each key maps to one `ObjectMetadata` record:
 | `size`, `object_checksum`, `data_type` | Object length, optional checksum, data-type classification |
 | `tenant_id`, `user_key`, `group_id` | Identity (the key is stored again inside the record) and optional group for shared-TTL lifecycle |
 | `lease`, `soft_pin_timeout`, `hard_pinned` | Read lease and pin state that control eviction eligibility |
-| `quota_ledger` | Per-tenant quota accounting for this object |
 | `replicas_` | `std::vector<Replica>` — the location descriptors |
 
 A `Replica` is a `std::variant` over the storage media, with a serializable
@@ -98,11 +84,12 @@ returned to readers.
 visible to readers:
 
 1. **`PutStart`** (`master_service.cpp`): validates the request, takes the
-   object-operation stripe lock and the shard write lock, then checks for
+   key's write lock, then checks for
    duplicates — a completed object or a fresh in-progress write returns
    `OBJECT_ALREADY_EXISTS`, while an expired in-progress write has its stale
    `PROCESSING` replicas moved to a deferred-release list. The Master then
-   charges tenant quota, allocates buffers on segments via the
+   asks the namespace policy (the tenant quota, with multi-tenancy on) for the
+   memory the write takes, allocates buffers on segments via the
    `AllocationStrategy` over the `SegmentManager`'s per-segment allocators,
    and **inserts the `ObjectMetadata` with replicas in `PROCESSING` state**,
    returning the replica descriptors to the client.
@@ -129,19 +116,19 @@ visible to readers:
      then RDMA-reads.
    - `DISK` / `DFS`: read the file/range directly.
 3. `ExistKey` walks the same index but only checks readability; admin
-   interfaces (`GetAllKeys`, `GetReplicaListByRegex`) scan all 1024 shards.
+   interfaces (`GetAllKeys`, `GetReplicaListByRegex`) walk the tenant's route.
 
 ## Auxiliary Indexes
 
-Besides the primary sharded tables, the Master maintains several secondary
+Besides the per-tenant routes, the Master maintains several secondary
 structures:
 
 - **`SoftPinDeadlineIndex`**: a min-heap keyed by soft-pin deadline plus a
   registration hash map for dedup/lazy deletion, letting a background thread
   pop expired soft-pins in batch without scanning all objects.
-- **Group domain** (`group_domain_`): `group_id -> {member_keys, shared lease}`.
-  Object routing never uses it (always `hash(tenant, key)`); it is consulted
-  only at put/registration time and for all-or-none group eviction.
+- **Group index** (one per route): `group_id -> {member_keys, shared lease}`.
+  Lookups never use it; publishing and tearing down an object keep it in
+  step, and group eviction reads it for all-or-none eviction.
 - **`SegmentManager`** (`segment.h`): parallel maps from `segment_id`,
   `client_id`, segment name, and `host_id` to mounted segments and their
   allocators, used for allocation, preferred-segment selection, and
@@ -189,7 +176,7 @@ connection information.
 ## Summary: Where Key, Metadata, and Data Live
 
 - **Master memory**: the key and its metadata are stored together — the key
-  is the hash-table key in `TenantState::metadata`, and `ObjectMetadata` also
+  is the slot-map key in the tenant's route, and `ObjectMetadata` also
   keeps a copy of `user_key`/`tenant_id` for serialization and reverse
   lookup.
 - **Metadata vs. data**: always separated. The Master holds only location

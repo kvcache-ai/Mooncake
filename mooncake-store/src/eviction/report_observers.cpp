@@ -21,26 +21,10 @@ int64_t Saturated(uint64_t value) {
 }  // namespace
 
 void MetricsObserver::OnRunEnd(const Scope& scope, const Report& report) {
-    auto& metrics = MasterMetricManager::instance();
-    if (const TenantId* tenant_id = scope.tenant_id()) {
-        if (report.released_bytes > 0) {
-            metrics.inc_tenant_evict_bytes(tenant_id->value(),
-                                           Saturated(report.released_bytes));
-        }
-        return;
-    }
-    // A run with nothing filed had nothing to succeed or fail at.
-    if (report.filed == 0) {
-        return;
-    }
-    if (report.MadeProgress()) {
-        const auto objects = Saturated(report.evicted_objects);
-        const auto bytes = Saturated(report.released_bytes);
-        metrics.inc_eviction_success(objects, bytes);
-        metrics.inc_mem_eviction_success(objects, bytes);
-    } else {
-        metrics.inc_eviction_fail();
-        metrics.inc_mem_eviction_fail();
+    const TenantId* tenant_id = scope.tenant_id();
+    if (tenant_id != nullptr && report.released_bytes > 0) {
+        MasterMetricManager::instance().inc_tenant_evict_bytes(
+            tenant_id->value(), Saturated(report.released_bytes));
     }
 }
 
@@ -66,7 +50,13 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
                 << ", actual_evict_ratio=" << actual_evict_ratio;
         LOG(INFO) << "[EVICT-RESULT] evicted_count=" << report.evicted_objects
                   << ", eviction_base=" << report.filed
-                  << ", actual_evict_ratio=" << actual_evict_ratio;
+                  << ", actual_evict_ratio=" << actual_evict_ratio
+                  << ", visited=" << report.visited
+                  << ", moved=" << report.moved << ", busy=" << report.busy
+                  << ", lease_active=" << report.lease_active
+                  << ", scanned_slots=" << report.scanned_slots
+                  << ", scan_waves=" << report.scan_waves
+                  << ", workers=" << report.workers;
     }
 
     const std::string prefix =

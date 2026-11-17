@@ -266,7 +266,14 @@ Status GdsTransport::install(std::string& local_segment_name,
     conf_ = conf;
     installed_ = true;
     io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 32);
+#ifdef USE_XPU_GDS
+    // The cuFile-compatible library used on XPU accepts only registered
+    // device buffers, and host memory cannot be registered with it, so
+    // DRAM<->file stays on IOURING.
+    caps.dram_to_file = false;
+#else
     caps.dram_to_file = true;
+#endif
     caps.gpu_to_file = true;
     return Status::OK();
 }
@@ -592,10 +599,19 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+// Device memory types that are registered with cuFile.
+static bool isGdsDeviceLocation(const std::string& type) {
+#ifdef USE_XPU_GDS
+    return type == "xpu";
+#else
+    return type == "cuda";
+#endif
+}
+
 Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
                                      const MemoryOptions& options) {
     LocationParser location(options.location);
-    if (location.type() != "cuda") return Status::OK();
+    if (!isGdsDeviceLocation(location.type())) return Status::OK();
     auto result = cuFileBufRegister((void*)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
@@ -607,7 +623,7 @@ Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
 
 Status GdsTransport::removeMemoryBuffer(BufferDesc& desc) {
     LocationParser location(desc.location);
-    if (location.type() != "cuda") return Status::OK();
+    if (!isGdsDeviceLocation(location.type())) return Status::OK();
     auto result = cuFileBufDeregister((void*)desc.addr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(

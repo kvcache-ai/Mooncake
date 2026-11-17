@@ -105,7 +105,9 @@ class Workers {
     // partway through a group of completions that share one timestamp.
     void handleCompletion(WorkerContext& worker, RdmaContext& context,
                           const ibv_wc& wc, uint64_t poll_ts,
-                          bool last_in_pass = true);
+                          bool last_in_pass = true,
+                          bool queue_already_drained = false,
+                          bool completion_owed = true);
 
     // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
     // when it cannot be resolved (no lane recorded, or the worker array is
@@ -392,10 +394,9 @@ class Workers {
         // so parked entries can never starve behind contending producers.
         std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
 
-        // Values are held via unique_ptr so that map rehashing does not
-        // invalidate pointers into RailMonitor stored on in-flight slices
-        // (see RdmaSlice::rail_monitor).
-        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
+        // Shared ownership keeps the monitor alive while a slice is retained
+        // by an endpoint through delayed teardown.
+        std::unordered_map<std::string, std::shared_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
         uint64_t padding[15];
     };

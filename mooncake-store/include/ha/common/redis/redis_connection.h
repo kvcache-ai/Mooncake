@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -15,6 +16,10 @@ namespace mooncake {
 namespace ha {
 namespace common {
 namespace redis {
+
+// ConnectRedis installs this deadline for ordinary commands. Confirmation
+// phases may temporarily replace it, then restore it before reusing the socket.
+inline constexpr auto kRedisCommandTimeout = std::chrono::seconds(3);
 
 struct RedisEndpoint {
     std::string host;

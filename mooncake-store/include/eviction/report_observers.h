@@ -7,11 +7,13 @@
 namespace mooncake {
 namespace eviction {
 
-// Eviction counters in MasterMetricManager: success or failure of each
-// pool-wide run that had anything filed, and the bytes each tenant's runs
-// released.
+// Eviction counters in MasterMetricManager: the bytes each tenant's runs
+// released. A pool-wide run's success or failure is counted by its caller,
+// which may also have freed memory outside the run.
 class MetricsObserver final : public EvictionObserver {
    public:
+    bool SupportsParallel() const override { return true; }
+
     void OnRunEnd(const Scope& scope, const Report& report) override;
 };
 
@@ -21,6 +23,8 @@ class LogObserver final : public EvictionObserver {
    public:
     // `offload_cap` is how many offloads a run may queue, for the warning.
     explicit LogObserver(long offload_cap) : offload_cap_(offload_cap) {}
+
+    bool SupportsParallel() const override { return true; }
 
     void OnRunEnd(const Scope& scope, const Report& report) override;
 

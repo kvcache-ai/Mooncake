@@ -174,7 +174,7 @@ TEST_F(BatchReadTest, OnlyClientBatchReadsGrantLeases) {
               ErrorCode::OBJECT_HAS_LEASE);
 }
 
-TEST_F(BatchReadTest, ListsAndCountsThroughTheTenantCursors) {
+TEST_F(BatchReadTest, ListsAndCountsThroughTheRouteCursors) {
     MasterService service(MultiTenantConfig());
     const auto context = PrepareSimpleSegment(service);
     Populate(service, context.client_id);

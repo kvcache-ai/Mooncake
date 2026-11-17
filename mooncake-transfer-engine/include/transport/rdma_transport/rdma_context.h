@@ -119,6 +119,9 @@ struct DmabufExport {
     // unknown. Data Direct registration is only possible on NICs whose Data
     // Direct function sits under the same root.
     std::string pci_root;
+    // HIP: the exported allocation and the GPU that owns it.
+    void *alloc_base = nullptr;
+    int device = -1;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -341,6 +344,11 @@ class RdmaContext {
 
     int socketId();
 
+    // False when the HCA reports IBV_ATOMIC_NONE. Data QPs then omit
+    // IBV_ACCESS_REMOTE_ATOMIC. Mooncake's host path only posts RDMA
+    // READ/WRITE, so this does not change the transfer protocol.
+    bool supportsRdmaAtomic() const { return supports_rdma_atomic_; }
+
    private:
     int openRdmaDevice(const std::string &device_name, uint8_t port,
                        int gid_index);
@@ -380,6 +388,7 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
+    bool supports_rdma_atomic_ = true;
     uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;

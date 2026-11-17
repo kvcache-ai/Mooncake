@@ -123,10 +123,12 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
+    int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
 
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -263,6 +265,7 @@ class MasterServiceSupervisorConfig {
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -402,6 +405,7 @@ class MasterServiceSupervisorConfig {
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -584,6 +588,7 @@ class WrappedMasterServiceConfig {
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -681,6 +686,7 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -806,6 +812,7 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -873,6 +880,7 @@ class MasterServiceConfigBuilder {
     // OpLog store configuration
     bool enable_oplog_ = false;
     bool weight_management_oplog_capability_confirmed_ = false;
+    uint64_t weight_import_idle_timeout_ms_ = 5 * 60 * 1000;
     bool enable_oplog_snapshot_ = false;
     uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
@@ -1015,6 +1023,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_weight_import_idle_timeout_ms(
+        uint64_t timeout_ms) {
+        weight_import_idle_timeout_ms_ = timeout_ms;
         return *this;
     }
 
@@ -1189,6 +1203,10 @@ struct TaskManagerConfig {
 
 class MasterServiceConfig {
    public:
+    // Parallel eviction workers. Callbacks that do not support concurrent
+    // execution stay serial. Default 0 = ceil(filed keys / 16M), clamped
+    // to [1, 64] each round; explicit counts [1, 64] override automatic sizing.
+    uint32_t eviction_worker_threads = 0;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
@@ -1243,6 +1261,7 @@ class MasterServiceConfig {
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -1336,6 +1355,7 @@ class MasterServiceConfig {
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -1411,6 +1431,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_oplog = enable_oplog_;
     config.weight_management_oplog_capability_confirmed =
         weight_management_oplog_capability_confirmed_;
+    config.weight_import_idle_timeout_ms = weight_import_idle_timeout_ms_;
     config.enable_oplog_snapshot = enable_oplog_snapshot_;
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;

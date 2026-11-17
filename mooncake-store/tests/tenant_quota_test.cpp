@@ -386,6 +386,31 @@ TEST(TenantQuotaTableTest, DisablePolicyRejectsNonEmptyTenant) {
     EXPECT_TRUE(table.GetOrCreateTenantHandle(tenant_id)->TryCharge(1));
 }
 
+TEST(TenantQuotaTableTest, DisablePolicyWaitsOutWritesThatChargeNothing) {
+    TenantQuotaTable table;
+    const TenantId tenant_id("tenant-a");
+    auto* account = table.GetOrCreateTenantHandle(tenant_id);
+    auto unregistered = account->BeginWrite();
+    ASSERT_FALSE(unregistered.has_value());
+    EXPECT_EQ(unregistered.error(), TenantQuotaError::kTenantNotRegistered);
+
+    ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100).has_value());
+    table.RecomputeEffectiveQuotas(100);
+    ASSERT_TRUE(account->BeginWrite().has_value());
+
+    auto refused = table.DisableTenantPolicyIfEmpty(tenant_id);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), TenantQuotaError::kTenantNotEmpty);
+    EXPECT_TRUE(table.IsTenantRegistered(tenant_id));
+    EXPECT_FALSE(Snapshot(table, "tenant-a").admission_closed);
+
+    account->EndWrite();
+    ASSERT_TRUE(table.DisableTenantPolicyIfEmpty(tenant_id).has_value());
+    auto closed = account->BeginWrite();
+    ASSERT_FALSE(closed.has_value());
+    EXPECT_EQ(closed.error(), TenantQuotaError::kTenantNotRegistered);
+}
+
 TEST(TenantQuotaTableTest, HandleRemainsStableAcrossPolicyLifecycle) {
     TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");

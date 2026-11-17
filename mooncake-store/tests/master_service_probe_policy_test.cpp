@@ -157,15 +157,14 @@ TEST_F(BatchProbePolicyTest, ValidationDoesNotLeaseAndEmptyInputIsEmpty) {
     EXPECT_TRUE(service.BatchProbeKey({}, {}, TenantId::Default()).empty());
 }
 
-TEST_F(BatchProbePolicyTest, DuplicateKeysAndSameShardPreserveExistence) {
+TEST_F(BatchProbePolicyTest, DuplicateKeysAndSameStripePreserveExistence) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const std::string first = "same-shard-first";
+    const std::string first = "same-stripe-first";
     std::string second;
     for (int i = 0; i < 100000; ++i) {
-        const std::string candidate = "same-shard-" + std::to_string(i);
-        if (MetadataShardIndex(service, candidate) ==
-            MetadataShardIndex(service, first)) {
+        const std::string candidate = "same-stripe-" + std::to_string(i);
+        if (RouteStripeIndex(candidate) == RouteStripeIndex(first)) {
             second = candidate;
             break;
         }

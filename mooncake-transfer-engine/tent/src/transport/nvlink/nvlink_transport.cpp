@@ -26,6 +26,7 @@
 #include <memory>
 #include <unordered_map>
 
+#include "cuda_memcpy_batch_compat.h"
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
@@ -130,8 +131,11 @@ Status NVLinkTransport::install(std::string& local_segment_name,
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
+    // Copies below this size run as a blocking cudaMemcpy instead of the
+    // async stream + completion-event pipeline (see startTransfer). KiB
+    // units; 0 disables the sync fast path.
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 2048) * 1024;
     host_register_ = conf_->get("transports/nvlink/host_register", false);
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
@@ -283,6 +287,59 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                                     NVLinkSubBatch* batch) {
     if (tasks.empty()) return;
 
+    // A single small copy completes faster with a blocking cudaMemcpy than
+    // with the async stream + completion-event pipeline: the sync call
+    // returns already-completed and saves the fixed event record/poll
+    // notification latency, while the copy itself runs at the same speed.
+    // Only single-task batches take this path: batched submissions amortize
+    // the per-copy submit cost across tasks, and blocking copies serialize
+    // inside the driver under concurrency, so multi-task batches and sizes
+    // at/above async_memcpy_threshold_ keep the async pipeline.
+    if (async_memcpy_threshold_ > 0 && tasks.size() == 1 &&
+        tasks[0]->request.length < async_memcpy_threshold_) {
+        NVLinkTask* task = tasks[0];
+        void* src = nullptr;
+        void* dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;
+            src = (void*)task->target_addr;
+        } else {
+            src = task->request.source;
+            dst = (void*)task->target_addr;
+        }
+        // Match the async path's device discipline (fix for #2722): run the
+        // copy on the stream's device, then restore the caller's device.
+        int saved_device = -1;
+        if (batch->stream_device_id >= 0) {
+            auto dev_err = cudaGetDevice(&saved_device);
+            if (dev_err == cudaSuccess &&
+                saved_device != batch->stream_device_id) {
+                dev_err = cudaSetDevice(batch->stream_device_id);
+            }
+            if (dev_err != cudaSuccess) {
+                LOG(ERROR) << "NVLinkTransport: cudaGetDevice/cudaSetDevice "
+                              "failed for sync copy: "
+                           << cudaGetErrorString(dev_err);
+                task->status_word = TransferStatusEnum::FAILED;
+                return;
+            }
+        }
+        auto err =
+            cudaMemcpy(dst, src, task->request.length, cudaMemcpyDefault);
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
+        if (err == cudaSuccess) {
+            task->transferred_bytes = task->request.length;
+            task->status_word = TransferStatusEnum::COMPLETED;
+        } else {
+            LOG(ERROR) << "NVLinkTransport: synchronous cudaMemcpy failed: "
+                       << cudaGetErrorString(err);
+            task->status_word = TransferStatusEnum::FAILED;
+        }
+        return;
+    }
+
     std::vector<void*> srcs;
     std::vector<void*> dsts;
     std::vector<size_t> sizes;
@@ -315,9 +372,9 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     size_t attrs_idx = 0;
     size_t fail_idx = tasks.size();
-    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
-                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
-                               batch->async_stream.get());
+    err = cudaMemcpyBatchAsyncCompat(dsts.data(), srcs.data(), sizes.data(),
+                                     srcs.size(), &attr, &attrs_idx, 1,
+                                     &fail_idx, batch->async_stream.get());
     if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver &&
         fail_idx < tasks.size()) {
         LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
