@@ -164,7 +164,13 @@ fn configure_nof_spdk() -> Result<(), Box<dyn std::error::Error>> {
     let object = out_dir.join("nof_spdk_shim.o");
     let archive = out_dir.join("libmooncake_nof_spdk_shim.a");
     let cflags = pkg_config_words(&["--cflags", "spdk_nvme", "spdk_env_dpdk", "spdk_syslibs"])?;
-    let libs = pkg_config_words(&["--libs", "spdk_nvme", "spdk_env_dpdk", "spdk_syslibs"])?;
+    let libs = pkg_config_words(&[
+        "--libs",
+        "--static",
+        "spdk_nvme",
+        "spdk_env_dpdk",
+        "spdk_syslibs",
+    ])?;
 
     let mut cc = std::process::Command::new("cc");
     cc.arg("-std=c11")
@@ -185,11 +191,27 @@ fn configure_nof_spdk() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=mooncake_nof_spdk_shim");
+    if libs.iter().any(|flag| flag == "-lspdk_rdma") {
+        // SPDK 23.01's pkg-config files omit these private dependencies.
+        println!("cargo:rustc-link-lib=ibverbs");
+        println!("cargo:rustc-link-lib=rdmacm");
+    }
     for token in libs {
         if let Some(path) = token.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={path}");
         } else if let Some(lib) = token.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib={lib}");
+            if lib.starts_with("spdk_") || lib.starts_with("rte_") {
+                // SPDK/DPDK register transports and allocators in constructors.
+                // Bundle the archives into the rlib so downstream cdylibs retain
+                // those constructors and do not drop DPDK through --as-needed.
+                if matches!(lib, "spdk_nvme" | "spdk_sock_posix" | "rte_mempool_ring") {
+                    println!("cargo:rustc-link-lib=static:+whole-archive={lib}");
+                } else {
+                    println!("cargo:rustc-link-lib=static={lib}");
+                }
+            } else {
+                println!("cargo:rustc-link-lib={lib}");
+            }
         } else if token == "-pthread" {
             println!("cargo:rustc-link-arg=-pthread");
         } else if let Some(arg) = token.strip_prefix("-Wl,") {

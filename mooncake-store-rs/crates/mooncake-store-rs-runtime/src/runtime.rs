@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mooncake_store_client::{
     http_transport_label, ClassicTeTransportFactory, ColdTierRateLimitConfig,
     HttpStoreTransportFactory, HttpTransportServerHandle, LocalMemoryConfig,
-    MooncakeCompatibilityFacade, PlacementPlanner, RouteControlMode, StoreClient,
+    MooncakeCompatibilityFacade, NofTargetConfig, PlacementPlanner, RouteControlMode, StoreClient,
     StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
@@ -54,6 +54,30 @@ impl CompatRuntimeArgs {
         self,
         cold_tier_rate_limits: ColdTierRateLimitConfig,
     ) -> Result<CompatRuntime> {
+        self.build_with_storage(cold_tier_rate_limits, Vec::new(), 1)
+    }
+
+    pub fn build_with_nof_targets(
+        self,
+        targets: Vec<NofTargetConfig>,
+        replica_count: usize,
+    ) -> Result<CompatRuntime> {
+        self.build_with_storage(ColdTierRateLimitConfig::default(), targets, replica_count)
+    }
+
+    fn build_with_storage(
+        self,
+        cold_tier_rate_limits: ColdTierRateLimitConfig,
+        nof_targets: Vec<NofTargetConfig>,
+        nof_replica_count: usize,
+    ) -> Result<CompatRuntime> {
+        if !(1..=8).contains(&nof_replica_count)
+            || (!nof_targets.is_empty() && nof_replica_count > nof_targets.len())
+        {
+            return Err(mooncake_store_core::StoreError::InvalidState(
+                "NoF replica count must be in 1..=8 and cannot exceed target count".to_string(),
+            ));
+        }
         let plan = self.setup.build()?;
         let timeouts = plan.timeouts;
         let planner_metadata = plan.routed_writes.then(|| plan.metadata.clone());
@@ -124,6 +148,12 @@ impl CompatRuntimeArgs {
             .route_control(self.route_control)
             .route_topk(plan.route_topk)
             .cold_tier_rate_limits(cold_tier_rate_limits);
+
+        if !nof_targets.is_empty() {
+            builder = builder
+                .nof_targets(nof_targets)
+                .nof_replica_count(nof_replica_count);
+        }
 
         if !plan.cold_tier_targets.is_empty() {
             builder = builder.cold_tier_targets(plan.cold_tier_targets);

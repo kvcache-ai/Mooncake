@@ -69,6 +69,7 @@ _CPP_INTERNAL_EXPORTS = frozenset(
 
 _RS_EXPORTS = frozenset(
     {
+        "NOF_ENABLED",
         "MooncakeDistributedStore",
         "MooncakeHostMemAllocator",
         "BufferPool",

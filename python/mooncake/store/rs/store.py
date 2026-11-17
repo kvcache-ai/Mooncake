@@ -29,6 +29,7 @@ except ModuleNotFoundError as exc:
 _logger = logging.getLogger("mooncake.store.rs.store")
 BufferPool = _native.BufferPool
 RegisteredBufferPool = BufferPool
+NOF_ENABLED = getattr(_native, "NOF_ENABLED", False)
 
 _CACHE_STATUS = "status"
 _CACHE_STATUS_LIST = "status_list"
@@ -1638,6 +1639,7 @@ READ_MODE_SHARD = _native.READ_MODE_SHARD()
 READ_MODE_FULL = _native.READ_MODE_FULL()
 
 __all__ = [
+    "NOF_ENABLED",
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
     "BufferPool",

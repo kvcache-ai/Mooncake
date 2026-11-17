@@ -65,9 +65,9 @@ Each entry has `capability`, `result`, and a human-readable `reason`:
 | `not_implemented` | The backend or dedicated workload does not implement it. | `SKIP_NOT_IMPLEMENTED` |
 
 The matrix covers NoF replica count, promotion, zero-copy reads, and zero-copy
-writes. Store-RS has NoF copy I/O, but the benchmark's Python setup adapter does
-not configure its NoF replicas. It reports that row as `not_configured` and
-promotion / NoF zero-copy reads as `not_implemented`. Neither backend has a
+writes. Store-RS reports copy I/O as `supported` when targets are supplied and
+the Python extension was built with `nof-spdk`; otherwise it is `not_configured`.
+It reports promotion / NoF zero-copy reads as `not_implemented`. Neither backend has a
 dedicated NoF zero-copy write workload. Registered-buffer I/O over TCP remains
 available; it is separate from NoF zero copy.
 
@@ -93,6 +93,89 @@ The summary reports `result: "SKIP_NOT_IMPLEMENTED"`, the capability and reason,
 latency measurements and is not a passing run. Configured workloads still run
 normally, with `result: "PASS"` or `"FAIL"` derived from their actual I/O results.
 Setup, import, and runtime errors remain errors; they are not converted to skips.
+
+### NoF copy comparison
+
+Use a dedicated NVMe-oF namespace for each target and run the two backends
+separately. Store-RS owns the supplied byte ranges and writes its ExtentStore
+format there. Do not share those ranges with C++ Store or another storage user.
+An SPDK Malloc bdev with an NVMe/TCP listener is sufficient for functional checks;
+physical NVMe devices are needed for storage performance measurements.
+
+Build Store-RS Python with the `nof-spdk` Cargo feature (`USE_NOF=ON` enables it
+for the root CMake Python target). SPDK pkg-config files must be discoverable
+when building, and the SPDK/DPDK static archives must be available (as in the
+project's `dependencies.sh --with-spdk` installation). The native extension
+exports `NOF_ENABLED` for both backends.
+Store-RS also requires `MC_STORE_RS_ENABLE_COLD_TIER=1` throughout the run;
+configuring targets while its cold-tier paths are disabled is a setup error.
+Python setup waits for target ownership and startup recovery within the normal
+startup timeout before returning; that wait is outside the measured phases.
+
+For Store-RS, create a target JSON file such as `/tmp/rs-nof-targets.json`:
+
+```json
+[
+  {
+    "target_id": "bench-nof-0",
+    "transport": "tcp",
+    "traddr": "127.0.0.1",
+    "port": "4420",
+    "subnqn": "nqn.2026-11.io.mooncake:benchmark",
+    "nsid": 1,
+    "start_offset": 0,
+    "device_bytes": 67108864
+  }
+]
+```
+
+`device_bytes` is the exclusive range's end offset within the namespace; it
+cannot exceed device capacity. Both offsets must be 4 KiB aligned. Targets must
+have distinct IDs and namespaces; the replica count is in `1..=8` and cannot
+exceed target count. `hostnqn` is optional. The Python runtime also accepts this JSON
+through `MC_STORE_RS_NOF_TARGETS` and the count through
+`MC_STORE_RS_NOF_REPLICA_COUNT`; the driver scopes these variables to setup and
+restores the previous environment afterward.
+
+```bash
+MC_STORE_RS_ENABLE_COLD_TIER=1 python3 mooncake-store/benchmarks/store_kv_bench.py \
+  --scenario verify_write --store-backend rs --io-api plain \
+  --memory-replica-num 0 --nof-replica-num 1 \
+  --rs-nof-targets /tmp/rs-nof-targets.json \
+  --rs-metadata-url redis://127.0.0.1:6380 --rs-keyspace nof-copy-rs \
+  --numjobs 1 --iodepth 1 --batch-size 8 \
+  --nr-objects 128 --value-size 4096 --pattern 0x12345678 --verify \
+  --output-dir /tmp/nof-copy-rs
+```
+
+For C++, register a separate namespace using the normal NoF registration tool,
+then run the same workload with `--store-backend cpp`, the C++ metadata/master
+addresses, and no `--rs-*` flags. Use `--memory-replica-num 0 --nof-replica-num 1`
+on both backends so reads cannot be served by a requested DRAM replica.
+The shared copy comparison requires value sizes that are multiples of 4 KiB,
+matching the C++ NoF transfer alignment requirements.
+For this C++ copy-only mode the driver disables the local payload hot cache
+during setup, then restores the previous `MC_STORE_LOCAL_HOT_CACHE_SIZE`
+environment setting. It also checks that the authoritative descriptors are
+complete NoF replicas before reads and after writes. Rebuild the C++ binding
+to expose `ReplicaDescriptor.is_nof_replica()`.
+
+Store-RS first stages each put in one hot replica, then the driver invokes its
+existing diagnostic eviction path and checks that every key has the requested
+number of materialized NoF copies and no remaining hot replicas. This handoff
+and its route checks are included in each timed write request. Reads check the
+NoF-only route before issuing copy I/O; these checks are included in read
+latency. NoF reads are not promoted back into DRAM. Consequently this measures
+the end-to-end NoF-ready path, including staging, metadata and validation costs.
+It is not a raw device bandwidth measurement. `nof_write_completion` records
+this completion boundary in the summary.
+
+Store-RS comparison currently requires one lane (`--numjobs 1 --iodepth 1`),
+plain copy I/O, no memory replicas, and no DFS replicas. A missing build or
+target configuration still produces a skip; a failed handoff, pending backing,
+incorrect copy count, or hot read is an error and cannot produce a passing
+NoF result. Try `verify_write` first, then reuse the same settings for `fill`,
+`write_perf`, `read_perf`, or `mixed_rw` with their documented budgets.
 
 ## APIs
 

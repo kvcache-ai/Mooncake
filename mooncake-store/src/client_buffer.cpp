@@ -41,8 +41,10 @@ ClientBufferAllocator::ClientBufferAllocator(
         allocator_ = nullptr;
         return;
     }
-    // Align to 64 bytes(cache line size) for better cache performance
-    constexpr size_t alignment = 64;
+    // NoF without SGL requires block-aligned slices. A 4 KiB DMA pool base
+    // preserves alignment for block-sized staging allocations; ordinary host
+    // pools retain their cache-line alignment.
+    const size_t alignment = dma_allocator_ ? 4096 : 64;
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
