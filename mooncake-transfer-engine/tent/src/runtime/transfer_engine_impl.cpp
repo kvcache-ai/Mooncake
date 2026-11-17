@@ -38,6 +38,7 @@
 #include "tent/runtime/progress_worker.h"
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
+#include "tent/runtime/transfer_trace.h"
 #include "tent/runtime/topology.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
@@ -93,6 +94,7 @@ struct Batch {
     // `finished` so getBatchStatus can skip the owner walk (TE #4199) while
     // maybeFireSubmitHooks still fires per interval (TENT #4001).
     struct SubmitInterval {
+        std::shared_ptr<TransferTrace> transfer_trace;
         size_t start_task_id{0};
         size_t end_task_id{0};  // [start, end)
         uint64_t expected_owners{0};
@@ -147,6 +149,7 @@ void bindIntervalPublishCounter(Transport::SubBatchRef sub_batch,
     if (!sub_batch) return;
     sub_batch->publish_finished_counter =
         interval ? &interval->finished : nullptr;
+    sub_batch->transfer_trace = interval ? interval->transfer_trace : nullptr;
 }
 
 struct PreservedTentConfigOverrides {
@@ -1991,6 +1994,7 @@ MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
     MergeResult result;
     result.request_list.reserve(requests.size());
     result.task_lookup.resize(requests.size());
+    result.first_public.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         result.request_list.push_back(requests[i]);
         result.task_lookup[i] = i;
@@ -2119,6 +2123,7 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
 
     MergeResult result;
     result.task_lookup.resize(requests.size());
+    result.first_public.reserve(items.size());
     for (const auto& item : items) {
         if (merged_items.empty() || !can_merge(merged_items.back(), item)) {
             merged_items.push_back(item);
@@ -2136,10 +2141,43 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     return result;
 }
 
-std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
-    if (!buffer) return std::nullopt;
-    return BufferKey{buffer->addr, buffer->length};
-}
+namespace {
+// Scoped to one pinned descriptor snapshot. A hit retains findBuffer's first
+// covering MR: overlapping earlier MRs can win a shorter subsequent request,
+// so those hits must still use findBuffer. Zero-length requests also retain
+// its inclusive-end semantics at adjacent MR boundaries.
+class BoundaryLookup {
+   public:
+    explicit BoundaryLookup(SegmentDesc* desc) : desc_(desc) {}
+
+    std::optional<BufferKey> find(uint64_t base, uint64_t length) {
+        if (last_ && length && base >= last_->addr &&
+            base - last_->addr <= last_->length &&
+            length <= last_->length - (base - last_->addr))
+            return last_;
+        auto* buffer = desc_->findBuffer(base, length);
+        last_.reset();
+        if (!buffer) return std::nullopt;
+        const BufferKey result{buffer->addr, buffer->length};
+        last_ = result;
+        const uint64_t end = buffer->addr + buffer->length;
+        for (const auto& earlier : desc_->getMemory().buffers) {
+            if (&earlier == buffer) break;
+            const uint64_t earlier_end = earlier.addr + earlier.length;
+            if (earlier_end >= earlier.addr && earlier.addr < end &&
+                buffer->addr < earlier_end) {
+                last_.reset();
+                break;
+            }
+        }
+        return result;
+    }
+
+   private:
+    SegmentDesc* desc_;
+    std::optional<BufferKey> last_;
+};
+}  // namespace
 
 std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     ControlService* metadata, const std::vector<Request>& requests,
@@ -2151,11 +2189,12 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     auto local_desc = metadata->segmentManager().getLocal();
 
     if (local_desc) {
+        BoundaryLookup lookup(local_desc.get());
         for (size_t i = 0; i < requests.size(); ++i) {
             auto source_addr = static_cast<uint64_t>(
                 reinterpret_cast<uintptr_t>(requests[i].source));
-            boundaries[i].source_key = toBufferKey(
-                local_desc->findBuffer(source_addr, requests[i].length));
+            boundaries[i].source_key =
+                lookup.find(source_addr, requests[i].length);
         }
     }
 
@@ -2167,6 +2206,7 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     for (auto& [target_id, idxs] : by_target) {
         metadata->segmentManager().withCachedSegment(
             target_id, [&](SegmentDesc* target_desc) {
+                BoundaryLookup lookup(target_desc);
                 auto hp_tcp_limit = hp_tcp_config.params.max_transfer_bytes;
                 if (hp_tcp_config.enabled && idxs.size() > 1 &&
                     target_desc->type == SegmentType::Memory) {
@@ -2189,13 +2229,12 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
                                                   r.transport_hint == UNSPEC)) {
                         boundaries[i].max_merge_bytes = hp_tcp_limit;
                     }
-                    auto* buffer =
-                        target_desc->findBuffer(r.target_offset, r.length);
+                    auto buffer = lookup.find(r.target_offset, r.length);
                     if (!buffer) {
                         any_missing = true;
                         boundaries[i].target_key = std::nullopt;
                     } else {
-                        boundaries[i].target_key = toBufferKey(buffer);
+                        boundaries[i].target_key = buffer;
                     }
                 }
                 // Invariant: when this lambda returns NeedsRefreshCache, all
@@ -2536,7 +2575,7 @@ Status TransferEngineImpl::prepareSubmit(
 
     for (size_t owner_id = 0; owner_id < merged.request_list.size();
          ++owner_id) {
-        PreparedSubmit::Owner owner;
+        auto& owner = prepared.owners.emplace_back();
         owner.request = merged.request_list[owner_id];
         const auto& req = owner.request;
         const auto& boundary = merge_boundaries[merged.first_public[owner_id]];
@@ -2604,7 +2643,6 @@ Status TransferEngineImpl::prepareSubmit(
                 "scatter transfer does not support staged TENT "
                 "routes" LOC_MARK);
         }
-        prepared.owners.push_back(std::move(owner));
     }
 
     prepared.tasks.reserve(merged.task_lookup.size());
@@ -2648,32 +2686,27 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
     }
 
     std::vector<size_t> physical_task_id_list[kSupportedTransportTypes];
-    std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
 
-    std::unordered_map<size_t, size_t> owner_task_id_by_merged_task;
     std::unordered_map<size_t, std::vector<size_t>>
         public_tasks_by_physical_owner;
+    public_tasks_by_physical_owner.reserve(prepared.owners.size());
     for (const auto& task_plan : prepared.tasks) {
         size_t task_id = task_plan.task_id;
         size_t merged_task_id = task_plan.merged_task_index;
         auto& task = batch->task_list[task_id];
         const auto& owner = prepared.owners[merged_task_id];
         auto& merged_request = owner.request;
-        if (merged_task_id_map.count(merged_task_id)) {
-            task = merged_task_id_map[merged_task_id];
+        if (task_id != owner.owner_task_id) {
+            task = batch->task_list[owner.owner_task_id];
             task.derived = true;
             task.public_length = task_plan.public_length;
-            auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
-            if (owner_it != owner_task_id_by_merged_task.end()) {
-                task.physical_owner_task_id = owner_it->second;
-                if (task.type != UNSPEC) {
-                    public_tasks_by_physical_owner[owner_it->second].push_back(
-                        task_id);
-                }
-            }
+            task.physical_owner_task_id = owner.owner_task_id;
+            if (task.type != UNSPEC)
+                public_tasks_by_physical_owner[owner.owner_task_id].push_back(
+                    task_id);
             continue;
         }
 
@@ -2691,12 +2724,10 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
         task.physical_owner_task_id = task_id;
-        owner_task_id_by_merged_task[merged_task_id] = task_id;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
             noteBatchPollRequirement(batch, UNSPEC, false);
-            merged_task_id_map[merged_task_id] = task;
             continue;
         }
 
@@ -2716,7 +2747,6 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                 task.post_time = std::chrono::steady_clock::now();
             }
             noteBatchPollRequirement(batch, task.type, true);
-            merged_task_id_map[merged_task_id] = task;
             continue;
         }
 
@@ -2736,7 +2766,6 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                 task.status = FAILED;
                 task.failure_stage = 0;
                 task.suppress_failover = true;
-                merged_task_id_map[merged_task_id] = task;
                 continue;
             }
             attachProgressNotifier(batch, batch->sub_batch[task.type]);
@@ -2746,17 +2775,14 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
         task.derived = false;
         physical_task_id_list[task.type].push_back(task_id);
         public_tasks_by_physical_owner[task_id].push_back(task_id);
-        merged_task_id_map[merged_task_id] = task;
     }
 
     // Staging-internal submissions are physical implementation details of an
     // already-counted user request. Count only user-visible owner tasks as
     // logical requests, after their TaskInfo state is fully published and
     // before any transport attempt can complete.
-    for (const auto& [merged_task_id, owner_task_id] :
-         owner_task_id_by_merged_task) {
-        (void)merged_task_id;
-        auto& task = batch->task_list[owner_task_id];
+    for (const auto& owner : prepared.owners) {
+        auto& task = batch->task_list[owner.owner_task_id];
         if (owner_kind == QueueOwnerKind::User) {
             startLogicalRequestObservability(task);
         }
@@ -2791,6 +2817,7 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             submit_groups.push_back(physical_task_id_list[type]);
         }
 
+        std::vector<Request> requests;
         for (const auto& group : submit_groups) {
             if (group.empty()) continue;
 
@@ -2818,7 +2845,7 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             bindIntervalPublishCounter(sub_batch,
                                        intervalForTask(batch, group.front()));
 
-            std::vector<Request> requests;
+            requests.clear();
             requests.reserve(group.size());
             for (const auto task_id : group)
                 requests.push_back(batch->task_list[task_id].request);
@@ -3268,6 +3295,8 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind,
     bool require_post_submit_cancellation) {
+    auto trace =
+        TransferTrace::enabled() ? std::make_shared<TransferTrace>() : nullptr;
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
@@ -3278,10 +3307,13 @@ Status TransferEngineImpl::submitTransfer(
         std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
         const size_t start_task_id = batch_ref.get()->task_list.size();
         PreparedSubmit prepared;
+        if (trace) trace->prepare_start = TransferTrace::now();
         CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
                                    require_post_submit_cancellation));
+        if (trace) trace->prepare_end = TransferTrace::now();
 
         auto interval = std::make_unique<Batch::SubmitInterval>();
+        interval->transfer_trace = std::move(trace);
         interval->start_task_id = start_task_id;
         interval->end_task_id = start_task_id + request_list.size();
         if (notifi) {
@@ -4120,7 +4152,18 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                                              TransferStatus& overall_status) {
-    return getBatchStatus(batch_id, overall_status, false);
+    if (!TransferTrace::enabled())
+        return getBatchStatus(batch_id, overall_status, false);
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    CHECK_STATUS(getBatchStatus(batch_id, overall_status, false));
+    if (overall_status.s != PENDING) {
+        const auto complete = TransferTrace::now();
+        for (auto& interval :
+             reinterpret_cast<Batch*>(batch_id)->submit_intervals)
+            if (interval->transfer_trace)
+                interval->transfer_trace->finish(complete, overall_status.s);
+    }
+    return Status::OK();
 }
 
 Status TransferEngineImpl::progressBatch(BatchID batch_id,

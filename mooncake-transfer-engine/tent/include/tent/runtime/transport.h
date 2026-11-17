@@ -36,6 +36,7 @@
 
 namespace mooncake {
 namespace tent {
+struct TransferTrace;
 struct Capabilities {
     bool dram_to_dram = false;
     bool dram_to_gpu = false;  // dram as local side, gpu as peer side
@@ -68,6 +69,7 @@ class Transport {
         // interval can notify without a second CQ atomic on the batch counter.
         std::atomic<uint64_t>* publish_finished_counter{nullptr};
         std::atomic<bool> has_failure{false};
+        std::shared_ptr<TransferTrace> transfer_trace;
         // Named QP pool for this batch's transfers (RFC #2568 step 3). Empty =
         // no pool (default spray). Carried like device_mask, from the matched
         // SelectionPolicy down to each RdmaTask.

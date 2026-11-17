@@ -193,6 +193,8 @@ struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
     int max_retry_count = 8;
     int block_size = 65536;
+    // Zero inherits endpoint.max_qp_wr, including its per-lane startup ramp.
+    int submit_chunk_size = 0;
     uint64_t grace_period_ns = 5000000;  // 5ms
     std::string rail_topo_path;
     bool show_latency_info = false;

@@ -264,6 +264,58 @@ Request makeLocalWrite(uint8_t* ptr, size_t length) {
     return request;
 }
 
+TEST(RuntimeQueueDispatch, CompletedPrefixCannotCompleteBatchBeforeTail) {
+    for (bool queue : {false, true}) {
+        for (bool progress : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "queue=" << queue << " progress=" << progress);
+            auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+            cfg->set("enable_runtime_queue", queue);
+            cfg->set("enable_progress_worker", progress);
+            cfg->set("enable_auto_failover_on_poll", false);
+            std::vector<uint8_t> buffer(8192);
+            std::atomic<bool> tail_done{false};
+            TransferEngineImpl engine(cfg);
+            ASSERT_TRUE(engine.available());
+            auto fake = std::make_shared<FakeTransport>(
+                RDMA, [&](const Request& request, int) {
+                    const bool done = request.source == buffer.data() ||
+                                      tail_done.load(std::memory_order_acquire);
+                    return TransferStatus{done ? COMPLETED : PENDING,
+                                          done ? request.length : 0};
+                });
+            installFakeRdma(engine, fake);
+            ASSERT_TRUE(
+                engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+            auto batch = engine.allocateBatch(2);
+            ASSERT_TRUE(
+                engine
+                    .submitTransfer(
+                        batch, {makeLocalWrite(buffer.data(), 4096),
+                                makeLocalWrite(buffer.data() + 4096, 4096)})
+                    .ok());
+            TransferStatus status;
+            for (int i = 0; i < 4; ++i) {
+                ASSERT_TRUE(engine.getTransferStatus(batch, status).ok());
+                EXPECT_EQ(status.s, PENDING);
+            }
+            tail_done.store(true, std::memory_order_release);
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            do {
+                ASSERT_TRUE(engine.getTransferStatus(batch, status).ok());
+            } while (status.s == PENDING &&
+                     std::chrono::steady_clock::now() < deadline);
+            EXPECT_EQ(status.s, COMPLETED);
+            EXPECT_EQ(status.transferred_bytes, buffer.size());
+            EXPECT_TRUE(engine.freeBatch(batch).ok());
+            EXPECT_TRUE(
+                engine.unregisterLocalMemory(buffer.data(), buffer.size())
+                    .ok());
+        }
+    }
+}
+
 TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);

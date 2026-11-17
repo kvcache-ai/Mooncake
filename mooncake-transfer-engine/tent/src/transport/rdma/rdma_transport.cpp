@@ -257,6 +257,10 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
 
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
+    SET_WORKERS(submit_chunk_size, params->workers.submit_chunk_size);
+    if (params->workers.submit_chunk_size < 0)
+        return Status::InvalidArgument(
+            "Negative RDMA submit_chunk_size" LOC_MARK);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
 
@@ -537,7 +541,9 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
-    const size_t steady_watermark = params_->endpoint.max_qp_wr;
+    const size_t steady_watermark = params_->workers.submit_chunk_size
+                                        ? params_->workers.submit_chunk_size
+                                        : params_->endpoint.max_qp_wr;
     // Lower first-flush watermark to reduce worker first-post latency
     const size_t first_watermark =
         steady_watermark / num_workers + (steady_watermark % num_workers != 0);
@@ -576,7 +582,6 @@ Status RdmaTransport::submitTransferTasks(
     thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
     int next_worker_idx = tl_caller_id;
     for (auto& request : request_list) {
-        bool flush_ready = false;
         auto opcode = request.opcode;
         auto type = Platform::getLoader().getMemoryType(request.source);
         size_t max_slice_count = 64;
@@ -585,9 +590,9 @@ Status RdmaTransport::submitTransferTasks(
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
         task->request = request;
+        task->transfer_trace = rdma_batch->transfer_trace;
         task->device_mask = rdma_batch->device_mask;
         task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
-        task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
         task->success_slices.store(0, std::memory_order_relaxed);
@@ -604,6 +609,10 @@ Status RdmaTransport::submitTransferTasks(
             planRdmaSlices(request.length, default_block_size, max_slice_count);
         const uint64_t block_size = plan.block_size;
         const uint64_t num_slices = plan.count;
+        // Immutable before publication: even if a worker resolves the first
+        // chunk while we build the tail, it cannot finalize this task or
+        // publish its completion counter until the entire plan is resolved.
+        task->num_slices = num_slices;
 
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
@@ -640,7 +649,6 @@ Status RdmaTransport::submitTransferTasks(
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
             slice->priority = request.priority;  // Copy priority from request
-            task->num_slices++;
             task->ref();  // Each slice holds a reference to the task
             if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
@@ -651,8 +659,6 @@ Status RdmaTransport::submitTransferTasks(
             auto& list = slice_lists[part_id];
             auto& tail = slice_tails[part_id];
             list.num_slices++;
-            if (static_cast<size_t>(list.num_slices) >= watermarks[part_id])
-                flush_ready = true;
             next_worker_idx++;
             if (list.first) {
                 tail->next = slice;
@@ -660,16 +666,8 @@ Status RdmaTransport::submitTransferTasks(
             } else {
                 list.first = tail = slice;
             }
-        }
-        // Flush a chunk to pipeline task slice submission and worker posting
-        // Publish only after this task's slice count and references are
-        // finalized
-        if (flush_ready) {
-            for (int i = 0; i < num_workers; ++i) {
-                if (static_cast<size_t>(slice_lists[i].num_slices) >=
-                    watermarks[i])
-                    flush_lane(i);
-            }
+            if (static_cast<size_t>(list.num_slices) >= watermarks[part_id])
+                flush_lane(part_id);
         }
     }
 

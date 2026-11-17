@@ -379,6 +379,10 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
     // A worker may finish immediately after queue publication.
     const auto previous =
         worker.inflight_slices.fetch_add(slice_list.num_slices);
+    if (slice_list.first && slice_list.first->task) {
+        if (auto& trace = slice_list.first->task->transfer_trace)
+            TransferTrace::first(trace->first_enqueue, TransferTrace::now());
+    }
     worker.queues[priority].push(slice_list);
     if (!previous) {
         std::lock_guard<std::mutex> lock(worker.mutex);
@@ -707,8 +711,26 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
 void Workers::asyncPostSend() {
     auto& worker = worker_context_[tl_wid];
     std::vector<RdmaSliceList> result;
-    const size_t slice_budget = transport_->params_->endpoint.max_qp_wr;
+    const auto& params = *transport_->params_;
+    const size_t slice_budget = params.workers.submit_chunk_size
+                                    ? params.workers.submit_chunk_size
+                                    : params.endpoint.max_qp_wr;
     size_t new_slices = 0;
+    auto take_chunk = [&](RdmaSliceList& list) {
+        const int count =
+            deadline_bw_arbitration_
+                ? list.num_slices
+                : std::min<size_t>(list.num_slices, slice_budget - new_slices);
+        result.push_back({list.first, count});
+        // Keep batch-owned next links intact. The remaining cursor also
+        // handles legacy/retry producers that enqueue an oversized chain.
+        if (count == list.num_slices)
+            list.first = nullptr;
+        else
+            for (int i = 0; i < count; ++i) list.first = list.first->next;
+        list.num_slices -= count;
+        new_slices += count;
+    };
 
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
@@ -726,9 +748,11 @@ void Workers::asyncPostSend() {
              it != overflow.end() &&
              (deadline_bw_arbitration_ || new_slices < slice_budget);) {
             if (it->first == prio) {
-                new_slices += it->second.num_slices;
-                result.push_back(it->second);
-                it = overflow.erase(it);
+                take_chunk(it->second);
+                if (it->second.num_slices == 0)
+                    it = overflow.erase(it);
+                else
+                    ++it;
             } else {
                 ++it;
             }
@@ -742,8 +766,8 @@ void Workers::asyncPostSend() {
             while (new_slices < slice_budget) {
                 auto list = worker.queues[prio].pop();
                 if (!list.num_slices) break;
-                new_slices += list.num_slices;
-                result.push_back(list);
+                take_chunk(list);
+                if (list.num_slices) overflow.emplace_back(prio, list);
             }
         }
         if (!result.empty()) break;
