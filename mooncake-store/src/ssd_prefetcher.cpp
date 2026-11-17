@@ -259,8 +259,9 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
                     throttle->markAlreadyResident(chunk[i]);
                     continue;
                 }
-                if (route->holder_endpoint.empty() ||
-                    route->holder_endpoint == local_rpc_addr) {
+                if (file_storage &&
+                    (route->holder_endpoint.empty() ||
+                     route->holder_endpoint == local_rpc_addr)) {
                     // Only the process that actually has the SSD object may
                     // RegisterPrefetchTask. EngineCore (segment=0) otherwise
                     // leaves a PROCESSING MEMORY replica that get() waits on
@@ -276,7 +277,7 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
                     } else {
                         throttle->markFailed(chunk[i]);
                     }
-                } else {
+                } else if (!route->holder_endpoint.empty()) {
                     remote_keys[route->holder_endpoint].push_back(chunk[i]);
                     remote_sizes[route->holder_endpoint].push_back(
                         route->local_disk_size);
@@ -284,6 +285,8 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
                     // mark delegated so the requester neither waits on the
                     // key nor re-delegates it before the dedup TTL expires.
                     throttle->markDelegated(chunk[i]);
+                } else {
+                    throttle->markFailed(chunk[i]);
                 }
             }
 
