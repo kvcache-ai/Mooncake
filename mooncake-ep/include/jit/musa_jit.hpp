@@ -20,9 +20,8 @@ struct MusaJitCompileConfig {
     std::filesystem::path objcopy;
     std::filesystem::path work_dir;
     std::vector<std::filesystem::path> include_dirs;
-    // Empty selects the active MUSA device's compute capability (mp_<major><minor>).
-    // A hard-coded architecture can load successfully and then fail at execution
-    // time with opaque device errors when it does not match the installed GPU.
+    // Set explicitly or through MOONCAKE_MUSA_JIT_ARCH. Runtime compilation
+    // does not probe a device because the compiler environment may be GPU-less.
     std::string target_arch;
     std::vector<std::string> extra_options;
 };
@@ -34,11 +33,16 @@ struct MusaJitCompileResult {
     double compiler_sec = 0.0;
 };
 
+// Apply the process environment to a runtime compiler configuration. Tool
+// paths and extra compiler options remain overridable without rebuilding the
+// extension.
+void apply_musa_jit_environment(MusaJitCompileConfig* config);
+
 // Compile a MUSA translation unit and extract the device member from the
 // clang offload bundle. The returned image is suitable for muModuleLoadData.
-MusaJitCompileResult compile_musa_to_image(
-    std::string_view source, std::string_view stem,
-    const MusaJitCompileConfig& config);
+MusaJitCompileResult compile_musa_to_image(std::string_view source,
+                                           std::string_view stem,
+                                           const MusaJitCompileConfig& config);
 
 class MusaJitModule final {
    public:
@@ -61,13 +65,10 @@ class MusaJitModule final {
     MUmodule module_ = nullptr;
 };
 
-bool launch_musa_kernel_cached(std::string_view source, std::string_view stem,
-                               std::string_view entry, unsigned grid_x,
-                               unsigned grid_y, unsigned grid_z,
-                               unsigned block_x, unsigned block_y,
-                               unsigned block_z, unsigned shared_bytes,
-                               MUstream stream, void** args,
-                               const MusaJitCompileConfig& config,
-                               std::string* error);
+bool launch_musa_kernel_cached(
+    std::string_view source, std::string_view stem, std::string_view entry,
+    unsigned grid_x, unsigned grid_y, unsigned grid_z, unsigned block_x,
+    unsigned block_y, unsigned block_z, unsigned shared_bytes, MUstream stream,
+    void** args, const MusaJitCompileConfig& config, std::string* error);
 
 }  // namespace mooncake::jit

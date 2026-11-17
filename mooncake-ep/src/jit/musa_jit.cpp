@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -62,9 +63,10 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
     }
     close(pipe_fd[0]);
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    result->exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
-                                          : 128 + WTERMSIG(status);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    result->exit_code =
+        WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
     return result->exit_code == 0;
 }
 
@@ -82,31 +84,6 @@ std::vector<char> read_file(const std::filesystem::path& path) {
                              std::istreambuf_iterator<char>());
 }
 
-std::string musa_error(MUresult result);
-
-std::string resolve_target_arch(std::string configured, std::string* error) {
-    if (!configured.empty()) return configured;
-    if (const char* value = std::getenv("MOONCAKE_MUSA_JIT_ARCH");
-        value != nullptr && *value != '\0') {
-        return value;
-    }
-    MUresult init_result = muInit(0);
-    if (init_result != MUSA_SUCCESS) {
-        if (error != nullptr) *error = "muInit failed while detecting MUSA arch: " + musa_error(init_result);
-        return {};
-    }
-    MUdevice device;
-    int major = 0;
-    int minor = 0;
-    if (muDeviceGet(&device, 0) != MUSA_SUCCESS ||
-        muDeviceGetAttribute(&major, MU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != MUSA_SUCCESS ||
-        muDeviceGetAttribute(&minor, MU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != MUSA_SUCCESS) {
-        if (error != nullptr) *error = "could not query active MUSA device compute capability";
-        return {};
-    }
-    return "mp_" + std::to_string(major) + std::to_string(minor);
-}
-
 std::string musa_error(MUresult result) {
     const char* text = nullptr;
     muGetErrorString(result, &text);
@@ -118,9 +95,34 @@ std::string musa_error(MUresult result) {
 
 }  // namespace
 
-MusaJitCompileResult compile_musa_to_image(
-    std::string_view source, std::string_view stem,
-    const MusaJitCompileConfig& config) {
+void apply_musa_jit_environment(MusaJitCompileConfig* config) {
+    if (config == nullptr) return;
+    auto set_path = [](std::filesystem::path* path, const char* name) {
+        if (const char* value = std::getenv(name);
+            value != nullptr && *value != '\0') {
+            *path = value;
+        }
+    };
+    set_path(&config->compiler, "MOONCAKE_MUSA_JIT_COMPILER");
+    set_path(&config->bundler, "MOONCAKE_MUSA_JIT_BUNDLER");
+    set_path(&config->objcopy, "MOONCAKE_MUSA_JIT_OBJCOPY");
+    if (config->target_arch.empty()) {
+        if (const char* value = std::getenv("MOONCAKE_MUSA_JIT_ARCH");
+            value != nullptr && *value != '\0') {
+            config->target_arch = value;
+        }
+    }
+    if (const char* value = std::getenv("MOONCAKE_MUSA_JIT_EXTRA_OPTIONS");
+        value != nullptr && *value != '\0') {
+        std::istringstream options(value);
+        std::string option;
+        while (options >> option) config->extra_options.push_back(option);
+    }
+}
+
+MusaJitCompileResult compile_musa_to_image(std::string_view source,
+                                           std::string_view stem,
+                                           const MusaJitCompileConfig& config) {
     MusaJitCompileResult result;
     const auto started = std::chrono::steady_clock::now();
     std::error_code ec;
@@ -129,12 +131,13 @@ MusaJitCompileResult compile_musa_to_image(
         result.log = "mkdir failed: " + ec.message();
         return result;
     }
-    std::string arch_error;
-    const std::string target_arch = resolve_target_arch(config.target_arch, &arch_error);
-    if (target_arch.empty()) {
-        result.log = arch_error;
+    if (config.target_arch.empty()) {
+        result.log =
+            "MUSA JIT target architecture is unset; set "
+            "MOONCAKE_MUSA_JIT_ARCH or MusaJitCompileConfig::target_arch";
         return result;
     }
+    const std::string& target_arch = config.target_arch;
     const auto source_path = config.work_dir / (std::string(stem) + ".cu");
     const auto object_path = config.work_dir / (std::string(stem) + ".o");
     const auto bundle_path = config.work_dir / (std::string(stem) + ".bundle");
@@ -146,9 +149,16 @@ MusaJitCompileResult compile_musa_to_image(
 
     std::vector<std::string> compile = {
         config.compiler.empty() ? "mcc" : config.compiler.string(),
-        "-x", "musa", "-std=c++17", "-O3", "-fPIC", "-c",
+        "-x",
+        "musa",
+        "-std=c++17",
+        "-O3",
+        "-fPIC",
+        "-c",
         "--cuda-gpu-arch=" + target_arch,
-        source_path.string(), "-o", object_path.string()};
+        source_path.string(),
+        "-o",
+        object_path.string()};
     for (const auto& include : config.include_dirs)
         compile.push_back("-I" + include.string());
     compile.insert(compile.end(), config.extra_options.begin(),
@@ -178,8 +188,10 @@ MusaJitCompileResult compile_musa_to_image(
     const auto host_path = config.work_dir / (std::string(stem) + ".host.o");
     const std::string target = "musa-mtgpu-mt-musa--" + target_arch;
     std::vector<std::string> unbundle = {
-        config.bundler.empty() ? "clang-offload-bundler" : config.bundler.string(),
-        "--unbundle", "--type=o",
+        config.bundler.empty() ? "clang-offload-bundler"
+                               : config.bundler.string(),
+        "--unbundle",
+        "--type=o",
         "--targets=host-x86_64-unknown-linux," + target,
         "--inputs=" + bundle_path.string(),
         "--outputs=" + host_path.string() + "," + image_path.string()};
@@ -206,7 +218,8 @@ bool MusaJitModule::load(const std::vector<char>& image, std::string* error) {
     reset();
     const MUresult result = muModuleLoadData(&module_, image.data());
     if (result == MUSA_SUCCESS) return true;
-    if (error != nullptr) *error = "muModuleLoadData failed: " + musa_error(result);
+    if (error != nullptr)
+        *error = "muModuleLoadData failed: " + musa_error(result);
     module_ = nullptr;
     return false;
 }
@@ -222,9 +235,11 @@ bool MusaJitModule::get_function(std::string_view name, MUfunction* function,
                                  std::string* error) const {
     if (module_ == nullptr || function == nullptr) return false;
     const std::string owned(name);
-    const MUresult result = muModuleGetFunction(function, module_, owned.c_str());
+    const MUresult result =
+        muModuleGetFunction(function, module_, owned.c_str());
     if (result == MUSA_SUCCESS) return true;
-    if (error != nullptr) *error = "muModuleGetFunction failed: " + musa_error(result);
+    if (error != nullptr)
+        *error = "muModuleGetFunction failed: " + musa_error(result);
     return false;
 }
 
@@ -233,11 +248,12 @@ bool MusaJitModule::launch(MUfunction function, unsigned grid_x,
                            unsigned block_y, unsigned block_z,
                            unsigned shared_bytes, MUstream stream, void** args,
                            std::string* error) const {
-    const MUresult result = muLaunchKernel(function, grid_x, grid_y, grid_z,
-                                            block_x, block_y, block_z,
-                                            shared_bytes, stream, args, nullptr);
+    const MUresult result =
+        muLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y,
+                       block_z, shared_bytes, stream, args, nullptr);
     if (result == MUSA_SUCCESS) return true;
-    if (error != nullptr) *error = "muLaunchKernel failed: " + musa_error(result);
+    if (error != nullptr)
+        *error = "muLaunchKernel failed: " + musa_error(result);
     return false;
 }
 
@@ -252,8 +268,9 @@ bool launch_musa_kernel_cached(
     };
     static std::mutex mutex;
     static std::unordered_map<std::string, std::shared_ptr<Loaded>> cache;
-    const std::string key = std::string(stem) + ":" +
-                            std::to_string(std::hash<std::string_view>{}(source));
+    const std::string key =
+        std::string(stem) + ":" +
+        std::to_string(std::hash<std::string_view>{}(source));
     std::shared_ptr<Loaded> loaded;
     {
         std::lock_guard<std::mutex> lock(mutex);
