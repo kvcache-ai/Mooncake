@@ -919,6 +919,120 @@ TEST(KvEventPublisherTest, PendingRemovalOnlyRetainsAlreadyAnnouncedTiers) {
     }
 }
 
+TEST(KvEventPublisherTest, PendingRemovalDoesNotHideUpsertOrTierRecovery) {
+    const std::string endpoint = MakeIpcEndpoint();
+    MasterServiceConfig config;
+    config.enable_kv_events = true;
+    config.kv_events_bind_endpoint = endpoint;
+    config.kv_events_backend_id = "pending-removal-recovery-test";
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
+    test::MasterServiceTestPeer peer(service);
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint));
+
+    const UUID client = generate_uuid();
+    for (int i = 0; i < 2; ++i) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "kv_event_recovery_segment_" + std::to_string(i);
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000 + i * 16 * 1024 * 1024;
+        segment.size = 16 * 1024 * 1024;
+        ASSERT_TRUE(service.MountSegment(segment, client));
+    }
+
+    const auto tenant = TenantId::Default();
+    const std::string key = "pending_removal_recovery";
+    ReplicateConfig write_config;
+    write_config.replica_num = 2;
+    write_config.session_ids = std::vector<std::string>{"old-session"};
+    auto started = service.PutStart(client, key, tenant, 1024, write_config);
+    ASSERT_TRUE(started);
+    ASSERT_EQ(started->size(), 2u);
+    ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::MEMORY));
+    msgpack::object_handle payload;
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(EventCount(payload), 1u);
+    ExpectObjectEvent(FirstEvent(payload), "stored", key);
+
+    // Model a partial HA removal whose durable finalizer has not run yet.
+    // The other CPU replica can still be overwritten by an in-place Upsert.
+    const ReplicaID removed_cpu = started->front().id;
+    using Accessor = test::MasterServiceTestPeer::MetadataAccessorRW;
+    {
+        Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+        ASSERT_TRUE(accessor.IsPublished());
+        accessor.Get().GetReplicaByID(removed_cpu)->mark_removed();
+    }
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+
+    write_config.session_ids = std::vector<std::string>{"new-session"};
+    ASSERT_TRUE(service.UpsertStart(client, key, tenant, 1024, write_config));
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(EventCount(payload), 1u);
+    ExpectObjectEvent(FirstEvent(payload), "removed", key);
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+
+    ASSERT_TRUE(service.UpsertEnd(client, key, tenant, ReplicaType::MEMORY));
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(EventCount(payload), 1u);
+    ExpectObjectEvent(FirstEvent(payload), "stored", key);
+    const auto* session = FindMapValue(FirstEvent(payload), "session_id");
+    ASSERT_NE(session, nullptr);
+    EXPECT_EQ(MsgpackString(*session), "new-session");
+
+    OpLogEntry durable_entry;
+    durable_entry.tenant_id = tenant.value();
+    durable_entry.object_key = key;
+    peer.FinalizeRemovedReplicasAfterDurable(durable_entry, {removed_cpu});
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+
+    // Add an announced disk tier, then leave it pending removal. Registering
+    // LOCAL_DISK must re-announce availability even though the old NOF_SSD
+    // replica still retains the same disk announcement bit.
+    auto allocator =
+        std::make_shared<DummyBufferAllocator>("recovery-nof", "recovery-nof");
+    ReplicaID removed_disk;
+    {
+        Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+        ASSERT_TRUE(accessor.IsPublished());
+        std::vector<Replica> replicas;
+        replicas.emplace_back(
+            std::make_unique<AllocatedBuffer>(allocator, nullptr, 1024),
+            ReplicaStatus::COMPLETE, ReplicaType::NOF_SSD);
+        removed_disk = replicas.front().id();
+        accessor.Get().AddReplicas(std::move(replicas));
+    }
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(EventCount(payload), 1u);
+    ExpectObjectEvent(FirstEvent(payload), "stored", key);
+    {
+        Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+        ASSERT_TRUE(accessor.IsPublished());
+        accessor.Get().GetReplicaByID(removed_disk)->mark_removed();
+    }
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+
+    Replica disk(client, 1024, "local://recovery", ReplicaStatus::COMPLETE);
+    auto added = service.AddReplica(client, key, tenant, disk);
+    ASSERT_TRUE(added);
+    ASSERT_TRUE(*added);
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(EventCount(payload), 1u);
+    ExpectObjectEvent(FirstEvent(payload), "stored", key);
+    const auto* medium = FindMapValue(FirstEvent(payload), "medium");
+    ASSERT_NE(medium, nullptr);
+    EXPECT_EQ(MsgpackString(*medium), "disk");
+    session = FindMapValue(FirstEvent(payload), "session_id");
+    ASSERT_NE(session, nullptr);
+    EXPECT_EQ(MsgpackString(*session), "new-session");
+
+    peer.FinalizeRemovedReplicasAfterDurable(durable_entry, {removed_disk});
+    ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::MEMORY));
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+}
+
 TEST(KvEventPublisherTest, DisabledObjectKeyCountsSkippedObjectEvents) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventConfig config = MakeEnabledConfig(endpoint);

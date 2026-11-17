@@ -2190,8 +2190,8 @@ class MasterService {
     // RemoveAll holds no lock across its walk, so a concurrent commit can land
     // in a tenant or stripe it already passed. Publishing `cleared` from the
     // scan's own bookkeeping would then order it after that commit's `stored`
-    // and tell subscribers to drop a live object. Every announcement of a newly
-    // available object bumps its tenant's atomic epoch before taking the
+    // and tell subscribers to drop a live object. Every announcement of a new
+    // or recovered tier bumps its tenant's atomic epoch before taking the
     // publisher's queue lock, and `cleared` re-checks that epoch under the same
     // queue lock before enqueuing.
     //

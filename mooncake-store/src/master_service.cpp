@@ -3424,8 +3424,9 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
-        accessor.GetState().announced_kv_media =
-            KvMediaMasksForMetadata(metadata).live;
+        const uint8_t live_media = KvMediaMasksForMetadata(metadata).live;
+        accessor.GetState().announced_kv_media = live_media;
+        accessor.GetState().live_kv_media = live_media;
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -6009,6 +6010,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             eligible_replica_ids.insert(replica.id());
                             replica.mark_processing();
                         });
+                    // Pending durable removals may still retain a tier, but
+                    // no replica may advertise the contents being overwritten.
+                    accessor.GetState().kv_content_invalidated =
+                        !eligible_replica_ids.empty();
                     metadata.BeginSessionTag(config.SessionId(),
                                              eligible_replica_ids);
                     metadata.BeginSoftPinAction(
@@ -11114,8 +11119,8 @@ MasterService::KvMediaMasks MasterService::KvMediaMasksForMetadata(
     for (const Replica& replica : metadata.GetAllReplicas()) {
         const bool complete = replica.is_completed();
         // HA removal marks replicas before the OpLog is durable. Retain their
-        // announced tiers until the finalizer erases them, but still exclude
-        // PROCESSING so UpsertStart retracts the old tier.
+        // announced tiers until the finalizer erases them. An explicit content
+        // invalidation (in-place Upsert) overrides this retention on release.
         if (!complete && replica.status() != ReplicaStatus::REMOVED) {
             continue;
         }
@@ -11170,16 +11175,23 @@ void MasterService::OnKvWriteRelease(const TenantId& tenant_id,
     const uint8_t old_mask = state.announced_kv_media;
 
     const KvMediaMasks masks = KvMediaMasksForMetadata(metadata);
-    const uint8_t removed = old_mask & ~masks.retained;
-    const uint8_t stored = static_cast<uint8_t>(masks.live & ~old_mask);
+    const uint8_t removed = std::exchange(state.kv_content_invalidated, false)
+                                ? old_mask
+                                : old_mask & ~masks.retained;
+    // A retained announcement is not proof that a tier stayed available: a
+    // tenant-wide clear may have followed its pending removal. Re-announce
+    // recovery even on the same tier, and order it against any racing clear.
+    const uint8_t stored = static_cast<uint8_t>(
+        masks.live & (~old_mask | ~state.live_kv_media | removed));
+    state.live_kv_media = masks.live;
     state.announced_kv_media =
         static_cast<uint8_t>((old_mask & ~removed) | stored);
 
     if ((removed | stored) == 0) {
         return;
     }
-    // Only a newly announced tier can contradict a concurrent `cleared` scan;
-    // pure retractions safely precede or follow `cleared`.
+    // Both a new tier and a recovered tier can contradict `cleared`; pure
+    // retractions safely precede or follow it.
     if (stored != 0) {
         BumpKvTenantEpoch(tenant_id.value());
     }
