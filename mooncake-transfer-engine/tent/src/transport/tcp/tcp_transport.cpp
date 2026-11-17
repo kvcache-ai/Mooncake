@@ -23,11 +23,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <thread>
 
 #include "tent/common/status.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/slab.h"
 
@@ -113,6 +115,7 @@ Status TcpTransport::install(std::string &local_segment_name,
         params_.allow_unsafe_legacy_data_rpc =
             conf->get("transports/tcp/allow_unsafe_legacy_data_rpc",
                       params_.allow_unsafe_legacy_data_rpc);
+        notify_backlog_max_ = loadNotifyRecvBacklogMax(*conf);
     }
 
     if (params_.max_concurrent_tasks == 0) {
@@ -189,7 +192,19 @@ Status TcpTransport::install(std::string &local_segment_name,
     installed_ = true;
     metadata_->setNotifyCallback([&](const Notification &message) -> int {
         RWSpinlock::WriteGuard guard(notify_lock_);
+        if (notify_list_.size() >= notify_backlog_max_) {
+            notify_list_.pop_front();
+            const uint64_t dropped = ++notify_backlog_dropped_;
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::RecvBacklog, 1);
+            LOG_EVERY_N(WARNING, 1000)
+                << "Notification receive queue recv_tcp full at "
+                << notify_backlog_max_ << ", dropped the oldest unread, "
+                << dropped << " so far";
+        }
         notify_list_.push_back(message);
+        TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvTcp,
+                                    notify_list_.size());
         return 0;
     });
     caps.dram_to_dram = true;
@@ -580,29 +595,24 @@ Status TcpTransport::findRemoteSegment(
 
 Status TcpTransport::sendNotification(SegmentID target_id,
                                       const Notification &message) {
-    return metadata_->segmentManager().withCachedSegment(
-        target_id, [&](SegmentDesc *segment) {
-            auto rpc_server_addr = segment->rpc_server_addr;
-            if (rpc_server_addr.empty()) {
-                return Status::NeedsRefreshCache(
-                    "Empty RPC server addr" LOC_MARK);
-            }
-            auto status = ControlClient::notify(rpc_server_addr, message);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
-            return status;
+    return metadata_->segmentManager().withPeerRpcAddr(
+        target_id, [&](const std::string &rpc_server_addr) {
+            return ControlClient::notify(rpc_server_addr, message);
         });
 }
 
 Status TcpTransport::receiveNotification(
     std::vector<Notification> &notify_list) {
-    RWSpinlock::WriteGuard guard(notify_lock_);
     notify_list.clear();
-    notify_list.swap(notify_list_);
+    std::unique_lock<RWSpinlock> guard(notify_lock_);
+    if (notify_list_.empty()) return Status::OK();
+    // Arrivals spin on this lock: take the queue whole, move it out after.
+    std::deque<Notification> taken;
+    taken.swap(notify_list_);
+    TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvTcp, 0);
+    guard.unlock();
+    notify_list.assign(std::make_move_iterator(taken.begin()),
+                       std::make_move_iterator(taken.end()));
     return Status::OK();
 }
 

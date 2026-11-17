@@ -20,10 +20,13 @@
 // so a notification that arrived over RPC is not stranded in a queue nobody
 // polls. Stand-in transports keep this free of any NIC or metadata server.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -41,7 +44,8 @@ namespace tent {
 
 namespace {
 
-std::shared_ptr<Config> makeConfig(bool rpc_fallback = true) {
+std::shared_ptr<Config> makeConfig(bool rpc_fallback = true,
+                                   int notify_proto = 1) {
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
     config->set("rpc_server_hostname", "127.0.0.1");
@@ -65,6 +69,7 @@ std::shared_ptr<Config> makeConfig(bool rpc_fallback = true) {
     config->set("enable_progress_worker", false);
     config->set("enable_runtime_queue", false);
     config->set("notification/rpc_fallback", rpc_fallback);
+    config->set("notification/proto", notify_proto);
     return config;
 }
 
@@ -365,6 +370,122 @@ TEST(NotificationFallbackTest, ReceiveKeepsDrainingPastAFailingTransport) {
     EXPECT_TRUE(received.empty());
 }
 
+// Stamped per target, a resend keeps its stamp, and proto=0 sends them bare.
+TEST(NotificationFallbackTest, OutgoingNotificationsAreStampedPerTarget) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+    SegmentID peer_a = ~0ull, peer_b = ~0ull;
+    ASSERT_TRUE(engine.openSegment(peer_a, "peer-a:1234").ok());
+    ASSERT_TRUE(engine.openSegment(peer_b, "peer-b:1234").ok());
+
+    ASSERT_TRUE(engine.sendNotification(peer_a, makeNotification("a")).ok());
+    ASSERT_TRUE(engine.sendNotification(peer_a, makeNotification("b")).ok());
+    ASSERT_TRUE(engine.sendNotification(peer_b, makeNotification("c")).ok());
+    ASSERT_EQ(rdma->sent.size(), 3u);
+    EXPECT_NE(rdma->sent[0].session, 0u);
+    EXPECT_EQ(rdma->sent[0].session, rdma->sent[1].session);
+    EXPECT_EQ(rdma->sent[0].seq, 1u);
+    EXPECT_EQ(rdma->sent[1].seq, 2u);
+    EXPECT_EQ(rdma->sent[2].seq, 1u);  // another target, its own count
+    // A notification that already carries a stamp (a resend) keeps it.
+    Notification resend = rdma->sent[0];
+    ASSERT_TRUE(engine.sendNotification(peer_a, resend).ok());
+    EXPECT_EQ(rdma->sent[3].seq, 1u);
+
+    TransferEngineImpl raw(makeConfig(/*rpc_fallback=*/true,
+                                      /*notify_proto=*/0));
+    ASSERT_TRUE(raw.available());
+    auto raw_rdma = installStub(raw, RDMA, "<rdma>", Status::OK());
+    ASSERT_TRUE(raw.sendNotification(kRemote, makeNotification("d")).ok());
+    ASSERT_EQ(raw_rdma->sent.size(), 1u);
+    EXPECT_EQ(raw_rdma->sent[0].session, 0u);
+    EXPECT_EQ(raw_rdma->sent[0].seq, 0u);
+    // A stamp the caller passed in, e.g. on a forwarded one, is cleared too.
+    Notification forwarded = makeNotification("e");
+    forwarded.session = 7;
+    forwarded.seq = 9;
+    ASSERT_TRUE(raw.sendNotification(kRemote, forwarded).ok());
+    ASSERT_EQ(raw_rdma->sent.size(), 2u);
+    EXPECT_TRUE(raw_rdma->sent[1].session == 0 && raw_rdma->sent[1].seq == 0);
+}
+
+// A stamped notification reaches the caller once, whichever path carried it.
+TEST(NotificationFallbackTest, DuplicateStampedNotificationIsDeliveredOnce) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+    auto tcp = installStub(engine, TCP, "<tcp>", Status::OK());
+
+    Notification stamped = makeNotification("once");
+    stamped.session = 0x5EED;
+    stamped.seq = 7;
+    Notification bare = makeNotification("bare");
+    rdma->queued = {stamped, stamped, bare};
+    tcp->queued = {stamped, bare};
+
+    std::vector<Notification> received;
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 3u);  // 5 queued, the 2 stamped repeats dropped
+    EXPECT_EQ(received[0].msg, "once");
+    EXPECT_EQ(received[1].msg, "bare");
+    EXPECT_EQ(received[2].msg, "bare");
+
+    // A later poll still remembers it: 1 queued, 0 delivered.
+    tcp->queued = {stamped};
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    EXPECT_TRUE(received.empty());
+}
+
+// The receiver's dedup limits come from the config; a value <= 0 keeps the
+// default. Each engine sees 1, 3 and 5 of one sender, then a late 2 and 4.
+TEST(NotificationFallbackTest, DedupLimitsComeFromTheConfig) {
+    auto late = [](const std::shared_ptr<Config>& config,
+                   std::chrono::milliseconds wait) {
+        TransferEngineImpl engine(config);
+        EXPECT_TRUE(engine.available());
+        auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+        auto queue = [&](std::initializer_list<uint64_t> seqs) {
+            for (uint64_t seq : seqs) {
+                Notification notifi = makeNotification(std::to_string(seq));
+                notifi.session = 0x5EED;
+                notifi.seq = seq;
+                rdma->queued.push_back(notifi);
+            }
+        };
+        std::vector<Notification> received;
+        queue({1, 3, 5});
+        EXPECT_TRUE(engine.receiveNotification(received).ok());
+        EXPECT_EQ(received.size(), 3u);
+        std::this_thread::sleep_for(wait);
+        queue({2, 4});
+        EXPECT_TRUE(engine.receiveNotification(received).ok());
+        std::string delivered;
+        for (const Notification& notifi : received) delivered += notifi.msg;
+        return delivered;
+    };
+    const std::chrono::milliseconds none(0);
+    EXPECT_EQ(late(makeConfig(), none), "24");
+
+    auto capped = makeConfig();
+    capped->set("notification/dedup_max_holes", 1);
+    EXPECT_EQ(late(capped, none), "4");
+
+    auto short_ttl = makeConfig();
+    short_ttl->set("notification/dedup_hole_ttl_ms", 1);
+    EXPECT_EQ(late(short_ttl, std::chrono::milliseconds(10)), "");
+
+    auto endless = makeConfig();
+    endless->set("notification/dedup_hole_ttl_ms",
+                 std::numeric_limits<int64_t>::max());
+    EXPECT_EQ(late(endless, none), "24");
+
+    auto unset = makeConfig();
+    unset->set("notification/dedup_hole_ttl_ms", -1);
+    unset->set("notification/dedup_max_holes", 0);
+    EXPECT_EQ(late(unset, none), "24");
+}
+
 // Two engines on loopback, neither with a TCP transport. The sender's only
 // notification transport reports its channel unavailable, so the engine
 // itself makes the control-plane RPC; the receiver, with nothing registered
@@ -404,6 +525,9 @@ TEST(NotificationFallbackTest, RpcNotifyLandsWithoutTcpTransport) {
     ASSERT_EQ(received.size(), 1u);
     EXPECT_EQ(received[0].name, "notification-fallback-test");
     EXPECT_EQ(received[0].msg, "over-rpc");
+    // The stamp survives the RPC leg.
+    EXPECT_EQ(received[0].session, sender_rdma->sent[0].session);
+    EXPECT_EQ(received[0].seq, sender_rdma->sent[0].seq);
     EXPECT_TRUE(receiver_rdma->queued.empty());
 
     // Delivered exactly once.
@@ -524,6 +648,223 @@ TEST(NotifyAckTest, ADeliveredNotifyIsAcked) {
     ASSERT_EQ(delivered.size(), 1u);
     EXPECT_EQ(delivered[0].name, "notification-fallback-test");
     EXPECT_EQ(delivered[0].msg, "delivered");
+}
+
+// A dead control plane is reported as such and the cached desc survives.
+TEST(NotificationFallbackTest, ControlPlaneFailureKeepsTheCachedSegment) {
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    installStub(sender, RDMA, "<sender-rdma-unavailable>",
+                Status::RdmaError("RDMA notification channel unavailable"));
+    SegmentID remote = ~0ull;
+    SegmentInfo info;
+    {
+        TransferEngineImpl receiver(makeConfig());
+        ASSERT_TRUE(receiver.available());
+        ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+        ASSERT_TRUE(sender.getSegmentInfo(remote, info).ok());  // now cached
+    }
+
+    const Status status =
+        sender.sendNotification(remote, makeNotification("dead"));
+    EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
+    EXPECT_TRUE(sender.getSegmentInfo(remote, info).ok())
+        << "the cached desc was dropped by a refetch";
+
+    const Status probe = sender.probePeerAliveByID(remote);
+    EXPECT_TRUE(probe.IsRpcServiceError()) << probe.ToString();
+    EXPECT_TRUE(sender.getSegmentInfo(remote, info).ok());
+    PeerHealth::instance().clear();
+}
+
+// A peer back on the same address answers the first probe after its restart.
+TEST(NotificationFallbackTest, RestartedPeerAnswersTheFirstProbe) {
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    SegmentID remote = ~0ull;
+    std::string name;
+    {
+        TransferEngineImpl first(makeConfig());
+        ASSERT_TRUE(first.available());
+        name = first.getSegmentName();
+        ASSERT_TRUE(sender.openSegment(remote, name).ok());
+        ASSERT_TRUE(sender.probePeerAliveByID(remote).ok());
+    }
+    auto config = makeConfig();
+    config->set("rpc_server_port", name.substr(name.rfind(':') + 1));
+    TransferEngineImpl second(config);
+    ASSERT_EQ(second.getSegmentName(), name);
+    const Status status = sender.probePeerAliveByID(remote);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+}
+
+// The same for the first notification after the restart, delivered once.
+TEST(NotificationFallbackTest, RestartedPeerAnswersTheFirstNotify) {
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    installStub(sender, RDMA, "<sender-rdma-unavailable>",
+                Status::RdmaError("RDMA notification channel unavailable"));
+    SegmentID remote = ~0ull;
+    std::string name;
+    std::vector<Notification> received;
+    {
+        TransferEngineImpl first(makeConfig());
+        ASSERT_TRUE(first.available());
+        name = first.getSegmentName();
+        ASSERT_TRUE(sender.openSegment(remote, name).ok());
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("before")).ok());
+        ASSERT_TRUE(first.receiveNotification(received).ok());
+        ASSERT_EQ(received.size(), 1u);
+    }
+    auto config = makeConfig();
+    config->set("rpc_server_port", name.substr(name.rfind(':') + 1));
+    TransferEngineImpl second(config);
+    ASSERT_EQ(second.getSegmentName(), name);
+    const Status status =
+        sender.sendNotification(remote, makeNotification("after"));
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(second.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "after");
+}
+
+// A copy that came over RPC into the local queue is deduplicated too.
+TEST(NotificationFallbackTest, RpcCopyIsDedupedWithoutTcpTransport) {
+    TransferEngineImpl receiver(makeConfig());
+    ASSERT_TRUE(receiver.available());
+    auto receiver_rdma = installStub(receiver, RDMA, "<rdma>", Status::OK());
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    installStub(sender, RDMA, "<rdma-down>",
+                Status::RdmaError("RDMA notification channel unavailable"));
+    SegmentID remote = ~0ull;
+    ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+    ASSERT_TRUE(sender.sendNotification(remote, makeNotification("x")).ok());
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+
+    ASSERT_TRUE(sender.sendNotification(remote, received[0]).ok());  // RPC
+    receiver_rdma->queued = {received[0]};                           // QP copy
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    EXPECT_TRUE(received.empty());
+}
+
+// A transport's queue drops before duplicate detection, so a later copy of
+// what it dropped is delivered; the engine's queue checks on arrival first.
+TEST(NotificationFallbackTest,
+     ACopyOfABacklogDropIsDeliveredByATransportQueue) {
+    for (const bool tcp : {true, false}) {
+        auto receiver_config = makeConfig();
+        receiver_config->set("notification/recv_backlog_max", 1);
+        receiver_config->set("transports/tcp/enable", tcp);
+        TransferEngineImpl receiver(receiver_config);
+        ASSERT_TRUE(receiver.available());
+        installStub(receiver, RDMA, "<rdma>", Status::OK());
+        TransferEngineImpl sender(makeConfig());
+        ASSERT_TRUE(sender.available());
+        installStub(sender, RDMA, "<rdma-down>",
+                    Status::RdmaError("RDMA notification channel unavailable"));
+        SegmentID remote = ~0ull;
+        ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+        std::vector<Notification> got;
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("a")).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        ASSERT_EQ(got.size(), 1u) << tcp;
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("b")).ok());
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("c")).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        ASSERT_EQ(got.size(), 1u) << tcp;
+        EXPECT_EQ(got[0].msg, "c");
+
+        Notification copy = got[0];
+        copy.seq -= 1;
+        copy.msg = "b-copy";
+        ASSERT_TRUE(sender.sendNotification(remote, copy).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        EXPECT_EQ(got.size(), tcp ? 1u : 0u) << tcp;
+        ASSERT_TRUE(sender.sendNotification(remote, copy).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        EXPECT_TRUE(got.empty()) << tcp;
+    }
+}
+
+// Reopening a segment continues its count instead of repeating a stamp.
+TEST(NotificationFallbackTest, ReopenedSegmentDoesNotRepeatAStamp) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+    for (int i = 0; i < 2; ++i) {
+        SegmentID handle = ~0ull;
+        ASSERT_TRUE(engine.openSegment(handle, "peer-a:1234").ok());
+        ASSERT_TRUE(
+            engine.sendNotification(handle, makeNotification("n")).ok());
+        ASSERT_TRUE(engine.closeSegment(handle).ok());
+    }
+    ASSERT_EQ(rdma->sent.size(), 2u);
+    EXPECT_EQ(rdma->sent[1].session, rdma->sent[0].session);  // one window
+    EXPECT_EQ(rdma->sent[1].seq, 2u);
+    NotifyDedupFilter receiver;
+    EXPECT_TRUE(receiver.admit(rdma->sent[0].session, rdma->sent[0].seq));
+    EXPECT_TRUE(receiver.admit(rdma->sent[1].session, rdma->sent[1].seq));
+}
+
+// Nothing takes a Notify RPC before the engine registers its callback or
+// after teardown clears it.
+TEST(NotificationFallbackTest, ANotifyRpcWithNoCallbackIsLogged) {
+    ControlService service("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(service.start(port).ok());
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+    // 100 drops: LOG_EVERY_N(100) logs one of them, whatever ran before.
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 100; ++i)
+        (void)ControlClient::notify(addr, makeNotification("lost"));
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+}
+
+// One poll that refuses copies logs once; 100 polls log at least once.
+TEST(NotificationFallbackTest, ACopyRefusedInAPollIsLogged) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+    Notification copy = makeNotification("once");
+    copy.session = 7;
+    copy.seq = 1;
+    std::vector<Notification> received;
+    rdma->queued = {copy};
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 100; ++i) {
+        rdma->queued = {copy};
+        (void)engine.receiveNotification(received);
+        EXPECT_TRUE(received.empty());
+    }
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+}
+
+// The engine's own queue refuses a copy on arrival, not in the poll.
+TEST(NotificationFallbackTest, ACopyRefusedOnArrivalIsLogged) {
+    TransferEngineImpl receiver(makeConfig());
+    ASSERT_TRUE(receiver.available());
+    Notification copy = makeNotification("once");
+    copy.session = 7;
+    copy.seq = 1;
+    const std::string addr = receiver.getSegmentName();
+    ASSERT_TRUE(ControlClient::notify(addr, copy).ok());
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 100; ++i)
+        ASSERT_TRUE(ControlClient::notify(addr, copy).ok());
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "once");
 }
 
 }  // namespace tent

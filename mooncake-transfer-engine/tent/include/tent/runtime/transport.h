@@ -180,6 +180,14 @@ class Transport {
             "sendNotification not implemented" LOC_MARK);
     }
 
+    // For a poller's thread: only over a channel that is already up, so no
+    // dial or control-plane wait (a full send queue may still wait out its
+    // stall timeout). A transport without such a split sends as usual.
+    virtual Status sendNotificationIfConnected(SegmentID target_id,
+                                               const Notification& notify) {
+        return sendNotification(target_id, notify);
+    }
+
     virtual Status receiveNotification(std::vector<Notification>& notify_list) {
         return Status::NotImplemented(
             "receiveNotification not implemented" LOC_MARK);

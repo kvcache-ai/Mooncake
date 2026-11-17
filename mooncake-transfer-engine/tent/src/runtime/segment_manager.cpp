@@ -59,14 +59,25 @@ Status SegmentManager::openRemote(SegmentID &handle,
     return Status::OK();
 }
 
+std::string SegmentManager::remoteName(SegmentID handle) {
+    RWSpinlock::ReadGuard guard(lock_);
+    auto it = id_to_name_map_.find(handle);
+    return it == id_to_name_map_.end() ? std::string() : it->second;
+}
+
 Status SegmentManager::closeRemote(SegmentID handle) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (!id_to_name_map_.count(handle))
-        return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
-    auto segment_name = id_to_name_map_[handle];
-    name_to_id_map_.erase(segment_name);
-    id_to_name_map_.erase(handle);
-    version_.fetch_add(1, std::memory_order_relaxed);
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (!id_to_name_map_.count(handle))
+            return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
+        auto segment_name = id_to_name_map_[handle];
+        name_to_id_map_.erase(segment_name);
+        id_to_name_map_.erase(handle);
+        version_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // After the version bump: a fetch still in flight then stores nothing.
+    std::unique_lock<std::shared_mutex> fetched_guard(fetched_lock_);
+    fetched_.erase(handle);
     return Status::OK();
 }
 
@@ -118,6 +129,12 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
         auto status = getRemote(desc_ref, handle);
         if (!status.ok()) return status;
         cache.id_to_desc_map[handle] = desc_ref;
+        {
+            std::unique_lock<std::shared_mutex> guard(fetched_lock_);
+            if (version_.load(std::memory_order_relaxed) == current_version)
+                fetched_[handle] = {desc_ref,
+                                    static_cast<uint64_t>(current_ts)};
+        }
 
         std::string peer_rpc_addr = desc_ref->rpc_server_addr;
         std::string local_rpc_addr = getLocal()->rpc_server_addr;
@@ -126,8 +143,10 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
             // invalidation. This is a best-effort mechanism to reduce stale
             // cache hits. Errors are logged and ignored; correctness should not
             // depend on this.
-            ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
-                                                       local_rpc_addr);
+            // A peer whose control plane stopped answering is not dialed.
+            if (!PeerHealth::instance().shouldFailFast(peer_rpc_addr))
+                ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
+                                                           local_rpc_addr);
         } else {
             LOG(ERROR) << "Unexpected empty RPC address, peer: '"
                        << peer_rpc_addr << "', local: '" << local_rpc_addr
@@ -136,6 +155,18 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
     }
     desc = cache.id_to_desc_map[handle];
     assert(desc);
+    return Status::OK();
+}
+
+Status SegmentManager::peekRemote(SegmentDescRef &desc, SegmentID handle) {
+    std::shared_lock<std::shared_mutex> guard(fetched_lock_);
+    auto it = fetched_.find(handle);
+    if (it == fetched_.end() ||
+        getCurrentTimeInNano() - it->second.fetched_at >
+            static_cast<uint64_t>(TENT_SEGMENT_DESC_TTL_MS) * 1000000) {
+        return Status::InvalidEntry("Segment desc not cached" LOC_MARK);
+    }
+    desc = it->second.desc;
     return Status::OK();
 }
 
@@ -161,6 +192,29 @@ Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
 Status SegmentManager::getRemote(SegmentDescRef &desc,
                                  const std::string &segment_name) {
     return registry_->getSegmentDesc(desc, segment_name);
+}
+
+Status SegmentManager::withPeerRpcAddr(
+    SegmentID segment_id,
+    const std::function<Status(const std::string &)> &call) {
+    const bool may_move = segment_id != LOCAL_SEGMENT_ID && registry_ &&
+                          registry_->refetchMayChangeRpcAddr();
+    std::string failed_addr;
+    Status failed;
+    return withCachedSegment(segment_id, [&](SegmentDesc *segment) {
+        const std::string &addr = segment->rpc_server_addr;
+        if (addr.empty()) {
+            return Status::NeedsRefreshCache("Empty RPC server addr" LOC_MARK);
+        }
+        if (addr == failed_addr) return failed;  // refetched, same address
+        Status status = call(addr);
+        if (!status.IsRpcServiceError() || !may_move || !failed_addr.empty())
+            return status;
+        failed_addr = addr;
+        failed = status;
+        return Status::NeedsRefreshCache(std::string{status.message()} +
+                                         LOC_MARK);
+    });
 }
 
 Status SegmentManager::invalidateRemote(SegmentID handle) {

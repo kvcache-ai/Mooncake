@@ -1,2 +1,2 @@
 add_library(tent_xport_tcp STATIC tcp_transport.cpp)
-target_link_libraries(tent_xport_tcp PUBLIC tent_rpc tent_common)
+target_link_libraries(tent_xport_tcp PUBLIC tent_rpc tent_common tent_metrics)

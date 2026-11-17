@@ -55,6 +55,9 @@ class SegmentManager {
 
     Status closeRemote(SegmentID handle);
 
+    // The name a remote handle was opened with; empty if it is not open.
+    std::string remoteName(SegmentID handle);
+
     // Use `withCachedSegment()` when you want automatic
     // cache invalidation and retry on stale segment cache.
     Status getRemoteCached(SegmentDesc *&desc, SegmentID handle);
@@ -63,6 +66,11 @@ class SegmentManager {
     // (and raw pointers into it) alive independently of the thread-local
     // cache's lifetime.
     Status getRemoteCached(SegmentDescRef &desc, SegmentID handle);
+
+    // Never fetches: the desc any thread last fetched for an open handle, or
+    // InvalidEntry if none was fetched within the desc TTL. It may predate a
+    // segment update, so use it only to find what is already connected.
+    Status peekRemote(SegmentDescRef &desc, SegmentID handle);
 
     Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
 
@@ -134,6 +142,12 @@ class SegmentManager {
         }
         return res;
     }
+
+    // Runs `call` on the rpc_server_addr and returns an RPC failure as is,
+    // keeping the desc; a registry that can move the address is asked once.
+    Status withPeerRpcAddr(
+        SegmentID segment_id,
+        const std::function<Status(const std::string &)> &call);
 
    public:
     // Returns the current immutable snapshot of the local SegmentDesc.
@@ -241,6 +255,14 @@ class SegmentManager {
     const uint64_t manager_id_;
 
     ThreadLocalStorage<RemoteSegmentCache> tl_remote_cache_;
+
+    // What peekRemote() answers from, shared by every thread.
+    struct FetchedDesc {
+        SegmentDescRef desc;
+        uint64_t fetched_at = 0;
+    };
+    std::shared_mutex fetched_lock_;
+    std::unordered_map<SegmentID, FetchedDesc> fetched_;
 
     std::unique_ptr<SegmentRegistry> registry_;
 
