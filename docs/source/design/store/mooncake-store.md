@@ -85,95 +85,15 @@ Snapshots restore object runtime state only. Tenant quota policy is always loade
 
 ### Object Information Maintenance
 
-The Master Service needs to maintain mappings related to buffer allocators and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
+The Master tracks registered segments, their allocators, and the replica state of
+each object. A storage client registers memory with the Transfer Engine before
+mounting the segment on the Master. For writes, the client obtains replica
+locations from the Master, transfers the bytes, then completes or revokes the
+write. Readers query the Master for readable replica descriptors and use those
+descriptors to fetch the object.
 
-- MountSegment
-
-```C++
-tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
-                                          uint64_t size,
-                                          const std::string& segment_name);
-```
-
-The storage node (Client) registers the storage segment space with the Master Service.
-
-- UnmountSegment
-
-```C++
-tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
-```
-
-The storage node (Client) unregisters the storage segment space with the Master Service.
-
-The Master Service handles object-related interfaces as follows:
-
-- Put
-
-```C++
-    ErrorCode PutStart(const std::string& key,
-                       uint64_t value_length,
-                       const std::vector<uint64_t>& slice_lengths,
-                       const ReplicateConfig& config,
-                       std::vector<ReplicaInfo>& replica_list);
-
-    ErrorCode PutEnd(const std::string& key);
-```
-
-Before writing an object, the Client calls PutStart to request storage space allocation from the Master Service. After completing data writing, the Client calls PutEnd to notify the Master Service to mark the object write as completed.
-
-- Upsert
-
-```C++
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
-    const std::string& key,
-    const std::vector<size_t>& slice_lengths,
-    const ReplicateConfig& config);
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-BatchUpsertStart(const std::vector<std::string>& keys,
-                 const std::vector<std::vector<uint64_t>>& slice_lengths,
-                 const ReplicateConfig& config);
-
-tl::expected<void, ErrorCode> UpsertEnd(
-    const std::string& key, ReplicaType replica_type);
-
-std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-    const std::vector<std::string>& keys);
-
-tl::expected<void, ErrorCode> UpsertRevoke(
-    const std::string& key, ReplicaType replica_type);
-
-std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
-    const std::vector<std::string>& keys);
-```
-
-`UpsertStart` / `UpsertEnd` / `UpsertRevoke` mirror the existing put lifecycle
-but operate on insert-or-update semantics. If the key does not exist, the flow
-behaves like `PutStart`. If the key already exists, the Master may reuse the
-current allocation for an in-place update or allocate new space when the object
-layout changes. The batch variants provide the same control flow for multiple
-keys and are the lower-level primitives used by the high-level `BatchUpsert`
-path.
-
-- GetReplicaList
-
-```C++
-ErrorCode GetReplicaList(const std::string& key,
-                         std::vector<ReplicaInfo>& replica_list);
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
-GetReplicaListByRegex(const std::string& str);
-```
-
-The Client requests the Master Service to retrieve the replica list for a specified key or for all object keys matching a specified regular expression, allowing the Client to select an appropriate replica for reading based on this information.
-
-- Remove
-
-```C++
-tl::expected<void, ErrorCode> Remove(const std::string& key);
-tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
-```
-
-The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
+See {ref}`store-master-rpc` for the RPC signatures and
+operation semantics.
 
 ### Optional Object Groups
 
@@ -650,248 +570,196 @@ For Python, C++, and HTTP API signatures, parameter details, and usage examples,
 - [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md)
 - [Mooncake Store HTTP Service](../../api-reference/http/http-service.md)
 
+(store-master-rpc)=
 ### Master Service APIs
 
-The protobuf definition between Master and Client is as follows:
+The C++ Store client calls `WrappedMasterService` handlers over YLT
+`coro_rpc`, with arguments and results serialized by `struct_pack`.
+The signatures below are selected control-plane handlers. The full handler set
+is in [`rpc_service.h`](gh-file:mooncake-store/include/rpc_service.h) and
+[`RegisterRpcService`](gh-file:mooncake-store/src/rpc_service.cpp).
+Data transfers happen separately through the locations returned by the Master.
 
-```protobuf
-message BufHandle {
-  required uint64 segment_name = 1;  // Storage segment name (can be simply understood as the name of the storage node)
-  required uint64 size = 2;          // Size of the allocated space
-  required uint64 buffer = 3;        // Pointer to the allocated space
+A handler returning `tl::expected<T, ErrorCode>` returns either a value or a
+Store error. Batch query, Put, and Upsert handlers return one result per input
+in input order. For handlers that take a tenant, the default is `"default"`.
+When multi-tenancy is disabled, the Master resolves requests to that namespace.
 
-  enum BufStatus {
-    INIT = 0;          // Initial state, space reserved but not used
-    COMPLETE = 1;      // Completed usage, space contains valid data
-    FAILED = 2;        // Usage failed, upstream should update the handle state to this value
-    UNREGISTERED = 3;  // Space has been unregistered, metadata deleted
-  }
-  required BufStatus status = 4 [default = INIT]; // Space status
-};
+#### Replica queries
 
-message ReplicaInfo {
-  repeated BufHandle handles = 1; // Specific locations of the stored object data
+```cpp
+tl::expected<
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+    ErrorCode>
+GetReplicaListByRegex(const std::string& str,
+                      const std::string& tenant_id = "default");
 
-  enum ReplicaStatus {
-    UNDEFINED = 0;   // Uninitialized
-    INITIALIZED = 1; // Space allocated, waiting for write
-    PROCESSING = 2;  // Writing data in progress
-    COMPLETE = 3;    // Write completed, replica available
-    REMOVED = 4;     // Replica has been removed
-    FAILED = 5;      // Replica write failed, consider reallocation
-  }
-  required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status
-};
+tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+    const std::string& key, const std::string& tenant_id = "default");
 
-service MasterService {
-  // Get the list of replicas for an object
-  rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
-
-  // Get replica lists for objects matching a regex
-  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
-
-  // Batch query IP addresses for multiple client IDs
-  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
-
-  // Batch clear replicas for multiple object keys
-  rpc BatchReplicaClear(BatchReplicaClearRequest) returns (BatchReplicaClearResponse);
-
-  // Start Put operation, allocate storage space
-  rpc PutStart(PutStartRequest) returns (PutStartResponse);
-
-  // End Put operation, mark object write completion
-  rpc PutEnd(PutEndRequest) returns (PutEndResponse);
-
-  // Delete all replicas of an object
-  rpc Remove(RemoveRequest) returns (RemoveResponse);
-
-  // Remove objects matching a regex
-  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
-
-  // Storage node (Client) registers a storage segment
-  rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
-
-  // Storage node (Client) unregisters a storage segment
-  rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
-}
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+BatchGetReplicaList(const std::vector<std::string>& keys,
+                    const std::string& tenant_id = "default");
 ```
 
-1. GetReplicaList
+`GetReplicaList` returns readable replicas and grants a read lease.
+[`GetReplicaListResponse`](gh-file:mooncake-store/include/rpc_types.h)
+contains `replicas`, `lease_ttl_ms`, an optional `object_checksum`, and the
+compatible `resolved_tenant_id` field used to verify local-disk replicas under
+the correct tenant. Each
+[`Replica::Descriptor`](gh-file:mooncake-store/include/replica.h)
+contains a replica ID, status, and a location variant for memory, NoF, legacy
+disk, local disk, or DFS. `BatchGetReplicaList` returns the same response type
+per key.
 
-```protobuf
-message GetReplicaListRequest {
-  required string key = 1;
-};
+`GetReplicaListByRegex` searches keys in the resolved tenant using an
+ECMAScript regular expression. It returns a map of keys to readable replica
+descriptors and grants a lease for each returned key. The read-only
+`GetReplicaListForAdmin` and `BatchGetReplicaListForAdmin` variants query
+replicas without granting leases or triggering promotion.
 
-message GetReplicaListResponse {
-  required int32 status_code = 1;
-  repeated ReplicaInfo replica_list = 2; // List of replica information
-};
+#### Put and Upsert
+
+```cpp
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    const UUID& client_id, const std::string& key,
+    const uint64_t slice_length, const ReplicateConfig& config,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> PutEnd(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> PutRevoke(
+    const UUID& client_id, const std::string& key,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+              const std::vector<uint64_t>& slice_lengths,
+              const ReplicateConfig& config,
+              const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    const UUID& client_id, const std::string& key,
+    const uint64_t slice_length, const ReplicateConfig& config,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> UpsertEnd(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> UpsertRevoke(
+    const UUID& client_id, const std::string& key,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchUpsertStart(const UUID& client_id,
+                 const std::vector<std::string>& keys,
+                 const std::vector<uint64_t>& slice_lengths,
+                 const ReplicateConfig& config,
+                 const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id = "default");
 ```
 
-- **Request**: `GetReplicaListRequest` containing the key to query.
-- **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
-- **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
+`PutStart` allocates replicas and returns descriptors for the client to write.
+At this RPC boundary, `slice_length` is the total object size in bytes. The
+batch request carries one total per key. The client computes each total from
+its input slices before issuing the RPC.
 
-2. GetReplicaListByRegex
+For memory-only configurations, allocation can succeed with fewer replicas
+than requested if it finds at least one. For a flexible request with one
+memory and one NoF replica, either can satisfy the allocation requirement.
+Other requests involving NoF or DFS require the requested counts.
 
-```protobuf
-message GetReplicaListByRegexRequest {
-  required string key_regex = 1;
-};
+After transferring the data, the writer calls `PutEnd` with the key and optional
+checksum in [`ObjectMeta`](gh-file:mooncake-store/include/rpc_types.h).
+`replica_type` selects which replicas to complete. The `ALL` selector targets
+memory, NoF, and DFS write replicas. On failure, the writer can call
+`PutRevoke` to cancel pending replicas.
 
-message ObjectReplicaList {
-  repeated ReplicaInfo replica_list = 1;
-};
+Upsert uses the same start, transfer, and completion sequence. A missing key
+follows the insert path. An existing object can reuse its allocation when it
+is eligible for an in-place update. The Master can also allocate a replacement
+when the write needs a new allocation. `BatchUpsertEnd` and
+`BatchUpsertRevoke` use the `ALL` selector internally.
 
-message GetReplicaListByRegexResponse {
-  required int32 status_code = 1;
-  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
-};
+#### Removal
+
+```cpp
+tl::expected<void, ErrorCode> Remove(
+    const std::string& key, bool force = false,
+    const std::string& tenant_id = "default");
+
+tl::expected<long, ErrorCode> RemoveByRegex(
+    const std::string& str, bool force = false,
+    const std::string& tenant_id = "default");
 ```
 
-- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
-- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
-- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
+`Remove` removes the specified object and its replicas. `RemoveByRegex`
+searches keys in the resolved tenant and returns the number of objects removed.
+Setting `force=true` bypasses the lease check. Both operations still check
+replica completion and in-flight replication tasks.
 
-3. BatchQueryIp
+#### Segment registration
 
-```protobuf
-message BatchQueryIpRequest {
-  repeated UUID client_ids = 1; // List of client IDs to query
-};
+```cpp
+tl::expected<void, ErrorCode> MountSegment(
+    const Segment& segment, const UUID& client_id);
 
-message BatchQueryIpResponse {
-  required int32 status_code = 1;
-  map<UUID, IPAddressList> client_ip_map = 2; // Map from client ID to their IP address lists
-};
-
-message IPAddressList {
-  repeated string ip_addresses = 1; // List of unique IP addresses
-};
+tl::expected<void, ErrorCode> UnmountSegment(
+    const UUID& segment_id, const UUID& client_id);
 ```
 
-- **Request**: `BatchQueryIpRequest` containing a list of client IDs to query.
-- **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
-- **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
+After registering a memory region with the Transfer Engine, the storage client
+calls `MountSegment` with its client ID and a
+[`Segment`](gh-file:mooncake-store/include/types.h). The segment
+includes its UUID, logical name, base address, size, transport endpoint,
+protocol, host ID, and optional locality. `UnmountSegment` identifies the
+mounted resource by its segment UUID and client ID.
 
-4. BatchReplicaClear
+#### Batch maintenance
 
-```protobuf
-message BatchReplicaClearRequest {
-  repeated string object_keys = 1; // List of object keys to clear
-  required UUID client_id = 2;     // Client ID that owns the objects
-  optional string segment_name = 3; // Optional segment name. If empty, clears all segments
-};
+```cpp
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+BatchQueryIp(const std::vector<UUID>& client_ids);
 
-message BatchReplicaClearResponse {
-  required int32 status_code = 1;
-  repeated string cleared_keys = 2; // List of object keys that were successfully cleared
-};
+tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name,
+    const std::string& tenant_id = "default");
 ```
 
-- **Request**: `BatchReplicaClearRequest` containing a list of object keys to clear, the client ID that owns the objects, and an optional segment name. If `segment_name` is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If `segment_name` is provided, only replicas located on that specific segment are cleared.
-- **Response**: `BatchReplicaClearResponse` containing the status code `status_code` and a list of `cleared_keys` representing the object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are included in the result. Objects with active leases, incomplete replicas (when clearing all segments), or belonging to different clients are silently skipped.
-- **Description**: Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments, providing flexible storage resource management capabilities.
+`BatchQueryIp` returns the distinct IP addresses derived from each client's
+mounted segments. The response omits clients without matching segments.
 
-5. PutStart
-
-```protobuf
-message PutStartRequest {
-  required string key = 1;             // Object key
-  required int64 value_length = 2;     // Total length of data to be written
-  required ReplicateConfig config = 3; // Replica configuration information
-  repeated uint64 slice_lengths = 4;   // Lengths of each data slice
-};
-
-message PutStartResponse {
-  required int32 status_code = 1;
-  repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
-};
-```
-
-- **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
-- **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
-- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
-
-6. PutEnd
-
-```protobuf
-message PutEndRequest {
-  required string key = 1;
-};
-
-message PutEndResponse {
-  required int32 status_code = 1;
-};
-```
-
-- **Request**: `PutEndRequest` containing the key.
-- **Response**: `PutEndResponse` containing the status code status_code.
-- **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
-
-7. Remove
-
-```protobuf
-message RemoveRequest {
-  required string key = 1;
-};
-
-message RemoveResponse {
-  required int32 status_code = 1;
-};
-```
-
-- **Request**: `RemoveRequest` containing the key of the object to be deleted.
-- **Response**: `RemoveResponse` containing the status code `status_code`.
-- **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
-
-8. RemoveByRegex
-
-```protobuf
-message RemoveByRegexRequest {
-  required string key_regex = 1;
-};
-
-message RemoveByRegexResponse {
-  required int32 status_code = 1;
-  optional int64 removed_count = 2; // The number of objects removed.
-};
-```
-
-- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
-- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
-- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
-
-9. MountSegment
-
-```protobuf
-message MountSegmentRequest {
-  required uint64 buffer = 1;       // Starting address of the space
-  required uint64 size = 2;         // Size of the space
-  required string segment_name = 3; // Storage segment name
-}
-
-message MountSegmentResponse {
-  required int32 status_code = 1;
-};
-```
-
-The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
-
-10. UnmountSegment
-
-```protobuf
-message UnmountSegmentRequest {
-  required string segment_name = 1;  // Storage segment name used during mounting
-}
-
-message UnMountSegmentResponse {
-  required int32 status_code = 1;
-};
-```
-
-When the space needs to be released, this interface is used to remove the previously mounted resources from the Master Service.
+`BatchReplicaClear` returns the keys for which replica clearing succeeded.
+It checks that the client owns the object and that its lease has expired.
+An empty `segment_name` clears the entire object if all its replicas are
+complete. A nonempty name clears completed replicas on that segment.
 
 ---
 
