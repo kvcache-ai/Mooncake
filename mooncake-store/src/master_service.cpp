@@ -2489,7 +2489,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     }
                     const ReplicaID alloc_id = state.promotion_task->alloc_id;
                     const UUID holder_id = state.promotion_task->holder_id;
-                    ErasePromotionTaskIfPresent(accessor.QuotaAccount(), state);
+                    ErasePromotionTaskIfPresent(state);
                     if (alloc_id != 0) {
                         EraseReplicasWithCacheTotalAccounting(
                             metadata, [alloc_id](const Replica& replica) {
