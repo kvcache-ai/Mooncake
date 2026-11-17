@@ -16,6 +16,7 @@
 #include "client_buffer.h"
 #include "mutex.h"
 #include "common/result.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "file_storage.h"
 
 namespace mooncake {
@@ -26,6 +27,7 @@ namespace mooncake {
 enum IpcRequestType : uint32_t {
     IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
     IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
+    IPC_CUDA_REGISTER = 2,   // dummy → real: register a CUDA DMA-BUF fd
 };
 
 // Segment types for IPC_SHM_FD_REQUEST
@@ -125,6 +127,14 @@ struct ShmRegisterRequest {
     uint64_t shm_size;
     int32_t device_id = kInvalidPhysicalDeviceId;
     bool is_local_buffer;
+};
+
+// Payload for IPC_CUDA_REGISTER (accompanied by a DMA-BUF fd via SCM_RIGHTS).
+struct CudaRegisterRequest {
+    uint64_t client_id_first;
+    uint64_t client_id_second;
+    uint64_t dummy_addr;
+    CudaIpcBufferHandle handle;
 };
 
 // Payload for IPC_SHM_FD_REQUEST

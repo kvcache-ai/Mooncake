@@ -6,6 +6,7 @@
 
 #if defined(USE_CUDA)
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include "cuda_alike.h"
 #endif
@@ -166,6 +167,65 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
 #endif
 }
 
+tl::expected<int, ErrorCode> ExportCudaIpcDmabuf(
+    const CudaIpcBufferHandle &handle, const void *ptr) {
+#if defined(USE_CUDA)
+    if (ptr == nullptr || handle.size == 0) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto device = ResolveCudaDevice(handle);
+    if (!device) return tl::unexpected(device.error());
+
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess ||
+        cudaSetDevice(*device) != cudaSuccess) {
+        ClearCudaError();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto exported = [&]() -> tl::expected<int, ErrorCode> {
+        CUdeviceptr base = 0;
+        size_t allocation_size = 0;
+        if (GetCudaAllocationRange(&base, &allocation_size, (CUdeviceptr)ptr) !=
+                CUDA_SUCCESS ||
+            base == 0 || allocation_size == 0 ||
+            reinterpret_cast<uintptr_t>(ptr) < base ||
+            reinterpret_cast<uintptr_t>(ptr) - base != handle.offset ||
+            handle.offset > allocation_size ||
+            handle.size > allocation_size - handle.offset) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const long host_page_size = sysconf(_SC_PAGESIZE);
+        if (host_page_size <= 0) {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        const auto page_size = static_cast<size_t>(host_page_size);
+        if (allocation_size >
+            std::numeric_limits<size_t>::max() - (page_size - 1)) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const size_t export_size =
+            (allocation_size + page_size - 1) / page_size * page_size;
+        int fd = -1;
+        if (cuMemGetHandleForAddressRange(&fd, base, export_size,
+                                          CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                                          0) != CUDA_SUCCESS) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return fd;
+    }();
+    if (cudaSetDevice(current_device) != cudaSuccess) {
+        ClearCudaError();
+        if (exported) close(*exported);
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return exported;
+#else
+    (void)handle;
+    (void)ptr;
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+}
+
 tl::expected<void, ErrorCode> SynchronizeCudaStream(int32_t device_id,
                                                     uintptr_t stream_handle) {
 #if defined(USE_CUDA)
@@ -203,7 +263,8 @@ CudaIpcBufferMapping::CudaIpcBufferMapping(
     CudaIpcBufferMapping &&other) noexcept
     : base_(std::exchange(other.base_, nullptr)),
       ptr_(std::exchange(other.ptr_, nullptr)),
-      device_id_(std::exchange(other.device_id_, -1)) {}
+      device_id_(std::exchange(other.device_id_, -1)),
+      allocation_size_(std::exchange(other.allocation_size_, 0)) {}
 
 CudaIpcBufferMapping &CudaIpcBufferMapping::operator=(
     CudaIpcBufferMapping &&other) noexcept {
@@ -212,6 +273,7 @@ CudaIpcBufferMapping &CudaIpcBufferMapping::operator=(
         base_ = std::exchange(other.base_, nullptr);
         ptr_ = std::exchange(other.ptr_, nullptr);
         device_id_ = std::exchange(other.device_id_, -1);
+        allocation_size_ = std::exchange(other.allocation_size_, 0);
     }
     return *this;
 }
@@ -264,7 +326,7 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     }
 
     auto *ptr = static_cast<char *>(base) + handle.offset;
-    return CudaIpcBufferMapping(base, ptr, *resolved_device);
+    return CudaIpcBufferMapping(base, ptr, *resolved_device, allocation_size);
 #else
     (void)handle;
     return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -287,6 +349,7 @@ void CudaIpcBufferMapping::Close() {
     base_ = nullptr;
     ptr_ = nullptr;
     device_id_ = -1;
+    allocation_size_ = 0;
 }
 
 }  // namespace device

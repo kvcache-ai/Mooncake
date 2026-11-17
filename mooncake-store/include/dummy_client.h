@@ -5,6 +5,7 @@
 #include <atomic>
 #include <csignal>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
@@ -20,7 +21,10 @@ namespace mooncake {
 
 class DummyClient : public PyClient {
    public:
-    DummyClient();
+    // Explicit values override the environment; nullopt reads the existing
+    // MC_CUDA_IPC_PERSISTENT_REGISTRATION=1 opt-in (disabled by default).
+    explicit DummyClient(
+        std::optional<bool> cuda_ipc_persistent_registration = std::nullopt);
     // Drains in-flight RPCs before the pool member is released (#3909).
     ~DummyClient();
 
@@ -258,6 +262,12 @@ class DummyClient : public PyClient {
     bool is_registered_buffer(void *buffer, size_t size) const;
     int register_external_buffer(void *buffer, size_t size);
     int unregister_external_buffer(void *buffer);
+    std::optional<size_t> registered_cuda_buffer_remaining(void *buffer) const;
+    int register_cuda_via_ipc(uint64_t dummy_addr,
+                              const CudaIpcBufferHandle &handle);
+    int register_cuda_buffer(void *buffer, size_t size);
+    std::optional<int> unregister_cuda_buffer(void *buffer);
+    int reregister_cuda_buffers();
 #if defined(USE_ASCEND_DIRECT)
     std::optional<size_t> registered_ascend_buffer_remaining(
         void *buffer) const;
@@ -300,6 +310,19 @@ class DummyClient : public PyClient {
         BufferRegistrationMap &registrations, uintptr_t base);
     mutable std::mutex registered_external_buffers_mutex_;
     BufferRegistrationMap registered_external_buffers_;
+
+    struct CudaBufferRegistration {
+        size_t size = 0;
+        CudaIpcBufferHandle handle;
+        size_t references = 1;
+        // A failed RPC may have registered the allocation on the server. Keep
+        // its handle for an idempotent retry, but do not use it for transfers.
+        bool registered = false;
+    };
+    const bool cuda_ipc_persistent_registration_;
+    mutable std::mutex registered_cuda_buffers_mutex_;
+    std::unordered_map<uintptr_t, CudaBufferRegistration>
+        registered_cuda_buffers_;
 
     ErrorCode connect(const std::string &server_address);
 

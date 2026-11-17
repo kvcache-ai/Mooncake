@@ -21,6 +21,7 @@
 #include "client_buffer.h"
 #include "client_service.h"
 #include "device/cuda_ipc_buffer_handle.h"
+#include "device/cuda_ipc_buffer.h"
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
@@ -675,6 +676,13 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
+    tl::expected<void, ErrorCode> register_cuda_buffer_internal(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
+        const UUID &client_id);
+    tl::expected<void, ErrorCode> unregister_cuda_buffer_internal(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
+        const UUID &client_id);
+
     tl::expected<void, ErrorCode> ascend_shm_internal(
         uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
         const std::string &shareable_handle_bytes, int32_t device_id,
@@ -1252,7 +1260,16 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, PutSessionEntry> put_sessions;
     };
 
+    struct CudaRegisteredAllocation {
+        device::CudaIpcBufferMapping mapping;
+        bool registered = false;
+    };
+    struct CudaRegisteredBuffer {
+        CudaIpcBufferHandle handle;
+        std::shared_ptr<CudaRegisteredAllocation> allocation;
+    };
     struct ShmContext {
+        std::unordered_map<uint64_t, CudaRegisteredBuffer> cuda_buffers;
         std::shared_ptr<SessionState> sessions =
             std::make_shared<SessionState>();
         // Closed before cleanup; failed revocations retain this context for
@@ -1268,6 +1285,15 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+    // Protected by dummy_client_mutex_. Logical registrations share one MR
+    // and IPC mapping for each physical CUDA allocation, even across Dummies.
+    std::unordered_map<std::string, std::shared_ptr<CudaRegisteredAllocation>>
+        cuda_allocations_;
+    tl::expected<void, ErrorCode> unregister_cuda_buffer_locked(
+        ShmContext &context, uint64_t dummy_addr);
+    tl::expected<void, ErrorCode> register_cuda_buffer_with_fd(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
+        const UUID &client_id, int fd);
 
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
@@ -1399,6 +1425,7 @@ class RealClient : public PyClient {
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);
+    void handle_ipc_cuda_register(UdsConnection &connection);
     void handle_ipc_shm_fd_request(UdsConnection &connection);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);

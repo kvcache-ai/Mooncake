@@ -1350,6 +1350,23 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertIn("3", config_str)  # Should contain replica_num
 
 
+class TestDummyClientConfiguration(unittest.TestCase):
+    def test_setup_dummy_rejects_non_boolean_persistent_registration(self):
+        store = MooncakeDistributedStore()
+        try:
+            for value in (0, 1, 0.0, 1.0, "0", "1", "false", [], {}, object()):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        TypeError,
+                        "cuda_ipc_persistent_registration must be bool or None",
+                    ):
+                        store.setup_dummy(
+                            0, 0, "", cuda_ipc_persistent_registration=value
+                        )
+        finally:
+            store.close()
+
+
 class TestDummyClientCudaSessions(unittest.TestCase):
     """CUDA session ranges through a separately running RealClient daemon.
 
@@ -1360,9 +1377,12 @@ class TestDummyClientCudaSessions(unittest.TestCase):
         python3 -m unittest discover -s mooncake-wheel/tests \
         -p test_dummy_client.py -k TestDummyClientCudaSessions -v
 
-    Session fragments use DummyClient's registered SHM staging pool; they do
-    not use the separate CUDA IPC object-buffer fast path. Raw pointer callers
-    synchronize their producer stream before submitting session transfers.
+    Session fragments use DummyClient's registered SHM staging pool by default.
+    Set MC_CUDA_IPC_PERSISTENT_REGISTRATION=1 before creating the client to
+    exercise persistent CUDA IPC/MR registration. setup_dummy also accepts
+    cuda_ipc_persistent_registration=True/False to override the environment;
+    None preserves the environment fallback. Raw pointer callers synchronize
+    their producer stream before submitting session transfers.
     """
 
     @classmethod

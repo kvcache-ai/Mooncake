@@ -2584,10 +2584,23 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
-               size_t local_buffer_size, const std::string &server_address) {
+               size_t local_buffer_size, const std::string &server_address,
+               const py::object &cuda_ipc_persistent_registration) {
+                std::optional<bool> persistent_registration;
+                if (!cuda_ipc_persistent_registration.is_none()) {
+                    if (!py::isinstance<py::bool_>(
+                            cuda_ipc_persistent_registration)) {
+                        throw py::type_error(
+                            "cuda_ipc_persistent_registration must be bool or "
+                            "None");
+                    }
+                    persistent_registration =
+                        cuda_ipc_persistent_registration.cast<bool>();
+                }
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
-                self.store_ = std::make_shared<DummyClient>();
+                self.store_ =
+                    std::make_shared<DummyClient>(persistent_registration);
                 self.real_client_.reset();
                 resource_tracker.registerInstance(
                     std::static_pointer_cast<PyClient>(self.store_));
@@ -2597,7 +2610,16 @@ PYBIND11_MODULE(_store, m) {
                     "@mooncake_client_" + std::to_string(port) + ".sock");
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
-            py::arg("server_address"))
+            py::arg("server_address"),
+            py::arg("cuda_ipc_persistent_registration") = py::none(),
+            "Connect a DummyClient to a same-host RealClient daemon.\n"
+            "cuda_ipc_persistent_registration accepts bool or None: True "
+            "enables persistent CUDA IPC/MR registration, False retains the "
+            "existing staging behavior. None uses "
+            "MC_CUDA_IPC_PERSISTENT_REGISTRATION (only '1' enables it; "
+            "disabled when unset). Explicit values override the environment "
+            "without modifying it. Registration failures are returned as "
+            "errors rather than silently falling back to staging.")
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,

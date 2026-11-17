@@ -34,8 +34,13 @@ int Import(int fd) {
     if (!Transfer(fd, handle, false)) return 77;
     auto mapping = mooncake::device::CudaIpcBufferMapping::Open(handle);
     if (!mapping) return 2;
+    if (mapping->base() == nullptr || mapping->allocation_size() < kBytes ||
+        mapping->ptr() != static_cast<char *>(mapping->base()) + handle.offset)
+        return 5;
+    auto moved = std::move(*mapping);
+    if (mapping->base() != nullptr || mapping->allocation_size() != 0) return 6;
     std::array<unsigned char, kBytes> actual{};
-    if (cudaMemcpy(actual.data(), mapping->ptr(), actual.size(),
+    if (cudaMemcpy(actual.data(), moved.ptr(), actual.size(),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return 3;
     }
