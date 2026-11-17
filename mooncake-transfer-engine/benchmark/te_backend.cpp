@@ -517,9 +517,13 @@ int TEBenchRunner::allocateBuffers() {
     } else if (XferBenchConfig::seg_type == "VRAM") {
         int gpu_count = 0;
         auto err = cudaGetDeviceCount(&gpu_count);
-        if (err != cudaSuccess || gpu_count == 0) {
-            LOG(ERROR) << "No GPU available for --seg_type=VRAM: "
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "cudaGetDeviceCount failed: "
                        << cudaGetErrorString(err);
+            return -1;
+        }
+        if (gpu_count == 0) {
+            LOG(ERROR) << "No GPU available for --seg_type=VRAM";
             return -1;
         }
         int start_gpu = 0, num_buffers = gpu_count;
