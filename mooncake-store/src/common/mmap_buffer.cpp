@@ -1,4 +1,5 @@
 #include "common/client_buffer_allocation.h"
+#include "common.h"
 
 #include "config/hugepage_config.h"
 #include "config/mmap_arena_config.h"
@@ -87,9 +88,21 @@ size_t touch_thread_count(size_t page_count) {
 
 void touch_page_range(volatile char *data, size_t page_size, size_t begin_page,
                       size_t end_page, int numa_node) {
-    if (numa_node >= 0 && numa_run_on_node(numa_node) != 0) {
-        LOG(WARNING) << "Failed to bind HugeTLB population worker to NUMA node "
-                     << numa_node << ": " << std::strerror(errno);
+    if (numa_node >= 0) {
+        // numa_run_on_node() fills libnuma's per-node cpumask cache on first
+        // use, and these workers start together; see numaNodeCpuCacheMutex().
+        int rc;
+        int err;
+        {
+            std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+            rc = numa_run_on_node(numa_node);
+            err = errno;
+        }
+        if (rc != 0) {
+            LOG(WARNING)
+                << "Failed to bind HugeTLB population worker to NUMA node "
+                << numa_node << ": " << std::strerror(err);
+        }
     }
     for (size_t page = begin_page; page < end_page; ++page) {
         data[page * page_size] = 0;

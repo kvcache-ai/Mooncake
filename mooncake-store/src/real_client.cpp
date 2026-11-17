@@ -16,6 +16,7 @@
 #include <climits>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -1236,7 +1237,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
+            kWildcardLocation, client_->SupportsGatherRead(), true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
                        << toString(result.error());
@@ -1373,7 +1374,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && use_hugepage_;
+            (protocol == "rdma" || protocol == "efa") && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(
@@ -4776,8 +4777,11 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // segment. ShmHelper::allocate rounds the mapping up to hugepage
     // granularity, so the MR bounds must coincide with the mapping bounds;
     // otherwise madvise(MADV_DONTFORK) (active after ibv_fork_init) fails
-    // with EINVAL when the kernel has to split the hugetlb VMA. Sub-range
-    // registrations are not special-cased and behave exactly as before.
+    // with EINVAL when the kernel has to split the hugetlb VMA. An interior
+    // sub-range is passed through as given: the RDMA transport tries it as
+    // given first and widens it to its enclosing huge pages only if that is
+    // rejected with EINVAL (see RdmaTransport::registerLocalMemoryInternal),
+    // which also covers callers that never go through this function.
     // A zero-length request is left untouched so it keeps hitting the
     // existing length==0 rejection instead of being widened to the segment.
     size_t registration_size = size;
@@ -4792,8 +4796,11 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
-    auto result = client_->RegisterLocalMemory(buffer, registration_size,
-                                               kWildcardLocation, false, true);
+    // Gather reads are owner-initiated WRITEs. Publish Store output buffers
+    // on supported classic transports; TE's registration defaults stay intact.
+    auto result = client_->RegisterLocalMemory(
+        buffer, registration_size, kWildcardLocation,
+        client_->SupportsGatherRead(), true);
     if (!result) {
         return result;
     }
@@ -5377,10 +5384,29 @@ RealClient::get_into_ranges_internal(
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     struct ScatterLease {
         std::chrono::steady_clock::time_point expires_at;
+        std::unordered_map<ReplicaID, AllocatedBuffer::Descriptor> sources;
         std::optional<ErrorCode> error;
+        bool renewable = true;
     };
     std::unordered_map<std::string, ScatterLease> scatter_leases;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
+    std::vector<std::string> gather_endpoints;
+    std::vector<const ScatterLease *> transfer_leases;
+    auto append_memory_transfer =
+        [&](TransferEngine::ScatterTransferRange transfer,
+            const Replica::Descriptor &replica, ScatterLease &lease) {
+            if (allow_query_refresh) {
+                lease.sources.try_emplace(
+                    replica.id,
+                    replica.get_memory_descriptor().buffer_descriptor);
+            }
+            gather_endpoints.push_back(
+                buffer_capacities || client_->CanUseLocalMemcpy(replica)
+                    ? ""
+                    : transfer.remote_segment);
+            memory_transfers.push_back(std::move(transfer));
+            transfer_leases.push_back(&lease);
+        };
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
             continue;
@@ -5512,28 +5538,31 @@ RealClient::get_into_ranges_internal(
                         [results = &range_results, sizes = &sizes,
                          lease = &lease_it->second](size_t k,
                                                     const Status &status) {
-                            if (status.ok() && !lease->error.has_value() &&
-                                std::chrono::steady_clock::now() <
-                                    lease->expires_at) {
+                            const bool expired =
+                                std::chrono::steady_clock::now() >=
+                                lease->expires_at;
+                            if (status.ok() && !lease->error && !expired) {
                                 (*results)[k] =
                                     static_cast<int64_t>((*sizes)[k]);
                                 return;
                             }
                             const auto error = lease->error.value_or(
-                                status.ok() ? ErrorCode::LEASE_EXPIRED
-                                            : scatter_transfer_error(status));
+                                expired ? ErrorCode::LEASE_EXPIRED
+                                        : scatter_transfer_error(status));
                             (*results)[k] = tl::unexpected(error);
                         },
                 };
                 if (!StoreHcaAffinityEnabled() ||
                     metadata.query_result.replicas.size() == 1) {
-                    memory_transfers.push_back(std::move(transfer));
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica, lease_it->second);
                     continue;
                 }
                 auto candidates = FilterQueryResult(metadata.query_result,
                                                     metadata.replica, false);
                 if (candidates.replicas.size() == 1) {
-                    memory_transfers.push_back(std::move(transfer));
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica, lease_it->second);
                     continue;
                 }
                 Replica::Descriptor selected;
@@ -5570,7 +5599,8 @@ RealClient::get_into_ranges_internal(
                             size_t, const Status &status) {
                             complete(k, status);
                         };
-                    memory_transfers.push_back(std::move(fragment));
+                    append_memory_transfer(std::move(fragment), selected,
+                                           lease_it->second);
                 }
                 continue;
             }
@@ -5598,7 +5628,9 @@ RealClient::get_into_ranges_internal(
         auto delay = std::chrono::nanoseconds::max();
         for (const auto &[key, lease] : scatter_leases) {
             (void)key;
-            if (lease.error.has_value()) continue;
+            if (!lease.renewable || lease.error || now >= lease.expires_at) {
+                continue;
+            }
             const auto remaining =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     lease.expires_at - now);
@@ -5610,8 +5642,13 @@ RealClient::get_into_ranges_internal(
     auto refresh_leases = [&]() {
         std::vector<std::string> keys;
         keys.reserve(scatter_leases.size());
-        for (const auto &[key, lease] : scatter_leases)
-            if (!lease.error.has_value()) keys.push_back(key);
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto &[key, lease] : scatter_leases) {
+            if (lease.renewable && !lease.error && now < lease.expires_at) {
+                keys.push_back(key);
+            }
+        }
+        if (keys.empty()) return;
         auto refreshed = client_->BatchQuery(keys);
         for (size_t i = 0; i < refreshed.size(); ++i) {
             auto &lease = scatter_leases.at(keys[i]);
@@ -5619,12 +5656,138 @@ RealClient::get_into_ranges_internal(
                 lease.error = refreshed[i].error();
                 continue;
             }
-            lease.expires_at = refreshed[i]->lease_timeout;
+            // Only a query that still advertises the planned sources can
+            // renew them. A retired source keeps its original deadline.
+            lease.renewable =
+                std::chrono::steady_clock::now() < lease.expires_at &&
+                std::ranges::all_of(
+                    lease.sources,
+                    [&](const auto &source) {
+                        return std::ranges::any_of(
+                            refreshed[i]->replicas,
+                            [&](const Replica::Descriptor &replica) {
+                                if (replica.id != source.first ||
+                                    !replica.is_memory_replica()) {
+                                    return false;
+                                }
+                                const auto &buffer =
+                                    replica.get_memory_descriptor()
+                                        .buffer_descriptor;
+                                return buffer.buffer_address_ ==
+                                           source.second.buffer_address_ &&
+                                       buffer.transport_endpoint_ ==
+                                           source.second.transport_endpoint_ &&
+                                       buffer.size_ == source.second.size_ &&
+                                       buffer.protocol_ ==
+                                           source.second.protocol_;
+                            });
+                    });
+            if (lease.renewable) lease.expires_at = refreshed[i]->lease_timeout;
         }
     };
 
     // Planning may consume most of a short lease; renew before submission.
     if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
+    // Choose only compatible contiguous-output groups. Both ordinary and
+    // snapshot reads share this planner and preserve their lease semantics.
+    auto plans =
+        client_->SupportsGatherRead()
+            ? store::PlanGatherReads(memory_transfers, gather_endpoints)
+            : std::vector<store::GatherReadPlan>{};
+    std::vector<std::pair<size_t, store::GatherReadOperation>> gathered;
+    if (!plans.empty()) {
+        // The worker only uses the leases already valid at launch. If one
+        // expires while an earlier plan is submitted, leave it for scatter
+        // to recheck against the latest lease.
+        std::vector<std::chrono::steady_clock::time_point> submission_deadlines;
+        submission_deadlines.reserve(transfer_leases.size());
+        for (const auto *lease : transfer_leases) {
+            submission_deadlines.push_back(
+                lease->error ? std::chrono::steady_clock::time_point::min()
+                             : lease->expires_at);
+        }
+        // Discovery, pool contention and session negotiation can all block.
+        // Keep renewing every source lease, including earlier submissions,
+        // while one worker prepares and submits the plans.
+        auto submitting = std::async(std::launch::async, [&] {
+            for (size_t i = 0; i < plans.size(); ++i) {
+                const auto &plan = plans[i];
+                const auto now = std::chrono::steady_clock::now();
+                if (std::ranges::any_of(plan.transfers, [&](size_t index) {
+                        return now >= submission_deadlines[index];
+                    })) {
+                    continue;
+                }
+                auto operation = client_->SubmitGatherRead(
+                    plan.endpoint, plan.ranges, plan.destination, plan.bytes);
+                if (operation) gathered.emplace_back(i, std::move(*operation));
+            }
+        });
+        if (allow_query_refresh) {
+            while (true) {
+                const auto delay = next_refresh_delay();
+                if (delay == std::chrono::nanoseconds::max() ||
+                    submitting.wait_for(delay) == std::future_status::ready)
+                    break;
+                refresh_leases();
+            }
+        }
+        submitting.get();
+    }
+    std::vector<bool> handled(memory_transfers.size(), false);
+    for (auto &[index, operation] : gathered) {
+        store::GatherReadResult result;
+        do {
+            auto delay = allow_query_refresh ? next_refresh_delay()
+                                             : std::chrono::nanoseconds::max();
+            result =
+                delay == std::chrono::nanoseconds::max()
+                    ? operation.wait()
+                    : operation.waitFor(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              delay));
+            if (result.completion == store::GatherReadCompletion::Pending)
+                refresh_leases();
+        } while (result.completion == store::GatherReadCompletion::Pending);
+        // Rejection guarantees no writes: unsupported/busy owners safely use
+        // scatter. A submitted, drained failure must not silently retry.
+        if (result.rejected()) continue;
+        for (size_t i : plans[index].transfers) {
+            handled[i] = true;
+            const auto &transfer = memory_transfers[i];
+            const auto failure = Status::Socket(result.error);
+            for (size_t k = 0; k < transfer.lengths.size(); ++k) {
+                const auto offset =
+                    reinterpret_cast<uintptr_t>(transfer.local_buffer) +
+                    transfer.local_offsets[k] -
+                    reinterpret_cast<uintptr_t>(plans[index].destination);
+                transfer.on_fragment_complete(
+                    k, result.completedRange(offset, transfer.lengths[k])
+                           ? Status::OK()
+                           : failure);
+            }
+        }
+    }
+    size_t retained = 0;
+    for (size_t i = 0; i < memory_transfers.size(); ++i) {
+        if (handled[i]) continue;
+        const auto &lease = *transfer_leases[i];
+        if (lease.error ||
+            std::chrono::steady_clock::now() >= lease.expires_at) {
+            const auto &transfer = memory_transfers[i];
+            const auto failure =
+                Status::InvalidArgument("Read lease expired before submission");
+            for (size_t k = 0; k < transfer.lengths.size(); ++k) {
+                transfer.on_fragment_complete(k, failure);
+            }
+            continue;
+        }
+        if (retained != i)
+            memory_transfers[retained] = std::move(memory_transfers[i]);
+        ++retained;
+    }
+    memory_transfers.resize(retained);
+    if (memory_transfers.empty()) return results;
     auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =

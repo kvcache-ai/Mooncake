@@ -6,6 +6,7 @@
 #include <msgpack.hpp>
 #include <zmq.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <endian.h>
@@ -161,10 +162,12 @@ void KvEventPublisher::PublishTransition(std::string_view object_key,
         return;
     }
     const std::string normalized_tenant = NormalizeTenant(tenant_id);
-    bool was_empty = false;
+    bool notify = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        was_empty = queue_.empty();
+        const size_t previous_size = queue_.size();
+        notify = previous_size == 0 ||
+                 (stored_mask & (kMediumCpu | kMediumDisk)) != 0;
         if ((removed_mask & kMediumCpu) != 0) {
             PushEventLocked(
                 PendingEvent{EventKind::kRemoved, std::string(object_key),
@@ -187,8 +190,10 @@ void KvEventPublisher::PublishTransition(std::string_view object_key,
                              "disk", normalized_tenant, std::string(group_id),
                              std::string(session_id)});
         }
+        notify = notify || (previous_size < kMaxBatchSize &&
+                            queue_.size() >= kMaxBatchSize);
     }
-    if (was_empty) {
+    if (notify) {
         queue_cv_.notify_one();
     }
 }
@@ -197,16 +202,12 @@ void KvEventPublisher::PublishCleared(std::string_view tenant_id) {
     if (!config_.enabled) {
         return;
     }
-    bool was_empty = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        was_empty = queue_.empty();
         PushEventLocked(PendingEvent{EventKind::kCleared, "", "",
                                      NormalizeTenant(tenant_id), ""});
     }
-    if (was_empty) {
-        queue_cv_.notify_one();
-    }
+    queue_cv_.notify_one();
 }
 
 bool KvEventPublisher::PublishClearedIfUnchanged(
@@ -215,19 +216,15 @@ bool KvEventPublisher::PublishClearedIfUnchanged(
     if (!config_.enabled) {
         return epoch.load(std::memory_order_acquire) == expected_epoch;
     }
-    bool was_empty = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (epoch.load(std::memory_order_acquire) != expected_epoch) {
             return false;
         }
-        was_empty = queue_.empty();
         PushEventLocked(PendingEvent{EventKind::kCleared, "", "",
                                      NormalizeTenant(tenant_id), ""});
     }
-    if (was_empty) {
-        queue_cv_.notify_one();
-    }
+    queue_cv_.notify_one();
     return true;
 }
 
@@ -275,6 +272,25 @@ void KvEventPublisher::WorkerLoop() {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cv_.wait(lock,
                            [this] { return stop_.load() || !queue_.empty(); });
+            if (!queue_.empty() && queue_.front().kind == EventKind::kRemoved &&
+                config_.removal_batch_timeout_us > 0) {
+                // Keep one FIFO for all mutations: delaying removals outside
+                // this queue could retract a later same-key Stored event.
+                // The deadline is fixed for this batch, not reset on arrivals.
+                const auto deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(config_.removal_batch_timeout_us);
+                queue_cv_.wait_until(lock, deadline, [this] {
+                    // The scan is bounded by kMaxBatchSize. Control events
+                    // bypass the delay even when followed by more removals.
+                    return stop_.load() || queue_.size() >= kMaxBatchSize ||
+                           std::any_of(queue_.begin(), queue_.end(),
+                                       [](const PendingEvent& event) {
+                                           return event.kind !=
+                                                  EventKind::kRemoved;
+                                       });
+                });
+            }
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();
