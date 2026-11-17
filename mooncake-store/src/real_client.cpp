@@ -1075,6 +1075,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
+    dummy_read_drain_ = RpcDrainGuard{};
 
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
@@ -1926,6 +1927,12 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    // Count queued reads before post(), not only workers already holding SHM.
+    // Their post completion resumes inline, so this does not need a live
+    // caller RPC executor to finish draining.
+    while (!dummy_read_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(WARNING) << "Waiting for queued dummy reads during teardown";
+    }
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
@@ -6492,49 +6499,47 @@ RealClient::batch_get_into_dummy_helper(
     const std::vector<uint64_t> &dummy_buffers,
     const std::vector<size_t> &sizes, int32_t device_id,
     const UUID &client_id) {
-    // Hold shared_lock for the entire operation to prevent SHM from being
-    // unmapped while batch_get_into_internal is using the translated buffers.
-    auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(
-        dummy_client_mutex_);
-    auto it = shm_contexts_.find(client_id);
-    if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+    RpcDrainGuard::ScopedCall inflight(dummy_read_drain_);
+    if (!inflight.ok()) {
         co_return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    auto &context = it->second;
-
-    auto buffers_result =
-        map_dummy_addrs_to_real_ptrs(context, dummy_buffers, sizes, client_id);
-    if (!buffers_result) {
-        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(buffers_result.error()));
-    }
-
-    // Run batch_get_into_internal (which may block on offload RPC + SSD I/O)
-    // on a dedicated thread pool so the coro_rpc IO thread stays free for ping.
-    //
-    // Pack everything the worker-thread call needs into a single heap-owned
-    // state object so the lambda captures only a raw pointer (trivially
-    // copyable, trivially destructible). Avoids GCC 11 coroutine + coro_io
-    // double-destruction interactions when non-trivial captures end up in
-    // both the OUTER coroutine frame and the post_helper chain.
+    // Translate and read under a lock owned by the worker. A shared_mutex
+    // must be unlocked on the same thread that acquired it.
     struct CallState {
         std::vector<std::string> keys;
         std::vector<size_t> sizes;
-        std::vector<void *> buffers;
-        std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+        std::vector<uint64_t> dummy_buffers;
+        UUID client_id;
         int32_t device_id;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
-    state->buffers = std::move(buffers_result.value());
-    state->lock = std::move(lock);
+    state->dummy_buffers = dummy_buffers;
+    state->client_id = client_id;
     state->device_id = device_id;
 
     auto *s = state.get();
     auto try_result = co_await coro_io::post([this, s]() {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (closed_.load(std::memory_order_acquire)) {
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                s->keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        auto it = shm_contexts_.find(s->client_id);
+        if (it == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << s->client_id
+                       << ", error=shm_not_mapped";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                s->keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        auto buffers = map_dummy_addrs_to_real_ptrs(
+            it->second, s->dummy_buffers, s->sizes, s->client_id);
+        if (!buffers) {
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                s->keys.size(), tl::unexpected(buffers.error()));
+        }
 #ifdef USE_ASCEND_DIRECT
         auto context_result =
             set_context_if_needed(protocol, s->device_id, "batch_get worker");
@@ -6543,7 +6548,7 @@ RealClient::batch_get_into_dummy_helper(
                 s->keys.size(), tl::unexpected(context_result.error()));
         }
 #endif
-        return batch_get_into_internal(s->keys, s->buffers, s->sizes);
+        return batch_get_into_internal(s->keys, *buffers, s->sizes);
     });
     co_return try_result.value();
 }
