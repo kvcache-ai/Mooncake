@@ -331,11 +331,15 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    // rdma_stager may retain registered device slices for TENT RDMA clients
+    // writing ordinary memory replicas. Pointers without a TENT route are
+    // passed through the full host stager before transfer submission.
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager,
-        bool group_by_target = false);
+        bool group_by_target = false,
+        const WriteBufferStager& rdma_stager = {});
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -414,7 +418,8 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager,
-        bool group_by_target = false);
+        bool group_by_target = false,
+        const WriteBufferStager& rdma_stager = {});
 
     /**
      * @brief Removes an object and all its replicas
@@ -1139,8 +1144,12 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
-    void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
-                                            const WriteBufferStager& stager);
+    void StageWriteBuffersForRemoteReplicas(
+        std::vector<PutOperation>& ops, const WriteBufferStager& stager,
+        const WriteBufferStager& rdma_stager);
+
+    bool CanTransferDeviceWriteSlices(const PutOperation& op,
+                                      const std::vector<Slice>& slices);
     void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);

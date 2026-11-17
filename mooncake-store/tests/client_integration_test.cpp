@@ -1161,6 +1161,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
 
 TEST_F(ClientIntegrationTest, BatchWriteStagesActualNonLocalAllocation) {
     size_t stage_calls = 0;
+    size_t rdma_stage_calls = 0;
     std::vector<std::pair<void*, size_t>> staged_allocations;
     Client::WriteBufferStager stager = [&](const std::vector<Slice>& slices)
         -> tl::expected<std::vector<Slice>, ErrorCode> {
@@ -1182,12 +1183,19 @@ TEST_F(ClientIntegrationTest, BatchWriteStagesActualNonLocalAllocation) {
         ++stage_calls;
         return staged_slices;
     };
+    Client::WriteBufferStager rdma_stager =
+        [&](const std::vector<Slice>& slices) {
+            ++rdma_stage_calls;
+            return stager(slices);
+        };
     auto write = [&](const std::string& key, std::string& value,
                      const ReplicateConfig& config, bool upsert) {
         std::vector<std::string> keys{key};
         std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
-        return upsert ? test_client_->BatchUpsert(keys, slices, config, stager)
-                      : test_client_->BatchPut(keys, slices, config, stager);
+        return upsert ? test_client_->BatchUpsert(keys, slices, config, stager,
+                                                  false, rdma_stager)
+                      : test_client_->BatchPut(keys, slices, config, stager,
+                                               false, rdma_stager);
     };
 
     ReplicateConfig config;
@@ -1224,6 +1232,11 @@ TEST_F(ClientIntegrationTest, BatchWriteStagesActualNonLocalAllocation) {
     ++expected_stage_calls;
     EXPECT_EQ(stage_calls, expected_stage_calls);
 
+    EXPECT_EQ(
+        rdma_stage_calls,
+        FLAGS_protocol == "rdma" && !test_client_->HasClassicTransport("rdma")
+            ? expected_stage_calls
+            : 0);
     EXPECT_TRUE(test_client_->Remove("batch_write_actual_local", true));
     EXPECT_TRUE(test_client_->Remove("batch_write_actual_remote", true));
     for (const auto& [ptr, size] : staged_allocations) {

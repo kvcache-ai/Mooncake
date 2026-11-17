@@ -1395,6 +1395,9 @@ TEST_F(MemFabricTransportTest, QueryErrorPreservesPending) {
     EXPECT_FALSE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
     EXPECT_EQ(InflightCount(), 1u);
+    bool drained = true;
+    EXPECT_FALSE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_FALSE(drained);
     SetQueryResult(SM_OK, -777);
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
@@ -1503,6 +1506,9 @@ TEST_F(MemFabricTransportTest, InvalidParamMapsToInvalid) {
     TransferStatus status{};
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::INVALID);
+    bool drained = false;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_TRUE(drained);
 
     auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch_);
     ASSERT_NE(mf_batch, nullptr);

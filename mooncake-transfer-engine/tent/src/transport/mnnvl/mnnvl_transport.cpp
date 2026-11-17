@@ -768,6 +768,27 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+Status MnnvlTransport::isSubBatchDrained(SubBatchRef batch, bool &drained) {
+    drained = false;
+    auto *mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
+    if (!mnnvl_batch)
+        return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+    std::lock_guard<std::mutex> lock(mnnvl_batch->mutex);
+    // Error cleanup may itself fail. Completion-group status alone cannot
+    // prove that the stream has stopped accessing accepted copies' buffers.
+    if (auto stream = mnnvl_batch->async_stream.get()) {
+        MnnvlDeviceGuard guard(mnnvl_batch->stream_device_id);
+        CHECK_CUDA(guard.error());
+        auto result = cudaStreamQuery(stream);
+        if (result == cudaErrorNotReady) return Status::OK();
+        if (result != cudaSuccess)
+            return Status::InternalError(std::string("cudaStreamQuery: ") +
+                                         cudaGetErrorString(result) + LOC_MARK);
+    }
+    drained = true;
+    return Status::OK();
+}
+
 Status MnnvlTransport::ensureCudaContext() {
     CUcontext context = nullptr;
     auto result = cuCtxGetCurrent(&context);

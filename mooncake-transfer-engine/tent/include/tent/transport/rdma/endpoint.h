@@ -129,7 +129,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     Status accept(const BootstrapDesc& peer_desc, BootstrapDesc& local_desc);
 
     EndPointStatus status() const {
-        return status_.load(std::memory_order_relaxed);
+        return status_.load(std::memory_order_acquire);
     }
 
     std::vector<uint32_t> qpNum();

@@ -36,6 +36,9 @@
 #include "transfer_engine.h"
 #include "topology.h"
 #include "transfer_task.h"
+#ifdef USE_TENT
+#include "tent/transfer_engine.h"
+#endif
 #include "transport/transport.h"
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
@@ -3680,8 +3683,44 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
+bool Client::CanTransferDeviceWriteSlices(const PutOperation& op,
+                                          const std::vector<Slice>& slices) {
+#ifdef USE_TENT
+    auto engine = transfer_engine_->getTentEngine();
+    auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (std::none_of(slices.begin(), slices.end(), [&](const Slice& slice) {
+            return slice.size && accelerators.FindDeviceForPointer(slice.ptr);
+        }))
+        return true;
+    for (const auto& replica : op.replicas) {
+        if (CanUseLocalMemcpy(replica)) continue;
+        const auto& buffer = replica.get_memory_descriptor().buffer_descriptor;
+        tent::SegmentID segment;
+        if (!engine->openSegment(segment, buffer.transport_endpoint_).ok())
+            return false;
+        uint64_t offset = buffer.buffer_address_;
+        for (const auto& slice : slices) {
+            if (slice.size && accelerators.FindDeviceForPointer(slice.ptr)) {
+                tent::Request request;
+                request.opcode = tent::Request::WRITE;
+                request.source = slice.ptr;
+                request.target_id = segment;
+                request.target_offset = offset;
+                request.length = slice.size;
+                if (!engine->canTransfer(request)) return false;
+            }
+            offset += slice.size;
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 void Client::StageWriteBuffersForRemoteReplicas(
-    std::vector<PutOperation>& ops, const WriteBufferStager& stager) {
+    std::vector<PutOperation>& ops, const WriteBufferStager& stager,
+    const WriteBufferStager& rdma_stager) {
     if (!stager) return;
 
     for (auto& op : ops) {
@@ -3692,14 +3731,35 @@ void Client::StageWriteBuffersForRemoteReplicas(
                         })) {
             continue;
         }
-        auto staged_slices = stager(op.slices);
+        // Ordinary memory descriptors currently default to "tcp" even for
+        // RDMA-mounted segments, so they cannot identify the network route.
+        // Probe retained device pointers before submitting any transfer: TENT
+        // may have neither direct RDMA nor an enabled device staging route.
+        // Classic transports and non-memory replicas keep full host staging.
+        const bool use_rdma_stager =
+            rdma_stager && protocol_ == "rdma" && transfer_engine_ &&
+            transfer_engine_->isUsingTent() &&
+            std::all_of(op.replicas.begin(), op.replicas.end(),
+                        [](const Replica::Descriptor& replica) {
+                            return replica.is_memory_replica() &&
+                                   replica.get_memory_descriptor()
+                                           .buffer_descriptor.protocol_ !=
+                                       "cxl";
+                        });
+        auto staged_slices =
+            (use_rdma_stager ? rdma_stager : stager)(op.slices);
+        if (staged_slices && use_rdma_stager &&
+            !CanTransferDeviceWriteSlices(op, *staged_slices)) {
+            staged_slices = stager(*staged_slices);
+        }
         if (!staged_slices) {
             op.SetError(staged_slices.error(),
                         "Failed to stage non-local write buffers");
             continue;
         }
         op.slices = std::move(*staged_slices);
-        VLOG(1) << "Staged write buffers for non-local replica, key=" << op.key;
+        VLOG(1) << "Prepared write buffers for non-local replica, key="
+                << op.key;
     }
 }
 
@@ -3714,7 +3774,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager,
-    bool group_by_target) {
+    bool group_by_target, const WriteBufferStager& rdma_stager) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3733,7 +3793,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         }
     }
     StartBatchPut(ops, client_cfg);
-    StageWriteBuffersForRemoteReplicas(ops, stager);
+    StageWriteBuffersForRemoteReplicas(ops, stager, rdma_stager);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops,
@@ -3764,7 +3824,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager,
-    bool group_by_target) {
+    bool group_by_target, const WriteBufferStager& rdma_stager) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3784,7 +3844,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     StartBatchUpsert(ops, client_cfg);
-    StageWriteBuffersForRemoteReplicas(ops, stager);
+    StageWriteBuffersForRemoteReplicas(ops, stager, rdma_stager);
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops,
                     group_by_target || client_cfg.prefer_alloc_in_same_node);

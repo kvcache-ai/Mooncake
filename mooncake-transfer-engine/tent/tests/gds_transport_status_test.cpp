@@ -33,6 +33,8 @@ size_t handle_register_call_count = 0;
 size_t handle_deregister_call_count = 0;
 size_t failed_handle_register_count = 0;
 size_t batch_submit_call_count = 0;
+size_t failed_batch_submit_count = 0;
+size_t failed_status_query_count = 0;
 size_t buf_register_call_count = 0;
 size_t buf_deregister_call_count = 0;
 
@@ -49,6 +51,12 @@ extern "C" CUfileError_t __wrap_cuFileBatchIOGetStatus(CUfileBatchHandle_t,
                                                        unsigned* num_events,
                                                        CUfileIOEvents_t* events,
                                                        timespec*) {
+    if (failed_status_query_count > 0) {
+        --failed_status_query_count;
+        CUfileError_t result{};
+        result.err = CU_FILE_INTERNAL_ERROR;
+        return result;
+    }
     const auto count = std::min<size_t>(*num_events, reported_events.size());
     std::copy_n(reported_events.begin(), count, events);
     *num_events = static_cast<unsigned>(count);
@@ -70,6 +78,11 @@ extern "C" CUfileError_t __wrap_cuFileBatchIOSubmit(CUfileBatchHandle_t,
                                                     unsigned) {
     ++batch_submit_call_count;
     CUfileError_t result{};
+    if (failed_batch_submit_count > 0) {
+        --failed_batch_submit_count;
+        result.err = CU_FILE_INTERNAL_ERROR;
+        return result;
+    }
     result.err = CU_FILE_SUCCESS;
     return result;
 }
@@ -234,12 +247,37 @@ TEST(GdsTransportStatusTest, CancellationDoesNotMaskOriginalFailure) {
     ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
     EXPECT_EQ(status.s, PENDING);
     EXPECT_EQ(batch.io_param_ranges[0].known_failure, INVALID);
+    bool drained = true;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
 
     reported_events = {makeEvent(CUFILE_INVALID, 0, 0),
                        makeEvent(CUFILE_CANCELED, 0, 1)};
     ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
     EXPECT_EQ(status.s, INVALID);
     EXPECT_EQ(cancel_call_count, 1);
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+}
+
+TEST(GdsTransportStatusTest, QueryFailureDoesNotConfirmDrain) {
+    GdsTransport transport;
+    GdsSubBatch batch;
+    BatchHandle batch_handle{};
+    batch.batch_handle = &batch_handle;
+    batch.io_params.resize(1);
+    batch.io_events.resize(1);
+    batch.cached_events = {makeEvent(CUFILE_PENDING)};
+    batch.io_param_ranges.push_back(IOParamRange{0, 1, 0, PENDING, PENDING});
+    failed_status_query_count = 1;
+
+    bool drained = true;
+    EXPECT_FALSE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+
+    reported_events = {makeEvent(CUFILE_INVALID)};
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
 }
 
 TEST(GdsTransportStatusTest, ReusesHandleOnlyAfterWholeBatchIsTerminal) {
@@ -396,6 +434,84 @@ TEST(GdsTransportStatusTest, FailurePrecedenceIsCompletionOrderIndependent) {
         {makeEvent(CUFILE_FAILED), makeEvent(CUFILE_CANCELED)}, all_terminal);
     EXPECT_EQ(second.s, FAILED);
     EXPECT_TRUE(all_terminal);
+}
+
+TEST(GdsTransportStatusTest, RejectedSubmissionPreservesOnlyAcceptedIOs) {
+    char path[] = "/tmp/tent-gds-submit-rollback-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(close(fd), 0);
+
+    GdsTransport transport;
+    std::string local_segment_name = "gds-submit-rollback";
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+    ASSERT_NE(GdsTransportTestPeer::getOrCreate(transport, 104, path), nullptr);
+    ASSERT_EQ(unlink(path), 0);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.target_id = 104;
+    // Two slices per task keep task and slice rollback offsets distinct.
+    request.length = (16ull << 20) + 1;
+
+    auto check_submission = [&](bool accepted_prefix, bool native_rejection) {
+        SCOPED_TRACE(::testing::Message()
+                     << "accepted_prefix=" << accepted_prefix
+                     << ", native_rejection=" << native_rejection);
+        GdsSubBatch batch;
+        BatchHandle batch_handle{};
+        batch.batch_handle = &batch_handle;
+        batch.io_params.reserve(8);
+        batch.cached_events.reserve(8);
+        batch.io_events.resize(8);
+        if (accepted_prefix)
+            ASSERT_TRUE(transport.submitTransferTasks(&batch, {request}).ok());
+        const size_t prefix_size = batch.size();
+        const size_t prefix_params = batch.io_params.size();
+        const size_t submits = batch_submit_call_count;
+        auto second = request;
+        if (native_rejection)
+            failed_batch_submit_count = 1;
+        else
+            second.target_id = 105;
+
+        EXPECT_FALSE(
+            transport.submitTransferTasks(&batch, {request, second}).ok());
+        EXPECT_EQ(batch_submit_call_count, submits + native_rejection);
+        ASSERT_EQ(batch.size(), prefix_size);
+        ASSERT_EQ(batch.io_params.size(), prefix_params);
+        ASSERT_EQ(batch.cached_events.size(), prefix_params);
+        ASSERT_EQ(batch.file_contexts.size(), prefix_size);
+        reported_events.clear();
+        bool drained = true;
+        ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+        EXPECT_EQ(drained, !accepted_prefix);
+
+        ASSERT_TRUE(
+            transport.submitTransferTasks(&batch, {request, request}).ok());
+        ASSERT_EQ(batch.size(), prefix_size + 2);
+        for (size_t i = 0; i < batch.io_params.size(); ++i) {
+            EXPECT_EQ(batch.io_params[i].cookie,
+                      reinterpret_cast<void*>(i + 1));
+            reported_events.push_back(
+                makeEvent(CUFILE_COMPLETE, batch.io_params[i].u.batch.size, i));
+        }
+        if (accepted_prefix) {
+            reported_events[0] = makeEvent(CUFILE_PENDING);
+            ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+            EXPECT_FALSE(drained);
+            reported_events[0] =
+                makeEvent(CUFILE_COMPLETE, batch.io_params[0].u.batch.size);
+        }
+        ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+        EXPECT_TRUE(drained);
+    };
+    for (bool accepted_prefix : {false, true})
+        for (bool native_rejection : {false, true})
+            check_submission(accepted_prefix, native_rejection);
 }
 
 #ifdef USE_XPU_GDS

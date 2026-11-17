@@ -734,7 +734,32 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
     auto* task = rdma_batch->task_list[task_id];
-    status = TransferStatus{task->status_word, task->transferred_bytes};
+    status = TransferStatus{
+        __atomic_load_n(&task->status_word, __ATOMIC_ACQUIRE),
+        __atomic_load_n(&task->transferred_bytes, __ATOMIC_RELAXED)};
+    return Status::OK();
+}
+
+Status RdmaTransport::isSubBatchDrained(SubBatchRef batch, bool& drained) {
+    CHECK_STATUS(Transport::isSubBatchDrained(batch, drained));
+    if (!drained) return Status::OK();
+    drained = false;
+    auto* rdma_batch = static_cast<RdmaSubBatch*>(batch);
+    for (auto* head : rdma_batch->slice_chain) {
+        for (auto* slice = head; slice; slice = slice->next) {
+            // TIMEOUT can precede QP teardown. A handled completion or a
+            // destroyed endpoint confirms that the WR no longer uses memory.
+            // QP destruction can discard CQEs while another thread still
+            // holds a shared endpoint reference.
+            if (slice->completions_owed.load(std::memory_order_acquire) != 0) {
+                auto endpoint = slice->ep_weak_ptr.lock();
+                if (endpoint &&
+                    endpoint->status() != RdmaEndPoint::EP_DESTROYED)
+                    return Status::OK();
+            }
+        }
+    }
+    drained = true;
     return Status::OK();
 }
 

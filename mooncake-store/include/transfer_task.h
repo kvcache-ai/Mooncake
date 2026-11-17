@@ -248,12 +248,14 @@ class FilereadOperationState : public OperationState {
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+                                 size_t batch_size,
+                                 int64_t timeout_milliseconds = 60 * 1000)
         : engine_(engine),
           tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
-          start_ts_(getCurrentTimeInMilli()) {}
+          start_ts_(getCurrentTimeInMilli()),
+          timeout_milliseconds_(timeout_milliseconds) {}
 
     ~TransferEngineOperationState();
 
@@ -267,11 +269,15 @@ class TransferEngineOperationState : public OperationState {
 
    private:
     /**
-     * @brief Check the current completion status of the task, make sure to lock
-     * the mutex before calling this function.
-     * Updates the internal state and returns true if the task is completed.
+     * @brief Check task status and update the result. The caller must hold
+     * mutex_.
      */
     void check_task_status();
+
+#ifdef USE_TENT
+    void cancel_tent_transfers();
+    void check_tent_task_status();
+#endif
 
     void set_result_internal(ErrorCode error_code);
 
@@ -280,6 +286,8 @@ class TransferEngineOperationState : public OperationState {
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    const int64_t timeout_milliseconds_;
+    bool tent_failure_ = false;
 };
 
 /**

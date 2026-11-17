@@ -5658,6 +5658,46 @@ TEST_F(RdmaSliceOrphanTest, AFreedBatchReturnsASettledSliceStraightAway) {
     EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
 }
 
+TEST_F(RdmaSliceOrphanTest, TerminalTimeoutDoesNotConfirmPhysicalDrain) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0,
+                            /*signaled=*/false);
+    RdmaSubBatch batch;
+    batch.task_list.push_back(slice->task);
+    batch.slice_chain.push_back(slice);
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(
+        *workers_, RdmaTransportTestPeer::workerContext(*workers_, 0),
+        /*now_ns=*/2'000'000);
+    TransferStatus status;
+    ASSERT_TRUE(transport_.getTransferStatus(&batch, 0, status).ok());
+    ASSERT_EQ(status.s, TIMEOUT);
+    bool drained = true;
+    ASSERT_TRUE(transport_.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    completeWith(slice, IBV_WC_WR_FLUSH_ERR);
+    ASSERT_TRUE(transport_.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+}
+
+TEST_F(RdmaSliceOrphanTest, DestroyedEndpointConfirmsDrainWithoutCompletion) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    RdmaSubBatch batch;
+    batch.task_list.push_back(slice->task);
+    batch.slice_chain.push_back(slice);
+    updateSliceStatus(slice, TIMEOUT);
+    bool drained = true;
+    ASSERT_TRUE(transport_.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    ASSERT_EQ(endpoint_->deconstruct(), 0);
+    ASSERT_FALSE(slice->ep_weak_ptr.expired());
+    ASSERT_TRUE(transport_.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    endpoint_.reset();
+    ASSERT_TRUE(slice->ep_weak_ptr.expired());
+    ASSERT_TRUE(transport_.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+}
+
 // The completion may never arrive -- destroying a queue pair clears the
 // completions naming it -- so a gone endpoint settles the orphan too.
 TEST_F(RdmaSliceOrphanTest, AnOrphanIsReapedOnceItsEndpointIsGone) {

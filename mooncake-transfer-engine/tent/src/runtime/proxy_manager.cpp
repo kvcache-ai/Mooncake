@@ -54,6 +54,9 @@ void ProxyManager::flushPendingCleanups(bool unpin_remote_buffers) {
                  batch_it != it->batches.end();) {
                 TransferStatus status;
                 auto poll_status = impl_->progressBatch(*batch_it, status);
+                bool drained = false;
+                if (poll_status.ok() && status.s != PENDING)
+                    poll_status = impl_->isBatchDrained(*batch_it, drained);
                 if (!poll_status.ok()) {
                     LOG_EVERY_N(WARNING, 100)
                         << "Failed to poll deferred staging batch: "
@@ -61,7 +64,7 @@ void ProxyManager::flushPendingCleanups(bool unpin_remote_buffers) {
                     ++batch_it;
                     continue;
                 }
-                if (status.s == PENDING) {
+                if (!drained) {
                     ++batch_it;
                     continue;
                 }
@@ -450,7 +453,10 @@ void ProxyManager::runner(size_t id) {
                  it != undrained_batches.end();) {
                 TransferStatus child_status;
                 auto polled = impl_->progressBatch(*it, child_status);
-                if (polled.ok() && child_status.s != PENDING) {
+                bool drained = false;
+                if (polled.ok() && child_status.s != PENDING)
+                    polled = impl_->isBatchDrained(*it, drained);
+                if (polled.ok() && drained) {
                     impl_->releaseBatch(reinterpret_cast<Batch*>(*it));
                     it = undrained_batches.erase(it);
                 } else {
@@ -575,6 +581,9 @@ Status ProxyManager::transferEventLoop(
     auto drain_batch = [&](BatchID batch) {
         TransferStatus xfer_status;
         auto status = impl_->progressBatch(batch, xfer_status);
+        bool drained = false;
+        if (status.ok() && xfer_status.s != PENDING)
+            status = impl_->isBatchDrained(batch, drained);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to poll in-flight staging batch: " << status;
             impl_->freeBatch(batch);
@@ -585,7 +594,7 @@ Status ProxyManager::transferEventLoop(
             LOG(WARNING) << "Failed to free drained staging batch: "
                          << free_status;
         }
-        return xfer_status.s != PENDING;
+        return drained;
     };
     auto cleanup_inflight = [&]() {
         bool all_drained = true;
@@ -751,6 +760,16 @@ Status ProxyManager::transferEventLoop(
                     return status;
                 }
                 if (xfer_status.s == PENDING) {
+                    event_queue.push(id);
+                    break;
+                }
+                bool drained = false;
+                status = impl_->isBatchDrained(chunk.batch, drained);
+                if (!status.ok()) {
+                    buffers_safe_to_release = cleanup_inflight();
+                    return status;
+                }
+                if (!drained) {
                     event_queue.push(id);
                     break;
                 }
