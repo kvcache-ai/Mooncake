@@ -5,6 +5,7 @@ namespace mooncake {
 
 std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     const UUID& task_id) const {
+    AssertMutexHeld();
     auto it = manager_->all_tasks_.find(task_id);
     if (it != manager_->all_tasks_.end()) {
         return it->second;
@@ -13,19 +14,23 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::begin() const {
+    AssertMutexHeld();
     return manager_->all_tasks_.cbegin();
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::end() const {
+    AssertMutexHeld();
     return manager_->all_tasks_.cend();
 }
 
 size_t ScopedTaskReadAccess::size() const {
+    AssertMutexHeld();
     return manager_->all_tasks_.size();
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload) {
+    AssertMutexHeld();
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -56,6 +61,7 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
 std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
                                                    size_t batch_size) {
     std::vector<Task> result;
+    AssertMutexHeld();
 
     auto pit = manager_->pending_tasks_.find(client_id);
     if (pit == manager_->pending_tasks_.end()) {
@@ -74,6 +80,7 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
         const UUID task_id = queue.front();
         queue.pop();
 
+        AssertMutexHeld();
         auto it = manager_->all_tasks_.find(task_id);
         if (it == manager_->all_tasks_.end()) {
             // Terminal tasks can be pruned before their queued IDs are
@@ -111,12 +118,14 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,
                                                const std::string& message) {
+    AssertMutexHeld();
     if (!is_finished_status(status)) {
         LOG(ERROR) << "complete_task: invalid completion status=" << status
                    << ", task_id=" << task_id;
         return ErrorCode::INVALID_PARAMS;
     }
 
+    AssertMutexHeld();
     auto it = manager_->all_tasks_.find(task_id);
     if (it == manager_->all_tasks_.end()) {
         LOG(ERROR) << "Task " << task_id << " not found for update";
@@ -158,6 +167,7 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
+    AssertMutexHeld();
     while (manager_->finished_task_history_.size() >
            manager_->max_total_finished_tasks_) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
@@ -167,6 +177,7 @@ void ScopedTaskWriteAccess::prune_finished_tasks() {
 }
 
 void ScopedTaskWriteAccess::prune_expired_tasks() {
+    AssertMutexHeld();
     const auto now = std::chrono::system_clock::now();
     // Pending timeout: based on created_at
     if (manager_->pending_task_timeout_sec_ > 0) {
@@ -179,6 +190,7 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                 const UUID task_id = task_queue.front();
                 task_queue.pop();
 
+                AssertMutexHeld();
                 auto it = manager_->all_tasks_.find(task_id);
                 if (it == manager_->all_tasks_.end()) {
                     // The terminal transition already released the pending
@@ -217,6 +229,7 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
              manager_->processing_tasks_) {
             std::vector<UUID> to_remove;
             for (const UUID& task_id : processing_task_set) {
+                AssertMutexHeld();
                 auto it = manager_->all_tasks_.find(task_id);
                 if (it == manager_->all_tasks_.end()) {
                     // Drop dangling id.
@@ -258,6 +271,7 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
 
 ErrorCode ScopedTaskWriteAccess::fail_task_if_pending(
     const UUID& task_id, const std::string& message) {
+    AssertMutexHeld();
     auto it = manager_->all_tasks_.find(task_id);
     if (it == manager_->all_tasks_.end()) {
         return ErrorCode::TASK_NOT_FOUND;

@@ -179,13 +179,13 @@ void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
 
 size_t MasterServiceTestPeer::SoftPinHeapSize() const {
     const auto& index = service_.soft_pin_deadline_index_;
-    std::lock_guard lock(index.mutex_);
+    MutexLocker lock(&index.mutex_);
     return index.heap_.size();
 }
 
 size_t MasterServiceTestPeer::SoftPinRegistrationCount() const {
     const auto& index = service_.soft_pin_deadline_index_;
-    std::lock_guard lock(index.mutex_);
+    MutexLocker lock(&index.mutex_);
     return index.registrations_.size();
 }
 

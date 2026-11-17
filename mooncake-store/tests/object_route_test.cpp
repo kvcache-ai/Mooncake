@@ -1056,7 +1056,7 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
                 continue;
             }
             pairs_observed.fetch_add(1, std::memory_order_relaxed);
-            if (first->metadata().lease_ != second->metadata().lease_ ||
+            if (LeaseOf(route, "k1") != LeaseOf(route, "k2") ||
                 !is_member("k1") || !is_member("k2")) {
                 violation();
             }

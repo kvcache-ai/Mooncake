@@ -156,6 +156,8 @@ class ScopedTaskReadAccess {
     size_t size() const;
 
    private:
+    void AssertMutexHeld() const;
+
     const ClientTaskManager* manager_;
     SharedMutexLocker lock_;
 };
@@ -192,6 +194,8 @@ class ScopedTaskWriteAccess {
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
                                               const std::string& payload);
+
+    void AssertMutexHeld() const;
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -254,5 +258,10 @@ class ClientTaskManager {
     // Used to implement LRU eviction for completed tasks
     std::deque<UUID> finished_task_history_ GUARDED_BY(mutex_);
 };
+
+inline void ScopedTaskReadAccess::AssertMutexHeld() const
+    ASSERT_CAPABILITY(manager_->mutex_) {}
+inline void ScopedTaskWriteAccess::AssertMutexHeld() const
+    ASSERT_CAPABILITY(manager_->mutex_) {}
 
 }  // namespace mooncake

@@ -1919,7 +1919,7 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
         metadata, &Replica::fn_is_processing);
     if (!replicas.empty()) {
         FreeDfsReplicas(metadata.user_key, replicas);
-        std::lock_guard lock(discarded_replicas_mutex_);
+        MutexLocker lock(&discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
     if (!metadata.IsValid()) {
@@ -1982,7 +1982,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
     if (!replicas.empty()) {
         FreeDfsReplicas(metadata.user_key, replicas);
-        std::lock_guard lock(discarded_replicas_mutex_);
+        MutexLocker lock(&discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
     if (dynamic_task) {
@@ -2234,7 +2234,7 @@ void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
 
 void MasterService::SoftPinDeadlineIndex::Upsert(std::string scoped_key,
                                                  const TimePoint& deadline) {
-    std::lock_guard lock(mutex_);
+    MutexLocker lock(&mutex_);
     const auto it = registrations_.find(scoped_key);
     if (it != registrations_.end() && it->second.deadline == deadline) {
         return;
@@ -2249,7 +2249,7 @@ void MasterService::SoftPinDeadlineIndex::Upsert(std::string scoped_key,
 
 void MasterService::SoftPinDeadlineIndex::Remove(
     const std::string& scoped_key) {
-    std::lock_guard lock(mutex_);
+    MutexLocker lock(&mutex_);
     if (registrations_.erase(scoped_key) > 0) {
         MaybeCompactLocked();
     }
@@ -2257,7 +2257,7 @@ void MasterService::SoftPinDeadlineIndex::Remove(
 
 void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
     const std::string& scoped_key, const TimePoint& deadline) {
-    std::lock_guard lock(mutex_);
+    MutexLocker lock(&mutex_);
     const auto it = registrations_.find(scoped_key);
     if (it != registrations_.end() && it->second.deadline == deadline) {
         registrations_.erase(it);
@@ -2268,7 +2268,7 @@ void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
 std::vector<MasterService::SoftPinDeadlineIndex::Entry>
 MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
     std::vector<Entry> expired;
-    std::lock_guard lock(mutex_);
+    MutexLocker lock(&mutex_);
     while (!heap_.empty() && heap_.top().deadline <= now) {
         Entry entry = heap_.top();
         heap_.pop();
@@ -2286,7 +2286,7 @@ MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
 }
 
 void MasterService::SoftPinDeadlineIndex::Clear() {
-    std::lock_guard lock(mutex_);
+    MutexLocker lock(&mutex_);
     registrations_.clear();
     decltype(heap_) empty;
     heap_.swap(empty);
@@ -3524,7 +3524,7 @@ tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::lock_guard<std::mutex> lock(job_mutex_);
+    MutexLocker lock(&job_mutex_);
     for (const auto& [_, job] : drain_jobs_) {
         std::lock_guard<std::mutex> job_lock(job->mutex);
         if (job->status == JobStatus::SUCCEEDED ||
@@ -5343,7 +5343,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 metadata, &Replica::fn_is_processing);
             if (!replicas.empty()) {
                 FreeDfsReplicas(key, replicas);
-                std::lock_guard lock(discarded_replicas_mutex_);
+                MutexLocker lock(&discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
                     std::move(replicas),
                     metadata.put_start_time + put_start_release_timeout_sec_);
@@ -5986,7 +5986,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.pending_session_tag.reset();
                     if (!processing_replicas.empty()) {
                         FreeDfsReplicas(key, processing_replicas);
-                        std::lock_guard lock(discarded_replicas_mutex_);
+                        MutexLocker lock(&discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(processing_replicas),
                             now + put_start_release_timeout_sec_);
@@ -6193,7 +6193,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
                     FreeDfsReplicas(key, old_replicas);
-                    std::lock_guard lock(discarded_replicas_mutex_);
+                    MutexLocker lock(&discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(std::move(old_replicas),
                                                      release_at);
                 }
@@ -7188,7 +7188,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             });
         if (!source_replica.empty()) {
             FreeDfsReplicas(key, source_replica);
-            std::lock_guard lock(discarded_replicas_mutex_);
+            MutexLocker lock(&discarded_replicas_mutex_);
             discarded_replicas_.emplace_back(std::move(source_replica),
                                              release_at);
         }
@@ -9815,7 +9815,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     if (!discarded_replicas.empty()) {
-        std::lock_guard lock(discarded_replicas_mutex_);
+        MutexLocker lock(&discarded_replicas_mutex_);
         discarded_replicas_.splice(discarded_replicas_.end(),
                                    std::move(discarded_replicas));
     }
@@ -9824,7 +9824,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     const std::chrono::system_clock::time_point& now) {
     uint64_t released_cnt = 0;
-    std::lock_guard lock(discarded_replicas_mutex_);
+    MutexLocker lock(&discarded_replicas_mutex_);
     discarded_replicas_.remove_if(
         [&now, &released_cnt](const DiscardedReplicas& item) {
             const bool expired = item.isExpired(now);
@@ -10709,7 +10709,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     // Held until the job is registered so SetSegmentStatus never sees a
     // segment this job has marked DRAINING without also seeing the job.
-    std::lock_guard<std::mutex> lock(job_mutex_);
+    MutexLocker lock(&job_mutex_);
     std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
@@ -10749,7 +10749,7 @@ tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
     const UUID& job_id) {
     std::shared_ptr<DrainJob> job;
     {
-        std::lock_guard<std::mutex> lock(job_mutex_);
+        MutexLocker lock(&job_mutex_);
         auto it = drain_jobs_.find(job_id);
         if (it == drain_jobs_.end()) {
             return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
@@ -10784,7 +10784,7 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
     const UUID& job_id) {
     std::shared_ptr<DrainJob> job;
     {
-        std::lock_guard<std::mutex> lock(job_mutex_);
+        MutexLocker lock(&job_mutex_);
         auto it = drain_jobs_.find(job_id);
         if (it == drain_jobs_.end()) {
             return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
@@ -11163,7 +11163,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 void MasterService::ProcessDrainJobs() {
     std::vector<std::shared_ptr<DrainJob>> jobs;
     {
-        std::lock_guard<std::mutex> lock(job_mutex_);
+        MutexLocker lock(&job_mutex_);
         jobs.reserve(drain_jobs_.size());
         for (const auto& [_, job] : drain_jobs_) {
             jobs.push_back(job);
@@ -11408,7 +11408,7 @@ void MasterService::PublishKvClearedIfEpochUnchanged(const TenantId& tenant_id,
     // Holding the epoch lock across the publish is what makes this a barrier
     // rather than a racy re-check: a commit that wants to announce this tenant
     // has to wait for the lock, and will then find the clear already enqueued.
-    std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+    MutexLocker lock(&kv_tenant_epoch_mutex_);
     if (kv_tenant_epochs_[KvTenantEpochSlot(tenant_id.value())] !=
         expected_epoch) {
         // A commit landed in an already-scanned stripe. Its `stored` is on the

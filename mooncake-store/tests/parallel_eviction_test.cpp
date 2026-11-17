@@ -130,6 +130,7 @@ TEST_F(ShardedLeaseIndexTest, LiveLeaseIsRevalidatedAndRefiled) {
     ASSERT_TRUE(entry);
     {
         auto guard = ns_.objects.Read("a");
+        SpinLocker locker(&guard->metadata().lock);
         guard->metadata().lease_->ExtendTo(now_ + std::chrono::seconds(20));
     }
     {
@@ -148,6 +149,7 @@ TEST_F(ShardedLeaseIndexTest,
         Publish(key);
         {
             auto guard = ns_.objects.Read(key);
+            SpinLocker locker(&guard->metadata().lock);
             guard->metadata().lease_->ExtendTo(now_ - std::chrono::seconds(1));
         }
         auto cursor = ns_.eviction_index().ScanRanges(now_, 1);
@@ -664,6 +666,7 @@ TEST_F(ParallelEvictorNativeTest,
     for (int i = 0; i < 5; ++i) {
         publish_at("r0_" + std::to_string(i), Clock::time_point{});
         auto read = ns.objects.Read("r0_" + std::to_string(i));
+        SpinLocker locker(&read->metadata().lock);
         read->metadata().lease_->ExtendTo(Clock::now() + std::chrono::hours(1));
     }
     for (int i = 0; i < 5; ++i) {
@@ -719,11 +722,13 @@ TEST_F(ParallelEvictorNativeTest, ByteGoalReclaimsExpiredReadRenewalsInOneRun) {
             auto& ns = namespaces_.GetOrCreate(TenantId{});
             {
                 auto guard = ns.objects.Read(expired);
+                SpinLocker locker(&guard->metadata().lock);
                 guard->metadata().lease_->ExtendTo(Clock::now() -
                                                    std::chrono::seconds(1));
             }
             {
                 auto guard = ns.objects.Read(live);
+                SpinLocker locker(&guard->metadata().lock);
                 guard->metadata().lease_->ExtendTo(Clock::now() +
                                                    std::chrono::hours(1));
             }
@@ -754,6 +759,7 @@ TEST_F(ParallelEvictorNativeTest,
     auto& ns = namespaces_.GetOrCreate(TenantId{});
     for (int i = 0; i < 50; ++i) {
         auto guard = ns.objects.Read(std::to_string(i));
+        SpinLocker locker(&guard->metadata().lock);
         guard->metadata().lease_->ExtendTo(Clock::now() +
                                            std::chrono::hours(1));
     }

@@ -1260,7 +1260,7 @@ class MasterService {
 
         void MaybeCompactLocked() REQUIRES(mutex_);
 
-        mutable std::mutex mutex_;
+        mutable Mutex mutex_;
         std::priority_queue<Entry, std::vector<Entry>, EarlierDeadline> heap_
             GUARDED_BY(mutex_);
         std::unordered_map<std::string, Registration> registrations_
@@ -2110,7 +2110,7 @@ class MasterService {
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
     };
-    std::mutex discarded_replicas_mutex_;
+    mutable Mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
@@ -2167,7 +2167,7 @@ class MasterService {
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
-    std::mutex job_mutex_;
+    Mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
 
@@ -2188,7 +2188,7 @@ class MasterService {
     // tenants share an epoch, which can only suppress a clear that was safe to
     // send — never publish one that was not.
     static constexpr size_t kKvTenantEpochSlots = 1024;
-    mutable std::mutex kv_tenant_epoch_mutex_;
+    mutable Mutex kv_tenant_epoch_mutex_;
     std::array<uint64_t, kKvTenantEpochSlots> kv_tenant_epochs_
         GUARDED_BY(kv_tenant_epoch_mutex_) = {};
     // Set from KvEventsEnabled() at construction. Kept separate so tests can
@@ -2209,14 +2209,14 @@ class MasterService {
         if (!kv_track_tenant_epochs_) {
             return;
         }
-        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+        MutexLocker lock(&kv_tenant_epoch_mutex_);
         ++kv_tenant_epochs_[KvTenantEpochSlot(tenant)];
     }
     uint64_t ReadKvTenantEpoch(const std::string& tenant) {
         if (!kv_track_tenant_epochs_) {
             return 0;
         }
-        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+        MutexLocker lock(&kv_tenant_epoch_mutex_);
         return kv_tenant_epochs_[KvTenantEpochSlot(tenant)];
     }
     // A whole-array copy taken before a scan begins. The global RemoveAll does
@@ -2227,7 +2227,7 @@ class MasterService {
         if (!needed || !kv_track_tenant_epochs_) {
             return {};
         }
-        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
+        MutexLocker lock(&kv_tenant_epoch_mutex_);
         return kv_tenant_epochs_;
     }
     // Re-reads the epoch and publishes under the same lock that guards the
