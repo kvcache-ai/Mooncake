@@ -7800,6 +7800,98 @@ fn routed_batch_put_from_mixed_batch_keeps_live_targets_when_one_ranked_runtime_
 }
 
 #[test]
+fn routed_put_retries_after_reserve_phase_membership_refresh_and_uses_new_runtime() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("put-reserve-retry-a-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("put-reserve-retry-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("put-reserve-retry-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "put-reserve-retry-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "put-reserve-retry-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "put-reserve-retry-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &writer, &reader]);
+
+    let store_b_transport = Arc::new(store_a_transport.peer("put-reserve-retry-b-segment"));
+    let store_b = StoreClientBuilder::new(metadata.clone(), "put-reserve-retry-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+
+    // Simulate a stale shared membership view that predates the successor rollout.
+    writer
+        .live_client_cache
+        .lock()
+        .store(vec![store_a.lease(), writer.lease(), reader.lease()]);
+
+    // The predecessor stops accepting new reservations before the writer refreshes membership.
+    store_a
+        .enter_draining()
+        .expect("store-a should enter draining before reserve retry");
+
+    let source = b"put-reserve-retry-payload";
+    let route = writer
+        .put("put-reserve-retry-key", source)
+        .expect("put should retry after reserve-stage membership refresh");
+
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, *store_b.runtime_id());
+    assert_eq!(
+        reader
+            .get("put-reserve-retry-key")
+            .expect("reader should see reserve-stage retried write"),
+        source
+    );
+}
+
+#[test]
 fn routed_batch_put_from_retries_after_reserve_phase_membership_refresh_and_uses_new_runtime() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("batch-put-reserve-retry-a-segment"));

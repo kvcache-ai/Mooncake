@@ -479,6 +479,28 @@ impl StoreClient {
                         quota_reservation.as_ref(),
                         "allocation_reserve_failed",
                     );
+                    if attempt < max_write_attempts
+                        && self.should_retry_put_after_transient_failure(&error, &policy)
+                    {
+                        sleep(Duration::from_millis(
+                            300_u64.saturating_mul(attempt as u64),
+                        ));
+                        let _ = refresh_live_client_cache(
+                            self.metadata.as_ref(),
+                            &self.live_client_cache,
+                            "live_client_snapshot_put_reserve_failure",
+                        );
+                        debug!(
+                            runtime = %self.lease.runtime,
+                            tenant,
+                            key,
+                            attempt,
+                            max_write_attempts,
+                            error = %error,
+                            "retrying put after transient placement reservation failure"
+                        );
+                        continue;
+                    }
                     return Err(error);
                 }
             };
@@ -511,7 +533,7 @@ impl StoreClient {
                     );
                     self.note_remote_write_failure(&targets, &error, "remote_write_failed");
                     if attempt < max_write_attempts
-                        && self.should_retry_put_after_write_failure(&error, &policy)
+                        && self.should_retry_put_after_transient_failure(&error, &policy)
                     {
                         debug!(
                             runtime = %self.lease.runtime,
@@ -2202,7 +2224,7 @@ impl StoreClient {
             && left.length == right.length
     }
 
-    fn should_retry_put_after_write_failure(
+    fn should_retry_put_after_transient_failure(
         &self,
         error: &StoreError,
         policy: &ResolvedReplicationPolicy,
