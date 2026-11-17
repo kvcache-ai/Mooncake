@@ -1690,6 +1690,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+        dummy_ping_client_ = client_;
+    }
+
     return {};
 }
 
@@ -1994,6 +1999,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Client reference, its destructor stops and joins those workers before
         // we release backing memory. This is not a GPU completion barrier:
         // transfers that timed out may still require deferred cleanup.
+        {
+            std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+            dummy_ping_client_.reset();
+        }
         client_.reset();
     }
     // Free staging arenas only after the last storage-owned Client/TE owner.
@@ -3247,6 +3256,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
 tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     int32_t physical_device_id, const UUID &client_id) {
+    DummyRegistrationGuard registration(*this, client_id, is_local_buffer);
     std::stringstream addr_stream;
     addr_stream << "0x" << std::hex << dummy_base_addr;
 
@@ -3418,6 +3428,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
 tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    return unmap_shm_locked(client_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::unmap_shm_locked(
+    const UUID &client_id) {
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
@@ -3515,6 +3530,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
     uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
     const std::string &shareable_handle_bytes, int32_t device_id,
     const UUID &client_id) {
+    DummyRegistrationGuard registration(*this, client_id, is_local_buffer);
 #ifdef USE_ASCEND_DIRECT
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -3596,6 +3612,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
     uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
     const std::string &ipc_key_bytes, int32_t device_id,
     const UUID &client_id) {
+    DummyRegistrationGuard registration(*this, client_id, is_local_buffer);
 #ifdef USE_ASCEND_DIRECT
     constexpr size_t kIPCKeyLen = 65;
     if (!client_) {
@@ -3705,9 +3722,15 @@ void RealClient::teardown_ascend_shm_buffer(MappedShm &shm) {
 
 tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    return ascend_unmap_shm_locked(client_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_locked(
+    const UUID &client_id) {
     LOG(INFO) << "[ascend_unmap_shm] client_id=" << client_id
               << ", action=unmapping";
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "[ascend_unmap_shm] client_id=" << client_id
@@ -9174,70 +9197,110 @@ RealClient::batch_get_into_multi_buffers_internal(
     return results;
 }
 
+RealClient::DummyRegistrationGuard::DummyRegistrationGuard(
+    RealClient &owner, const UUID &client_id, bool is_local_buffer)
+    : owner_(owner) {
+    std::lock_guard<std::mutex> lock(owner_.dummy_heartbeat_mutex_);
+    ++owner_.dummy_registrations_in_progress_;
+    // setup_dummy registers its local/control buffer synchronously before
+    // starting heartbeats. Recognize that first registration without forcing
+    // a reconnect during normal startup. A late data-buffer registration after
+    // expiry must still request the complete set. Reconnect registrations keep
+    // the notification already consumed by the preceding NEED_REMOUNT ping.
+    owner_.dummy_heartbeats_.try_emplace(
+        client_id, DummyClientHeartbeat{std::chrono::steady_clock::now(),
+                                        !is_local_buffer});
+}
+
+RealClient::DummyRegistrationGuard::~DummyRegistrationGuard() {
+    std::lock_guard<std::mutex> lock(owner_.dummy_heartbeat_mutex_);
+    --owner_.dummy_registrations_in_progress_;
+    owner_.last_dummy_registration_ = std::chrono::steady_clock::now();
+}
+
 tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
-    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-
-    if (!client_) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=client_not_ready";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    bool healthy;
+    bool needs_remount;
+    {
+        std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+        // Finish this atomic health read under the lifetime gate: teardown
+        // must not release segment memory while a ping keeps Client alive.
+        auto client = dummy_ping_client_.lock();
+        healthy = client && client->is_ping_healthy();
+        auto [it, inserted] = dummy_heartbeats_.try_emplace(client_id);
+        it->second.last_seen = std::chrono::steady_clock::now();
+        needs_remount = inserted || it->second.needs_remount;
+        // Existing dummy clients synchronously re-register all buffers after
+        // a non-OK ping, then ping again to acknowledge recovery (also with
+        // zero buffers). A lost response causes the same reconnect path.
+        if (!client) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        it->second.needs_remount = false;
     }
-
     ClientStatus client_status =
-        client_->is_ping_healthy() ? ClientStatus::OK : ClientStatus::UNDEFINED;
-
-    PodUUID pod_client_id = {client_id.first, client_id.second};
-    if (!dummy_client_ping_queue_.push(pod_client_id)) {
-        // Queue is full
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=dummy_client_ping_queue_";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        healthy ? ClientStatus::OK : ClientStatus::UNDEFINED;
+    if (needs_remount) {
+        client_status = ClientStatus::NEED_REMOUNT;
+        LOG(INFO) << "client_id=" << client_id << ", action=need_remount";
     }
     return PingResponse(view_version_, client_status);
 }
 
 void RealClient::dummy_client_monitor_func() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
+    const auto ttl = std::chrono::seconds(dummy_client_live_ttl_sec_);
     while (dummy_client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (dummy_client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(dummy_client_live_ttl_sec_);
-        }
-
-        // Find out expired clients
         std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            for (auto &client_id : expired_clients) {
-                // Unmap mapped_shms associated with this client
-                if (globalConfig().ascend_agent_mode) {
-                    ascend_unmap_shm_internal(client_id);
-                } else {
-                    unmap_shm_internal(client_id);
+        {
+            std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            if (dummy_registrations_in_progress_ == 0 &&
+                now - last_dummy_registration_ > ttl) {
+                for (const auto &[id, heartbeat] : dummy_heartbeats_) {
+                    if (now - heartbeat.last_seen > ttl) {
+                        expired_clients.push_back(id);
+                    }
                 }
             }
+        }
+        for (const auto &client_id : expired_clients) {
+            try_expire_dummy_client(client_id);
         }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kDummyClientMonitorSleepMs));
     }
+}
+
+bool RealClient::try_expire_dummy_client(const UUID &client_id) {
+    const auto ttl = std::chrono::seconds(dummy_client_live_ttl_sec_);
+    std::unique_lock<std::shared_mutex> shm_lock(dummy_client_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        auto it = dummy_heartbeats_.find(client_id);
+        // A ping or registration may have arrived while we waited for
+        // the SHM lock. Commit expiry only after checking again.
+        if (it == dummy_heartbeats_.end() ||
+            dummy_registrations_in_progress_ != 0 ||
+            now - last_dummy_registration_ <= ttl ||
+            now - it->second.last_seen <= ttl) {
+            return false;
+        }
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=client_expired, last_activity_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         now - it->second.last_seen)
+                         .count();
+        // Unknown clients get NEED_REMOUNT on their next ping. No tombstones
+        // are needed for clients that never return.
+        dummy_heartbeats_.erase(it);
+    }
+    // Never hold the heartbeat lock during slow unregister/munmap.
+    if (globalConfig().ascend_agent_mode) {
+        ascend_unmap_shm_locked(client_id);
+    } else {
+        unmap_shm_locked(client_id);
+    }
+    return true;
 }
 
 int RealClient::start_dummy_client_monitor() {

@@ -1439,6 +1439,14 @@ python -m mooncake.mooncake_store_service --config=<config_path> -Dtenant_id=ten
 
 Run the `mooncake_client` binary as a standalone RPC process that owns storage resources; application processes (vLLM / SGLang) use lightweight **dummy clients** to forward requests to it. It connects to the master and listens on port `50052` by default.
 
+Heartbeats continue while shared memory is being registered. Expiration waits
+until the serial registration channel has been idle for one client TTL, so
+clients queued behind another registration are not mistaken for dead clients.
+Sustained registration activity can therefore defer reclamation of a genuinely
+dead client. After expiration, the next heartbeat requests a full remount using
+the existing `NEED_REMOUNT` status; the dummy client resends its registered
+shared-memory descriptors automatically. The heartbeat TTL default is unchanged.
+
 ```bash
 mooncake_client \
   --global_segment_size="4GB" \
