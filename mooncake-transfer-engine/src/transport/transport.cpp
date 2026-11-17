@@ -42,7 +42,7 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
     batch_desc->context = NULL;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
-    batch_desc_set_[batch_desc->id] = batch_desc;
+    batch_desc_set_[batch_desc->id] = std::shared_ptr<BatchDesc>(batch_desc);
     batch_desc_lock_.unlock();
 #endif
     return batch_desc->id;
