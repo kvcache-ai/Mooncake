@@ -9,7 +9,7 @@ use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
     ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
     ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteReplicaReference, RouteState, RouteVersion, StoreError,
+    RouteOwnerScanStatus, RouteReplicaReference, RouteState, RouteVersion, StoreError,
     ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
@@ -31,9 +31,9 @@ use crate::mesh::registry::{
     local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
-    authority_candidates, merge_authority_candidates, ranked_authorities,
-    ranked_merged_authorities, ranked_top_authorities, retained_authority_candidates,
-    select_authorities_for_requests, RouteAuthoritySelection,
+    authority_candidates, merge_authority_candidates, owner_scan_authority_candidates,
+    ranked_authorities, ranked_merged_authorities, ranked_top_authorities,
+    retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::{record_cas_outcome, record_delete_marker_event};
 use crate::shim::{
@@ -267,6 +267,10 @@ impl EmbeddedWrhRouteDirectory {
 
     fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
         authority_candidates(self.membership.as_ref(), observer, false)
+    }
+
+    fn owner_scan_authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
+        owner_scan_authority_candidates(self.membership.as_ref(), observer)
     }
 
     fn authority_candidates_force_refresh(
@@ -634,9 +638,9 @@ impl EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
         require_snapshot: bool,
-    ) -> Result<()> {
+    ) -> Result<RouteOwnerScanStatus> {
         let mut scans = Vec::new();
-        let authorities = self.authority_candidates(observer)?;
+        let authorities = self.owner_scan_authority_candidates(observer)?;
         if authorities.is_empty() {
             return Err(StoreError::InvalidState(format!(
                 "owner-route scan for {owner} has no route authorities"
@@ -652,6 +656,7 @@ impl EmbeddedWrhRouteDirectory {
                 require_snapshot,
             ) {
                 Ok(page) => {
+                    self.membership.clear_suspect(&authority.runtime);
                     let mut seen_cursors = HashSet::new();
                     validate_owner_route_page(None, &page, &mut seen_cursors)?;
                     if require_snapshot && page.snapshot_epoch.is_none() {
@@ -701,8 +706,10 @@ impl EmbeddedWrhRouteDirectory {
         }
 
         loop {
-            for scan in &mut scans {
+            let mut next_scans = Vec::with_capacity(scans.len());
+            for mut scan in scans {
                 if !scan.routes.is_empty() || scan.next_cursor.is_none() {
+                    next_scans.push(scan);
                     continue;
                 }
                 let cursor = scan
@@ -722,6 +729,7 @@ impl EmbeddedWrhRouteDirectory {
                     require_snapshot,
                 ) {
                     Ok(page) => {
+                        self.membership.clear_suspect(&authority.runtime);
                         if require_snapshot && page.snapshot_epoch != expected_epoch {
                             return Err(StoreError::StaleEpoch(format!(
                                 "route authority {} changed owner-route snapshot while scanning {owner}",
@@ -749,6 +757,7 @@ impl EmbeddedWrhRouteDirectory {
                         validate_owner_route_page(Some(&cursor), &page, &mut scan.seen_cursors)?;
                         scan.routes = VecDeque::from(page.routes);
                         scan.next_cursor = page.next_cursor;
+                        next_scans.push(scan);
                     }
                     Err(error) => {
                         if !matches!(
@@ -767,10 +776,14 @@ impl EmbeddedWrhRouteDirectory {
                             error = %error,
                             "route-owner scan is incomplete after continuation page failure"
                         );
-                        return Err(error);
+                        if require_snapshot {
+                            return Err(error);
+                        }
+                        last_error = Some(error);
                     }
                 }
             }
+            scans = next_scans;
 
             let Some(next_key) = scans
                 .iter()
@@ -781,7 +794,11 @@ impl EmbeddedWrhRouteDirectory {
                 if require_snapshot {
                     self.validate_owner_route_scan_snapshot(observer, owner, &scans)?;
                 }
-                return Ok(());
+                return Ok(if last_error.is_some() {
+                    RouteOwnerScanStatus::Incomplete
+                } else {
+                    RouteOwnerScanStatus::Complete
+                });
             };
             let mut merged = BTreeMap::new();
             for scan in &mut scans {
@@ -1903,7 +1920,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
         let mut routes = Vec::new();
-        self.visit_routes_by_replica_owner_pages(observer, owner, &mut |route| {
+        let status = self.visit_routes_by_replica_owner_pages(observer, owner, &mut |route| {
             if routes.len() == DEFAULT_ROUTE_OWNER_PAGE_SIZE {
                 return Err(StoreError::Unsupported(
                     "complete owner-route listing exceeds the bounded compatibility page; use the visitor API"
@@ -1913,7 +1930,12 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             routes.push(route);
             Ok(())
         }, false)?;
-        Ok(routes)
+        match status {
+            RouteOwnerScanStatus::Complete => Ok(routes),
+            RouteOwnerScanStatus::Incomplete => Err(StoreError::Transport(
+                "owner route scan incomplete".to_string(),
+            )),
+        }
     }
 
     fn visit_routes_by_replica_owner(
@@ -1922,7 +1944,12 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
-        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)
+        match self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)? {
+            RouteOwnerScanStatus::Complete => Ok(()),
+            RouteOwnerScanStatus::Incomplete => Err(StoreError::Transport(
+                "owner route scan incomplete".to_string(),
+            )),
+        }
     }
 
     fn visit_routes_by_replica_owner_consistent(
@@ -1931,7 +1958,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
-        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, true)
+        match self.visit_routes_by_replica_owner_pages(observer, owner, visitor, true)? {
+            RouteOwnerScanStatus::Complete => Ok(()),
+            RouteOwnerScanStatus::Incomplete => Err(StoreError::Transport(
+                "owner route scan incomplete".to_string(),
+            )),
+        }
+    }
+
+    fn visit_routes_by_replica_owner_with_status(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<RouteOwnerScanStatus> {
+        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)
     }
 
     fn list_routes_in_scope(
@@ -2167,6 +2208,8 @@ mod owner_page_contract_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -2210,6 +2253,8 @@ mod owner_page_contract_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -2238,6 +2283,8 @@ mod owner_page_contract_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
@@ -2271,6 +2318,8 @@ mod owner_page_contract_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
@@ -3574,6 +3623,8 @@ mod snapshot_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -3606,6 +3657,8 @@ mod snapshot_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
