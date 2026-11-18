@@ -32,6 +32,10 @@
 
 namespace mooncake {
 
+namespace test {
+class RealClientTeardownTest;
+}  // namespace test
+
 class PutOperation;
 class DistributedStorageBackend;
 
@@ -77,6 +81,8 @@ class QueryResult {
  * @brief Client for interacting with the mooncake distributed object store
  */
 class Client {
+    friend class test::RealClientTeardownTest;
+
    public:
     virtual ~Client();
 
@@ -836,6 +842,10 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    [[nodiscard]] bool IsUsingTent() const {
+        return transfer_engine_ && transfer_engine_->isUsingTent();
+    }
 
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
         return transfer_engine_ && !transfer_engine_->isUsingTent() &&

@@ -2332,10 +2332,10 @@ calls concurrently. Close stops local services. For an EGM Provider, close
 also stops `FileStorage` workers before unmounting EGM segments and
 releasing their backing memory.
 
-Close is terminal: both real-client and dummy-client handles are cleared from
-the Python object even when cleanup fails. Further `close()` calls are
-idempotent, not cleanup retries. Repeated `setup()` calls are not a recovery
-mechanism.
+Close normally clears the native handle even when cleanup fails. For a
+persistent CUDA DummyClient, `CUDA_BUFFER_IN_USE` (-802) means the daemon
+may still access its registered buffers. Keep those allocations and their
+contents intact and retry `close()` on the same store until it succeeds.
 
 If EGM setup fails, Mooncake attempts cleanup even for failed or uncertain
 mounts. When unmount cannot be confirmed, it logs the error and retains the
@@ -2350,7 +2350,8 @@ def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = terminal cleanup failure).
+- `int`: 0 on success, -802 while a CUDA transfer still needs to be drained,
+  or another nonzero status on terminal cleanup failure.
 
 **Example:**
 ```python
@@ -3242,6 +3243,43 @@ before talking to Master.
 ⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
 Store-managed registered memory. DFS session reads use temporary staging; the
 staging allocation is released after the synchronous read and scatter finish.
+
+These APIs are also available after `setup_dummy`. Each DummyClient has its own
+session state in the RealClient, while sharing the RealClient's Transfer Engine.
+Starting or ending a get session does not change another client's session for
+the same key. Disconnect cleanup revokes that client's unfinished put sessions.
+Both the DummyClient and the `mooncake_client` daemon must include session RPC
+support; older daemons return an RPC error.
+
+In DummyClient mode, session transfers use the RealClient's mapping for
+registered shared memory. External CPU buffers and, by default, CUDA buffers
+use shared-memory staging. With `setup_dummy(..., cuda_ipc_persistent_registration=True)`,
+the RealClient keeps a CUDA IPC mapping and a Transfer Engine registration for
+the GPU allocation. Persistent registration supports the classic Transfer
+Engine. With RDMA, turn off `MC_RDMA_DATA_DIRECT` to use this mode. A daemon
+using TENT or RDMA Data Direct returns an error before importing the allocation.
+An application with only registered GPU buffers can set `local_buffer_size=0`.
+Use matching DummyClient and daemon versions for persistent registration.
+Synchronize device producer streams before range writes. If a range read or
+write using a persistent CUDA registration loses its RPC reply, the DummyClient
+asks the daemon to finish outstanding accesses and remove this client's
+mappings. After the daemon acknowledges, the range call returns `RPC_FAIL`
+and the caller can reuse the buffers.
+If that acknowledgement also fails, the transfer returns `CUDA_BUFFER_IN_USE`
+(-802). Keep all the client's registered buffers and their contents intact
+and retry `close()` on the same store. After cleanup, set up a new DummyClient
+and register the buffers again to resume transfers.
+
+In persistent mode, match each successful `register_buffer` call with an
+`unregister_buffer` call. Finish in-flight transfers before the final
+unregister and keep the GPU allocation alive until that call succeeds. If a
+registration fails after reaching the daemon, including a lost reply, the
+daemon may still hold the mapping. Retry registration to use the buffer, or
+retry unregistration to confirm cleanup before releasing it. If the daemon
+cannot confirm that a failed memory registration was rolled back, keep the
+allocation alive until the daemon exits. If the daemon shuts down with a CUDA
+mapping still held, its process retains the IPC socket name until exit so a
+replacement daemon cannot acknowledge cleanup on its behalf.
 
 #### batch_get_session_start()
 

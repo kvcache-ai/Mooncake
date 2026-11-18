@@ -5,6 +5,7 @@
 #include <atomic>
 #include <csignal>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
@@ -12,6 +13,7 @@
 #include "client_metric.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "pyclient.h"
+#include "rpc_types.h"
 #include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
 #include <memory>
@@ -20,9 +22,16 @@ namespace mooncake {
 
 class DummyClient : public PyClient {
    public:
-    DummyClient();
+    // Explicit values override the environment; nullopt reads the existing
+    // MC_CUDA_IPC_PERSISTENT_REGISTRATION=1 opt-in (disabled by default).
+    explicit DummyClient(
+        std::optional<bool> cuda_ipc_persistent_registration = std::nullopt);
     // Drains in-flight RPCs before the pool member is released (#3909).
     ~DummyClient();
+
+    bool cuda_transfer_pending() const {
+        return cuda_transfer_state_.load() == CudaTransferState::kPending;
+    }
 
     int64_t unregister_shm();
 
@@ -114,6 +123,27 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) override;
+    std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) override;
+    int batch_get_session_end(const std::vector<std::string> &keys) override;
+    std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+    std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_dst_offsets) override;
+    std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) override;
+    std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) override;
 
     std::vector<int> batch_put_from_cuda_ipc(
         const std::vector<CudaIpcWriteRequest> &requests,
@@ -224,6 +254,7 @@ class DummyClient : public PyClient {
 
    private:
     friend class DummyClientTeardownTestPeer;
+    friend class DummyClientCudaLifecycleTest;
 
     struct PreparedBuffer {
         void *original = nullptr;
@@ -231,6 +262,7 @@ class DummyClient : public PyClient {
         size_t size = 0;
         std::unique_ptr<BufferHandle> staging;
         bool copy_back = false;
+        bool direct_cuda = false;
     };
 
     bool is_device_buffer(void *buffer) const;
@@ -239,6 +271,19 @@ class DummyClient : public PyClient {
     bool is_registered_buffer(void *buffer, size_t size) const;
     int register_external_buffer(void *buffer, size_t size);
     int unregister_external_buffer(void *buffer);
+    std::optional<size_t> registered_cuda_buffer_remaining(void *buffer) const;
+    struct CudaBufferIpcResult {
+        int status;
+        bool sent;
+    };
+    CudaBufferIpcResult cuda_buffer_ipc_request(
+        IpcRequestType type, uint64_t dummy_addr,
+        const CudaIpcBufferHandle &handle, int fd = -1);
+    CudaBufferIpcResult register_cuda_via_ipc(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle);
+    int register_cuda_buffer(void *buffer, size_t size);
+    std::optional<int> unregister_cuda_buffer(void *buffer);
+    int reregister_cuda_buffers();
 #if defined(USE_ASCEND_DIRECT)
     std::optional<size_t> registered_ascend_buffer_remaining(
         void *buffer) const;
@@ -261,6 +306,12 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool copy_to_staging = true, bool copy_back = false);
 
+    std::vector<int> transfer_session_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_offsets, bool is_write);
+
     struct ExternalBufferRegistration {
         size_t size = 0;
         size_t references = 0;
@@ -276,7 +327,29 @@ class DummyClient : public PyClient {
     mutable std::mutex registered_external_buffers_mutex_;
     BufferRegistrationMap registered_external_buffers_;
 
+    enum class CudaRegistrationState { kUnconfirmed, kRegistered, kReleasing };
+    struct CudaBufferRegistration {
+        size_t size = 0;
+        CudaIpcBufferHandle handle;
+        // Count only registrations that returned success to the application.
+        size_t references = 0;
+        CudaRegistrationState state = CudaRegistrationState::kUnconfirmed;
+    };
+    const bool cuda_ipc_persistent_registration_;
+    // Once a direct transfer loses its reply, this UUID can never import
+    // GPU memory again. A delayed data request may still carry its address.
+    enum class CudaTransferState { kActive, kPending, kDrained };
+    std::atomic<CudaTransferState> cuda_transfer_state_{
+        CudaTransferState::kActive};
+    ErrorCode drain_failed_cuda_transfer();
+    int unmap_cuda_client_locked();
+    mutable std::mutex registered_cuda_buffers_mutex_;
+    std::unordered_map<uintptr_t, CudaBufferRegistration>
+        registered_cuda_buffers_;
+
     ErrorCode connect(const std::string &server_address);
+    tl::expected<PingResponse, ErrorCode> ping_daemon(
+        bool establish_context = false);
 
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
                             bool is_local = false);
@@ -364,6 +437,8 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+    // A failed close still needs its unmap RPC after connected_ is cleared.
+    bool remote_cleanup_pending_ = false;
 
 #if defined(USE_ASCEND_DIRECT)
     mutable std::mutex external_fabric_registration_mutex_;

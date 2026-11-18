@@ -310,6 +310,8 @@ add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
 add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
 add_store_test(prefetch_teardown_test prefetch_teardown_test.cpp)
+add_store_test(real_client_teardown_test real_client_teardown_test.cpp)
+set_tests_properties(real_client_teardown_test PROPERTIES TIMEOUT 60)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -474,8 +476,21 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_teardown_test dummy_client_teardown_test.cpp)
+add_store_test(dummy_client_cuda_lifecycle_test
+               dummy_client_cuda_lifecycle_test.cpp)
+if(USE_CUDA)
+  target_compile_definitions(dummy_client_cuda_lifecycle_test PRIVATE USE_CUDA)
+  target_link_libraries(dummy_client_cuda_lifecycle_test
+                        PRIVATE CUDA::cuda_driver CUDA::cudart)
+endif()
+set_tests_properties(dummy_client_cuda_lifecycle_test PROPERTIES TIMEOUT 90)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
+add_test(NAME dummy_client_session_test
+         COMMAND dummy_client_get_buffer_test
+                 --gtest_filter=DummyClientSessionTest.*)
+set_tests_properties(dummy_client_session_test
+                     PROPERTIES ENVIRONMENT "MC_FORCE_TCP=1" TIMEOUT 90)
 add_test(
   NAME dummy_client_object_checksum_test
   COMMAND

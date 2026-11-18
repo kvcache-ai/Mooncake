@@ -581,6 +581,11 @@ class MooncakeStorePyWrapper {
 
     MooncakeStorePyWrapper() = default;
 
+    bool cuda_transfer_pending() const {
+        const auto *dummy = dynamic_cast<const DummyClient *>(store_.get());
+        return dummy && dummy->cuda_transfer_pending();
+    }
+
     // Helper to initialize real client and register it
     std::shared_ptr<RealClient> init_real_client() {
         auto &resource_tracker = ResourceTracker::getInstance();
@@ -2495,6 +2500,8 @@ PYBIND11_MODULE(_store, m) {
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
                bool enable_embedded_master = false) {
+                if (self.cuda_transfer_pending())
+                    return toInt(ErrorCode::CUDA_BUFFER_IN_USE);
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2529,6 +2536,8 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                if (self.cuda_transfer_pending())
+                    return toInt(ErrorCode::CUDA_BUFFER_IN_USE);
                 auto real_client = self.init_real_client();
 
                 // Convert py::dict to ConfigDict (all values as strings)
@@ -2584,10 +2593,25 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
-               size_t local_buffer_size, const std::string &server_address) {
+               size_t local_buffer_size, const std::string &server_address,
+               const py::object &cuda_ipc_persistent_registration) {
+                std::optional<bool> persistent_registration;
+                if (!cuda_ipc_persistent_registration.is_none()) {
+                    if (!py::isinstance<py::bool_>(
+                            cuda_ipc_persistent_registration)) {
+                        throw py::type_error(
+                            "cuda_ipc_persistent_registration must be bool or "
+                            "None");
+                    }
+                    persistent_registration =
+                        cuda_ipc_persistent_registration.cast<bool>();
+                }
+                if (self.cuda_transfer_pending())
+                    return toInt(ErrorCode::CUDA_BUFFER_IN_USE);
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
-                self.store_ = std::make_shared<DummyClient>();
+                self.store_ =
+                    std::make_shared<DummyClient>(persistent_registration);
                 self.real_client_.reset();
                 resource_tracker.registerInstance(
                     std::static_pointer_cast<PyClient>(self.store_));
@@ -2597,7 +2621,16 @@ PYBIND11_MODULE(_store, m) {
                     "@mooncake_client_" + std::to_string(port) + ".sock");
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
-            py::arg("server_address"))
+            py::arg("server_address"),
+            py::arg("cuda_ipc_persistent_registration") = py::none(),
+            "Connect a DummyClient to a same-host RealClient daemon.\n"
+            "cuda_ipc_persistent_registration accepts bool or None: True "
+            "enables persistent CUDA IPC/MR registration, False retains the "
+            "existing staging behavior. None uses "
+            "MC_CUDA_IPC_PERSISTENT_REGISTRATION (only '1' enables it; "
+            "disabled when unset). Explicit values override the environment "
+            "without modifying it. Registration failures are returned as "
+            "errors rather than silently falling back to staging.")
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,
@@ -2759,13 +2792,14 @@ PYBIND11_MODULE(_store, m) {
             "close",
             [](MooncakeStorePyWrapper &self) {
                 int rc = self.store_ ? self.store_->tearDownAll() : 0;
+                if (rc == toInt(ErrorCode::CUDA_BUFFER_IN_USE)) return rc;
                 self.store_.reset();
                 self.real_client_.reset();
                 self.use_dummy_client_ = false;
                 return rc;
             },
-            "Close the store and clear the native client, including on "
-            "cleanup failure. A nonzero result is terminal, not retryable.")
+            "Close the store. If a persistent CUDA transfer is still pending "
+            "(-802), keep the buffers alive and retry close().")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "

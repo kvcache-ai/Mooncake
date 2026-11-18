@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import unittest
+import uuid
 
 try:
     import torch
@@ -1347,6 +1348,277 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         config_str = str(config)
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
+
+
+class TestDummyClientConfiguration(unittest.TestCase):
+    def test_setup_dummy_rejects_non_boolean_persistent_registration(self):
+        store = MooncakeDistributedStore()
+        try:
+            for value in (0, 1, 0.0, 1.0, "0", "1", "false", [], {}, object()):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        TypeError,
+                        "cuda_ipc_persistent_registration must be bool or None",
+                    ):
+                        store.setup_dummy(
+                            0, 0, "", cuda_ipc_persistent_registration=value
+                        )
+        finally:
+            store.close()
+
+
+class TestDummyClientCudaSessions(unittest.TestCase):
+    """CUDA session ranges through a separately running RealClient daemon.
+
+    Build the C++ Store/Python bindings and mooncake_client with USE_CUDA, then
+    run a Master and RealClient on the same host. With services already running:
+
+      MC_CUDA_REAL_CLIENT=127.0.0.1:50052 MOONCAKE_STORE_BACKEND=cpp \
+        python3 -m unittest discover -s mooncake-wheel/tests \
+        -p test_dummy_client.py -k TestDummyClientCudaSessions -v
+
+    Session fragments use DummyClient's registered SHM staging pool by default.
+    Set MC_CUDA_IPC_PERSISTENT_REGISTRATION=1 before creating the client to
+    exercise persistent CUDA IPC/MR registration. setup_dummy also accepts
+    cuda_ipc_persistent_registration=True/False to override the environment;
+    None preserves the environment fallback. Raw pointer callers synchronize
+    their producer stream before submitting session transfers.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        address = os.getenv("MC_CUDA_REAL_CLIENT")
+        if not address:
+            raise unittest.SkipTest("Set MC_CUDA_REAL_CLIENT to a separate daemon")
+        if torch is None:
+            raise unittest.SkipTest("PyTorch is unavailable")
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is unavailable")
+        cls.torch = torch
+        cls.store = MooncakeDistributedStore()
+        result = cls.store.setup_dummy(0, 4 << 20, address)
+        if result != 0:
+            cls.store.close()
+            raise RuntimeError(f"setup_dummy failed: {result}")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+
+    def test_persistent_gpu_only_batch_put_and_adjacent_range_reads(self):
+        torch = self.torch
+        store = MooncakeDistributedStore()
+        self.assertEqual(
+            store.setup_dummy(
+                0,
+                0,
+                os.environ["MC_CUDA_REAL_CLIENT"],
+                cuda_ipc_persistent_registration=True,
+            ),
+            0,
+        )
+        size = 256
+        pool = torch.zeros((4, size), dtype=torch.uint8, device="cuda")
+        pool[0].fill_(17)
+        pool[1].fill_(53)
+        torch.cuda.synchronize()
+        ptrs = [row.data_ptr() for row in pool]
+        registered = []
+        key = f"gpu_only_{uuid.uuid4().hex}"
+        try:
+            # Register adjacent slices separately, from highest address first.
+            for ptr in reversed(ptrs):
+                self.assertEqual(store.register_buffer(ptr, size), 0)
+                registered.append(ptr)
+            config = mooncake_store.ReplicateConfig()
+            config.replica_num = 1
+            config.prefer_alloc_in_same_node = True
+            self.assertEqual(
+                store.batch_put_from([key, key], ptrs[:2], [size, size], config),
+                [0, 0],
+            )
+            self.assertEqual(
+                store.get_into_ranges(
+                    ptrs[2:],
+                    [[key], [key]],
+                    [[[0]], [[0]]],
+                    [[[0]], [[0]]],
+                    [[[size]], [[size]]],
+                ),
+                [[[size]], [[size]]],
+            )
+            self.assertTrue(bool(torch.all(pool[2:].cpu() == 17)))
+        finally:
+            for ptr in reversed(registered):
+                self.assertEqual(store.unregister_buffer(ptr), 0)
+            store.remove(key, force=True)
+            self.assertEqual(store.close(), 0)
+
+    @unittest.skipUnless(
+        os.getenv("MC_TEST_CUDA_NOF") == "1",
+        "Set MC_TEST_CUDA_NOF=1 with a mounted NVMe-oF replica",
+    )
+    def test_persistent_gpu_batch_put_get_nof_with_unaligned_subranges(self):
+        store = MooncakeDistributedStore()
+        torch = self.torch
+        size = 4096
+        source = torch.full((size + 1,), 91, dtype=torch.uint8, device="cuda")
+        dest = torch.zeros_like(source)
+        torch.cuda.synchronize()
+        key = f"cuda_nof_{uuid.uuid4().hex}"
+        registered = []
+        self.assertEqual(
+            store.setup_dummy(
+                0,
+                0,
+                os.environ["MC_CUDA_REAL_CLIENT"],
+                cuda_ipc_persistent_registration=True,
+            ),
+            0,
+        )
+        try:
+            for tensor in (source, dest):
+                self.assertEqual(store.register_buffer(tensor.data_ptr(), size + 1), 0)
+                registered.append(tensor)
+            config = mooncake_store.ReplicateConfig()
+            config.replica_num = 0
+            config.nof_replica_num = 1
+            self.assertEqual(
+                store.batch_put_from([key], [source.data_ptr() + 1], [size], config),
+                [0],
+            )
+            self.assertEqual(
+                store.batch_get_into([key], [dest.data_ptr() + 1], [size]), [size]
+            )
+            self.assertEqual(dest[0].item(), 0)
+            self.assertTrue(torch.equal(dest[1:].cpu(), source[1:].cpu()))
+        finally:
+            store.remove(key, force=True)
+            for tensor in registered:
+                self.assertEqual(store.unregister_buffer(tensor.data_ptr()), 0)
+            self.assertEqual(store.close(), 0)
+
+    def test_registered_cuda_layers_fragments_bounds_and_partial_results(self):
+        torch = self.torch
+        layers, page, count, guard = 3, 64, 3, 8
+        object_size = layers * page
+        stride = object_size + 2 * guard
+        keys = [f"cuda_session_{uuid.uuid4().hex}_{i}" for i in range(count)]
+        missing = f"cuda_session_missing_{uuid.uuid4().hex}"
+        expected = (
+            torch.arange(count * object_size, dtype=torch.int64)
+            .remainder(127)
+            .to(torch.uint8)
+            .reshape(count, object_size)
+        )
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            source = expected.to("cuda")
+            destination = torch.full(
+                (count, stride), 165, dtype=torch.uint8, device="cuda"
+            )
+        stream.synchronize()
+        owners = (source, destination)
+        registered = []
+        try:
+            for owner in owners:
+                self.assertEqual(
+                    self.store.register_buffer(owner.data_ptr(), owner.numel()), 0
+                )
+                registered.append(owner)
+            self.assertEqual(
+                self.store.batch_put_session_start(keys, [object_size] * count),
+                [0] * count,
+            )
+            for layer in range(layers):
+                pointers = [
+                    [
+                        source[i].data_ptr() + layer * page,
+                        source[i].data_ptr() + layer * page + 17,
+                    ]
+                    for i in range(count)
+                ]
+                self.assertEqual(
+                    self.store.batch_put_from_multi_buffer_ranges(
+                        keys,
+                        pointers,
+                        [[17, 47] for _ in keys],
+                        [[layer * page, layer * page + 17] for _ in keys],
+                    ),
+                    [page] * count,
+                )
+            self.assertEqual(self.store.batch_put_session_end(keys), [0] * count)
+            self.assertEqual(self.store.batch_get_session_start(keys), [0] * count)
+
+            # Both a registered-range violation and an object-range violation
+            # must fail before changing the destination or invalidating a
+            # usable session.
+            self.assertLess(
+                self.store.batch_get_into_multi_buffer_ranges(
+                    [keys[0]],
+                    [[destination.data_ptr() + destination.numel() - 1]],
+                    [[2]],
+                    [[0]],
+                )[0],
+                0,
+            )
+            self.assertLess(
+                self.store.batch_get_into_multi_buffer_ranges(
+                    [keys[0]], [[destination.data_ptr()]], [[1]], [[object_size]]
+                )[0],
+                0,
+            )
+            self.assertTrue(bool(torch.all(destination.cpu() == 165)))
+            for layer in range(layers):
+                pointers = [
+                    [
+                        destination[i].data_ptr() + guard + layer * page + 17,
+                        destination[i].data_ptr() + guard + layer * page,
+                    ]
+                    for i in range(count)
+                ]
+                self.assertEqual(
+                    self.store.batch_get_into_multi_buffer_ranges(
+                        keys,
+                        pointers,
+                        [[47, 17] for _ in keys],
+                        [[layer * page + 17, layer * page] for _ in keys],
+                    ),
+                    [page] * count,
+                )
+            actual = destination.cpu()
+            self.assertTrue(torch.equal(actual[:, guard:-guard], expected))
+            self.assertTrue(bool(torch.all(actual[:, :guard] == 165)))
+            self.assertTrue(bool(torch.all(actual[:, -guard:] == 165)))
+
+            result = self.store.batch_get_session_start([keys[0], missing])
+            self.assertEqual(result[0], 0)
+            self.assertLess(result[1], 0)
+            result = self.store.batch_get_into_multi_buffer_ranges(
+                [keys[0], missing],
+                [[destination[0].data_ptr() + guard], [destination[1].data_ptr()]],
+                [[page], [guard]],
+                [[0], [0]],
+            )
+            self.assertEqual(result[0], page)
+            self.assertLess(result[1], 0)
+            self.assertTrue(bool(torch.all(destination[1, :guard].cpu() == 165)))
+            self.assertEqual(self.store.batch_get_session_end(keys + [missing]), 0)
+            self.assertLess(
+                self.store.batch_get_into_multi_buffer_ranges(
+                    [keys[0]], [[destination.data_ptr()]], [[1]], [[0]]
+                )[0],
+                0,
+            )
+        finally:
+            # Revoke is also valid cleanup after a failed assertion during a
+            # partially written object; completed puts need no reservation.
+            self.store.batch_get_session_end(keys + [missing])
+            self.store.batch_put_session_revoke(keys)
+            for owner in reversed(registered):
+                self.store.unregister_buffer(owner.data_ptr())
+            for key in keys:
+                self.store.remove(key, force=True)
 
 
 if __name__ == "__main__":
