@@ -288,7 +288,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
         auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+            MountLocalDiskSegment(enable_offloading_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
@@ -668,6 +668,14 @@ FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
 bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
     return error == ErrorCode::INVALID_READ ||
            error == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
+tl::expected<void, ErrorCode> FileStorage::MountLocalDiskSegment(
+    bool enable_offloading) {
+    const bool supports_versioned_offload =
+        dynamic_cast<BucketStorageBackend*>(storage_backend_.get()) != nullptr;
+    return client_->MountLocalDiskSegment(enable_offloading,
+                                          supports_versioned_offload);
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -1182,8 +1190,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in

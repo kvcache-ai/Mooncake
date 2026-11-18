@@ -8089,23 +8089,31 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
 
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
+    std::string fsdir;
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
                "data is disabled.";
-        return GetStorageConfigResponse("", enable_disk_eviction_,
-                                        quota_bytes_);
+    } else {
+        fsdir = root_fs_dir_ + "/" + cluster_id_;
     }
-    std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
-    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+    GetStorageConfigResponse config(fsdir, enable_disk_eviction_, quota_bytes_);
+    if (versioned_local_disk_) {
+        config.requires_versioned_local_disk = true;
+    }
+    return config;
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,
-                                          bool enable_offloading)
+                                          bool enable_offloading,
+                                          bool versioned)
     -> tl::expected<void, ErrorCode> {
     if (!enable_offload_) {
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
+    }
+    if (versioned != versioned_local_disk_) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
     }
     auto registration = client_sessions_.BeginRegistration(client_id);
     if (!registration) {
