@@ -401,7 +401,9 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     if (isCudaMemory(addr)) {
         useCudaDeviceOf(addr);
         std::vector<uint8_t> act_data(length);
-        cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        auto err = cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }
@@ -423,7 +425,9 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #ifdef USE_HIP
     if (isHipMemory(addr)) {
         std::vector<uint8_t> act_data(length);
-        hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);
+        auto err = hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);
+        LOG_ASSERT(err == hipSuccess)
+            << "hipMemcpy failed: " << hipGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }
