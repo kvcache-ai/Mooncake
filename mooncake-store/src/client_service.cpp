@@ -1875,7 +1875,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             const auto& desc = replica.get_dfs_descriptor();
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
+                DfsReadRequest{.key = key,
+                               .descriptor = desc,
+                               .slices = slices_it->second,
+                               .source_replica_id = replica.id});
             dfs_read_indices.push_back(i);
             dfs_read_replicas.push_back(replica);
             continue;
@@ -5370,7 +5373,11 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
 
     auto* dfs_metric = GetDfsMetricPtr();
     const auto& desc = replica_descriptor.get_dfs_descriptor();
-    std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
+    std::vector<DfsReadRequest> requests{
+        DfsReadRequest{.key = key,
+                       .descriptor = desc,
+                       .slices = slices,
+                       .source_replica_id = replica_descriptor.id}};
     const auto read_start = std::chrono::steady_clock::now();
     auto results = dfs_storage_backend_->BatchRead(requests);
     const auto read_latency_us = elapsed_us_since(read_start);
@@ -5485,7 +5492,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchReadFileReplicaRanges(
                                               replicas[i].get_dfs_descriptor(),
                                               {windows[i]},
                                               value_offsets[i],
-                                              true});
+                                              true,
+                                              replicas[i].id});
         dfs_indexes.push_back(i);
         results[i] = {};
     }
