@@ -39,6 +39,7 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
+    ObjectIncarnation incarnation{};
 };
 YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
 
@@ -315,6 +316,7 @@ class StorageBackendInterface {
 
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
         const std::vector<std::string>& evicted_keys)>;
+    using ObjectVersions = std::unordered_map<std::string, ObjectIncarnation>;
 
     virtual tl::expected<void, ErrorCode> Init() = 0;
 
@@ -323,7 +325,8 @@ class StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        EvictionHandler eviction_handler = nullptr) = 0;
+        EvictionHandler eviction_handler = nullptr,
+        const ObjectVersions* versions = nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -756,7 +759,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        EvictionHandler eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr,
+        const ObjectVersions* versions = nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -862,7 +866,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        EvictionHandler eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr,
+        const ObjectVersions* versions = nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -1062,7 +1067,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-        int disk_index);
+        int disk_index, std::string& serialized_metadata);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -1410,7 +1415,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        EvictionHandler eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr,
+        const ObjectVersions* versions = nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.

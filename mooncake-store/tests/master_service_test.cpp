@@ -3993,6 +3993,239 @@ TEST_F(MasterServiceTest, WrappedRequestBoundaryRejectsInvalidTenantIds) {
     EXPECT_EQ(service.RemoveAll(false, "_invalid-tenant"), 0);
 }
 
+TEST_F(MasterServiceTest, OldOffloadAckDoesNotAttachToRecreatedKey) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const auto [segment_id, client_id] = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+    const std::string key = "recreated-offload-ack";
+    const ReplicateConfig config;
+    PutCompletedObject(service, client_id, key, config);
+    auto old_tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(old_tasks);
+    ASSERT_EQ(old_tasks->size(), 1u);
+    ASSERT_TRUE(service.Remove(key, tenant, true));
+    PutCompletedObject(service, client_id, key, config);
+    auto current_tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(current_tasks);
+    ASSERT_EQ(current_tasks->size(), 1u);
+    EXPECT_NE(old_tasks->front().GetObjectIncarnation(),
+              current_tasks->front().GetObjectIncarnation());
+
+    StorageObjectMetadata old_disk{1, 0, 0, 1024, "old-endpoint"};
+    old_disk.object_incarnation = old_tasks->front().GetObjectIncarnation();
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, *old_tasks, {old_disk}));
+    auto replicas = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(replicas);
+    EXPECT_FALSE(std::any_of(replicas->replicas.begin(),
+                             replicas->replicas.end(),
+                             [](const Replica::Descriptor& replica) {
+                                 return replica.is_local_disk_replica();
+                             }));
+
+    StorageObjectMetadata current_disk{2, 0, 0, 1024, "current-endpoint"};
+    current_disk.object_incarnation =
+        current_tasks->front().GetObjectIncarnation();
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, *current_tasks,
+                                             {current_disk}));
+    replicas = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(replicas);
+    const auto disk =
+        std::find_if(replicas->replicas.begin(), replicas->replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.is_local_disk_replica();
+                     });
+    ASSERT_NE(disk, replicas->replicas.end());
+    EXPECT_EQ(disk->get_local_disk_descriptor().transport_endpoint,
+              "current-endpoint");
+}
+
+TEST_F(MasterServiceTest, OldOffloadNackKeepsRecreatedKeysSourcePinned) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const auto [segment_id, client_id] = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+    const std::string key = "recreated-offload-nack";
+    const ReplicateConfig config;
+    PutCompletedObject(service, client_id, key, config);
+    auto old_tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(old_tasks);
+    ASSERT_EQ(old_tasks->size(), 1u);
+    ASSERT_TRUE(service.Remove(key, tenant, true));
+    PutCompletedObject(service, client_id, key, config);
+    auto current_tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(current_tasks);
+    ASSERT_EQ(current_tasks->size(), 1u);
+
+    const StorageObjectMetadata nack{-1, 0, 0, -1, ""};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, *old_tasks, {nack}));
+    auto blocked = service.UpsertStart(client_id, key, tenant, 1024, config);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, *current_tasks, {nack}));
+    EXPECT_TRUE(service.UpsertStart(client_id, key, tenant, 1024, config));
+}
+
+TEST_F(MasterServiceTest, LateDiskRegistrationDoesNotAttachToRecreatedKey) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const auto [segment_id, client_id] = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+    const std::string key = "recreated-offload-registration";
+    const ReplicateConfig config;
+    PutCompletedObject(service, client_id, key, config);
+    auto old_tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(old_tasks);
+    ASSERT_EQ(old_tasks->size(), 1u);
+    StorageObjectMetadata old_disk{1, 0, 0, 1024, "old-endpoint"};
+    old_disk.object_incarnation = old_tasks->front().GetObjectIncarnation();
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, *old_tasks, {old_disk}));
+    ASSERT_TRUE(service.Remove(key, tenant, true));
+    OffloadTaskItem scan = old_tasks->front();
+    scan.attempt_id.reset();
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {scan}, {old_disk}));
+    const auto erased = service.ExistKey(key, tenant);
+    ASSERT_TRUE(erased);
+    EXPECT_FALSE(*erased);
+    PutCompletedObject(service, client_id, key, config);
+    auto current_tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(current_tasks);
+    ASSERT_EQ(current_tasks->size(), 1u);
+    const StorageObjectMetadata nack{-1, 0, 0, -1, ""};
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, *current_tasks, {nack}));
+
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {scan}, {old_disk}));
+    const auto replicas = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(replicas);
+    EXPECT_FALSE(std::any_of(replicas->replicas.begin(),
+                             replicas->replicas.end(),
+                             [](const Replica::Descriptor& replica) {
+                                 return replica.is_local_disk_replica();
+                             }));
+
+    scan.object_incarnation.reset();
+    old_disk.object_incarnation.reset();
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {scan}, {old_disk}));
+    const auto after_legacy_scan = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(after_legacy_scan);
+    EXPECT_EQ(after_legacy_scan->replicas.size(), 1u);
+}
+
+TEST_F(MasterServiceTest, OffloadRetryAndInPlaceUpsertUseDistinctIdentities) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    auto master_config =
+        MasterServiceConfig::builder().set_enable_offload(true).build();
+    master_config.offload_on_evict = true;
+    MasterService service(master_config);
+    const auto [segment_id, client_id] = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+    const std::string key = "same-version-offload-retry";
+    const ReplicateConfig config;
+    PutCompletedObject(service, client_id, key, config);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    const auto first = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->size(), 1u);
+
+    const StorageObjectMetadata nack{-1, 0, 0, -1, ""};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, *first, {nack}));
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    const auto retry = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(retry);
+    ASSERT_EQ(retry->size(), 1u);
+    EXPECT_EQ(first->front().GetObjectIncarnation(),
+              retry->front().GetObjectIncarnation());
+    ASSERT_TRUE(first->front().attempt_id);
+    ASSERT_TRUE(retry->front().attempt_id);
+    EXPECT_NE(*first->front().attempt_id, *retry->front().attempt_id);
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, *first, {nack}));
+    auto blocked = service.UpsertStart(client_id, key, tenant, 1024, config);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, *retry, {nack}));
+    ASSERT_TRUE(service.UpsertStart(client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(service.UpsertEnd(client_id, key, tenant, ReplicaType::MEMORY));
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    const auto replacement = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(replacement);
+    ASSERT_EQ(replacement->size(), 1u);
+    EXPECT_NE(retry->front().GetObjectIncarnation(),
+              replacement->front().GetObjectIncarnation());
+
+    StorageObjectMetadata old_disk{1, 0, 0, 1024, "old-endpoint"};
+    old_disk.object_incarnation = retry->front().GetObjectIncarnation();
+    StorageObjectMetadata new_disk{2, 0, 0, 1024, "new-endpoint"};
+    new_disk.object_incarnation = replacement->front().GetObjectIncarnation();
+    ASSERT_TRUE(service.NotifyOffloadSuccess(
+        client_id, {retry->front(), replacement->front()},
+        {old_disk, new_disk}));
+    const auto replicas = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(replicas);
+    const auto disk =
+        std::find_if(replicas->replicas.begin(), replicas->replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.is_local_disk_replica();
+                     });
+    ASSERT_NE(disk, replicas->replicas.end());
+    EXPECT_EQ(disk->get_local_disk_descriptor().transport_endpoint,
+              "new-endpoint");
+}
+
+TEST_F(MasterServiceTest, UnmountedOffloadMirrorCannotCancelMountedMirror) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const auto first = PrepareSimpleSegment(service, "first");
+    const auto second = PrepareSimpleSegment(
+        service, "second", kDefaultSegmentBase + kDefaultSegmentSize);
+    ASSERT_TRUE(service.MountLocalDiskSegment(first.client_id, true));
+    ASSERT_TRUE(service.MountLocalDiskSegment(second.client_id, true));
+    const std::string key = "two-offload-mirrors";
+    ReplicateConfig config;
+    config.replica_num = 2;
+    PutCompletedObject(service, first.client_id, key, config);
+    const auto first_work =
+        service.OffloadObjectHeartbeat(first.client_id, true);
+    const auto second_work =
+        service.OffloadObjectHeartbeat(second.client_id, true);
+    ASSERT_TRUE(first_work);
+    ASSERT_TRUE(second_work);
+    ASSERT_EQ(first_work->size(), 1u);
+    ASSERT_EQ(second_work->size(), 1u);
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(first.client_id));
+
+    StorageObjectMetadata stored{1, 0, 0, 1024, "disk-endpoint"};
+    stored.object_incarnation = first_work->front().GetObjectIncarnation();
+    const auto stale =
+        service.NotifyOffloadSuccess(first.client_id, *first_work, {stored});
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(stale.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(second.client_id, *second_work, {stored}));
+    const auto replicas = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas);
+    const auto disk =
+        std::find_if(replicas->replicas.begin(), replicas->replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.is_local_disk_replica();
+                     });
+    ASSERT_NE(disk, replicas->replicas.end());
+    EXPECT_EQ(disk->get_local_disk_descriptor().client_id, second.client_id);
+}
+
 TEST_F(MasterServiceTest, WrappedRequestBoundaryPreservesTenantNormalization) {
     WrappedMasterService multi_tenant_service(
         MakeStrictWrappedConfig({std::string(TenantId::kDefaultValue)}));

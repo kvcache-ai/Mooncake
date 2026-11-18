@@ -36,6 +36,7 @@
 #include "config/dfs_enablement_config.h"
 #include "config/master_metadata_config.h"
 #include "environ.h"
+#include "environment_variables.h"
 #include "segment.h"
 #include "segment/region_driver.h"
 // nof_runtime.h is compiled unconditionally (returns a null initiator in
@@ -353,10 +354,20 @@ struct MasterService::MemoryEviction {
         explicit OffloadQueue(MasterService& service) : service_(service) {}
 
         bool Push(const TenantId& tenant_id, const std::string& key,
-                  Replica& source, std::vector<UUID>* mirror_clients) override {
+                  Replica& source, ObjectIncarnation& incarnation,
+                  UUID& attempt_id,
+                  std::vector<UUID>* mirror_clients) override {
+            if (service_.versioned_local_disk_) {
+                if (incarnation.IsZero()) {
+                    incarnation = GenerateObjectIncarnation();
+                }
+                if (attempt_id == UUID{}) {
+                    attempt_id = generate_uuid();
+                }
+            }
             return service_
                 .PushOffloadingQueue(ObjectIdentity{tenant_id, key}, source,
-                                     mirror_clients)
+                                     incarnation, attempt_id, mirror_clients)
                 .has_value();
         }
 
@@ -498,6 +509,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      versioned_local_disk_(
+          enable_offload_ &&
+          Environ::ReadOr(MasterMetadataEnvironmentVariables::
+                              MOONCAKE_LOCAL_DISK_INCARNATIONS,
+                          false)),
       dynamic_replication_(config.dynamic_replication_mode,
                            config.dynamic_replication_heat_window_seconds,
                            config.dynamic_replication_admission_qps_threshold,
@@ -3575,6 +3591,8 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
+        metadata.incarnation =
+            standby_meta.object_incarnation.value_or(ObjectIncarnation{});
         const uint8_t live_media = KvMediaMasksForMetadata(metadata).live;
         accessor.GetState().announced_kv_media = live_media;
         accessor.GetState().live_kv_media = live_media;
@@ -5144,6 +5162,9 @@ auto MasterService::InsertMetadata(
                      config.with_hard_pin, config.data_type, group_id,
                      tenant_id, key, residency_affinity_id);
     auto& metadata = accessor.Get();
+    if (versioned_local_disk_) {
+        metadata.incarnation = GenerateObjectIncarnation();
+    }
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
                                 std::move(eligible_replica_ids));
@@ -5555,7 +5576,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
     }
 
-    if (replica_type != ReplicaType::DFS && enable_offload_ &&
+    if (!accessor.GetState().offloading_task &&
+        replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
@@ -5564,22 +5586,29 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         // collected before the marker is recorded.
         std::optional<ReplicaID> source_id;
         std::vector<UUID> mirror_clients;
+        const UUID attempt_id =
+            versioned_local_disk_ ? generate_uuid() : UUID{};
+        if (versioned_local_disk_ && metadata.incarnation.IsZero()) {
+            metadata.incarnation = GenerateObjectIncarnation();
+        }
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
-                auto result =
-                    PushOffloadingQueue(object_id, replica, &mirror_clients);
+            [this, &object_id, &source_id, &mirror_clients, &metadata,
+             &attempt_id](Replica& replica) {
+                auto result = PushOffloadingQueue(object_id, replica,
+                                                  metadata.incarnation,
+                                                  attempt_id, &mirror_clients);
                 if (result && !source_id.has_value()) {
                     replica.inc_refcnt();
                     source_id = replica.id();
                 }
             });
-        if (source_id.has_value() && !state.offloading_task) {
+        if (source_id.has_value()) {
             state.offloading_task =
                 OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients)};
+                               std::move(mirror_clients), attempt_id};
         }
     }
 
@@ -5621,10 +5650,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
-auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
-                                                const std::string& key,
-                                                const TenantId& tenant_id,
-                                                Replica& replica)
+auto MasterService::AddReplicaForRetainedClient(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    Replica& replica, std::optional<ObjectIncarnation> scanned_incarnation)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
@@ -5651,9 +5679,22 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
+    if (replica.type() != ReplicaType::LOCAL_DISK) {
+        LOG(ERROR) << "Invalid replica type: " << replica.type()
+                   << ". Expected ReplicaType::LOCAL_DISK.";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
+    if (scanned_incarnation &&
+        (scanned_incarnation->IsZero() || !accessor.IsPublished() ||
+         accessor.Get().incarnation != *scanned_incarnation ||
+         accessor.Get().TotalLength() !=
+             replica.get_descriptor().get_local_disk_descriptor().object_size ||
+         accessor.InProcessing())) {
+        return false;
+    }
     if (!accessor.IsPublished()) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
@@ -5662,12 +5703,6 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
-    if (replica.type() != ReplicaType::LOCAL_DISK) {
-        LOG(ERROR) << "Invalid replica type: " << replica.type()
-                   << ". Expected ReplicaType::LOCAL_DISK.";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
@@ -6144,10 +6179,31 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_bucket_dfs_replica =
                     bucket_allocator_ != nullptr &&
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                // The upsert client writes memory, NOF and DFS. A LOCAL_DISK
+                // replica cannot be carried into the replacement version.
+                const bool has_local_disk_replica =
+                    versioned_local_disk_ &&
+                    metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+                const bool needs_writable_replica =
+                    has_local_disk_replica &&
+                    !metadata.HasReplica([](const Replica& replica) {
+                        return replica.is_completed() &&
+                               (replica.is_memory_replica() ||
+                                replica.is_nof_replica());
+                    });
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
-                    !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
+                    !has_bucket_dfs_replica && !restore_missing_bucket_dfs &&
+                    !needs_writable_replica) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    metadata.incarnation = versioned_local_disk_
+                                               ? GenerateObjectIncarnation()
+                                               : ObjectIncarnation{};
+
+                    if (has_local_disk_replica) {
+                        EraseReplicasWithCacheTotalAccounting(
+                            metadata, &Replica::fn_is_local_disk_replica);
+                    }
 
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
@@ -6214,7 +6270,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // old metadata so an allocation failure leaves the old object
                 // readable instead of turning it into OBJECT_NOT_FOUND.
                 std::optional<std::vector<Replica>> replacement_replicas;
-                if (has_read_lease) {
+                if (has_read_lease || needs_writable_replica) {
                     auto grown = accessor.Grow(SaturatingMultiply(
                         slice_length, allocation_config.replica_num));
                     if (!grown) {
@@ -8242,15 +8298,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             MakeObjectIdentity(task.key, TenantId(task.tenant_id));
         MetadataAccessorRW accessor(this, object_id);
         if (accessor.Exists()) {
-            auto& offloading_task = accessor.GetState().offloading_task;
-            if (offloading_task) {
-                auto source =
-                    accessor.Get().GetReplicaByID(offloading_task->source_id);
-                if (source) {
-                    source->dec_refcnt();
-                }
-                offloading_task.reset();
-            }
+            FailOffloadMirror(accessor.Get(), accessor.GetState(), client_id,
+                              task);
         }
     }
     return std::vector<OffloadTaskItem>{};
@@ -8331,18 +8380,11 @@ auto MasterService::NotifyOffloadSuccess(
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
-            if (accessor.Exists()) {
-                auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
-                    MasterMetricManager::instance().inc_offload_failed(
-                        UuidToString(client_id));
-                }
+            if (accessor.Exists() &&
+                FailOffloadMirror(accessor.Get(), accessor.GetState(),
+                                  client_id, task)) {
+                MasterMetricManager::instance().inc_offload_failed(
+                    UuidToString(client_id));
             }
             continue;
         }
@@ -8352,7 +8394,8 @@ auto MasterService::NotifyOffloadSuccess(
                         owner_session);
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
-        {
+        const bool realtime = !versioned_local_disk_ || task.attempt_id;
+        if (realtime) {
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             // A disk replica may only be registered for a client whose
@@ -8387,6 +8430,35 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (offloading_task) {
+                    if (versioned_local_disk_ &&
+                        (offloading_task->attempt_id != *task.attempt_id ||
+                         obj_metadata.incarnation !=
+                             task.GetObjectIncarnation() ||
+                         std::ranges::find(offloading_task->mirror_clients,
+                                           client_id) ==
+                             offloading_task->mirror_clients.end())) {
+                        // An expired report must not roll back other items
+                        // in the holder's committed bucket.
+                        continue;
+                    }
+                    if (versioned_local_disk_ &&
+                        (metadata.GetObjectIncarnation() !=
+                             obj_metadata.incarnation ||
+                         metadata.data_size != task.size ||
+                         static_cast<uint64_t>(metadata.data_size) !=
+                             obj_metadata.TotalLength())) {
+                        LOG(WARNING) << "Offload result lacks valid disk "
+                                        "metadata for its attempt";
+                        FailOffloadMirror(obj_metadata, accessor.GetState(),
+                                          client_id, task);
+                        continue;
+                    }
+                    if (versioned_local_disk_ && !segment_mounted) {
+                        FailOffloadMirror(obj_metadata, accessor.GetState(),
+                                          client_id, task);
+                        refused_unmounted = true;
+                        continue;
+                    }
                     auto source =
                         obj_metadata.GetReplicaByID(offloading_task->source_id);
                     if (source != nullptr) {
@@ -8436,6 +8508,11 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         if (!handled_existing_object) {
+            if (versioned_local_disk_ &&
+                (realtime || metadata.GetObjectIncarnation() !=
+                                 task.GetObjectIncarnation())) {
+                continue;
+            }
             auto normalized_tenant_result =
                 ResolveTenantIdForWrite(request_object_id.tenant_id);
             if (!normalized_tenant_result) {
@@ -8446,7 +8523,10 @@ auto MasterService::NotifyOffloadSuccess(
                 request_object_id.user_key};
 
             auto res = AddReplicaForRetainedClient(
-                client_id, object_id.user_key, object_id.tenant_id, replica);
+                client_id, object_id.user_key, object_id.tenant_id, replica,
+                versioned_local_disk_
+                    ? std::make_optional(task.GetObjectIncarnation())
+                    : std::nullopt);
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
@@ -8482,6 +8562,7 @@ auto MasterService::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
+    const ObjectIncarnation& incarnation, const UUID& attempt_id,
     std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
     // No source segment names means there is no usable source segment to
@@ -8535,12 +8616,15 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         }
         const int64_t size =
             source_descriptor.get_memory_descriptor().buffer_descriptor.size_;
+        OffloadTaskItem task{.tenant_id = object_id.tenant_id.value(),
+                             .key = object_id.user_key,
+                             .size = size};
+        if (versioned_local_disk_) {
+            task.object_incarnation = incarnation;
+            task.attempt_id = attempt_id;
+        }
         auto err = local_ssd_manager_.EnqueueOffload(
-            *client_id,
-            OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
-                            .key = object_id.user_key,
-                            .size = size},
-            offloading_queue_limit_);
+            *client_id, std::move(task), offloading_queue_limit_);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
@@ -8565,6 +8649,31 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
+}
+
+bool MasterService::FailOffloadMirror(ObjectMetadata& metadata,
+                                      route::ObjectState& state,
+                                      const UUID& client_id,
+                                      const OffloadTaskItem& report) {
+    auto& task = state.offloading_task;
+    if (!task) {
+        return false;
+    }
+    if (versioned_local_disk_) {
+        if (!report.attempt_id || task->attempt_id != *report.attempt_id ||
+            metadata.incarnation != report.GetObjectIncarnation() ||
+            std::erase(task->mirror_clients, client_id) == 0) {
+            return false;
+        }
+        if (!task->mirror_clients.empty()) {
+            return true;
+        }
+    }
+    if (auto* source = metadata.GetReplicaByID(task->source_id)) {
+        source->dec_refcnt();
+    }
+    task.reset();
+    return true;
 }
 
 bool MasterService::CancelQueuedOffloadTask(ObjectMetadata& metadata,
@@ -11787,6 +11896,9 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
     payload.residency_affinity_id = metadata.residency_affinity_id;
+    if (!metadata.incarnation.IsZero()) {
+        payload.object_incarnation = metadata.incarnation;
+    }
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

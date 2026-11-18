@@ -79,6 +79,147 @@ namespace mooncake {
 
 namespace {
 
+constexpr std::string_view kBucketIncarnationSuffix = ".incarnation";
+constexpr uint32_t kBucketIncarnationFormat = 1;
+
+struct BucketFileStamp {
+    uint64_t inode;
+    int64_t modified_seconds;
+    int64_t modified_nanoseconds;
+
+    bool operator==(const BucketFileStamp&) const = default;
+};
+YLT_REFL(BucketFileStamp, inode, modified_seconds, modified_nanoseconds);
+
+struct BucketIncarnationMetadata {
+    uint32_t format;
+    int64_t bucket_id;
+    BucketFileStamp metadata_file;
+    BucketFileStamp data_file;
+    uint64_t metadata_size;
+    uint32_t metadata_crc32c;
+    std::vector<ObjectIncarnation> incarnations;
+};
+YLT_REFL(BucketIncarnationMetadata, format, bucket_id, metadata_file, data_file,
+         metadata_size, metadata_crc32c, incarnations);
+
+std::string BucketIncarnationPath(const std::string& metadata_path) {
+    auto path = std::filesystem::path(metadata_path);
+    return path.replace_extension(kBucketIncarnationSuffix).string();
+}
+
+std::optional<BucketFileStamp> GetBucketFileStamp(const std::string& path) {
+    struct stat info{};
+    if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
+        return std::nullopt;
+    }
+#ifdef __APPLE__
+    const auto& modified = info.st_mtimespec;
+#else
+    const auto& modified = info.st_mtim;
+#endif
+    return BucketFileStamp{static_cast<uint64_t>(info.st_ino), modified.tv_sec,
+                           modified.tv_nsec};
+}
+
+bool SyncBucketDirectory(const std::string& path) {
+    auto directory = std::filesystem::path(path).parent_path();
+    if (directory.empty()) {
+        directory = ".";
+    }
+    FdGuard fd(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (fd.get() < 0 || fsync(fd.get()) != 0) {
+        LOG(ERROR) << "Cannot sync bucket directory " << directory
+                   << ErrnoSuffix(errno);
+        return false;
+    }
+    return true;
+}
+
+bool RemoveBucketIncarnationFiles(const std::string& metadata_path) {
+    const auto version_path = BucketIncarnationPath(metadata_path);
+    struct stat info{};
+    // Persist the removal of the commit marker before discarding its version
+    // proof. A crash can leave a sidecar without a .meta, which Init ignores.
+    const int status = lstat(version_path.c_str(), &info);
+    if (status != 0 && errno != ENOENT) {
+        LOG(WARNING) << "Failed to inspect bucket incarnation file "
+                     << version_path << ErrnoSuffix(errno);
+        return false;
+    }
+    if (status == 0 && !SyncBucketDirectory(metadata_path)) {
+        return false;
+    }
+    bool removed = true;
+    for (const auto& path :
+         {version_path, version_path + ".tmp", metadata_path + ".tmp"}) {
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+            LOG(WARNING) << "Failed to remove bucket incarnation file " << path
+                         << ErrnoSuffix(errno);
+            removed = false;
+        }
+    }
+    return removed;
+}
+
+tl::expected<size_t, ErrorCode> LoadBucketIncarnations(
+    int64_t bucket_id, const std::string& metadata_path,
+    const std::string& data_path, const std::string& serialized_metadata,
+    BucketMetadata& bucket) {
+    const auto path = BucketIncarnationPath(metadata_path);
+    const int fd =
+        open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        if (errno == ENOENT) return size_t{0};
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    PosixFile file(path, fd);
+    struct stat info{};
+    // Each incarnation contains at most two 10-byte varints plus field tags.
+    const size_t max_size = bucket.metadatas.size() * 32 + 128;
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size < static_cast<off_t>(sizeof(uint32_t)) ||
+        static_cast<uint64_t>(info.st_size) > max_size) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::string bytes;
+    const auto size = static_cast<size_t>(info.st_size);
+    const auto read_result = file.read(bytes, size);
+    if (!read_result || *read_result != size) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    uint32_t checksum;
+    const auto payload_size = size - sizeof(checksum);
+    std::memcpy(&checksum, bytes.data() + payload_size, sizeof(checksum));
+    if (checksum != Crc32cValue(bytes.data(), payload_size)) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    bytes.resize(payload_size);
+    BucketIncarnationMetadata saved{};
+    try {
+        struct_pb::from_pb(saved, bytes);
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Cannot decode bucket incarnation file " << path << ": "
+                   << error.what();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (saved.format != kBucketIncarnationFormat ||
+        saved.bucket_id != bucket_id ||
+        GetBucketFileStamp(metadata_path) != saved.metadata_file ||
+        GetBucketFileStamp(data_path) != saved.data_file ||
+        saved.metadata_size != serialized_metadata.size() ||
+        saved.metadata_crc32c != Crc32cValue(serialized_metadata.data(),
+                                             serialized_metadata.size()) ||
+        saved.incarnations.size() != bucket.metadatas.size()) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    for (size_t i = 0; i < saved.incarnations.size(); ++i) {
+        bucket.metadatas[i].incarnation = saved.incarnations[i];
+    }
+    return size;
+}
+
 // True when `other` is `base` itself or lives underneath it. Compares path
 // components so that "/data/d1" is not treated as nested inside "/data/d".
 bool PathContainsOrEquals(const std::string& base, const std::string& other) {
@@ -1346,7 +1487,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    EvictionHandler eviction_handler) {
+    EvictionHandler eviction_handler, const ObjectVersions* /*versions*/) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1682,7 +1823,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    EvictionHandler eviction_handler) {
+    EvictionHandler eviction_handler, const ObjectVersions* versions) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1710,6 +1851,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(build_bucket_result.error());
     }
     auto bucket = build_bucket_result.value();
+    if (versions) {
+        for (size_t i = 0; i < bucket->keys.size(); ++i) {
+            const auto version = versions->find(bucket->keys[i]);
+            if (version != versions->end()) {
+                bucket->metadatas[i].incarnation = version->second;
+                metadatas[i].object_incarnation = version->second;
+            }
+        }
+    }
 
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
@@ -2288,7 +2438,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     entry.path().extension() != BUCKET_METADATA_FILE_SUFFIX) {
                     continue;
                 }
-                const auto& bucket_id_str = entry.path().stem();
+                const auto bucket_id_str = entry.path().stem().string();
                 int64_t bucket_id = 0;
                 try {
                     bucket_id = std::stoll(bucket_id_str);
@@ -2297,6 +2447,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         << "Skipping metadata file with a non-numeric "
                            "bucket id: "
                         << entry.path().string() << " (" << e.what() << ")";
+                    continue;
+                }
+                if (bucket_id_str != std::to_string(bucket_id)) {
                     continue;
                 }
                 // Bucket ids are unique within a disk (they are the file
@@ -2315,8 +2468,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 auto metadata = std::make_shared<BucketMetadata>();
                 metadata->disk_index = disk_index;
 
-                auto load_bucket_metadata_result =
-                    LoadBucketMetadata(bucket_id, metadata, disk_index);
+                std::string serialized_metadata;
+                auto load_bucket_metadata_result = LoadBucketMetadata(
+                    bucket_id, metadata, disk_index, serialized_metadata);
                 if (!load_bucket_metadata_result) {
                     LOG(ERROR)
                         << "Failed to load metadata for bucket: "
@@ -2353,7 +2507,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 const auto& meta = *metadata;
                 if (meta.data_size == 0 || meta.meta_size == 0 ||
-                    meta.metadatas.empty() || meta.keys.empty()) {
+                    meta.metadatas.empty() || meta.keys.empty() ||
+                    meta.metadatas.size() != meta.keys.size()) {
                     LOG(ERROR) << "Metadata validation failed for bucket: "
                                << bucket_id_str << " on disk " << disk_path
                                << ", will delete the bucket's data and "
@@ -2374,6 +2529,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     CleanupOrphanedBucket(bucket_id, disk_index);
                     continue;
                 }
+                auto incarnation_size =
+                    LoadBucketIncarnations(bucket_id, entry.path().string(),
+                                           bucket_data_path_res.value(),
+                                           serialized_metadata, *metadata);
+                if (!incarnation_size) {
+                    LOG(ERROR) << "Invalid incarnation metadata for bucket "
+                               << bucket_id << " on disk " << disk_path;
+                    return tl::make_unexpected(incarnation_size.error());
+                }
+                metadata->meta_size += *incarnation_size;
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
@@ -2385,16 +2550,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         meta.keys[i], StorageObjectMetadata{
                                           bucket_id, meta.metadatas[i].offset,
                                           meta.metadatas[i].key_size,
-                                          meta.metadatas[i].data_size, ""});
+                                          meta.metadatas[i].data_size, "",
+                                          meta.metadatas[i].incarnation});
                 }
                 buckets_.emplace(bucket_id, std::move(metadata));
             }
         }
 
-        // Clean up orphaned bucket files (.bucket files without corresponding
-        // .meta files) in the owned directory only. This handles the crash
-        // consistency case where data write succeeded but metadata write
-        // failed.
+        // Clean up files left by an interrupted write in the owned directories.
         uint64_t orphaned_files_count = 0;
         uint64_t orphaned_space_freed = 0;
 
@@ -2404,16 +2567,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     continue;
                 }
 
-                std::string extension = entry.path().extension().string();
-
-                // Only process .bucket files
-                if (extension != BUCKET_DATA_FILE_SUFFIX) {
+                const auto extension = entry.path().extension().string();
+                const auto filename = entry.path().filename().string();
+                const bool staged = filename.ends_with(".meta.tmp") ||
+                                    filename.ends_with(".incarnation.tmp");
+                if (extension != BUCKET_DATA_FILE_SUFFIX &&
+                    extension != kBucketIncarnationSuffix && !staged) {
                     continue;
                 }
 
                 // Extract bucket ID from filename (e.g., "12345.bucket" ->
                 // "12345")
-                auto bucket_id_str = entry.path().stem();
+                auto bucket_name = entry.path().stem();
+                if (staged) {
+                    bucket_name = bucket_name.stem();
+                }
+                const auto bucket_id_str = bucket_name.string();
                 int64_t bucket_id = 0;
                 try {
                     bucket_id = std::stoll(bucket_id_str);
@@ -2424,6 +2593,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         << entry.path().string() << " (" << e.what() << ")";
                     continue;
                 }
+                if (bucket_id_str != std::to_string(bucket_id)) {
+                    continue;
+                }
 
                 // Skip only the exact file that backs a recovered bucket.
                 // Matching on the id alone would spare a stale copy sitting in
@@ -2431,16 +2603,26 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 // loop index would point at the wrong file. Compare the
                 // resolved path instead.
                 auto recovered = buckets_.find(bucket_id);
-                if (recovered != buckets_.end()) {
-                    auto live_path = GetBucketDataPath(
-                        bucket_id, recovered->second->disk_index);
+                if (!staged && recovered != buckets_.end()) {
+                    const int owner_disk = recovered->second->disk_index;
+                    auto live_path =
+                        extension == BUCKET_DATA_FILE_SUFFIX
+                            ? GetBucketDataPath(bucket_id, owner_disk)
+                            : GetBucketMetadataPath(bucket_id, owner_disk);
+                    if (live_path && extension == kBucketIncarnationSuffix) {
+                        *live_path = BucketIncarnationPath(*live_path);
+                    }
                     if (live_path &&
                         fs::path(live_path.value()) == entry.path()) {
                         continue;
                     }
                 }
 
-                // This is an orphaned .bucket file without metadata
+                // Persist the absent .meta before deleting an old sidecar.
+                if (extension == kBucketIncarnationSuffix &&
+                    !SyncBucketDirectory(entry.path().string())) {
+                    continue;
+                }
                 std::error_code cleanup_ec;
                 uint64_t file_size = entry.file_size(cleanup_ec);
                 if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
@@ -2680,12 +2862,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
-        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
-            keys.emplace_back(bucket_it->second->keys[i]);
-            metadatas.emplace_back(StorageObjectMetadata{
-                bucket_it->first, bucket_it->second->metadatas[i].offset,
-                bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size, ""});
+        for (const auto& key : bucket_it->second->keys) {
+            const auto* live = object_bucket_map_.find(key);
+            if (live && live->bucket_id == bucket_it->first) {
+                keys.emplace_back(key);
+                metadatas.emplace_back(*live);
+            }
         }
     }
     return 0;
@@ -3056,7 +3238,6 @@ BucketStorageBackend::BuildAlignedDirectBucket(
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs, int disk_index) {
-    namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id, disk_index);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
@@ -3245,19 +3426,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
-
-        // Clean up the bucket file to prevent orphans
-        std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
-                            "write failure: "
-                         << bucket_data_path;
-        } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
-                          "failure: "
-                       << bucket_data_path << ", error: " << ec.message();
-        }
-
+        CleanupOrphanedBucket(bucket_id, disk_index);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
@@ -3298,6 +3467,9 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id,
             LOG(WARNING) << "Failed to cleanup bucket metadata file: "
                          << meta_path_res.value()
                          << ", error: " << ec.message();
+        }
+        if (!ec || ec == std::errc::no_such_file_or_directory) {
+            RemoveBucketIncarnationFiles(*meta_path_res);
         }
     }
 }
@@ -3807,9 +3979,9 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
             }
             const auto& object_meta = bucket_meta->metadatas[i];
             object_bucket_map_.insert_or_assign(
-                key, StorageObjectMetadata{bucket_id, object_meta.offset,
-                                           object_meta.key_size,
-                                           object_meta.data_size, ""});
+                key, StorageObjectMetadata{
+                         bucket_id, object_meta.offset, object_meta.key_size,
+                         object_meta.data_size, "", object_meta.incarnation});
             disk.total_size += object_meta.data_size + object_meta.key_size;
         }
         disk.total_size += bucket_meta->meta_size;
@@ -3889,6 +4061,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                 LOG(ERROR)
                     << "FinalizeEviction: failed to remove metadata file: "
                     << meta_path.value() << ", error: " << ec.message();
+                bucket_cleanup_failed = true;
+            } else if (!RemoveBucketIncarnationFiles(*meta_path)) {
                 bucket_cleanup_failed = true;
             }
         }
@@ -4132,6 +4306,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
             LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
                          << meta_path_res.value()
                          << ", error: " << ec.message();
+        } else {
+            RemoveBucketIncarnationFiles(*meta_path_res);
         }
     }
 
@@ -4171,34 +4347,91 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    const auto& meta_path = *meta_path_res;
+    const auto write_metadata =
+        [this](const std::string& path, const std::string& bytes,
+               bool durable) -> tl::expected<void, ErrorCode> {
+        auto opened = OpenFile(path, FileMode::Write);
+        if (!opened) return tl::make_unexpected(opened.error());
+        auto& file = *opened;
+        const auto written = file->write(bytes, bytes.size());
+        if (!written || *written != bytes.size()) {
+            NotifyDiskError(file->sys_errno(), "write");
+            LOG(ERROR) << "Failed to write bucket metadata " << path;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (durable && !file->datasync()) {
+            NotifyDiskError(file->sys_errno(), "fdatasync");
+            LOG(ERROR) << "Failed to sync bucket metadata " << path;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    };
+
+    std::string serialized_metadata;
+    struct_pb::to_pb(*metadata, serialized_metadata);
+    metadata->meta_size = serialized_metadata.size();
+    const bool versioned = std::ranges::any_of(
+        metadata->metadatas, [](const BucketObjectMetadata& object) {
+            return !object.incarnation.IsZero();
+        });
+    if (!versioned) {
+        return write_metadata(meta_path, serialized_metadata, false);
     }
-    auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
-    if (!write_result) {
-        NotifyDiskError(file->sys_errno(), "write");
-        LOG(ERROR) << "Write failed for: " << meta_path
-                   << ", error: " << write_result.error();
-        return tl::make_unexpected(write_result.error());
-    }
-    if (write_result.value() != str.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
-                   << ", got: " << write_result.value();
+
+    const auto staged_metadata = meta_path + ".tmp";
+    auto staged = write_metadata(staged_metadata, serialized_metadata, true);
+    if (!staged) return staged;
+    const auto data_path = GetBucketDataPath(id, disk_index);
+    if (!data_path) return tl::make_unexpected(data_path.error());
+    const auto metadata_stamp = GetBucketFileStamp(staged_metadata);
+    const auto data_stamp = GetBucketFileStamp(*data_path);
+    if (!metadata_stamp || !data_stamp) {
+        LOG(ERROR) << "Cannot identify files for versioned bucket " << id;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    metadata->meta_size = str.size();
+    BucketIncarnationMetadata incarnation{
+        kBucketIncarnationFormat,
+        id,
+        *metadata_stamp,
+        *data_stamp,
+        serialized_metadata.size(),
+        Crc32cValue(serialized_metadata.data(), serialized_metadata.size()),
+        {}};
+    incarnation.incarnations.reserve(metadata->metadatas.size());
+    for (const auto& object : metadata->metadatas) {
+        incarnation.incarnations.push_back(object.incarnation);
+    }
+    std::string versions;
+    struct_pb::to_pb(incarnation, versions);
+    const uint32_t checksum = Crc32cValue(versions.data(), versions.size());
+    versions.append(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
+
+    const auto incarnation_path = BucketIncarnationPath(meta_path);
+    const auto staged_incarnation = incarnation_path + ".tmp";
+    auto stored = write_metadata(staged_incarnation, versions, true);
+    if (!stored) return stored;
+    const auto publish = [](const std::string& from, const std::string& to) {
+        if (rename(from.c_str(), to.c_str()) != 0) {
+            LOG(ERROR) << "Cannot publish bucket metadata " << to
+                       << ErrnoSuffix(errno);
+            return false;
+        }
+        return SyncBucketDirectory(to);
+    };
+    // Recovery only considers buckets with a published .meta. The sidecar
+    // and data file's directory entry must be durable before publishing it.
+    if (!publish(staged_incarnation, incarnation_path) ||
+        !publish(staged_metadata, meta_path)) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    metadata->meta_size += versions.size();
     return {};
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
-    int64_t id, std::shared_ptr<BucketMetadata> metadata, int disk_index) {
+    int64_t id, std::shared_ptr<BucketMetadata> metadata, int disk_index,
+    std::string& serialized_metadata) {
     auto meta_path_res = GetBucketMetadataPath(id, disk_index);
     if (!meta_path_res) {
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
@@ -4211,9 +4444,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
         return tl::make_unexpected(open_file_result.error());
     }
     auto file = std::move(open_file_result.value());
-    std::string str;
     int64_t size = std::filesystem::file_size(meta_path);
-    auto read_result = file->read(str, size);
+    auto read_result = file->read(serialized_metadata, size);
     if (!read_result) {
         NotifyDiskError(file->sys_errno(), "read");
         LOG(ERROR) << "read failed for: " << meta_path
@@ -4227,7 +4459,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     try {
-        struct_pb::from_pb(*metadata, str);
+        struct_pb::from_pb(*metadata, serialized_metadata);
         metadata->meta_size = size;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Metadata parsing failed with exception: " << e.what();
@@ -5699,7 +5931,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    EvictionHandler eviction_handler) {
+    EvictionHandler eviction_handler, const ObjectVersions* /*versions*/) {
     // ================================================================
     // SINGLE-WRITER PRECONDITION
     //

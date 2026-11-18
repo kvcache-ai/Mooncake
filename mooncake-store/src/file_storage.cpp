@@ -79,11 +79,13 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     tasks.reserve(storage_keys.size());
     for (size_t i = 0; i < storage_keys.size(); ++i) {
         auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
-        const int64_t size =
-            i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(key),
-                                        .size = size});
+        OffloadTaskItem task{
+            .tenant_id = tenant_id.value(), .key = std::move(key), .size = 0};
+        if (i < metadatas.size()) {
+            task.size = metadatas[i].data_size;
+            task.object_incarnation = metadatas[i].object_incarnation;
+        }
+        tasks.emplace_back(std::move(task));
     }
     return tasks;
 }
@@ -686,6 +688,19 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     auto bucket_backend =
         std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket_backend &&
+        std::any_of(offloading_objects.begin(), offloading_objects.end(),
+                    [](const OffloadTaskItem& task) {
+                        return task.attempt_id.has_value();
+                    })) {
+        std::vector<StorageObjectMetadata> failures(
+            offloading_objects.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+        const auto rejected =
+            client_->NotifyOffloadSuccess(offloading_objects, failures);
+        if (!rejected) return rejected;
+        LOG(ERROR) << "Versioned offload requires the Bucket backend";
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     // Merge in tasks carried across a bucket deferral (see
     // deferred_task_by_storage_key_): the backend's ungrouped pool will
@@ -901,13 +916,22 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
+        StorageBackendInterface::ObjectVersions versions;
+        for (const auto& [key, _] : host_batch_object) {
+            const auto incarnation =
+                task_by_storage_key.at(key).GetObjectIncarnation();
+            if (!incarnation.IsZero()) {
+                versions.emplace(key, incarnation);
+            }
+        }
         auto offload_res = [&] {
             ColdReadInvalidation invalidate(*this);
             return storage_backend_->BatchOffload(
                 host_batch_object, bucket_complete_handler,
                 [this](const std::vector<std::string>& evicted_keys) {
                     return NotifyEvictedDiskReplicas(evicted_keys);
-                });
+                },
+                versions.empty() ? nullptr : &versions);
         }();
 
         // Release staging buffers back to pool.
