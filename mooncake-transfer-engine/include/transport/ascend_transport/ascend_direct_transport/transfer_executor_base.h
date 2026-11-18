@@ -165,8 +165,7 @@ class TransferExecutorBase {
 
     // One disconnectAllPeers() at a time. finalize() takes it as well, so
     // teardown cannot stop the query thread or destroy engines until the
-    // call returns. peers_quiesced_ is a flag, not a call count, so a second
-    // caller has to wait until the first restores it.
+    // call returns.
     std::mutex disconnect_all_mutex_;
 
     // Guards active_sync_transfers_ and peers_quiesced_.
