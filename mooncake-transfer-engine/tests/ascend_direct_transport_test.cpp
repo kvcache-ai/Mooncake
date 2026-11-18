@@ -2921,6 +2921,46 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(adxl_mock::get_disconnect_count(), disconnects_before + 1);
 }
 
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_FinalizeWaitsUntilCallReturns) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+
+    mock_acl::arm_get_current_context_block();
+
+    std::atomic<int> disconnect_rc{kDisconnectPending};
+    std::atomic<bool> destroyed{false};
+    std::thread disconnecter;
+    JoinThread join_disconnecter{disconnecter};
+    std::thread destroyer;
+    JoinThread join_destroyer{destroyer};
+    struct ReleaseContextBlock {
+        ~ReleaseContextBlock() {
+            mock_acl::release_get_current_context_block();
+        }
+    } release_context_block;
+
+    disconnecter = std::thread([&transport, &disconnect_rc] {
+        disconnect_rc = transport->disconnectAllPeers();
+    });
+    ASSERT_TRUE(mock_acl::wait_get_current_context_entered());
+
+    destroyer = std::thread([&transport, &destroyed] {
+        transport.reset();
+        destroyed.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(disconnect_rc.load(), kDisconnectPending);
+    EXPECT_FALSE(destroyed.load());
+
+    mock_acl::release_get_current_context_block();
+    disconnecter.join();
+    destroyer.join();
+    EXPECT_EQ(disconnect_rc.load(), 0);
+    EXPECT_TRUE(destroyed.load());
+}
+
 TEST_F(AscendDirectTransportTest, DisconnectAllPeers_NoPeers_ReturnsZero) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);

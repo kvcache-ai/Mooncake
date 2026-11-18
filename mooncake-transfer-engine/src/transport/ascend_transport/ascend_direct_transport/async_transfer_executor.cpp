@@ -50,6 +50,11 @@ int AsyncTransferExecutor::initialize() {
 }
 
 void AsyncTransferExecutor::finalize() {
+    // Wait out an in-progress disconnectAllPeers(). Stopping the query thread
+    // first would drop unfinished batches without decrementing
+    // active_async_tasks_, and the disconnect call would wait forever while
+    // the engines are destroyed.
+    std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
     if (finalized_) {
         return;
     }
@@ -196,6 +201,22 @@ void AsyncTransferExecutor::queryThreadLoop() {
                 std::chrono::microseconds(kQueryPollIntervalMicros));
         }
     }
+    abandonInFlightBatches(pending_batches);
+}
+
+void AsyncTransferExecutor::abandonInFlightBatches(
+    std::vector<QueryBatch>& pending) {
+    {
+        std::lock_guard<std::mutex> lock(query_mutex_);
+        while (!query_slice_queue_.empty()) {
+            pending.emplace_back(std::move(query_slice_queue_.front()));
+            query_slice_queue_.pop();
+        }
+    }
+    for (auto& batch : pending) {
+        markBatchFailed(batch, "Async executor stopped", false);
+    }
+    pending.clear();
 }
 
 void AsyncTransferExecutor::fetchPendingBatches(

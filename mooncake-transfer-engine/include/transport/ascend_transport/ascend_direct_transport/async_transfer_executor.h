@@ -69,6 +69,10 @@ class AsyncTransferExecutor : public TransferExecutorBase {
 
     void queryThreadLoop();
     void fetchPendingBatches(std::vector<QueryBatch>& out_batches);
+    // Fails every batch still queued or polled when the query thread stops,
+    // so active_async_tasks_ reaches 0 and drainInFlightTransfers() can
+    // return.
+    void abandonInFlightBatches(std::vector<QueryBatch>& pending);
     void processOneBatch(QueryBatch& batch, BatchPollResult& result);
     void failAllPendingOnRoute(size_t engine_idx, const std::string& target,
                                std::vector<QueryBatch>& pending,
