@@ -21,8 +21,9 @@ install(
   COMPONENT python
   FILES_MATCHING
   PATTERN "*.py"
+  PATTERN "pg.py" EXCLUDE
   PATTERN "__init__.py" EXCLUDE)
-if(WITH_EP)
+if(WITH_PG)
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/pg_py.cpp"

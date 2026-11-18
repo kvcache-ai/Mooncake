@@ -168,6 +168,9 @@ class TentMetrics {
     // register/unregisterLocalMemory. Same pairing rule as above.
     void recordRegisteredBufferBytes(TransportType tp, int64_t delta);
 
+    enum class MnnvlEvent { FabricFallback, StrictFailure };
+    void recordMnnvlEvent(MnnvlEvent event);
+
     enum class Stage {
         QueueWait,
         Dispatch,
@@ -202,6 +205,9 @@ class TentMetrics {
     // Runtime enable flag (atomic for thread-safe access with minimal overhead)
     static inline std::atomic<bool> runtime_enabled_{true};
 
+    // Serializes process-wide initialize/shutdown and protects config_.
+    std::mutex lifecycle_mutex_;
+
     std::atomic<bool> initialized_{false};
     MetricsConfig config_;
     // Port the HTTP server actually bound to, 0 until a successful bind. Kept
@@ -213,9 +219,9 @@ class TentMetrics {
     friend class TentMetricsTestPeer;
 
     // Published only after every bounded accounting label has a resolved
-    // cell. initialize() marks initialized_ before registration to serialize
-    // concurrent initializers, so accounting starts need this separate ready
-    // barrier to avoid pairing a dropped early start with a later finish.
+    // cell and the metrics subsystem is fully initialized. Starts use this
+    // separate barrier so shutdown can reject new pairs while allowing already
+    // started pairs to finish before initialized_ is cleared.
     std::atomic<bool> accounting_ready_{false};
 
     static constexpr size_t kSerializationFormatCount = 2;
@@ -328,6 +334,10 @@ class TentMetrics {
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
     }
+
+    metrics::CachedDynamicCounter<1> mnnvl_events_total_{
+        "tent_mnnvl_events_total", "MNNVL fabric event activity",
+        std::array<std::string, 1>{"event"}, 2};
 
     // Per-transport counters (label: transport). Values are int64_t.
     metrics::CachedDynamicCounter<1> read_bytes_total_{

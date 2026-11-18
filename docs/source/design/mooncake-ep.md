@@ -124,14 +124,20 @@ On Intel XPU the native buffer is a SYCL implementation
 Python wrapper and the `ep_py.cpp` bindings are shared with CUDA, as is the
 host bookkeeping that pairs each combine with its dispatch
 (`mooncake_ep_dispatch_slots.h`); the kernels and transport are XPU-specific.
-It provides the P2P / IPC fast path only:
+Peers on the node are reached over IPC by default, and ranks on other nodes
+over RDMA when the build has the verbs path. Peers on the node can also be
+reached over RDMA instead (see `MC_EP_RANKS_PER_NODE` below):
 
 - Peers share one device buffer through Level Zero IPC handles, exchanged over
   the process group like the CUDA IPC handles. Ranks must be on one host and in
   one PID namespace, their devices need peer access to each other, and each rank
   must be allowed to `pidfd_getfd` the others: Yama `ptrace_scope` 0 or 1, or 2
-  with `CAP_SYS_PTRACE`. Otherwise, and for multi-node groups, the Python
-  fallback is used.
+  with `CAP_SYS_PTRACE`. Otherwise the Python fallback is used.
+- Ranks on other hosts or PID namespaces are reached over RDMA: a host thread
+  per rank writes what the send kernel staged into the receiver's buffer,
+  registered with the NIC through dma_buf. This needs an rdma-core with
+  `ibv_reg_dmabuf_mr` at build time; without it, or if any rank fails to
+  connect, groups that span nodes use the Python fallback.
 - Data is pulled rather than pushed: each rank stages what it sends in its own
   half of the buffer and only writes small ready flags to peers. On PCIe a GPU
   writing to several peers at once is far slower than one reading from several.
@@ -140,8 +146,63 @@ It provides the P2P / IPC fast path only:
   `dispatch()` is given `topk_weights`, combine also sums each token's rows on
   the expert side, so one row per rank travels back. The partial sum is rounded
   to BF16 once.
-- Kernels run on the caller's `torch.xpu` stream. Zero-copy combine and the
-  elastic buffer are not supported.
+- Kernels run on the caller's `torch.xpu` stream. Zero-copy combine is not
+  supported.
+
+Ranks count as on another node when they are on another host or in another
+PID namespace. `MC_EP_RANKS_PER_NODE=n` instead places rank `r` on node
+`r // n`, which decides for each pair of ranks on a host whether they use IPC
+or RDMA: with `n=1` every peer is reached over RDMA, with `n=4` on 8 XPUs
+pairs within each group of four use IPC and pairs across them RDMA. RDMA
+between peers on the node needs an RDMA NIC per XPU. One such host can thus
+test both paths; finding nodes from the host words of the handles, and RDMA
+between hosts, still need two.
+
+(mooncake-ep-intel-xpu-elastic)=
+#### `ElasticBuffer` on Intel XPU
+
+`mooncake.mooncake_elastic_buffer.ElasticBuffer` (the DeepEP V2 API) also has
+a SYCL implementation in the same `_ep` module
+(`mooncake_ep_xpu_elastic_buffer.cpp`, `xpu_ep_elastic_kernels.cpp`), with the
+same outputs and handle as on CUDA. It uses the pull protocol and device
+helpers (`xpu_ep_device.h`) of the XPU `Buffer` but its own device buffer, so
+both can be used in one process. As on CUDA, only
+`allow_multiple_reduction=True` is supported: combine sums each token's rows
+on the expert side, rounding that partial sum to BF16 once, before one row per
+rank travels back. It differs from CUDA in that:
+
+- Ranks are reached as by `Buffer`: over RDMA, when the build has the verbs
+  path, if they are on another node (another host or PID namespace, or
+  another group of `MC_EP_RANKS_PER_NODE` ranks, see above), and over Level
+  Zero IPC otherwise. RDMA never stands in for IPC that fails. `transport`
+  must be `"auto"` or `"ipc"`, which covers both.
+- There is no Python fallback. If ranks on another node need RDMA and the
+  build lacks the verbs path, or any rank fails to set up or connect it, every
+  rank raises; a rank that cannot map a peer on its node over IPC raises too.
+- Dispatch and combine are flat over all ranks: `get_logical_domain_size()`
+  is `(1, num_ranks)`. `get_buffer_size_hint()`, which sizes the buffer when
+  `num_bytes` is not given, reserves room for ranks on other nodes when
+  `allow_hybrid_mode` is `True` (the default) or the ranks span nodes, judged
+  from `MC_EP_RANKS_PER_NODE`, else `MOONCAKE_EP_NUM_LOCAL_RANKS` or
+  `LOCAL_WORLD_SIZE`. `allow_hybrid_mode` has no other effect.
+  `get_physical_domain_size()` reports (nodes, ranks per node) as above.
+- Slots are assigned in token order, so dispatch is deterministic whatever
+  `deterministic` is set to.
+- Kernels run on the caller's `torch.xpu` stream, also with
+  `async_with_compute_stream=True`, so communication does not overlap compute
+  queued on that stream. The returned `EventOverlap` works as on CUDA.
+- `MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE=1` (experimental, off by
+  default) runs the kernels on a queue of the buffer's own once the compute
+  stream's queued work is done, as CUDA runs them on a communication stream.
+  With `async_with_compute_stream=True` they can then overlap compute queued
+  later, and `num_sms` caps their work-groups. Whether the GPU runs the two
+  concurrently depends on the device and on the compute kernels.
+- Without that setting, `num_sms` and `prefer_overlap_with_compute` (which
+  lowers the default `num_sms`) are accepted and ignored: the kernels size
+  their grids from the device's compute units. `sl_idx`, `num_allocated_qps`
+  and `num_cpu_timeout_secs` are always ignored.
+- Combine accumulates in FP32 as on CUDA, but in another order, so results can
+  differ from CUDA by BF16 rounding.
 
 ## JIT kernel compilation
 
@@ -285,6 +346,13 @@ python python/tests/ep/test_mooncake_ep.py
 
 # Intel XPU correctness test (exact payloads, hooks, two batches, timeouts)
 python python/tests/ep/test_mooncake_ep_xpu.py --num-ranks 4 --num-experts 256
+
+# Intel XPU ElasticBuffer correctness test (--fp8 also checks FP8 (x, sf)
+# dispatch)
+torchrun --standalone --nproc_per_node=4 python/tests/ep/test_elastic_buffer.py --quick
+
+# Intel XPU ElasticBuffer benchmark
+torchrun --standalone --nproc_per_node=4 mooncake-ep/benchmarks/elastic_buffer_perf.py
 
 # Host-only test of the dispatch bookkeeping shared by every backend
 ctest --test-dir build -R ep_dispatch_slots_test

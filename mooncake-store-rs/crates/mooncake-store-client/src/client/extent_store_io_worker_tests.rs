@@ -116,6 +116,8 @@
                 locator: loc.as_str(),
                 expected_len: p.len() as u64,
                 dst: buf.as_mut_slice(),
+                allow_intermediate_buffer: true,
+                allow_padded_direct_read: false,
             })
             .collect();
         let results = engine.get_batch_into(&mut reads);

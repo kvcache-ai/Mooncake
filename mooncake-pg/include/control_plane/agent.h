@@ -24,6 +24,8 @@ class AgentStateMachine {
     AgentApplyResult handleRankStateUpdate(const RankStatePush& push);
     PGResult<AgentApplyResult> applyGroupView(const GroupView& view);
     PGResult<AgentApplyResult> handleViewUpdate(const ViewUpdatePush& push);
+    PGResult<AgentApplyResult> handleTransferEndpointUpdate(
+        uint64_t request_id, const TransferEndpointUpdatePush& push) const;
 
     HeartbeatRequest buildHeartbeat() const;
 
@@ -85,6 +87,12 @@ class AgentStateMachine {
 
     void appendApplyGroupStateEffect(const GroupView& view,
                                      AgentApplyResult& effects) const;
+    // Appends a RefreshPeerLink for every peer whose endpoint in `view` is
+    // new: absent from `old_view` (nullptr for a group's first view) or
+    // published at another endpoint epoch. Returns those peers.
+    std::vector<GlobalRank> appendPeerSegmentRefreshEffects(
+        const GroupView* old_view, const GroupView& view,
+        AgentApplyResult& effects) const;
     void appendApplyRankStateEffects(GlobalRank rank,
                                      AgentApplyResult& effects) const;
     void resetRankForNewEpoch(GlobalRank rank, uint64_t rank_epoch,

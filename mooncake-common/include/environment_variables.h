@@ -45,11 +45,20 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    // 0/false: buffered; packed/true/1: packed direct writes;
+    // aligned: aligned direct writes
+    // (BucketBackendConfig::aligned_direct_write).
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_BUCKET_MAX_TOTAL_SIZE);
+    // Comma-separated per-disk quotas, positionally aligned with the disk
+    // list in MOONCAKE_OFFLOAD_FILE_STORAGE_PATH. Kept as a string because it
+    // is a list, not a scalar.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY);
@@ -100,6 +109,9 @@ struct HugepageEnvironmentVariables {
     // the existing byte-size parser, fallback, and logging behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_HUGEPAGE);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
+    // Opt-in THP backing of the RDMA client buffer (1/0, true/false, yes/no,
+    // on/off). Kept as a string so an invalid value can be warned about.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_MADV_HUGEPAGE);
 };
 
 struct ShmSpdkRegistrationEnvironmentVariables {

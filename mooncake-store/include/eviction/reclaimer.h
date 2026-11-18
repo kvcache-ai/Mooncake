@@ -19,6 +19,10 @@ namespace eviction {
 
 class Reclaimer {
    public:
+    // Opt in only when Apply/TearDown are independent across keys and do not
+    // depend on the run-wide so_far report (offload caps/OpLog stay serial).
+    virtual bool SupportsParallel() const { return false; }
+
     // Takes `plan`'s replicas off the object `hold` holds, under that write
     // lock, which it neither lets go nor uses to reach the route. `so_far` is
     // what the run has done before this object. An error, from an OpLog

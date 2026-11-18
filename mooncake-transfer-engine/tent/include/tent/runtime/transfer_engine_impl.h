@@ -368,7 +368,11 @@ class TransferEngineImpl {
 
     Status waitTransferCompletion(BatchID batch_id);
 
-    Status transferSync(const std::vector<Request>& request_list);
+    Status waitTransfer(BatchID batch_id,
+                        std::vector<TransferStatus>* status_list = nullptr,
+                        uint64_t timeout_ms = 0);
+
+    Status submitAndWaitTransfer(const std::vector<Request>& request_list);
 
     uint64_t lockStageBuffer(const std::string& location);
 
@@ -438,18 +442,18 @@ class TransferEngineImpl {
     SelectionResult getTransportType(const Request& request,
                                      int transport_index = 0);
 
-    // One selection pass behind getTransportType(). `allow_xpu_direct` lets a
-    // dma-buf-registered XPU buffer route directly over RDMA (see
-    // xpuDirectRdmaReady); when false every XPU side is host-staged for the
+    // One selection pass behind getTransportType(). `allow_device_direct` lets
+    // dma-buf-registered XPU or MLU buffers route directly over RDMA (see
+    // deviceDirectRdmaReady); when false device buffers are host-staged for the
     // network transports. `allow_xpu_ipc` additionally offers XpuTransport,
     // unstaged, for a same-host peer's XPU buffer that may be IPC-mapped (see
     // xpuIpcCandidate); the mapping is made only if XPU is selected, and the
-    // pass is redone without IPC if that fails. `xpu_direct`, if given,
+    // pass is redone without IPC if that fails. `device_direct`, if given,
     // reports whether this pass planned the network transports unstaged, so
     // the caller can retry staged when it yields no transport.
     SelectionResult planTransport(const Request& request, int transport_index,
-                                  bool allow_xpu_direct, bool allow_xpu_ipc,
-                                  bool* xpu_direct);
+                                  bool allow_device_direct, bool allow_xpu_ipc,
+                                  bool* device_direct);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
@@ -543,6 +547,13 @@ class TransferEngineImpl {
 
     Status cancelQueuedOwner(QueueOwnerId owner_id);
 
+    // Cancels the batch's owners that are still waiting in the admission queue
+    // and does not refill the dispatch window per owner: a refill in the middle
+    // of this loop could start another owner of the same batch. Owners that are
+    // already in the dispatch window are left for the caller to cancel in
+    // flight.
+    Status cancelQueuedOwners(BatchID batch_id);
+
     Status retireQueueForBatch(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
@@ -561,6 +572,11 @@ class TransferEngineImpl {
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
 
+    // False when req carries a producer_event that the route (a concrete
+    // transport, or a staged route) would not order the copy after.
+    bool producerEventHonored(const Request& req, TransportType type,
+                              bool staging) const;
+
     Status loadTransports();
 
     // Control-plane delivery used by sendNotification() once every loaded
@@ -569,16 +585,17 @@ class TransferEngineImpl {
     Status sendNotificationViaRpc(SegmentID target_id,
                                   const Notification& notifi);
 
-    void findStagingPolicy(const Request& req,
-                           std::vector<std::string>& policy);
+    void findStagingPolicy(const Request& req, std::vector<std::string>& policy,
+                           bool allow_device_direct = true);
 
-    // True when a request touching Intel XPU memory can go over RDMA without
+    // True when a request touching XPU or MLU memory can go over RDMA without
     // host staging: the RDMA transport advertises the device capability the
     // memory-type pair needs, and every buffer involved was registered on RDMA
-    // (an XPU buffer only carries RDMA when its dma-buf registration
+    // (a device buffer only carries RDMA when its dma-buf registration
     // succeeded). `remote_entry` is the remote buffer the request targets.
-    bool xpuDirectRdmaReady(const Request& req, const BufferDesc* remote_entry,
-                            MemoryType local_mtype, MemoryType remote_mtype);
+    bool deviceDirectRdmaReady(const Request& req,
+                               const BufferDesc* remote_entry,
+                               MemoryType local_mtype, MemoryType remote_mtype);
 
     // True when the XPU buffer `remote_entry` of segment `desc` is on this
     // host and publishes a Level Zero IPC handle XpuTransport may map, so
@@ -654,6 +671,7 @@ class TransferEngineImpl {
    private:
     std::shared_ptr<Config> conf_;
     HpTcpTransportConfig hp_tcp_transport_config_;
+    MnnvlConfig mnnvl_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;

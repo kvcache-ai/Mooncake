@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import cached_property
 
-from .types import KVCacheDescriptor, require_nonempty_string
+from .types import KVCacheDescriptor, descriptor_identity, require_nonempty_string
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class KVCacheModelDomain:
             "model_id": self.model_id,
             "model_revision": self.model_revision,
             "semantic_fingerprint": self.semantic_fingerprint,
-            "descriptor": asdict(self.descriptor),
+            "descriptor": descriptor_identity(self.descriptor),
             # Preserve the existing domain encoding. This constant is a
             # compatibility marker, never the active host-memory axis order.
             "object_format": "PLHD",

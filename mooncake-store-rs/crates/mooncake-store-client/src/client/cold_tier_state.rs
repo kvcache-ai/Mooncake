@@ -141,6 +141,7 @@ struct ColdTierDeviceManager {
     devices: SharedColdTierDeviceCache,
     watermarks: ColdTierWatermarkConfig,
     admission: Arc<ColdTierAdmission>,
+    accumulated_write_bytes: Mutex<BTreeMap<String, u64>>,
     runtime: ClientRuntimeId,
 }
 
@@ -395,6 +396,21 @@ struct PendingDeleteGcResult {
     used_bytes_released: u64,
 }
 
+/// Outcome of one owner-side pending-delete cold reclaim attempt. Shared by the
+/// Redis cold-backing index GC and the owner-local cold reclaim queue so both
+/// delete the payload and release used_bytes identically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColdReclaimDisposition {
+    /// Payload deleted, used_bytes released, route CAS advanced or removed.
+    Reclaimed,
+    /// Route not deletable yet (still Active, backing changed, or claim lost).
+    NotEligible,
+    /// Route CAS conflicted with a concurrent writer; retry later.
+    Conflict,
+    /// Route already gone; nothing left to reclaim.
+    Gone,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ColdTierMaintenanceStats {
     pub(crate) devices: BTreeMap<String, BackendMaintenanceStats>,
@@ -571,19 +587,106 @@ impl PendingBackingRoute {
     }
 }
 
-struct PendingOffloadPayload(Vec<u8>);
+enum PendingOffloadPayload {
+    Hot(PinnedHotOffloadPayload),
+    Ordinary(Vec<u8>),
+}
+
+struct PinnedHotOffloadPayload {
+    allocator: Arc<Mutex<LocalAllocatorState>>,
+    identity: AllocationIdentity,
+    region: StorageRegionSlice,
+}
 
 impl PendingOffloadPayload {
-    fn new(payload: Vec<u8>) -> Self {
-        Self(payload)
+    fn pin_local_memory(
+        allocator: &Arc<Mutex<LocalAllocatorState>>,
+        state: &Arc<Mutex<StoreState>>,
+        replica: &ReplicaRoute,
+    ) -> Result<Self> {
+        let span = AllocationSpan {
+            segment_name: replica.segment_name.clone(),
+            offset_bytes: replica.segment_offset,
+            length_bytes: replica.length,
+        };
+        let identity = {
+            let mut allocator = allocator.lock();
+            let identity = allocator.allocation_identity(&span).ok_or_else(|| {
+                StoreError::Allocator(format!(
+                    "local offload allocation is missing for {} offset={} len={}",
+                    replica.segment_name.0, replica.segment_offset, replica.length
+                ))
+            })?;
+            if replica
+                .allocation_id
+                .is_some_and(|allocation_id| allocation_id != identity.allocation_id)
+            {
+                return Err(StoreError::Allocator(format!(
+                    "local offload allocation generation changed for {} offset={}: route={:?} current={}",
+                    replica.segment_name.0,
+                    replica.segment_offset,
+                    replica.allocation_id,
+                    identity.allocation_id
+                )));
+            }
+            allocator.pin_allocation(&identity)?;
+            identity
+        };
+        let region = state.lock().memory_ref().and_then(|memory| {
+            memory.storage_slice(
+                &replica.segment_name,
+                replica.segment_offset as usize,
+                replica.length as usize,
+            )
+        });
+        match region {
+            Ok(region) => Ok(Self::Hot(PinnedHotOffloadPayload {
+                allocator: Arc::clone(allocator),
+                identity,
+                region,
+            })),
+            Err(error) => {
+                if let Err(unpin_error) = allocator.lock().unpin_allocation(&identity) {
+                    warn!(
+                        segment = %identity.segment_name.0,
+                        offset_bytes = identity.offset_bytes,
+                        allocation_id = identity.allocation_id,
+                        error = %unpin_error,
+                        "failed to undo local offload allocation pin"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn from_vec(payload: Vec<u8>) -> Self {
+        Self::Ordinary(payload)
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self.0
+        match self {
+            Self::Hot(payload) => payload.region.as_slice(),
+            Self::Ordinary(payload) => payload,
+        }
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.as_slice().len()
+    }
+}
+
+impl Drop for PinnedHotOffloadPayload {
+    fn drop(&mut self) {
+        if let Err(error) = self.allocator.lock().unpin_allocation(&self.identity) {
+            warn!(
+                segment = %self.identity.segment_name.0,
+                offset_bytes = self.identity.offset_bytes,
+                allocation_id = self.identity.allocation_id,
+                error = %error,
+                "failed to release local offload allocation pin"
+            );
+        }
     }
 }
 

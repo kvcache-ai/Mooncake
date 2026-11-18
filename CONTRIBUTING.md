@@ -52,13 +52,19 @@ applicable sign-off trailers in the resulting commits.
 
 ### Maintainer setup
 
-The [DCO GitHub App](https://github.com/apps/dco) checks pull request commits.
-A repository administrator must enable it for Mooncake and make its `DCO`
+The [DCO Check workflow](.github/workflows/dco-check.yml) checks every non-merge
+commit in a pull request for a `Signed-off-by` trailer matching the commit
+author's name and email. It runs when a PR is opened, updated, reopened, or
+edited (including a base-branch change). Organization members and bot-authored
+commits are checked as well; merge commits are skipped.
+
+A repository administrator must make the `Developer Certificate of Origin`
 check required in the branch protection rule or ruleset for the target branch.
-The configuration in [`.github/dco.yml`](.github/dco.yml) requires sign-offs
-from organization members as well. Adding this file alone does not install the
-App or enable a required check. The App's default exemptions for bot-authored
-commits and merge commits still apply; see the [App documentation](https://github.com/dcoapp/app).
+Adding the workflow alone does not enable a required check.
+
+The workflow does not require the [DCO GitHub App](https://github.com/apps/dco).
+If the App is also enabled, [`.github/dco.yml`](.github/dco.yml) requires
+sign-offs from organization members for that separate check.
 
 ## Pull Requests & Code Reviews
 

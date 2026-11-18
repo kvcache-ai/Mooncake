@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -109,8 +110,9 @@ var (
 	globalMutex    sync.Mutex
 	globalRefCount int
 	// etcd client for store
-	storeClient *clientv3.Client
-	storeMutex  sync.Mutex
+	storeClient              *clientv3.Client
+	storeMutex               sync.Mutex
+	storeMaxSendMessageBytes int64 = 2 * 1024 * 1024
 	// keep alive contexts for store
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
@@ -282,6 +284,7 @@ func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
 	}
 	return clientv3.Config{
 		Endpoints:            validEndpoints,
+		MaxCallSendMsgSize:   int(atomic.LoadInt64(&storeMaxSendMessageBytes)),
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
@@ -435,6 +438,29 @@ func getStoreClient() *clientv3.Client {
 	storeMutex.Lock()
 	defer storeMutex.Unlock()
 	return storeClient
+}
+
+// Configure before connecting: live clients retain their original gRPC options.
+func configureStoreMaxSendMessageBytes(maxBytes int32) error {
+	if maxBytes <= 0 {
+		return errors.New("etcd store max send message bytes must be positive")
+	}
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+	if storeClient != nil && int64(maxBytes) != atomic.LoadInt64(&storeMaxSendMessageBytes) {
+		return errors.New("cannot change etcd store send limit after initialization")
+	}
+	atomic.StoreInt64(&storeMaxSendMessageBytes, int64(maxBytes))
+	return nil
+}
+
+//export SetStoreEtcdMaxSendMessageBytes
+func SetStoreEtcdMaxSendMessageBytes(maxBytes C.int32_t, errMsg **C.char) int {
+	if err := configureStoreMaxSendMessageBytes(int32(maxBytes)); err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
 }
 
 //export NewStoreEtcdClient
