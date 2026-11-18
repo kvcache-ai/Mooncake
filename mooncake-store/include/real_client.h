@@ -1219,6 +1219,10 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
         // Buffers held by dummy via acquire_buffer; keyed by dummy address
+        // Acquires pin mappings with dummy_client_mutex_ shared during I/O.
+        // Serialize their inserts here; other accesses hold
+        // dummy_client_mutex_ exclusively.
+        std::mutex handles_mutex;
         std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
             active_handles;
     };

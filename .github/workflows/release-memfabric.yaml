@@ -93,6 +93,7 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           rm -rf build
           cmake -S . -B build -G Ninja \
+            -DWITH_CONDUCTOR=ON \
             -DUSE_TENT=ON \
             -DUSE_MEMFABRIC=ON \
             -DUSE_ETCD=ON \

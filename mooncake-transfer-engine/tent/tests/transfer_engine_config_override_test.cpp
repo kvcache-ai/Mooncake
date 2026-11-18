@@ -29,6 +29,9 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
+#ifdef TENT_TEST_HTTP_METASTORE
+#include "tent/metastore/http.h"
+#endif
 
 #ifndef _WIN32
 #include <asio.hpp>
@@ -177,6 +180,11 @@ class TestHttpMetadataServer {
         return it->second;
     }
 
+    std::string lastPutExpectHeader() const {
+        std::lock_guard<std::mutex> lock(store_mutex_);
+        return last_put_expect_;
+    }
+
    private:
     void initServer() {
         using namespace coro_http;
@@ -220,6 +228,7 @@ class TestHttpMetadataServer {
 
                 std::lock_guard<std::mutex> lock(store_mutex_);
                 store_[key] = std::string(req.get_body());
+                last_put_expect_ = std::string(req.get_header_value("Expect"));
                 resp.set_status_and_content(status_type::ok,
                                             "metadata updated");
             });
@@ -265,7 +274,27 @@ class TestHttpMetadataServer {
     std::unique_ptr<coro_http::coro_http_server> server_;
     mutable std::mutex store_mutex_;
     std::unordered_map<std::string, std::string> store_;
+    std::string last_put_expect_;
 };
+#ifdef TENT_TEST_HTTP_METASTORE
+TEST(HttpMetaStoreTest, BufferedPutDoesNotRequest100Continue) {
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    HttpMetaStore store;
+    ASSERT_TRUE(store.connect(buildHttpMetadataEndpoint(port)).ok());
+    for (size_t size : {size_t{32}, size_t{2 * 1024 * 1024}}) {
+        const std::string value(size, 'x');
+        ASSERT_TRUE(store.set("buffered-put", value).ok());
+        EXPECT_TRUE(server.lastPutExpectHeader().empty());
+        std::string actual;
+        ASSERT_TRUE(store.get("buffered-put", actual).ok());
+        EXPECT_EQ(actual, value);
+        EXPECT_TRUE(store.remove("buffered-put").ok());
+    }
+}
+#endif
+
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
@@ -509,6 +538,16 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaDestDeviceAffinityEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_ENABLE_DEST_DEVICE_AFFINITY", "true");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/rdma/dest_device_affinity", false));
+}
+
 // "1" is how most MC_* switches are set; setFromString() would store it as an
 // integer, which get(..., false) cannot read as a bool.
 TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
@@ -516,6 +555,8 @@ TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
         {"MC_DISABLE_GPU_DIRECT_RDMA",
          "transports/rdma/disable_gpu_direct_rdma"},
         {"MC_LOG_RDMA_SLICE_AFFINITY", "transports/rdma/log_slice_affinity"},
+        {"MC_ENABLE_DEST_DEVICE_AFFINITY",
+         "transports/rdma/dest_device_affinity"},
     };
     for (const auto& [env, key] : cases) {
         SCOPED_TRACE(env);

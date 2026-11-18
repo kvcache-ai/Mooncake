@@ -847,6 +847,19 @@ TEST_F(MasterServiceTest, SoftPinMasterConfigRejectsDefaultAboveMaximum) {
     EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
 }
 
+TEST_F(MasterServiceTest, RejectsTooManyEvictionWorkerThreads) {
+    auto max_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS)
+            .build();
+    EXPECT_NO_THROW(MasterService service(max_config));
+    auto invalid_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS + 1)
+            .build();
+    EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
+}
+
 TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 
@@ -2172,6 +2185,210 @@ TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
     MasterServiceConfig service_config(wrapped_config);
     EXPECT_EQ(service_config.allocation_strategy_type,
               AllocationStrategyType::LOCAL_FIRST);
+}
+
+namespace {
+class PreferredSequenceRecorder final : public RandomAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& manager, size_t length, size_t replicas,
+        const std::vector<std::string>& preferred,
+        const std::set<std::string>& excluded, ReplicaType type) override {
+        names = preferred;
+        return RandomAllocationStrategy::Allocate(manager, length, replicas,
+                                                  preferred, excluded, type);
+    }
+
+    std::vector<std::string> names;
+};
+}  // namespace
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitPriorityAndFirstOccurrence) {
+    for (bool use_hint : {false, true}) {
+        SCOPED_TRACE(use_hint);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            use_hint ? AllocationStrategyType::RANDOM
+                     : AllocationStrategyType::LOCAL_FIRST;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        size_t index = 0;
+        for (const auto& [name, host] :
+             std::vector<std::pair<std::string, std::string>>{
+                 {"A", "host-a"},
+                 {"B", "host-b"},
+                 {"A", "host-c"},
+                 {"C", "host-c"}}) {
+            auto segment =
+                MakeSegment(name, kDefaultSegmentBase + index++ * 65536, 65536);
+            segment.host_id = host;
+            ASSERT_TRUE(service.MountSegment(segment, owner));
+        }
+        ReplicateConfig incoming;
+        incoming.host_id = "host-b";
+        incoming.prefer_alloc_in_same_node = use_hint;
+        incoming.preferred_segments = {"", "C", "C", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "array", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "array", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        // The singular preference takes precedence over the array, and its
+        // remote host stays ahead of the automatically preferred local host.
+        incoming.preferred_segment = "C";
+        ASSERT_TRUE(service.PutStart(owner, "single", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "B", "A"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "single", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        incoming.preferred_segment.clear();
+        incoming.preferred_segments.clear();
+        const std::string key = "cross-host-duplicate";
+        ASSERT_TRUE(
+            service.PutStart(owner, key, TenantId::Default(), 4096, incoming));
+        // host-b comes first, then host-c's rotated A/C, then host-a's A.
+        // The final A must not be appended again.
+        const bool c_first = std::hash<std::string>{}(key) % 2 != 0;
+        EXPECT_EQ(recorder->names,
+                  (c_first ? std::vector<std::string>{"B", "C", "A"}
+                           : std::vector<std::string>{"B", "A", "C"}));
+        ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                      ReplicaType::MEMORY));
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitNamesAcrossManyAppends) {
+    for (bool use_hint : {false, true}) {
+        for (size_t prefix_length : {0U, 96U}) {
+            SCOPED_TRACE(use_hint);
+            SCOPED_TRACE(prefix_length);
+            MasterServiceConfig config;
+            config.memory_allocator = BufferAllocatorType::OFFSET;
+            config.allocation_strategy_type =
+                use_hint ? AllocationStrategyType::RANDOM
+                         : AllocationStrategyType::LOCAL_FIRST;
+            MasterService service(config);
+            auto recorder = std::make_shared<PreferredSequenceRecorder>();
+            MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+            const UUID owner{1, 1};
+            const std::string prefix(prefix_length, 'x');
+            const std::string explicit_name = prefix + "preferred";
+            std::vector<std::string> expected{explicit_name};
+            size_t index = 0;
+            auto mount = [&](const std::string& name, const std::string& host) {
+                auto segment = MakeSegment(
+                    name, kDefaultSegmentBase + index++ * 65536, 65536);
+                segment.host_id = host;
+                return service.MountSegment(segment, owner);
+            };
+            for (size_t i = 0; i < 64; ++i) {
+                const auto name = prefix + "s" + std::to_string(i);
+                ASSERT_TRUE(mount(name, "host-" + std::to_string(100 + i)));
+                expected.push_back(name);
+            }
+            // These duplicates arrive after enough appends to relocate an
+            // unreserved vector. Short explicit names exercise SSO storage;
+            // the automatic duplicate has equal content in another string.
+            ASSERT_TRUE(mount(explicit_name, "host-z"));
+            ASSERT_TRUE(mount(expected[1], "host-zz"));
+            ReplicateConfig incoming;
+            incoming.host_id = "host-100";
+            incoming.prefer_alloc_in_same_node = use_hint;
+            incoming.preferred_segments = {"", explicit_name, explicit_name,
+                                           ""};
+            for (size_t request = 0; request < 2; ++request) {
+                const auto key = "many-appends-" + std::to_string(request);
+                ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(),
+                                             4096, incoming));
+                EXPECT_EQ(recorder->names, expected);
+                ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                              ReplicaType::MEMORY));
+            }
+        }
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesUnknownHostAndUnavailableSegmentFallback) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+    MasterService service(config);
+    auto recorder = std::make_shared<PreferredSequenceRecorder>();
+    MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+    const UUID owner{1, 1};
+    std::vector<Segment> segments;
+    for (size_t i = 0; i < 3; ++i) {
+        auto segment = MakeSegment(std::string(1, 'A' + i),
+                                   kDefaultSegmentBase + i * 65536, 65536);
+        segment.host_id = "host-" + std::string(1, 'a' + i);
+        ASSERT_TRUE(service.MountSegment(segment, owner));
+        segments.push_back(segment);
+    }
+    ReplicateConfig incoming;
+    incoming.host_id = "host-bb";
+    ASSERT_TRUE(service.PutStart(owner, "unknown", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "unknown", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    incoming.host_id = "host-z";
+    ASSERT_TRUE(
+        service.PutStart(owner, "wrap", TenantId::Default(), 4096, incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A", "B", "C"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "wrap", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName("B", SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    incoming.host_id = "host-b";
+    ASSERT_TRUE(service.PutStart(owner, "draining", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "draining", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    ASSERT_TRUE(service.UnmountSegment(segments[2].id, owner));
+    ASSERT_TRUE(service.PutStart(owner, "unmounted", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesPreferencesWithoutAutomaticCandidates) {
+    for (bool local_first : {false, true}) {
+        SCOPED_TRACE(local_first);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            local_first ? AllocationStrategyType::LOCAL_FIRST
+                        : AllocationStrategyType::RANDOM;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        // No host identity is registered, so local-first has no automatic
+        // candidates; ordinary placement must not add any either.
+        ASSERT_TRUE(service.MountSegment(MakeSegment("A"), owner));
+        ReplicateConfig incoming;
+        incoming.host_id = "unknown";
+        incoming.preferred_segments = {"", "A", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "no-host", TenantId::Default(),
+                                     4096, incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+    }
 }
 
 TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
@@ -4078,6 +4295,60 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_FALSE(segment_names.contains("segment_0"));
 }
 
+TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(10000).build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service, "move_source");
+    PrepareSimpleSegment(*service, "move_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto tenant = TenantId::Default();
+    const auto key =
+        PutObjectOnSegment(*service, source.client_id, "move_source");
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.preferred_segment = "move_source";
+
+    auto upsert =
+        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    ASSERT_TRUE(upsert);
+    auto premature_move = service->MoveStart(source.client_id, key, tenant,
+                                             "move_source", "move_target");
+    ASSERT_FALSE(premature_move);
+    EXPECT_EQ(premature_move.error(), ErrorCode::REPLICA_NOT_FOUND);
+    ASSERT_TRUE(
+        service->UpsertEnd(source.client_id, key, tenant, ReplicaType::MEMORY));
+
+    auto before = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->replicas.size(), 1u);
+    const auto source_id = before->replicas.front().id;
+    auto move = service->MoveStart(source.client_id, key, tenant, "move_source",
+                                   "move_target");
+    ASSERT_TRUE(move);
+    ASSERT_TRUE(move->target);
+
+    auto concurrent_upsert =
+        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    ASSERT_FALSE(concurrent_upsert);
+    EXPECT_EQ(concurrent_upsert.error(),
+              ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    auto during = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(during);
+    ASSERT_EQ(during->replicas.size(), 1u);
+    EXPECT_EQ(during->replicas.front().id, source_id);
+    ASSERT_TRUE(service->MoveRevoke(source.client_id, key, tenant));
+
+    auto after = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(after);
+    ASSERT_EQ(after->replicas.size(), 1u);
+    EXPECT_EQ(after->replicas.front().id, source_id);
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  "move_target"),
+              0);
+}
+
 // Drain plans and completes one tenant at a time: the segment counts as
 // drained only once every tenant's object under the same user key has left
 // it.
@@ -4858,6 +5129,113 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
     // Cleanup stays disabled: neither a co-located server nor a remote URL.
     MasterServiceTestPeer(service).CleanupHttpMetadataForTesting("segment_a");
     service.StopHttpMetadataCleanup();
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentCopyEndAndCopyRevokeOnSameClientSerializeCleanly) {
+    auto service_config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(600).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service, "concurrent_copy_source",
+                                             kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "concurrent_copy_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = source.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "concurrent_copy_source";
+
+    constexpr int kNumKeys = 16;
+    for (int i = 0; i < kNumKeys; ++i) {
+        const std::string key = "concurrent_copy_key_" + std::to_string(i);
+        PutCompletedObject(*service, client_id, key, config);
+        ASSERT_TRUE(service
+                        ->CopyStart(client_id, key, TenantId::Default(),
+                                    "concurrent_copy_source",
+                                    {"concurrent_copy_target"})
+                        .has_value());
+
+        std::promise<void> go;
+        std::shared_future<void> start = go.get_future().share();
+        auto end_future = std::async(std::launch::async, [&] {
+            start.wait();
+            return service->CopyEnd(client_id, key, TenantId::Default());
+        });
+        auto revoke_future = std::async(std::launch::async, [&] {
+            start.wait();
+            return service->CopyRevoke(client_id, key, TenantId::Default());
+        });
+        go.set_value();
+
+        const auto end_res = end_future.get();
+        const auto revoke_res = revoke_future.get();
+        ASSERT_NE(end_res.has_value(), revoke_res.has_value());
+        const auto& loser = end_res.has_value() ? revoke_res : end_res;
+        EXPECT_EQ(loser.error(), ErrorCode::OBJECT_NO_REPLICATION_TASK);
+
+        auto replicas = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas.has_value());
+        EXPECT_EQ(replicas->replicas.size(), end_res.has_value() ? 2u : 1u);
+    }
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentFetchTasksOnSameClientDispatchesEachTaskOnce) {
+    auto service_config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(600).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service, "concurrent_task_source",
+                                             kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "concurrent_task_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = source.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "concurrent_task_source";
+
+    constexpr int kNumTasks = 16;
+    std::set<UUID> expected_ids;
+    for (int i = 0; i < kNumTasks; ++i) {
+        const std::string key = "concurrent_task_key_" + std::to_string(i);
+        PutCompletedObject(*service, client_id, key, config);
+        auto task_id = service->CreateCopyTask(key, TenantId::Default(),
+                                               {"concurrent_task_target"});
+        ASSERT_TRUE(task_id.has_value());
+        EXPECT_TRUE(expected_ids.insert(*task_id).second);
+    }
+
+    constexpr int kWorkers = 4;
+    std::barrier sync_point(kWorkers);
+    std::vector<std::future<std::vector<UUID>>> workers;
+    workers.reserve(kWorkers);
+    for (int w = 0; w < kWorkers; ++w) {
+        workers.push_back(std::async(std::launch::async, [&] {
+            std::vector<UUID> popped;
+            sync_point.arrive_and_wait();
+            for (;;) {
+                auto batch = service->FetchTasks(client_id, /*batch_size=*/2);
+                EXPECT_TRUE(batch.has_value());
+                if (!batch.has_value() || batch->empty()) {
+                    break;
+                }
+                for (const auto& assignment : *batch) {
+                    popped.push_back(assignment.id);
+                }
+            }
+            return popped;
+        }));
+    }
+
+    std::vector<UUID> all_popped;
+    for (auto& worker : workers) {
+        auto part = worker.get();
+        all_popped.insert(all_popped.end(), part.begin(), part.end());
+    }
+    EXPECT_EQ(all_popped.size(), static_cast<size_t>(kNumTasks));
+    std::set<UUID> unique_popped(all_popped.begin(), all_popped.end());
+    EXPECT_EQ(unique_popped, expected_ids);
 }
 
 }  // namespace mooncake::test
