@@ -5842,7 +5842,7 @@ void Client::StorageHeartbeatThreadMain() {
         // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
         // re-register offloaded object metadata.
     };
-    // Use another thread to remount segments to avoid blocking the ping
+    // Use another thread to remount segments to avoid bl ocking the ping
     // thread
     std::future<void> remount_segment_future;
 
