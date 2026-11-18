@@ -11,6 +11,7 @@ on:
       - 'cmake/**'
       - 'CMakeLists.txt'
       - '.github/workflows/ci-macos.yml'
+      - 'scripts/ci/smoke_master_lifecycle.py'
   pull_request:
     branches:
       - "main"
@@ -74,6 +75,9 @@ jobs:
       run: cmake --build build --target mooncake_master --parallel "$(sysctl -n hw.ncpu)"
       shell: bash
 
-    - name: Smoke test
-      run: ./build/mooncake-store/src/mooncake_master --version
+    - name: Smoke test mooncake_master
+      run: |
+        master=./build/mooncake-store/src/mooncake_master
+        "$master" --version
+        python3 scripts/ci/smoke_master_lifecycle.py "$master"
       shell: bash
