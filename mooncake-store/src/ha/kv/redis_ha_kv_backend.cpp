@@ -106,6 +106,17 @@ end
 return out
 )LUA";
 
+// Declares only the index key and derives the record keys from its contents
+// (redis_prefix .. rest). Declaring every record key instead would follow the
+// scripting guidance, but a script cannot be redirected, so a derived key that
+// is mid-migration aborts the EVAL mid-way and Lua cannot roll back what the
+// delete already removed.
+//
+// The alternative costs one extra round trip (scan members, then EVAL with the
+// index plus every record key), adds ~70 B of request and ~27 B of reply per
+// record with the extra cost dominated by client side key construction, and
+// caps one call at 16383 records because RedisClusterClient::Execute bounds an
+// EVAL to 16384 declared keys.
 constexpr char kDeleteRangeScript[] = R"LUA(
 if #KEYS ~= 1 or #ARGV ~= 4 then return {-1} end
 local index_type = redis.call('TYPE', KEYS[1]).ok
