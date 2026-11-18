@@ -14,6 +14,68 @@ int write_manifest_impl(const std::string &key,
     return ret;
 }
 
+// Return nullopt before submitting any RPC if this batch cannot use MLU IPC.
+std::optional<std::vector<int>> try_dummy_mlu_ipc_batch_write_tensor_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+    bool upsert) {
+    if (!use_dummy_client_ || keys.size() != infos.size()) return std::nullopt;
+    for (const auto &info : infos) {
+        if (!info.valid()) continue;
+        if (!info.owner || info.owner.is_none() || !info.tensor_size ||
+            info.owner.attr("device").attr("type").cast<std::string>() != "mlu")
+            return std::nullopt;
+    }
+    for (const auto &info : infos) {
+        if (!info.valid()) continue;
+        torch_module()
+            .attr("mlu")
+            .attr("current_stream")(info.owner.attr("device"))
+            .attr("synchronize")();
+    }
+    std::vector<int> results(keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+    py::gil_scoped_release release_gil;
+    // Tensor owners in infos outlive exports, which drain active imports even
+    // on RPC failure. Metadata is owned by each RPC request at the receiver.
+    std::vector<mooncake::device::MluIpcBufferExport> exports;
+    std::vector<MluIpcWriteRequest> requests;
+    std::vector<size_t> indices;
+    for (size_t i = 0; i < infos.size(); ++i) {
+        const auto &info = infos[i];
+        if (!info.valid()) continue;
+        auto exported = mooncake::device::MluIpcBufferExport::Create(
+            reinterpret_cast<const void *>(info.data_ptr), info.tensor_size);
+        if (!exported) return std::nullopt;
+        // An unaligned host destination makes CNRT D2H copies much slower.
+        // Pad the small header so the payload keeps the Store allocation's
+        // DMA alignment. Tensor readers already honor header.data_offset.
+        constexpr size_t kPayloadAlignment = 512;
+        constexpr size_t metadata_size =
+            (sizeof(TensorMetadata) + kPayloadAlignment - 1) /
+            kPayloadAlignment * kPayloadAlignment;
+        auto metadata = info.metadata;
+        metadata.header.data_offset = metadata_size;
+        std::string metadata_bytes(metadata_size, '\0');
+        std::memcpy(metadata_bytes.data(), &metadata, sizeof(metadata));
+        requests.push_back(
+            MluIpcWriteRequest{.key = keys[i],
+                               .metadata = std::move(metadata_bytes),
+                               .payload = exported->handle()});
+        indices.push_back(i);
+        exports.push_back(std::move(*exported));
+    }
+    if (!requests.empty()) {
+        auto dummy = std::static_pointer_cast<DummyClient>(store_);
+        auto write_config = MakeIndexedConfig(config, indices);
+        auto op_results =
+            upsert ? dummy->batch_upsert_from_mlu_ipc(requests, write_config)
+                   : dummy->batch_put_from_mlu_ipc(requests, write_config);
+        apply_indexed_results(upsert ? "upsert" : "put", op_results, indices,
+                              results);
+    }
+    return results;
+}
+
 template <typename CudaIpcBatchWriteFn>
 std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_write_tensor_impl(
     const std::vector<std::string> &keys,

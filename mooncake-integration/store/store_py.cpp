@@ -19,6 +19,7 @@
 #include "ssd_register_client.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
+#include "device/mlu_ipc_buffer.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -1096,6 +1097,9 @@ class MooncakeStorePyWrapper {
         }
 
         auto metadata = batch_get_tensor_metadata_prefixes(keys, context);
+        std::vector<mooncake::device::MluIpcBufferExport> mlu_exports;
+        std::vector<MluIpcReadRequest> mlu_requests;
+        std::vector<size_t> mlu_indices;
         std::vector<CudaIpcReadRequest> read_requests;
         std::vector<size_t> original_indices;
         read_requests.reserve(keys.size());
@@ -1111,6 +1115,27 @@ class MooncakeStorePyWrapper {
             }
             if (target.tensor_size == 0) {
                 results[i] = 0;
+                continue;
+            }
+            if (target.owner.attr("device").attr("type").cast<std::string>() ==
+                "mlu") {
+                // Finish preceding operations on this destination before the
+                // service writes it from another process.
+                torch_module()
+                    .attr("mlu")
+                    .attr("current_stream")(target.owner.attr("device"))
+                    .attr("synchronize")();
+                auto exported = mooncake::device::MluIpcBufferExport::Create(
+                    reinterpret_cast<void *>(target.data_ptr),
+                    target.tensor_size);
+                if (!exported) continue;
+                mlu_requests.push_back(
+                    MluIpcReadRequest{.key = keys[i],
+                                      .destination = exported->handle(),
+                                      .source_offset = metadata[i]->data_offset,
+                                      .size = metadata[i]->data_bytes});
+                mlu_indices.push_back(i);
+                mlu_exports.push_back(std::move(*exported));
                 continue;
             }
             auto dst_buffer = mooncake::device::ExportCudaIpcBuffer(
@@ -1141,6 +1166,16 @@ class MooncakeStorePyWrapper {
             }
             apply_indexed_results(context.c_str(), op_results, original_indices,
                                   results);
+        }
+        {
+            py::gil_scoped_release release_gil;
+            if (!mlu_requests.empty()) {
+                auto dummy = std::static_pointer_cast<DummyClient>(store_);
+                auto op_results = dummy->batch_get_into_mlu_ipc(mlu_requests);
+                apply_indexed_results(context.c_str(), op_results, mlu_indices,
+                                      results);
+            }
+            mlu_exports.clear();
         }
         return results;
     }
@@ -1320,6 +1355,10 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config = ReplicateConfig{}) {
         auto config_error = ValidateBatchKeyHints(config, keys.size(), "put");
         if (!config_error.empty()) return config_error;
+        if (auto mlu_ipc_results = try_dummy_mlu_ipc_batch_write_tensor_impl(
+                keys, infos, config, false)) {
+            return *mlu_ipc_results;
+        }
         if (auto cuda_ipc_results =
                 try_dummy_cuda_ipc_batch_put_tensor_impl(keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1349,6 +1388,10 @@ class MooncakeStorePyWrapper {
         auto config_error =
             ValidateBatchKeyHints(config, keys.size(), "upsert");
         if (!config_error.empty()) return config_error;
+        if (auto mlu_ipc_results = try_dummy_mlu_ipc_batch_write_tensor_impl(
+                keys, infos, config, true)) {
+            return *mlu_ipc_results;
+        }
         if (auto cuda_ipc_results = try_dummy_cuda_ipc_batch_upsert_tensor_impl(
                 keys, infos, config)) {
             return *cuda_ipc_results;

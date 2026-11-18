@@ -132,6 +132,54 @@ MC_STORE_TEST_REQUIRE_MLU=1 MASTER_SERVER=127.0.0.1:50051 \
   -p test_mlu_tensor.py
 ```
 
+#### MLU IPC with a Separate Store Client
+
+Build both `mooncake_client` and the Python extension with MLU support. Start
+`mooncake_client` against your Master, then connect from the application:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+if store.setup_dummy(0, 32 * 1024 * 1024, "127.0.0.1:50052") != 0:
+    raise RuntimeError("setup_dummy failed")
+```
+
+MLU `put_tensor`, `upsert_tensor`, and their batch variants export device memory
+through CNDRV IPC. Small tensor headers travel with the write RPC.
+`get_tensor_into_cuda` and its batch variant also accept contiguous MLU
+destinations; these tensor destinations do not need `register_buffer` in dummy
+mode. Registered MLU pointers use IPC in `put_from`, `batch_put_from`, `get_into`,
+and `batch_get_into`. Raw-pointer callers must finish producing the data before
+calling Store and keep the allocation alive until the call returns.
+
+Both processes must run as the same user on the same host, share `/dev/shm`, and
+have access to the exported MLU. Devices are matched by UUID, so visible-device
+ordering may differ. This path uses CNDRV directly and does not require a TENT
+IPC transport. RealClient still uses Store's existing staging and transfer path
+for remote replicas.
+
+Tensor IPC synchronizes the current MLU stream for each participating tensor.
+If another stream produces the tensor, establish an event dependency or
+synchronize that stream before the call. Mixed CPU/MLU write batches, empty
+tensors, and allocations that cannot be exported retain the existing host
+staging path; callers remain responsible for producer readiness on that path.
+
+Each export has a per-call lease. Returning from the RPC, including on failure,
+revokes future imports and waits for active mappings to close before the caller
+can release its tensors. This wait may exceed the RPC timeout.
+A stuck service can therefore keep a call waiting; forcibly terminating an
+exporter while its allocation is imported is unsupported. Do not remove active
+`/dev/shm/mooncake-store-mlu-*` lease files.
+
+With the Master and a separate `mooncake_client` running:
+
+```bash
+MC_STORE_TEST_REQUIRE_MLU=1 MC_MLU_REAL_CLIENT=127.0.0.1:50052 \
+  python3 -m unittest discover -s mooncake-wheel/tests -p test_mlu_dummy_ipc.py
+ctest --test-dir build -R '^mlu_ipc_buffer_test$' --output-on-failure
+```
+
 (build-with-intel-xpu)=
 ### Build with Intel XPU
 

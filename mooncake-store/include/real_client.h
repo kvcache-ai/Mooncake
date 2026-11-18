@@ -21,6 +21,7 @@
 #include "client_buffer.h"
 #include "client_service.h"
 #include "device/cuda_ipc_buffer_handle.h"
+#include "device/mlu_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
@@ -609,13 +610,27 @@ class RealClient : public PyClient {
         const ReplicateConfig &config, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_mlu_ipc_dummy_helper(
+        const std::vector<MluIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
     batch_upsert_from_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_mlu_ipc_dummy_helper(
+        const std::vector<MluIpcWriteRequest> &requests,
         const ReplicateConfig &config, const UUID &client_id);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_mlu_ipc_dummy_helper(
+        const std::vector<MluIpcReadRequest> &requests, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_upsert_from_multi_buffers_dummy_helper(
@@ -1095,6 +1110,11 @@ class RealClient : public PyClient {
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config, const UUID &client_id, bool is_upsert);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_write_from_mlu_ipc_dummy_helper(
+        const std::vector<MluIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id, bool is_upsert);
+
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
@@ -1332,6 +1352,9 @@ class RealClient : public PyClient {
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
+
+    // Limits direct MLU IPC reads; contending RPCs use host staging.
+    std::mutex mlu_ipc_local_read_mutex_;
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();
