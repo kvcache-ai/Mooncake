@@ -368,8 +368,8 @@ bool launch_musa_kernel_cached(std::string_view source, std::string_view stem,
     std::shared_ptr<Loaded> loaded;
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto it = cache.find(key);
-        if (it != cache.end()) loaded = it->second;
+        auto it = cache->find(key);
+        if (it != cache->end()) loaded = it->second;
         if (!loaded) {
             auto config = make_musa_jit_compile_config();
             if (!resolve_musa_jit_target_arch(&config, error)) return false;
@@ -383,7 +383,7 @@ bool launch_musa_kernel_cached(std::string_view source, std::string_view stem,
                 !loaded->module.get_function(entry, &loaded->function, error)) {
                 return false;
             }
-            cache.emplace(key, loaded);
+            cache->emplace(key, loaded);
         }
     }
     return loaded->module.launch(loaded->function, grid_x, grid_y, grid_z,
