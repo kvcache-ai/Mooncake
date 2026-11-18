@@ -54,6 +54,8 @@
                 "max_rd_atomic": 16
             },
             "workers" : {
+                "numa_nodes": [],
+                "prefer_local": false,
                 "max_retry_count": 8,
                 "block_size": 65536,
                 "grace_period_ns": 50000,
