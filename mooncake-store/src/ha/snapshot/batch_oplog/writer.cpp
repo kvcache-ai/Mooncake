@@ -103,9 +103,10 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     }
 
     ha::BatchOpLogSnapshotManifest manifest;
+    const bool has_local_deletes = !capture.pending_local_deletes.empty();
     const bool has_weight_state =
         capture.weight_metadata != WeightMetadataSnapshot{} ||
-        capture.object_storage.target.has_value();
+        capture.object_storage.target.has_value() || has_local_deletes;
     if (has_weight_state) {
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
@@ -113,6 +114,11 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     if (capture.object_storage.target) {
         manifest.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
+    }
+    if (has_local_deletes) {
+        manifest.schema_version =
+            ha::kBatchOpLogLocalDeleteSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogLocalDeleteSnapshotFormat;
     }
     manifest.snapshot_id = snapshot_id;
     manifest.last_included_seq = capture.last_included_seq;
@@ -167,6 +173,22 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
             return fail("Failed to upload object storage state: " +
                         upload.error());
     }
+    if (has_local_deletes) {
+        auto bytes = struct_pack::serialize<std::vector<uint8_t>>(
+            capture.pending_local_deletes);
+        const auto key = ha::BuildBatchOpLogSnapshotLocalDeletesKey(
+            snapshot_root, snapshot_id);
+        manifest.pending_local_deletes = ha::BatchOpLogSnapshotObjectDescriptor{
+            .key = key,
+            .stored_size = bytes.size(),
+            .crc32c = Crc32cValue(bytes.data(), bytes.size()),
+        };
+        upload = object_store_.UploadBuffer(key, bytes);
+        if (!upload) {
+            return fail("Failed to upload pending local deletions: " +
+                        upload.error());
+        }
+    }
     uint64_t chunk_index = 0;
     while (!capture.done()) {
         std::vector<StandbyObjectEntry> objects;
@@ -210,6 +232,12 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         const auto& objects = *manifest.object_storage;
         verify = VerifyObject(object_store_, objects.key, objects.stored_size,
                               objects.crc32c);
+        if (!verify) return fail(std::move(verify.error()));
+    }
+    if (manifest.pending_local_deletes) {
+        const auto& tasks = *manifest.pending_local_deletes;
+        verify = VerifyObject(object_store_, tasks.key, tasks.stored_size,
+                              tasks.crc32c);
         if (!verify) return fail(std::move(verify.error()));
     }
     if (manifest.weight_metadata) {
@@ -282,6 +310,9 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
                                       : 0) +
             (manifest.object_storage ? manifest.object_storage->stored_size
                                      : 0) +
+            (manifest.pending_local_deletes
+                 ? manifest.pending_local_deletes->stored_size
+                 : 0) +
             manifest_json.size() + descriptor_json.size();
     });
     return metric_timer.Success(descriptor_json);

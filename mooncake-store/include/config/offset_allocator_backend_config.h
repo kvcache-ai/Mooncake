@@ -5,6 +5,9 @@
 
 namespace mooncake {
 
+// On-disk key bound shared by writes, recovery, and delete intents.
+inline constexpr size_t kMaxOffsetStorageKeySize = 1024 * 1024;
+
 enum class OffsetEvictionPolicy {
     NONE,  // No eviction
     FIFO,  // Evict oldest key first (by insertion order)

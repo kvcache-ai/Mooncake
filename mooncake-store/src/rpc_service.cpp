@@ -1769,6 +1769,34 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode>
+WrappedMasterService::MountVersionedLocalDiskSegment(const UUID& client_id,
+                                                     bool enable_offloading) {
+    return master_service_.MountLocalDiskSegment(client_id, enable_offloading,
+                                                 /*versioned=*/true);
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::MountOffsetDeleteStorage(
+    const UUID& client_id, bool enable_offloading, const UUID& storage_id) {
+    return master_service_.MountOffsetDeleteStorage(
+        client_id, enable_offloading, storage_id);
+}
+
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+WrappedMasterService::FetchLocalDeletes(const UUID& client_id,
+                                        const UUID& storage_id,
+                                        const UUID& epoch, uint32_t limit) {
+    return master_service_.FetchLocalDeletes(client_id, storage_id, epoch,
+                                             limit);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::AckLocalDeletes(
+    const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+    const std::vector<UUID>& task_ids) {
+    return master_service_.AckLocalDeletes(client_id, storage_id, epoch,
+                                           task_ids);
+}
+
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
@@ -2064,9 +2092,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const std::vector<LocalDeleteTask>& pending_local_deletes) {
     return master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments, weight_metadata);
+        objects, initial_oplog_sequence_id, segments, weight_metadata,
+        pending_local_deletes);
 }
 
 tl::expected<void, ErrorCode>
@@ -2144,6 +2174,10 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::BatchExistKey,
         &WrappedMasterService::BatchProbeKey,
         &WrappedMasterService::MountLocalDiskSegment,
+        &WrappedMasterService::MountVersionedLocalDiskSegment,
+        &WrappedMasterService::MountOffsetDeleteStorage,
+        &WrappedMasterService::FetchLocalDeletes,
+        &WrappedMasterService::AckLocalDeletes,
         &WrappedMasterService::UnmountLocalDiskSegment,
         &WrappedMasterService::OffloadObjectHeartbeat,
         &WrappedMasterService::ReportSsdCapacity,

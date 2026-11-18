@@ -116,6 +116,14 @@ struct ObjectMetadata {
     const std::string user_key;
     const uint8_t key_group;
 
+    // Changes when a writer replaces the content under the object's key lock.
+    // Zero means a legacy disk record or restored metadata without a version.
+    ObjectIncarnation incarnation;
+    // Stable disks authorized to write this incarnation, including copies
+    // whose holder has not yet returned an offload completion.
+    std::vector<UUID> offset_write_targets;
+    uint64_t offset_write_target_sequence{0};
+
     // Committed attribution only; protected by the key's lock.
     std::string session_id;
     struct PendingSessionTag {

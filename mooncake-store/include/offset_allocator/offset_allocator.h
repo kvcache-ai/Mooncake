@@ -110,6 +110,7 @@ class OffsetAllocationHandle {
     uint64_t requested_size;
 
     friend class OffsetAllocatorTest;  // for unit tests
+    friend class OffsetAllocator;
 };
 
 struct OffsetAllocatorMetrics {
@@ -191,6 +192,13 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics() const;
 
+    // Capture only the supplied live allocations for restart persistence.
+    // The caller must keep every supplied handle alive for this call. Omitted
+    // allocations remain owned by their handles in the original allocator.
+    [[nodiscard]] std::shared_ptr<OffsetAllocator> snapshot(
+        const std::vector<const OffsetAllocationHandle*>& live_allocations)
+        const;
+
     // Serialize the allocator with serializer.
     template <typename T>
     void serialize_to(T& serializer) const;
@@ -225,6 +233,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     bool m_largest_free_region_tightened GUARDED_BY(m_mutex) = false;
 
     // Private constructor - use create() factory method instead
+    OffsetAllocator() = default;
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
                     uint32 max_capacity);
 
@@ -243,6 +252,7 @@ class __Allocator {
     template <typename T>
         requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
     __Allocator(T& serializer) noexcept(false);
+    __Allocator(const __Allocator&) = default;
     __Allocator(__Allocator&& other);
     ~__Allocator() = default;
     void reset();

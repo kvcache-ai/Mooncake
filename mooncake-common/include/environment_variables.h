@@ -252,6 +252,7 @@ struct StoreClusterIdentityEnvironmentVariables {
 };
 
 struct MasterMetadataEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_LOCAL_DISK_INCARNATIONS);
     MC_DEFINE_ENV_VAR(std::string, MC_METADATA_CLUSTER_ID);
 };
 

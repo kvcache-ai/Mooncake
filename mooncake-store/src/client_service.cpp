@@ -1434,7 +1434,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return tl::expected<QueryResult, ErrorCode>(
         tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum, result.value().resolved_tenant_id);
+        result.value().object_checksum, result.value().resolved_tenant_id,
+        result.value().object_incarnation.value_or(ObjectIncarnation{}));
 }
 
 tl::expected<QueryResult, ErrorCode> Client::QueryReadOnly(
@@ -1483,7 +1484,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
                 response[i].value().object_checksum,
-                response[i].value().resolved_tenant_id);
+                response[i].value().resolved_tenant_id,
+                response[i].value().object_incarnation.value_or(
+                    ObjectIncarnation{}));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -4426,9 +4429,9 @@ WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
-    bool enable_offloading) {
-    auto response =
-        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+    bool enable_offloading, bool supports_versioned_offload) {
+    auto response = master_client_.MountLocalDiskSegment(
+        client_id_, enable_offloading, supports_versioned_offload);
 
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
@@ -4438,6 +4441,33 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
 
     EnsureStorageControlPlaneStarted();
     return response;
+}
+
+tl::expected<bool, ErrorCode> Client::SupportsOffsetDelete() {
+    auto config = master_client_.GetStorageConfig();
+    if (!config) return tl::make_unexpected(config.error());
+    return config->supports_offset_delete.value_or(false);
+}
+
+tl::expected<UUID, ErrorCode> Client::MountOffsetDeleteStorage(
+    bool enable_offloading, const UUID& storage_id) {
+    auto result = master_client_.MountOffsetDeleteStorage(
+        client_id_, enable_offloading, storage_id);
+    if (result) EnsureStorageControlPlaneStarted();
+    return result;
+}
+
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode> Client::FetchLocalDeletes(
+    const UUID& storage_id, const UUID& epoch, uint32_t limit) {
+    return master_client_.FetchLocalDeletes(client_id_, storage_id, epoch,
+                                            limit);
+}
+
+tl::expected<void, ErrorCode> Client::AckLocalDeletes(
+    const UUID& storage_id, const UUID& epoch,
+    const std::vector<UUID>& task_ids) {
+    return master_client_.AckLocalDeletes(client_id_, storage_id, epoch,
+                                          task_ids);
 }
 
 tl::expected<void, ErrorCode> Client::UnmountLocalDiskSegment() {
