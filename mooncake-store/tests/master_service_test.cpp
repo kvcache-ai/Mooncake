@@ -4488,6 +4488,155 @@ TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     EXPECT_EQ(restored_status.value(), SegmentStatus::OK);
 }
 
+TEST_F(MasterServiceTest, GracefulUnmountEvacuatesAndUnmountsOnceEmpty) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(0)
+                      .set_evacuate_on_graceful_unmount(true)
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000,
+                         kDefaultSegmentSize);
+    const auto key =
+        PutObjectOnSegment(*service, source.client_id, "segment_0");
+
+    ASSERT_TRUE(service->GracefulUnmountSegment(source.segment_id,
+                                                source.client_id, 60000));
+    WaitUntil([&] {
+        (void)ExecutePendingMoveTasks(*service, source.client_id);
+        return !service->QuerySegmentStatusById(source.segment_id).has_value();
+    });
+
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+}
+
+TEST_F(MasterServiceTest, GracefulUnmountWithoutEvacuationMovesNothing) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000,
+                         kDefaultSegmentSize);
+    PutObjectOnSegment(*service, source.client_id, "segment_0");
+
+    ASSERT_TRUE(service->GracefulUnmountSegment(source.segment_id,
+                                                source.client_id, 60000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+    auto tasks = service->FetchTasks(source.client_id, 16);
+    ASSERT_TRUE(tasks.has_value());
+    EXPECT_TRUE(tasks->empty());
+    EXPECT_EQ(service->QuerySegmentStatusById(source.segment_id).value(),
+              SegmentStatus::GRACEFULLY_UNMOUNTING);
+}
+
+TEST_F(MasterServiceTest, EvacuationWaitsForEverySegmentOfTheNameAndLeases) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(2000)
+                      .set_evacuate_on_graceful_unmount(true)
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const UUID client_id = generate_uuid();
+    const Segment first = MakeSegment("leaving", 0x300000000);
+    ASSERT_TRUE(service->MountSegment(first, client_id));
+    const auto key = PutObjectOnSegment(*service, client_id, "leaving");
+    const Segment second = MakeSegment("leaving", 0x500000000);
+    ASSERT_TRUE(service->MountSegment(second, client_id));
+    PrepareSimpleSegment(*service, "target", 0x400000000, kDefaultSegmentSize);
+
+    ASSERT_TRUE(service->GracefulUnmountSegment(first.id, client_id, 60000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    auto tasks = service->FetchTasks(client_id, 16);
+    ASSERT_TRUE(tasks.has_value());
+    EXPECT_TRUE(tasks->empty());
+
+    ASSERT_TRUE(service->GracefulUnmountSegment(second.id, client_id, 60000));
+    WaitUntil([&] {
+        // Read right before the move so MoveEnd keeps a fresh 2 s lease.
+        EXPECT_TRUE(service->GetReplicaList(key, TenantId::Default()));
+        return ExecutePendingMoveTasks(*service, client_id);
+    });
+
+    // The moved-off copy stays mounted while the read lease covers it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    auto first_status = service->QuerySegmentStatusById(first.id);
+    ASSERT_TRUE(first_status.has_value());
+    EXPECT_EQ(first_status.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+    WaitUntil([&] {
+        return !service->QuerySegmentStatusById(first.id).has_value() &&
+               !service->QuerySegmentStatusById(second.id).has_value();
+    });
+}
+
+TEST_F(MasterServiceTest, EvacuationStopsWhenTheNameIsMountedAgain) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(0)
+                      .set_evacuate_on_graceful_unmount(true)
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const UUID client_id = generate_uuid();
+    const Segment leaving = MakeSegment("leaving", 0x300000000);
+    ASSERT_TRUE(service->MountSegment(leaving, client_id));
+    PutObjectOnSegment(*service, client_id, "leaving");
+    PrepareSimpleSegment(*service, "target", 0x400000000, kDefaultSegmentSize);
+
+    ASSERT_TRUE(service->GracefulUnmountSegment(leaving.id, client_id, 60000));
+    DrainJobListRequest filter;
+    filter.segment = "leaving";
+    WaitUntil([&] {
+        auto page = service->ListDrainJobs(filter);
+        return page.has_value() && page->jobs.size() == 1;
+    });
+
+    const Segment remounted = MakeSegment("leaving", 0x500000000);
+    ASSERT_TRUE(service->MountSegment(remounted, client_id));
+    WaitUntil([&] {
+        auto page = service->ListDrainJobs(filter);
+        return page.has_value() && page->jobs.size() == 1 &&
+               page->jobs[0].status == JobStatus::CANCELED;
+    });
+
+    auto tasks = service->FetchTasks(client_id, 16);
+    ASSERT_TRUE(tasks.has_value());
+    EXPECT_TRUE(tasks->empty());
+    auto status = service->QuerySegmentStatusById(remounted.id);
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, CanceledDrainKeepsGracefullyUnmountingSegmentClosed) {
+    auto service = std::make_unique<MasterService>();
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000,
+                         kDefaultSegmentSize);
+    PutObjectOnSegment(*service, source.client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.max_concurrency = 1;
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    ASSERT_TRUE(service->GracefulUnmountSegment(source.segment_id,
+                                                source.client_id, 60000));
+    ASSERT_TRUE(service->CancelDrainJob(job_id.value()));
+    WaitUntil([&] {
+        auto job = service->QueryDrainJob(job_id.value());
+        return job.has_value() && job->status == JobStatus::CANCELED;
+    });
+
+    EXPECT_EQ(service->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::GRACEFULLY_UNMOUNTING);
+}
+
 TEST_F(MasterServiceTest, DrainJobTimeoutWaitsForMoveAndCanResume) {
     auto config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();

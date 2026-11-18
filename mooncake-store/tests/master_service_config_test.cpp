@@ -281,6 +281,26 @@ TEST(MasterServiceConfigTest, EvictionWorkerThreadsPropagates) {
     EXPECT_EQ(8u, MasterServiceConfig(from_supervisor).eviction_worker_threads);
 }
 
+TEST(MasterServiceConfigTest, EvacuateOnGracefulUnmountPropagates) {
+    EXPECT_FALSE(
+        MasterServiceConfig::builder().build().evacuate_on_graceful_unmount);
+    EXPECT_TRUE(MasterServiceConfig::builder()
+                    .set_evacuate_on_graceful_unmount(true)
+                    .build()
+                    .evacuate_on_graceful_unmount);
+
+    MasterConfig master_config{};
+    EXPECT_FALSE(master_config.evacuate_on_graceful_unmount);
+    master_config.evacuate_on_graceful_unmount = true;
+    const WrappedMasterServiceConfig from_master(master_config, 1);
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+    const WrappedMasterServiceConfig from_supervisor(supervisor_config, 1);
+
+    EXPECT_TRUE(MasterServiceConfig(from_master).evacuate_on_graceful_unmount);
+    EXPECT_TRUE(
+        MasterServiceConfig(from_supervisor).evacuate_on_graceful_unmount);
+}
+
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     auto config =
         MasterServiceConfig::builder().set_oplog_batch_max_entries(17).build();

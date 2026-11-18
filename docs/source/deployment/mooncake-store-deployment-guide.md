@@ -864,6 +864,7 @@ mooncake_master \
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
 | `--eviction_worker_threads` | `0` | Threads per memory eviction pass; `0` picks one per 16M keys (1–64), `1`–`64` sets the count |
+| `--evacuate_on_graceful_unmount` | `false` | When a client gracefully unmounts a segment, move its objects to other segments within the grace period, and unmount the segment once it is empty |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota

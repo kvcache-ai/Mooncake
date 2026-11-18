@@ -110,6 +110,7 @@ struct MasterConfig {
     double eviction_high_watermark_ratio;
     double tenant_eviction_high_watermark_ratio;
     uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
+    bool evacuate_on_graceful_unmount = false;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
@@ -253,6 +254,7 @@ class MasterServiceSupervisorConfig {
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
+    bool evacuate_on_graceful_unmount = false;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
@@ -354,6 +356,7 @@ class MasterServiceSupervisorConfig {
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         eviction_worker_threads = config.eviction_worker_threads;
+        evacuate_on_graceful_unmount = config.evacuate_on_graceful_unmount;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -550,6 +553,7 @@ class WrappedMasterServiceConfig {
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
+    bool evacuate_on_graceful_unmount = false;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -645,6 +649,7 @@ class WrappedMasterServiceConfig {
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         eviction_worker_threads = config.eviction_worker_threads;
+        evacuate_on_graceful_unmount = config.evacuate_on_graceful_unmount;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -771,6 +776,7 @@ class WrappedMasterServiceConfig {
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         eviction_worker_threads = config.eviction_worker_threads;
+        evacuate_on_graceful_unmount = config.evacuate_on_graceful_unmount;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -868,6 +874,7 @@ class MasterServiceConfigBuilder {
     double tenant_eviction_high_watermark_ratio_ =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     uint32_t eviction_worker_threads_ = DEFAULT_EVICTION_WORKER_THREADS;
+    bool evacuate_on_graceful_unmount_ = false;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio_ =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -963,6 +970,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_eviction_worker_threads(uint32_t threads) {
         eviction_worker_threads_ = threads;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_evacuate_on_graceful_unmount(bool enable) {
+        evacuate_on_graceful_unmount_ = enable;
         return *this;
     }
 
@@ -1220,6 +1232,9 @@ class MasterServiceConfig {
     // to [1, 64] each round; explicit counts [1, 64] override automatic sizing.
     // Set from the master's -eviction_worker_threads flag or config key.
     uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
+    // Start a timed drain when a segment begins a graceful unmount, and
+    // unmount it as soon as the drain empties it.
+    bool evacuate_on_graceful_unmount = false;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
@@ -1325,6 +1340,7 @@ class MasterServiceConfig {
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
         eviction_worker_threads = config.eviction_worker_threads;
+        evacuate_on_graceful_unmount = config.evacuate_on_graceful_unmount;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -1430,6 +1446,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.tenant_eviction_high_watermark_ratio =
         tenant_eviction_high_watermark_ratio_;
     config.eviction_worker_threads = eviction_worker_threads_;
+    config.evacuate_on_graceful_unmount = evacuate_on_graceful_unmount_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
     config.nof_eviction_high_watermark_ratio =
         nof_eviction_high_watermark_ratio_;
