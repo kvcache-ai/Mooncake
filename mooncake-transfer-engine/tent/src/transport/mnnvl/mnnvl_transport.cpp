@@ -611,7 +611,14 @@ Status MnnvlTransport::submitTransferTasks(
     }
     mnnvl_batch->completion_groups.reserve(
         mnnvl_batch->completion_groups.size() + 1);
-    CHECK_STATUS(syncWithCallerStream());
+    // Requests carrying a producer_event are ordered on the device by
+    // startTransfer, so the CPU barrier on the caller's per-thread stream is
+    // skipped when every request has one.
+    const bool need_caller_sync = std::any_of(
+        request_list.begin(), request_list.end(), [](const Request &request) {
+            return request.producer_event == nullptr;
+        });
+    if (need_caller_sync) CHECK_STATUS(syncWithCallerStream());
     MnnvlDeviceGuard guard(stream_device);
     CHECK_CUDA(guard.error());
 
@@ -659,6 +666,31 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
                                    MnnvlSubBatch *batch,
                                    MnnvlCompletion &completion) {
     if (tasks.empty()) return;
+    cudaStream_t stream = batch->async_stream.get();
+
+    // Order the copies after each distinct producer event on the device, so
+    // a producer on any application stream is covered without blocking the
+    // CPU. No copy is queued yet, so a failure here needs no drain.
+    std::vector<cudaEvent_t> waited_events;
+    for (auto *task : tasks) {
+        auto producer =
+            reinterpret_cast<cudaEvent_t>(task->request.producer_event);
+        if (!producer || std::find(waited_events.begin(), waited_events.end(),
+                                   producer) != waited_events.end())
+            continue;
+        auto wait_err = cudaStreamWaitEvent(stream, producer, 0);
+        if (wait_err != cudaSuccess) {
+            LOG(ERROR) << "MNNVL producer event wait failed: "
+                       << cudaGetErrorString(wait_err) << "; batch=" << batch
+                       << " group=" << tasks.front()->completion_group
+                       << " device=" << completion.device;
+            completion.result = wait_err;
+            for (auto *t : tasks) t->status_word = TransferStatusEnum::FAILED;
+            return;
+        }
+        waited_events.push_back(producer);
+    }
+
     cudaError_t err;
 
 #if CUDART_VERSION >= 13000
@@ -668,7 +700,7 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     err = cudaMemcpyBatchAsync(const_cast<const void **>(dsts.data()),
                                const_cast<const void **>(srcs.data()),
                                sizes.data(), srcs.size(), &attr, &attrs_idx, 1,
-                               batch->async_stream.get());
+                               stream);
 #elif CUDART_VERSION >= 12080
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -676,7 +708,7 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     size_t fail_idx = tasks.size();
     err = cudaMemcpyBatchAsyncCompat(dsts.data(), srcs.data(), sizes.data(),
                                      srcs.size(), &attr, &attrs_idx, 1,
-                                     &fail_idx, batch->async_stream.get());
+                                     &fail_idx, stream);
     if (err != cudaSuccess && fail_idx < tasks.size()) {
         LOG(ERROR) << "MnnvlTransport::startTransfer internal error: "
                    << "cudaMemcpyBatchAsync failed at task index " << fail_idx
@@ -687,9 +719,8 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
 #else
     err = cudaSuccess;
     for (size_t i = 0; i < tasks.size(); ++i) {
-        auto single_err =
-            cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
-                            batch->async_stream.get());
+        auto single_err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i],
+                                          cudaMemcpyDefault, stream);
         if (single_err != cudaSuccess) {
             err = single_err;
             break;
@@ -697,14 +728,13 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     }
 #endif
 
-    if (err == cudaSuccess)
-        err = cudaEventRecord(completion.event, batch->async_stream.get());
+    if (err == cudaSuccess) err = cudaEventRecord(completion.event, stream);
     if (err != cudaSuccess) {
         // Batch memcpy may have accepted a prefix. Drain before terminal
         // failure allows runtime teardown or recovery to reuse these buffers.
         // Submission remains successful: returning an error here would invite
         // redispatch.
-        const auto drain = cudaStreamSynchronize(batch->async_stream.get());
+        const auto drain = cudaStreamSynchronize(stream);
         LOG(ERROR) << "MNNVL copy/completion failed: "
                    << cudaGetErrorString(err)
                    << "; drain: " << cudaGetErrorString(drain)

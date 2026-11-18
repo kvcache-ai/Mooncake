@@ -5118,6 +5118,113 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
     service.StopHttpMetadataCleanup();
 }
 
+TEST_F(MasterServiceTest,
+       ConcurrentCopyEndAndCopyRevokeOnSameClientSerializeCleanly) {
+    auto service_config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(600).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service, "concurrent_copy_source",
+                                             kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "concurrent_copy_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = source.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "concurrent_copy_source";
+
+    constexpr int kNumKeys = 16;
+    for (int i = 0; i < kNumKeys; ++i) {
+        const std::string key = "concurrent_copy_key_" + std::to_string(i);
+        PutCompletedObject(*service, client_id, key, config);
+        ASSERT_TRUE(service
+                        ->CopyStart(client_id, key, TenantId::Default(),
+                                    "concurrent_copy_source",
+                                    {"concurrent_copy_target"})
+                        .has_value());
+
+        std::promise<void> go;
+        std::shared_future<void> start = go.get_future().share();
+        auto end_future = std::async(std::launch::async, [&] {
+            start.wait();
+            return service->CopyEnd(client_id, key, TenantId::Default());
+        });
+        auto revoke_future = std::async(std::launch::async, [&] {
+            start.wait();
+            return service->CopyRevoke(client_id, key, TenantId::Default());
+        });
+        go.set_value();
+
+        const auto end_res = end_future.get();
+        const auto revoke_res = revoke_future.get();
+        ASSERT_NE(end_res.has_value(), revoke_res.has_value());
+        const auto& loser = end_res.has_value() ? revoke_res : end_res;
+        EXPECT_EQ(loser.error(), ErrorCode::OBJECT_NO_REPLICATION_TASK);
+
+        auto replicas = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas.has_value());
+        EXPECT_EQ(replicas->replicas.size(), end_res.has_value() ? 2u : 1u);
+    }
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentFetchTasksOnSameClientDispatchesEachTaskOnce) {
+    auto service_config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(600).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service, "concurrent_task_source",
+                                             kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "concurrent_task_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = source.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "concurrent_task_source";
+
+    constexpr int kNumTasks = 16;
+    std::set<UUID> expected_ids;
+    for (int i = 0; i < kNumTasks; ++i) {
+        const std::string key = "concurrent_task_key_" + std::to_string(i);
+        PutCompletedObject(*service, client_id, key, config);
+        auto task_id = service->CreateCopyTask(key, TenantId::Default(),
+                                               {"concurrent_task_target"});
+        ASSERT_TRUE(task_id.has_value());
+        EXPECT_TRUE(expected_ids.insert(*task_id).second);
+    }
+
+    constexpr int kWorkers = 4;
+    std::barrier sync_point(kWorkers);
+    std::vector<std::future<std::vector<UUID>>> workers;
+    workers.reserve(kWorkers);
+    for (int w = 0; w < kWorkers; ++w) {
+        workers.push_back(std::async(std::launch::async, [&] {
+            std::vector<UUID> popped;
+            sync_point.arrive_and_wait();
+            for (;;) {
+                auto batch = service->FetchTasks(client_id, /*batch_size=*/2);
+                EXPECT_TRUE(batch.has_value());
+                if (!batch.has_value() || batch->empty()) {
+                    break;
+                }
+                for (const auto& assignment : *batch) {
+                    popped.push_back(assignment.id);
+                }
+            }
+            return popped;
+        }));
+    }
+
+    std::vector<UUID> all_popped;
+    for (auto& worker : workers) {
+        auto part = worker.get();
+        all_popped.insert(all_popped.end(), part.begin(), part.end());
+    }
+    EXPECT_EQ(all_popped.size(), static_cast<size_t>(kNumTasks));
+    std::set<UUID> unique_popped(all_popped.begin(), all_popped.end());
+    EXPECT_EQ(unique_popped, expected_ids);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

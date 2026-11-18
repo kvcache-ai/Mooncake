@@ -1891,11 +1891,10 @@ class MasterService {
     ClientSessionRegistry client_sessions_;
     ClientOffboardingWorker client_offboarding_worker_{this};
     void ClientMonitorFunc();
+    void OnClientRetired(const UUID& client_id, ClientSessionSharedPtr session);
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs = 1000;
-    const int64_t client_active_ttl_sec_;
-    const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
