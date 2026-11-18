@@ -89,6 +89,45 @@ class NVLinkAllocator:
             return cls._instances[device]
 
 
+class HipGemAllocator:
+    """HIP device memory in amdgpu GEM BOs, for buffers RDMA NICs pin (KV caches).
+
+    amdgpu-dkms 6.18.4 through 7.1.9, and kernels before torvalds/linux
+    9131cc85d0de (v7.4-rc1), charge KFD memory that a NIC pins twice in the KFD
+    allocation limit, so registering a KV cache larger than the VRAM left after
+    allocating it makes every later device allocation of the process fail. A GEM
+    BO is charged once. The library is loaded with RTLD_GLOBAL so the transfer
+    engine can find its buffers (mc_hip_gem_lookup) and register them through
+    their own dma-buf.
+    """
+
+    _instances: Dict[torch_device, CUDAPluggableAllocator] = {}
+    _lock: Final = threading.Lock()
+    _library = None
+
+    @classmethod
+    def _get_so_path(cls) -> str:
+        return get_mooncake_so_path(
+            "hip_gem_allocator.so",
+            "HipGemAllocator requires a ROCm build of mooncake-transfer-engine "
+            "that ships hip_gem_allocator.so.",
+        )
+
+    @classmethod
+    def get_allocator(cls, device: torch_device) -> CUDAPluggableAllocator:
+        with cls._lock:
+            if device not in cls._instances:
+                so_path = cls._get_so_path()
+                if cls._library is None:
+                    cls._library = ctypes.CDLL(
+                        so_path, mode=os.RTLD_NOW | os.RTLD_GLOBAL
+                    )
+                cls._instances[device] = CUDAPluggableAllocator(
+                    so_path, "mc_hip_gem_malloc", "mc_hip_gem_free"
+                )
+            return cls._instances[device]
+
+
 class BarexAllocator:
     _instances: Dict[torch_device, CUDAPluggableAllocator] = {}
     _lock: Final = threading.Lock()

@@ -45,6 +45,9 @@
 #include "transport/transport.h"
 
 #include "cuda_alike.h"
+#ifdef USE_HIP
+#include "transport/hip_gem_lookup.h"
+#endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
     defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_UBSHMEM)
