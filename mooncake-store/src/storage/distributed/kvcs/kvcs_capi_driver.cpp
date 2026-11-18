@@ -189,6 +189,8 @@ class KvcsLowLevelDriver final : public KvcsDriver {
     }
     uint64_t MaxValueSize() const override { return config_.max_value_size; }
     uint32_t MaxKeySize() const override { return config_.max_key_size; }
+    size_t MaxBatchKeys() const override { return config_.max_keys_per_batch; }
+    size_t ReadConcurrency() const override { return config_.get_workers; }
 
     tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() override {

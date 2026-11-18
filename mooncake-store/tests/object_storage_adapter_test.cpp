@@ -212,6 +212,54 @@ TEST_F(ObjectStorageAdapterTest, DefaultPutBatchForwardsIovecArrayAndCount) {
     EXPECT_EQ(adapter.putv_calls, 3);
 }
 
+TEST_F(ObjectStorageAdapterTest, DefaultReadCompletionKeepsNativeBatchResults) {
+    FakeObjectStorageAdapter adapter;
+    adapter.objects["short"] = "abc";
+    std::array<char, 4> first{}, missing{};
+    std::vector<tl::expected<size_t, ErrorCode>> completed;
+    adapter.GetBatchWithCompletion(
+        {{"short", first.data(), first.size()},
+         {"missing", missing.data(), missing.size()}},
+        [&](size_t index, const auto& result) {
+            EXPECT_EQ(adapter.get_batch_calls, 1);
+            EXPECT_EQ(adapter.get_calls, 2);  // Native batch has finished.
+            EXPECT_EQ(index, completed.size());
+            completed.push_back(result);
+        });
+    ASSERT_EQ(completed.size(), 2u);
+    ASSERT_TRUE(completed[0]);
+    EXPECT_EQ(*completed[0],
+              3u);  // Retain the adapter's native short-read result.
+    ASSERT_FALSE(completed[1]);
+    EXPECT_EQ(completed[1].error(), ErrorCode::FILE_NOT_FOUND);
+    EXPECT_EQ(std::string(first.data(), 3), "abc");
+    const auto without_callback = adapter.GetBatchWithCompletion(
+        {{"short", first.data(), first.size()}}, {});
+    ASSERT_EQ(without_callback.size(), 1u);
+    EXPECT_EQ(without_callback[0].value(), 3u);
+    EXPECT_EQ(adapter.get_batch_calls, 2);
+}
+
+TEST_F(ObjectStorageAdapterTest, DefaultReadCompletionRejectsWrongResultCount) {
+    class ShortBatchAdapter : public FakeObjectStorageAdapter {
+       public:
+        std::vector<tl::expected<size_t, ErrorCode>> GetBatch(
+            const std::vector<ObjectGetRequest>&) override {
+            return {1};
+        }
+    } adapter;
+    std::array<char, 2> buffers{};
+    size_t completed = 0;
+    adapter.GetBatchWithCompletion(
+        {{"first", &buffers[0], 1}, {"second", &buffers[1], 1}},
+        [&](size_t index, const auto& result) {
+            EXPECT_EQ(index, completed++);
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+        });
+    EXPECT_EQ(completed, 2u);
+}
+
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);

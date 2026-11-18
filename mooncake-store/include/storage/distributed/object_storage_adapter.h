@@ -3,6 +3,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -89,6 +90,26 @@ class ObjectStorageAdapter {
             results.emplace_back(
                 Get(request.logical_key, request.buffer, request.size));
         }
+        return results;
+    }
+
+    using ReadCompletion =
+        std::function<void(size_t, const tl::expected<size_t, ErrorCode>&)>;
+    // Synchronous batch with optional early completion, once per index on
+    // normal return, on the calling thread after its destination is written.
+    // A callback exception stops notifications, drains submitted I/O and is
+    // propagated. Borrowed buffers remain live until return or exception.
+    // Existing adapters keep their native batching and complete after GetBatch.
+    virtual std::vector<tl::expected<size_t, ErrorCode>> GetBatchWithCompletion(
+        const std::vector<ObjectGetRequest>& requests,
+        const ReadCompletion& completed) {
+        auto results = GetBatch(requests);
+        if (results.size() != requests.size())
+            results.assign(requests.size(),
+                           tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        if (completed)
+            for (size_t i = 0; i < results.size(); ++i)
+                completed(i, results[i]);
         return results;
     }
 
