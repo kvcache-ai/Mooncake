@@ -17,10 +17,13 @@
 
 #include <atomic>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_set>
 #include <cn_api.h>
@@ -51,6 +54,16 @@ struct MluCopyQueue {
     Status error;  // Guarded by mutex; do not submit to a failed queue.
     ~MluCopyQueue();
     Status synchronize();
+
+   private:
+    friend struct MluTask;
+    void deferRelease(CNnotifier notifier, std::shared_ptr<void> mapping);
+    struct DeferredRelease {
+        CNnotifier notifier;
+        std::shared_ptr<void> mapping;
+    };
+    // Guarded by mutex. Release only after a successful queue drain.
+    std::unique_ptr<std::vector<DeferredRelease>> deferred_;
 };
 
 struct MluTask {
@@ -109,11 +122,12 @@ class MluTransport : public Transport {
     bool mayMapRemoteBuffer(SegmentID target_id, const SegmentDesc &segment,
                             const BufferDesc &entry) const;
     bool prepareRemoteBuffer(SegmentID target_id, const SegmentDesc &segment,
-                             const BufferDesc &entry, void *local_source);
+                             const BufferDesc &entry, void *local_source,
+                             Request::OpCode opcode);
     void closeRemoteSegment(SegmentID target_id);
 
-    // Both addresses must be local (or already imported). Peer accessibility
-    // is assumed symmetric, so this check is independent of the copy opcode.
+    // Both addresses must be local (or already imported), in the actual copy
+    // direction. READ callers must swap the request's source and target.
     // A false result requires engine-managed staging.
     static bool canCopyPeer(void *src, void *dst);
 
@@ -133,12 +147,24 @@ class MluTransport : public Transport {
     Status drainBuffer(uint64_t addr, size_t size);
     std::shared_ptr<void> relocate(SegmentID target_id, uint64_t &addr,
                                    size_t length);
+    void reapImports();
+    void evictIdleSegments(std::chrono::steady_clock::time_point now);
 
+    // Serialize install/uninstall while the reaper is joined outside mutex_.
+    std::mutex lifecycle_mutex_;
     std::mutex mutex_;
+    std::condition_variable import_reaper_cv_;
+    std::thread import_reaper_;
+    // Guarded by mutex_; durations are fixed before starting the reaper.
+    bool stop_import_reaper_ = true;
+    std::chrono::milliseconds import_idle_timeout_{std::chrono::minutes(5)};
+    std::chrono::milliseconds import_scan_interval_{std::chrono::minutes(5)};
     // D2H/D2D on the source context, H2D on the destination context.
     std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 2>> queues_;
     std::unordered_set<MluSubBatch *> batches_;
     std::map<SegmentID, std::vector<mlu_detail::ImportEntry>> imports_;
+    std::map<SegmentID, std::chrono::steady_clock::time_point>
+        last_import_request_;
     std::map<SegmentID, uint64_t> high_water_;
     std::string machine_id_;
     bool installed_ = false;

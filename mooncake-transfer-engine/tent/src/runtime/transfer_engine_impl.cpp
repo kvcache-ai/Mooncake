@@ -1824,10 +1824,11 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         transport_list_[MLU]) {
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
+        void* copy_src = request.source;
+        void* copy_dst = reinterpret_cast<void*>(request.target_offset);
+        if (request.opcode == Request::READ) std::swap(copy_src, copy_dst);
         if (getTypeEnum(LocationParser(entry->location).type()) == MTYPE_MLU &&
-            !MluTransport::canCopyPeer(
-                request.source,
-                reinterpret_cast<void*>(request.target_offset))) {
+            !MluTransport::canCopyPeer(copy_src, copy_dst)) {
             findStagingPolicy(request, host_staging_params);
             // An inaccessible device pair must not fall back to unstaged MLU.
             if (host_staging_params.empty()) return SelectionResult{};
@@ -2425,8 +2426,9 @@ bool TransferEngineImpl::mluIpcReady(const Request& request,
 #ifdef USE_MLU
     if (!desc || !remote_entry) return false;
     auto* mlu = dynamic_cast<MluTransport*>(transport_list_[MLU].get());
-    return mlu && mlu->prepareRemoteBuffer(request.target_id, *desc,
-                                           *remote_entry, request.source);
+    return mlu &&
+           mlu->prepareRemoteBuffer(request.target_id, *desc, *remote_entry,
+                                    request.source, request.opcode);
 #else
     (void)request;
     (void)desc;

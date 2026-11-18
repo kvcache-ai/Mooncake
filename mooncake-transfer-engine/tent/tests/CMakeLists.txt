@@ -1001,8 +1001,11 @@ if(USE_MLU)
     PRIVATE
     "-Wl,--wrap=cnrtHostMalloc"
     "-Wl,--wrap=cnrtFreeHost"
+    "-Wl,--wrap=cnrtMapMemHandle"
+    "-Wl,--wrap=cnrtUnMapMemHandle"
     "-Wl,--wrap=numa_move_pages"
     "-Wl,--wrap=cnPlaceNotifier"
+    "-Wl,--wrap=cnDestroyNotifier"
     "-Wl,--wrap=cnMemcpyAsync_V3"
     "-Wl,--wrap=cnMemcpyPeerAsync"
     "-Wl,--wrap=cnMemcpyHtoD"

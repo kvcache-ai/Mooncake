@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <charconv>
 #include <sstream>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 
@@ -110,6 +111,23 @@ class ContextGuard {
     CNcontext previous_ = nullptr;
     Status status_;
 };
+
+class RuntimeDeviceGuard {
+   public:
+    RuntimeDeviceGuard() : status_(cnrtGetDevice(&previous_)) {}
+    ~RuntimeDeviceGuard() {
+        if (status_ != cnrtSuccess) return;
+        auto result = cnrtSetDevice(previous_);
+        if (result != cnrtSuccess) LOG(ERROR) << cnrtGetErrorStr(result);
+    }
+    cnrtRet_t use(int device) {
+        return status_ == cnrtSuccess ? cnrtSetDevice(device) : status_;
+    }
+
+   private:
+    int previous_ = -1;
+    cnrtRet_t status_;
+};
 }  // namespace
 
 Status MluCopyQueue::synchronize() {
@@ -117,16 +135,31 @@ Status MluCopyQueue::synchronize() {
     ContextGuard guard;
     CHECK_STATUS(guard.use(context));
     auto status = driverStatus(cnQueueSync(handle));
-    if (!status.ok()) error = status;
+    if (!status.ok()) {
+        error = status;
+    } else if (deferred_) {
+        for (const auto &resource : *deferred_)
+            logError(driverStatus(cnDestroyNotifier(resource.notifier)));
+        deferred_.reset();
+    }
     return status;
+}
+
+void MluCopyQueue::deferRelease(CNnotifier notifier,
+                                std::shared_ptr<void> mapping) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!deferred_)
+        deferred_ = std::make_unique<std::vector<DeferredRelease>>();
+    deferred_->push_back({notifier, std::move(mapping)});
 }
 
 MluCopyQueue::~MluCopyQueue() {
     if (!handle) return;
     auto drained = synchronize();
     if (!drained.ok()) {
-        logError(drained);
-        return;  // Destruction is not a device-side cancellation barrier.
+        // No owner remains to retry. Do not let member destruction unmap
+        // resources that the device may still be using.
+        LOG(FATAL) << "Cannot safely destroy MLU queue: " << drained.ToString();
     }
     ContextGuard guard;
     auto status = guard.use(context);
@@ -151,6 +184,8 @@ MluTask::~MluTask() {
         auto drained = queue->synchronize();
         if (!drained.ok()) {
             logError(drained);
+            queue->deferRelease(std::exchange(completion, nullptr),
+                                std::move(imported_target));
             return;
         }
     }
@@ -166,6 +201,7 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
                              std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> /*local_topology*/,
                              std::shared_ptr<Config> conf) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (installed_) {
         return Status::InvalidArgument(
@@ -192,6 +228,16 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
                 }));
         }
     }
+    if (ipc_enabled_) {
+        stop_import_reaper_ = false;
+        try {
+            import_reaper_ = std::thread(&MluTransport::reapImports, this);
+        } catch (const std::system_error &error) {
+            stop_import_reaper_ = true;
+            return Status::InternalError(
+                std::string("Cannot start MLU import reaper: ") + error.what());
+        }
+    }
     installed_ = true;
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
@@ -200,9 +246,21 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
 }
 
 Status MluTransport::uninstall() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_import_reaper_ = true;
+    }
+    import_reaper_cv_.notify_all();
+    // Stop before draining: even a failed drain must not leave a joinable
+    // thread behind on destruction. Never join while holding mutex_.
+    if (import_reaper_.joinable()) import_reaper_.join();
+    // Declared before the lock so cached mappings are unmapped after unlock.
+    decltype(imports_) dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
-    imports_.clear();
+    dropped.swap(imports_);
+    last_import_request_.clear();
     high_water_.clear();
     queues_.clear();
     metadata_.reset();
@@ -210,6 +268,35 @@ Status MluTransport::uninstall() {
     installed_ = false;
     machine_id_.clear();
     return Status::OK();
+}
+
+void MluTransport::reapImports() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!import_reaper_cv_.wait_for(
+        lock, import_scan_interval_, [this] { return stop_import_reaper_; })) {
+        lock.unlock();
+        evictIdleSegments(std::chrono::steady_clock::now());
+        lock.lock();
+    }
+}
+
+void MluTransport::evictIdleSegments(
+    std::chrono::steady_clock::time_point now) {
+    // Drop only cache references. Tasks may still hold these mappings; the
+    // last reference unmaps them, outside the transport lock.
+    decltype(imports_) dropped;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = last_import_request_.begin();
+         it != last_import_request_.end();) {
+        if (now - it->second < import_idle_timeout_) {
+            ++it;
+            continue;
+        }
+        dropped.insert(imports_.extract(it->first));
+        it = last_import_request_.erase(it);
+    }
+    // Preserve high_water_: old snapshots must not recreate expired imports.
+    // They follow the existing IPC failure/fallback path on a cache miss.
 }
 
 Status MluTransport::quiesce() {
@@ -743,7 +830,8 @@ bool MluTransport::mayMapRemoteBuffer(SegmentID target_id,
 bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
                                        const SegmentDesc &segment,
                                        const BufferDesc &entry,
-                                       void *local_source) {
+                                       void *local_source,
+                                       Request::OpCode opcode) {
     if (!mayMapRemoteBuffer(target_id, segment, entry)) return false;
     const auto *generation_text = segment.getMemory().getTransportAttrs(MLU);
     uint64_t generation = 0;
@@ -765,8 +853,12 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     if (queried != cnrtSuccess) return false;
     if (source.type == cnrtMemTypeDevice && source.device != attr.device) {
         unsigned int accessible = 0;
-        auto result =
-            cnrtGetPeerAccessibility(&accessible, source.device, attr.device);
+        // submitPeerCopy queues READ on the peer's context after swapping
+        // the endpoints. Check that same direction before committing IPC.
+        const bool read = opcode == Request::READ;
+        auto result = cnrtGetPeerAccessibility(
+            &accessible, read ? attr.device : source.device,
+            read ? source.device : attr.device);
         if (result != cnrtSuccess || !accessible) return false;
     }
 
@@ -775,6 +867,7 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     std::vector<std::shared_ptr<void>> dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     auto &entries = imports_[target_id];
+    last_import_request_[target_id] = std::chrono::steady_clock::now();
     auto &watermark = high_water_[target_id];
     if (generation < watermark) {
         // A newer snapshot has already removed stale imports. Reuse a mapping
@@ -806,9 +899,12 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     for (const auto &imported : entries)
         if (imported.attr == attr_text) return true;
 
+    // Restore CNRT's device before the caller's exact driver context: setting
+    // the runtime device may itself change the current context.
     ContextGuard guard;
+    RuntimeDeviceGuard device_guard;
     if (!guard.use(nullptr).ok()) return false;
-    auto selected = cnrtSetDevice(attr.device);
+    auto selected = device_guard.use(attr.device);
     if (selected != cnrtSuccess) return false;
     void *mapped = nullptr;
     auto result = cnrtMapMemHandle(
@@ -849,14 +945,18 @@ std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
         if (!rangeWithin(addr, length, entry.base, entry.size)) continue;
         addr =
             addr - entry.base + reinterpret_cast<uint64_t>(entry.mapping.get());
+        last_import_request_[target_id] = std::chrono::steady_clock::now();
         return entry.mapping;
     }
     return nullptr;
 }
 
 void MluTransport::closeRemoteSegment(SegmentID target_id) {
+    // Extract under the lock; destroy the node and its mappings after unlock.
+    decltype(imports_)::node_type dropped;
     std::lock_guard<std::mutex> lock(mutex_);
-    imports_.erase(target_id);
+    dropped = imports_.extract(target_id);
+    last_import_request_.erase(target_id);
     high_water_.erase(target_id);
 }
 

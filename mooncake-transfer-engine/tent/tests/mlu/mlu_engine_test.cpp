@@ -497,6 +497,38 @@ TEST_P(MluEngineTest, LocalDevicePairSelectsDirectMluCopy) {
     EXPECT_TRUE(route.staging_params.empty());
 }
 
+TEST_P(MluEngineTest, OneWayLocalPairChecksActualCopyDirection) {
+    void *source = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &source));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &target));
+    // Expose target as device 1 only for peer checks; allocations stay real.
+    mlu_test::InaccessiblePeer remote_device(target, kLength);
+    Request request{};
+    request.source = source;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target);
+    request.length = kLength;
+    for (auto allowed : {Request::WRITE, Request::READ}) {
+        mlu_test::OneWayPeer peer(allowed == Request::READ ? 1 : 0,
+                                  allowed == Request::READ ? 0 : 1);
+        for (auto opcode : {Request::WRITE, Request::READ}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "allowed=" << allowed << ", opcode=" << opcode);
+            request.opcode = opcode;
+            const auto route = TransferEngineImplTestPeer::route(*a_, request);
+            EXPECT_EQ(route.transport, MLU);
+            EXPECT_EQ(route.staging_params.empty(), opcode == allowed);
+            EXPECT_EQ(mlu_test::last_peer_src.load(),
+                      opcode == Request::READ ? 1 : 0);
+            EXPECT_EQ(mlu_test::last_peer_dst.load(),
+                      opcode == Request::READ ? 0 : 1);
+            const auto no_stage =
+                TransferEngineImplTestPeer::routeWithoutHostStage(*a_, request);
+            EXPECT_EQ(no_stage.transport, opcode == allowed ? MLU : UNSPEC);
+        }
+    }
+}
+
 TEST_P(MluEngineTest, InaccessibleLocalPairWithoutHostStageFailsSelection) {
     void *source = nullptr, *target = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &source));
@@ -506,23 +538,12 @@ TEST_P(MluEngineTest, InaccessibleLocalPairWithoutHostStageFailsSelection) {
     request.target_id = LOCAL_SEGMENT_ID;
     request.target_offset = reinterpret_cast<uint64_t>(target);
     request.length = kLength;
-    for (auto opcode : {Request::WRITE, Request::READ}) {
-        for (auto hint : {UNSPEC, MLU}) {
-            request.opcode = opcode;
-            request.transport_hint = hint;
-            // A directly accessible pair does not need a host stage.
-            auto direct =
-                TransferEngineImplTestPeer::routeWithoutHostStage(*a_, request);
-            EXPECT_EQ(direct.transport, MLU);
-            EXPECT_TRUE(direct.staging_params.empty());
-
-            mlu_test::InaccessiblePeer inaccessible(source, kLength);
-            auto rejected =
-                TransferEngineImplTestPeer::routeWithoutHostStage(*a_, request);
-            EXPECT_EQ(rejected.transport, UNSPEC);
-            EXPECT_TRUE(rejected.staging_params.empty());
-        }
-    }
+    request.opcode = Request::WRITE;
+    mlu_test::InaccessiblePeer inaccessible(source, kLength);
+    auto rejected =
+        TransferEngineImplTestPeer::routeWithoutHostStage(*a_, request);
+    EXPECT_EQ(rejected.transport, UNSPEC);
+    EXPECT_TRUE(rejected.staging_params.empty());
 }
 
 TEST_P(MluEngineTest, InaccessibleLocalPairUsesOneChunkPool) {
@@ -535,43 +556,37 @@ TEST_P(MluEngineTest, InaccessibleLocalPairUsesOneChunkPool) {
     auto& platform = Platform::getLoader();
 
     for (auto opcode : {Request::WRITE, Request::READ}) {
-        for (auto hint : {UNSPEC, MLU}) {
-            void* src = opcode == Request::WRITE ? local : target;
-            void* dst = opcode == Request::WRITE ? target : local;
-            ASSERT_TRUE(platform.copy(src, seed.data(), kLength).ok());
-            ASSERT_TRUE(platform.copy(dst, zero.data(), kLength).ok());
-            Request request{};
-            request.opcode = opcode;
-            request.source = local;
-            request.target_id = LOCAL_SEGMENT_ID;
-            request.target_offset = reinterpret_cast<uint64_t>(target);
-            request.length = kLength;
-            request.transport_hint = hint;
-            auto route = TransferEngineImplTestPeer::route(*a_, request);
-            ASSERT_EQ(route.transport, MLU);
-            ASSERT_EQ(route.staging_params.size(), 3u);
-            EXPECT_TRUE(route.staging_params[0].empty());
-            EXPECT_FALSE(route.staging_params[1].empty());
-            EXPECT_TRUE(route.staging_params[2].empty());
-            const int copies_before = local_copy_->device_copy_tasks;
-            auto batch = a_->allocateBatch(1);
-            ASSERT_NE(batch, 0u);
-            batches_.push_back({a_.get(), batch});
-            ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
-            auto status = wait(batch);
-            ASSERT_EQ(status.s, COMPLETED);
-            EXPECT_EQ(status.transferred_bytes, kLength);
-            ASSERT_TRUE(platform.copy(readback.data(), dst, kLength).ok());
-            EXPECT_EQ(readback, seed);
-            // Four 1 MiB chunks and a tail, with two copies per chunk.
-            EXPECT_EQ(local_copy_->device_copy_tasks - copies_before, 10);
-            EXPECT_EQ(local_copy_->device_pair_tasks.load(), 0);
-            EXPECT_LE(local_copy_->max_copy_length.load(), 1UL << 20);
-            EXPECT_EQ(local_network_->device_copy_tasks.load(), 0);
-            EXPECT_EQ(peer_copy_->device_copy_tasks.load(), 0);
-            ASSERT_TRUE(a_->freeBatch(batch).ok());
-            batches_.pop_back();
-        }
+        void* src = opcode == Request::WRITE ? local : target;
+        void* dst = opcode == Request::WRITE ? target : local;
+        ASSERT_TRUE(platform.copy(src, seed.data(), kLength).ok());
+        ASSERT_TRUE(platform.copy(dst, zero.data(), kLength).ok());
+        Request request{};
+        request.opcode = opcode;
+        request.source = local;
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target);
+        request.length = kLength;
+        auto route = TransferEngineImplTestPeer::route(*a_, request);
+        ASSERT_EQ(route.transport, MLU);
+        ASSERT_EQ(route.staging_params.size(), 3u);
+        EXPECT_TRUE(route.staging_params[0].empty());
+        EXPECT_FALSE(route.staging_params[1].empty());
+        EXPECT_TRUE(route.staging_params[2].empty());
+        auto batch = a_->allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        batches_.push_back({a_.get(), batch});
+        ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
+        auto status = wait(batch);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+        ASSERT_TRUE(platform.copy(readback.data(), dst, kLength).ok());
+        EXPECT_EQ(readback, seed);
+        EXPECT_EQ(local_copy_->device_pair_tasks.load(), 0);
+        EXPECT_LE(local_copy_->max_copy_length.load(), 1UL << 20);
+        EXPECT_EQ(local_network_->device_copy_tasks.load(), 0);
+        EXPECT_EQ(peer_copy_->device_copy_tasks.load(), 0);
+        ASSERT_TRUE(a_->freeBatch(batch).ok());
+        batches_.pop_back();
     }
     EXPECT_EQ(local_copy_->memory_allocations.load(), 1);
     EXPECT_EQ(peer_copy_->memory_allocations.load(), 0);
