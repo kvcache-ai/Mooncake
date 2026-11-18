@@ -346,11 +346,13 @@ bool MusaJitModule::launch(MUfunction function, unsigned grid_x,
     return false;
 }
 
-bool launch_musa_kernel_cached(
-    std::string_view source, std::string_view stem, std::string_view entry,
-    unsigned grid_x, unsigned grid_y, unsigned grid_z, unsigned block_x,
-    unsigned block_y, unsigned block_z, unsigned shared_bytes, MUstream stream,
-    void** args, const MusaJitCompileConfig& config, std::string* error) {
+bool launch_musa_kernel_cached(std::string_view source, std::string_view stem,
+                               std::string_view entry, unsigned grid_x,
+                               unsigned grid_y, unsigned grid_z,
+                               unsigned block_x, unsigned block_y,
+                               unsigned block_z, unsigned shared_bytes,
+                               MUstream stream, void** args,
+                               std::string* error) {
     struct Loaded {
         MusaJitModule module;
         MUfunction function = nullptr;
@@ -369,6 +371,8 @@ bool launch_musa_kernel_cached(
         auto it = cache.find(key);
         if (it != cache.end()) loaded = it->second;
         if (!loaded) {
+            auto config = make_musa_jit_compile_config();
+            if (!resolve_musa_jit_target_arch(&config, error)) return false;
             auto compiled = compile_musa_to_image(source, stem, config);
             if (!compiled.ok) {
                 if (error != nullptr) *error = compiled.log;

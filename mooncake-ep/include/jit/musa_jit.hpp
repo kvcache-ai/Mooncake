@@ -20,7 +20,8 @@ struct MusaJitCompileConfig {
     std::filesystem::path objcopy;
     std::filesystem::path work_dir;
     std::vector<std::filesystem::path> include_dirs;
-    // Set explicitly or through MOONCAKE_MUSA_JIT_ARCH.
+    // Set explicitly, through MOONCAKE_MUSA_JIT_ARCH, or by probing the
+    // active MUSA device when unset.
     std::string target_arch;
     std::vector<std::string> extra_options;
 };
@@ -68,10 +69,12 @@ class MusaJitModule final {
     MUmodule module_ = nullptr;
 };
 
-bool launch_musa_kernel_cached(
-    std::string_view source, std::string_view stem, std::string_view entry,
-    unsigned grid_x, unsigned grid_y, unsigned grid_z, unsigned block_x,
-    unsigned block_y, unsigned block_z, unsigned shared_bytes, MUstream stream,
-    void** args, const MusaJitCompileConfig& config, std::string* error);
+bool launch_musa_kernel_cached(std::string_view source, std::string_view stem,
+                               std::string_view entry, unsigned grid_x,
+                               unsigned grid_y, unsigned grid_z,
+                               unsigned block_x, unsigned block_y,
+                               unsigned block_z, unsigned shared_bytes,
+                               MUstream stream, void** args,
+                               std::string* error);
 
 }  // namespace mooncake::jit
