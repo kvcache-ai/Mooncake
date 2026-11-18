@@ -8640,7 +8640,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                     state.offloading_task->mirror_clients.end()) {
                 continue;
             }
-            if (item.key.empty() || item.key.size() > kMaxOpLogObjectKeySize) {
+            if (!CanPersistLocalDeleteKey(object_id.tenant_id.value(),
+                                          item.key)) {
                 FailOffloadMirror(metadata, state, client_id, item);
                 continue;
             }

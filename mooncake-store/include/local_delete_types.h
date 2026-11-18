@@ -3,8 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "config/offset_allocator_backend_config.h"
 #include "ha/oplog/oplog_types.h"
 #include "tenant_id.h"
 #include "types.h"
@@ -25,11 +27,18 @@ struct LocalDeleteTask {
 };
 YLT_REFL(LocalDeleteTask, task_id, storage_id, tenant_id, key, incarnation);
 
+inline bool CanPersistLocalDeleteKey(std::string_view tenant_id,
+                                     std::string_view key) {
+    // Include the tenant separator in the OffsetAllocator record size.
+    return !tenant_id.empty() && !key.empty() &&
+           key.size() <= kMaxOpLogObjectKeySize &&
+           tenant_id.size() < kMaxOffsetStorageKeySize - key.size();
+}
+
 inline bool IsValidLocalDeleteTask(const LocalDeleteTask& task) {
     return task.task_id != UUID{} && task.storage_id != UUID{} &&
-           !task.tenant_id.empty() && TenantId(task.tenant_id).IsValid() &&
-           !task.key.empty() && task.key.size() <= kMaxOpLogObjectKeySize &&
-           !task.incarnation.IsZero();
+           CanPersistLocalDeleteKey(task.tenant_id, task.key) &&
+           TenantId(task.tenant_id).IsValid() && !task.incarnation.IsZero();
 }
 
 struct LocalDeleteTarget {

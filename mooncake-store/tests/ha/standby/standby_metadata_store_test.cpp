@@ -403,6 +403,11 @@ TEST(LocalDeleteReplayTest, OldAckCannotRemoveNewPendingTask) {
     EXPECT_FALSE(apply(1, OpType::LOCAL_DELETE_REMOVE, old_remove, ""));
     EXPECT_EQ(applier.GetExpectedSequenceId(), 1u);
     EXPECT_TRUE(store.CopyLocalDeleteTasks().empty());
+    auto oversized = old_task;
+    oversized.tenant_id.assign(kMaxOffsetStorageKeySize - old_task.key.size(),
+                               't');
+    EXPECT_FALSE(store.RestoreLocalDeleteTasks({oversized}));
+    EXPECT_TRUE(store.CopyLocalDeleteTasks().empty());
     ASSERT_TRUE(apply(1, OpType::LOCAL_DELETE_REMOVE, old_remove));
     EXPECT_FALSE(store.Exists("default", old_task.key));
     EXPECT_TRUE(store.Exists("other", old_task.key));

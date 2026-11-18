@@ -1660,11 +1660,6 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);
 
-    // Maximum key length accepted by BatchOffload and trusted on recovery.
-    // Write-side enforcement (BatchOffload) and recovery-side validation
-    // (RebuildShardMapsFromAllocator) must agree on this bound.
-    static constexpr uint32_t kMaxKeyLen = 1024 * 1024;
-
     // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
     // freed when last shared_ptr reference drops.
     struct RefCountedAllocationHandle {
