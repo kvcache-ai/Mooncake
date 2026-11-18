@@ -186,6 +186,33 @@ class RealClientTest : public ::testing::Test {
     }
 };
 
+TEST_F(RealClientTest, GetBufferErrorIdentifiesLocalPoolExhaustion) {
+    StartMasterAndSetupClient();
+
+    const std::string key = "get_buffer_local_pool_exhaustion";
+    const std::string source(256 * 1024, 'x');
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+
+    std::vector<std::shared_ptr<BufferHandle>> held;
+    for (size_t i = 0; i < 128; ++i) {
+        auto handle = py_client_->get_buffer(key);
+        if (!handle) break;
+        held.push_back(std::move(handle));
+    }
+    ASSERT_EQ(held.size(), 64);
+
+    auto exhausted = py_client_->get_buffer_with_error(key);
+    ASSERT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), ErrorCode::CLIENT_BUFFER_EXHAUSTED);
+
+    held.clear();
+    auto recovered = py_client_->get_buffer_with_error(key);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered.value()->size(), source.size());
+}
+
 TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     StartMasterAndSetupClient();
 

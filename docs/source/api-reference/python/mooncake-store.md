@@ -1346,10 +1346,10 @@ def get(self, key: str) -> bytes
 - `key` (str): Object identifier to retrieve
 
 **Returns:**
-- `bytes`: Retrieved binary data
+- `bytes`: Retrieved binary data, or empty bytes if key doesn't exist
 
 **Raises:**
-- Returns empty bytes if key doesn't exist
+- `MemoryError`: The object exists, but the client buffer pool cannot allocate space for another `get()` buffer. Use `get_into()` with caller-owned storage, or release retained `get_buffer()` handles before retrying. This exception identifies local pool exhaustion, not a backing-store read failure. Earlier versions returned empty bytes for this allocation failure, so callers that need to distinguish it from a missing key should catch `MemoryError`.
 
 **Example:**
 
