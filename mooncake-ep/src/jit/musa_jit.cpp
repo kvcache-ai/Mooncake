@@ -158,7 +158,8 @@ MusaJitCompileConfig make_musa_jit_compile_config() {
     if (source_dir.empty() || !std::filesystem::is_directory(source_dir)) {
         source_dir = installed_source;
     }
-    if (transfer_dir.empty()) transfer_dir = installed_root;
+    if (transfer_dir.empty() || !std::filesystem::is_directory(transfer_dir))
+        transfer_dir = installed_root;
     config.include_dirs = {source_dir, transfer_dir, transfer_dir / "include"};
     config.extra_options = {"-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"};
     apply_musa_jit_environment(&config);
@@ -172,6 +173,13 @@ bool resolve_musa_jit_target_arch(MusaJitCompileConfig* config,
     if (const char* value = std::getenv("MOONCAKE_MUSA_JIT_ARCH");
         value != nullptr && *value != '\0') {
         config->target_arch = value;
+        return true;
+    }
+    static std::mutex arch_mutex;
+    static std::string detected_arch;
+    std::lock_guard<std::mutex> lock(arch_mutex);
+    if (!detected_arch.empty()) {
+        config->target_arch = detected_arch;
         return true;
     }
     if (muInit(0) != MUSA_SUCCESS) {
@@ -196,7 +204,8 @@ bool resolve_musa_jit_target_arch(MusaJitCompileConfig* config,
         }
         return false;
     }
-    config->target_arch = "mp_" + std::to_string(major) + std::to_string(minor);
+    detected_arch = "mp_" + std::to_string(major) + std::to_string(minor);
+    config->target_arch = detected_arch;
     return true;
 }
 
@@ -347,7 +356,10 @@ bool launch_musa_kernel_cached(
         MUfunction function = nullptr;
     };
     static std::mutex mutex;
-    static std::unordered_map<std::string, std::shared_ptr<Loaded>> cache;
+    // Keep modules alive until process exit without invoking MUSA unload after
+    // the runtime context has already been torn down.
+    static auto* cache =
+        new std::unordered_map<std::string, std::shared_ptr<Loaded>>;
     const std::string key =
         std::string(stem) + ":" +
         std::to_string(std::hash<std::string_view>{}(source));

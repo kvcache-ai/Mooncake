@@ -415,7 +415,7 @@ if(USE_CUDA)
   # is kept out of auditwheel and injected into the wheel afterwards.
 elseif(USE_MUSA)
   set_target_properties(_ep PROPERTIES LINKER_LANGUAGE CXX)
-  target_link_libraries(_ep PRIVATE musa musart rt)
+  target_link_libraries(_ep PRIVATE musa musart rt ${CMAKE_DL_LIBS})
 elseif(USE_MACA)
   set_target_properties(_ep PROPERTIES LINKER_LANGUAGE CXX)
   if(NOT DEFINED MACA_RUNTIME_LIBS)
