@@ -72,7 +72,8 @@ class HeterogeneousRdmaTransport : public Transport {
    private:
     void transferLoop();
 
-    Status aggTransport(const std::vector<TransferTask *> &task_list);
+    Status aggTransport(const std::vector<TransferTask *> &task_list,
+                        std::unique_lock<std::mutex> lock);
 
     Status noAggTransport(const std::vector<TransferTask *> &task_list);
 
@@ -83,6 +84,53 @@ class HeterogeneousRdmaTransport : public Transport {
         uint64_t total_length{};
     };
 
+    class SubmissionGuard {
+       public:
+        explicit SubmissionGuard(HeterogeneousRdmaTransport &self)
+            : self_(self) {
+            std::lock_guard<std::mutex> lock(self_.lifecycle_mutex_);
+            if (!self_.running_) return;
+            ++self_.active_submissions_;
+            active_ = true;
+        }
+
+        SubmissionGuard(const SubmissionGuard &) = delete;
+        SubmissionGuard &operator=(const SubmissionGuard &) = delete;
+
+        ~SubmissionGuard() {
+            if (!active_) return;
+            std::lock_guard<std::mutex> lock(self_.lifecycle_mutex_);
+            --self_.active_submissions_;
+            if (self_.active_submissions_ == 0) {
+                self_.submissions_cv_.notify_all();
+            }
+        }
+
+        bool active() const { return active_; }
+
+       private:
+        HeterogeneousRdmaTransport &self_;
+        bool active_{false};
+    };
+
+    void waitForSubmissions() {
+        std::unique_lock<std::mutex> lock(lifecycle_mutex_);
+        submissions_cv_.wait(lock, [&] { return active_submissions_ == 0; });
+    }
+
+    void signalShutdown() {
+        {
+            std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+            running_ = false;
+        }
+        transfer_queue_cv_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(block_queue_mutx_);
+            running_ = false;
+        }
+        block_queue_cv_.notify_all();
+    }
+
     char *acquireBlock() {
         using namespace std::chrono_literals;
 
@@ -91,7 +139,7 @@ class HeterogeneousRdmaTransport : public Transport {
             if (block_queue_cv_.wait_for(lock, 1000ms, [&] {
                     return !this->block_queue_.empty() || !running_;
                 })) {
-                if (!running_ && block_queue_.empty()) {
+                if (!running_) {
                     return nullptr;
                 }
                 auto block = block_queue_.front();
@@ -112,7 +160,8 @@ class HeterogeneousRdmaTransport : public Transport {
         block_queue_cv_.notify_one();
     }
 
-    bool allBlockReleased() const {
+    bool allBlockReleased() {
+        std::lock_guard<std::mutex> lock(block_queue_mutx_);
         return block_queue_.size() == (size_t)HUGE_DEVICE_NUM;
     }
 
@@ -149,6 +198,9 @@ class HeterogeneousRdmaTransport : public Transport {
     }
 
     std::atomic<bool> running_{};
+    std::mutex lifecycle_mutex_;
+    size_t active_submissions_{0};
+    std::condition_variable submissions_cv_;
     int logic_device_id_{};
 
     std::unique_ptr<RdmaTransport> transport_{};
