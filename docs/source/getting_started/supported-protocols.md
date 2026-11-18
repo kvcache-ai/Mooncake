@@ -195,9 +195,14 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVMe-oF capable storage
 - Properly mounted remote storage nodes
 
+(nvlink-transport)=
 ### NVLink (nvlink)
 
 **Description:** NVIDIA MNNVL (Multi-Node NVLink) protocol for high-bandwidth, low-latency GPU-to-GPU communication across nodes.
+
+See [MNNVL Architecture and PD Hardening](../design/transfer-engine/transport/mnnvl_transport.md)
+for classic versus native TENT selection, memory export/import, F5
+optimizations, configuration, and compatibility boundaries.
 
 **Use When:**
 - Inter-node GPU communication is required
@@ -441,7 +446,7 @@ requirement.
 
 ### Ascend Transport (ascend)
 
-**Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
+**Description:** Huawei Ascend NPU communication using the Ascend Direct transport (ADXL engine). The legacy HCCL transport is deprecated and is no longer built.
 
 **Use When:**
 - Working with Huawei Ascend NPUs
@@ -449,11 +454,11 @@ requirement.
 
 **Requirements:**
 - Huawei Ascend NPU hardware
-- HCCL runtime
+- Ascend CANN toolkit with ADXL/HIXL support
 
 **Documentation:**
 - [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+- [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
 
 ### Hylink Transport (hylink)
 
@@ -778,4 +783,5 @@ If a protocol fails to initialize:
 ../design/transfer-engine/transport/flagcx_transport
 ../design/transfer-engine/transport/mpcomm_transport
 ../design/transfer-engine/transport/memfabric_transport
+../design/transfer-engine/transport/mnnvl_transport
 :::

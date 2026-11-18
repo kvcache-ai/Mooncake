@@ -580,6 +580,13 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    // Reconnection iterates the SHM registry. Join it before free() erases
+    // segments or releases their mappings and FDs.
+    ping_running_ = false;
+    if (ping_thread_.joinable()) {
+        ping_thread_.join();
+    }
+
     void* local_buffer_base = local_buffer_base_;
     unregister_shm();
     if (local_buffer_base && shm_helper_ &&
@@ -600,12 +607,6 @@ int DummyClient::tearDownAll() {
         hot_cache_fd_ = -1;
     }
 
-    if (ping_running_) {
-        ping_running_ = false;
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
-        }
-    }
     connected_.store(false);
     last_ping_healthy_.store(false);
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);

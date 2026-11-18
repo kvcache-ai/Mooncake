@@ -183,10 +183,19 @@ class Config {
     mutable std::mutex mutex_;
 };
 
+// Bootstrap-only MNNVL controls. Defaults preserve the existing transport.
+struct MnnvlConfig {
+    bool require_fabric{false};
+    bool egm_enabled{false};
+};
+
+Status parseMnnvlConfig(const Config& config, MnnvlConfig& options);
+
 struct ConfigHelper {
     Status loadFromEnv(Config& config);
 
     static void forceTcp(Config& config);
+    static void forceFabric(Config& config, const std::string& provider);
 
     // Common parsing utilities for environment variable values
     static bool parseBool(const std::string& str, bool default_value = false);

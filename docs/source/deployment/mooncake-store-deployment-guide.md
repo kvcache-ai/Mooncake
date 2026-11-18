@@ -449,6 +449,7 @@ HA leadership and metadata replication are configured separately:
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--etcd_max_send_message_bytes`: Outgoing gRPC message limit for the HA store etcd client, in bytes. Defaults to `2097152` (2 MiB) and must be positive. For a server configured with `--max-request-bytes=16777216`, use `--etcd_max_send_message_bytes=16777216` and keep serialized batches below that request budget. The setting is applied before the first connection and reused by reset and keepalive clients; it does not change the server limit, receive limit, Transfer Engine client, or snapshot client. The YAML/JSON configuration key is also `etcd_max_send_message_bytes`; an explicitly supplied CLI flag overrides it.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
 - With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
 - Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
@@ -661,6 +662,11 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_requested_bytes_sum`
 - `mooncake_tenant_quota_effective_bytes_sum`
 
+With `--metrics_key_groups="kv:suffix:_k,state:prefix:state_"`, `/metrics` also
+reports `master_key_count_by_group{group}` and `master_value_bytes_by_group{group}`.
+Rules are `group:prefix|suffix|contains:pattern`; the first match wins and other
+keys count as `other`. Value bytes are logical, once per key.
+
 ---
 
 ## Tenant Quota Management
@@ -723,6 +729,7 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 |------|---------|-------------|
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
+| `--metrics_key_groups` | `""` | Break key count and value bytes down by key; see [Metrics Endpoints](#metrics-endpoints) |
 
 ### KV Cache Event Publisher
 
@@ -856,6 +863,7 @@ mooncake_master \
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
+| `--eviction_worker_threads` | `0` | Threads per memory eviction pass; `0` picks one per 16M keys (1–64), `1`–`64` sets the count |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota
@@ -876,6 +884,7 @@ mooncake_master \
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
+| `--etcd_max_send_message_bytes` | `2097152` | Positive outgoing gRPC message limit in bytes for the HA store etcd client; configure before connection and keep requests within the etcd server byte limit |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
@@ -1511,6 +1520,18 @@ Do not run binaries from before and after checksum support was introduced in the
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 | `MC_STORE_REGISTER_SPDK` | unset | Set `1` to register `ShmHelper`-allocated shared memory (host pool, dummy local buffer) with SPDK for NoF zero-copy transfers. Forces HugeTLB backing for those allocations, defaulting to 2MB hugepages when `MC_STORE_USE_HUGEPAGE` is unset. Must be set on BOTH the dummy and the real process (SPDK registration is per-process) |
+| `MC_STORE_MADV_HUGEPAGE` | unset (off) | Set `1` to back the RDMA client (local) buffer with transparent huge pages (`madvise(MADV_HUGEPAGE)`), like the RDMA global segment. Ignored when `MC_STORE_USE_HUGEPAGE` is set. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+
+Without `MC_STORE_USE_HUGEPAGE`, the RDMA global segment is an anonymous
+mapping advised with `madvise(MADV_HUGEPAGE)`, so it is backed by transparent
+huge pages when the host THP mode is `always` or `madvise`. Set
+`MC_STORE_MADV_HUGEPAGE=1` to back the RDMA client (local) buffer the same way;
+it is off by default. THP keeps the NIC memory-registration footprint 512x
+smaller than 4KB-backed memory, which some NICs (e.g. Pensando ionic) need to
+register more than a few GiB. THP backing is best effort: under memory
+fragmentation part of the mapping may stay base-page backed; use
+`MC_STORE_USE_HUGEPAGE` to guarantee huge pages. Dummy-client shared-memory
+buffers are not covered.
 
 RDMA Store segments backed by HugeTLB are populated in parallel immediately
 before transfer-engine registration. No additional population-mode setting is

@@ -60,7 +60,7 @@ class AllocationStrategyParameterizedTest
         size_t size = 64 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         auto allocator = CreateBufferAllocator(allocator_type_, segment_name,
-                                               base, size, segment_name);
+                                               base, size, segment_name, "tcp");
         if (!allocator) {
             throw std::invalid_argument("Invalid allocator test parameters");
         }
@@ -70,7 +70,8 @@ class AllocationStrategyParameterizedTest
     // Registrations bound to the returned record are not serving.
     static std::shared_ptr<ClientLivenessRecord> MakeSuspectedRecord() {
         const auto initial = ClientLivenessRecord::TimePoint{};
-        auto record = std::make_shared<ClientLivenessRecord>(initial);
+        auto record =
+            std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
         EXPECT_EQ(
             record->Evaluate(initial + std::chrono::seconds(1),
                              std::chrono::seconds(1), std::chrono::seconds(10)),
@@ -122,6 +123,63 @@ INSTANTIATE_TEST_SUITE_P(
         return strategy_str + "_" + allocator_str;
     });
 
+TEST(AllocatorManagerTest, ReplacesDistinctRegistrationSlots) {
+    for (const std::string second_name : {"second", "first"}) {
+        SCOPED_TRACE(second_name);
+        auto first_allocator =
+            std::make_shared<DummyBufferAllocator>("first", "first");
+        auto second_allocator =
+            std::make_shared<DummyBufferAllocator>(second_name, second_name);
+        AllocatorManager manager;
+        const auto first = manager.addAllocator("first", first_allocator);
+        const auto second = manager.addAllocator(second_name, second_allocator);
+        AllocatorManager replacements;
+        const auto next_first =
+            replacements.addAllocator("first", first_allocator);
+        const auto next_second =
+            replacements.addAllocator(second_name, second_allocator);
+
+        // Cover both separate per-name vectors (including checked iterators)
+        // and distinct slots in the same vector.
+        ASSERT_TRUE(
+            manager.replaceRegistrations({{"first", first, next_first},
+                                          {second_name, second, next_second}}));
+        ASSERT_NE(manager.getAllocators("first"), nullptr);
+        ASSERT_NE(manager.getAllocators(second_name), nullptr);
+        EXPECT_EQ(manager.getAllocators("first")->front(), next_first);
+        EXPECT_EQ(manager.getAllocators(second_name)->back(), next_second);
+    }
+}
+
+TEST(AllocatorManagerTest,
+     DuplicateReplacementLeavesAllRegistrationsUnchanged) {
+    auto first_allocator =
+        std::make_shared<DummyBufferAllocator>("first", "first");
+    auto second_allocator =
+        std::make_shared<DummyBufferAllocator>("second", "second");
+    AllocatorManager manager;
+    const auto first = manager.addAllocator("first", first_allocator);
+    const auto second = manager.addAllocator("second", second_allocator);
+    AllocatorManager replacements;
+    const auto next_first = replacements.addAllocator("first", first_allocator);
+    const auto next_second =
+        replacements.addAllocator("second", second_allocator);
+
+    EXPECT_FALSE(manager.replaceRegistrations({{"first", first, next_first},
+                                               {"second", second, next_second},
+                                               {"first", first, next_first}}));
+    ASSERT_NE(manager.getAllocators("first"), nullptr);
+    ASSERT_NE(manager.getAllocators("second"), nullptr);
+    EXPECT_EQ(manager.getAllocators("first")->front(), first);
+    EXPECT_EQ(manager.getAllocators("second")->front(), second);
+
+    // A rejected batch must also leave both slots usable by a later batch.
+    ASSERT_TRUE(manager.replaceRegistrations(
+        {{"first", first, next_first}, {"second", second, next_second}}));
+    EXPECT_EQ(manager.getAllocators("first")->front(), next_first);
+    EXPECT_EQ(manager.getAllocators("second")->front(), next_second);
+}
+
 // Test basic functionality with empty allocators map (non-parameterized)
 TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     AllocatorManager allocator_manager;
@@ -147,17 +205,19 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
 
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    auto suspected =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
     ASSERT_EQ(
         suspected->Evaluate(initial + std::chrono::seconds(1),
                             std::chrono::seconds(1), std::chrono::seconds(10)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    auto active = std::make_shared<ClientLivenessRecord>(initial);
+    auto active =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected");
+        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected", "tcp");
     auto active_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
+        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active", "tcp");
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("shared", suspected_allocator, suspected);
     allocator_manager.addAllocator("shared", active_allocator, active);
@@ -402,7 +462,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
 // Test invalid replication count
 TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator);
@@ -419,9 +479,10 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 // count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
     auto allocator2 = std::make_shared<OffsetBufferAllocator>(
-        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2");
+        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2",
+        "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -526,7 +587,7 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
 // Test allocation when all available segments are excluded
 TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -813,8 +874,8 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     // Test Random strategy
@@ -876,8 +937,8 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     std::vector<std::vector<Replica>> replicas;
@@ -913,7 +974,7 @@ class SsdPlacementTestState {
         allocators.addAllocator(
             name, std::make_shared<OffsetBufferAllocator>(
                       name, 0x100000000ULL + index * segment_size, segment_size,
-                      name));
+                      name, "tcp"));
         const UUID client_id{index + 1, index + 100};
         client_by_name.emplace(name, client_id);
         ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
@@ -924,8 +985,8 @@ class SsdPlacementTestState {
 
     void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {
         allocators.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
-                                                          segment_size, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL, segment_size, name, "tcp"));
         client_by_name.emplace(name, UUID{1, 100});
     }
 
