@@ -502,6 +502,11 @@ void TransferExecutorBase::drainLocalCopies() {
 }
 
 int TransferExecutorBase::disconnectAllPeers() {
+    // Held across the whole call, including the waits below. Those waits drop
+    // transfer_lifecycle_mutex_ and connection_mutex_, so neither lock can
+    // keep a second caller out of the flag clear.
+    std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
+
     // The caller may keep using this thread after the call, and the next
     // unregister saves whatever context it finds. Put the caller's context
     // back even though Disconnect below binds each engine's own context.

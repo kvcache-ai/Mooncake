@@ -73,6 +73,11 @@ static std::map<const void*, aclrtMemLocation> g_memory_locations;
 // False stands for a thread that never bound a context, which is what the
 // signal handling thread looks like when it tears the client down.
 static bool g_thread_context_bound = true;
+static int g_get_context_block_remaining = 0;
+static bool g_get_context_entered = false;
+static bool g_release_get_context = true;
+static std::mutex g_get_context_mutex;
+static std::condition_variable g_get_context_cv;
 static std::mutex g_acl_mutex;
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
 static size_t g_malloc_physical_max_success = 0;
@@ -146,6 +151,13 @@ void reset() {
     g_set_device_ids.clear();
     g_memory_locations.clear();
     g_thread_context_bound = true;
+    {
+        std::lock_guard<std::mutex> context_lock(g_get_context_mutex);
+        g_get_context_block_remaining = 0;
+        g_get_context_entered = false;
+        g_release_get_context = true;
+        g_get_context_cv.notify_all();
+    }
     g_malloc_physical_max_success = 0;
     g_malloc_physical_call_count = 0;
     g_acl_event_seq = 0;
@@ -183,6 +195,26 @@ void set_device_count(int count) {
 void set_thread_context_bound(bool bound) {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_thread_context_bound = bound;
+}
+
+void arm_get_current_context_block() {
+    std::lock_guard<std::mutex> lock(g_get_context_mutex);
+    g_get_context_block_remaining = 1;
+    g_get_context_entered = false;
+    g_release_get_context = false;
+}
+
+void release_get_current_context_block() {
+    std::lock_guard<std::mutex> lock(g_get_context_mutex);
+    g_get_context_block_remaining = 0;
+    g_release_get_context = true;
+    g_get_context_cv.notify_all();
+}
+
+bool wait_get_current_context_entered() {
+    std::unique_lock<std::mutex> lock(g_get_context_mutex);
+    return g_get_context_cv.wait_for(lock, std::chrono::seconds(5),
+                                     [] { return g_get_context_entered; });
 }
 
 void set_pointer_location(void* ptr, aclrtMemLocationType type, uint32_t id) {
@@ -322,6 +354,15 @@ aclError aclrtSetDevice(int deviceId) {
 }
 
 aclError aclrtGetCurrentContext(aclrtContext* context) {
+    {
+        std::unique_lock<std::mutex> lock(g_get_context_mutex);
+        if (g_get_context_block_remaining > 0) {
+            --g_get_context_block_remaining;
+            g_get_context_entered = true;
+            g_get_context_cv.notify_all();
+            g_get_context_cv.wait(lock, [] { return g_release_get_context; });
+        }
+    }
     if (!g_thread_context_bound) {
         return 1;
     }
@@ -2832,6 +2873,53 @@ struct UnsetEnv {
     ~UnsetEnv() { unsetenv(name); }
 };
 }  // namespace
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_SecondCallWaitsUntilFirstReturns) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+    const int disconnects_before = adxl_mock::get_disconnect_count();
+
+    // GetCurrentContext is the first step after disconnect_all_mutex_, and it
+    // is outside connection_mutex_. A second call that is not serialized
+    // finishes Disconnect while this one is still blocked here.
+    mock_acl::arm_get_current_context_block();
+
+    std::thread first;
+    JoinThread join_first{first};
+    std::thread second;
+    JoinThread join_second{second};
+    // Released before the joins on the failure path, so a blocked caller
+    // cannot outlive the test.
+    struct ReleaseContextBlock {
+        ~ReleaseContextBlock() {
+            mock_acl::release_get_current_context_block();
+        }
+    } release_context_block;
+    std::atomic<int> first_rc{kDisconnectPending};
+    std::atomic<int> second_rc{kDisconnectPending};
+
+    first = std::thread([&transport, &first_rc] {
+        first_rc = transport->disconnectAllPeers();
+    });
+    ASSERT_TRUE(mock_acl::wait_get_current_context_entered());
+
+    second = std::thread([&transport, &second_rc] {
+        second_rc = transport->disconnectAllPeers();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(first_rc.load(), kDisconnectPending);
+    ASSERT_EQ(second_rc.load(), kDisconnectPending);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), disconnects_before);
+
+    mock_acl::release_get_current_context_block();
+    first.join();
+    second.join();
+    EXPECT_EQ(first_rc.load(), 0);
+    EXPECT_EQ(second_rc.load(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), disconnects_before + 1);
+}
 
 TEST_F(AscendDirectTransportTest, DisconnectAllPeers_NoPeers_ReturnsZero) {
     auto transport = createTransport();

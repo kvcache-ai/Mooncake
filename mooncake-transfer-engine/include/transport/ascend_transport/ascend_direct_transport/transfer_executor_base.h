@@ -163,6 +163,10 @@ class TransferExecutorBase {
     std::unordered_map<size_t, std::set<std::string>> connected_segments_;
     std::mutex connection_mutex_;
 
+    // One disconnectAllPeers() at a time. peers_quiesced_ is a flag, not a
+    // call count, so a second caller has to wait until the first restores it.
+    std::mutex disconnect_all_mutex_;
+
     // Held only for the duration of disconnectAllPeers(). New execute() and
     // local Copy() calls fail while it is set, and it is cleared before
     // disconnectAllPeers returns.
