@@ -610,18 +610,16 @@ TEST_F(RedisHaKvProtocolTest,
     EXPECT_EQ("WAIT", target.commands()[1][0]);
 }
 
-TEST_F(RedisHaKvProtocolTest,
-       MovedUsesKnownTargetWhileDiscoveryTopologyLags) {
+TEST_F(RedisHaKvProtocolTest, MovedUsesKnownTargetWhileDiscoveryTopologyLags) {
     ScriptedRedisPeer target({"*1\r\n:1\r\n", ":2\r\n"});
     const auto target_port =
         target.endpoint().substr(target.endpoint().find(':') + 1);
     const auto stale_topology =
         "*2\r\n" + Topology(2, "PORT", 0, 8191).substr(4) +
         Topology(2, target_port, 8192, 16383, 1).substr(4);
-    ScriptedRedisPeer seed(
-        {stale_topology, stale_topology,
-         "-MOVED 5061 " + target.endpoint() + "\r\n", stale_topology,
-         stale_topology});
+    ScriptedRedisPeer seed({stale_topology, stale_topology,
+                            "-MOVED 5061 " + target.endpoint() + "\r\n",
+                            stale_topology, stale_topology});
     RedisHaKvBackend backend({.replicas_required = 2});
     ASSERT_EQ(ErrorCode::OK,
               backend.Connect("redis+cluster://" + seed.endpoint()));
