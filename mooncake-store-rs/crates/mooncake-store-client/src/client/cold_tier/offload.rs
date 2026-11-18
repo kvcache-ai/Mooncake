@@ -918,17 +918,25 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
         complete_pending_offload_batch(storage_owner, pending);
         return Err(error);
     }
+    // Reclaim may already see the published route. Keep each successful
+    // offload in flight until its reserved bytes have been moved to used bytes.
+    for &index in &outcome.published {
+        storage_owner
+            .pending_offloads
+            .complete(&pending[index].entry.key);
+    }
+    let materialized = outcome.published.len();
     // Signal cold restore waiters that new Materialized entries are available for
     // zero-I/O eviction. This is the "proxy execution" notification: offload completed
     // its SSD write, now cold restore can evict the clean entry instantly.
-    if outcome.materialized > 0 {
+    if materialized > 0 {
         storage_owner.eviction_ready_signal.signal();
         // Reduce pressure: offload completed, backlog shrinks → restore can ramp up.
-        for _ in 0..outcome.materialized {
+        for _ in 0..materialized {
             storage_owner.cold_tier_devices.pressure_decrement_pending();
         }
     }
-    Ok(outcome.materialized)
+    Ok(materialized)
 }
 
 fn materialize_managed_nof_batch(
@@ -1338,7 +1346,7 @@ fn apply_pending_offload_cas_results(
     first_error: &mut Option<StoreError>,
 ) -> Result<PendingOffloadCasOutcome> {
     let mut outcome = PendingOffloadCasOutcome {
-        materialized: 0,
+        published: Vec::new(),
         used_add_bytes: 0,
         reserved_release_bytes,
         cleanup: Vec::new(),
@@ -1384,10 +1392,9 @@ fn apply_pending_offload_cas_result(
                 length_bytes,
                 "cold tier used-byte accounting exceeds range",
             )?;
-            context.outcome.materialized = context.outcome.materialized.saturating_add(1);
+            context.outcome.published.push(ready.index);
             registry::record_cold_tier_operation("offload", "materialized", "none");
             storage_owner.sync_route(&ready.next_route);
-            storage_owner.pending_offloads.complete(&pending.entry.key);
         }
         Ok(cas) => {
             let current_backing = cas.current.as_ref().and_then(materialized_cold_backing);
@@ -1696,6 +1703,12 @@ impl ColdTierOffloadManager {
         route_version: RouteVersion,
     ) -> Option<PendingOffloadEntry> {
         self.queue.lock().claim(route_key, route_version)
+    }
+
+    pub(in super::super) fn is_in_flight(&self, route_key: &ObjectKey) -> bool {
+        self.queue.lock().in_flight.contains(&PendingOffloadKey {
+            route_key: route_key.clone(),
+        })
     }
 
     pub(in super::super) fn complete(&self, key: &PendingOffloadKey) {

@@ -12,7 +12,7 @@ use super::{
     same_cold_payload,
 };
 use mooncake_store_core::{ClientRuntimeId, ColdTierDeviceRecord};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -100,6 +100,7 @@ impl StorageOwnerState {
                 },
             )?;
             let mut result = PendingDeleteGcResult::default();
+            let mut live_foreign_owners = BTreeSet::new();
             for listed_route in routes {
                 if result.scanned_routes >= limit {
                     break;
@@ -113,6 +114,16 @@ impl StorageOwnerState {
                         && listed_backing.state
                             == mooncake_store_core::ColdBackingState::Materialized)
                 {
+                    continue;
+                }
+                // Only the backing owner can see its in-flight offload. Keep the
+                // index fallback for expired owners, whose local queue is gone.
+                let owner = &listed_backing.owner;
+                if *owner != self.runtime
+                    && (live_foreign_owners.contains(owner)
+                        || self.metadata.get_client_lease(owner)?.is_some())
+                {
+                    live_foreign_owners.insert(owner.clone());
                     continue;
                 }
                 self.reclaim_pending_delete_cold_route(&listed_route, listed_backing, &mut result)?;
@@ -266,7 +277,8 @@ impl StorageOwnerState {
         let Some(backing) = route.cold_backing.as_ref() else {
             return Ok(true);
         };
-        if backing.cold_tier_id != identity.cold_tier_id
+        if backing.owner != identity.owner
+            || backing.cold_tier_id != identity.cold_tier_id
             || backing.object_locator != identity.object_locator
         {
             // The route now carries a different cold generation; token is stale.
@@ -309,6 +321,10 @@ impl StorageOwnerState {
         };
         if !eligible {
             self.sync_route(&current);
+            return Ok(None);
+        }
+        // Materialized becomes visible before the offload settles device usage.
+        if self.pending_offloads.is_in_flight(&current.key) {
             return Ok(None);
         }
         let mut claimed = current.clone();
@@ -761,6 +777,11 @@ impl StorageOwnerState {
                 skipped_still_referenced: true,
                 ..crate::control_plane::ColdReclaimResult::default()
             });
+        }
+        if self.pending_offloads.is_in_flight(route_key) {
+            return Err(StoreError::Backpressure(
+                "cold backing offload is still in flight".to_string(),
+            ));
         }
         let backend = self.cold_tier_devices.backend_for(cold_backing)?;
         let removed_cold_payload = backend_remove_cold_payload(backend.as_ref(), cold_backing)?;

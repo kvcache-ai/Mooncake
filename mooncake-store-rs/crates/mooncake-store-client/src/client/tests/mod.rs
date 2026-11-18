@@ -284,7 +284,10 @@ struct BlockingCasMetadataBackend {
 struct RecoverableMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     state: StdMutex<RecoverableMetadataState>,
+    cold_usage_settlement_gate: StdMutex<Option<ColdUsageSettlementGate>>,
 }
+
+type ColdUsageSettlementGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 #[derive(Default)]
 struct BlockingCasGateState {
@@ -627,6 +630,7 @@ impl RecoverableMetadataBackend {
         Self {
             inner,
             state: StdMutex::new(RecoverableMetadataState::default()),
+            cold_usage_settlement_gate: StdMutex::new(None),
         }
     }
 
@@ -840,6 +844,15 @@ impl MetadataBackend for RecoverableMetadataBackend {
         delta: mooncake_store_core::ColdTierUsageDelta,
         updated_at_ms: u64,
     ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+        if delta.used_bytes > 0 {
+            let gate = self.cold_usage_settlement_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).expect("test should wait for settlement");
+                release
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test should release settlement");
+            }
+        }
         self.inner
             .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
     }

@@ -697,7 +697,7 @@ struct PendingOffloadReadyRoute {
 }
 
 struct PendingOffloadCasOutcome {
-    materialized: usize,
+    published: Vec<usize>,
     used_add_bytes: i64,
     reserved_release_bytes: i64,
     cleanup: Vec<mooncake_store_core::ColdBackingRoute>,
