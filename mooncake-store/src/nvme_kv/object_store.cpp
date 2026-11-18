@@ -159,6 +159,7 @@ tl::expected<NvmeKvReadRoot, ErrorCode> DecodeNvmeKvReadRoot(std::string blob) {
         !ParseNvmeKvStoredIdentity(identity_blob, root.identity)) {
         return tl::make_unexpected(ErrorCode::CHECKSUM_MISMATCH);
     }
+    root.chunk_slot = root.identity.resolved_slot;
     return root;
 }
 
@@ -816,7 +817,10 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
             }
             item.root_written = false;
             item.written_chunk_keys.clear();
-            results[plan_index] = PutResult{.stored = true, .inserted = true};
+            results[plan_index] = PutResult{
+                .stored = true,
+                .inserted = true,
+                .added_payload_bytes = plans[plan_index].payload_size};
             if (!item.write_plan->store_inline) {
                 CacheManifestAfterWrite(
                     plans[plan_index].key, plans[plan_index].payload_size,
@@ -834,12 +838,6 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
             if (results[index] && results[index]->stored) {
                 item.root_written = false;
                 item.written_chunk_keys.clear();
-                if (!item.write_plan->store_inline) {
-                    CacheManifestAfterWrite(plans[index].key,
-                                            plans[index].payload_size,
-                                            item.write_plan->slot,
-                                            item.write_plan->manifest_records);
-                }
             }
         });
     } catch (const std::exception &error) {
@@ -909,9 +907,14 @@ void NvmeKvObjectStore::GetBatch(std::span<GetRequest> requests) {
             return {};
         }
 
-        auto cached_manifest =
-            CacheManifest(plan.key, plan.dest_slice.size,
-                          root->identity.resolved_slot, root->chunks);
+        const auto &cached = plan.cached_manifest;
+        if (cached && cached->resolved_slot == root->chunk_slot &&
+            ManifestChunkRecordsEqual(cached->chunk_records, root->chunks)) {
+            prepared_reads[plan_index].manifest = cached;
+            return {};
+        }
+        auto cached_manifest = CacheManifest(plan.key, plan.dest_slice.size,
+                                             root->chunk_slot, root->chunks);
         if (cached_manifest == nullptr) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
@@ -938,19 +941,8 @@ void NvmeKvObjectStore::GetBatch(std::span<GetRequest> requests) {
     };
 
     std::vector<tl::expected<void, ErrorCode>> prepare_results(plans.size());
-    std::vector<size_t> prepare_misses;
-    prepare_misses.reserve(plans.size());
-    for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
-        if (plans[plan_index].cached_manifest == nullptr) {
-            prepare_misses.push_back(plan_index);
-            continue;
-        }
-        prepared_reads[plan_index].manifest = plans[plan_index].cached_manifest;
-        prepare_results[plan_index] = {};
-    }
     try {
-        RunParallelIo(prepare_misses.size(), [&](size_t index) {
-            const size_t plan_index = prepare_misses[index];
+        RunParallelIo(plans.size(), [&](size_t plan_index) {
             prepare_results[plan_index] = prepare_one(plan_index);
         });
         std::vector<tl::expected<void, ErrorCode>> chunk_results(plans.size());

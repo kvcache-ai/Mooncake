@@ -1,7 +1,9 @@
 #include "nvme_kv/backend.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
+#include <mutex>
 
 #include <glog/logging.h>
 
@@ -52,7 +54,7 @@ class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
     tl::expected<NvmeKvWritePlan, ErrorCode> PrepareWrite(
         const NvmeKvObjectKey &key, std::string_view payload,
         uint32_t value_limit) const override {
-        return PrepareWriteAtSlot(key, payload, value_limit, 0);
+        return PrepareWriteAtSlot(key, payload, value_limit, 0, 0);
     }
 
     tl::expected<NvmeKvReadRoot, ErrorCode> ReadRoot(
@@ -95,15 +97,21 @@ class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
     }
 
    private:
+    // Recovery can reclaim newly staged chunks before publishing the root.
+    // Serialize competing recoveries for a key while keeping the batch fast
+    // path.
+    mutable std::array<std::mutex, 64> recovery_mutexes_;
+
     tl::expected<NvmeKvWritePlan, ErrorCode> PrepareWriteAtSlot(
         const NvmeKvObjectKey &key, std::string_view payload,
-        uint32_t value_limit, uint32_t slot) const {
+        uint32_t value_limit, uint32_t chunk_slot, uint32_t root_slot) const {
         const NvmeKvObjectIdentity identity{key.logical_key};
-        return BuildNvmeKvWritePlan(
-            identity, payload, value_limit,
-            {EncodePhysicalKey(key, slot, 0), slot, [&](uint32_t index) {
-                 return EncodePhysicalKey(key, slot, index + 1);
-             }});
+        return BuildNvmeKvWritePlan(identity, payload, value_limit,
+                                    {EncodePhysicalKey(key, root_slot, 0),
+                                     root_slot, [&](uint32_t index) {
+                                         return EncodePhysicalKey(
+                                             key, chunk_slot, index + 1);
+                                     }});
     }
 };
 
@@ -121,7 +129,21 @@ tl::expected<NvmeKvReadRoot, ErrorCode> LocalNvmeKvPolicy::ReadRoot(
     if (!validation_res) {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
-
+    // The root stays at its original address. A rewrite can reference
+    // immutable chunks staged at another collision slot.
+    if (!resolved->root.chunks.empty()) {
+        const auto &first = resolved->root.chunks.front().physical_key;
+        uint32_t slot = resolved->slot;
+        if (first != EncodePhysicalKey(key, slot, 1)) {
+            for (slot = 0; slot < kNvmeKvMaxPhysicalKeySlots; ++slot) {
+                if (first == EncodePhysicalKey(key, slot, 1)) break;
+            }
+            if (slot == kNvmeKvMaxPhysicalKeySlots) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+        }
+        resolved->root.chunk_slot = slot;
+    }
     return std::move(resolved->root);
 }
 
@@ -258,8 +280,9 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         }
         if (requests[i].result.value().inserted) {
             ++inserted_keys;
-            inserted_size += static_cast<int64_t>(plans[i].payload_size);
         }
+        inserted_size +=
+            static_cast<int64_t>(requests[i].result->added_payload_bytes);
         keys.push_back(plans[i].key);
         metadatas.emplace_back(StorageObjectMetadata{
             .bucket_id = 0,
@@ -294,15 +317,29 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
         static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    std::lock_guard lock(
+        recovery_mutexes_[std::hash<std::string>{}(key.logical_key) %
+                          recovery_mutexes_.size()]);
     auto *connector = &connector_ref;
     AbortWrite(connector_ref, attempt);
     const uint32_t effective_max_value_size =
         std::max(connector->GetCapabilities().effective_max_value_size,
                  kMinMaxValueSize);
 
-    for (uint32_t slot = 0; slot < kNvmeKvMaxPhysicalKeySlots; ++slot) {
+    auto current = ResolveRoot(*connector, key.logical_key);
+    if (!current && current.error() != ErrorCode::OBJECT_NOT_FOUND)
+        return tl::make_unexpected(current.error());
+    if (current &&
+        !ValidateNvmeKvReadRoot({key.logical_key}, current->physical_key,
+                                current->slot, std::nullopt, current->root))
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    const auto mode = current ? NvmeKvCommandExecutor::StoreMode::kUpdate
+                              : NvmeKvCommandExecutor::StoreMode::kInsert;
+    for (uint32_t slot = current ? current->slot : 0;
+         slot < kNvmeKvMaxPhysicalKeySlots; ++slot) {
         auto write_plan_res =
-            PrepareWriteAtSlot(key, payload, effective_max_value_size, slot);
+            PrepareWriteAtSlot(key, payload, effective_max_value_size, slot,
+                               current ? current->slot : slot);
         if (!write_plan_res) {
             return tl::make_unexpected(write_plan_res.error());
         }
@@ -312,6 +349,8 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
         const auto &physical_key = write_plan.root_key;
         const auto &root_blob = write_plan.root_blob;
         const auto &chunk_store_values = write_plan.chunk_values;
+        if (store_inline && current && current->root.blob == root_blob)
+            return NvmeKvPutResult{.stored = true, .inserted = false};
 
         auto &written_chunk_keys = attempt.written_chunk_keys;
         auto &root_written = attempt.root_written;
@@ -362,17 +401,27 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             return NvmeKvPutResult{.stored = true, .inserted = false};
         };
 
+        size_t added_payload_bytes = 0;
         bool write_success = true;
         bool slot_collision = false;
         ErrorCode &write_error = attempt.error;
         write_error = ErrorCode::OK;
         if (store_inline) {
-            auto store_res = connector->Store(physical_key, root_blob);
+            auto store_res = connector->Store(physical_key, root_blob, mode);
             if (!store_res) {
                 write_success = false;
                 write_error = store_res.error();
             } else {
-                root_written = true;
+                root_written = !current;
+                if (current) {
+                    const auto previous =
+                        current->root.header.object_type ==
+                                static_cast<uint32_t>(NvmeKvObjectType::kInline)
+                            ? current->root.header.payload_size
+                            : 0u;
+                    if (payload_size > previous)
+                        added_payload_bytes = payload_size - previous;
+                }
             }
         } else {
             const auto handle_chunk_store_error =
@@ -392,8 +441,8 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                         write_error = existing_chunk_res.error();
                     } else {
                         write_error = ErrorCode::OBJECT_ALREADY_EXISTS;
+                        slot_collision = true;
                     }
-                    slot_collision = true;
                 } else {
                     write_error = error;
                 }
@@ -416,6 +465,8 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                 if (chunk_requests[chunk_index].result) {
                     written_chunk_keys.push_back(
                         chunk_store_values[chunk_index].first);
+                    added_payload_bytes +=
+                        chunk_store_values[chunk_index].second.size();
                 }
             }
 
@@ -433,18 +484,29 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                 }
             }
             if (write_success) {
-                auto store_res = connector->Store(physical_key, root_blob);
+                if (current && current->root.blob == root_blob) {
+                    return NvmeKvPutResult{
+                        .stored = true,
+                        .added_payload_bytes = added_payload_bytes};
+                }
+                // Completion can be lost after an update reaches the device.
+                // Keep staged immutable chunks available for readers and
+                // retries.
+                if (current) written_chunk_keys.clear();
+                auto store_res =
+                    connector->Store(physical_key, root_blob, mode);
                 if (!store_res) {
                     write_success = false;
                     write_error = store_res.error();
                     cleanup_new_writes();
                 } else {
-                    root_written = true;
+                    root_written = !current;
                 }
             }
         }
 
-        if (!write_success && write_error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+        if (!write_success && !slot_collision &&
+            write_error == ErrorCode::OBJECT_ALREADY_EXISTS) {
             auto existing_res = resolve_existing_root();
             if (existing_res && existing_res.value().stored) {
                 return existing_res;
@@ -468,7 +530,11 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             return tl::make_unexpected(write_error);
         }
 
-        return NvmeKvPutResult{.stored = true, .inserted = true};
+        return NvmeKvPutResult{.stored = true,
+                               .inserted = !current,
+                               .added_payload_bytes = current
+                                                          ? added_payload_bytes
+                                                          : payload_size};
     }
     return NvmeKvPutResult{};
 }

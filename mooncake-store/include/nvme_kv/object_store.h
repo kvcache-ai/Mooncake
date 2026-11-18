@@ -23,6 +23,7 @@ struct NvmeKvObjectKey {
 struct NvmeKvReadRoot {
     NvmeKvObjectHeader header{};
     NvmeKvStoredIdentityView identity;
+    uint32_t chunk_slot = 0;
     std::string blob;
     std::vector<NvmeKvManifestChunkRecord> chunks;
 
@@ -53,6 +54,7 @@ tl::expected<void, ErrorCode> ValidateNvmeKvReadRoot(
 struct NvmeKvPutResult {
     bool stored = false;
     bool inserted = false;
+    size_t added_payload_bytes = 0;
 };
 
 struct NvmeKvWriteAttempt {

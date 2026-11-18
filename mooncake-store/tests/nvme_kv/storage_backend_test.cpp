@@ -321,6 +321,8 @@ TEST_F(NvmeKvStorageBackendTest, ManifestCacheUpdatesAfterSameKeyRewrite) {
     NvmeKvStorageBackend backend(config);
     ASSERT_TRUE(backend.Init().has_value());
 
+    NvmeKvStorageBackend reader(config);
+    ASSERT_TRUE(reader.Init().has_value());
     const std::string key = "nvme_kv_manifest_cache_rewrite";
     std::string first_value(192 * 1024, 'x');
     std::string second_value(first_value.size(), 'y');
@@ -343,10 +345,15 @@ TEST_F(NvmeKvStorageBackendTest, ManifestCacheUpdatesAfterSameKeyRewrite) {
         {key, Slice{loaded.data(), loaded.size()}}};
     ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
     EXPECT_EQ(loaded, first_value);
+    ASSERT_TRUE(reader.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(loaded, first_value);
 
     store_value(second_value);
     std::fill(loaded.begin(), loaded.end(), '\0');
     ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(loaded, second_value);
+    std::fill(loaded.begin(), loaded.end(), '\0');
+    ASSERT_TRUE(reader.BatchLoad(load_batch).has_value());
     EXPECT_EQ(loaded, second_value);
 }
 

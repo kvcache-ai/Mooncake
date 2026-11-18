@@ -44,7 +44,8 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
     }
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
-                                        std::string value) override {
+                                        std::string value,
+                                        StoreMode mode) override {
         if (value.size() > capabilities_.effective_max_value_size) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -70,9 +71,9 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
         nvme_passthru_cmd cmd{};
         BuildNvmeKvStoreCommand(cmd, nsid_, key, dma_buffer.get(),
-                                submission_bytes);
+                                submission_bytes, mode);
 
-        auto result = Submit(cmd, true, "store-if-not-exists");
+        auto result = Submit(cmd, true, "store");
         if (!result) {
             return tl::make_unexpected(result.error());
         }

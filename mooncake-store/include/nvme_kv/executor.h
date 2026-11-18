@@ -19,12 +19,14 @@ struct FileStorageConfig;
 class NvmeKvCommandExecutor {
    public:
     using PhysicalKey = std::array<uint8_t, 16>;
+    enum class StoreMode { kInsert, kUpdate };
 
     struct StoreRequest {
         PhysicalKey key;
         std::string_view value;
         tl::expected<void, ErrorCode> result =
             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        StoreMode mode = StoreMode::kInsert;
     };
 
     struct RetrievedBuffer {
@@ -60,13 +62,15 @@ class NvmeKvCommandExecutor {
 
     virtual ~NvmeKvCommandExecutor() = default;
 
-    virtual tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
-                                                std::string value) = 0;
+    virtual tl::expected<void, ErrorCode> Store(
+        const PhysicalKey &key, std::string value,
+        StoreMode mode = StoreMode::kInsert) = 0;
     // Batch calls are synchronous: implementations must finish accessing all
     // request-owned buffers and populate every result before returning.
     virtual void StoreBatch(std::vector<StoreRequest> &requests) {
         for (auto &request : requests) {
-            request.result = Store(request.key, std::string(request.value));
+            request.result =
+                Store(request.key, std::string(request.value), request.mode);
         }
     }
     virtual tl::expected<std::string, ErrorCode> Retrieve(

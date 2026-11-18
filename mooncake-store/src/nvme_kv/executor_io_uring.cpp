@@ -415,10 +415,12 @@ class NvmeKvIoUringExecutor : public NvmeKvCommandExecutor {
     }
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
-                                        std::string value) override {
+                                        std::string value,
+                                        StoreMode mode) override {
         StoreRequest request;
         request.key = key;
         request.value = value;
+        request.mode = mode;
         std::vector<StoreRequest> requests;
         requests.push_back(std::move(request));
         StoreBatch(requests);
@@ -467,7 +469,8 @@ class NvmeKvIoUringExecutor : public NvmeKvCommandExecutor {
             command.is_write = true;
             command.context_index = index;
             BuildNvmeKvStoreCommand(command.cmd, nsid_, request.key,
-                                    submission_data, submission_bytes);
+                                    submission_data, submission_bytes,
+                                    request.mode);
 
             commands.push_back(std::move(command));
         }
