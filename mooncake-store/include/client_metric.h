@@ -529,6 +529,15 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_zero_copy_ops("mooncake_ssd_zero_copy_ops_total",
+                            "Offloaded keys served in place from a DAX arena "
+                            "(no copy; not counted in ssd_read_*)",
+                            labels),
+          ssd_zero_copy_bytes("mooncake_ssd_zero_copy_bytes_total",
+                              "Bytes served in place from a DAX arena", labels),
+          ssd_zero_copy_fallbacks(
+              "mooncake_ssd_zero_copy_fallbacks_total",
+              "BatchGet calls that fell back from zero-copy to a copy", labels),
           ssd_disk_fenced("mooncake_ssd_disk_fenced",
                           "1 after a disk failure fenced the SSD tier", labels),
           start_time_(std::chrono::steady_clock::now()) {}
@@ -545,6 +554,9 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::counter_t ssd_zero_copy_ops;
+    ylt::metric::counter_t ssd_zero_copy_bytes;
+    ylt::metric::counter_t ssd_zero_copy_fallbacks;
     ylt::metric::gauge_t ssd_disk_fenced;
     std::chrono::steady_clock::time_point start_time_;
 
@@ -567,6 +579,9 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_zero_copy_ops.serialize(str);
+        ssd_zero_copy_bytes.serialize(str);
+        ssd_zero_copy_fallbacks.serialize(str);
         ssd_disk_fenced.serialize(str);
     }
 

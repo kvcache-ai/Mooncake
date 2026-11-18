@@ -17,8 +17,10 @@
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
+#include "config.h"
 #include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
+#include "memory_location.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
@@ -176,6 +178,15 @@ FileStorage::~FileStorage() {
     }
     // A metadata rescan can still be reading through the storage backend.
     if (rescan_future_.valid()) rescan_future_.wait();
+    // Deregister before storage_backend_ unmaps the region.
+    void* base = zero_copy_base_.exchange(nullptr);
+    if (base && client_) {
+        auto res = client_->unregisterLocalMemory(base);
+        if (!res) {
+            LOG(WARNING) << "Failed to unregister zero-copy region: "
+                         << res.error();
+        }
+    }
 #ifdef USE_URING
     // client_buffer_allocator_ frees the staging buffer after this body, so
     // unpin it here: the source registration and every I/O thread's clone of
@@ -202,6 +213,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                    << init_storage_backend_result.error();
         return init_storage_backend_result;
     }
+    RegisterZeroCopyRegion();
     if (config_.enable_dfs) {
         client_buffer_gc_running_.store(true);
         client_buffer_gc_thread_ =
@@ -393,13 +405,82 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
     return allocated_batch;
 }
 
+void FileStorage::RegisterZeroCopyRegion() {
+    auto region = storage_backend_->ZeroCopyRegion();
+    if (!region) return;
+    // Remote readers RDMA-read offloaded values straight out of this
+    // region. Failure is not fatal (e.g. fsdax without ODP refuses
+    // long-term pinning): reads then go through ClientBuffer copies.
+    const std::string& location =
+        region->location.empty() ? kWildcardLocation : region->location;
+    auto reg = client_->RegisterLocalMemory(region->base, region->size,
+                                            location, true, true);
+    if (reg) {
+        // Set before zero_copy_base_ publishes the region to PinBatch.
+        const size_t page = detectBufferPageSize(region->base);
+        zero_copy_huge_page_ =
+            page > static_cast<size_t>(sysconf(_SC_PAGESIZE)) ? page : 0;
+        zero_copy_base_ = region->base;
+        LOG(INFO) << "Zero-copy offload reads enabled, region size="
+                  << region->size << ", location=" << location;
+    } else {
+        LOG(WARNING) << "Failed to register zero-copy region (" << reg.error()
+                     << "); serving reads by copy";
+    }
+}
+
+std::shared_ptr<FileStorage::AllocatedBatch> FileStorage::PinBatch(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (!zero_copy_base_.load()) return nullptr;
+    auto pinned = storage_backend_->BatchPin(keys, sizes);
+    if (!pinned) {
+        VLOG(1) << "Zero-copy pin refused (" << pinned.error()
+                << "); falling back to copy";
+        if (ssd_metric_) ssd_metric_->ssd_zero_copy_fallbacks.inc();
+        return nullptr;
+    }
+    // The transfer engine registers the region as one memory region per
+    // max_mr_size chunk and a remote read must fit inside one of them, so a
+    // value that straddles a chunk boundary is served by copy. Like
+    // RdmaTransport, round the chunk down to a huge-page multiple.
+    const uint64_t base = reinterpret_cast<uintptr_t>(zero_copy_base_.load());
+    uint64_t chunk = globalConfig().max_mr_size;
+    if (zero_copy_huge_page_ != 0) chunk -= chunk % zero_copy_huge_page_;
+    for (size_t i = 0; chunk != 0 && i < sizes.size(); ++i) {
+        if (sizes[i] <= 0) continue;
+        const uint64_t first = pinned->pointers[i] - base;
+        const uint64_t last = first + static_cast<uint64_t>(sizes[i]) - 1;
+        if (first / chunk != last / chunk) {
+            if (ssd_metric_) ssd_metric_->ssd_zero_copy_fallbacks.inc();
+            return nullptr;
+        }
+    }
+    // Registered and released exactly like a copied batch (ReleaseBuffer,
+    // lease GC); dropping it drops the pins.
+    auto batch = std::make_shared<AllocatedBatch>();
+    batch->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+    batch->lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    batch->pointers = std::move(pinned->pointers);
+    batch->pin_owner = std::move(pinned->owner);
+    for (int64_t size : sizes) batch->total_size += size;
+    if (ssd_metric_) {
+        ssd_metric_->ssd_zero_copy_ops.inc(keys.size());
+        ssd_metric_->ssd_zero_copy_bytes.inc(batch->total_size);
+    }
+    return batch;
+}
+
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
-    auto load_result = LoadBatch(keys, sizes, false);
-    if (!load_result) return tl::make_unexpected(load_result.error());
-
-    auto allocated_batch = std::move(load_result.value());
+    auto allocated_batch = PinBatch(keys, sizes);
+    if (!allocated_batch) {
+        auto load_result = LoadBatch(keys, sizes, false);
+        if (!load_result) return tl::make_unexpected(load_result.error());
+        allocated_batch = std::move(load_result.value());
+    }
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
