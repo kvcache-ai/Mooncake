@@ -847,6 +847,19 @@ TEST_F(MasterServiceTest, SoftPinMasterConfigRejectsDefaultAboveMaximum) {
     EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
 }
 
+TEST_F(MasterServiceTest, RejectsTooManyEvictionWorkerThreads) {
+    auto max_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS)
+            .build();
+    EXPECT_NO_THROW(MasterService service(max_config));
+    auto invalid_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS + 1)
+            .build();
+    EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
+}
+
 TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 

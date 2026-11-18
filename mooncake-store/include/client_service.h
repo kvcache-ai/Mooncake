@@ -1183,6 +1183,8 @@ class Client {
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     std::unique_ptr<store::GatherReadService> gather_service_;
+    // Protects only gather_endpoint_; never held across an RPC.
+    std::mutex gather_endpoint_mutex_;
     std::string gather_endpoint_;
     std::mutex gather_clients_mutex_;
     struct GatherPeer {

@@ -57,6 +57,17 @@ inline int clampRdAtomicDepth(int device_max) {
     return device_max < kIdealRdAtomicDepth ? device_max : kIdealRdAtomicDepth;
 }
 
+// Resolve a QP's RD-atomic depth from an operator request (MC_MAX_RD_ATOMIC /
+// MC_MAX_DEST_RD_ATOMIC) and the device's advertised limit.  requested <= 0
+// means "not set" and keeps the clampRdAtomicDepth() default.  Otherwise the
+// request is honored up to the device limit (floored at 1 as above), so it may
+// lower the depth below kIdealRdAtomicDepth or raise it up to the device max.
+inline int resolveRdAtomicDepth(int requested, int device_max) {
+    if (requested <= 0) return clampRdAtomicDepth(device_max);
+    int cap = device_max <= 0 ? 1 : device_max;
+    return requested < cap ? requested : cap;
+}
+
 class RdmaEndPoint;
 class RdmaTransport;
 class RdmaContextTestPeer;

@@ -28,7 +28,8 @@
 
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
-              "Memory segment type for the target side: DRAM|VRAM");
+              "Memory segment type for the target side: DRAM|VRAM "
+              "(case-insensitive)");
 DEFINE_string(
     seg_type_mix, "",
     "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
@@ -259,7 +260,11 @@ std::optional<size_t> parseHugepageSizeFlag(std::string_view raw) {
 }  // namespace
 
 void XferBenchConfig::loadFromFlags() {
+    // Case-insensitive, as TENT already accepted "dram"/"vram"; the backends
+    // compare against "DRAM"/"VRAM".
     seg_type = FLAGS_seg_type;
+    for (auto& c : seg_type)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
