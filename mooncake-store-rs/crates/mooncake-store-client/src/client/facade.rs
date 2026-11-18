@@ -2352,6 +2352,15 @@ impl StoreClient {
         self.set_lifecycle_state(next_state);
     }
 
+    pub fn refresh_membership(&self) -> Result<()> {
+        refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &self.live_client_cache,
+            "manual_membership_refresh",
+        )?;
+        Ok(())
+    }
+
     pub fn health_channel(&self) -> HealthChannel {
         HealthChannel::new(self.metadata.clone(), self.lease(), self.lease_ttl_ms)
     }
