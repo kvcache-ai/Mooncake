@@ -179,6 +179,22 @@ DEFINE_double(tenant_eviction_high_watermark_ratio,
               "quota sits at or below eviction_high_watermark_ratio reaches "
               "its own ceiling before the pool crosses the pool-wide "
               "watermark, so nothing ever reclaims on its behalf");
+DEFINE_uint32(eviction_worker_threads,
+              mooncake::DEFAULT_EVICTION_WORKER_THREADS,
+              "Threads that walk the eviction index in each memory eviction "
+              "pass. 0 picks one per 16M filed keys, clamped to [1, 64]; 1-64 "
+              "sets the count. Passes stay serial when an eviction policy, "
+              "reclaimer or observer cannot run concurrently (e.g. with "
+              "oplog or offload-on-evict)");
+DEFINE_validator(eviction_worker_threads,
+                 [](const char* flagname, uint32_t value) {
+                     if (value > mooncake::MAX_EVICTION_WORKER_THREADS) {
+                         LOG(ERROR) << flagname << " must be between 0 and "
+                                    << mooncake::MAX_EVICTION_WORKER_THREADS;
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -577,6 +593,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         "tenant_eviction_high_watermark_ratio",
         &master_config.tenant_eviction_high_watermark_ratio,
         FLAGS_tenant_eviction_high_watermark_ratio);
+    default_config.GetUInt32("eviction_worker_threads",
+                             &master_config.eviction_worker_threads,
+                             FLAGS_eviction_worker_threads);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -925,6 +944,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.tenant_eviction_high_watermark_ratio =
             FLAGS_tenant_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("eviction_worker_threads", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.eviction_worker_threads = FLAGS_eviction_worker_threads;
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1628,6 +1652,7 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", tenant_eviction_high_watermark_ratio="
         << master_config.tenant_eviction_high_watermark_ratio
+        << ", eviction_worker_threads=" << master_config.eviction_worker_threads
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
         << ", weight_management_oplog_capability_confirmed="
