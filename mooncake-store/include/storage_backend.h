@@ -1384,6 +1384,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
+    friend class OffsetAllocatorStorageBackendTestPeer;
+
    public:
     OffsetAllocatorStorageBackend(
         const FileStorageConfig& file_storage_config_,

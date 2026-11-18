@@ -689,6 +689,53 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
     return get_metrics_internal();
 }
 
+std::shared_ptr<OffsetAllocator> OffsetAllocator::snapshot(
+    const std::vector<const OffsetAllocationHandle*>& live_allocations) const {
+    MutexLocker lock(&m_mutex);
+    if (!m_allocator) return nullptr;
+
+    auto result = std::shared_ptr<OffsetAllocator>(new OffsetAllocator());
+    MutexLocker image_lock(&result->m_mutex);
+    result->m_base = m_base;
+    result->m_multiplier_bits = m_multiplier_bits;
+    result->m_capacity = m_capacity;
+    result->m_allocator = std::make_unique<__Allocator>(*m_allocator);
+    lock.unlock();
+
+    std::vector<bool> retained(result->m_allocator->m_nodes.size(), false);
+    for (const auto* handle : live_allocations) {
+        if (!handle || handle->m_allocator.lock().get() != this) {
+            return nullptr;
+        }
+        const auto& allocation = handle->m_allocation;
+        if (allocation.metadata >= retained.size() ||
+            retained[allocation.metadata]) {
+            return nullptr;
+        }
+        const auto& node = result->m_allocator->m_nodes[allocation.metadata];
+        if (!node.used || node.dataOffset != allocation.offset ||
+            handle->requested_size == 0 ||
+            handle->requested_size >
+                (static_cast<uint64_t>(node.dataSize) << m_multiplier_bits)) {
+            return nullptr;
+        }
+        retained[allocation.metadata] = true;
+        result->m_allocated_size += handle->requested_size;
+        ++result->m_allocated_num;
+    }
+
+    // Reuse the normal free/coalescing logic only on the independent image.
+    // The original allocator must keep reader-pinned extents unavailable.
+    for (NodeIndex index = 0; index < retained.size(); ++index) {
+        const auto& node = result->m_allocator->m_nodes[index];
+        if (node.used && !retained[index]) {
+            result->m_allocator->free(OffsetAllocation(node.dataOffset, index));
+        }
+    }
+    result->refreshLargestFreeRegion();
+    return result;
+}
+
 void OffsetAllocator::refreshLargestFreeRegion() {
     const uint64_t largest_free_region =
         m_allocator ? m_allocator->storageReport().largestFreeRegion

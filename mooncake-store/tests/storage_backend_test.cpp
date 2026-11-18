@@ -27,15 +27,34 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <ylt/struct_pb.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
+#include "serializer.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "utils/common.h"
 
 namespace fs = std::filesystem;
+
+namespace mooncake {
+
+class OffsetAllocatorStorageBackendTestPeer {
+   public:
+    static std::shared_ptr<void> PinAllocation(
+        OffsetAllocatorStorageBackend& backend, const std::string& key) {
+        auto& shard = backend.shards_[backend.ShardForKey(key)];
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        const auto it = shard.map.find(key);
+        return it == shard.map.end() ? nullptr : it->second.allocation;
+    }
+};
+
+}  // namespace mooncake
+
 namespace mooncake::test {
 
 // Ignore the #3528 path lock when tests assert "empty" / file counts.
@@ -5047,6 +5066,161 @@ FileStorageConfig MakeOffsetPersistConfig(const std::string& data_path,
 }
 
 }  // namespace
+
+TEST_F(
+    StorageBackendTest,
+    OffsetAllocatorStorageBackend_Persist_PinnedRetirementAcrossCheckpoints) {
+    auto config = MakeOffsetPersistConfig(data_path, 32 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_cfg.high_watermark_bytes = 20000;
+    backend_cfg.low_watermark_bytes = 15000;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [&] {
+            OffsetAllocatorStorageBackend backend(config, backend_cfg);
+            ASSERT_TRUE(backend.Init());
+            const auto put = [&](const std::string& key,
+                                 const std::string& value) {
+                std::vector<std::unique_ptr<char[]>> buffers;
+                auto batch = MakeSingleKeyBatch(key, value, buffers);
+                const auto result = backend.BatchOffload(
+                    batch, NoopCompleteHandler(), AcceptAllEvictionHandler());
+                return result && result.value() == 1;
+            };
+
+            ASSERT_TRUE(put("retired", std::string(8192, 'r')));
+            ASSERT_TRUE(put("sentinel", "s"));
+            // Hold the same allocation reference as an in-flight read plan.
+            auto pinned = OffsetAllocatorStorageBackendTestPeer::PinAllocation(
+                backend, "retired");
+            ASSERT_NE(pinned, nullptr);
+
+            // This write evicts only the oldest, larger record. Its extent
+            // remains allocated in this process while pinned is alive.
+            ASSERT_TRUE(put("replacement", std::string(4096, 'b')));
+            ASSERT_FALSE(backend.IsExist("retired").value());
+            ASSERT_TRUE(fs::exists(data_path + "/kv_cache.meta"));
+
+            // A second strict checkpoint must still exclude the retired
+            // extent even though the first save cleared the eviction set.
+            ASSERT_TRUE(put("later", "c"));
+            ASSERT_EQ(LoadOne(backend, "sentinel", 1),
+                      std::make_optional(std::string("s")));
+            // Abrupt exit: do not release the pin or run a final checkpoint.
+            _exit(0);
+        };
+        run();
+        _exit(1);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    std::ifstream meta_file(data_path + "/kv_cache.meta", std::ios::binary);
+    ASSERT_TRUE(meta_file.is_open());
+    const std::string meta_bytes((std::istreambuf_iterator<char>(meta_file)),
+                                 std::istreambuf_iterator<char>());
+    OffsetAllocatorPersistedMetadata meta;
+    ASSERT_NO_THROW(struct_pb::from_pb(meta, meta_bytes));
+    ASSERT_EQ(meta.version, kOffsetAllocatorPersistVersion);
+    std::vector<SerializedByte> allocator_bytes(meta.allocator_state.begin(),
+                                                meta.allocator_state.end());
+    auto checkpoint =
+        deserialize_from<offset_allocator::OffsetAllocator>(allocator_bytes);
+    ASSERT_NE(checkpoint, nullptr);
+    bool retained_first_extent = false;
+    checkpoint->visit_used_nodes([&](uint64_t offset, uint64_t, uint32_t) {
+        retained_first_extent |= offset == 0;
+    });
+    EXPECT_FALSE(retained_first_extent);
+
+    // Recovery must use the actual checkpoint, not silently start fresh.
+    // Disable eviction so a failed reuse cannot be hidden by dropping a
+    // surviving object to make room.
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::NONE;
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist("retired").value());
+    EXPECT_EQ(LoadOne(recovered, "sentinel", 1),
+              std::make_optional(std::string("s")));
+    EXPECT_EQ(LoadOne(recovered, "replacement", 4096),
+              std::make_optional(std::string(4096, 'b')));
+    EXPECT_EQ(LoadOne(recovered, "later", 1),
+              std::make_optional(std::string("c")));
+
+    std::vector<std::unique_ptr<char[]>> buffers;
+    auto batch = MakeSingleKeyBatch("reused", std::string(8192, 'n'), buffers);
+    int64_t reused_offset = -1;
+    const auto result = recovered.BatchOffload(
+        batch, [&](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            reused_offset = metadatas.at(0).offset;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value(), 1);
+    EXPECT_EQ(reused_offset, 0);
+    EXPECT_EQ(LoadOne(recovered, "reused", 8192),
+              std::make_optional(std::string(8192, 'n')));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_PinnedOverwriteKeepsNewValue) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string old_value(8192, 'a');
+    const std::string new_value(8192, 'b');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        const auto put = [&](const std::string& key, const std::string& value) {
+            std::vector<std::unique_ptr<char[]>> buffers;
+            auto batch = MakeSingleKeyBatch(key, value, buffers);
+            const auto result =
+                backend.BatchOffload(batch, NoopCompleteHandler());
+            return result && result.value() == 1;
+        };
+        ASSERT_TRUE(put("same_key", old_value));
+        auto pinned = OffsetAllocatorStorageBackendTestPeer::PinAllocation(
+            backend, "same_key");
+        ASSERT_NE(pinned, nullptr);
+        ASSERT_TRUE(put("same_key", new_value));
+        ASSERT_TRUE(put("sentinel", "s"));
+
+        std::ifstream file(data_path + "/kv_cache.meta", std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        const std::string bytes((std::istreambuf_iterator<char>(file)),
+                                std::istreambuf_iterator<char>());
+        OffsetAllocatorPersistedMetadata meta;
+        ASSERT_NO_THROW(struct_pb::from_pb(meta, bytes));
+        const std::vector<SerializedByte> allocator_bytes(
+            meta.allocator_state.begin(), meta.allocator_state.end());
+        auto checkpoint = deserialize_from<offset_allocator::OffsetAllocator>(
+            allocator_bytes);
+        ASSERT_NE(checkpoint, nullptr);
+        EXPECT_EQ(checkpoint->get_metrics().allocated_num_, 2);
+        bool contains_old = false;
+        checkpoint->visit_used_nodes([&](uint64_t offset, uint64_t, uint32_t) {
+            contains_old |= offset == 0;
+        });
+        EXPECT_FALSE(contains_old);
+        EXPECT_EQ(LoadOne(backend, "same_key", new_value.size()),
+                  std::make_optional(new_value));
+    }
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "same_key", new_value.size()),
+              std::make_optional(new_value));
+    EXPECT_EQ(LoadOne(recovered, "sentinel", 1),
+              std::make_optional(std::string("s")));
+}
 
 TEST_F(StorageBackendTest,
        OffsetAllocatorStorageBackend_Persist_RecoveryRoundtrip) {

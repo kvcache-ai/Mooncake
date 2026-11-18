@@ -5055,9 +5055,34 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
 
         auto t_start = std::chrono::steady_clock::now();
 
-        // 1. Serialize allocator
+        // 1. Serialize only recoverable allocations. This runs at the
+        // single-writer checkpoint boundary after prepared evictions have
+        // committed or rolled back. Readers may still pin retired extents,
+        // but those extents must not survive in any later checkpoint.
+        auto checkpoint_allocator = allocator_;
+        if (checkpoint_allocator->get_metrics().allocated_num_ !=
+            static_cast<uint64_t>(
+                total_keys_.load(std::memory_order_relaxed))) {
+            std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+            shard_locks.reserve(kNumShards);
+            for (auto& shard : shards_) {
+                shard_locks.emplace_back(std::make_unique<SharedMutexLocker>(
+                    &shard.mutex, shared_lock));
+            }
+            std::vector<const offset_allocator::OffsetAllocationHandle*> live;
+            live.reserve(total_keys_.load(std::memory_order_relaxed));
+            for (const auto& shard : shards_) {
+                for (const auto& [key, entry] : shard.map) {
+                    live.push_back(&entry.allocation->handle);
+                }
+            }
+            checkpoint_allocator = checkpoint_allocator->snapshot(live);
+            if (!checkpoint_allocator) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
         std::vector<SerializedByte> alloc_buf;
-        ErrorCode ec = serialize_to(*allocator_, alloc_buf);
+        ErrorCode ec = serialize_to(*checkpoint_allocator, alloc_buf);
         if (ec != ErrorCode::OK || alloc_buf.empty()) {
             return tl::make_unexpected(
                 ec != ErrorCode::OK ? ec : ErrorCode::INTERNAL_ERROR);
