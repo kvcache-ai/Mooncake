@@ -322,11 +322,9 @@ The Master retries unacknowledged work when a holder remounts the same
 directory. A permanently retired directory leaves its tasks pending. Direct
 Upsert and automatic catalog cleanup follow ordinary eviction for old extents.
 
-> **Warning:** This backend does **not** support metadata recovery on restart. On initialization, the data file is truncated and all in-memory metadata is cleared. Any previously offloaded objects become inaccessible after a process restart.
-
 **Capacity:** `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` is used directly as the pre-allocated file size (100%, no safety margin). Unlike `bucket_storage_backend`, there is no separate quota variable — this is the sole disk usage control. Set it below the physical disk capacity to avoid filling the disk; writes are rejected once usage reaches this limit.
 
-Best for: high-concurrency scenarios with many small objects where restart durability is not required.
+Best for: high-concurrency scenarios with many small objects.
 
 ---
 
