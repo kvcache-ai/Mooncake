@@ -6,6 +6,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -148,7 +150,9 @@ class DummyClientGetBufferTest : public ::testing::Test {
         real_client_ = RealClient::create();
         const std::string rdma_devices =
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
-        ipc_path_ = "@dummy_test_" + std::to_string(getpid()) + ".sock";
+        ipc_path_ = ipc_path_override_.empty()
+                        ? "@dummy_test_" + std::to_string(getpid()) + ".sock"
+                        : ipc_path_override_;
         if (real_client_->setup_real(
                 "localhost:17815", "P2PHANDSHAKE", kSegmentSize, kLocalBufSize,
                 FLAGS_protocol, rdma_devices, master_.master_address(), nullptr,
@@ -213,6 +217,9 @@ class DummyClientGetBufferTest : public ::testing::Test {
     std::unique_ptr<coro_rpc::coro_rpc_server> rpc_server_;
     int rpc_port_ = 0;
     std::string ipc_path_;
+    // When set, SetupStack uses this IPC socket name instead of the default
+    // abstract one.
+    std::string ipc_path_override_;
     std::optional<std::string> saved_hot_cache_env_;
     std::optional<std::string> saved_hot_block_env_;
     std::optional<std::string> saved_hot_shm_env_;
@@ -665,6 +672,43 @@ TEST_F(DummyClientGetBufferTest, ShmMappingEstablished) {
     // Verify shm mapping is valid via memcmp (byte-by-byte too slow at 500 MB)
     EXPECT_EQ(std::memcmp(buf->ptr(), data.data(), data.size()), 0)
         << "Shm content mismatch";
+}
+
+// ---- Test: dummy and real client meet on a filesystem IPC socket ----
+// Real and dummy clients in different pods cannot see each other's abstract
+// sockets, so they share a filesystem socket instead. Both IPC exchanges must
+// work over it: registering the dummy buffer (setup fails otherwise) and
+// receiving the hot-cache fd (proved by a hot-cache hit).
+TEST_F(DummyClientGetBufferTest, FilesystemIpcSocketServesRegisterAndHotCache) {
+    ipc_path_override_ =
+        "/tmp/dummy_test_" + std::to_string(getpid()) + "_fs.sock";
+    unlink(ipc_path_override_.c_str());
+    ASSERT_TRUE(SetupStack())
+        << "Failed to bring up real+dummy stack over " << ipc_path_override_;
+
+    struct stat st;
+    ASSERT_EQ(lstat(ipc_path_override_.c_str(), &st), 0)
+        << "real client should create the socket file";
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+
+    const std::string cold_key = "fs_ipc_fallback_key";
+    const std::string cold_data(kPayloadSize, 'C');
+    PutData(cold_key, cold_data);
+    auto cold_buf = dummy_client_->get_buffer(cold_key);
+    ASSERT_NE(cold_buf, nullptr) << "fallback read via registered buffer";
+    std::string cold_got(static_cast<const char *>(cold_buf->ptr()),
+                         cold_buf->size());
+    EXPECT_EQ(cold_got, cold_data);
+
+    const std::string hot_key = "fs_ipc_hot_key";
+    const std::string hot_data(kPayloadSize, 'W');
+    PutData(hot_key, hot_data);
+    WarmHotCache(hot_key);
+    auto hot_buf = dummy_client_->get_buffer(hot_key);
+    ASSERT_NE(hot_buf, nullptr);
+    EXPECT_TRUE(dummy_client_->is_hot_cache_ptr(hot_buf->ptr()))
+        << "hot-cache fd should have been delivered over the filesystem socket";
+    EXPECT_EQ(std::memcmp(hot_buf->ptr(), hot_data.data(), hot_data.size()), 0);
 }
 
 // ---- Perf: hot cache vs allocator fallback latency comparison ----
