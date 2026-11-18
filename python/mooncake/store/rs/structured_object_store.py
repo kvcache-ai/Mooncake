@@ -433,9 +433,10 @@ class _BundleManifestStore:
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
         manifest = self.resolve_manifest(ref)
-        keys = self._payload_keys(manifest)
-        keys.append(self._manifest_key(ref, manifest))
-        _cleanup_keys(self._store, keys, strict=True)
+        manifest_key = self._manifest_key(ref, manifest)
+        # A manifest-only handle needs the payload list if cleanup is retried.
+        _cleanup_keys(self._store, self._payload_keys(manifest), strict=True)
+        _cleanup_keys(self._store, [manifest_key], strict=True)
 
     def resolve_manifest(
         self, ref: RemoteBundleRef | Mapping[str, Any]
@@ -1270,7 +1271,6 @@ def _is_duplicate_buffer_registration(status: Any) -> bool:
 
 
 def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None:
-    errors = []
     pending_keys = list(dict.fromkeys(keys))
     batch_remove = getattr(store, "batch_remove", None)
     if callable(batch_remove) and pending_keys:
@@ -1283,20 +1283,16 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
                 raise RuntimeError(
                     f"batch_remove returned {len(results)} results for {len(pending_keys)} keys"
                 )
-            failed_results = [
-                (key, status)
+            pending_keys = [
+                key
                 for key, status in zip(pending_keys, results)
                 if status not in (None, 0, MISSING_OBJECT_ERROR)
             ]
-            if not failed_results:
-                return
-            errors.extend(failed_results)
-            pending_keys = [key for key, _status in failed_results]
         except Exception:
             if strict:
                 raise
 
-    retry_errors = []
+    errors = []
     for key in pending_keys:
         try:
             status = store.remove(key, force=True)
@@ -1307,9 +1303,7 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
                 raise
             continue
         if status not in (None, 0, MISSING_OBJECT_ERROR):
-            retry_errors.append((key, status))
-    if retry_errors:
-        errors = retry_errors
+            errors.append((key, status))
     if errors and strict:
         raise RuntimeError(
             f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}"

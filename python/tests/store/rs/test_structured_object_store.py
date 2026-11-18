@@ -571,7 +571,39 @@ def test_bundle_remove_deletes_payload_and_manifest() -> None:
     transfer.remove_bundle(ref)
 
     assert store.objects == {}
-    assert store.batch_remove_calls == 1
+    assert store.batch_remove_calls == 2
+
+
+@pytest.mark.parametrize("single_remove_fails", [False, True])
+def test_bundle_remove_retries_failed_payload(monkeypatch, single_remove_fails) -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_bundle(b"meta", {"payload": b"abcdef"}, chunk_bytes=2)
+    handle = {"manifest_key": ref.manifest_key}
+    failed_key = ref.manifest["buffers"]["payload"]["chunks"][0]["key"]
+    remove = store.remove
+
+    def batch_remove(keys, *, force):
+        return [-1 if key == failed_key else remove(key, force) for key in keys]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "batch_remove", batch_remove)
+        if single_remove_fails:
+            patch.setattr(
+                store,
+                "remove",
+                lambda key, force=False: -1
+                if key == failed_key
+                else remove(key, force),
+            )
+            with pytest.raises(RuntimeError, match="failed to remove"):
+                transfer.remove_bundle(handle)
+            assert set(store.objects) == {ref.manifest_key, failed_key}
+        else:
+            transfer.remove_bundle(handle)
+
+    if single_remove_fails:
+        transfer.remove_bundle(handle)
+    assert store.objects == {}
 
 
 def test_bundle_partial_put_failure_cleans_payloads() -> None:
@@ -600,7 +632,7 @@ def test_bundle_remove_uses_force_batch_remove_when_available() -> None:
     transfer.materialize(transfer.read_spec(ref))
     transfer.remove_bundle(ref)
 
-    assert store.batch_remove_forces == [True]
+    assert store.batch_remove_forces == [True, True]
     assert store.objects == {}
 
 
