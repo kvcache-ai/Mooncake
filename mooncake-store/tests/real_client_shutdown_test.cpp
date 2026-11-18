@@ -107,6 +107,15 @@ TEST_F(RealClientShutdownTest, ExplicitCloseReleasesStorageAndClientOwners) {
     EXPECT_EQ(client->tearDownAll(), 0);
 }
 
+TEST_F(RealClientShutdownTest, ClosedClientRejectsVersionedOffloadRead) {
+    ASSERT_EQ(client->tearDownAll(), 0);
+    const VersionedOffloadReadRequest request{};
+    auto result = async_simple::coro::syncAwait(
+        client->batch_get_versioned_offload_object(request));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+}
+
 TEST_F(RealClientShutdownTest, ConcurrentCloseWaitsForStorageRescan) {
     std::promise<void> release;
     FileStorageShutdownTestPeer::SetRescan(*client->file_storage_,

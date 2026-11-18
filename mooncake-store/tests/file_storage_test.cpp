@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -135,11 +136,16 @@ class DelayedReadBackend : public BucketStorageBackend {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& slices) override {
         ++loads;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (read_gate.valid()) {
+            read_gate.wait();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         return BucketStorageBackend::BatchLoad(slices);
     }
 
     std::atomic<size_t> loads{0};
+    std::shared_future<void> read_gate;
 };
 
 class FileStorageTest : public ::testing::Test {
@@ -314,11 +320,23 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
         ASSERT_EQ(disk_replicas(), 1);
         const auto storage_key = TenantId::Default().MakeScopedKey(key);
-        std::string contents(kValueSize, '\0');
-        std::unordered_map<std::string, Slice> load{
-            {storage_key, {contents.data(), contents.size()}}};
-        ASSERT_TRUE(holder->storage_backend_->BatchLoad(load));
-        EXPECT_EQ(contents, std::string(kValueSize, 'a'));
+        const auto old_incarnation = tasks.front().GetObjectIncarnation();
+        auto load = holder->BatchGetLocal({storage_key}, {kValueSize},
+                                          {old_incarnation});
+        ASSERT_TRUE(load);
+        ASSERT_EQ(load->pointers.size(), 1u);
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(load->pointers[0]),
+                              kValueSize),
+                  std::string(kValueSize, 'a'));
+        auto read_range = holder->BatchGetRanges(
+            {storage_key}, {8}, {4}, {kValueSize}, {old_incarnation});
+        ASSERT_TRUE(read_range);
+        ASSERT_EQ(read_range->pointers.size(), 1u);
+        EXPECT_EQ(
+            std::string(reinterpret_cast<const char*>(read_range->pointers[0]),
+                        4),
+            "aaaa");
+        EXPECT_TRUE(holder->ReleaseBuffer(read_range->batch_id));
 
         ASSERT_TRUE(client->Remove(key, true));
         std::memset(buffer, 'b', kValueSize);
@@ -326,10 +344,18 @@ class FileStorageTest : public ::testing::Test {
         std::vector<OffloadTaskItem> new_tasks;
         ASSERT_TRUE(client->OffloadObjectHeartbeat(true, new_tasks));
         ASSERT_EQ(new_tasks.size(), 1u);
-        EXPECT_NE(tasks.front().GetObjectIncarnation(),
-                  new_tasks.front().GetObjectIncarnation());
+        const auto new_incarnation = new_tasks.front().GetObjectIncarnation();
+        EXPECT_NE(tasks.front().GetObjectIncarnation(), new_incarnation);
         ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
         EXPECT_EQ(disk_replicas(), 0);
+        auto mismatched =
+            holder->BatchGet({storage_key}, {kValueSize}, {new_incarnation});
+        ASSERT_FALSE(mismatched);
+        EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_VERSION);
+        auto mismatched_range = holder->BatchGetLocalRanges(
+            {storage_key}, {8}, {4}, {kValueSize}, {new_incarnation});
+        ASSERT_FALSE(mismatched_range);
+        EXPECT_EQ(mismatched_range.error(), ErrorCode::INVALID_VERSION);
         auto upsert = client->Upsert(key, slices, replicate);
         ASSERT_FALSE(upsert);
         EXPECT_EQ(upsert.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
@@ -3035,6 +3061,53 @@ TEST_F(FileStorageTest, BatchGetLocalSharesOwnerAndPreservesPointerOrder) {
     ASSERT_TRUE(later);
     EXPECT_EQ(backend->loads.load(), 2u);
     EXPECT_NE(later->pointers.front(), results[0]->pointers.front());
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SeparatesIncarnations) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.use_uring = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = InstallDelayedReadBackend(storage, config);
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, data));
+    ASSERT_FALSE(keys.empty());
+    keys.resize(1);
+    sizes.resize(1);
+
+    std::promise<void> release;
+    backend->read_gate = release.get_future().share();
+    auto current = std::async(std::launch::async, [&] {
+        return storage.BatchGetLocal(keys, sizes, {ObjectIncarnation{}});
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend->loads.load() == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto loads = backend->loads.load();
+    auto stale = std::async(std::launch::async, [&] {
+        return storage.BatchGetLocal(keys, sizes, {ObjectIncarnation{1, 1}});
+    });
+    const auto stale_status = stale.wait_for(std::chrono::seconds(5));
+    release.set_value();
+
+    ASSERT_EQ(loads, 1u);
+    EXPECT_EQ(stale_status, std::future_status::ready);
+    const auto stale_read = stale.get();
+    ASSERT_FALSE(stale_read);
+    EXPECT_EQ(stale_read.error(), ErrorCode::INVALID_VERSION);
+    const auto current_read = current.get();
+    ASSERT_TRUE(current_read);
+    ASSERT_EQ(current_read->pointers.size(), 1u);
+    EXPECT_EQ(std::string(
+                  reinterpret_cast<const char*>(current_read->pointers.front()),
+                  sizes.front()),
+              data.at(keys.front()));
 }
 
 TEST_F(FileStorageTest, LocalAndRpcReadsKeepSeparateStagingContracts) {
