@@ -10,7 +10,6 @@ target_link_libraries(clientctl PUBLIC
     cachelib_memory_allocator
     glog::glog
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(e2e_rand_test e2e_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
@@ -21,7 +20,6 @@ target_link_libraries(e2e_rand_test PUBLIC
     glog::glog
     gtest
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(chaosctl chaosctl.cpp ${MOONCAKE_E2E_TEST_SOURCES})
@@ -31,7 +29,6 @@ target_link_libraries(chaosctl PUBLIC
     cachelib_memory_allocator
     glog::glog
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(client_runner client_runner.cpp ${MOONCAKE_E2E_TEST_SOURCES})
@@ -41,7 +38,6 @@ target_link_libraries(client_runner PUBLIC
     cachelib_memory_allocator
     glog::glog
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(oplog_ha_client oplog_ha_client.cpp client_wrapper.cpp)
@@ -51,7 +47,6 @@ target_link_libraries(oplog_ha_client PUBLIC
     cachelib_memory_allocator
     glog::glog
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(chaos_test chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
@@ -62,7 +57,6 @@ target_link_libraries(chaos_test PUBLIC
     glog::glog
     gtest
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(chaos_rand_test chaos_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
@@ -73,7 +67,6 @@ target_link_libraries(chaos_rand_test PUBLIC
     glog::glog
     gtest
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_executable(storage_backend_e2e_test storage_backend_e2e_test.cpp client_wrapper.cpp)
@@ -87,7 +80,6 @@ target_link_libraries(storage_backend_e2e_test PUBLIC
     glog::glog
     gtest
     pthread
-    ${ETCD_WRAPPER_LIB}
 )
 
 add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)

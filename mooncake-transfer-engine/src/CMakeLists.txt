@@ -60,10 +60,6 @@ if(USE_ETCD)
     endif()
   else()
     add_dependencies(transfer_metadata_plugin build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB
-        ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
-    )
-    target_link_libraries(transfer_metadata_plugin PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()
 if(USE_REDIS)

@@ -40,7 +40,7 @@
 #ifdef USE_ETCD_LEGACY
 #include <etcd/SyncClient.hpp>
 #else
-#include <libetcd_wrapper.h>
+#include "etcd_wrapper_loader.h"
 #endif
 #endif  // USE_ETCD
 
@@ -670,6 +670,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     const std::string metadata_uri_;
 };
 #else
+using namespace mooncake::etcd_wrapper;
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
         : metadata_uri_(metadata_uri) {

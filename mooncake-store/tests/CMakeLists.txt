@@ -9,7 +9,6 @@ function(add_store_test name)
            master_service_test_peer
            transfer_engine
            cachelib_memory_allocator
-           ${ETCD_WRAPPER_LIB}
            glog::glog
            ibverbs
            gtest
@@ -27,7 +26,6 @@ function(add_ha_test name)
            master_service_test_peer
            transfer_engine
            cachelib_memory_allocator
-           ${ETCD_WRAPPER_LIB}
            glog::glog
            gflags::gflags
            ibverbs
@@ -524,7 +522,6 @@ target_link_libraries(
   PUBLIC mooncake_store
          transfer_engine
          cachelib_memory_allocator
-         ${ETCD_WRAPPER_LIB}
          glog::glog
          gtest
          gtest_main
@@ -589,7 +586,6 @@ target_link_libraries(
   PUBLIC mooncake_store
          transfer_engine
          cachelib_memory_allocator
-         ${ETCD_WRAPPER_LIB}
          mooncake_common
          glog::glog
          gflags::gflags

@@ -14,9 +14,12 @@
 
 #include "tent/metastore/etcd.h"
 #include <glog/logging.h>
+#include "etcd_wrapper_loader.h"
 
 namespace mooncake {
 namespace tent {
+
+using namespace mooncake::etcd_wrapper;
 
 EtcdMetaStore::EtcdMetaStore() {}
 

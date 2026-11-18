@@ -16,7 +16,6 @@
 #define TENT_ETCD_H
 
 #include <atomic>
-#include <libetcd_wrapper.h>
 
 #include "tent/runtime/metastore.h"
 

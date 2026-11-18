@@ -1,12 +1,16 @@
 #include "etcd_helper.h"
 
 #ifdef STORE_USE_ETCD
-#include "libetcd_wrapper.h"
+#include "etcd_wrapper_loader.h"
 #endif
 
 #include <glog/logging.h>
 
 namespace mooncake {
+
+#ifdef STORE_USE_ETCD
+using namespace mooncake::etcd_wrapper;
+#endif
 
 std::string EtcdHelper::connected_endpoints_ = "";
 std::mutex EtcdHelper::etcd_mutex_;

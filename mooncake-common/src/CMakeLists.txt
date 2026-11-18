@@ -7,7 +7,7 @@ if(NOT ASIO_INCLUDE_DIR)
 endif()
 
 set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
-                            rpc_client_io_context.cpp)
+                            etcd_wrapper_loader.cpp rpc_client_io_context.cpp)
 
 add_library(asio_shared SHARED asio_impl.cpp)
 
@@ -52,7 +52,14 @@ target_include_directories(
 
 target_link_libraries(
   mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp
-                         yalantinglibs::yalantinglibs)
+                         yalantinglibs::yalantinglibs ${CMAKE_DL_LIBS})
+if((USE_ETCD AND NOT USE_ETCD_LEGACY) OR STORE_USE_ETCD)
+  target_compile_definitions(
+    mooncake_common
+    PRIVATE
+      MOONCAKE_ETCD_WRAPPER_BUILD_PATH="${CMAKE_BINARY_DIR}/mooncake-common/etcd/libetcd_wrapper.so"
+  )
+endif()
 
 if(BUILD_SHARED_LIBS)
   set_target_properties(mooncake_common PROPERTIES INSTALL_RPATH "$ORIGIN")

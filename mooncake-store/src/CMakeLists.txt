@@ -532,8 +532,7 @@ endif()
 # Resolve target-independent configuration before defining the Store targets.
 set(MOONCAKE_STORE_INCLUDE_DIRS
     ${MOONCAKE_STORE_INCLUDE_ROOT}/mooncake-store/proto
-    ${MOONCAKE_STORE_INCLUDE_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/../include
-    ${ETCD_WRAPPER_INCLUDE})
+    ${MOONCAKE_STORE_INCLUDE_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/../include)
 
 # jemalloc replaces the process allocator, so it is linked into the executables
 # rather than into libmooncake_store, which is also consumed by the Python
@@ -716,7 +715,6 @@ target_link_libraries(
   mooncake_store_master
   PRIVATE mooncake_local_ssd
           cachelib_memory_allocator
-          ${ETCD_WRAPPER_LIB}
           glog::glog
           ${EXTRA_LIBS}
           mooncake_common
@@ -759,7 +757,6 @@ target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd
          cachelib_memory_allocator
-         ${ETCD_WRAPPER_LIB}
          glog::glog
          ${EXTRA_LIBS}
          mooncake_common
@@ -846,7 +843,6 @@ target_link_libraries(
           gflags::gflags
           JsonCpp::JsonCpp
           yalantinglibs::yalantinglibs
-          ${ETCD_WRAPPER_LIB}
           ${ALLOCATOR_LIBS}
           asio_shared)
 if(USE_SUNRISE)

@@ -42,3 +42,17 @@ add_executable(ib_link_speed_test ib_link_speed_test.cpp)
 target_link_libraries(ib_link_speed_test PUBLIC mooncake_common gtest
                                                 gtest_main pthread)
 add_test(NAME ib_link_speed_test COMMAND ib_link_speed_test)
+
+add_library(mock_etcd_wrapper SHARED mock_etcd_wrapper.cpp)
+target_include_directories(mock_etcd_wrapper
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+add_executable(etcd_wrapper_loader_test etcd_wrapper_loader_test.cpp)
+add_dependencies(etcd_wrapper_loader_test mock_etcd_wrapper)
+target_link_libraries(etcd_wrapper_loader_test
+                      PUBLIC mooncake_common gtest gtest_main pthread
+                             ${CMAKE_DL_LIBS})
+target_compile_definitions(
+  etcd_wrapper_loader_test
+  PRIVATE MOONCAKE_MOCK_ETCD_WRAPPER_PATH="$<TARGET_FILE:mock_etcd_wrapper>")
+add_test(NAME etcd_wrapper_loader_test COMMAND etcd_wrapper_loader_test)
