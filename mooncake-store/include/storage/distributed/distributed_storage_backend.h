@@ -90,9 +90,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
 
-    ObjectStorageIoResults BatchDeleteObjects(
-        std::span<const std::string> logical_keys);
-
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
     tl::expected<void, ErrorCode> BatchLoad(

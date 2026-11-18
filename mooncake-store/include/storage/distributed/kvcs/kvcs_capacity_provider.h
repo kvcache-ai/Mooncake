@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <ylt/util/tl/expected.hpp>
@@ -24,9 +25,13 @@ class KvcsCapacityProvider {
     tl::expected<void, ErrorCode> DeleteObject(const std::string& logical_key);
 
    private:
+    tl::expected<void, ErrorCode> EnsureDriverInitialized();
+
     uint32_t mountpoint_index_;
     std::string mountpoint_id_;
     std::unique_ptr<KvcsDriver> driver_;
+    std::mutex driver_init_mutex_;
+    bool driver_initialized_{false};
 };
 
 tl::expected<std::unique_ptr<KvcsCapacityProvider>, ErrorCode>

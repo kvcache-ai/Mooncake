@@ -4,8 +4,11 @@
 #include "storage/distributed/kvcs/kvcs_efc_target.h"
 
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <map>
 #include <optional>
 #include <string>
@@ -22,7 +25,10 @@ class MemoryDriver final : public KvcsDriver {
     explicit MemoryDriver(std::vector<KvcsMountpointStat> stats = {})
         : stats_(std::move(stats)) {}
 
-    tl::expected<void, ErrorCode> Init() override { return {}; }
+    tl::expected<void, ErrorCode> Init() override {
+        ++init_calls_;
+        return {};
+    }
     uint64_t MaxValueSize() const override { return 8; }
     tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() override {
@@ -86,9 +92,11 @@ class MemoryDriver final : public KvcsDriver {
     }
 
     size_t put_calls() const { return put_calls_; }
+    size_t init_calls() const { return init_calls_.load(); }
     const std::vector<ObjectKey>& deleted_keys() const { return deleted_keys_; }
 
    private:
+    std::atomic<size_t> init_calls_{0};
     size_t put_calls_ = 0;
     std::map<ObjectKey, std::string> values_;
     std::vector<KvcsMountpointStat> stats_;
@@ -168,6 +176,29 @@ TEST(KvcsCapacityProviderTest, DeletesLogicalKeyWithSharedEncoding) {
     EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
     ASSERT_EQ(driver_ptr->deleted_keys().size(), 1u);
     EXPECT_EQ(driver_ptr->deleted_keys()[0], EncodeKvcsKey("key"));
+}
+
+TEST(KvcsCapacityProviderTest, InitializesSharedDriverOnce) {
+    auto driver = std::make_unique<MemoryDriver>(
+        std::vector<KvcsMountpointStat>{{.index = 1,
+                                         .id = "target-mp",
+                                         .total_bytes = 100,
+                                         .used_bytes = 25}});
+    auto* driver_ptr = driver.get();
+    KvcsCapacityProvider provider(1, "target-mp", std::move(driver));
+    std::barrier start(3);
+    auto capacity = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        return provider.GetCapacity();
+    });
+    auto deleted = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        return provider.DeleteObject("key");
+    });
+    start.arrive_and_wait();
+    EXPECT_TRUE(capacity.get());
+    EXPECT_TRUE(deleted.get());
+    EXPECT_EQ(driver_ptr->init_calls(), 1u);
 }
 
 TEST(KvcsObjectStorageAdapterTest, PutGetAndRemove) {

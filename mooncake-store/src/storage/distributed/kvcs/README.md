@@ -27,13 +27,15 @@ Upsert reuses Mooncake's existing Master state machine; at the adapter boundary
 it is Delete followed by the insert-only KVCS Put. Replacement is not atomic:
 if Put fails after Delete, the previous provider value is not restored.
 
-Remove and BatchRemove first use the existing Master metadata removal, then
-delete only the keys whose metadata removal succeeded. A provider delete error
-is returned but does not recreate Master metadata, so an unreachable provider
-value can remain until a later write pre-deletes the same key or KVCS reclaims
-it. RemoveByRegex and RemoveAll return `NOT_SUPPORTED` because the Low Level
-interface does not provide the required listing and conditional bulk-delete
-contract.
+Remove and BatchRemove ask Master to delete the KVCS value while holding the
+existing per-key metadata lock, then commit the metadata removal. A provider
+delete error is returned with metadata unchanged, and the same lock prevents a
+concurrent Put or Upsert from publishing a replacement before deletion
+finishes. Clients do not issue a delayed provider delete. If provider deletion
+succeeds but metadata removal cannot be committed, metadata may remain; a later
+KVCS Get miss can reconcile the stale DFS replica. RemoveByRegex and RemoveAll
+return `NOT_SUPPORTED` because the Low Level interface does not provide the
+required listing and conditional bulk-delete contract.
 
 Reads use the object size stored in Master metadata and reject a shorter or
 longer KVCS value. An explicit KVCS `OBJECT_NOT_FOUND` conditionally removes

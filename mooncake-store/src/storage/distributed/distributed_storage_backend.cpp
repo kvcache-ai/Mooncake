@@ -985,16 +985,6 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     return results;
 }
 
-ObjectStorageIoResults DistributedStorageBackend::BatchDeleteObjects(
-    std::span<const std::string> logical_keys) {
-    if (!initialized_ || !UsesObjectStorage() || !object_storage_adapter_) {
-        return ObjectStorageIoResults(
-            logical_keys.size(),
-            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
-    }
-    return object_storage_adapter_->DeleteBatch(logical_keys);
-}
-
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
     if (!UsesObjectStorage()) {
