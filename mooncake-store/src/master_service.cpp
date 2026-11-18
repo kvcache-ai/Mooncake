@@ -594,6 +594,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument(
             "Invalid tenant eviction high watermark ratio");
     }
+    if (config.eviction_worker_threads > MAX_EVICTION_WORKER_THREADS) {
+        LOG(ERROR) << "Eviction worker threads must be between 0 and "
+                   << MAX_EVICTION_WORKER_THREADS
+                   << ", current value: " << config.eviction_worker_threads;
+        throw std::invalid_argument("Invalid eviction worker threads");
+    }
     // Multi-tenancy is the namespace policy every namespace is created under,
     // so it is in place before the first one is.
     if (enable_multi_tenants_) {
