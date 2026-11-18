@@ -35,6 +35,7 @@
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "tent/platform/cuda_utils.h"
 #endif
 #ifdef USE_HIP
 #include "tent/platform/rocm_gem.h"
@@ -550,13 +551,14 @@ RdmaContext::MemReg RdmaContext::registerMemReg(
     }
 
 #ifdef USE_CUDA
-    // Ensure CUDA context is current for GPU memory registration
-    // This is needed for worker threads or callers from non-CUDA threads
+    // Use ibv_reg_mr() directly only when a peer-memory module is active;
+    // otherwise fall through to the shared dma-buf export path below.
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
-    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
+    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE &&
+        useCudaPeerMemoryModule()) {
         // Get device ordinal and set primary context current
         unsigned int devOrd = 0;
         result = cuPointerGetAttribute(
@@ -652,10 +654,11 @@ RdmaContext::MemReg RdmaContext::registerMemReg(
         }
     }
 
-    // MLU memory must not reach the plain MR path when dma-buf verbs or export
-    // are unavailable. The engine may still use a separate host stage buffer.
+    // Device memory without peer-memory must not reach the plain host MR path
+    // when dma-buf verbs or export are unavailable. The engine may still use a
+    // separate host stage buffer.
     const auto memory_type = Platform::getLoader().getMemoryType(addr);
-    if (memory_type == MTYPE_MLU) return nullptr;
+    if (memory_type == MTYPE_MLU || memory_type == MTYPE_CUDA) return nullptr;
 #ifdef USE_HIP
     // The amdgpu peer-memory client behind ibv_reg_mr dereferences the NULL
     // kfd_bo of a GEM BO, so a GEM buffer is only ever registered above.

@@ -28,16 +28,17 @@ use super::{
     cached_live_client_snapshot, compatibility_matches, control_bind_host, copy_into_region,
     decode_backend_payload, effective_route_policy, encode_backend_component,
     encode_backend_payload, encode_lifecycle_state, flatten_slices, now_ms, payload_checksum,
-    record_success_metric, restore_payload_from_cold_backing, route_topk_from_tenant_spec,
-    run_bounded_parallel_jobs, scatter_into_buffers, shared_cold_tier_device_cache,
-    shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
-    ColdObjectRead, ColdObjectWrite, ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode,
-    ColdTierOffloadPriorityConfig, ColdTierRateLimitConfig, ColdTierTargetConfig,
-    ColdTierWatermarkConfig, DeletePendingEntry, LiveClientCache, LocalAllocatorAdapter,
-    LocalAllocatorState, LocalAuthorityAdapter, LocalDirPersistentStorageBackend,
-    PendingEvictionPhase, PendingReclaim, PersistentStorageBackend, ReplicaWriteTarget,
-    ResolvedObject, RouteWriteGate, SegmentAllocator, StorageOwnerColdTierConfig,
-    StorageOwnerState, StoreState, SuspectRuntimeCache, PENDING_EVICTION_RETRY_MAX_MS,
+    record_success_metric, refresh_live_client_cache, restore_payload_from_cold_backing,
+    route_topk_from_tenant_spec, run_bounded_parallel_jobs, scatter_into_buffers,
+    shared_cold_tier_device_cache, shared_suspect_runtime_cache, stable_debug_log_sample,
+    startup_prewarm_delay, AllocationSpan, ColdObjectRead, ColdObjectWrite,
+    ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
+    ColdTierRateLimitConfig, ColdTierTargetConfig, ColdTierWatermarkConfig, DeletePendingEntry,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    LocalDirPersistentStorageBackend, PendingEvictionPhase, PendingReclaim,
+    PersistentStorageBackend, ReplicaWriteTarget, ResolvedObject, RouteWriteGate, SegmentAllocator,
+    StorageOwnerColdTierConfig, StorageOwnerState, StoreState, SuspectRuntimeCache,
+    PENDING_EVICTION_RETRY_MAX_MS,
 };
 use crate::{
     control_plane::{
@@ -155,6 +156,7 @@ struct CountingMetadataBackend {
 
 struct CountingRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
+    miss_bounded_reads: AtomicBool,
     injected_routes: Mutex<BTreeMap<String, ObjectRoute>>,
     get_object_routes_calls: AtomicUsize,
     bounded_reads: Arc<AtomicUsize>,
@@ -546,6 +548,7 @@ impl CountingRouteDirectory {
     fn new(inner: Arc<dyn RouteDirectory>) -> Self {
         Self {
             inner,
+            miss_bounded_reads: AtomicBool::new(false),
             injected_routes: Mutex::new(BTreeMap::new()),
             get_object_routes_calls: AtomicUsize::new(0),
             bounded_reads: Arc::new(AtomicUsize::new(0)),
@@ -2050,6 +2053,9 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_bounded_reads.load(Ordering::Relaxed) {
+            return Ok(vec![None; keys.len()]);
+        }
         let mut routes = self.inner.get_object_routes_bounded(observer, keys)?;
         for (key, route) in keys.iter().zip(routes.iter_mut()) {
             if let Some(injected) = self.injected_route(key) {
@@ -2183,6 +2189,15 @@ impl RouteDirectory for CountingRouteDirectory {
         }
         self.inner
             .get_allocation_route_reference_keys_consistent(observer, identities)
+    }
+
+    fn get_allocation_route_references_consistent(
+        &self,
+        observer: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::AllocationRouteReferenceState>> {
+        self.inner
+            .get_allocation_route_references_consistent(observer, identities)
     }
 
     fn metadata(&self) -> &dyn MetadataBackend {
@@ -17097,7 +17112,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
 }
 
 #[test]
-fn true_client_shrink_ignores_unreachable_route_authority() {
+fn true_client_shrink_blocks_on_unreachable_route_authority() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("shrink-dead-auth-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("shrink-dead-auth-b-segment"));
@@ -17216,27 +17231,192 @@ fn true_client_shrink_ignores_unreachable_route_authority() {
         })
         .expect("dead authority lease should publish");
 
-    let migrated = store_a
-        .evacuate_owned_replicas()
-        .expect("true client shrink should ignore unreachable mirrored authorities");
-    assert_eq!(migrated, owned_keys.len());
-
+    let result = store_a.evacuate_owned_replicas();
+    assert!(
+        result.is_err(),
+        "true client shrink must stop when owner-route coverage is incomplete"
+    );
     for key in owned_keys {
         let route = router
             .query_route(&key)
-            .expect("post-shrink route query should succeed")
-            .expect("post-shrink route should exist");
+            .expect("route query should succeed")
+            .expect("route should exist");
         assert!(
             route
                 .replicas
                 .iter()
                 .all(|replica| replica.owner != *store_a.runtime_id()),
-            "post-shrink route still references evacuated runtime"
+            "known routes should still migrate before incomplete coverage blocks completion"
         );
         assert_eq!(
             reader.get(&key).expect("reader get should succeed"),
             expected[&key]
         );
+    }
+}
+
+#[test]
+fn evacuation_blocks_stale_release_after_incomplete_owner_scan() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("incomplete-owner-scan-segment"));
+    let mut client = StoreClientBuilder::new(metadata.clone(), "incomplete-owner-scan")
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:0")
+        .segment_name("incomplete-owner-scan-segment")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(128))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    let payload = vec![7u8; 64];
+    let object_key = ObjectKey::new("default::incomplete-owner-scan-key");
+    client
+        .put("incomplete-owner-scan-key", &payload)
+        .expect("seed put should succeed");
+    let route = client
+        .route_directory
+        .get_object_route(&client.lease, &object_key)
+        .expect("seed route lookup should succeed")
+        .expect("seed route should exist");
+    let used_before = client
+        .list_segments()
+        .expect("segment listing should succeed")
+        .into_iter()
+        .map(|segment| segment.used_bytes)
+        .sum::<u64>();
+    assert_eq!(used_before, payload.len() as u64);
+
+    let route_scope = "incomplete-owner-scan-scope";
+    let make_authority_lease = |stable_id: &str, address: &str| {
+        let mut labels = BTreeMap::new();
+        labels.insert("route".to_string(), "true".to_string());
+        labels.insert("route_scope".to_string(), route_scope.to_string());
+        labels.insert(control_address_label().to_string(), address.to_string());
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: client.lease.compatibility.clone(),
+            endpoints: ClientEndpointSet {
+                rpc_address: address.to_string(),
+                labels,
+                ..ClientEndpointSet::default()
+            },
+            expires_at_ms: test_future_expiry_ms(),
+        }
+    };
+    let empty_authority = make_authority_lease("incomplete-owner-scan-empty", "127.0.0.1:0");
+    let failed_authority_a = make_authority_lease("incomplete-owner-scan-failed-a", "127.0.0.1:1");
+    let failed_authority_b = make_authority_lease("incomplete-owner-scan-failed-b", "127.0.0.1:1");
+    for lease in [&empty_authority, &failed_authority_a, &failed_authority_b] {
+        metadata
+            .upsert_client_lease(lease)
+            .expect("authority lease should publish");
+    }
+    client
+        .lease
+        .endpoints
+        .labels
+        .insert("route_scope".to_string(), route_scope.to_string());
+    let live_client_cache = Arc::new(Mutex::new(LiveClientCache::default()));
+    refresh_live_client_cache(
+        metadata.as_ref(),
+        &live_client_cache,
+        "incomplete_owner_scan_test_membership",
+    )
+    .expect("authority membership should refresh");
+    let route_directory = build_route_directory(
+        crate::route_directory::RouteDirectoryBuildConfig {
+            mode: RouteControlMode::EmbeddedWrh,
+            route_topk: 3,
+            delete_marker_budget_bytes: 0,
+        },
+        metadata.clone(),
+        &empty_authority,
+        Arc::new(
+            ControlPlaneClient::with_request_timeout(Duration::from_millis(20))
+                .expect("control client should build"),
+        ),
+        live_client_cache,
+        Arc::new(Mutex::new(SuspectRuntimeCache::default())),
+    );
+    client.route_directory = route_directory;
+
+    let route_ops = mooncake_store_route::RouteOperations::new(
+        client.route_directory.clone(),
+        client.lease.clone(),
+    );
+    let mut partial_routes = Vec::new();
+    let status = route_ops
+        .visit_routes_by_replica_owner_with_status(&client.lease.runtime, &mut |route| {
+            partial_routes.push(route);
+            Ok(())
+        })
+        .expect("owner status scan should return partial coverage");
+    assert_eq!(
+        status,
+        mooncake_store_core::RouteOwnerScanStatus::Incomplete
+    );
+    assert!(partial_routes.is_empty());
+
+    authority_replace(
+        &metadata.route_namespace(),
+        &empty_authority.runtime.stable_id,
+        &object_key,
+        Some(&route),
+    )
+    .expect("healthy authority route should publish");
+    let mut healthy_partial_routes = Vec::new();
+    let partial_status = route_ops
+        .visit_routes_by_replica_owner_with_status(&client.lease.runtime, &mut |route| {
+            healthy_partial_routes.push(route);
+            Ok(())
+        })
+        .expect("partial owner scan should return status");
+    assert_eq!(
+        partial_status,
+        mooncake_store_core::RouteOwnerScanStatus::Incomplete
+    );
+    assert_eq!(healthy_partial_routes, vec![route]);
+    authority_replace(
+        &metadata.route_namespace(),
+        &empty_authority.runtime.stable_id,
+        &object_key,
+        None,
+    )
+    .expect("healthy authority route should be removed");
+
+    let mut legacy_routes = Vec::new();
+    assert!(
+        route_ops
+            .visit_routes_by_replica_owner(&client.lease.runtime, &mut |route| {
+                legacy_routes.push(route);
+                Ok(())
+            })
+            .is_err(),
+        "legacy owner visitor must reject incomplete coverage"
+    );
+    assert!(
+        route_ops
+            .list_routes_by_replica_owner(&client.lease.runtime)
+            .is_err(),
+        "legacy owner list must reject incomplete coverage"
+    );
+
+    for attempt in 0..2 {
+        let result = client.evacuate_owned_replicas();
+        assert!(
+            result.is_err(),
+            "evacuation attempt {attempt} must stop when owner-route coverage is incomplete"
+        );
+        let used_after = client
+            .list_segments()
+            .expect("segment listing should succeed")
+            .into_iter()
+            .map(|segment| segment.used_bytes)
+            .sum::<u64>();
+        assert_eq!(used_after, used_before);
     }
 }
 
@@ -21604,6 +21784,146 @@ fn capacity_pressure_forces_bounded_reclaim_of_untracked_allocation() {
             .expect("stale route lookup should succeed")
             .is_none(),
         "forced candidate reclaim must not republish the deleted route"
+    );
+}
+
+#[test]
+fn background_eviction_recovers_after_bounded_route_miss() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "bounded-route-miss")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new("bounded-route-miss-segment")))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(64)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("memory should register");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    for index in 0..4 {
+        let route = client
+            .put(&format!("live-{index}"), b"0123456789abcdef")
+            .expect("public put should fill local capacity");
+        wait_for_storage_clock_route(&client, &route, false);
+        owner.track_route(&route);
+    }
+    directory.miss_bounded_reads.store(true, Ordering::Relaxed);
+    let initial = owner
+        .evict_until_low_watermark(90, 50)
+        .expect("transient bounded miss should fail closed");
+    assert_eq!(initial, 0);
+    directory.miss_bounded_reads.store(false, Ordering::Relaxed);
+    sleep(Duration::from_millis(120));
+    let recovered = owner
+        .evict_until_low_watermark(90, 50)
+        .expect("healthy authorities should allow eviction again");
+    eprintln!(
+        "recovered={recovered} usage={} pending={} clock={}",
+        owner.allocator.lock().usage_bytes().0,
+        owner.pending_evictions.lock().len(),
+        owner
+            .hot_replicas
+            .clock
+            .lock()
+            .entries
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+    );
+    client.storage_owner = owner;
+    client
+        .put("after-recovery", b"fedcba9876543210")
+        .expect("public put must resume after the bounded lookup recovers");
+}
+
+#[test]
+fn repeated_public_put_recovers_after_clock_misses() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "clock-miss-queue")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new("clock-miss-queue-segment")))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(16 * 1024)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("memory should register");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    for index in 0..1024 {
+        let route = client
+            .put(&format!("queue-live-{index}"), b"0123456789abcdef")
+            .expect("public put should fill local capacity");
+        owner.track_route(&route);
+    }
+    directory.miss_bounded_reads.store(true, Ordering::Relaxed);
+    for _ in 0..4 {
+        assert_eq!(
+            owner
+                .evict_until_low_watermark(90, 50)
+                .expect("bounded miss"),
+            0,
+        );
+    }
+    directory.miss_bounded_reads.store(false, Ordering::Relaxed);
+    client.storage_owner = owner.clone();
+    let mut successful_writes = 0;
+    for index in 0..40 {
+        sleep(Duration::from_millis(120));
+        if client
+            .put(&format!("queue-recovered-{index}"), b"fedcba9876543210")
+            .is_ok()
+        {
+            successful_writes += 1;
+        }
+    }
+    eprintln!(
+        "successful_writes={successful_writes} usage={} pending={} clock={}",
+        owner.allocator.lock().usage_bytes().0,
+        owner.pending_evictions.lock().len(),
+        owner
+            .hot_replicas
+            .clock
+            .lock()
+            .entries
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+    );
+    assert_eq!(
+        successful_writes, 40,
+        "public writes must recover after the route lookup recovers"
+    );
+    assert!(
+        owner.pending_evictions.lock().is_empty(),
+        "recovery must drain the reclaim queue"
     );
 }
 

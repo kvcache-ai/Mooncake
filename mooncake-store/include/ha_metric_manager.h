@@ -286,6 +286,9 @@ class HAMetricManager {
 
     void observe_batch_record_batch_entries(int64_t entries);
     void observe_batch_record_batch_bytes(int64_t bytes);
+    void observe_batch_record_encode_latency_us(int64_t latency_us);
+    void observe_batch_record_decode_latency_us(int64_t latency_us);
+    void observe_batch_record_backend_txn_latency_us(int64_t latency_us);
     void observe_batch_record_txn_latency_us(int64_t latency_us);
     void observe_batch_record_commit_to_durable_us(int64_t latency_us);
     void observe_batch_record_callback_latency_us(int64_t latency_us);
@@ -360,6 +363,9 @@ class HAMetricManager {
     ylt::metric::gauge_t batch_record_durable_sequence_;
     ylt::metric::histogram_t batch_record_batch_entries_;
     ylt::metric::histogram_t batch_record_batch_bytes_;
+    ylt::metric::histogram_t batch_record_encode_latency_us_;
+    ylt::metric::histogram_t batch_record_decode_latency_us_;
+    ylt::metric::histogram_t batch_record_backend_txn_latency_us_;
     ylt::metric::histogram_t batch_record_txn_latency_us_;
     ylt::metric::histogram_t batch_record_commit_to_durable_us_;
     ylt::metric::histogram_t batch_record_callback_latency_us_;

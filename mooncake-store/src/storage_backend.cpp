@@ -1788,12 +1788,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         std::vector<size_t> committed_indices;
         for (size_t i = 0; i < bucket_keys.size(); ++i) {
             if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
-                object_bucket_map_.find(bucket_keys[i]) !=
-                    object_bucket_map_.end()) {
+                object_bucket_map_.find(bucket_keys[i]) != nullptr) {
                 continue;  // Still persisted elsewhere: idempotent skip.
             }
-            if (object_bucket_map_.find(bucket_keys[i]) ==
-                object_bucket_map_.end()) {
+            if (object_bucket_map_.find(bucket_keys[i]) == nullptr) {
                 committed_indices.push_back(i);
             } else {
                 VLOG(1) << "Key already committed by a concurrent offload, "
@@ -1811,11 +1809,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
 
         int64_t committed_data_size = bucket->meta_size;
-        object_bucket_map_.reserve(object_bucket_map_.size() +
-                                   committed_indices.size());
         for (size_t i : committed_indices) {
-            auto [it, inserted] =
-                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
+            const bool inserted =
+                object_bucket_map_.insert(bucket_keys[i], metadatas[i]);
             CHECK(inserted)
                 << "Reserved key became duplicated: " << bucket_keys[i];
             committed_data_size +=
@@ -1869,8 +1865,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     SharedMutexLocker lock(&mutex_, shared_lock);
     for (const auto& key : keys) {
         auto object_metadata_it = object_bucket_map_.find(key);
-        if (object_metadata_it != object_bucket_map_.end()) {
-            batch_object_metadata.emplace(key, object_metadata_it->second);
+        if (object_metadata_it != nullptr) {
+            batch_object_metadata.emplace(key, *object_metadata_it);
         } else {
             LOG(ERROR) << "Key " << key << " does not exist";
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1927,11 +1923,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             const Slice& dest_slice = span.slice;
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
-            if (object_it == object_bucket_map_.end()) {
+            if (object_it == nullptr) {
                 LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
-            const auto& metadata = object_it->second;
+            const auto& metadata = *object_it;
 
             // Lookup bucket -> BucketMetadata
             auto bucket_it = buckets_.find(metadata.bucket_id);
@@ -2370,7 +2366,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 disk.fifo_index.insert(bucket_id);
                 disk.lru_index.emplace(0LL, bucket_id);
                 for (size_t i = 0; i < meta.keys.size(); i++) {
-                    object_bucket_map_.emplace(
+                    object_bucket_map_.insert(
                         meta.keys[i], StorageObjectMetadata{
                                           bucket_id, meta.metadatas[i].offset,
                                           meta.metadatas[i].key_size,
@@ -2570,18 +2566,17 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto it = object_bucket_map_.find(key);
-    if (it == object_bucket_map_.end()) {
+    if (it == nullptr) {
         return false;
     }
     // The index alone cannot see an externally wiped bucket file: writes
     // commit file-then-index, so an index hit with no file behind it means
     // the backing data is gone and the answer must be false, not "present".
-    auto bucket_it = buckets_.find(it->second.bucket_id);
+    auto bucket_it = buckets_.find(it->bucket_id);
     if (bucket_it == buckets_.end()) {
         return false;
     }
-    auto path =
-        GetBucketDataPath(it->second.bucket_id, bucket_it->second->disk_index);
+    auto path = GetBucketDataPath(it->bucket_id, bucket_it->second->disk_index);
     if (!path) {
         return tl::make_unexpected(path.error());
     }
@@ -2598,10 +2593,10 @@ std::optional<int64_t> BucketStorageBackend::GetObjectDataSize(
     const std::string& key) const {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto it = object_bucket_map_.find(key);
-    if (it == object_bucket_map_.end() || it->second.data_size <= 0) {
+    if (it == nullptr || it->data_size <= 0) {
         return std::nullopt;
     }
-    return it->second.data_size;
+    return it->data_size;
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -3316,13 +3311,11 @@ void BucketStorageBackend::RollbackCommittedBucket(
 
         // Remove all keys from object_bucket_map_
         for (const auto& key : keys) {
-            auto obj_it = object_bucket_map_.find(key);
-            if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == bucket_id) {
-                disk.total_size -=
-                    obj_it->second.data_size + obj_it->second.key_size;
-                object_bucket_map_.erase(obj_it);
-            }
+            object_bucket_map_.erase_if(key, [&](const auto& metadata) {
+                if (metadata.bucket_id != bucket_id) return false;
+                disk.total_size -= metadata.data_size + metadata.key_size;
+                return true;
+            });
         }
 
         // Remove bucket metadata
@@ -3566,7 +3559,7 @@ BucketStorageBackend::PrepareEviction(
 
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
+            if (object_bucket_map_.find(key) != nullptr ||
                 pending_write_keys_.find(key) != pending_write_keys_.end()) {
                 // Already persisted, or being persisted by a concurrent
                 // offload: re-offloading is an idempotent no-op (Put
@@ -3709,14 +3702,14 @@ BucketStorageBackend::PrepareEviction(
         // commit time keeps pointing at its authoritative bucket, so
         // reporting it here would make the master drop a live replica.
         for (const auto& key : evict_meta->keys) {
-            auto obj_it = object_bucket_map_.find(key);
-            if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == evict_id) {
-                const int64_t object_size =
-                    obj_it->second.data_size + obj_it->second.key_size;
-                disk.total_size -= object_size;
-                evicted_size += object_size;
-                object_bucket_map_.erase(obj_it);
+            if (object_bucket_map_.erase_if(key, [&](const auto& metadata) {
+                    if (metadata.bucket_id != evict_id) return false;
+                    const int64_t object_size =
+                        metadata.data_size + metadata.key_size;
+                    disk.total_size -= object_size;
+                    evicted_size += object_size;
+                    return true;
+                })) {
                 pending_eviction_keys_.insert(key);
                 result.keys.push_back(key);
             }
@@ -3788,9 +3781,10 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
                 continue;
             }
             const auto& object_meta = bucket_meta->metadatas[i];
-            object_bucket_map_[key] = StorageObjectMetadata{
-                bucket_id, object_meta.offset, object_meta.key_size,
-                object_meta.data_size, ""};
+            object_bucket_map_.insert_or_assign(
+                key, StorageObjectMetadata{bucket_id, object_meta.offset,
+                                           object_meta.key_size,
+                                           object_meta.data_size, ""});
             disk.total_size += object_meta.data_size + object_meta.key_size;
         }
         disk.total_size += bucket_meta->meta_size;
@@ -4050,13 +4044,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         // Collect keys to remove (they reference this bucket)
         keys_to_remove = bucket_metadata->keys;
         for (const auto& key : keys_to_remove) {
-            auto obj_it = object_bucket_map_.find(key);
-            if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == bucket_id) {
-                disk.total_size -=
-                    obj_it->second.data_size + obj_it->second.key_size;
-                object_bucket_map_.erase(obj_it);
-            }
+            object_bucket_map_.erase_if(key, [&](const auto& metadata) {
+                if (metadata.bucket_id != bucket_id) return false;
+                disk.total_size -= metadata.data_size + metadata.key_size;
+                return true;
+            });
         }
 
         // Subtract metadata size

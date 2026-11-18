@@ -25,12 +25,12 @@ namespace tent {
 
 std::vector<QosClassSample> makeQosClassSamples(
     const std::vector<QosClassConfig>& classes,
-    std::vector<XferBenchStats>* stats);
+    const std::vector<XferBenchStats>* stats);
 
 QosMetricsReport calculateQosMetricsFromBenchStats(
     size_t block_size, size_t batch_size, int num_threads,
     const std::vector<QosClassConfig>& classes,
-    std::vector<XferBenchStats>* stats, double link_capacity_gbps,
+    const std::vector<XferBenchStats>* stats, double link_capacity_gbps,
     const std::vector<uint64_t>& bytes_per_operation = {});
 
 }  // namespace tent
