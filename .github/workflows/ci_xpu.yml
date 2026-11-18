@@ -107,10 +107,12 @@ jobs:
             -DUSE_XPU=ON -DUSE_TENT=ON -DUSE_CUDA=OFF -DUSE_XPU_GDS=OFF \
             -DWITH_EP=ON -DMOONCAKE_EP_XPU_AOT_DEVICES=bmg \
             -DWITH_STORE=ON -DWITH_STORE_RUST=OFF -DWITH_STORE_RS=OFF \
+            -DWITH_CONDUCTOR=ON \
             -DWITH_P2P_STORE=OFF -DUSE_HTTP=ON -DBUILD_UNIT_TESTS=ON
           # Ninja's memory-aware pools still cap compilation and linking at three jobs each.
           cmake --build "$BUILD_DIR" --parallel 4 --target \
             engine store _ep mooncake_master mooncake_client transfer_engine_bench \
+            _conductor mooncake_conductor \
             tent_xpu_platform_test tent_xpu_transport_test tent_xpu_engine_test \
             tent_xpu_ipc_process_test pybind_client_test \
             config_lifecycle_test ep_dispatch_slots_test crc32c_test

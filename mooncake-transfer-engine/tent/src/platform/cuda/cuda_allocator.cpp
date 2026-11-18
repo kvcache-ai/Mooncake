@@ -20,10 +20,12 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
+#include <limits>
 #include <mutex>
 #include <numa.h>
 #include <vector>
 #include <cstring>
+#include <unistd.h>
 
 namespace mooncake {
 namespace tent {
@@ -255,6 +257,124 @@ Status CudaPlatform::synchronizeDevices(const Topology* topology) {
             (void)cudaGetLastError();
         }
     }
+    return Status::OK();
+}
+
+Status CudaPlatform::exportDmabuf(void* addr, size_t length,
+                                  DmabufExport& out) {
+    out = DmabufExport{};
+    CudaPointerInfo info;
+    const CUresult ptr_rc = getCudaPointerInfo(addr, info);
+    if (ptr_rc != CUDA_SUCCESS || info.kind != CudaMemoryKind::Device) {
+        return Status::InvalidArgument("Not CUDA device memory" LOC_MARK);
+    }
+    if (!length) {
+        return Status::InvalidArgument("Empty CUDA DMA-BUF range" LOC_MARK);
+    }
+    if (useCudaPeerMemoryModule()) {
+        return Status::NotImplemented(
+            "CUDA peer-memory module active; using ibv_reg_mr" LOC_MARK);
+    }
+
+    CUcontext caller_ctx = nullptr;
+    if (!ensureCudaDriverInit() ||
+        cuCtxGetCurrent(&caller_ctx) != CUDA_SUCCESS) {
+        return Status::InternalError("cuCtxGetCurrent failed" LOC_MARK);
+    }
+    CUdevice cu_dev = 0;
+    CHECK_CU(cuDeviceGet(&cu_dev, info.device));
+    int dma_buf_supported = 0;
+    if (cuDeviceGetAttribute(&dma_buf_supported,
+                             CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                             cu_dev) != CUDA_SUCCESS ||
+        !dma_buf_supported) {
+        return Status::NotImplemented(
+            "CUDA device does not support DMA-BUF export" LOC_MARK);
+    }
+    CUcontext primary_ctx = nullptr;
+    CHECK_CU(cuDevicePrimaryCtxRetain(&primary_ctx, cu_dev));
+
+    auto restore_ctx = [&]() -> CUresult {
+        const CUresult set_rc = cuCtxSetCurrent(caller_ctx);
+        (void)cuDevicePrimaryCtxRelease(cu_dev);
+        return set_rc;
+    };
+    if (cuCtxSetCurrent(primary_ctx) != CUDA_SUCCESS) {
+        (void)restore_ctx();
+        return Status::InternalError("cuCtxSetCurrent failed" LOC_MARK);
+    }
+
+    CUdeviceptr alloc_base = 0;
+    size_t alloc_size = 0;
+    CUresult rc =
+        cuMemGetAddressRange(&alloc_base, &alloc_size, (CUdeviceptr)addr);
+    if (rc != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        cuGetErrorString(rc, &err_str);
+        (void)restore_ctx();
+        return Status::InternalError(
+            std::string("cuMemGetAddressRange failed: ") +
+            (err_str ? err_str : "unknown") + LOC_MARK);
+    }
+
+    // cuMemGetHandleForAddressRange() requires page-aligned base and size.
+    // When registering a sub-range (or a VMM growth chunk smaller than
+    // `length`), export only [aligned, addr + length) rather than the whole
+    // allocation so concurrent imports do not over-map BAR1.
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        (void)restore_ctx();
+        return Status::InternalError("Unable to query page size" LOC_MARK);
+    }
+    const size_t page = static_cast<size_t>(page_size);
+    CUdeviceptr export_base = alloc_base;
+    uint64_t export_offset = (uintptr_t)addr - (uintptr_t)alloc_base;
+    size_t raw_size = alloc_size;
+    if (export_offset != 0 || length != alloc_size) {
+        uintptr_t aligned = (uintptr_t)addr & ~(page - 1);
+        if (aligned < (uintptr_t)alloc_base) {
+            aligned = (uintptr_t)alloc_base;
+        }
+        export_base = (CUdeviceptr)aligned;
+        export_offset = (uintptr_t)addr - aligned;
+        if (export_offset > std::numeric_limits<size_t>::max() - length) {
+            (void)restore_ctx();
+            return Status::InvalidArgument(
+                "CUDA DMA-BUF size overflow" LOC_MARK);
+        }
+        raw_size = static_cast<size_t>(export_offset) + length;
+    }
+    if (raw_size > std::numeric_limits<size_t>::max() - (page - 1)) {
+        (void)restore_ctx();
+        return Status::InvalidArgument("CUDA DMA-BUF size overflow" LOC_MARK);
+    }
+    const size_t export_size = (raw_size + page - 1) & ~(page - 1);
+
+    int fd = -1;
+    rc = cuMemGetHandleForAddressRange(&fd, export_base, export_size,
+                                       CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    const CUresult restore_rc = restore_ctx();
+    if (rc != CUDA_SUCCESS) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        const char* err_str = nullptr;
+        cuGetErrorString(rc, &err_str);
+        return Status::InternalError(
+            std::string("cuMemGetHandleForAddressRange failed: ") +
+            (err_str ? err_str : "unknown") + LOC_MARK);
+    }
+    if (restore_rc != CUDA_SUCCESS) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        return Status::InternalError(
+            "cuCtxSetCurrent failed to restore the caller context" LOC_MARK);
+    }
+
+    out.fd = fd;
+    out.offset = export_offset;
+    out.close_fd = true;
     return Status::OK();
 }
 }  // namespace tent

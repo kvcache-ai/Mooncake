@@ -5,12 +5,21 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <new>
+#include <string>
 #include <thread>
 #include <vector>
+
+#include "common/client_buffer_allocation.h"
 
 namespace mooncake {
 
@@ -94,6 +103,141 @@ TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
     allocator.reset();
 }
 #endif
+
+#ifndef USE_VRAM_SEGMENT
+// VmFlags of the VMA containing addr in /proc/self/smaps, or "" if unmapped.
+std::string VmaFlags(const void* addr) {
+    std::ifstream smaps("/proc/self/smaps");
+    const auto target = reinterpret_cast<uintptr_t>(addr);
+    bool in_vma = false;
+    for (std::string line; std::getline(smaps, line);) {
+        unsigned long start = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%lx-%lx ", &start, &end) == 2) {
+            in_vma = start <= target && target < end;
+        } else if (in_vma && line.rfind("VmFlags:", 0) == 0) {
+            return line + " ";
+        }
+    }
+    return "";
+}
+
+// Sets MC_STORE_MADV_HUGEPAGE for one test and restores the previous value.
+class ScopedMadvHugepageEnv {
+   public:
+    explicit ScopedMadvHugepageEnv(const char* value) {
+        const char* old = std::getenv(kName);
+        if (old) old_ = old;
+        had_old_ = old != nullptr;
+        if (value) {
+            setenv(kName, value, 1);
+        } else {
+            unsetenv(kName);
+        }
+    }
+    ~ScopedMadvHugepageEnv() {
+        if (had_old_) {
+            setenv(kName, old_.c_str(), 1);
+        } else {
+            unsetenv(kName);
+        }
+    }
+
+   private:
+    static constexpr const char* kName = "MC_STORE_MADV_HUGEPAGE";
+    std::string old_;
+    bool had_old_ = false;
+};
+
+// With MC_STORE_MADV_HUGEPAGE=1, an owned RDMA client buffer is a slab-aligned
+// THP-advised mapping like the base-page RDMA global segment, and the whole
+// mapping is unmapped on destruction.
+TEST_F(ClientBufferTest, RdmaOwnedBufferRequestsThp) {
+    if (access("/sys/kernel/mm/transparent_hugepage/enabled", F_OK) != 0) {
+        GTEST_SKIP() << "THP is not available";
+    }
+    if (get_hugepage_size_from_env() != 0) {
+        GTEST_SKIP() << "MC_STORE_USE_HUGEPAGE selects HugeTLB instead";
+    }
+    ScopedMadvHugepageEnv env("1");
+    const size_t size = 3 * SZ_2MB + 64;
+    auto allocator = ClientBufferAllocator::create(size, "rdma");
+    ASSERT_NE(allocator, nullptr);
+    auto* base = static_cast<unsigned char*>(allocator->getBase());
+    ASSERT_NE(base, nullptr);
+    EXPECT_EQ(allocator->size(), size);
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(base) % facebook::cachelib::Slab::kSize,
+        0u);
+    EXPECT_NE(VmaFlags(base).find(" hg "), std::string::npos);
+    // The 2MB-rounded tail belongs to the same advised mapping.
+    unsigned char* map_end = base + align_up(size, SZ_2MB);
+    EXPECT_NE(VmaFlags(map_end - 1).find(" hg "), std::string::npos);
+
+    std::memset(base, 0x5a, size);
+    {
+        auto handle = allocator->allocate(SZ_2MB);
+        ASSERT_TRUE(handle.has_value());
+        EXPECT_GE(handle->ptr(), static_cast<void*>(base));
+        EXPECT_LE(static_cast<unsigned char*>(handle->ptr()) + SZ_2MB,
+                  base + size);
+    }
+
+    allocator.reset();
+    EXPECT_EQ(VmaFlags(base), "");
+    EXPECT_EQ(VmaFlags(map_end - 1), "");
+}
+
+// Without the opt-in (unset, off, or an invalid value), an owned RDMA client
+// buffer keeps the generic allocation path.
+TEST_F(ClientBufferTest, RdmaOwnedBufferIsNotThpAdvisedByDefault) {
+    const char* tunables = std::getenv("GLIBC_TUNABLES");
+    if (tunables && std::strstr(tunables, "hugetlb")) {
+        GTEST_SKIP() << "glibc may advise malloc'd mappings itself";
+    }
+    if (get_hugepage_size_from_env() != 0) {
+        GTEST_SKIP() << "MC_STORE_USE_HUGEPAGE selects HugeTLB instead";
+    }
+    for (const char* value :
+         {static_cast<const char*>(nullptr), "0", "off", "not-a-bool"}) {
+        ScopedMadvHugepageEnv env(value);
+        const size_t size = 3 * SZ_2MB + 64;
+        auto allocator = ClientBufferAllocator::create(size, "rdma");
+        ASSERT_NE(allocator, nullptr);
+        ASSERT_NE(allocator->getBase(), nullptr);
+        EXPECT_EQ(VmaFlags(allocator->getBase()).find(" hg "),
+                  std::string::npos)
+            << "MC_STORE_MADV_HUGEPAGE=" << (value ? value : "<unset>");
+    }
+}
+
+// Other protocols keep the generic allocation path even with the opt-in.
+TEST_F(ClientBufferTest, TcpOwnedBufferIsNotThpAdvised) {
+    const char* tunables = std::getenv("GLIBC_TUNABLES");
+    if (tunables && std::strstr(tunables, "hugetlb")) {
+        GTEST_SKIP() << "glibc may advise malloc'd mappings itself";
+    }
+    ScopedMadvHugepageEnv env("1");
+    const size_t size = 3 * SZ_2MB + 64;
+    auto allocator = ClientBufferAllocator::create(size, "tcp");
+    ASSERT_NE(allocator, nullptr);
+    ASSERT_NE(allocator->getBase(), nullptr);
+    EXPECT_EQ(VmaFlags(allocator->getBase()).find(" hg "), std::string::npos);
+}
+#endif
+
+// A caller-owned RDMA buffer is neither advised nor unmapped.
+TEST_F(ClientBufferTest, RdmaExternalBufferRetainsCallerOwnership) {
+    std::vector<unsigned char> storage(3 * SZ_2MB + 64, 0x5a);
+    {
+        auto allocator = ClientBufferAllocator::create(storage.data(),
+                                                       storage.size(), "rdma");
+        ASSERT_NE(allocator, nullptr);
+        EXPECT_EQ(allocator->getBase(), storage.data());
+    }
+    std::memset(storage.data(), 0xa5, storage.size());
+    EXPECT_EQ(storage.front(), 0xa5);
+    EXPECT_EQ(storage.back(), 0xa5);
+}
 
 // Test multiple allocations
 TEST_F(ClientBufferTest, MultipleAllocations) {

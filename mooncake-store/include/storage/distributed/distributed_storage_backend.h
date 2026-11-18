@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/read_singleflight.h"
 #include "config/distributed_storage_config.h"
 #include "fs_adapter.h"
 #include "replica.h"
@@ -37,6 +38,9 @@ struct DfsReadRequest {
     // value_offset. Otherwise slices must cover the whole object.
     uint64_t value_offset = 0;
     bool range_read = false;
+    // Existing replica identity distinguishes allocations at a reused source.
+    // Zero means no published source identity, so the read cannot be shared.
+    ReplicaID source_replica_id = 0;
 };
 
 /**
@@ -117,6 +121,26 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::mutex mutex;
     };
     struct DfsIoOp;
+    struct ReadIdentity {
+        std::string key;
+        DistributedFSDescriptor source;
+        uint64_t window_offset;
+        uint64_t window_size;
+        ReplicaID replica_id;
+        bool operator==(const ReadIdentity& other) const;
+    };
+    struct ReadIdentityHash {
+        size_t operator()(const ReadIdentity& identity) const;
+    };
+    using SharedRead =
+        tl::expected<std::shared_ptr<const std::vector<char>>, ErrorCode>;
+    using ReadFlights =
+        ReadSingleFlight<ReadIdentity, SharedRead, ReadIdentityHash>;
+    struct ReadInvalidation;
+    tl::expected<DfsReadRequest, ErrorCode> ValidateReadRequest(
+        const DfsReadRequest& request) const;
+    std::vector<tl::expected<void, ErrorCode>> BatchReadOnce(
+        const std::vector<DfsReadRequest>& requests);
 
     tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
         const DistributedFSDescriptor& descriptor);
@@ -153,6 +177,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
                        std::vector<tl::expected<void, ErrorCode>>& results,
                        bool write, bool complete_short_io);
 
+    ReadFlights read_flights_;
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
