@@ -2142,14 +2142,14 @@ for desc in descriptors:
 Get descriptors of replicas for a tuple of keys.
 
 ```python
-def batch_get_replica_desc(self, keys: List[str]) -> Dict[str, List[Replica::Descriptor]]
+def batch_get_replica_desc(self, keys: List[str]) -> Dict[str | bytes, List[Replica::Descriptor]]
 ```
 
 **Parameters:**
 - `keys` (List[str]): List of mooncake store keys
 
 **Returns:**
-- `Dict[str, List[Replica::Descriptor]]`: Dictionary mapping keys to their list of replica descriptors
+- `Dict[str | bytes, List[Replica::Descriptor]]`: Dictionary mapping keys to their list of replica descriptors. A key that is valid UTF-8 is `str`; any other key is `bytes`.
 
 **Example:**
 ```python

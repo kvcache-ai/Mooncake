@@ -183,6 +183,19 @@ if(WITH_STORE)
       store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
                    cachelib_memory_allocator)
   endif()
+
+  if(BUILD_UNIT_TESTS)
+    find_package(
+      Python3
+      COMPONENTS Development.Embed
+      REQUIRED)
+    add_executable(store_key_py_test tests/store_key_py_test.cpp)
+    target_include_directories(store_key_py_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(store_key_py_test PRIVATE pybind11::headers
+                                                     Python3::Python)
+    add_test(NAME store_key_py_test COMMAND store_key_py_test)
+  endif()
 endif()
 
 if(WITH_CONDUCTOR)
