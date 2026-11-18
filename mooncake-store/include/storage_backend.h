@@ -306,6 +306,8 @@ struct StorageValueSpan {
     uint64_t offset = 0;
     uint64_t object_size = 0;
     Slice slice;
+    // Zero identifies an unversioned record.
+    ObjectIncarnation expected_incarnation{};
 };
 
 class StorageBackendInterface {
@@ -890,6 +892,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices,
+        const ObjectVersions& expected_incarnations);
 
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;

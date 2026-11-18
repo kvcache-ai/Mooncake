@@ -3503,11 +3503,14 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     construction_ok = false;
                     break;
                 }
-                replicas.push_back(Replica(
-                    desc.id, local_disk_desc.client_id,
-                    local_disk_desc.object_size,
-                    local_disk_desc.transport_endpoint, desc.status,
-                    ctx.owners.FindOrCreate(local_disk_desc.client_id)));
+                replicas.push_back(
+                    Replica(desc.id, local_disk_desc.client_id,
+                            local_disk_desc.object_size,
+                            local_disk_desc.transport_endpoint, desc.status,
+                            ctx.owners.FindOrCreate(local_disk_desc.client_id),
+                            local_disk_desc.object_incarnation.value_or(
+                                standby_meta.object_incarnation.value_or(
+                                    ObjectIncarnation{}))));
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
                 if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
@@ -4086,11 +4089,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                             << ", key=" << user_key;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
-                    replicas.push_back(Replica(
-                        desc.id, local_disk_desc.client_id,
-                        local_disk_desc.object_size,
-                        local_disk_desc.transport_endpoint, desc.status,
-                        restore.FindOrCreate(local_disk_desc.client_id)));
+                    replicas.push_back(
+                        Replica(desc.id, local_disk_desc.client_id,
+                                local_disk_desc.object_size,
+                                local_disk_desc.transport_endpoint, desc.status,
+                                restore.FindOrCreate(local_disk_desc.client_id),
+                                local_disk_desc.object_incarnation.value_or(
+                                    standby_meta.object_incarnation.value_or(
+                                        ObjectIncarnation{}))));
                 } else if (desc.is_dfs_replica()) {
                     const auto& dfs_desc = desc.get_dfs_descriptor();
                     if (!use_kvcs_ ||
@@ -5687,8 +5693,11 @@ auto MasterService::AddReplicaForRetainedClient(
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
+    // A durable REMOVE can leave the key published with all replicas already
+    // marked REMOVED. Only a retained COMPLETE replica authorizes reattachment.
     if (scanned_incarnation &&
         (scanned_incarnation->IsZero() || !accessor.IsPublished() ||
+         !accessor.Get().HasReplica(&Replica::fn_is_completed) ||
          accessor.Get().incarnation != *scanned_incarnation ||
          accessor.Get().TotalLength() !=
              replica.get_descriptor().get_local_disk_descriptor().object_size ||
@@ -5703,18 +5712,21 @@ auto MasterService::AddReplicaForRetainedClient(
             ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
+    const auto matches_holder = [client_id](const Replica& existing) {
+        return existing.get_local_disk_client_id() == client_id;
+    };
+    // A different holder can reattach the same verified incarnation while
+    // the catalog still contains the previous owner's unavailable replica.
     const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        scanned_incarnation
+            ? metadata.HasReplica(matches_holder)
+            : metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
         for (const auto& existing : metadata.GetAllReplicas()) {
             if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
+            if (replacing_existing && matches_holder(existing)) {
                 // Substitute with the updated descriptor.
                 Replica::Descriptor updated = existing.get_descriptor();
                 updated.get_local_disk_descriptor().transport_endpoint =
@@ -5751,23 +5763,14 @@ auto MasterService::AddReplicaForRetainedClient(
         return true;
     }
 
-    metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
+    metadata.VisitReplicas(matches_holder, [&replica](Replica& rep) {
+        rep.get_descriptor().get_local_disk_descriptor().transport_endpoint =
+            replica.get_descriptor()
                 .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
-        });
+                .transport_endpoint;
+        rep.get_descriptor().get_local_disk_descriptor().object_size =
+            replica.get_descriptor().get_local_disk_descriptor().object_size;
+    });
     return false;
 }
 
@@ -8399,7 +8402,9 @@ auto MasterService::NotifyOffloadSuccess(
 
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE,
-                        owner_session);
+                        owner_session,
+                        versioned_local_disk_ ? metadata.GetObjectIncarnation()
+                                              : ObjectIncarnation{});
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         const bool realtime = !versioned_local_disk_ || task.attempt_id;
@@ -9347,6 +9352,15 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    const auto* source = metadata.GetReplicaByID(promotion_task->source_id);
+    if (!source || !source->is_local_disk_replica() ||
+        !source->is_completed()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    const auto incarnation = source->get_descriptor()
+                                 .get_local_disk_descriptor()
+                                 .GetObjectIncarnation();
+
     if (auto grown = accessor.Grow(size); !grown) {
         return tl::make_unexpected(grown.error());
     }
@@ -9410,7 +9424,11 @@ auto MasterService::PromotionAllocStart(
     // during which the reaper's erase-by-allocation branch is a no-op.
     promotion_task->alloc_id = new_id;
     promotion_task->start_time = std::chrono::system_clock::now();
-    return PromotionAllocStartResponse{std::move(desc)};
+    PromotionAllocStartResponse response{std::move(desc)};
+    if (!incarnation.IsZero()) {
+        response.object_incarnation = incarnation;
+    }
+    return response;
 }
 
 auto MasterService::NotifyPromotionSuccess(const UUID& client_id,

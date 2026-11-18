@@ -530,6 +530,11 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
 
 tl::expected<void, ErrorCode> StorageBackendInterface::BatchLoadSpans(
     std::unordered_map<std::string, StorageValueSpan>& spans) {
+    if (std::ranges::any_of(spans, [](const auto& entry) {
+            return !entry.second.expected_incarnation.IsZero();
+        })) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
     bool partial = false;
     std::unordered_map<std::string, Slice> full;
     full.reserve(spans.size());
@@ -2042,10 +2047,21 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    return BatchLoad(batch_object, {});
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
+    std::unordered_map<std::string, Slice>& batch_object,
+    const ObjectVersions& expected_incarnations) {
     std::unordered_map<std::string, StorageValueSpan> spans;
     spans.reserve(batch_object.size());
     for (const auto& [key, slice] : batch_object) {
-        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+        const auto incarnation = expected_incarnations.find(key);
+        spans.emplace(
+            key, StorageValueSpan{0, slice.size, slice,
+                                  incarnation == expected_incarnations.end()
+                                      ? ObjectIncarnation{}
+                                      : incarnation->second});
     }
     auto loaded = ReadBucketValues(spans, true);
     if (!loaded) return loaded;
@@ -2093,6 +2109,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
             const auto& metadata = *object_it;
+            if (metadata.GetObjectIncarnation() != span.expected_incarnation) {
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            }
 
             // Lookup bucket -> BucketMetadata
             auto bucket_it = buckets_.find(metadata.bucket_id);
@@ -2106,6 +2125,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                                   std::numeric_limits<int64_t>::max()) ||
                 metadata.data_size < 0) {
                 LOG(ERROR) << "Invalid span for key: " << key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const auto expected_size =
+                span.object_size == 0 ? dest_slice.size : span.object_size;
+            if (!span.expected_incarnation.IsZero() &&
+                expected_size != static_cast<uint64_t>(metadata.data_size)) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             const auto value_offset = static_cast<int64_t>(span.offset);
@@ -6366,6 +6391,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
     std::unordered_map<std::string, StorageValueSpan>& spans) {
+    if (std::ranges::any_of(spans, [](const auto& entry) {
+            return !entry.second.expected_incarnation.IsZero();
+        })) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
     return ReadOffsetValues(spans, false);
 }
 
