@@ -434,18 +434,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                          << " transport was requested but is not compiled in, "
                             "falling back to RDMA/TCP";
         }
+        const bool hint_intra_nvlink =
+#ifdef USE_INTRA_NVLINK
+            !force_hca && auto_discover_config_.protocol == "nvlink_intra";
+#else
+            false;
+#endif
+        const bool hint_gpu_p2p =
+            !force_hca && auto_discover_config_.protocol == gpu_p2p_protocol;
         // Explicit env var overrides take priority over HCA auto-detection
-        if (intra_env) {
+        if (intra_env || (!force_gpu_p2p && hint_intra_nvlink)) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
                 LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
                 return -1;
             }
-            LOG(INFO) << "Using Intra-Node NVLink transport "
-                         "(MC_INTRANODE_NVLINK set)";
+            LOG(INFO) << "Using Intra-Node NVLink transport";
         } else if (kGpuP2PCompiled &&
-                   (force_gpu_p2p || (no_hca && !force_hca))) {
+                   (force_gpu_p2p || hint_gpu_p2p || (no_hca && !force_hca))) {
             // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
             // explicitly requested GPU P2P transport precedence unchanged.
             Transport* t =
@@ -455,8 +462,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                            << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using " << gpu_p2p_name << " transport "
-                      << "(forced or no HCA detected)";
+            LOG(INFO) << "Using " << gpu_p2p_name << " transport";
         } else if (!no_hca || force_hca) {
             const char* rdma_protocol =
                 globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
