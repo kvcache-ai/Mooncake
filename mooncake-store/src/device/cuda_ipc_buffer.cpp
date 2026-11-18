@@ -346,6 +346,10 @@ void CudaIpcBufferMapping::Close() {
         if (restore_device) cudaSetDevice(current_device);
     }
 #endif
+    Abandon();
+}
+
+void CudaIpcBufferMapping::Abandon() noexcept {
     base_ = nullptr;
     ptr_ = nullptr;
     device_id_ = -1;

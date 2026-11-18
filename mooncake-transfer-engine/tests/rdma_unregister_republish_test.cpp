@@ -47,10 +47,14 @@
 #include "config.h"
 #include "error.h"
 #include "rdma_test_peers.h"
+#include "transfer_engine_impl.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#ifdef USE_TCP
+#include "transport/tcp_transport/tcp_transport.h"
+#endif
 
 using namespace mooncake;
 
@@ -131,6 +135,18 @@ extern "C" int ibv_dereg_mr(struct ibv_mr *mr) {
 
 namespace mooncake {
 
+class TransferEngineImplTestPeer {
+   public:
+    static void setTransports(
+        TransferEngineImpl &engine, std::shared_ptr<TransferMetadata> metadata,
+        std::map<std::string, std::shared_ptr<Transport>> transports) {
+        engine.metadata_ = std::move(metadata);
+        engine.multi_transports_ = std::make_shared<MultiTransport>(
+            engine.metadata_, engine.local_server_name_);
+        engine.multi_transports_->transport_map_ = std::move(transports);
+    }
+};
+
 namespace {
 
 constexpr const char *kSegmentName = "local-rdma-segment";
@@ -188,6 +204,27 @@ class TestableTransferMetadata : public TransferMetadata {
     explicit TestableTransferMetadata(
         std::shared_ptr<MetadataStoragePlugin> storage_plugin)
         : TransferMetadata(std::move(storage_plugin)) {}
+};
+
+class MissingRegistrationTransport : public RdmaTransport {
+   public:
+    MissingRegistrationTransport(const char *name,
+                                 std::shared_ptr<TransferMetadata> metadata)
+        : name_(name) {
+        metadata_ = std::move(metadata);
+    }
+
+    const char *getName() const override { return name_; }
+    int registerLocalMemory(void *, size_t, const std::string &, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void *, bool) override {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+
+   private:
+    const char *name_;
 };
 
 }  // namespace
@@ -278,6 +315,80 @@ class RdmaUnregisterRepublishTest : public ::testing::Test {
     std::shared_ptr<RdmaContext> context_;
     uint64_t saved_max_mr_size_ = 0;
 };
+
+TEST_F(RdmaUnregisterRepublishTest, MissingTransportDoesNotMaskLiveMr) {
+    TransferEngineImpl engine;
+    auto missing =
+        std::make_shared<MissingRegistrationTransport>("tcp", metadata_);
+    TransferEngineImplTestPeer::setTransports(
+        engine, metadata_,
+        {{"already-removed", missing}, {"rdma", std::move(transport_)}});
+    ASSERT_EQ(engine.registerLocalMemory(addrA(), kLen, "cpu:0", true, false),
+              0);
+
+    g_fake_dereg_failures_remaining = 1;
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), false), ERR_CONTEXT);
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, addrA()));
+    EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
+
+    const int sets_before = plugin_->setCalls();
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), false), 0);
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, addrA()));
+    EXPECT_FALSE(engine.checkOverlap(addrA(), kLen));
+    EXPECT_EQ(plugin_->setCalls(), sets_before);
+}
+
+TEST_F(RdmaUnregisterRepublishTest, MissingDescriptorCanLeaveAnUnconfirmedMr) {
+    TransferEngineImpl engine;
+    auto missing =
+        std::make_shared<MissingRegistrationTransport>("efa", metadata_);
+    TransferEngineImplTestPeer::setTransports(engine, metadata_,
+                                              {{"efa", missing}});
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true),
+              ERR_ADDRESS_NOT_REGISTERED);
+    ASSERT_EQ(engine.registerLocalMemory(addrA(), kLen, "cpu:0", true, false),
+              0);
+
+    const int sets_before = plugin_->setCalls();
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), ERR_CONTEXT);
+    EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
+    EXPECT_EQ(plugin_->setCalls(), sets_before);
+}
+
+#ifdef USE_TCP
+TEST_F(RdmaUnregisterRepublishTest, TcpRetryPublishesRemovalBeforeRangeReuse) {
+    TransferEngineImpl engine;
+    auto tcp = std::make_shared<TcpTransport>();
+    tcp->meta() = metadata_;
+    TransferEngineImplTestPeer::setTransports(engine, metadata_,
+                                              {{"tcp", tcp}});
+    ASSERT_EQ(engine.registerLocalMemory(addrA(), kLen, "cpu:0", true, true),
+              0);
+
+    const std::string key = std::string("mooncake/ram/") + kSegmentName;
+    Json::Value published;
+    plugin_->failNextSet(2);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), ERR_METADATA);
+        EXPECT_FALSE(hasLocalBuffer(addrA()));
+        EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
+        ASSERT_TRUE(plugin_->get(key, published));
+        EXPECT_EQ(published["buffers"].size(), 1u);
+    }
+
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), 0);
+    ASSERT_TRUE(plugin_->get(key, published));
+    EXPECT_EQ(published["buffers"].size(), 0u);
+    EXPECT_FALSE(engine.checkOverlap(addrA(), kLen));
+    const int sets_before = plugin_->setCalls();
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(plugin_->setCalls(), sets_before);
+    EXPECT_EQ(engine.registerLocalMemory(addrA(), kLen, "cpu:0", true, true),
+              0);
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), 0);
+}
+#endif
 
 // Single buffer: the first failure happens while the MRs are still live, the
 // retry reaches the MR cleanup and then fails only at the publish. The retry in

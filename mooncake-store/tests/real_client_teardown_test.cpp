@@ -155,6 +155,83 @@ class RealClientTeardownTest : public ::testing::Test {
             master_.master_address());
     }
 
+    std::weak_ptr<ClientBufferAllocator> AddCudaAllocation(
+        const UUID &id, CudaIpcBufferHandle &handle) {
+        handle.has_device_uuid = true;
+        handle.size = 4096;
+        const std::string key(handle.device_uuid.size() + handle.handle.size(),
+                              '\0');
+        auto &context = client_->shm_contexts_[id];
+        auto &allocation = client_->cuda_allocations_[key];
+        // Exercise MR bookkeeping and the production cleanup paths without
+        // requiring a CUDA device or verbs provider.
+        allocation = std::make_shared<RealClient::CudaRegisteredAllocation>();
+        auto allocator = ClientBufferAllocator::create(mapping_, mapping_size_);
+        std::weak_ptr<ClientBufferAllocator> allocator_observer = allocator;
+        context.client_buffer_allocator = std::move(allocator);
+        return allocator_observer;
+    }
+
+    void CheckCudaQuarantine() {
+        const UUID id = generate_uuid();
+        CudaIpcBufferHandle handle{};
+        auto allocator = AddCudaAllocation(id, handle);
+        // A second request for an allocation with an ambiguous initial
+        // rollback must preserve the negative acknowledgement for this id.
+        ASSERT_FALSE(client_->register_cuda_buffer_with_fd(kCudaAddress, handle,
+                                                           id, -1));
+        EXPECT_FALSE(client_->unmap_shm(id, true));
+        EXPECT_TRUE(allocator.expired());
+        EXPECT_EQ(client_->shm_contexts_.count(id), 0U);
+        EXPECT_FALSE(
+            client_->unregister_cuda_buffer_internal(kCudaAddress, handle, id));
+        EXPECT_FALSE(client_->unmap_shm(id, true));
+        EXPECT_TRUE(client_->unmap_shm(generate_uuid(), true));
+        ASSERT_EQ(ReconnectMaster(), ErrorCode::OK);
+        EXPECT_NE(client_->tearDownAll(), 0);
+        EXPECT_EQ(client_->client_, nullptr);
+        EXPECT_NE(client_->tearDownAll(), 0);
+        EXPECT_EQ(client_->cuda_allocations_.size(), 1U);
+        // There is no actual MR or CUDA import in this synthetic test.
+        client_->cuda_allocations_.clear();
+    }
+
+    void CheckCudaDeregistrationRetry() {
+        const UUID id = generate_uuid();
+        CudaIpcBufferHandle handle{};
+        auto allocator = AddCudaAllocation(id, handle);
+        auto &allocation = client_->cuda_allocations_.begin()->second;
+        allocation->state = RealClient::CudaRegistrationState::kRegistered;
+        client_->shm_contexts_[id].cuda_buffers.emplace(
+            kCudaAddress, RealClient::CudaRegisteredBuffer{handle, allocation});
+        client_->registered_buffer_sizes_[allocation->mapping.base()] = {
+            handle.size};
+        int attempts = 0;
+        struct ResetHook {
+            ~ResetHook() { RealClient::SetTeUnregisterHookForTesting(nullptr); }
+        } reset_hook;
+        RealClient::SetTeUnregisterHookForTesting(
+            [&](void *) -> tl::expected<void, ErrorCode> {
+                // The first attempt fails after removing the MR. The retry
+                // confirms that TE no longer has it and clears the Store
+                // record.
+                return tl::unexpected(++attempts == 1
+                                          ? ErrorCode::INVALID_PARAMS
+                                          : ErrorCode::NOT_REGISTERED);
+            });
+        auto result = client_->unmap_shm(id, true);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(allocator.expired());
+        EXPECT_EQ(allocation->state,
+                  RealClient::CudaRegistrationState::kUnregisterPending);
+        EXPECT_TRUE(client_->unmap_shm(id, true));
+        EXPECT_TRUE(client_->unmap_shm(id, true));
+        EXPECT_EQ(attempts, 2);
+        EXPECT_TRUE(client_->cuda_allocations_.empty());
+    }
+
+    static constexpr uint64_t kCudaAddress = 0x1000;
     static constexpr const char *kPendingKey = "teardown_pending_put";
     testing::InProcMaster master_;
     std::unique_ptr<coro_rpc::coro_rpc_server> failing_master_;
@@ -190,6 +267,14 @@ TEST_F(RealClientTeardownTest, ExplicitCloseRetainsFailedSessionForRetry) {
     EXPECT_EQ(client_->client_, nullptr);
     EXPECT_TRUE(PendingStateEmpty());
     EXPECT_FALSE(IsMapped(mapping_));
+}
+
+TEST_F(RealClientTeardownTest, CudaQuarantineSurvivesDummyAndRealClose) {
+    CheckCudaQuarantine();
+}
+
+TEST_F(RealClientTeardownTest, CudaDeregistrationRetriesAfterShmCleanup) {
+    CheckCudaDeregistrationRetry();
 }
 
 }  // namespace mooncake::test

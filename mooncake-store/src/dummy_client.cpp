@@ -192,13 +192,9 @@ constexpr bool can_invoke_when_disconnected() {
            std::is_same_v<Method,
                           std::remove_reference_t<
                               decltype(&RealClient::ascend_shm_internal)>> ||
-           std::is_same_v<
-               Method, std::remove_reference_t<
-                           decltype(&RealClient::ascend_ipc_shm_internal)>> ||
-           std::is_same_v<
-               Method,
-               std::remove_reference_t<
-                   decltype(&RealClient::unregister_cuda_buffer_internal)>>;
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_ipc_shm_internal)>>;
 }
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
@@ -616,10 +612,22 @@ int DummyClient::tearDownAll() {
     }
 
     void* local_buffer_base = local_buffer_base_;
-    const auto unmap_result = unregister_shm();
-    if (unmap_result == 0) {
+    int cuda_cleanup_status = 0;
+    {
         std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
-        registered_cuda_buffers_.clear();
+        if (registered_cuda_buffers_.empty()) {
+            (void)unregister_shm();
+        } else {
+            // Queue close behind any CUDA registration whose reply timed out.
+            // Even a failed bulk close may have released some of the MRs.
+            for (auto& [address, registration] : registered_cuda_buffers_) {
+                registration.state = CudaRegistrationState::kReleasing;
+            }
+            cuda_cleanup_status =
+                cuda_buffer_ipc_request(IPC_CUDA_UNMAP_CLIENT, 0, {}).status;
+            if (cuda_cleanup_status == 0) registered_cuda_buffers_.clear();
+        }
+        connected_.store(false);
     }
     if (local_buffer_base && shm_helper_ &&
         shm_helper_->get_shm(local_buffer_base) &&
@@ -639,7 +647,6 @@ int DummyClient::tearDownAll() {
         hot_cache_fd_ = -1;
     }
 
-    connected_.store(false);
     last_ping_healthy_.store(false);
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
     registered_external_buffers_.clear();
@@ -649,13 +656,7 @@ int DummyClient::tearDownAll() {
         registered_device_buffers_.clear();
     }
 #endif
-    if (cuda_ipc_persistent_registration_ && unmap_result != 0) {
-        std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
-        if (!registered_cuda_buffers_.empty()) {
-            return static_cast<int>(unmap_result);
-        }
-    }
-    return 0;
+    return cuda_cleanup_status;
 }
 
 std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
@@ -790,67 +791,71 @@ int DummyClient::unregister_external_buffer(void* buffer) {
 
 std::optional<size_t> DummyClient::registered_cuda_buffer_remaining(
     void* buffer) const {
-    if (!cuda_ipc_persistent_registration_ || !connected_.load()) {
-        return std::nullopt;
-    }
+    if (!cuda_ipc_persistent_registration_) return std::nullopt;
     const auto address = reinterpret_cast<uintptr_t>(buffer);
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
+    if (!connected_.load()) return std::nullopt;
     for (const auto& [base, registration] : registered_cuda_buffers_) {
-        if (registration.registered && address >= base &&
-            address - base < registration.size) {
+        if (registration.state == CudaRegistrationState::kRegistered &&
+            address >= base && address - base < registration.size) {
             return registration.size - (address - base);
         }
     }
     return std::nullopt;
 }
 
-int DummyClient::register_cuda_via_ipc(uint64_t dummy_addr,
-                                       const CudaIpcBufferHandle& handle) {
+DummyClient::CudaBufferIpcResult DummyClient::cuda_buffer_ipc_request(
+    IpcRequestType type, uint64_t dummy_addr, const CudaIpcBufferHandle& handle,
+    int fd) {
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
-    if (!inflight.ok()) return toInt(ErrorCode::RPC_FAIL);
+    if (!inflight.ok()) return {toInt(ErrorCode::RPC_FAIL), false};
 
     UdsConnector connector(ipc_socket_path_);
     auto connection_result = connector.connect();
     if (!connection_result) {
         LOG(ERROR) << "Failed to connect CUDA registration IPC socket: "
                    << connection_result.error();
-        return toInt(ErrorCode::RPC_FAIL);
+        return {toInt(ErrorCode::RPC_FAIL), false};
     }
     auto connection = std::move(*connection_result);
     if (auto timeout = connection->setRecvTimeout(std::chrono::seconds(30));
         !timeout) {
         LOG(ERROR) << "Failed to set CUDA registration response timeout: "
                    << timeout.error();
-        return toInt(ErrorCode::RPC_FAIL);
+        return {toInt(ErrorCode::RPC_FAIL), false};
     }
-    auto dmabuf = device::ExportCudaIpcDmabuf(
-        handle, reinterpret_cast<void*>(dummy_addr));
-    if (!dmabuf) return toInt(dmabuf.error());
-
-    IpcRequestType type = IPC_CUDA_REGISTER;
     if (connection->sendRaw(&type, sizeof(type)) < 0) {
-        close(*dmabuf);
         LOG(ERROR) << "Failed to send CUDA registration IPC request type";
-        return toInt(ErrorCode::RPC_FAIL);
+        return {toInt(ErrorCode::RPC_FAIL), false};
     }
     CudaRegisterRequest request{};
     request.client_id_first = client_id_.first;
     request.client_id_second = client_id_.second;
     request.dummy_addr = dummy_addr;
     request.handle = handle;
-    const int sent = connection->sendFd(*dmabuf, &request, sizeof(request));
-    // SCM_RIGHTS transfers an independent descriptor to the daemon.
-    close(*dmabuf);
+    const int sent = fd >= 0 ? connection->sendFd(fd, &request, sizeof(request))
+                             : connection->sendRaw(&request, sizeof(request));
     if (sent < 0) {
-        LOG(ERROR) << "Failed to send CUDA DMA-BUF FD to RealClient";
-        return toInt(ErrorCode::RPC_FAIL);
+        LOG(ERROR) << "Failed to send CUDA registration IPC request";
+        return {toInt(ErrorCode::RPC_FAIL), false};
     }
     int status = toInt(ErrorCode::RPC_FAIL);
     if (connection->recvRaw(&status, sizeof(status)) < 0) {
         LOG(ERROR) << "Failed to receive CUDA registration response";
-        return toInt(ErrorCode::RPC_FAIL);
+        return {toInt(ErrorCode::RPC_FAIL), true};
     }
-    return status;
+    return {status, true};
+}
+
+DummyClient::CudaBufferIpcResult DummyClient::register_cuda_via_ipc(
+    uint64_t dummy_addr, const CudaIpcBufferHandle& handle) {
+    auto dmabuf = device::ExportCudaIpcDmabuf(
+        handle, reinterpret_cast<void*>(dummy_addr));
+    if (!dmabuf) return {toInt(dmabuf.error()), false};
+    auto result =
+        cuda_buffer_ipc_request(IPC_CUDA_REGISTER, dummy_addr, handle, *dmabuf);
+    close(*dmabuf);
+    return result;
 }
 
 int DummyClient::register_cuda_buffer(void* buffer, size_t size) {
@@ -859,13 +864,24 @@ int DummyClient::register_cuda_buffer(void* buffer, size_t size) {
         return toInt(ErrorCode::INVALID_PARAMS);
     }
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
+    if (!connected_.load()) return toInt(ErrorCode::RPC_FAIL);
     auto it = registered_cuda_buffers_.find(base);
+    if (it != registered_cuda_buffers_.end() && it->second.references == 0) {
+        // A failed initial request may have installed the MR. Retire it before
+        // exporting the allocation currently occupying this address.
+        auto result = cuda_buffer_ipc_request(IPC_CUDA_UNREGISTER, base,
+                                              it->second.handle);
+        if (result.status != 0) return result.status;
+        registered_cuda_buffers_.erase(it);
+        it = registered_cuda_buffers_.end();
+    }
     if (it != registered_cuda_buffers_.end()) {
         if (it->second.size != size ||
+            it->second.state == CudaRegistrationState::kReleasing ||
             it->second.references == std::numeric_limits<size_t>::max()) {
             return toInt(ErrorCode::INVALID_PARAMS);
         }
-        if (it->second.registered) {
+        if (it->second.state == CudaRegistrationState::kRegistered) {
             ++it->second.references;
             return 0;
         }
@@ -880,13 +896,17 @@ int DummyClient::register_cuda_buffer(void* buffer, size_t size) {
         auto handle = device::ExportCudaIpcBuffer(buffer, size);
         if (!handle) return toInt(handle.error());
         it = registered_cuda_buffers_
-                 .emplace(base, CudaBufferRegistration{size, *handle, 1, false})
+                 .emplace(base, CudaBufferRegistration{size, *handle})
                  .first;
     }
-    const int result =
-        register_cuda_via_ipc(static_cast<uint64_t>(base), it->second.handle);
-    if (result == 0) it->second.registered = true;
-    return result;
+    auto result = register_cuda_via_ipc(base, it->second.handle);
+    if (result.status == 0) {
+        it->second.state = CudaRegistrationState::kRegistered;
+        ++it->second.references;
+    } else if (!result.sent && it->second.references == 0) {
+        registered_cuda_buffers_.erase(it);
+    }
+    return result.status;
 }
 
 std::optional<int> DummyClient::unregister_cuda_buffer(void* buffer) {
@@ -898,21 +918,26 @@ std::optional<int> DummyClient::unregister_cuda_buffer(void* buffer) {
         --it->second.references;
         return 0;
     }
+    // The daemon may release the MR even when we lose its reply. Keep the
+    // handle for a retry and stop exposing this address to transfers/replay.
+    it->second.state = CudaRegistrationState::kReleasing;
     auto result =
-        invoke_rpc<&RealClient::unregister_cuda_buffer_internal, void>(
-            static_cast<uint64_t>(base), it->second.handle, client_id_);
-    if (result) registered_cuda_buffers_.erase(it);
-    return to_py_ret(result);
+        cuda_buffer_ipc_request(IPC_CUDA_UNREGISTER, base, it->second.handle);
+    if (result.status == 0) registered_cuda_buffers_.erase(it);
+    return result.status;
 }
 
 int DummyClient::reregister_cuda_buffers() {
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
     for (auto& [base, registration] : registered_cuda_buffers_) {
-        registration.registered = false;
-        const int result = register_cuda_via_ipc(static_cast<uint64_t>(base),
-                                                 registration.handle);
-        if (result != 0) return result;
-        registration.registered = true;
+        if (registration.references == 0 ||
+            registration.state == CudaRegistrationState::kReleasing) {
+            continue;
+        }
+        registration.state = CudaRegistrationState::kUnconfirmed;
+        auto result = register_cuda_via_ipc(base, registration.handle);
+        if (result.status != 0) return result.status;
+        registration.state = CudaRegistrationState::kRegistered;
     }
     return 0;
 }

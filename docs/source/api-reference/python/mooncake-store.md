@@ -3250,12 +3250,20 @@ the same key. Disconnect cleanup revokes that client's unfinished put sessions.
 Both the DummyClient and the `mooncake_client` daemon must include session RPC
 support; older daemons return an RPC error.
 
-In DummyClient mode, registered shared-memory buffers are transferred through
-the RealClient's mapping. Other buffers accepted by `register_buffer`, including
-CUDA buffers, use the existing shared-memory staging and copy-back path. This
-does not persistently import or RDMA-register GPU allocations in the RealClient.
-Keep buffers registered and alive until the synchronous call returns, and
-synchronize device producer streams before range writes.
+In DummyClient mode, session transfers use the RealClient's mapping for
+registered shared memory. External CPU buffers and, by default, CUDA buffers
+use shared-memory staging. With `setup_dummy(..., cuda_ipc_persistent_registration=True)`,
+the RealClient keeps a CUDA IPC mapping and a Transfer Engine registration for
+the GPU allocation. Synchronize device producer streams before range writes.
+
+In persistent mode, match each successful `register_buffer` call with an
+`unregister_buffer` call. Finish in-flight transfers before the final
+unregister and keep the GPU allocation alive until that call succeeds. If a
+registration fails after reaching the daemon, including a lost reply, the
+daemon may still hold the mapping. Retry registration to use the buffer, or
+retry unregistration to confirm cleanup before releasing it. If the daemon
+cannot confirm that a failed memory registration was rolled back, keep the
+allocation alive until the daemon exits.
 
 #### batch_get_session_start()
 

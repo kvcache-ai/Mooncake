@@ -32,6 +32,10 @@ class CudaIpcBufferMapping {
     static tl::expected<CudaIpcBufferMapping, ErrorCode> Open(
         const CudaIpcBufferHandle &handle);
 
+    // Leave the CUDA mapping open until process exit when an MR may still
+    // reference it after its owner shuts down.
+    void Abandon() noexcept;
+
     void *ptr() const { return ptr_; }
     void *base() const { return base_; }
     size_t allocation_size() const { return allocation_size_; }

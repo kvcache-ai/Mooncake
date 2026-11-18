@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef WITH_METRICS
@@ -843,13 +844,35 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
+    bool already_removed = false;
+    bool unconfirmed_removal = false;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret && !first_error) first_error = ret;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            already_removed = true;
+            // TCP only removes a descriptor. Classic RDMA tracks pending MR
+            // deregistration. Other transports can lose their descriptor while
+            // still holding an MR after a failed unregister.
+            std::string_view name = transport->getName();
+            if (name != "tcp" && name != "rdma") unconfirmed_removal = true;
+        } else if (ret && !first_error) {
+            first_error = ret;
+        }
     }
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (already_removed) {
+        if (!local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)))
+            return ERR_ADDRESS_NOT_REGISTERED;
+        if (unconfirmed_removal) return ERR_CONTEXT;
+        // A transport may have removed its local descriptor before an earlier
+        // publish failed. Keep the range reserved until peers can see removal.
+        if (update_metadata) {
+            int ret = metadata_->updateLocalSegmentDesc();
+            if (ret) return ret;
+        }
+    }
     clearSkipRegistrationLocked(addr);
     eraseMemoryRegionLocked(addr);
     return 0;

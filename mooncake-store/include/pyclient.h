@@ -28,6 +28,8 @@ enum IpcRequestType : uint32_t {
     IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
     IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
     IPC_CUDA_REGISTER = 2,   // dummy → real: register a CUDA DMA-BUF fd
+    IPC_CUDA_UNREGISTER = 3,
+    IPC_CUDA_UNMAP_CLIENT = 4,
 };
 
 // Segment types for IPC_SHM_FD_REQUEST
@@ -129,7 +131,9 @@ struct ShmRegisterRequest {
     bool is_local_buffer;
 };
 
-// Payload for IPC_CUDA_REGISTER (accompanied by a DMA-BUF fd via SCM_RIGHTS).
+// CUDA lifecycle requests share the serialized UDS acceptor. Registration
+// carries a DMA-BUF fd via SCM_RIGHTS. Unregistration and client cleanup send
+// the payload directly, and client cleanup only uses the client ID.
 struct CudaRegisterRequest {
     uint64_t client_id_first;
     uint64_t client_id_second;

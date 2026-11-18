@@ -676,13 +676,6 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
-    tl::expected<void, ErrorCode> register_cuda_buffer_internal(
-        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
-        const UUID &client_id);
-    tl::expected<void, ErrorCode> unregister_cuda_buffer_internal(
-        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
-        const UUID &client_id);
-
     tl::expected<void, ErrorCode> ascend_shm_internal(
         uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
         const std::string &shareable_handle_bytes, int32_t device_id,
@@ -1260,9 +1253,14 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, PutSessionEntry> put_sessions;
     };
 
+    enum class CudaRegistrationState {
+        kQuarantined,  // Initial registration did not confirm MR ownership.
+        kRegistered,
+        kUnregisterPending,
+    };
     struct CudaRegisteredAllocation {
         device::CudaIpcBufferMapping mapping;
-        bool registered = false;
+        CudaRegistrationState state = CudaRegistrationState::kQuarantined;
     };
     struct CudaRegisteredBuffer {
         CudaIpcBufferHandle handle;
@@ -1289,11 +1287,19 @@ class RealClient : public PyClient {
     // and IPC mapping for each physical CUDA allocation, even across Dummies.
     std::unordered_map<std::string, std::shared_ptr<CudaRegisteredAllocation>>
         cuda_allocations_;
+    // Remember uncertain imports after releasing the client's other resources.
+    // An unmap acknowledgement would allow the exporter to free its allocation.
+    std::unordered_set<UUID, boost::hash<UUID>> clients_with_quarantined_cuda_;
+    tl::expected<void, ErrorCode> unmap_shm(const UUID &client_id,
+                                            bool missing_ok);
     tl::expected<void, ErrorCode> unregister_cuda_buffer_locked(
         ShmContext &context, uint64_t dummy_addr);
     tl::expected<void, ErrorCode> register_cuda_buffer_with_fd(
         uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
         const UUID &client_id, int fd);
+    tl::expected<void, ErrorCode> unregister_cuda_buffer_internal(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
+        const UUID &client_id);
 
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
@@ -1339,6 +1345,7 @@ class RealClient : public PyClient {
     std::vector<int> batch_put_session_revoke_impl(
         SessionState &sessions, const std::vector<std::string> &keys);
     ErrorCode cleanup_dummy_sessions(ShmContext &context);
+    ErrorCode unregister_dummy_cuda_buffers(ShmContext &context);
     ErrorCode cleanup_session_state(SessionState &sessions);
     std::vector<int> execute_dummy_session_ranges(
         const std::vector<DummySessionRangeRequest> &requests,
@@ -1425,7 +1432,8 @@ class RealClient : public PyClient {
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);
-    void handle_ipc_cuda_register(UdsConnection &connection);
+    void handle_ipc_cuda_request(UdsConnection &connection,
+                                 IpcRequestType type);
     void handle_ipc_shm_fd_request(UdsConnection &connection);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);

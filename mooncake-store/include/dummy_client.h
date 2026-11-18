@@ -249,6 +249,7 @@ class DummyClient : public PyClient {
 
    private:
     friend class DummyClientTeardownTestPeer;
+    friend class DummyClientCudaLifecycleTest;
 
     struct PreparedBuffer {
         void *original = nullptr;
@@ -265,8 +266,15 @@ class DummyClient : public PyClient {
     int register_external_buffer(void *buffer, size_t size);
     int unregister_external_buffer(void *buffer);
     std::optional<size_t> registered_cuda_buffer_remaining(void *buffer) const;
-    int register_cuda_via_ipc(uint64_t dummy_addr,
-                              const CudaIpcBufferHandle &handle);
+    struct CudaBufferIpcResult {
+        int status;
+        bool sent;
+    };
+    CudaBufferIpcResult cuda_buffer_ipc_request(
+        IpcRequestType type, uint64_t dummy_addr,
+        const CudaIpcBufferHandle &handle, int fd = -1);
+    CudaBufferIpcResult register_cuda_via_ipc(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle);
     int register_cuda_buffer(void *buffer, size_t size);
     std::optional<int> unregister_cuda_buffer(void *buffer);
     int reregister_cuda_buffers();
@@ -313,13 +321,13 @@ class DummyClient : public PyClient {
     mutable std::mutex registered_external_buffers_mutex_;
     BufferRegistrationMap registered_external_buffers_;
 
+    enum class CudaRegistrationState { kUnconfirmed, kRegistered, kReleasing };
     struct CudaBufferRegistration {
         size_t size = 0;
         CudaIpcBufferHandle handle;
-        size_t references = 1;
-        // A failed RPC may have registered the allocation on the server. Keep
-        // its handle for an idempotent retry, but do not use it for transfers.
-        bool registered = false;
+        // Count only registrations that returned success to the application.
+        size_t references = 0;
+        CudaRegistrationState state = CudaRegistrationState::kUnconfirmed;
     };
     const bool cuda_ipc_persistent_registration_;
     mutable std::mutex registered_cuda_buffers_mutex_;

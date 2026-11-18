@@ -674,12 +674,6 @@ class RealClient::OffloadRestoreLease {
 
 PyClient::~PyClient() {}
 
-tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_internal(
-    uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
-    const UUID &client_id) {
-    return register_cuda_buffer_with_fd(dummy_addr, handle, client_id, -1);
-}
-
 tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
     uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
     const UUID &client_id, int fd) {
@@ -697,7 +691,7 @@ tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
         if (base == dummy_addr && buffer.handle.size == handle.size &&
             buffer.handle.offset == handle.offset &&
             CudaAllocationKey(buffer.handle) == key) {
-            if (!buffer.allocation->registered)
+            if (buffer.allocation->state != CudaRegistrationState::kRegistered)
                 return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             return {};  // An RPC retry must not acquire another reference.
         }
@@ -710,6 +704,12 @@ tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
     auto new_allocation = std::make_shared<CudaRegisteredAllocation>();
     auto [allocation_it, inserted] =
         cuda_allocations_.try_emplace(key, new_allocation);
+    auto &allocation = allocation_it->second;
+    if (!inserted && allocation->state != CudaRegistrationState::kRegistered) {
+        if (allocation->state == CudaRegistrationState::kQuarantined)
+            clients_with_quarantined_cuda_.insert(client_id);
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     decltype(buffers.begin()) buffer_it;
     try {
         buffer_it = buffers.try_emplace(dummy_addr).first;
@@ -717,7 +717,6 @@ tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
         if (inserted) cuda_allocations_.erase(allocation_it);
         throw;
     }
-    auto &allocation = allocation_it->second;
     buffer_it->second = CudaRegisteredBuffer{handle, allocation};
     if (inserted) {
         auto mapping = device::CudaIpcBufferMapping::Open(handle);
@@ -742,17 +741,18 @@ tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
         auto registered = register_buffer_internal(
             allocation->mapping.base(), allocation->mapping.allocation_size());
         if (!registered) {
-            // TE rollback is best effort. Keep a failed import quarantined:
-            // failure does not prove that every NIC released its MR.
+            // TE does not distinguish overlap with an existing MR from an
+            // incomplete rollback. Deregistering by VA could remove another
+            // owner's MR. Keep only the import and the negative
+            // acknowledgement.
+            clients_with_quarantined_cuda_.insert(client_id);
+            buffers.erase(buffer_it);
             return registered;
         }
-        allocation->registered = true;
+        allocation->state = CudaRegistrationState::kRegistered;
         LOG(INFO) << "Persistent CUDA IPC MR registered: base="
                   << allocation->mapping.base()
                   << ", bytes=" << allocation->mapping.allocation_size();
-    }
-    if (!allocation->registered) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     const size_t capacity = allocation->mapping.allocation_size();
     if (handle.offset > capacity || handle.size > capacity - handle.offset) {
@@ -768,11 +768,14 @@ tl::expected<void, ErrorCode> RealClient::unregister_cuda_buffer_locked(
     auto it = context.cuda_buffers.find(dummy_addr);
     if (it == context.cuda_buffers.end()) return {};
     const auto &allocation = it->second.allocation;
-    if (!allocation->registered)
+    if (allocation->state == CudaRegistrationState::kQuarantined)
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     // One global owner plus this final logical registration. Data handlers
     // hold the shared dummy lock through TE completion, so none is in flight.
     if (allocation.use_count() == 2) {
+        // A failure can follow a partial TE or NoF deregistration. Keep the
+        // mapping for retry but stop using it for transfers immediately.
+        allocation->state = CudaRegistrationState::kUnregisterPending;
         auto result = unregister_buffer_internal(allocation->mapping.base());
         if (!result) return result;  // Keep the mapping while its MR is live.
         LOG(INFO) << "Persistent CUDA IPC MR unregistered: base="
@@ -787,6 +790,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_cuda_buffer_internal(
     uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
     const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto allocation = cuda_allocations_.find(CudaAllocationKey(handle));
+    if (allocation != cuda_allocations_.end() &&
+        allocation->second->state == CudaRegistrationState::kQuarantined)
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     auto ctx = shm_contexts_.find(client_id);
     if (ctx == shm_contexts_.end()) return {};
     auto it = ctx->second.cuda_buffers.find(dummy_addr);
@@ -825,7 +832,8 @@ bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                           void *&out_real,
                                           size_t *out_capacity) const {
     for (const auto &[base, buffer] : shm_ctx.cuda_buffers) {
-        if (!buffer.allocation->registered) continue;
+        if (buffer.allocation->state != CudaRegistrationState::kRegistered)
+            continue;
         if (dummy_addr >= base && dummy_addr - base <= buffer.handle.size &&
             buf_size <= buffer.handle.size - (dummy_addr - base)) {
             out_real = static_cast<char *>(buffer.allocation->mapping.base()) +
@@ -1099,6 +1107,11 @@ RealClient::~RealClient() {
     if (!tearDownAll_internal(/*final_teardown=*/true)) {
         LOG(ERROR) << "RealClient teardown completed with cleanup failures";
     }
+    // An unconfirmed MR can outlive Client (e.g. with a borrowed TE). Keep
+    // its CUDA import even if explicit close already released other state.
+    for (auto &[key, allocation] : cuda_allocations_) {
+        allocation->mapping.Abandon();
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -1214,7 +1227,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // munmap it while an old registration is still live.
     {
         std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-        if (!quarantine_shms_.empty()) {
+        if (!quarantine_shms_.empty() || !cuda_allocations_.empty()) {
             LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
                           "quarantined shared mappings that must stay pinned; "
                           "create a new client instead";
@@ -2092,6 +2105,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
         {
             std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
             shm_rc = RetryQuarantinedShmsLocked();
+            if (!cuda_allocations_.empty() && shm_rc == ErrorCode::OK)
+                shm_rc = ErrorCode::INTERNAL_ERROR;
         }
         if (shm_rc != ErrorCode::OK) {
             return tl::unexpected(shm_rc);
@@ -2116,7 +2131,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
     {
         std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
         for (auto &[client_id, context] : shm_contexts_) {
-            const ErrorCode result = cleanup_dummy_sessions(context);
+            ErrorCode result = cleanup_dummy_sessions(context);
+            if (result == ErrorCode::OK)
+                result = unregister_dummy_cuda_buffers(context);
             if (result != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
                 cleanup_error = result;
             }
@@ -2289,16 +2306,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
         cleanup_error == ErrorCode::OK) {
         cleanup_error = ErrorCode::INTERNAL_ERROR;
     }
-    if (final_teardown) {
-        // A failed deregistration can outlive Client (e.g. a borrowed TE).
-        // Retain the import until process exit rather than close a live MR.
-        for (auto &[key, allocation] : cuda_allocations_) {
-            (void)key;
-            (void)new std::shared_ptr<CudaRegisteredAllocation>(
-                std::move(allocation));
-        }
-        cuda_allocations_.clear();
-    }
+    if (!cuda_allocations_.empty() && cleanup_error == ErrorCode::OK)
+        cleanup_error = ErrorCode::INTERNAL_ERROR;
     if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
@@ -3453,6 +3462,10 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     // Check if this shm is already mapped
     auto context_it = shm_contexts_.find(client_id);
     if (context_it != shm_contexts_.end()) {
+        if (context_it->second.sessions_closing) {
+            if (fd >= 0) close(fd);
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
         for (const auto &shm : context_it->second.mapped_shms) {
             if (shm.dummy_base_addr ==
                 static_cast<uintptr_t>(dummy_base_addr)) {
@@ -3612,18 +3625,26 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
 
 tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     const UUID &client_id) {
+    return unmap_shm(client_id, false);
+}
+
+tl::expected<void, ErrorCode> RealClient::unmap_shm(const UUID &client_id,
+                                                    bool missing_ok) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
+        if (clients_with_quarantined_cuda_.count(client_id))
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        if (missing_ok) return {};
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     auto &context = it->second;
-    if (auto result = cleanup_dummy_sessions(context);
-        result != ErrorCode::OK) {
+    if (auto result = cleanup_dummy_sessions(context); result != ErrorCode::OK)
         return tl::unexpected(result);
-    }
+    const ErrorCode cuda_error = unregister_dummy_cuda_buffers(context);
+    context.active_handles.clear();
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
@@ -3703,8 +3724,9 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         failed = true;
     }
     context.mapped_shms.clear();
+    if (cuda_error != ErrorCode::OK) return tl::unexpected(cuda_error);
     shm_contexts_.erase(it);
-    if (failed) {
+    if (failed || clients_with_quarantined_cuda_.count(client_id)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return {};
@@ -3726,6 +3748,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
     }
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto &context = shm_contexts_[client_id];
+    if (context.sessions_closing)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     for (const auto &region : context.mapped_shms) {
         if (region.dummy_base_addr == static_cast<uintptr_t>(dummy_base_addr)) {
             LOG(INFO) << "VMM region already mapped for dummy address";
@@ -3807,6 +3831,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
     }
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto &context = shm_contexts_[client_id];
+    if (context.sessions_closing)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     for (const auto &region : context.mapped_shms) {
         if (region.dummy_base_addr == static_cast<uintptr_t>(dummy_base_addr)) {
             LOG(INFO) << "IPC region already mapped for dummy address";
@@ -3915,10 +3941,11 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     }
 
     auto &context = it->second;
-    if (auto result = cleanup_dummy_sessions(context);
-        result != ErrorCode::OK) {
+    if (auto result = cleanup_dummy_sessions(context); result != ErrorCode::OK)
         return tl::unexpected(result);
-    }
+    if (auto result = unregister_dummy_cuda_buffers(context);
+        result != ErrorCode::OK)
+        return tl::unexpected(result);
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
@@ -7800,14 +7827,19 @@ ErrorCode RealClient::cleanup_dummy_sessions(ShmContext &context) {
     // The caller holds the exclusive dummy lock, so no handler can still use
     // this context or add a reservation while cleanup runs.
     context.sessions_closing = true;
-    const auto result = cleanup_session_state(*context.sessions);
-    if (result != ErrorCode::OK) return result;
-    while (!context.cuda_buffers.empty()) {
-        auto unregistered = unregister_cuda_buffer_locked(
-            context, context.cuda_buffers.begin()->first);
-        if (!unregistered) return unregistered.error();
+    return cleanup_session_state(*context.sessions);
+}
+
+ErrorCode RealClient::unregister_dummy_cuda_buffers(ShmContext &context) {
+    ErrorCode result = ErrorCode::OK;
+    for (auto it = context.cuda_buffers.begin();
+         it != context.cuda_buffers.end();) {
+        const auto address = (it++)->first;
+        auto unregistered = unregister_cuda_buffer_locked(context, address);
+        if (!unregistered && result == ErrorCode::OK)
+            result = unregistered.error();
     }
-    return ErrorCode::OK;
+    return result;
 }
 
 ErrorCode RealClient::cleanup_session_state(SessionState &sessions) {
@@ -9746,14 +9778,20 @@ void RealClient::dummy_client_monitor_func() {
                 auto result = globalConfig().ascend_agent_mode
                                   ? ascend_unmap_shm_internal(client_id)
                                   : unmap_shm_internal(client_id);
-                if (!result && result.error() != ErrorCode::INVALID_PARAMS) {
-                    // Failed revocation retains the closing context; retry
-                    // without accepting new session operations from it.
-                    closing_clients.insert(client_id);
-                    client_ttl[client_id] = now + std::chrono::seconds(1);
-                } else {
-                    closing_clients.erase(client_id);
+                if (!result) {
+                    // TE can return INVALID_PARAMS for a failed deregistration.
+                    // A retained closing context still has retryable work.
+                    std::shared_lock<std::shared_mutex> lock(
+                        dummy_client_mutex_);
+                    auto ctx = shm_contexts_.find(client_id);
+                    if (ctx != shm_contexts_.end() &&
+                        ctx->second.sessions_closing) {
+                        closing_clients.insert(client_id);
+                        client_ttl[client_id] = now + std::chrono::seconds(1);
+                        continue;
+                    }
                 }
+                closing_clients.erase(client_id);
             }
         }
 
@@ -9801,8 +9839,10 @@ int RealClient::start_ipc_server() {
             handle_ipc_shm_register(connection);
         } else if (req_type == IPC_SHM_FD_REQUEST) {
             handle_ipc_shm_fd_request(connection);
-        } else if (req_type == IPC_CUDA_REGISTER) {
-            handle_ipc_cuda_register(connection);
+        } else if (req_type == IPC_CUDA_REGISTER ||
+                   req_type == IPC_CUDA_UNREGISTER ||
+                   req_type == IPC_CUDA_UNMAP_CLIENT) {
+            handle_ipc_cuda_request(connection, req_type);
         } else {
             LOG(ERROR) << "Unknown IPC request type: " << req_type;
         }
@@ -9824,14 +9864,28 @@ int RealClient::stop_ipc_server() {
     return 0;
 }
 
-void RealClient::handle_ipc_cuda_register(UdsConnection &connection) {
+void RealClient::handle_ipc_cuda_request(UdsConnection &connection,
+                                         IpcRequestType type) {
     CudaRegisterRequest request{};
-    const int fd = connection.recvFd(&request, sizeof(request));
-    if (fd < 0) return;
+    int fd = -1;
+    if (type == IPC_CUDA_REGISTER) {
+        fd = connection.recvFd(&request, sizeof(request));
+        if (fd < 0) return;
+    } else if (connection.recvRaw(&request, sizeof(request)) != 0) {
+        return;
+    }
     const UUID client_id{request.client_id_first, request.client_id_second};
-    auto result = register_cuda_buffer_with_fd(request.dummy_addr,
-                                               request.handle, client_id, fd);
-    ::close(fd);
+    tl::expected<void, ErrorCode> result;
+    if (type == IPC_CUDA_REGISTER) {
+        result = register_cuda_buffer_with_fd(request.dummy_addr,
+                                              request.handle, client_id, fd);
+        ::close(fd);
+    } else if (type == IPC_CUDA_UNREGISTER) {
+        result = unregister_cuda_buffer_internal(request.dummy_addr,
+                                                 request.handle, client_id);
+    } else {
+        result = unmap_shm(client_id, true);
+    }
     int status = to_py_ret(result);
     (void)connection.sendRaw(&status, sizeof(status));
 }
