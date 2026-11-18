@@ -218,6 +218,25 @@ class DummyClient : public PyClient {
                                                    const std::string &source,
                                                    const std::string &target);
 
+    tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) override;
+
+    tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) override;
+
+    tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) override;
+
+    tl::expected<void, ErrorCode> cancel_drain_job(const UUID &job_id) override;
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) override;
+
+    tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) override;
+
+    tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
+
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;

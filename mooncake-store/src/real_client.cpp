@@ -4203,7 +4203,8 @@ tl::expected<void, ErrorCode> RealClient::release_hot_cache(
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
 RealClient::acquire_buffer_dummy(const std::string &key,
                                  const UUID &client_id) {
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    // Pin mappings through I/O and publication without serializing readers.
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -4231,6 +4232,7 @@ RealClient::acquire_buffer_dummy(const std::string &key,
         uint64_t shm_end = shm_start + shm.shm_size;
         if (real_addr >= shm_start && real_addr < shm_end) {
             uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
+            std::lock_guard handles_lock(context.handles_mutex);
             context.active_handles[dummy_addr] = std::move(buffer_handle);
             return std::make_tuple(dummy_addr, buf_size);
         }
@@ -4334,7 +4336,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
 
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    // The shared pin also keeps the allocator and mapped destinations alive.
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto ctx_it = shm_contexts_.find(client_id);
     if (ctx_it == shm_contexts_.end()) {
         for (auto &r : results)
@@ -4352,20 +4355,11 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
     }
 #endif
 
-    // Use batch_get_buffer_internal with dummy's allocator
-    lock.unlock();
+    // Use batch_get_buffer_internal with dummy's allocator.
     auto handles =
         batch_get_buffer_internal(keys, ctx_it->second.client_buffer_allocator);
-    lock.lock();
-
-    // Re-validate context after re-lock
-    ctx_it = shm_contexts_.find(client_id);
-    if (ctx_it == shm_contexts_.end()) {
-        for (auto &r : results)
-            r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        return results;
-    }
     auto &ctx = ctx_it->second;
+    std::lock_guard handles_lock(ctx.handles_mutex);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         if (!handles[i]) {
@@ -9304,7 +9298,17 @@ int RealClient::start_ipc_server() {
             LOG(ERROR) << "Unknown IPC request type: " << req_type;
         }
     });
-    auto start_result = uds_acceptor_->start();
+    int backlog = UdsAcceptor::kDefaultListenBacklog;
+    if (auto value = Environ::Process().Get("MOONCAKE_UDS_LISTEN_BACKLOG")) {
+        auto parsed = TryParseEnvironmentValue<int>(*value);
+        if (parsed && *parsed > 0) {
+            backlog = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MOONCAKE_UDS_LISTEN_BACKLOG; using "
+                         << backlog;
+        }
+    }
+    auto start_result = uds_acceptor_->start(backlog);
     if (!start_result) {
         LOG(ERROR) << start_result.error();
         uds_acceptor_.reset();
@@ -9477,17 +9481,80 @@ std::vector<std::string> RealClient::batch_replica_clear(
 
 tl::expected<UUID, ErrorCode> RealClient::create_copy_task(
     const std::string &key, const std::vector<std::string> &targets) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return client_->CreateCopyTask(key, targets);
 }
 
 tl::expected<UUID, ErrorCode> RealClient::create_move_task(
     const std::string &key, const std::string &source,
     const std::string &target) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return client_->CreateMoveTask(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> RealClient::create_drain_job(
+    const CreateDrainJobRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CreateDrainJob(request);
+}
+
+tl::expected<UUID, ErrorCode> RealClient::create_timed_drain_job(
+    const CreateDrainJobRequest &request, uint64_t timeout_ms) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CreateTimedDrainJob(request, timeout_ms);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> RealClient::query_drain_job(
+    const UUID &job_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->QueryDrainJob(job_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::cancel_drain_job(const UUID &job_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CancelDrainJob(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> RealClient::list_drain_jobs(
+    const DrainJobListRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->ListDrainJobs(request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> RealClient::list_tasks(
+    const TaskListRequest &request) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->ListTasks(request);
+}
+
+tl::expected<void, ErrorCode> RealClient::cancel_task(const UUID &task_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->CancelTask(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return client_->QueryTask(task_id);
 }
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>

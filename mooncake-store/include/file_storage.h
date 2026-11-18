@@ -1,12 +1,16 @@
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "client_service.h"
+#include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
@@ -183,11 +187,42 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+
+    struct AllocatedBatch;
+    struct ColdReadInvalidation;
+
+    tl::expected<BatchGetResult, ErrorCode> BatchGetOnce(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatchShared(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool prefer_pinned, std::string flight_key);
+    static tl::expected<std::vector<uint64_t>, ErrorCode>
+    StagingPointersInOrder(const AllocatedBatch& batch,
+                           const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes);
+
+    /**
+     * @brief Hands a singleflight waiter its own batch id and pointer order for
+     * the staging buffer its leader has already filled.
+     *
+     * The new id aliases the leader's AllocatedBatch, and the caller holds a
+     * strong reference to it, so the waiter can register its id even if the
+     * leader has already released its own. Every reader releases its own id
+     * and the staging memory goes back to the pool when the last id is gone.
+     * The alias gets its own lease because the waiter starts its own read
+     * window now; without that it could outlive the leader's lease and read
+     * freed memory. Keeping the deadline in the alias's table entry also lets
+     * different shards update and collect their leases independently.
+     */
+    BatchGetResult ShareStagingBuffer(
+        const std::shared_ptr<AllocatedBatch>& staging,
+        std::vector<uint64_t> pointers);
+
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
-        std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
 
@@ -200,6 +235,11 @@ class FileStorage {
 
         ~AllocatedBatch() = default;
     };
+
+    // Shared staging stays alive independently of each remote alias lease or
+    // local reader's RAII owner. The flight itself retains no completed value.
+    using ColdReadOutcome =
+        tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode>;
 
     /**
      * @brief Offload object data and metadata.
@@ -348,9 +388,26 @@ class FileStorage {
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;
-    mutable Mutex client_buffer_mutex_;
-    std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
-        client_buffer_mutex_) client_buffer_allocated_batches_;
+    // A singleflight burst gives every waiter of one batch its own batch id at
+    // the same instant, and all of them then register and release that id
+    // here. Striping the table by id keeps the resulting convoy off a single
+    // mutex; ids are handed out sequentially, so this spreads them evenly.
+    static constexpr size_t kClientBufferShards = 16;
+    struct ClientBufferEntry {
+        std::shared_ptr<AllocatedBatch> batch;
+        std::chrono::steady_clock::time_point lease_timeout;
+    };
+    struct ClientBufferShard {
+        Mutex mutex;
+        std::unordered_map<uint64_t, ClientBufferEntry> GUARDED_BY(
+            mutex) batches;
+    };
+    std::array<ClientBufferShard, kClientBufferShards> client_buffer_shards_;
+
+    ClientBufferShard& ShardFor(uint64_t batch_id) {
+        return client_buffer_shards_[batch_id % kClientBufferShards];
+    }
+
     std::atomic<uint64_t> next_batch_id_{1};
 
     /**
@@ -418,6 +475,15 @@ class FileStorage {
     // in which case the master's TTL reaper reclaims the orphaned tasks.
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
+
+    // Singleflight for cold reads. The first reader of an exact batch becomes
+    // the leader and does the SSD I/O; readers that request the same key/size
+    // pairs, in any order, share the staging owner. Remote readers take an
+    // independent alias lease; local readers retain a request-scoped owner.
+    // Waiting on a future wakes only that batch's waiters, and if the leader
+    // unwinds, the destroyed promise reports a broken promise instead of
+    // parking the waiters forever.
+    ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

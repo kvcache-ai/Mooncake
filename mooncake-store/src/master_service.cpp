@@ -501,14 +501,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
-      client_sessions_(
-          std::chrono::seconds(config.client_active_ttl_sec),
-          std::chrono::seconds(config.client_suspicion_ttl_sec),
-          [this] { return AdmitsBusinessWorkers(); },
-          [this] { client_offboarding_worker_.ReserveJob(); },
-          [this](const UUID& client_id, ClientSessionSharedPtr session) {
-              OnClientRetired(client_id, std::move(session));
-          }),
+      client_offboarding_worker_([this](ClientOffboardingJob& job) {
+          return ProcessClientOffboardingJob(job);
+      }),
+      client_sessions_(std::chrono::seconds(config.client_active_ttl_sec),
+                       std::chrono::seconds(config.client_suspicion_ttl_sec),
+                       [this] { return AdmitsBusinessWorkers(); }),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -546,6 +544,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),
       task_manager_(config.task_manager_config),
+      drain_job_deadline_scheduler_([this](const std::weak_ptr<DrainJob>& job) {
+          HandleDrainJobTimeout(job);
+      }),
       batch_oplog_writer_factory_(
           [](OrderedOpLogWriterConfig writer_config,
              OrderedOpLogWriter::WriteBatchFn write_batch) {
@@ -593,6 +594,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
                    << config.tenant_eviction_high_watermark_ratio;
         throw std::invalid_argument(
             "Invalid tenant eviction high watermark ratio");
+    }
+    if (config.eviction_worker_threads > MAX_EVICTION_WORKER_THREADS) {
+        LOG(ERROR) << "Eviction worker threads must be between 0 and "
+                   << MAX_EVICTION_WORKER_THREADS
+                   << ", current value: " << config.eviction_worker_threads;
+        throw std::invalid_argument("Invalid eviction worker threads");
     }
     // Multi-tenancy is the namespace policy every namespace is created under,
     // so it is in place before the first one is.
@@ -759,22 +766,21 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    // This worker is part of the Client lifecycle protocol. Start it before
-    // any raw std::thread so a startup failure can unwind the constructor
-    // normally instead of encountering joinable thread destructors.
+    CHECK(client_sessions_.AddListener([this](const ClientSessionEvent& event) {
+        OnClientSessionChanged(event);
+    }));
+    // Start these owned lifecycles before any raw std::thread so a startup
+    // failure can unwind the constructor normally instead of encountering
+    // joinable thread destructors. Cleanup must be able to accept work before
+    // expiry can retire a session.
     client_offboarding_worker_.Start();
-    VLOG(1) << "action=start_client_offboarding_worker";
+    client_sessions_.Start();
+    VLOG(1) << "action=start_client_session_plane";
     if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
-
-    // Start client monitor thread in all modes so TTL/heartbeat works
-    client_monitor_running_ = true;
-    client_monitor_thread_ =
-        std::thread(&MasterService::ClientMonitorFunc, this);
-    VLOG(1) << "action=start_client_monitor_thread";
 
 #ifdef USE_NOF
     nof_heartbeat_running_ = true;
@@ -962,7 +968,10 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
-    client_monitor_running_ = false;
+    // Stop publishing transitions and deliver what is already queued, while
+    // the offboarding worker can still accept the resulting jobs and the
+    // members the listener touches are still alive.
+    client_sessions_.Stop();
 
     task_cleanup_running_ = false;
     {
@@ -978,6 +987,7 @@ MasterService::~MasterService() {
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
+    drain_job_deadline_scheduler_.Stop();
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
     kvcs_capacity_refresh_worker_.Stop();
@@ -992,9 +1002,6 @@ MasterService::~MasterService() {
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
-    }
-    if (client_monitor_thread_.joinable()) {
-        client_monitor_thread_.join();
     }
 #ifdef USE_NOF
     if (nof_heartbeat_thread_.joinable()) {
@@ -2425,6 +2432,27 @@ void MasterService::CleanupExpiredSoftPins(
     }
 }
 
+void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
+    if (event.current != ClientLivenessState::OFFLINE) {
+        return;
+    }
+    const auto& client_id = event.client_id;
+    // The registry has already dropped its own state for this incarnation.
+    // Cancel graceful-unmount deadlines before terminal cleanup prepares the
+    // same segments. Everything that needs the snapshot or segment locks is
+    // the job's, so a long remount cannot stall event delivery.
+    graceful_unmount_scheduler_.RemoveIf(
+        [&client_id](const GracefulUnmountDeadlineRecord& pending) {
+            return pending.client_id == client_id;
+        });
+    // Only the job's completion removes the OFFLINE session and lifts the
+    // snapshot barrier.
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.retired_session = event.session;
+    client_offboarding_worker_.Schedule(std::move(job));
+}
+
 void MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     ClearInvalidHandlesLocked();
@@ -2520,51 +2548,58 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 }
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+    std::unordered_set<UUID, boost::hash<UUID>> prepared_segment_ids;
+    prepared_segment_ids.reserve(job.prepared_segments.size());
+    for (const auto& prepared : job.prepared_segments) {
+        prepared_segment_ids.insert(prepared.segment_id);
+    }
     bool quota_recompute_needed = false;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
-        if (!job.pending_prepare_segments.empty()) {
+        {
+            // Prepare whatever the client still owns and this job has not
+            // prepared yet. The segments are enumerated again on every attempt
+            // instead of being carried in the job.
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
-            for (auto it = job.pending_prepare_segments.begin();
-                 it != job.pending_prepare_segments.end();) {
-                SegmentStatus status = SegmentStatus::UNDEFINED;
-                const auto status_err =
-                    segment_access.GetSegmentStatusById(it->segment_id, status);
-                if (status_err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
+            std::vector<Segment> segments;
+            if (segment_access.GetClientSegments(job.client_id, segments) !=
+                ErrorCode::OK) {
+                segments.clear();
+            }
+            bool unprepared_segment = false;
+            for (const auto& segment : segments) {
+                if (prepared_segment_ids.contains(segment.id)) {
                     continue;
                 }
-                if (status_err == ErrorCode::OK &&
-                    status == SegmentStatus::UNMOUNTING) {
-                    ++it;
-                    continue;
-                }
-
                 size_t metrics_dec_capacity = 0;
                 const auto err = segment_access.PrepareUnmountSegment(
-                    it->segment_id, metrics_dec_capacity);
+                    segment.id, metrics_dec_capacity);
                 if (err == ErrorCode::OK) {
                     job.prepared_segments.push_back(
-                        {.segment_id = it->segment_id,
-                         .segment_name = it->segment_name,
-                         .transport_endpoint = it->transport_endpoint,
+                        {.segment_id = segment.id,
+                         .segment_name = segment.name,
+                         .transport_endpoint = segment.te_endpoint,
                          .metrics_dec_capacity = metrics_dec_capacity});
-                    it = job.pending_prepare_segments.erase(it);
+                    prepared_segment_ids.insert(segment.id);
                     continue;
                 }
                 if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", segment_name=" << it->segment_name
-                           << ", action=prepare_client_offboarding"
-                           << ", error=" << toString(err);
-                ++it;
+                // An existing unmount owns the preparation; retry later
+                // without taking over its capacity accounting or logging
+                // errors.
+                if (err != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                    LOG(ERROR) << "client_id=" << job.client_id
+                               << ", segment_name=" << segment.name
+                               << ", action=prepare_client_offboarding"
+                               << ", error=" << toString(err);
+                }
+                unprepared_segment = true;
             }
-            if (!job.pending_prepare_segments.empty()) {
+            if (unprepared_segment) {
                 return false;
             }
         }
@@ -2580,7 +2615,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                                job.client_id;
                     }
                     return replica.is_memory_replica() &&
-                           replica.isAffiliatedWith(job.liveness);
+                           replica.isAffiliatedWith(job.retired_session);
                 });
             if (!cleanup_result) {
                 LOG(ERROR) << "client_id=" << job.client_id
@@ -2598,7 +2633,8 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     if (object.metadata().HasReplica(
                             [&job](const Replica& replica) {
                                 return replica.is_processing() &&
-                                       replica.isAffiliatedWith(job.liveness);
+                                       replica.isAffiliatedWith(
+                                           job.retired_session);
                             })) {
                         unfinished_affiliated_replica = true;
                         break;
@@ -2678,7 +2714,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         return false;
     }
 
-    (void)client_sessions_.Remove(job.client_id, job.liveness);
+    client_sessions_.Remove(job.client_id, job.retired_session);
     return true;
 }
 
@@ -3527,9 +3563,7 @@ tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
     MutexLocker lock(&job_mutex_);
     for (const auto& [_, job] : drain_jobs_) {
         std::lock_guard<std::mutex> job_lock(job->mutex);
-        if (job->status == JobStatus::SUCCEEDED ||
-            job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED) {
+        if (IsDrainJobTerminal(job->status)) {
             continue;
         }
         const auto& sources = job->request.segments;
@@ -10039,75 +10073,6 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             << ", total_freed_size=" << total_freed_size;
 }
 
-void MasterService::ClientMonitorFunc() {
-    while (client_monitor_running_) {
-        client_sessions_.ExpireSessions(ClientLivenessRecord::Clock::now());
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
-    }
-}
-
-void MasterService::OnClientRetired(const UUID& client_id,
-                                    ClientSessionSharedPtr session) {
-    graceful_unmount_scheduler_.RemoveIf(
-        [&client_id](const GracefulUnmountDeadlineRecord& pending) {
-            return pending.client_id == client_id;
-        });
-
-    ClientOffboardingJob job;
-    job.client_id = client_id;
-    job.liveness = std::move(session);
-    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        std::vector<Segment> segments;
-        const auto get_result =
-            segment_access.GetClientSegments(client_id, segments);
-        if (get_result == ErrorCode::OK) {
-            for (const auto& segment : segments) {
-                SegmentStatus status = SegmentStatus::UNDEFINED;
-                const auto status_result =
-                    segment_access.GetSegmentStatusById(segment.id, status);
-                if (status_result == ErrorCode::SEGMENT_NOT_FOUND) {
-                    continue;
-                }
-                if (status_result == ErrorCode::OK &&
-                    status == SegmentStatus::UNMOUNTING) {
-                    job.pending_prepare_segments.push_back(
-                        {.segment_id = segment.id,
-                         .segment_name = segment.name,
-                         .transport_endpoint = segment.te_endpoint});
-                    continue;
-                }
-
-                size_t metrics_dec_capacity = 0;
-                const auto prepare_result =
-                    segment_access.PrepareUnmountSegment(segment.id,
-                                                         metrics_dec_capacity);
-                if (prepare_result == ErrorCode::OK) {
-                    job.prepared_segments.push_back(
-                        {.segment_id = segment.id,
-                         .segment_name = segment.name,
-                         .transport_endpoint = segment.te_endpoint,
-                         .metrics_dec_capacity = metrics_dec_capacity});
-                } else if (prepare_result != ErrorCode::SEGMENT_NOT_FOUND) {
-                    job.pending_prepare_segments.push_back(
-                        {.segment_id = segment.id,
-                         .segment_name = segment.name,
-                         .transport_endpoint = segment.te_endpoint});
-                    LOG(ERROR) << "client_id=" << client_id
-                               << ", segment_name=" << segment.name
-                               << ", action=prepare_client_offboarding"
-                               << ", error=" << toString(prepare_result);
-                }
-            }
-        }
-    }
-
-    client_offboarding_worker_.ScheduleReserved(std::move(job));
-}
-
 bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
                                     std::string* error_reason) {
 #ifndef USE_NOF
@@ -10496,6 +10461,13 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const TenantId& tenant_id,
     const std::string& source, const std::string& target) {
+    return CreateMoveTaskInternal(key, tenant_id, source, target, false);
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
+    const std::string& key, const TenantId& tenant_id,
+    const std::string& source, const std::string& target,
+    bool retained_by_drain) {
     auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
@@ -10611,10 +10583,12 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_MOVE>(
-            select_client, {.tenant_id = object_id.tenant_id.value(),
-                            .key = object_id.user_key,
-                            .source = source,
-                            .target = target});
+            select_client,
+            {.tenant_id = object_id.tenant_id.value(),
+             .key = object_id.user_key,
+             .source = source,
+             .target = target},
+            retained_by_drain);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
@@ -10626,6 +10600,38 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
         return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
     }
     return QueryTaskResponse(task_option.value());
+}
+
+tl::expected<ListTasksResponse, ErrorCode> MasterService::ListTasks(
+    const TaskListRequest& request) {
+    auto page = task_manager_.get_read_access().list_tasks(request);
+    if (!page) {
+        return tl::make_unexpected(page.error());
+    }
+    ListTasksResponse response;
+    response.tasks.reserve(page->tasks.size());
+    for (const auto& task : page->tasks) {
+        response.tasks.emplace_back(task);
+    }
+    response.next_page_token = std::move(page->next_page_token);
+    return response;
+}
+
+tl::expected<void, ErrorCode> MasterService::CancelTask(
+    const UUID& task_id, const TenantId& tenant_id) {
+    std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+    auto result =
+        task_manager_.get_write_access().cancel_task(task_id, tenant_id);
+    if (result != ErrorCode::OK) {
+        return tl::make_unexpected(result);
+    }
+    return {};
+}
+
+tl::expected<bool, ErrorCode> MasterService::IsTaskCancellationRequested(
+    const UUID& client_id, const UUID& task_id) {
+    return task_manager_.get_read_access().is_cancellation_requested(client_id,
+                                                                     task_id);
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
@@ -10663,6 +10669,16 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     return {};
 }
 
+bool MasterService::IsDrainJobTerminal(JobStatus status) {
+    return status == JobStatus::SUCCEEDED || status == JobStatus::FAILED ||
+           status == JobStatus::CANCELED || status == JobStatus::TIMED_OUT;
+}
+
+bool MasterService::DrainJobStopRequested(const DrainJob& job) {
+    return job.stop_reason.load(std::memory_order_relaxed) !=
+           DrainStopReason::NONE;
+}
+
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
     ScopedSegmentAccess& segment_access, const CreateDrainJobRequest& request) {
     if (request.segments.empty() || request.max_concurrency == 0) {
@@ -10676,6 +10692,9 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
     }
 
     for (const auto& segment_name : request.segments) {
+        if (segment_name.empty()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (!segment_access.ExistsSegmentName(segment_name)) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
@@ -10684,14 +10703,16 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
-        if (status != SegmentStatus::OK) {
+        if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING &&
+            status != SegmentStatus::DRAINED) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
     }
 
     for (const auto& target_segment : request.target_segments) {
-        if (unique_segments.contains(target_segment)) {
+        if (target_segment.empty() ||
+            unique_segments.contains(target_segment)) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (!segment_access.ExistsSegmentName(target_segment)) {
@@ -10707,9 +10728,54 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    return CreateTimedDrainJob(request, 0);
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    if (request.segments.empty() || request.max_concurrency == 0 ||
+        std::unordered_set<std::string>(request.segments.begin(),
+                                        request.segments.end())
+                .size() != request.segments.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Held until the job is registered so SetSegmentStatus never sees a
     // segment this job has marked DRAINING without also seeing the job.
     MutexLocker lock(&job_mutex_);
+
+    // A DRAINING segment may be retried after a timeout, but never while an
+    // earlier job still owns it (including while cancellation is in flight).
+    for (const auto& [_, existing] : drain_jobs_) {
+        const auto& sources = existing->request.segments;
+        const bool overlaps =
+            std::any_of(request.segments.begin(), request.segments.end(),
+                        [&](const std::string& segment) {
+                            return std::find(sources.begin(), sources.end(),
+                                             segment) != sources.end();
+                        });
+        if (!overlaps) {
+            continue;
+        }
+        std::lock_guard<std::mutex> job_lock(existing->mutex);
+        if (!IsDrainJobTerminal(existing->status)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto max_timeout =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now)
+            .count();
+    if (timeout_ms > static_cast<uint64_t>(max_timeout)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    if (timeout_ms != 0) {
+        deadline =
+            now + std::chrono::milliseconds(static_cast<int64_t>(timeout_ms));
+    }
     std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
@@ -10721,7 +10787,21 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
 
         draining_segments.reserve(request.segments.size());
         for (const auto& segment_name : request.segments) {
-            auto err = segment_access.SetSegmentStatusByName(
+            SegmentStatus previous = SegmentStatus::UNDEFINED;
+            auto err =
+                segment_access.GetSegmentStatusByName(segment_name, previous);
+            if (err != ErrorCode::OK) {
+                for (const auto& updated_segment : draining_segments) {
+                    (void)segment_access.SetSegmentStatusByName(
+                        updated_segment, SegmentStatus::OK);
+                }
+                return tl::make_unexpected(err);
+            }
+            // Preserve a pre-existing DRAINING or DRAINED status on retry.
+            if (previous != SegmentStatus::OK) {
+                continue;
+            }
+            err = segment_access.SetSegmentStatusByName(
                 segment_name, SegmentStatus::DRAINING);
             if (err != ErrorCode::OK) {
                 for (const auto& updated_segment : draining_segments) {
@@ -10735,13 +10815,19 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     }
 
     auto job = std::make_shared<DrainJob>();
-    job->id = generate_uuid();
+    do {
+        job->id = generate_uuid();
+    } while (drain_jobs_.contains(job->id));
     job->request = request;
+    job->deadline = deadline;
     job->created_at = std::chrono::system_clock::now();
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
     job->message = "Drain job created";
     drain_jobs_.emplace(job->id, job);
+    if (deadline) {
+        drain_job_deadline_scheduler_.Schedule(job, *deadline);
+    }
     return job->id;
 }
 
@@ -10758,25 +10844,72 @@ tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
     }
 
     std::lock_guard<std::mutex> job_lock(job->mutex);
+    return job->ToResponse();
+}
+
+QueryJobResponse MasterService::DrainJob::ToResponse() const {
     QueryJobResponse response;
-    response.id = job->id;
-    response.type = job->type;
-    response.status = job->status;
+    response.id = id;
+    response.type = type;
+    response.status = status;
     response.created_at_ms_epoch = static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->created_at.time_since_epoch())
+            created_at.time_since_epoch())
             .count());
     response.last_updated_at_ms_epoch = static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->last_updated_at.time_since_epoch())
+            last_updated_at.time_since_epoch())
             .count());
-    response.segments = job->request.segments;
-    response.succeeded_units = job->succeeded_units;
-    response.failed_units = job->failed_units;
-    response.blocked_units = job->blocked_units;
-    response.active_units = static_cast<uint64_t>(job->active_tasks.size());
-    response.migrated_bytes = job->migrated_bytes;
-    response.message = job->message;
+    response.segments = request.segments;
+    response.succeeded_units = succeeded_units;
+    response.failed_units = failed_units;
+    response.blocked_units = blocked_units;
+    response.active_units = static_cast<uint64_t>(active_tasks.size());
+    response.migrated_bytes = migrated_bytes;
+    response.message = message;
+    return response;
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> MasterService::ListDrainJobs(
+    const DrainJobListRequest& request) {
+    constexpr std::string_view prefix = "drain-v1:";
+    UUID after{};
+    if (request.limit == 0 || request.limit > 1000 ||
+        (request.status && (*request.status < JobStatus::CREATED ||
+                            *request.status > JobStatus::TIMED_OUT)) ||
+        (request.segment && request.segment->empty())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!request.page_token.empty()) {
+        const auto token = std::string_view(request.page_token);
+        if (!token.starts_with(prefix) ||
+            !StringToUuid(std::string(token.substr(prefix.size())), after) ||
+            token.substr(prefix.size()) != UuidToString(after)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    ListDrainJobsResponse response;
+    MutexLocker lock(&job_mutex_);
+    auto it = request.page_token.empty() ? drain_jobs_.begin()
+                                         : drain_jobs_.upper_bound(after);
+    for (; it != drain_jobs_.end(); ++it) {
+        const auto& job = *it->second;
+        std::lock_guard<std::mutex> job_lock(job.mutex);
+        const auto& segments = job.request.segments;
+        if ((request.status && job.status != *request.status) ||
+            (request.segment &&
+             std::find(segments.begin(), segments.end(), *request.segment) ==
+                 segments.end())) {
+            continue;
+        }
+        if (response.jobs.size() == request.limit) {
+            response.next_page_token =
+                std::string(prefix) + UuidToString(response.jobs.back().id);
+            break;
+        }
+        response.jobs.push_back(job.ToResponse());
+    }
     return response;
 }
 
@@ -10792,24 +10925,111 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
         job = it->second;
     }
 
-    std::vector<std::string> segments_to_restore;
-    {
-        std::lock_guard<std::mutex> job_lock(job->mutex);
-        if (job->status == JobStatus::SUCCEEDED ||
-            job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-
-        job->status = JobStatus::CANCELED;
-        job->last_updated_at = std::chrono::system_clock::now();
-        job->message = "Drain job canceled";
-        segments_to_restore = job->request.segments;
+    // The first stop request wins. If the deadline has already passed, retain
+    // the timeout reason even if its scheduler callback has not run yet.
+    auto expected = DrainStopReason::NONE;
+    if (job->deadline && std::chrono::steady_clock::now() >= *job->deadline) {
+        job->stop_reason.compare_exchange_strong(
+            expected, DrainStopReason::TIMEOUT, std::memory_order_relaxed);
+    }
+    expected = DrainStopReason::NONE;
+    job->stop_reason.compare_exchange_strong(expected, DrainStopReason::USER,
+                                             std::memory_order_relaxed);
+    std::lock_guard<std::mutex> job_lock(job->mutex);
+    if (job->status == JobStatus::SUCCEEDED ||
+        job->status == JobStatus::FAILED ||
+        job->status == JobStatus::TIMED_OUT) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (job->status == JobStatus::CANCELED) {
+        return {};
     }
 
+    ProcessDrainJobStop(*job);
+    return {};
+}
+
+void MasterService::ProcessDrainJobStop(DrainJob& job) {
+    if (IsDrainJobTerminal(job.status) || !DrainJobStopRequested(job)) {
+        return;
+    }
+    if (job.status != JobStatus::CANCELING) {
+        job.status = JobStatus::CANCELING;
+        job.last_updated_at = std::chrono::system_clock::now();
+        job.message = job.stop_reason.load(std::memory_order_relaxed) ==
+                              DrainStopReason::TIMEOUT
+                          ? "Drain job deadline exceeded; canceling tasks"
+                          : "Drain job cancellation requested";
+    }
+    RequestDrainTaskCancellation(job);
+    RefreshDrainJobTasks(job);
+    (void)FinishDrainJobCancellation(job);
+}
+
+void MasterService::HandleDrainJobTimeout(
+    const std::weak_ptr<DrainJob>& weak_job) {
+    auto job = weak_job.lock();
+    if (!job || !job_dispatch_running_.load()) {
+        return;
+    }
+    auto expected = DrainStopReason::NONE;
+    job->stop_reason.compare_exchange_strong(expected, DrainStopReason::TIMEOUT,
+                                             std::memory_order_relaxed);
+    if (job->stop_reason.load(std::memory_order_relaxed) !=
+        DrainStopReason::TIMEOUT) {
+        return;
+    }
+
+    // Never block the deadline scheduler on a long planning walk. The stop
+    // flag makes that walk exit; retry until the job can be processed.
+    bool retry = true;
+    if (AdmitsBusinessWorkers()) {
+        std::unique_lock<std::mutex> lock(job->mutex, std::try_to_lock);
+        if (lock) {
+            ProcessDrainJobStop(*job);
+            retry = !IsDrainJobTerminal(job->status);
+        }
+    }
+    if (retry && job_dispatch_running_.load()) {
+        drain_job_deadline_scheduler_.Schedule(
+            weak_job, std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+    }
+}
+
+void MasterService::RequestDrainTaskCancellation(DrainJob& job) {
+    auto write_access = task_manager_.get_write_access();
+    for (const auto& [task_id, active_task] : job.active_tasks) {
+        const auto result =
+            write_access.cancel_task(task_id, active_task.tenant_id);
+        // A task may finish between scheduling and cancellation. Its result
+        // is accounted for by RefreshDrainJobTasks.
+        if (result != ErrorCode::OK &&
+            result != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            LOG(ERROR) << "Failed to cancel drain task " << task_id << ": "
+                       << result;
+        }
+    }
+}
+
+bool MasterService::FinishDrainJobCancellation(DrainJob& job) {
+    if (!job.active_tasks.empty()) {
+        return false;
+    }
+
+    if (job.stop_reason.load(std::memory_order_relaxed) ==
+        DrainStopReason::TIMEOUT) {
+        // Keep unfinished sources DRAINING so a new job can safely resume.
+        // Sources already DRAINED remain DRAINED.
+        job.status = JobStatus::TIMED_OUT;
+        job.last_updated_at = std::chrono::system_clock::now();
+        job.message = "Drain job timed out";
+        return true;
+    }
+
+    // The job lock keeps queries and scheduling behind segment restoration.
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    for (const auto& segment_name : segments_to_restore) {
+    for (const auto& segment_name : job.request.segments) {
         SegmentStatus status = SegmentStatus::UNDEFINED;
         if (segment_access.GetSegmentStatusByName(segment_name, status) ==
                 ErrorCode::OK &&
@@ -10818,7 +11038,10 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
                                                         SegmentStatus::OK);
         }
     }
-    return {};
+    job.status = JobStatus::CANCELED;
+    job.last_updated_at = std::chrono::system_clock::now();
+    job.message = "Drain job canceled";
+    return true;
 }
 
 std::string MasterService::MakeDrainUnitKey(
@@ -10871,20 +11094,39 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
 }
 
 void MasterService::RefreshDrainJobTasks(DrainJob& job) {
-    auto read_access = task_manager_.get_read_access();
+    std::unordered_map<UUID, std::optional<Task>, boost::hash<UUID>> tasks;
+    {
+        auto read_access = task_manager_.get_read_access();
+        for (const auto& [task_id, _] : job.active_tasks) {
+            tasks.emplace(task_id, read_access.find_task_by_id(task_id));
+        }
+    }
     std::vector<UUID> finished_task_ids;
     finished_task_ids.reserve(job.active_tasks.size());
 
     for (const auto& [task_id, active_task] : job.active_tasks) {
-        auto task_opt = read_access.find_task_by_id(task_id);
+        const auto& task_opt = tasks.at(task_id);
         if (!task_opt.has_value()) {
-            finished_task_ids.push_back(task_id);
-            job.failed_units++;
-            job.terminal_failed_unit_keys.insert(active_task.unit_key);
+            // Drain tasks are retained until observed. Do not infer that a
+            // missing task's worker has stopped.
+            LOG(ERROR) << "Drain task disappeared: " << task_id;
             continue;
         }
         if (!task_opt->is_finished()) {
             continue;
+        }
+
+        if (task_opt->status != TaskStatus::SUCCESS) {
+            // A failed revoke can leave an allocation and a replication task
+            // behind. The worker has stopped, but wait for its cleanup before
+            // retrying the unit or restoring the source segment.
+            std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+            MetadataAccessorRO accessor(
+                this, ObjectIdentity{active_task.tenant_id, active_task.key});
+            if (accessor.IsPublished() &&
+                accessor.GetState().replication_task) {
+                continue;
+            }
         }
 
         finished_task_ids.push_back(task_id);
@@ -10892,7 +11134,9 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             job.succeeded_units++;
             job.migrated_bytes += active_task.bytes;
             job.completed_unit_keys.insert(active_task.unit_key);
-        } else {
+        } else if (task_opt->status == TaskStatus::FAILED ||
+                   (task_opt->status == TaskStatus::CANCELED &&
+                    !DrainJobStopRequested(job))) {
             job.failed_units++;
             auto& retry_count = job.retry_counts[active_task.unit_key];
             retry_count++;
@@ -10902,12 +11146,19 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
         }
     }
 
-    for (const auto& task_id : finished_task_ids) {
-        job.active_tasks.erase(task_id);
+    if (!finished_task_ids.empty()) {
+        auto write_access = task_manager_.get_write_access();
+        for (const auto& task_id : finished_task_ids) {
+            write_access.release_drain_task(task_id);
+            job.active_tasks.erase(task_id);
+        }
     }
 }
 
 void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
+    if (DrainJobStopRequested(job)) {
+        return;
+    }
     if (job.status == JobStatus::CREATED) {
         job.status = JobStatus::PLANNING;
     }
@@ -10948,6 +11199,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             // then.
             std::vector<std::string> keys_on_source;
             for (auto object : ns.objects.ReadCursor()) {
+                if (DrainJobStopRequested(job)) {
+                    return;
+                }
                 const auto replica_segments =
                     object.metadata().GetReplicaSegmentNames();
                 if (std::any_of(job.request.segments.begin(),
@@ -10962,6 +11216,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                 }
             }
             for (const std::string& key : keys_on_source) {
+                if (DrainJobStopRequested(job)) {
+                    return;
+                }
                 MetadataAccessorRO accessor(this,
                                             ObjectIdentity{tenant_id, key});
                 if (!accessor.IsPublished()) {
@@ -10969,6 +11226,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                 }
                 const auto& metadata = accessor.Get();
                 for (const auto& source_segment : job.request.segments) {
+                    if (DrainJobStopRequested(job)) {
+                        return;
+                    }
                     const auto unit_key =
                         MakeDrainUnitKey(tenant_id, key, source_segment);
                     if (job.completed_unit_keys.contains(unit_key) ||
@@ -11038,11 +11298,18 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         });
     }
 
+    if (DrainJobStopRequested(job)) {
+        return;
+    }
     job.blocked_units = blocked_unit_keys.size();
 
     for (const auto& plan : plans) {
-        auto task_id = CreateMoveTask(plan.key, plan.tenant_id,
-                                      plan.source_segment, plan.target_segment);
+        if (DrainJobStopRequested(job)) {
+            return;
+        }
+        auto task_id = CreateMoveTaskInternal(plan.key, plan.tenant_id,
+                                              plan.source_segment,
+                                              plan.target_segment, true);
         if (task_id.has_value()) {
             ActiveDrainTask active_task;
             active_task.task_id = task_id.value();
@@ -11074,7 +11341,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 }
 
 bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
-    if (!job.active_tasks.empty()) {
+    if (!job.active_tasks.empty() || DrainJobStopRequested(job)) {
         return false;
     }
 
@@ -11085,6 +11352,9 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         VisitNamespaces([&](const TenantId& tenant_id,
                             metadata::Namespace& ns) {
             for (auto object : ns.objects.ReadCursor()) {
+                if (DrainJobStopRequested(job)) {
+                    return;
+                }
                 const auto replica_segments =
                     object.metadata().GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
@@ -11100,6 +11370,9 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         });
     }
 
+    if (DrainJobStopRequested(job)) {
+        return false;
+    }
     bool awaiting_reclamation = false;
     {
         ScopedSegmentAccess segment_access =
@@ -11176,9 +11449,7 @@ void MasterService::ProcessDrainJobs() {
             continue;
         }
         std::lock_guard<std::mutex> job_lock(job->mutex);
-        if (job->status == JobStatus::SUCCEEDED ||
-            job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED) {
+        if (IsDrainJobTerminal(job->status)) {
             continue;
         }
         if (!swept_discarded_replicas) {
@@ -11186,6 +11457,10 @@ void MasterService::ProcessDrainJobs() {
                 master_state_mutex_);
             ReleaseExpiredDiscardedReplicas(std::chrono::system_clock::now());
             swept_discarded_replicas = true;
+        }
+        if (DrainJobStopRequested(*job)) {
+            ProcessDrainJobStop(*job);
+            continue;
         }
         RefreshDrainJobTasks(*job);
         if (MaybeCompleteDrainJob(*job)) {

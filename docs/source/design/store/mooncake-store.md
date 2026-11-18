@@ -455,6 +455,24 @@ overrides are rejected for `PRESERVE` and `DISABLE`.
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Updating soft pins through the master RPC
+
+`MasterClient::BatchUpdateSoftPin(keys, ttl_ms)` changes the soft-pin deadline
+of existing objects in the client's tenant without reading or rewriting their
+payloads. A positive TTL sets the deadline relative to the call; `ttl_ms = 0`
+unpins the objects. The TTL must not exceed `max_kv_soft_pin_ttl`.
+
+```cpp
+auto pinned = master_client.BatchUpdateSoftPin(keys, 60000);
+auto unpinned = master_client.BatchUpdateSoftPin(keys, 0);
+```
+
+Results follow input key order, and batches are not atomic. Missing objects,
+empty keys, and objects with unfinished writes return per-key errors. This RPC
+uses the existing runtime-only soft-pin behavior: it changes eviction priority,
+does not create session membership, and does not prevent explicit removal.
+Both the client and master must support `BatchUpdateSoftPin`.
+
 ## Hard Pin
 
 For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.

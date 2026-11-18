@@ -10,6 +10,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,7 @@
 #include "background_worker.h"
 #include "client_liveness.h"
 #include "client_offboarding.h"
+#include "client_session_event.h"
 #include "client_session_registry.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
@@ -895,15 +897,24 @@ class MasterService {
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
+    /** Start a drain with a relative timeout in milliseconds; zero disables it.
+     */
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
     /**
      * @brief Query the status of a drain job.
      */
     tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
 
     /**
-     * @brief Cancel an in-flight drain job and restore draining segments to OK.
+     * @brief Request cancellation; in-flight moves settle before segments are
+     * restored and the job becomes CANCELED.
      */
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
 
     /**
      * @brief Query current segment lifecycle state by segment name.
@@ -1021,6 +1032,14 @@ class MasterService {
      * @return Task basic info
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<void, ErrorCode> CancelTask(const UUID& task_id,
+                                             const TenantId& tenant_id);
+    tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& client_id, const UUID& task_id);
+
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
 
     /**
      * @brief fetch tasks assigned to a client
@@ -1174,6 +1193,7 @@ class MasterService {
     // handles stale table-wide.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+    void OnClientSessionChanged(const ClientSessionEvent& event);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1888,13 +1908,11 @@ class MasterService {
 
     ViewVersionId view_version_;
 
+    // Client session plane, declared in dependency order so the registry is
+    // destroyed before the offboarding worker its listener feeds. Resource
+    // coordination is a session listener, not a session responsibility.
+    ClientOffboardingWorker client_offboarding_worker_;
     ClientSessionRegistry client_sessions_;
-    ClientOffboardingWorker client_offboarding_worker_{this};
-    void ClientMonitorFunc();
-    void OnClientRetired(const UUID& client_id, ClientSessionSharedPtr session);
-    std::thread client_monitor_thread_;
-    std::atomic<bool> client_monitor_running_{false};
-    static constexpr uint64_t kClientMonitorSleepMs = 1000;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
@@ -2128,12 +2146,21 @@ class MasterService {
         std::string unit_key;
     };
 
+    enum class DrainStopReason { NONE, USER, TIMEOUT };
+
     struct DrainJob {
+        // Caller holds mutex.
+        QueryJobResponse ToResponse() const;
+
         mutable std::mutex mutex;
+        // Set without mutex so a long planning walk can observe a stop while
+        // the caller or deadline scheduler is waiting for the job lock.
+        std::atomic<DrainStopReason> stop_reason{DrainStopReason::NONE};
         UUID id;
         JobType type{JobType::DRAIN};
         JobStatus status{JobStatus::CREATED};
         CreateDrainJobRequest request;
+        std::optional<std::chrono::steady_clock::time_point> deadline;
         std::chrono::system_clock::time_point created_at;
         std::chrono::system_clock::time_point last_updated_at;
         std::string message;
@@ -2150,11 +2177,21 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
+    static bool IsDrainJobTerminal(JobStatus status);
+    static bool DrainJobStopRequested(const DrainJob& job);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
+    tl::expected<UUID, ErrorCode> CreateMoveTaskInternal(
+        const std::string& key, const TenantId& tenant_id,
+        const std::string& source, const std::string& target,
+        bool retained_by_drain);
     void ProcessDrainJobs();
+    void ProcessDrainJobStop(DrainJob& job);
+    void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);
     void RefreshDrainJobTasks(DrainJob& job);
+    void RequestDrainTaskCancellation(DrainJob& job);
+    bool FinishDrainJobCancellation(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
     std::optional<std::string> SelectDrainTargetForKey(
@@ -2166,10 +2203,11 @@ class MasterService {
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
+    DeadlineScheduler<std::weak_ptr<DrainJob>> drain_job_deadline_scheduler_;
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
     Mutex job_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
-        drain_jobs_ GUARDED_BY(job_mutex_);
+    std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_
+        GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
