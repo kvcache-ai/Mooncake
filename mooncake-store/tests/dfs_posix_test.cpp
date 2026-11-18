@@ -70,6 +70,7 @@ class EnvGuard {
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
         Save("MOONCAKE_DFS_ALIGNMENT");
         Save("MOONCAKE_DFS_SINGLE_TENANT");
+        Save("MOONCAKE_DFS_READ_THREADS");
     }
 
     ~EnvGuard() {
@@ -1865,6 +1866,12 @@ TEST_F(DfsBackendTest, BatchReadUsesExplicitDescriptorsAndMultipleSlices) {
 }
 
 TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
+    // Failures are injected by file offset, so the failing indexes stay fixed
+    // when the reads run concurrently. Use the pool to cover I/O errors and
+    // reopen-on-failure on the parallel path.
+    EnvGuard env;
+    env.Set("MOONCAKE_DFS_READ_THREADS", "8");
+
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp_->path();
@@ -2426,6 +2433,264 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     ASSERT_TRUE(backend.has_value());
     ASSERT_NE(*backend, nullptr);
     EXPECT_TRUE((*backend)->Init().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Parallel BatchRead (MOONCAKE_DFS_READ_THREADS > 1). These build a backend
+// after setting the env so Init() picks up the worker pool; EnvGuard restores
+// MOONCAKE_DFS_READ_THREADS afterwards. Buffers use deterministic fills (no
+// RNG) so failures are reproducible.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string ParallelShardPath(const TempDir& tmp, int shard_idx,
+                              int shard_count) {
+    return tmp.file("dfs_shard_" +
+                    ShardAllocator::FormatShardIdx(shard_idx, shard_count) +
+                    ".data");
+}
+
+// Builds a POSIX DFS backend honoring the current MOONCAKE_DFS_READ_THREADS.
+// Shards are preallocated because the backend only opens prepared shards.
+std::unique_ptr<DistributedStorageBackend> MakePosixBackend(const TempDir& tmp,
+                                                            int shard_count) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+
+    DistributedStorageConfig dcfg;
+    dcfg.fsdir = tmp.path();
+    dcfg.fs_adapter_type = "posix";
+    dcfg.shard_count = shard_count;
+    dcfg.shard_capacity = 64 * 1024 * 1024;
+    dcfg.alignment = 4096;
+
+    PosixFsAdapter adapter;
+    if (!adapter.Init(tmp.path())) return nullptr;
+    for (int i = 0; i < shard_count; ++i) {
+        if (!adapter.PreallocateFile(ParallelShardPath(tmp, i, shard_count),
+                                     dcfg.shard_capacity)) {
+            return nullptr;
+        }
+    }
+
+    auto backend = std::make_unique<DistributedStorageBackend>(
+        file_config, dcfg, std::make_unique<PosixFsAdapter>());
+    if (!backend->Init().has_value()) return nullptr;
+    return backend;
+}
+
+constexpr int kParallelObjectSize = 4096;
+
+struct StripedDataset {
+    std::vector<std::unique_ptr<AlignedBuffer>> src;
+    std::vector<DfsWriteRequest> writes;
+};
+
+// Writes `n` objects striped across shards, each filled with a distinct byte.
+bool WriteStriped(DistributedStorageBackend& backend, const TempDir& tmp,
+                  int shard_count, int n, StripedDataset& data) {
+    for (int i = 0; i < n; ++i) {
+        auto buffer = std::make_unique<AlignedBuffer>(kParallelObjectSize);
+        if (!buffer->data()) return false;
+        buffer->Fill(static_cast<char>('A' + (i % 26)));
+        const int shard = i % shard_count;
+        const uint64_t offset =
+            static_cast<uint64_t>(i / shard_count) * kParallelObjectSize;
+        data.writes.push_back(
+            {"k" + std::to_string(i),
+             {ParallelShardPath(tmp, shard, shard_count), offset,
+              kParallelObjectSize, kParallelObjectSize, shard},
+             {{buffer->data(), kParallelObjectSize}}});
+        data.src.push_back(std::move(buffer));
+    }
+    for (const auto& result : backend.BatchWrite(data.writes)) {
+        if (!result) return false;
+    }
+    return true;
+}
+
+// Reads objects [begin, begin + count) in one BatchRead and returns how many
+// failed or came back with the wrong content. Safe to call from any thread.
+int ReadAndCountMismatches(DistributedStorageBackend& backend,
+                           const StripedDataset& data, int begin, int count) {
+    std::vector<std::unique_ptr<AlignedBuffer>> dst;
+    std::vector<DfsReadRequest> reads;
+    for (int i = begin; i < begin + count; ++i) {
+        dst.push_back(std::make_unique<AlignedBuffer>(kParallelObjectSize));
+        if (!dst.back()->data()) return count;
+        reads.push_back({data.writes[i].key,
+                         data.writes[i].descriptor,
+                         {{dst.back()->data(), kParallelObjectSize}}});
+    }
+    auto results = backend.BatchRead(reads);
+    if (results.size() != static_cast<size_t>(count)) return count;
+    int mismatches = 0;
+    for (int j = 0; j < count; ++j) {
+        if (!results[j] ||
+            std::memcmp(dst[j]->data(), data.src[begin + j]->data(),
+                        kParallelObjectSize) != 0) {
+            ++mismatches;
+        }
+    }
+    return mismatches;
+}
+
+}  // namespace
+
+// Reads must return the same per-index result and content with and without the
+// pool. Thread count 1 pins the serial path, which posix no longer uses by
+// default. Data is spread across shards so the pool uses several fds.
+TEST(DfsBackendParallelTest, MatchesSerialAndPreservesOrder) {
+    for (const char* threads : {"1", "8"}) {
+        SCOPED_TRACE(std::string("MOONCAKE_DFS_READ_THREADS=") + threads);
+        EnvGuard env;
+        ConfigurePosixDfs(env);
+        env.Set("MOONCAKE_DFS_READ_THREADS", threads);
+
+        TempDir tmp("dfs_parallel_order");
+        constexpr int kShardCount = 8;
+        constexpr int kN = 256;
+        auto backend = MakePosixBackend(tmp, kShardCount);
+        ASSERT_NE(backend, nullptr);
+        StripedDataset data;
+        ASSERT_TRUE(WriteStriped(*backend, tmp, kShardCount, kN, data));
+        EXPECT_EQ(ReadAndCountMismatches(*backend, data, 0, kN), 0);
+    }
+}
+
+// Under concurrency the per-index error mapping must stay intact. Invalid
+// descriptors are used (not call-count injection) because BatchRead validates
+// each request independently, so the failing index is deterministic even when
+// requests run on different threads.
+TEST(DfsBackendParallelTest, MapsPerIndexErrorsByDescriptor) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_READ_THREADS", "8");
+
+    TempDir tmp("dfs_parallel_errors");
+    constexpr int kShardCount = 4;
+    auto backend = MakePosixBackend(tmp, kShardCount);
+    ASSERT_NE(backend, nullptr);
+
+    constexpr int kSize = 4096;
+    AlignedBuffer payload(kSize);
+    ASSERT_NE(payload.data(), nullptr);
+    payload.Fill('V');
+    const DistributedFSDescriptor good_desc{
+        ParallelShardPath(tmp, 0, kShardCount), 0, kSize, kSize, 0};
+    auto w =
+        backend->BatchWrite({{"valid", good_desc, {{payload.data(), kSize}}}});
+    ASSERT_EQ(w.size(), 1u);
+    ASSERT_TRUE(w[0].has_value());
+
+    // Index layout: 0 ok, 1 bad shard_idx, 2 ok, 3 path mismatch,
+    // 4 unaligned offset, 5 ok.
+    const DistributedFSDescriptor bad_shard{
+        ParallelShardPath(tmp, 0, kShardCount), 0, kSize, kSize, 999};
+    const DistributedFSDescriptor bad_path{tmp.file("nonexistent.data"), 0,
+                                           kSize, kSize, 0};
+    const DistributedFSDescriptor bad_align{
+        ParallelShardPath(tmp, 0, kShardCount), 1, kSize, kSize, 0};
+
+    std::vector<std::unique_ptr<AlignedBuffer>> out;
+    for (int i = 0; i < 6; ++i) {
+        out.push_back(std::make_unique<AlignedBuffer>(kSize));
+    }
+    std::vector<DfsReadRequest> reads{
+        {"ok0", good_desc, {{out[0]->data(), kSize}}},
+        {"bad_shard", bad_shard, {{out[1]->data(), kSize}}},
+        {"ok2", good_desc, {{out[2]->data(), kSize}}},
+        {"bad_path", bad_path, {{out[3]->data(), kSize}}},
+        {"bad_align", bad_align, {{out[4]->data(), kSize}}},
+        {"ok5", good_desc, {{out[5]->data(), kSize}}},
+    };
+    auto r = backend->BatchRead(reads);
+    ASSERT_EQ(r.size(), 6u);
+    EXPECT_TRUE(r[0].has_value());
+    ASSERT_FALSE(r[1].has_value());
+    EXPECT_EQ(r[1].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(r[2].has_value());
+    ASSERT_FALSE(r[3].has_value());
+    EXPECT_EQ(r[3].error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_FALSE(r[4].has_value());
+    EXPECT_EQ(r[4].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(r[5].has_value());
+    EXPECT_EQ(std::memcmp(out[0]->data(), payload.data(), kSize), 0);
+    EXPECT_EQ(std::memcmp(out[5]->data(), payload.data(), kSize), 0);
+}
+
+// Empty and single-request batches must be handled even with the pool enabled
+// (n <= 1 falls back to the serial path).
+TEST(DfsBackendParallelTest, EmptyAndSingleRequestWithPoolEnabled) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_READ_THREADS", "8");
+
+    TempDir tmp("dfs_parallel_edge");
+    constexpr int kShardCount = 2;
+    auto backend = MakePosixBackend(tmp, kShardCount);
+    ASSERT_NE(backend, nullptr);
+
+    EXPECT_TRUE(backend->BatchRead({}).empty());
+
+    constexpr int kSize = 4096;
+    AlignedBuffer payload(kSize);
+    ASSERT_NE(payload.data(), nullptr);
+    payload.Fill('X');
+    const DistributedFSDescriptor desc{ParallelShardPath(tmp, 1, kShardCount),
+                                       0, kSize, kSize, 1};
+    ASSERT_TRUE(
+        backend->BatchWrite({{"one", desc, {{payload.data(), kSize}}}})[0]
+            .has_value());
+
+    AlignedBuffer out(kSize);
+    ASSERT_NE(out.data(), nullptr);
+    auto r = backend->BatchRead({{"one", desc, {{out.data(), kSize}}}});
+    ASSERT_EQ(r.size(), 1u);
+    ASSERT_TRUE(r[0].has_value());
+    EXPECT_EQ(std::memcmp(out.data(), payload.data(), kSize), 0);
+}
+
+// Several threads calling BatchRead against a pool smaller than the caller
+// count. This is the shape that regressed before the calling thread began
+// draining the request cursor itself: the pool must not serialize independent
+// callers, and the shared cursor plus completion barrier must still hand every
+// caller exactly its own results.
+TEST(DfsBackendParallelTest, ConcurrentCallersWithSmallPool) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_READ_THREADS", "2");  // deliberately < caller count
+
+    TempDir tmp("dfs_parallel_callers");
+    constexpr int kShardCount = 4;
+    auto backend = MakePosixBackend(tmp, kShardCount);
+    ASSERT_NE(backend, nullptr);
+
+    constexpr int kCallers = 8;
+    constexpr int kPerCaller = 16;
+    // Each caller reads a disjoint range, so a cross-caller mix-up shows up as
+    // a content mismatch.
+    StripedDataset data;
+    ASSERT_TRUE(
+        WriteStriped(*backend, tmp, kShardCount, kCallers * kPerCaller, data));
+
+    std::atomic<int> failures{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> callers;
+    callers.reserve(kCallers);
+    for (int c = 0; c < kCallers; ++c) {
+        callers.emplace_back([&, c]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            failures += ReadAndCountMismatches(*backend, data, c * kPerCaller,
+                                               kPerCaller);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& t : callers) t.join();
+    EXPECT_EQ(failures.load(), 0);
 }
 
 }  // namespace mooncake::test

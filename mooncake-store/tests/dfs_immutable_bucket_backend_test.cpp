@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -37,6 +40,27 @@ class TempDir {
 
    private:
     std::filesystem::path path_;
+};
+
+// Sets an environment variable for the lifetime of the object and restores
+// the previous value afterwards.
+class ScopedEnv {
+   public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        if (const char* old = std::getenv(name)) old_ = old;
+        ::setenv(name, value, 1);
+    }
+    ~ScopedEnv() {
+        if (old_) {
+            ::setenv(name_, old_->c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_;
 };
 
 DistributedStorageConfig MakeConfig(const TempDir& dir) {
@@ -127,6 +151,39 @@ class BatchRecordingPosixAdapter : public RecordingPosixAdapter {
     bool SupportsBatchIo() const override { return true; }
 };
 
+// Thread-safe open/close accounting for the parallel read path. Each read
+// sleeps briefly so reads issued by different threads overlap.
+class ConcurrentRecordingPosixAdapter : public PosixFsAdapter {
+   public:
+    tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& path) override {
+        auto fd = PosixFsAdapter::OpenExistingFile(path);
+        if (fd) {
+            ++opens;
+            const int now = ++open_now;
+            int peak = peak_open.load();
+            while (now > peak && !peak_open.compare_exchange_weak(peak, now)) {
+            }
+        }
+        return fd;
+    }
+    tl::expected<void, ErrorCode> CloseFile(int fd) override {
+        ++closes;
+        --open_now;
+        return PosixFsAdapter::CloseFile(fd);
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+    }
+
+    std::atomic<int> opens{0};
+    std::atomic<int> closes{0};
+    std::atomic<int> open_now{0};
+    std::atomic<int> peak_open{0};
+};
+
 class ZeroProgressPosixAdapter : public CountingPosixAdapter {
    public:
     tl::expected<size_t, ErrorCode> WriteAt(int, const iovec*, int,
@@ -176,6 +233,9 @@ INSTANTIATE_TEST_SUITE_P(ScalarAndBatch, ImmutableBucketShortIoTest,
                          ::testing::Bool());
 
 TEST(ImmutableBucketBackendTest, PosixKeepsPerRequestBucketHandles) {
+    // peak_open == 1 and the adapter's plain counters assume one read at a
+    // time, so pin the serial read path.
+    ScopedEnv serial_reads("MOONCAKE_DFS_READ_THREADS", "1");
     TempDir dir;
     const auto config = MakeConfig(dir);
     ImmutableBucketAllocator allocator;
@@ -321,6 +381,68 @@ TEST(ImmutableBucketBackendTest, BatchBoundsOpenBucketsPerSubmission) {
     EXPECT_EQ(outputs, values);
     EXPECT_EQ(recorded->read_batches, (std::vector<size_t>{kMaxOpen, 1}));
     EXPECT_EQ(recorded->peak_open, static_cast<int>(kMaxOpen));
+}
+
+// Parallel POSIX reads in bucket layout: every request opens and closes its
+// own bucket fd, reads overlap, and one call never holds more than
+// kMaxOpenBucketsPerBatch fds even when MOONCAKE_DFS_READ_THREADS is higher.
+TEST(ImmutableBucketBackendTest, PosixParallelReadsBoundOpenBuckets) {
+    constexpr size_t kMaxOpen =
+        DistributedStorageBackend::kMaxOpenBucketsPerBatch;
+    constexpr size_t kObjects = 2 * kMaxOpen;
+    ScopedEnv parallel_reads("MOONCAKE_DFS_READ_THREADS", "128");
+    TempDir dir;
+    auto config = MakeConfig(dir);
+    config.max_bucket_count = kObjects;
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    // Each object fills a bucket, so every request targets its own bucket.
+    std::vector<std::string> values;
+    std::vector<DistributedFSDescriptor> descriptors;
+    for (size_t i = 0; i < kObjects; ++i) {
+        auto descriptor = allocator.Allocate("key" + std::to_string(i),
+                                             config.bucket_capacity);
+        ASSERT_TRUE(descriptor);
+        descriptors.push_back(*descriptor);
+        values.emplace_back(config.bucket_capacity,
+                            static_cast<char>('a' + i % 26));
+    }
+
+    auto adapter = std::make_unique<ConcurrentRecordingPosixAdapter>();
+    auto* recorded = adapter.get();
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<DfsWriteRequest> writes;
+    for (size_t i = 0; i < kObjects; ++i) {
+        writes.push_back({"key" + std::to_string(i),
+                          descriptors[i],
+                          {{values[i].data(), values[i].size()}}});
+    }
+    for (const auto& result : backend.BatchWrite(writes)) ASSERT_TRUE(result);
+    recorded->peak_open = 0;
+
+    std::vector<std::string> outputs(kObjects,
+                                     std::string(config.bucket_capacity, '\0'));
+    std::vector<DfsReadRequest> reads;
+    for (size_t i = 0; i < kObjects; ++i) {
+        reads.push_back({"key" + std::to_string(i),
+                         descriptors[i],
+                         {{outputs[i].data(), outputs[i].size()}}});
+    }
+    auto read_results = backend.BatchRead(reads);
+    ASSERT_EQ(read_results.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(read_results[i]) << "index " << i;
+        EXPECT_EQ(outputs[i], values[i]) << "index " << i;
+    }
+    EXPECT_EQ(recorded->opens.load(), static_cast<int>(2 * kObjects));
+    EXPECT_EQ(recorded->closes.load(), static_cast<int>(2 * kObjects));
+    EXPECT_EQ(recorded->open_now.load(), 0);
+    EXPECT_GT(recorded->peak_open.load(), 1);
+    EXPECT_LE(recorded->peak_open.load(), static_cast<int>(kMaxOpen));
 }
 
 TEST(ImmutableBucketBackendTest, RejectsEscapesMismatchAndMissingFile) {

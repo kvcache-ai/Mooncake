@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include "replica.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage_backend.h"
+#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -169,6 +171,15 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unordered_map<int, std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
+
+    // BatchRead workers in addition to the calling thread
+    // (MOONCAKE_DFS_READ_THREADS; see Init for defaults).
+    int dfs_read_threads_ = 1;
+    // Helper jobs enqueued in dfs_read_pool_ that no worker has picked up yet,
+    // capped in BatchRead at a multiple of dfs_read_threads_. Declared before
+    // the pool so it outlives the jobs.
+    std::atomic<size_t> dfs_read_jobs_{0};
+    std::unique_ptr<ThreadPool> dfs_read_pool_;
 };
 
 }  // namespace mooncake
