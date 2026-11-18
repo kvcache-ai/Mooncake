@@ -324,7 +324,7 @@ impl StorageOwnerState {
             return Ok(None);
         }
         // Materialized becomes visible before the offload settles device usage.
-        if self.pending_offloads.is_in_flight(&current.key) {
+        if self.pending_offloads.is_settling(current_backing) {
             return Ok(None);
         }
         let mut claimed = current.clone();
@@ -778,9 +778,9 @@ impl StorageOwnerState {
                 ..crate::control_plane::ColdReclaimResult::default()
             });
         }
-        if self.pending_offloads.is_in_flight(route_key) {
+        if self.pending_offloads.is_settling(cold_backing) {
             return Err(StoreError::Backpressure(
-                "cold backing offload is still in flight".to_string(),
+                "cold backing usage settlement is still in flight".to_string(),
             ));
         }
         let backend = self.cold_tier_devices.backend_for(cold_backing)?;

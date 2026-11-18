@@ -148,6 +148,14 @@ struct ColdTierDeviceManager {
 struct ColdTierOffloadManager {
     queue: Mutex<PendingOffloadQueue>,
     materializing: AtomicBool,
+    settling_backings: Mutex<BTreeMap<ColdBackingIdentity, usize>>,
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct ColdBackingIdentity {
+    owner: ClientRuntimeId,
+    cold_tier_id: String,
+    object_locator: String,
 }
 
 #[derive(Default)]
@@ -697,7 +705,7 @@ struct PendingOffloadReadyRoute {
 }
 
 struct PendingOffloadCasOutcome {
-    published: Vec<usize>,
+    materialized: usize,
     used_add_bytes: i64,
     reserved_release_bytes: i64,
     cleanup: Vec<mooncake_store_core::ColdBackingRoute>,
