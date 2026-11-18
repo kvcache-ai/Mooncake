@@ -580,7 +580,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
-#if defined(USE_CUDA) || defined(USE_SUPA)
+#if defined(USE_CUDA) || defined(USE_SUPA) || defined(USE_MACA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
