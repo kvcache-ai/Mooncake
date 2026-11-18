@@ -373,6 +373,16 @@ if(TARGET tent_xport_uring)
   set_tests_properties(tent_io_uring_transport_test PROPERTIES TIMEOUT 120)
 endif()
 
+add_executable(tent_bufio_transport_test bufio_transport_test.cpp)
+target_link_libraries(tent_bufio_transport_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+target_include_directories(tent_bufio_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+if(UNIX AND NOT APPLE)
+  target_link_options(tent_bufio_transport_test PRIVATE "-Wl,--wrap=pwrite")
+endif()
+add_test(NAME tent_bufio_transport_test COMMAND tent_bufio_transport_test)
+
 # NOT registered via add_test: the test needs a real GPU (it opens a CUDA IPC
 # handle exported by a forked child). Run manually on a GPU box:
 # ./tent_nvlink_transport_test --gtest_filter='NVLinkTransportTest.*' Only built

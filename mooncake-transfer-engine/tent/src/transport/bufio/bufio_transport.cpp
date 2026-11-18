@@ -270,8 +270,10 @@ Status BufIoTransport::submitTransferTasks(
         }
 
         task.transferred_bytes = static_cast<size_t>(io_ret < 0 ? 0 : io_ret);
-        task.status_word = (io_ret < 0) ? TransferStatusEnum::FAILED
-                                        : TransferStatusEnum::COMPLETED;
+        task.status_word =
+            (io_ret < 0 || static_cast<size_t>(io_ret) != req.length)
+                ? TransferStatusEnum::FAILED
+                : TransferStatusEnum::COMPLETED;
     }
 
     return Status::OK();
