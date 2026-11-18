@@ -2453,7 +2453,8 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
-    const std::function<bool(const Replica&)>& is_stale) {
+    const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void(const ObjectMetadata&)>& on_visited) {
     std::optional<ErrorCode> first_persist_error;
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         // Reader pre-check: an object with nothing to sweep never takes the
@@ -2463,6 +2464,9 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         std::vector<route::ObjectRef> to_sweep;
         for (auto object : ns.objects.ReadCursor()) {
             const auto& metadata = object.metadata();
+            if (on_visited) {
+                on_visited(metadata);
+            }
             if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
                 to_sweep.push_back(object.ref());
             }
@@ -2576,8 +2580,17 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.metadata_cleanup_accepted) {
-            const auto cleanup_result =
-                ClearStaleHandles([&job](const Replica& replica) {
+            // One pass: the sweep's read pass also answers the retry gate
+            // below. Asking both questions of the same walk is what keeps a
+            // retry from costing two full scans. The sweep predicate only
+            // matches completed replicas, so it can never erase the PROCESSING
+            // replica the visitor is looking for; at worst a replica that
+            // completes while this pass runs is still seen as PROCESSING, and
+            // the next attempt sweeps it. Objects this pass drops are ignored:
+            // their PROCESSING replica cannot surface again.
+            bool unfinished_affiliated_replica = false;
+            const auto cleanup_result = ClearStaleHandles(
+                [&job](const Replica& replica) {
                     if (!replica.is_completed()) {
                         return false;
                     }
@@ -2587,6 +2600,33 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     }
                     return replica.is_memory_replica() &&
                            replica.isAffiliatedWith(job.liveness);
+                },
+                [this, &job, &unfinished_affiliated_replica](
+                    const ObjectMetadata& metadata) {
+                    if (unfinished_affiliated_replica) {
+                        return;
+                    }
+                    const auto is_unfinished = [&job](const Replica& replica) {
+                        return replica.is_processing() &&
+                               replica.isAffiliatedWith(job.liveness);
+                    };
+                    if (!metadata.HasReplica(is_unfinished)) {
+                        return;
+                    }
+                    if (metadata.IsValid()) {
+                        unfinished_affiliated_replica = true;
+                        return;
+                    }
+                    // No usable replica left. The sweep then erases the
+                    // object, or enqueues its REMOVE and fails the whole walk
+                    // if that enqueue fails, so its PROCESSING replica cannot
+                    // surface again and waiting on it would only cost a
+                    // retry. HA without an OpLog is the exception: the sweep
+                    // leaves the object to the background reaper, so the
+                    // replica is still one this job has to wait for.
+                    if (enable_ha_ && !enable_oplog_) {
+                        unfinished_affiliated_replica = true;
+                    }
                 });
             if (!cleanup_result) {
                 LOG(ERROR) << "client_id=" << job.client_id
@@ -2594,23 +2634,6 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                            << ", error=" << toString(cleanup_result.error());
                 return false;
             }
-            bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(job.liveness);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
-                    }
-                }
-            });
             if (unfinished_affiliated_replica) {
                 LOG(ERROR)
                     << "client_id=" << job.client_id
