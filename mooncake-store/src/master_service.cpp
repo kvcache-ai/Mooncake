@@ -5246,8 +5246,12 @@ auto MasterService::PrepareWriteStart(
                              : config.host_id;
     }
 
-    if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
-        (slice_length > kMaxSliceSize)) {
+    const bool object_only = config.os_replica_num > 0 &&
+                             config.replica_num == 0 &&
+                             config.nof_replica_num == 0;
+    if (!object_only &&
+        memory_allocator_type_ == BufferAllocatorType::CACHELIB &&
+        slice_length > kMaxSliceSize) {
         LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
                    << ", max_size=" << kMaxSliceSize
                    << ", error=invalid_slice_size";

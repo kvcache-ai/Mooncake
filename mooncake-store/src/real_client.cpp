@@ -7014,7 +7014,7 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_object_storage_replica() ||
+        if (replica.is_disk_replica() ||
             (replica.is_dfs_replica() &&
              !can_use_direct_dfs_read(replica, {buffers[i]}))) {
             // DISK replicas, and DFS replicas that cannot be read directly
@@ -7029,8 +7029,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer. DFS into host memory:
-        // the fs adapter reads directly to user buffer.
+        // MEMORY, NoF, object storage, and direct DFS reads use the caller's
+        // destination slices.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -8839,6 +8839,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
+        const auto &buffers = all_buffers[i];
+        if (buffers.size() != sizes.size()) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
             dst_total_size += size;
@@ -8851,10 +8856,10 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Create slices for this key's buffer
-        const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            replica.is_object_storage_replica() ||
             (replica.is_dfs_replica() &&
              can_use_direct_dfs_read(replica, buffers))) {
             // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
@@ -8863,8 +8868,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
         } else if (replica.is_local_disk_replica() ||
-                   replica.is_disk_replica() || replica.is_dfs_replica() ||
-                   replica.is_object_storage_replica()) {
+                   replica.is_disk_replica() || replica.is_dfs_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
             if (valid_local_disk_ops.count(key)) {
@@ -8912,7 +8916,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         return results;
     }
 
-    // ---- Memory/NOF replica: existing BatchGet path ----
+    // Read into the primary destinations, then fan out duplicate keys.
     if (!valid_operations.empty()) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
