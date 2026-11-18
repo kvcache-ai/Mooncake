@@ -1027,7 +1027,12 @@ void MasterAdminServer::HandleCancelDrainJob(
         HttpCancelDrainJobResponse payload;
         payload.success = true;
         payload.job_id = UuidToString(job_id_result.value());
-        payload.status = "CANCELED";
+        auto job = service->QueryDrainJob(job_id_result.value());
+        if (job) {
+            std::ostringstream status;
+            status << job->status;
+            payload.status = status.str();
+        }
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
 }

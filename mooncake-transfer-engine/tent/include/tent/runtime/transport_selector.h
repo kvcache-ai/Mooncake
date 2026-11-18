@@ -102,6 +102,7 @@ struct SelectionContext {
     // a dma-buf RDMA registration nor a host staging route.
     bool xpu_ipc_only{false};
     bool mlu_ipc_only{false};
+    bool rdma_device_direct{true};
 };
 
 /**

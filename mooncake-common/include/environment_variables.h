@@ -109,6 +109,9 @@ struct HugepageEnvironmentVariables {
     // the existing byte-size parser, fallback, and logging behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_HUGEPAGE);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
+    // Opt-in THP backing of the RDMA client buffer (1/0, true/false, yes/no,
+    // on/off). Kept as a string so an invalid value can be warned about.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_MADV_HUGEPAGE);
 };
 
 struct ShmSpdkRegistrationEnvironmentVariables {

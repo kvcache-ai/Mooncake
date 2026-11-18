@@ -1734,6 +1734,18 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
     return Status::OK();
 }
 
+bool TransferEngineImpl::producerEventHonored(const Request& req,
+                                              TransportType type,
+                                              bool staging) const {
+    if (!req.producer_event) return true;
+    // Staging re-issues fresh chunk requests that do not carry the event.
+    if (staging || type == UNSPEC || type < 0 ||
+        type >= static_cast<TransportType>(kSupportedTransportTypes))
+        return false;
+    return transport_list_[type] &&
+           transport_list_[type]->supportsProducerEvent();
+}
+
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
     bool device_direct = false;
@@ -1829,20 +1841,27 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     bool xpu_ipc = false;
     bool mlu_ipc = false;
     bool direct = false;
+    bool rdma_direct = true;
     const BufferDesc* ipc_entry = nullptr;
     if (desc->type == SegmentType::Memory &&
         request.target_id != LOCAL_SEGMENT_ID) {
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
+        const bool cuda_side =
+            local_mtype == MTYPE_CUDA || remote_mtype == MTYPE_CUDA;
         const bool xpu_side =
             local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
         const bool mlu_side =
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU;
-        direct =
-            (xpu_side || mlu_side) && allow_device_direct &&
-            (hint == UNSPEC || hint == RDMA) &&
-            deviceDirectRdmaReady(request, entry, local_mtype, remote_mtype);
+        if (cuda_side || xpu_side || mlu_side) {
+            rdma_direct = allow_device_direct &&
+                          (hint == UNSPEC || hint == RDMA) &&
+                          deviceDirectRdmaReady(request, entry, local_mtype,
+                                                remote_mtype);
+        }
+        direct = ((xpu_side || mlu_side) && rdma_direct) ||
+                 (cuda_side && !xpu_side && !mlu_side && allow_device_direct);
         xpu_ipc = xpu_side && !mlu_side && allow_local_ipc &&
                   (hint == UNSPEC || hint == XPU) &&
                   xpuIpcCandidate(request, desc.get(), entry);
@@ -1853,9 +1872,13 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         if (device_direct) *device_direct = direct;
         if ((xpu_side && !direct && transport_list_[XPU]) ||
             (mlu_side && !direct)) {
-            findStagingPolicy(request, host_staging_params);
+            findStagingPolicy(request, host_staging_params,
+                              allow_device_direct);
             if (host_staging_params.empty() && !xpu_ipc && !mlu_ipc)
                 return SelectionResult{};
+        } else if (cuda_side && !direct) {
+            findStagingPolicy(request, host_staging_params,
+                              allow_device_direct);
         }
         if (!host_staging_params.empty()) {
             // A staged side is replaced by a freshly registered host stage
@@ -1961,6 +1984,10 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                     const bool staged = host_staging &&
                                         !(xpu_ipc && type == XPU) &&
                                         !(mlu_ipc && type == MLU);
+                    if (type == RDMA && !staged && !rdma_direct &&
+                        (isGpuType(local_mtype) || isGpuType(remote_mtype))) {
+                        continue;
+                    }
                     if (checkAvailability(transport_list_[type],
                                           staged ? MTYPE_CPU : local_mtype,
                                           staged ? MTYPE_CPU : remote_mtype)) {
@@ -1998,6 +2025,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     ctx.mlu_ipc = mlu_ipc;
     ctx.xpu_ipc_only = xpu_ipc && ipc_mixed && !host_staging;
     ctx.mlu_ipc_only = mlu_ipc && ipc_mixed && !host_staging;
+    ctx.rdma_device_direct = rdma_direct;
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
@@ -2174,6 +2202,9 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
             last.req.intent_type != curr.req.intent_type) {
             return false;
         }
+        // A merged request carries one producer dependency; mixing events
+        // would drop the ordering of the other half.
+        if (last.req.producer_event != curr.req.producer_event) return false;
         if (!last.boundary.source_key || !curr.boundary.source_key ||
             !last.boundary.target_key || !curr.boundary.target_key) {
             return false;
@@ -2405,7 +2436,8 @@ bool TransferEngineImpl::mluIpcReady(const Request& request,
 }
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,
-                                           std::vector<std::string>& policy) {
+                                           std::vector<std::string>& policy,
+                                           bool allow_device_direct) {
     policy.clear();
     if (request.target_id == LOCAL_SEGMENT_ID) {
 #ifdef USE_MLU
@@ -2446,21 +2478,18 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     auto server_addr = desc->rpc_server_addr;
     policy.clear();
     // case 1: rdma without gpu direct
-    if (transport_list_[RDMA] && transport_list_[NVLINK]) {
-        auto& xport = transport_list_[RDMA];
-        auto& caps = xport->capabilities();
-        if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CUDA &&
-            !caps.gpu_to_gpu) {
+    if (transport_list_[RDMA] && transport_list_[NVLINK] &&
+        !(allow_device_direct &&
+          deviceDirectRdmaReady(request, entry, local_mtype, remote_mtype))) {
+        if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CUDA) {
             policy.push_back(server_addr);
             policy.push_back(topology_->findNearMem(local));
             policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
-                   !caps.gpu_to_dram) {
+        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU) {
             policy.push_back(server_addr);
             policy.push_back(topology_->findNearMem(local));
             policy.push_back("");  // no remote stage
-        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CUDA &&
-                   !caps.dram_to_gpu) {
+        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CUDA) {
             policy.push_back(server_addr);
             policy.push_back("");  // no local stage
             policy.push_back(desc->getMemory().topology.findNearMem(remote));
@@ -2664,6 +2693,13 @@ Status TransferEngineImpl::prepareSubmit(
             return Status::NotImplemented(
                 "scatter transfer does not support staged TENT "
                 "routes" LOC_MARK);
+        }
+        if (owner.route.transport != UNSPEC &&
+            !producerEventHonored(owner.request, owner.route.transport,
+                                  owner.staging)) {
+            return Status::InvalidArgument(
+                "producer_event is not supported by the selected "
+                "transport route" LOC_MARK);
         }
         prepared.owners.push_back(std::move(owner));
     }
@@ -3179,6 +3215,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             staging_params.empty())
             findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
+            if (!producerEventHonored(task.request, task.type, true))
+                return finishQueuedOwner(owner_id, FAILED);
             task.staging = true;
             // Orchestration only; the real transport submissions issued by
             // ProxyManager are counted where they recurse through the
@@ -3202,6 +3240,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
 
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
+    if (!producerEventHonored(task.request, task.type, false))
+        return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
     if (task.type == RDMA || task.type == UB) {
         sub_batch->device_mask = task.device_mask;
@@ -3554,6 +3594,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         LOG_EVERY_N(WARNING, 100) << "No more transports available after "
                                   << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+    // Never fail over to a route that would drop the producer dependency.
+    if (!producerEventHonored(task.request, type,
+                              !result.staging_params.empty())) {
+        return Status::InvalidEntry(
+            "fallback transport cannot honor producer_event" LOC_MARK);
     }
 
     LOG_EVERY_N(INFO, 1000)
