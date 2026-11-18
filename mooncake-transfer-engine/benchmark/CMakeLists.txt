@@ -172,6 +172,15 @@ if(BUILD_UNIT_TESTS)
   set_tests_properties(
     tebench_reject_zero_duration
     PROPERTIES PASS_REGULAR_EXPRESSION "--duration must be positive" TIMEOUT 10)
+  # Target mode on the classic backend, which used to start with no buffers.
+  add_test(
+    NAME tebench_reject_unknown_seg_type
+    COMMAND ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+            --backend=classic --xport_type=tcp --seg_type=Foo)
+  set_tests_properties(
+    tebench_reject_unknown_seg_type
+    PROPERTIES PASS_REGULAR_EXPRESSION "--seg_type must be DRAM or VRAM"
+               TIMEOUT 10)
 
   if(WITH_METRICS AND USE_TCP)
     add_executable(

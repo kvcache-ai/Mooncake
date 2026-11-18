@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <iomanip>
 #include <limits>
 #if defined(__linux__)
@@ -508,9 +509,11 @@ Client::~Client() {
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
     }
-    if (!gather_endpoint_.empty())
+    // The heartbeat thread has drained any in-flight gather refresh.
+    if (!gather_endpoint_.empty()) {
         (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
                                                    gather_endpoint_, true);
+    }
 
     leader_monitor_running_ = false;
     if (leader_monitor_thread_.joinable()) {
@@ -1875,7 +1878,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             const auto& desc = replica.get_dfs_descriptor();
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
+                DfsReadRequest{.key = key,
+                               .descriptor = desc,
+                               .slices = slices_it->second,
+                               .source_replica_id = replica.id});
             dfs_read_indices.push_back(i);
             dfs_read_replicas.push_back(replica);
             continue;
@@ -4121,13 +4127,18 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
                         transfer_engine_, store::GatherReadOptions{},
                         GetSegmentEndpoint());
                     service->start("0.0.0.0");
-                    gather_endpoint_ = buildHostNameWithPort(
+                    auto gather_endpoint = buildHostNameWithPort(
                         getHostNameWithoutPort(
                             transfer_engine_->getLocalIpAndPort()),
                         service->port());
-                    gather_service_ = std::move(service);
+                    // Let the initial publish finish before heartbeats can
+                    // see the endpoint and schedule a refresh.
                     (void)master_client_.PublishGatherEndpoint(
-                        GetSegmentEndpoint(), gather_endpoint_);
+                        GetSegmentEndpoint(), gather_endpoint);
+                    gather_service_ = std::move(service);
+                    std::lock_guard<std::mutex> endpoint_lock(
+                        gather_endpoint_mutex_);
+                    gather_endpoint_ = std::move(gather_endpoint);
                 }
                 gather_service_->addSource(const_cast<void*>(buffer), size);
             } catch (const std::exception& e) {
@@ -5370,7 +5381,11 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
 
     auto* dfs_metric = GetDfsMetricPtr();
     const auto& desc = replica_descriptor.get_dfs_descriptor();
-    std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
+    std::vector<DfsReadRequest> requests{
+        DfsReadRequest{.key = key,
+                       .descriptor = desc,
+                       .slices = slices,
+                       .source_replica_id = replica_descriptor.id}};
     const auto read_start = std::chrono::steady_clock::now();
     auto results = dfs_storage_backend_->BatchRead(requests);
     const auto read_latency_us = elapsed_us_since(read_start);
@@ -5485,7 +5500,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchReadFileReplicaRanges(
                                               replicas[i].get_dfs_descriptor(),
                                               {windows[i]},
                                               value_offsets[i],
-                                              true});
+                                              true,
+                                              replicas[i].id});
         dfs_indexes.push_back(i);
         results[i] = {};
     }
@@ -5766,9 +5782,38 @@ void Client::StorageHeartbeatThreadMain() {
         // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
         // re-register offloaded object metadata.
     };
-    // Use another thread to remount segments to avoid blocking the ping
-    // thread
+    // Remounts and metadata retries share one slot.
     std::future<void> remount_segment_future;
+    std::atomic<bool> gather_refresh_done{true};
+    std::thread gather_refresh_thread;
+
+    auto retry_metadata = [this]() {
+        auto metadata = transfer_engine_->getMetadata();
+        if (!metadata) return;
+
+        if (segment_desc_publish_pending_.load()) {
+            int rc = metadata->updateLocalSegmentDesc();
+            if (rc != 0) {
+                LOG(ERROR) << "Retry: failed to re-publish segment "
+                           << "descriptor to metadata server, rc=" << rc;
+            } else {
+                LOG(INFO) << "Retry: successfully re-published segment "
+                          << "descriptor to metadata server";
+                segment_desc_publish_pending_.store(false);
+            }
+        }
+        if (rpc_meta_publish_pending_.load()) {
+            int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+            if (rc != 0) {
+                LOG(ERROR) << "Retry: failed to re-publish RPC "
+                           << "meta entry to metadata server, rc=" << rc;
+            } else {
+                LOG(INFO) << "Retry: successfully re-published "
+                          << "RPC meta entry to metadata server";
+                rpc_meta_publish_pending_.store(false);
+            }
+        }
+    };
 
     while (storage_heartbeat_running_.load()) {
         // Join the remount segment thread if it is ready
@@ -5777,22 +5822,38 @@ void Client::StorageHeartbeatThreadMain() {
                 std::future_status::ready) {
             remount_segment_future = std::future<void>();
         }
-
         auto ping_result = metrics_
                                ? metrics_->master_heartbeat_metric.ObservePing(
                                      [this] { return master_client_.Ping(); })
                                : master_client_.Ping();
         if (ping_result) {
-            // Ephemeral gather discovery survives Master restart/failover
-            // through the existing owner heartbeat, not snapshot metadata.
-            std::string gather_endpoint;
-            {
-                std::lock_guard lock(mounted_segments_mutex_);
-                gather_endpoint = gather_endpoint_;
+            // Skip refreshes while a publication is still in flight.
+            if (gather_refresh_done.load()) {
+                if (gather_refresh_thread.joinable()) {
+                    gather_refresh_thread.join();
+                }
+                std::string endpoint;
+                {
+                    std::lock_guard<std::mutex> lock(gather_endpoint_mutex_);
+                    endpoint = gather_endpoint_;
+                }
+                if (!endpoint.empty()) {
+                    gather_refresh_done.store(false);
+                    gather_refresh_thread =
+                        std::thread([this, endpoint = std::move(endpoint),
+                                     &gather_refresh_done] {
+                            try {
+                                (void)master_client_.PublishGatherEndpoint(
+                                    GetSegmentEndpoint(), endpoint);
+                            } catch (const std::exception& e) {
+                                LOG(WARNING)
+                                    << "Failed to refresh gather endpoint: "
+                                    << e.what();
+                            }
+                            gather_refresh_done.store(true);
+                        });
+                }
             }
-            if (!gather_endpoint.empty())
-                (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
-                                                           gather_endpoint);
             // Reset ping failure count
             ping_fail_count = 0;
             last_ping_success_.store(true);
@@ -5802,41 +5863,13 @@ void Client::StorageHeartbeatThreadMain() {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
-            } else if (segment_desc_publish_pending_.load() &&
+            } else if ((segment_desc_publish_pending_.load() ||
+                        rpc_meta_publish_pending_.load()) &&
                        !remount_segment_future.valid()) {
-                // Previous remount succeeded but updateLocalSegmentDesc()
-                // failed (e.g. transient HTTP error).  Retry it directly
-                // without re-running ReMountSegment.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->updateLocalSegmentDesc();
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish segment "
-                            << "descriptor to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "segment descriptor to metadata server";
-                        segment_desc_publish_pending_.store(false);
-                    }
-                }
-            } else if (rpc_meta_publish_pending_.load() &&
-                       !remount_segment_future.valid()) {
-                // Previous remount succeeded but rePublishRpcMetaEntry()
-                // failed.  Retry it directly.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish RPC "
-                            << "meta entry to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "RPC meta entry to metadata server";
-                        rpc_meta_publish_pending_.store(false);
-                    }
-                }
+                // Serialize retries with remount so an older attempt cannot
+                // clear the pending status of a newer publication.
+                remount_segment_future =
+                    std::async(std::launch::async, retry_metadata);
             }
 
             std::this_thread::sleep_for(
@@ -5903,7 +5936,10 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
         }
     }
-    // Explicitly wait for the remount segment thread to finish
+    if (gather_refresh_thread.joinable()) {
+        gather_refresh_thread.join();
+    }
+    // Finish remounts and metadata retries before destroying the client.
     if (remount_segment_future.valid()) {
         remount_segment_future.wait();
     }
