@@ -28,6 +28,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -6936,6 +6938,155 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, 0);
     ASSERT_TRUE(recovered.BatchOffload(make_batch(0), nullptr));
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
+}
+
+TEST_F(StorageBackendTest, StreamFailureCheckpointsCommittedEvictions) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_config;
+    backend_config.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_config.persist_mode = OffsetPersistMode::kStrict;
+    std::vector<std::string> evicted;
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_config);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        for (const auto& key : {"victim-a", "victim-b", "victim-c"}) {
+            auto batch =
+                MakeSingleKeyBatch(key, std::string(4096, 'v'), buffers);
+            ASSERT_TRUE(backend.BatchOffload(batch, NoopCompleteHandler(),
+                                             AcceptAllEvictionHandler()));
+        }
+        backend.SetSkipFinalCheckpointForTest();
+        bool published = false;
+        auto result = backend.OffloadStream(
+            "failed-stream", 48 * 1024,
+            [](int, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            },
+            [&](const auto&, auto&) {
+                published = true;
+                return ErrorCode::OK;
+            },
+            [&](const std::vector<std::string>& keys)
+                -> tl::expected<void, ErrorCode> {
+                evicted.insert(evicted.end(), keys.begin(), keys.end());
+                return {};
+            });
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        EXPECT_FALSE(published);
+        ASSERT_EQ(evicted.size(), 3U);
+        for (const auto& key : evicted) EXPECT_FALSE(*backend.IsExist(key));
+    }
+    OffsetAllocatorStorageBackend recovered(config, backend_config);
+    ASSERT_TRUE(recovered.Init());
+    for (const auto& key : evicted)
+        EXPECT_FALSE(*recovered.IsExist(key)) << key;
+    EXPECT_FALSE(*recovered.IsExist("failed-stream"));
+}
+
+TEST_F(StorageBackendTest, StreamRecoveryCleansOrphansWithoutEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "stream-recovery";
+    backend_config.enable_eviction = false;
+    const std::string value = "committed-value";
+    {
+        StorageBackendAdaptor backend(config, backend_config);
+        ASSERT_TRUE(backend.Init());
+        ASSERT_TRUE(backend.ScanMeta(NoopCompleteHandler()));
+        ASSERT_TRUE(backend.OffloadStream(
+            "committed", value.size(),
+            [&](int fd, uint64_t offset,
+                uint64_t size) -> tl::expected<void, ErrorCode> {
+                if (pwrite(fd, value.data(), size, offset) !=
+                    static_cast<ssize_t>(size))
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                return {};
+            },
+            NoopCompleteHandler()));
+    }
+    const auto temporary = fs::path(data_path) / backend_config.fsdir /
+                           ".streaming" / "interrupted";
+    fs::create_directories(temporary.parent_path());
+    std::ofstream(temporary) << "partial-payload";
+    StorageBackendAdaptor recovered(config, backend_config);
+    ASSERT_TRUE(recovered.Init());
+    ASSERT_TRUE(recovered.ScanMeta(NoopCompleteHandler()));
+    EXPECT_FALSE(fs::exists(temporary));
+    EXPECT_FALSE(*recovered.IsExist("interrupted"));
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, Slice> reads{
+        {"committed", {output.data(), output.size()}}};
+    ASSERT_TRUE(recovered.BatchLoad(reads));
+    EXPECT_EQ(output, value);
+}
+
+TEST_F(StorageBackendTest, StreamReportsWriteErrnoToDiskObserver) {
+    ASSERT_EXIT(
+        ([&] {
+            FileStorageConfig config;
+            config.storage_filepath = data_path;
+            BucketStorageBackend backend(config, BucketBackendConfig{});
+            if (!backend.Init()) _exit(1);
+            std::vector<std::pair<int, std::string>> reported;
+            backend.SetDiskErrorObserver([&](int err, const char* op) {
+                reported.emplace_back(err, op);
+            });
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(2);
+            limit.rlim_cur = 0;
+            signal(SIGXFSZ, SIG_IGN);
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(3);
+            bool writer_called = false;
+            auto result = backend.OffloadStream(
+                "write-failure", 4096,
+                [&](int, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+                    writer_called = true;
+                    return {};
+                },
+                NoopCompleteHandler());
+            const bool observed = reported.size() == 1 &&
+                                  reported[0].first == EFBIG &&
+                                  reported[0].second == "pwrite";
+            _exit(!result && !writer_called && observed ? 0 : 4);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StorageBackendTest, StreamReportsSyncErrnoButNotWriterCancellation) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::pair<int, std::string>> reported;
+    backend.SetDiskErrorObserver(
+        [&](int err, const char* op) { reported.emplace_back(err, op); });
+    auto result = backend.OffloadStream(
+        "sync-failure", 4096,
+        [](int fd, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(close(fd), 0);
+            return {};
+        },
+        NoopCompleteHandler());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(reported.size(), 1U);
+    if (reported.size() == 1) {
+        EXPECT_EQ(reported[0], std::make_pair(EBADF, std::string("fdatasync")));
+    }
+    reported.clear();
+    auto cancelled = backend.OffloadStream(
+        "cancelled-stream", 4096,
+        [](int, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+            errno = EIO;
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        },
+        NoopCompleteHandler());
+    ASSERT_FALSE(cancelled);
+    EXPECT_TRUE(reported.empty());
 }
 
 TEST_F(StorageBackendTest, StreamWriteNativeFormatsRecoveryAndCancellation) {
