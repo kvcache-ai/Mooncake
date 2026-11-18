@@ -100,13 +100,37 @@ watermark; if provider accounting includes non-Mooncake data, or too little
 Mooncake data is eligible, usage can remain above the low watermark.
 
 This first stage reuses the existing memory eviction index. An automatic KVCS
-watermark candidate must therefore have both a completed memory replica and a
+watermark candidate must therefore have both a readable memory replica and a
 completed KVCS DFS replica, which matches the HiCache configuration validated
 for this change. DFS-only KVCS objects are not selected by automatic watermark
 eviction yet.
 
-Automatic KVCS watermark eviction is disabled when OpLog durability is enabled
-because provider deletion is not yet tied to the durable metadata finalizer.
+With OpLog enabled, watermark eviction uses the same metadata reclaimer as
+memory eviction. Under the per-key write lock, Mooncake verifies that a surviving
+memory replica is readable, reserves OpLog capacity, deletes the KVCS value, and
+submits the DFS-replica removal. A full queue therefore leaves the value intact.
+After a successful delete, the DFS replica stays unreadable even if submission
+fails. A single pending metadata removal is retried before sampling capacity,
+including below the watermark or when the capacity query fails; no further
+provider deletes start until it is submitted. The retry checks the original
+object generation and replica IDs and never repeats the provider delete.
+Accepted submissions use the writer's existing durability retries and finalizer.
+A provider-delete failure leaves metadata unchanged for a later refresh.
+A crash after provider delete but
+before the OpLog record becomes durable can temporarily leave a stale DFS
+replica, which is reconciled by the existing explicit-Get miss path.
+
+Before voluntarily releasing HA leadership, the supervisor stops scheduling
+KVCS capacity refreshes, joins the current eviction pass, and retries any pending
+metadata submission while the OpLog writer is still running. Healthy accepted
+submissions finish through the existing writer shutdown path; backend failures
+can still prevent durability. This orders local eviction work before the handoff;
+it does not fence a provider request after lease loss or an SDK timeout.
+Cross-primary deletion requires the provider to atomically delete only the
+selected object version. The public KVCS 0.6.0 Low Level delete API accepts
+only keys and has no version condition. Version-conditional deletion and its
+integration remain prerequisites for HA watermark eviction across leadership
+changes. A local key lock or a leadership check before Delete is insufficient.
 
 Deployments should configure the KVCS GC watermark to 100%. Current KVCS
 cannot fully disable automatic GC, so this only makes provider-side deletion

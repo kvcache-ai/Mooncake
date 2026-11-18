@@ -758,6 +758,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto stop_term_resources =
             [&](std::unique_ptr<LeadershipMonitorHandle>& monitor) {
                 worker_pool.reset();
+                // Drain before voluntary release, while the OpLog writer can
+                // still accept the eviction's metadata update. Lease loss and
+                // late provider requests require provider-side fencing.
+                wrapped_master_service->StopKvcsCapacityRefresh();
                 StopLeadershipMonitor(monitor);
                 wrapped_master_service->StopBatchOpLogWriter();
                 DeactivateServingState(admin_server, label_reconciler);
@@ -1029,6 +1033,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         worker_pool.reset();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
+        wrapped_master_service->StopKvcsCapacityRefresh();
         StopLeadershipMonitor(leadership_monitor_handle);
         wrapped_master_service->StopBatchOpLogWriter();
         DeactivateServingState(admin_server, label_reconciler);
