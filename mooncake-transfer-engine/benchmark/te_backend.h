@@ -18,14 +18,11 @@
 #include "bench_runner.h"
 #include "utils.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 #include <functional>
-#include <fcntl.h>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <signal.h>
-#include <sys/time.h>
 #include <atomic>
 
 #include "transfer_engine.h"
@@ -48,23 +45,23 @@ class TEBenchRunner : public BenchRunner {
 
     std::string getSegmentName() const { return engine_->getLocalIpAndPort(); }
 
-    uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
-                                uint64_t batch_size) const {
+    std::optional<uint64_t> getLocalBufferBase(int thread_id,
+                                               uint64_t stride) const {
         const size_t num_buffers = pinned_buffer_list_.size();
-        return (uint64_t)pinned_buffer_list_[thread_id % num_buffers] +
-               block_size * batch_size * (thread_id / num_buffers);
+        return slotAddress(
+            (uint64_t)pinned_buffer_list_[thread_id % num_buffers],
+            XferBenchConfig::total_buffer_size, stride,
+            thread_id / num_buffers);
     }
 
-    uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
-                                 uint64_t batch_size) const {
+    std::optional<uint64_t> getTargetBufferBase(int thread_id,
+                                                uint64_t window) const {
         const int local_thread_id = localTargetThreadId(thread_id);
         const auto& info = target_infos_[getTargetIndex(thread_id)];
         const auto& buffer =
             info->buffers[local_thread_id % info->buffers.size()];
-        return targetSlotAddress(
-            thread_id, buffer.addr, buffer.length,
-            checkedMul(block_size, batch_size, "target operation size"),
-            local_thread_id / info->buffers.size());
+        return targetSlotAddress(buffer.addr, buffer.length, window,
+                                 local_thread_id / info->buffers.size());
     }
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_id,

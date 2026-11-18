@@ -70,6 +70,10 @@ class TransferEngineImplTestPeer {
         tent::TransferEngineImpl& engine) {
         return engine.metadata_;
     }
+    static void requireFabric(tent::TransferEngineImpl& engine) {
+        engine.mnnvl_config_.require_fabric = true;
+        engine.mnnvl_config_.egm_enabled = false;
+    }
 };
 
 namespace tent {
@@ -86,12 +90,14 @@ class MnnvlTransportTestPeer {
         transport.metadata_ = std::move(metadata);
         transport.platform_ =
             dynamic_cast<CudaPlatform*>(&Platform::getLoader());
+        transport.options_.require_fabric = true;
         transport.handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
         transport.caps.gpu_to_gpu = true;
     }
     static void configureRegistration(
         MnnvlTransport& transport, std::shared_ptr<ControlService> metadata) {
         configureLocalCopies(transport, std::move(metadata));
+        transport.options_.require_fabric = false;
         transport.handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     }
 
@@ -363,6 +369,7 @@ Status installLocalSegmentWithMnnvlHandle(ControlService& metadata,
             buffer.length = length;
             buffer.location = "cuda:0";
             buffer.mnnvl_handle = mnnvl_handle;
+            buffer.transports = {MNNVL};
             memory.buffers.push_back(std::move(buffer));
             return Status::OK();
         });
@@ -1233,6 +1240,54 @@ TEST_F(MnnvlCompletionTest, CpuBlockAndReadKeepExistingOrdering) {
     expectPattern(source_, 0x69);
 }
 
+TEST_F(MnnvlCompletionTest, CopyWaitsForRequestProducerEvent) {
+    CUDAStreamPool pool;
+    CUDAStreamHandle producer_stream;
+    ASSERT_TRUE(pool.acquire(producer_stream, 0).ok());
+    ASSERT_EQ(cudaMemset(source_, 0, kBufferLength), cudaSuccess);
+    cudaEvent_t producer_event = nullptr;
+    ASSERT_EQ(cudaEventCreateWithFlags(&producer_event, cudaEventDisableTiming),
+              cudaSuccess);
+
+    struct Gate {
+        std::atomic<bool> released{false};
+        cudaStream_t stream;
+        ~Gate() {
+            released.store(true);
+            cudaStreamSynchronize(stream);
+        }
+    } gate{{false}, producer_stream.get()};
+    ASSERT_EQ(cudaLaunchHostFunc(
+                  producer_stream.get(),
+                  [](void* data) {
+                      auto& gate = *static_cast<Gate*>(data);
+                      // Bound the wait even if the test exits unexpectedly.
+                      auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(5);
+                      while (!gate.released.load() &&
+                             std::chrono::steady_clock::now() < deadline)
+                          std::this_thread::yield();
+                  },
+                  &gate),
+              cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(source_, 0x5a, kBufferLength, producer_stream.get()),
+        cudaSuccess);
+    ASSERT_EQ(cudaEventRecord(producer_event, producer_stream.get()),
+              cudaSuccess);
+
+    auto req = request();
+    req.producer_event = producer_event;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {req}).ok());
+    TransferStatus before_release{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch_, 0, before_release).ok());
+    EXPECT_EQ(before_release.s, PENDING);
+    gate.released.store(true);
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    expectPattern(target_, 0x5a);
+    EXPECT_EQ(cudaEventDestroy(producer_event), cudaSuccess);
+}
+
 TEST_F(MnnvlCompletionTest, FailedValidationPreservesEarlierTasks) {
     ASSERT_EQ(cudaMemset(source_, 0x12, kBufferLength), cudaSuccess);
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());
@@ -1247,6 +1302,98 @@ TEST_F(MnnvlCompletionTest, FailedValidationPreservesEarlierTasks) {
     EXPECT_EQ(batch_->size(), 1);
     EXPECT_EQ(finish(0).s, COMPLETED);
     expectPattern(target_, 0x12);
+}
+
+TEST_F(MnnvlCompletionTest, StrictLocalOnlyCopiesUseDefaultEnginePolicy) {
+    // Test real CUDA copies through engine routing without requiring IMEX or
+    // installing a remote FABRIC transport. Cross-node tests remain separate.
+    for (bool legacy : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "legacy=" << legacy);
+        auto config = makeRegistrationEngineConfig();
+        config->set("use_legacy_transport_selection", legacy);
+        config->set("merge_requests", false);
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        TransferEngineImplTestPeer::requireFabric(engine);
+        auto metadata = TransferEngineImplTestPeer::metadata(engine);
+        auto fabric = std::make_shared<MnnvlTransport>();
+        MnnvlTransportTestPeer::configureLocalCopies(*fabric, metadata);
+        engine.swapTransportForTest(MNNVL, fabric);
+        MemoryOptions options;
+        options.type = MNNVL;
+        options.perm = kLocalReadWrite;
+        ASSERT_TRUE(engine
+                        .registerLocalMemory({source_, target_},
+                                             {kBufferLength, kBufferLength},
+                                             options)
+                        .ok());
+        auto expect_unexported = [&] {
+            auto local = metadata->segmentManager().getLocal();
+            for (auto* address : {source_, target_}) {
+                auto* buffer = local->findBuffer(
+                    reinterpret_cast<uint64_t>(address), kBufferLength);
+                ASSERT_NE(buffer, nullptr);
+                EXPECT_EQ(buffer->permission, kLocalReadWrite);
+                EXPECT_TRUE(buffer->transports.empty());
+                EXPECT_TRUE(buffer->mnnvl_handle.empty());
+            }
+        };
+        expect_unexported();
+        uint8_t pattern = 0x40;
+        for (auto hint : {UNSPEC, MNNVL}) {
+            for (auto opcode : {Request::READ, Request::WRITE}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "hint=" << hint << " opcode=" << opcode);
+                void* input = opcode == Request::WRITE ? source_ : target_;
+                void* output = opcode == Request::WRITE ? target_ : source_;
+                ASSERT_EQ(cudaMemsetAsync(input, ++pattern, kBufferLength,
+                                          cudaStreamPerThread),
+                          cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(output, 0, kBufferLength,
+                                          cudaStreamPerThread),
+                          cudaSuccess);
+                auto req = request(opcode);
+                req.transport_hint = hint;
+                auto batch = engine.allocateBatch(1);
+                ASSERT_NE(batch, (BatchID)0);
+                ASSERT_TRUE(engine.submitTransfer(batch, {req}).ok());
+                TransferStatus status{PENDING, 0};
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                do {
+                    ASSERT_TRUE(
+                        engine.getTransferStatus(batch, 0, status).ok());
+                    if (status.s != PENDING && status.s != INITIAL) break;
+                    std::this_thread::yield();
+                } while (std::chrono::steady_clock::now() < deadline);
+                EXPECT_TRUE(engine.freeBatch(batch).ok());
+                ASSERT_EQ(status.s, COMPLETED)
+                    << "Engine-routed local MNNVL copy failed or timed "
+                       "out";
+                EXPECT_EQ(status.transferred_bytes, kBufferLength);
+                expectPattern(output, pattern);
+            }
+        }
+        expect_unexported();
+        EXPECT_TRUE(engine
+                        .unregisterLocalMemory({source_, target_},
+                                               {kBufferLength, kBufferLength})
+                        .ok());
+    }
+}
+
+TEST_F(MnnvlCompletionTest, StrictGpuRegistrationPreservesLocalOnlyEndpoints) {
+    BufferDesc buffer;
+    buffer.addr = reinterpret_cast<uint64_t>(source_);
+    buffer.length = kBufferLength;
+    buffer.location = "cuda:0";
+    MemoryOptions options;
+    options.perm = kLocalReadWrite;
+    EXPECT_TRUE(transport_.addMemoryBuffer(buffer, options).ok());
+    EXPECT_TRUE(buffer.mnnvl_handle.empty());
+    EXPECT_TRUE(buffer.transports.empty());
+    options.perm = kGlobalReadWrite;
+    EXPECT_FALSE(transport_.addMemoryBuffer(buffer, options).ok());
 }
 
 #ifdef MNNVL_TEST_CUDA_WRAPPERS
@@ -1321,6 +1468,41 @@ TEST_F(MnnvlCompletionTest, MalformedFabricHandlesReturnValidationErrors) {
                         transport_, address, kBufferLength, LOCAL_SEGMENT_ID)
                         .IsInvalidArgument());
     }
+}
+
+TEST_F(MnnvlCompletionTest, StrictOwnedVmmAllocationExportsTrackedExtent) {
+    int supported = 0;
+    if (cuDeviceGetAttribute(&supported,
+                             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                             0) != CUDA_SUCCESS ||
+        !supported)
+        GTEST_SKIP() << "No CUDA FABRIC allocation support";
+    MemoryOptions options;
+    options.location = "cuda:0";
+    void* address = nullptr;
+    const auto allocation =
+        transport_.allocateLocalMemory(&address, kBufferLength, options);
+    if (!allocation.ok())
+        GTEST_SKIP() << "FABRIC/IMEX allocation unavailable: "
+                     << allocation.ToString();
+    BufferDesc buffer;
+    buffer.addr = reinterpret_cast<uint64_t>(address);
+    buffer.length = kBufferLength;
+    buffer.location = "cuda:0";
+    buffer.permission = kGlobalReadWrite;
+    const auto registration = transport_.addMemoryBuffer(buffer, options);
+    EXPECT_TRUE(registration.ok()) << registration.ToString();
+    EXPECT_FALSE(buffer.mnnvl_handle.empty());
+    EXPECT_EQ(buffer.addr, reinterpret_cast<uint64_t>(address));
+    EXPECT_EQ(buffer.length, kBufferLength);
+    if (registration.ok() && !buffer.mnnvl_handle.empty() &&
+        buffer.mnnvl_handle.front() == '{') {
+        const auto envelope = json::parse(buffer.mnnvl_handle);
+        EXPECT_GE(envelope.at("mapped_length").get<size_t>(), kBufferLength);
+        EXPECT_EQ(envelope.at("offset").get<uint64_t>(), 0);
+    }
+    EXPECT_TRUE(transport_.removeMemoryBuffer(buffer).ok());
+    EXPECT_TRUE(transport_.freeLocalMemory(address, kBufferLength).ok());
 }
 
 TEST_F(MnnvlCompletionTest,
