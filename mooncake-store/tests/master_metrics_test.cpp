@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -1405,6 +1406,144 @@ TEST_F(MasterMetricsTest, KeyGroupMetrics) {
 
     metrics.configure_key_groups("");
 }
+
+// Read a counter sample from the serialized output. ylt counters
+// serialize as "<exported_name> <value>"; the exported name embeds the
+// registration name, so searching for the line that contains it (and
+// nothing but the sample for that series) is robust to prefixes.
+static int64_t MetricSampleValue(const std::string& serialized,
+                                 const std::string& name) {
+    std::istringstream iss(serialized);
+    std::string line;
+    while (std::getline(iss, line)) {
+        // Skip HELP/TYPE comment lines: they contain the name too, but
+        // their last token is descriptive text, not the sample value.
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        const auto pos = line.find(name);
+        // The sample name must start the line: a prefixed series (e.g.
+        // legacy_nof_cache_hit_nums) must not satisfy the lookup.
+        if (pos != 0) {
+            continue;
+        }
+        // Word boundary: the sample for "nof_cache_hit_nums" must not
+        // match an exported "nof_cache_hit_nums_" (trailing-underscore)
+        // series.
+        const size_t after = pos + name.size();
+        if (after < line.size() && line[after] != ' ' && line[after] != '{') {
+            continue;
+        }
+        const auto value_pos = line.find_last_of(' ');
+        if (value_pos == std::string::npos) {
+            continue;
+        }
+        try {
+            return std::stoll(line.substr(value_pos + 1));
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    ADD_FAILURE() << "metric " << name << " missing from serialized output";
+    return 0;
+}
+
+// The NoF cache-hit counters must be exported even before any NoF traffic
+// (pre-registration with inc(0)) and must track hits independently from
+// the memory and SSD file-cache counters, in both counts and bytes.
+TEST_F(MasterMetricsTest, NofCacheHitCountersAreExportedAndIndependent) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const int64_t base_nof_nums =
+        MetricSampleValue(metrics.serialize_metrics(), "nof_cache_hit_nums");
+    const int64_t base_nof_bytes = MetricSampleValue(
+        metrics.serialize_metrics(), "nof_cache_hit_bytes_total");
+    const int64_t base_file_nums =
+        MetricSampleValue(metrics.serialize_metrics(), "file_cache_hit_nums_");
+    const int64_t base_file_bytes = MetricSampleValue(
+        metrics.serialize_metrics(), "file_cache_hit_bytes_total");
+    const int64_t base_mem_nums =
+        MetricSampleValue(metrics.serialize_metrics(), "mem_cache_hit_nums_");
+    const int64_t base_mem_bytes = MetricSampleValue(
+        metrics.serialize_metrics(), "mem_cache_hit_bytes_total");
+
+    constexpr int64_t kHitBytes = 4096;
+    metrics.inc_nof_cache_hit_nums();
+    metrics.inc_nof_cache_hit_nums();
+    metrics.inc_nof_cache_hit_bytes(kHitBytes);
+
+    const std::string serialized = metrics.serialize_metrics();
+    EXPECT_EQ(MetricSampleValue(serialized, "nof_cache_hit_nums"),
+              base_nof_nums + 2);
+    EXPECT_EQ(MetricSampleValue(serialized, "nof_cache_hit_bytes_total"),
+              base_nof_bytes + kHitBytes);
+    // NoF hits must not leak into the other pools' counters.
+    EXPECT_EQ(MetricSampleValue(serialized, "file_cache_hit_nums_"),
+              base_file_nums);
+    EXPECT_EQ(MetricSampleValue(serialized, "file_cache_hit_bytes_total"),
+              base_file_bytes);
+    EXPECT_EQ(MetricSampleValue(serialized, "mem_cache_hit_nums_"),
+              base_mem_nums);
+    EXPECT_EQ(MetricSampleValue(serialized, "mem_cache_hit_bytes_total"),
+              base_mem_bytes);
+}
+
+#ifdef USE_NOF
+// End-to-end: a GetReplicaList served by a NoF replica must count against
+// the NoF cache-hit counters (previously NoF hits were counted nowhere).
+TEST_F(MasterMetricsTest, GetReplicaListNoFHitCountsNofCounters) {
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = true;
+    WrappedMasterService service_(service_config);
+    const UUID client_id = generate_uuid();
+
+    NoFSegment nof_segment;
+    nof_segment.id = generate_uuid();
+    nof_segment.name = "metrics_nof_segment";
+    nof_segment.base = 0x400000000;
+    nof_segment.size = 1024 * 1024 * 16;
+    nof_segment.te_endpoint = "metrics_nof_segment_endpoint";
+    ASSERT_TRUE(service_.MountNoFSegment(nof_segment, client_id).has_value());
+
+    constexpr uint64_t kValueLength = 2048;
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+    const std::string key = "metrics_nof_hit_key";
+    ASSERT_TRUE(
+        service_.PutStart(client_id, key, kValueLength, config).has_value());
+    ASSERT_TRUE(
+        service_
+            .PutEnd(client_id, ObjectMeta{key, std::nullopt}, ReplicaType::ALL)
+            .has_value());
+
+    // Baselines after the writes: a read below must be the only delta.
+    auto sample = [&metrics](const std::string& name) {
+        return MetricSampleValue(metrics.serialize_metrics(), name);
+    };
+    const int64_t base_nof_nums = sample("nof_cache_hit_nums");
+    const int64_t base_nof_bytes = sample("nof_cache_hit_bytes_total");
+    const int64_t base_file_nums = sample("file_cache_hit_nums_");
+    const int64_t base_file_bytes = sample("file_cache_hit_bytes_total");
+    const int64_t base_mem_nums = sample("mem_cache_hit_nums_");
+    const int64_t base_mem_bytes = sample("mem_cache_hit_bytes_total");
+
+    auto get_result = service_.GetReplicaList(key);
+    ASSERT_TRUE(get_result.has_value());
+    ASSERT_FALSE(get_result->replicas.empty());
+    ASSERT_TRUE(get_result->replicas[0].is_nof_replica());
+
+    EXPECT_EQ(sample("nof_cache_hit_nums"), base_nof_nums + 1);
+    EXPECT_EQ(sample("nof_cache_hit_bytes_total"),
+              base_nof_bytes + static_cast<int64_t>(kValueLength));
+    EXPECT_EQ(sample("file_cache_hit_nums_"), base_file_nums);
+    EXPECT_EQ(sample("file_cache_hit_bytes_total"), base_file_bytes);
+    EXPECT_EQ(sample("mem_cache_hit_nums_"), base_mem_nums);
+    EXPECT_EQ(sample("mem_cache_hit_bytes_total"), base_mem_bytes);
+}
+#endif  // USE_NOF
 
 }  // namespace mooncake::test
 

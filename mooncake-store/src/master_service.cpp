@@ -4693,7 +4693,6 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // TODO: NoF SSD support (ranhaojia)
     if (replica_list[0].is_memory_replica()) {
         MasterMetricManager::instance().inc_mem_cache_hit_nums();
         MasterMetricManager::instance().inc_mem_cache_hit_bytes(
@@ -4702,6 +4701,12 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
                replica_list[0].is_disk_replica()) {
         MasterMetricManager::instance().inc_file_cache_hit_nums();
         MasterMetricManager::instance().inc_file_cache_hit_bytes(
+            static_cast<int64_t>(metadata.TotalLength()));
+    } else if (replica_list[0].is_nof_replica()) {
+        // NoF hits are tracked separately from the SSD file cache: the
+        // pools are provisioned and sized independently.
+        MasterMetricManager::instance().inc_nof_cache_hit_nums();
+        MasterMetricManager::instance().inc_nof_cache_hit_bytes(
             static_cast<int64_t>(metadata.TotalLength()));
     }
     MasterMetricManager::instance().inc_valid_get_nums();

@@ -41,10 +41,13 @@ class MasterMetricManager {
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
+    void inc_nof_cache_hit_nums(int64_t val = 1);
     void inc_mem_cache_hit_bytes(int64_t val = 1);
     void inc_file_cache_hit_bytes(int64_t val = 1);
+    void inc_nof_cache_hit_bytes(int64_t val = 1);
     int64_t get_mem_cache_hit_bytes();
     int64_t get_file_cache_hit_bytes();
+    int64_t get_nof_cache_hit_bytes();
     void inc_mem_cache_nums(int64_t val = 1);
     void inc_file_cache_nums(int64_t val = 1);
     int64_t get_mem_cache_nums();
@@ -746,8 +749,10 @@ class MasterMetricManager {
     // end-to-end request/token-level cache hit ratio.
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
+    ylt::metric::counter_t nof_cache_hit_nums_;
     ylt::metric::counter_t mem_cache_hit_bytes_;
     ylt::metric::counter_t file_cache_hit_bytes_;
+    ylt::metric::counter_t nof_cache_hit_bytes_;
     ylt::metric::gauge_t mem_cache_nums_;
     ylt::metric::gauge_t file_cache_nums_;
 
