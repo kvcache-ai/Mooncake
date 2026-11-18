@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <unistd.h>
 #ifdef USE_CUDA
 #include <dlfcn.h>
@@ -156,18 +155,64 @@ bool isKernelDmabufSupported() {
             if (found[0] && found[1]) break;
         }
 
-        // Fallback: probe /proc/kallsyms for the corresponding kernel symbols.
+        // Fallback: probe /proc/kallsyms for kernel symbols that exist ONLY
+        // when the corresponding config is enabled.
+        //
+        // The previous substring match on "pci_p2pdma" was a FALSE POSITIVE:
+        // the exported helper dma_pci_p2pdma_supported() is compiled in
+        // whenever CONFIG_HAS_DMA is set — regardless of CONFIG_PCI_P2PDMA
+        // (see include/linux/dma-mapping.h / kernel/dma/mapping.c) — so
+        // kernels without P2PDMA passed this gate. Since the config-file
+        // candidates above are typically invisible inside containers, this
+        // fallback is the deciding probe in containerized deployments.
+        //
+        // Consequence observed in production on MI308X + bnxt_re (Thor2)
+        // with kernel 6.6 lacking CONFIG_PCI_P2PDMA: the dmabuf MR path was
+        // allowed, and amdgpu silently migrated the registered VRAM buffer
+        // to GTT/system memory (mem_info_vram_used dropped by the buffer
+        // size, mem_info_gtt_used grew by the same amount). GPU-side access
+        // to the buffer collapsed from ~1838 GB/s to 115 GB/s (16x) and did
+        // not recover after MR deregistration; on a KV-cache pool this
+        // slowed attention kernels by 5-50x.
+        //
+        // The matching below is an exact symbol-name comparison (the third
+        // kallsyms field, with the __pfx_ prefix stripped) against symbols
+        // from drivers/pci/p2pdma.c, which is only compiled when
+        // CONFIG_PCI_P2PDMA=y (the =n variants are static inline and never
+        // appear in kallsyms).
         if (!found[0] || !found[1]) {
             std::ifstream f("/proc/kallsyms");
             if (f.good()) {
                 std::string line;
                 while (std::getline(f, line)) {
-                    if (!found[0] &&
-                        line.find("pci_p2pdma") != std::string::npos)
+                    // kallsyms line format: "<addr> <type> <name> [module]"
+                    size_t t1 = line.find(' ');
+                    size_t t2 = (t1 == std::string::npos)
+                                    ? std::string::npos
+                                    : line.find(' ', t1 + 1);
+                    if (t2 == std::string::npos) continue;
+                    std::string name = line.substr(t2 + 1);
+                    size_t sp = name.find(' ');
+                    if (sp != std::string::npos) name.resize(sp);
+                    // Strip the __pfx_ prefix used by newer kernels.
+                    if (name.rfind("__pfx_", 0) == 0) name.erase(0, 6);
+
+                    // Present in kallsyms iff CONFIG_PCI_P2PDMA=y.
+                    if (!found[0] && (name == "pci_p2pdma_add_resource" ||
+                                      name == "pci_p2pdma_distance_many" ||
+                                      name == "pci_p2pdma_enable_store")) {
                         found[0] = true;
-                    if (!found[1] &&
-                        line.find("dma_buf_move_notify") != std::string::npos)
+                    }
+                    // NOTE: dma_buf_move_notify() is compiled with the
+                    // dma-buf core (CONFIG_DMA_SHARED_BUFFER, see
+                    // drivers/dma-buf/dma-buf.c), so this only proves the
+                    // core exists, not that CONFIG_DMABUF_MOVE_NOTIFY=y.
+                    // No single =y-only symbol exists for MOVE_NOTIFY; the
+                    // overall gate is effectively decided by the P2PDMA
+                    // check above.
+                    if (!found[1] && name == "dma_buf_move_notify") {
                         found[1] = true;
+                    }
                     if (found[0] && found[1]) break;
                 }
             }
@@ -535,7 +580,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
-#if defined(USE_CUDA) || defined(USE_SUPA)
+#if defined(USE_CUDA) || defined(USE_SUPA) || defined(USE_MACA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
@@ -611,11 +656,15 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // the expandable-segment layout. The export base is page-aligned so
         // that offset % page_size == iova % page_size, which
         // ibv_reg_dmabuf_mr() requires.
+        const size_t page = (size_t)sysconf(_SC_PAGESIZE);
         CUdeviceptr exportBase = allocBase;
-        size_t exportSize = allocSize;
+        // cuMemGetHandleForAddressRange() requires a page-aligned size, but
+        // cuMemGetAddressRange() reports the size the caller passed to
+        // cudaMalloc(), which need not be a page multiple. Round it up, as the
+        // sub-range branch below does for its own range.
+        size_t exportSize = (allocSize + page - 1) & ~(size_t)(page - 1);
         uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
         if (length > 0 && (exportOffset != 0 || length != allocSize)) {
-            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
             if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
             exportBase = (CUdeviceptr)aligned;
@@ -742,6 +791,8 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // Offset within the dmabuf-backed region: distance from the
         // allocation base, plus any offset hsa returned for the export.
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+        out.alloc_base = allocBase;
+        out.device = hipAttr.device;
     }
 #else
     out.method = DmabufExport::Method::kHostReg;
@@ -779,6 +830,29 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
+        // #5015: a DMA-BUF MR whose start is 2^k-aligned (k >= 32) and whose
+        // length exceeds 2^k wraps every 2^k bytes, so an RDMA READ/WRITE at
+        // offset X silently lands at X mod 2^k. The wrap is below Mooncake:
+        // torvalds/linux@15fe76e23615 ("RDMA/umem: Fix truncation for block
+        // sizes >= 4G") left __rdma_block_iter_next() advancing block offset
+        // and step in 32-bit, so a block of >= 4 GiB never advances and every
+        // later block maps to the first. A single such block (length == align)
+        // never advances and is clean, so only a longer MR wraps. Warn so it is
+        // not silent. The check is VA-only: the kernel also considers the DMA
+        // address, so it may fire on some hosts that are not affected.
+        uintptr_t start = (uintptr_t)addr;
+        size_t align = start & (~start + 1);  // largest 2^k dividing start
+        if (align >= (size_t(1) << 32) && length > align) {
+            LOG(WARNING) << "DMA-BUF MR at " << addr << " length " << length
+                         << " starts on a " << align
+                         << "-byte boundary and may wrap every " << align
+                         << " bytes, corrupting RDMA offsets past that point "
+                            "(#5015, kernel block-iter truncation fixed in "
+                            "torvalds/linux@15fe76e23615). A kernel with that "
+                            "fix is unaffected; otherwise set MC_MAX_MR_SIZE "
+                            "<= 4GiB or register through nvidia-peermem "
+                            "(ibv_reg_mr) instead.";
+        }
         // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
         // by the caller until every NIC has registered; this MR takes its own
         // reference, so all NICs share one dma_buf object (and one BAR1
@@ -827,11 +901,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
+        // Capture errno before PLOG touches it: the transport needs to tell
+        // the HugeTLB sub-view EINVAL apart from every other failure so it can
+        // retry with a widened range (see
+        // RdmaTransport::registerLocalMemoryInternal).
+        const int saved_errno = errno;
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
                     << globalConfig().rdma_data_direct;
-        return ERR_CONTEXT;
+        return saved_errno == EINVAL ? ERR_CONTEXT_EINVAL : ERR_CONTEXT;
     }
     return 0;
 }
@@ -900,22 +979,14 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         memory_region_map_.erase(iter);
         return 0;
     }
-    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
-    // reading mr->length (or the cached region length) afterwards is a use-
-    // after-free. We restore fork state on the same range to undo the
-    // MADV_DONTFORK applied at register time (see issue #3639).
-    size_t region_length = iter->second.mr->length;
-    void *region_addr = static_cast<char *>(iter->second.addr) -
-                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // No MADV_DOFORK here (reverted #3660): libibverbs already restores the
+    // fork state of a plain host MR inside ibv_dereg_mr(), while dma-buf and
+    // device ranges never carried MADV_DONTFORK and madvise() on them only
+    // fails with EINVAL/ENOMEM (see issue #3639).
     memory_region_map_.erase(iter);
     return 0;
 }
@@ -934,6 +1005,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     // safe and does not affect the subsequent dereg.
     closeDmabufExport(exp);
     if (ret != 0) {
+        // Propagates ERR_CONTEXT_EINVAL unchanged: the fault-in attempt runs
+        // before any MR is recorded, so the transport can retry it widened.
         return ret;
     }
     if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC
@@ -1580,18 +1653,46 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
-        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
-        max_qp_init_rd_atom_ =
-            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
-        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
-            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+        supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
+        {
+            // Scoped so the gotos to cleanup_context_and_devices below do not
+            // jump past this initialization.
+            const auto &config = globalConfig();
+            max_qp_rd_atom_ = resolveRdAtomicDepth(config.max_dest_rd_atomic,
+                                                   device_attr.max_qp_rd_atom);
+            max_qp_init_rd_atom_ = resolveRdAtomicDepth(
+                config.max_rd_atomic, device_attr.max_qp_init_rd_atom);
+            if (config.max_rd_atomic > 0 || config.max_dest_rd_atomic > 0) {
+                LOG(INFO) << "Device " << device_name
+                          << " RD-atomic depth: max_rd_atomic="
+                          << max_qp_init_rd_atom_
+                          << " (MC_MAX_RD_ATOMIC=" << config.max_rd_atomic
+                          << ", device max_qp_init_rd_atom="
+                          << device_attr.max_qp_init_rd_atom
+                          << "), max_dest_rd_atomic=" << max_qp_rd_atom_
+                          << " (MC_MAX_DEST_RD_ATOMIC="
+                          << config.max_dest_rd_atomic
+                          << ", device max_qp_rd_atom="
+                          << device_attr.max_qp_rd_atom << ")";
+            }
+        }
+        if (!supports_rdma_atomic_) {
+            LOG(INFO) << "RNIC " << device_name
+                      << " reports no RDMA atomic; data QPs will not request "
+                         "IBV_ACCESS_REMOTE_ATOMIC";
+        }
+        if (clampRdAtomicDepth(device_attr.max_qp_rd_atom) <
+                kIdealRdAtomicDepth ||
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom) <
+                kIdealRdAtomicDepth) {
             LOG(WARNING)
                 << "Device " << device_name
                 << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
-                << max_qp_rd_atom_
-                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
-                << "; QPs on this NIC will use those "
-                << "values instead of the default " << kIdealRdAtomicDepth;
+                << device_attr.max_qp_rd_atom
+                << ", max_qp_init_rd_atom=" << device_attr.max_qp_init_rd_atom
+                << "; QPs on this NIC will use max_dest_rd_atomic="
+                << max_qp_rd_atom_ << ", max_rd_atomic=" << max_qp_init_rd_atom_
+                << " instead of the default " << kIdealRdAtomicDepth;
         }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;

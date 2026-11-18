@@ -63,6 +63,8 @@ class HideCommittedTxnReply : public HaKvBackend {
     explicit HideCommittedTxnReply(HaKvBackend& inner) : inner_(inner) {}
 
     void HideNextSuccess() { hide_next_success_ = true; }
+    void FailBeforeNextCommit() { fail_before_next_commit_ = true; }
+    size_t txn_calls{0};
 
     ErrorCode Get(std::string_view key, std::string& value) override {
         return inner_.Get(key, value);
@@ -80,17 +82,27 @@ class HideCommittedTxnReply : public HaKvBackend {
     }
     bool SupportsTxn() const override { return inner_.SupportsTxn(); }
     ErrorCode Txn(const KvTxn& txn) override {
-        const ErrorCode err = inner_.Txn(txn);
-        if (hide_next_success_ && err == ErrorCode::OK) {
-            hide_next_success_ = false;
-            return ErrorCode::ETCD_OPERATION_ERROR;
+        return TxnWithResult(txn).ToLegacyError();
+    }
+    KvWriteResult TxnWithResult(const KvTxn& txn) override {
+        ++txn_calls;
+        if (fail_before_next_commit_) {
+            fail_before_next_commit_ = false;
+            return KvWriteResult::FromError(ErrorCode::ETCD_OPERATION_ERROR);
         }
-        return err;
+        auto result = inner_.TxnWithResult(txn);
+        if (hide_next_success_ && result.status == KvWriteStatus::kCommitted) {
+            hide_next_success_ = false;
+            result.status = KvWriteStatus::kOutcomeUnknown;
+            result.error = ErrorCode::ETCD_OPERATION_ERROR;
+        }
+        return result;
     }
 
    private:
     HaKvBackend& inner_;
     bool hide_next_success_{false};
+    bool fail_before_next_commit_{false};
 };
 
 class RedisOpLogRecoveryTest : public ::testing::Test {
@@ -200,8 +212,10 @@ TEST_F(RedisOpLogRecoveryTest, LostReplyAfterCommitIsReconciled) {
     ASSERT_EQ(ErrorCode::OK, primary.InitDurablePrefix(prefix));
     ASSERT_EQ(ErrorCode::OK, primary.ClaimProducerView(1));
     hidden.HideNextSuccess();
-    ASSERT_EQ(ErrorCode::OK,
-              Write(MakeBatch(1, 1, "acked"), prefix, /*view=*/1));
+    const auto calls_before_write = hidden.txn_calls;
+    ASSERT_EQ(ErrorCode::OK, primary.WriteBatchAndAdvancePrefix(
+                                 MakeBatch(1, 1, "acked"), prefix, /*view=*/1));
+    EXPECT_EQ(calls_before_write + 1, hidden.txn_calls);
 
     std::vector<OpLogBatchRecord> batches;
     ASSERT_EQ(ErrorCode::OK, primary.ReadBatchesAfter(0, 10, batches));
@@ -213,6 +227,31 @@ TEST_F(RedisOpLogRecoveryTest, LostReplyAfterCommitIsReconciled) {
                                  MakeBatch(1, 1, "acked"), stale, /*view=*/1));
     ASSERT_EQ(ErrorCode::OK, primary.ReadBatchesAfter(0, 10, batches));
     EXPECT_EQ(1u, batches.size());
+}
+
+TEST_F(RedisOpLogRecoveryTest,
+       UnknownUncommittedReplyRetriesOriginalBatchIdentity) {
+    HideCommittedTxnReply hidden(*backend_);
+    OpLogBatchStorage primary(cluster_id_, hidden);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, primary.InitDurablePrefix(prefix));
+    ASSERT_EQ(ErrorCode::OK, primary.ClaimProducerView(1));
+    const auto batch = MakeBatch(1, 1, "retry");
+    hidden.FailBeforeNextCommit();
+    const auto calls_before_write = hidden.txn_calls;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              primary.WriteBatchAndAdvancePrefix(batch, prefix, 1));
+    EXPECT_EQ(calls_before_write + 1, hidden.txn_calls);
+    DurablePrefix unchanged;
+    ASSERT_EQ(ErrorCode::OK, primary.ReadDurablePrefix(unchanged));
+    EXPECT_EQ(0u, unchanged.batch_id);
+    ASSERT_EQ(ErrorCode::OK,
+              primary.WriteBatchAndAdvancePrefix(batch, prefix, 1));
+    std::vector<OpLogBatchRecord> batches;
+    ASSERT_EQ(ErrorCode::OK, primary.ReadBatchesAfter(0, 10, batches));
+    ASSERT_EQ(1u, batches.size());
+    EXPECT_EQ(1u, batches[0].batch_id);
+    EXPECT_EQ("retry", batches[0].entries[0].object_key);
 }
 
 TEST_F(RedisOpLogRecoveryTest, EmptyRedisDoesNotContinueACaughtUpStandby) {

@@ -46,7 +46,11 @@ class FakeBufferPool:
 
 store_module = types.ModuleType("mooncake.store")
 store_module.MooncakeDistributedStore = object
-store_module.ReplicateConfig = type("ReplicateConfig", (), {})
+store_module.ReplicateConfig = type(
+    "ReplicateConfig",
+    (),
+    {"replica_num": 1, "nof_replica_num": 0, "dfs_replica_num": 0},
+)
 store_module.BufferPool = FakeBufferPool
 sys.modules.setdefault("mooncake", types.ModuleType("mooncake"))
 sys.modules["mooncake.store"] = store_module
@@ -130,8 +134,13 @@ class ReplicaConfigTest(unittest.TestCase):
                         )[0]
                         store.batch_get_into.side_effect = read_into
                         runner = bench.BenchmarkRunner(args)
+                        fake_module = types.SimpleNamespace(
+                            MooncakeDistributedStore=Mock(return_value=store),
+                            ReplicateConfig=store_module.ReplicateConfig,
+                            BufferPool=FakeBufferPool,
+                        )
                         with patch.object(
-                            bench, "MooncakeDistributedStore", return_value=store
+                            bench, "load_store_module", return_value=fake_module
                         ):
                             try:
                                 phases = runner.run()
@@ -155,7 +164,7 @@ class ReplicaConfigTest(unittest.TestCase):
                         writes = getattr(store, write_api).call_args_list
                         self.assertTrue(writes)
                         for call in writes:
-                            config = call.args[-1]
+                            config = call.kwargs["config"]
                             self.assertEqual(
                                 (
                                     config.replica_num,
@@ -231,7 +240,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
             def __init__(self):
                 self.values = {}
 
-            def put(self, key, value, _config):
+            def put(self, key, value, config=None):
                 self.values[key] = value
                 return 0
 
@@ -247,7 +256,6 @@ class StoreSessionMetadataTest(unittest.TestCase):
         args = SimpleNamespace(
             memory_replica_num=1,
             nof_replica_num=0,
-            dfs_replica_num=0,
             key_prefix="metadata",
             key_size=24,
             value_size=512,
@@ -255,7 +263,13 @@ class StoreSessionMetadataTest(unittest.TestCase):
             batch_size=1,
         )
         store = FakeStore()
-        session = bench.StoreSession(args, 0, bench.PayloadFactory(512, b"x"), store)
+        session = bench.StoreSession(
+            args,
+            0,
+            bench.PayloadFactory(512, b"x"),
+            store,
+            SimpleNamespace(replica_num=1),
+        )
 
         for operation, expected_before, expected_after in [
             ("put", False, True),
@@ -275,7 +289,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
             def __init__(self):
                 self.values = {}
 
-            def put(self, key, value, _config):
+            def put(self, key, value, config=None):
                 self.values[key] = value
                 return 0
 
@@ -302,7 +316,13 @@ class StoreSessionMetadataTest(unittest.TestCase):
         )
         runner = bench.BenchmarkRunner(args)
         runner._sessions = [
-            bench.StoreSession(args, 0, runner.payload_factory, FakeStore())
+            bench.StoreSession(
+                args,
+                0,
+                runner.payload_factory,
+                FakeStore(),
+                SimpleNamespace(replica_num=1),
+            )
         ]
         phases = runner.run()
         runner.write_outputs(phases)
@@ -323,7 +343,13 @@ class RemoveExistenceErrorTest(unittest.TestCase):
     def test_remove_requires_a_successful_absence_check(self):
         args = bench.build_parser().parse_args(["--scenario=mixed_metadata"])
         store = Mock()
-        session = bench.StoreSession(args, 0, bench.PayloadFactory(4096, b"x"), store)
+        session = bench.StoreSession(
+            args,
+            0,
+            bench.PayloadFactory(4096, b"x"),
+            store,
+            SimpleNamespace(replica_num=1),
+        )
         for expected, removed, exists, ok in (
             (True, 0, -1, False),
             (False, -1, -1, False),
@@ -358,8 +384,12 @@ class RemoveExistenceErrorTest(unittest.TestCase):
                 "--output-dir",
                 directory,
             ]
+            fake_module = types.SimpleNamespace(
+                MooncakeDistributedStore=Mock(return_value=store),
+                ReplicateConfig=store_module.ReplicateConfig,
+            )
             with (
-                patch.object(bench, "MooncakeDistributedStore", return_value=store),
+                patch.object(bench, "load_store_module", return_value=fake_module),
                 patch.object(sys, "argv", argv),
             ):
                 code = bench.main()
@@ -460,8 +490,12 @@ class WorkerFailureTest(unittest.TestCase):
                     "--output-dir",
                     directory,
                 ]
+                fake_module = types.SimpleNamespace(
+                    MooncakeDistributedStore=Mock(return_value=store),
+                    ReplicateConfig=store_module.ReplicateConfig,
+                )
                 with (
-                    patch.object(bench, "MooncakeDistributedStore", return_value=store),
+                    patch.object(bench, "load_store_module", return_value=fake_module),
                     patch.object(sys, "argv", argv),
                     patch.object(bench.LOG, "exception") as log_error,
                 ):
@@ -469,6 +503,98 @@ class WorkerFailureTest(unittest.TestCase):
                 log_error.assert_called_once()
                 store.close.assert_called_once()
                 self.assertFalse((Path(directory) / "summary.json").exists())
+
+
+class StoreBackendTest(unittest.TestCase):
+    def _args(self, extra):
+        return bench.build_parser().parse_args(
+            [
+                "--scenario=write_perf",
+                "--nr-objects=1",
+                "--value-size=512",
+                "--key-size=24",
+                *extra,
+            ]
+        )
+
+    def _fake_module(self, store):
+        return types.SimpleNamespace(
+            MooncakeDistributedStore=Mock(return_value=store),
+            ReplicateConfig=store_module.ReplicateConfig,
+        )
+
+    def test_cpp_setup_uses_master_and_metadata_server(self):
+        store = Mock()
+        store.setup.return_value = 0
+        args = self._args(["--store-backend=cpp"])
+        with patch.object(
+            bench, "load_store_module", return_value=self._fake_module(store)
+        ):
+            bench.StoreRuntime(args, lane_count=1)
+        call = store.setup.call_args
+        self.assertEqual(
+            call.args,
+            (
+                "127.0.0.1:50071",
+                "http://127.0.0.1:8080/metadata",
+                64 * 1024 * 1024,
+                32 * 1024 * 1024,
+                "tcp",
+                "",
+                "127.0.0.1:50051",
+            ),
+        )
+        self.assertEqual(call.kwargs, {"enable_ssd_offload": False})
+        summary = bench.summarize_backend(args)
+        self.assertEqual(summary["store"], "cpp")
+        self.assertEqual(summary["routing"], "master")
+
+    def test_rs_setup_uses_store_rs_arguments(self):
+        store = Mock()
+        store.setup.return_value = 0
+        args = self._args(
+            [
+                "--store-backend=rs",
+                "--rs-metadata-url=redis://127.0.0.1:6380",
+                "--rs-keyspace=mc/test",
+                "--rs-route-control=metadata_only",
+            ]
+        )
+        with patch.object(
+            bench, "load_store_module", return_value=self._fake_module(store)
+        ):
+            bench.StoreRuntime(args, lane_count=1)
+        call = store.setup.call_args
+        self.assertEqual(
+            call.args,
+            (
+                "127.0.0.1:50071",
+                "P2PHANDSHAKE",
+                64 * 1024 * 1024,
+                32 * 1024 * 1024,
+                "tcp",
+                "",
+                "redis://127.0.0.1:6380",
+            ),
+        )
+        self.assertEqual(
+            call.kwargs,
+            {
+                "tenant": "default",
+                "replica_count": 1,
+                "keyspace": "mc/test",
+                "route_control": "metadata_only",
+            },
+        )
+        summary = bench.summarize_backend(args)
+        self.assertEqual(summary["store"], "rs")
+        self.assertEqual(summary["routing"], "metadata_only")
+        self.assertEqual(summary["keyspace"], "mc/test")
+
+    def test_rs_backend_rejects_nof_replica_num(self):
+        args = self._args(["--store-backend=rs", "--nof-replica-num=1"])
+        with self.assertRaisesRegex(ValueError, "does not support --nof-replica-num"):
+            bench.BenchmarkRunner(args)
 
 
 class ZcopyBufferPoolTest(unittest.TestCase):
@@ -479,7 +605,7 @@ class ZcopyBufferPoolTest(unittest.TestCase):
     def test_uses_native_buffer_pool_without_nof_allocators(self):
         store = object()
         pool = bench.ZcopyBufferPool(
-            store, value_size=16, slots=2, local_buffer_size=64
+            store, FakeBufferPool, value_size=16, slots=2, local_buffer_size=64
         )
         native_pool = FakeBufferPool.instances[0]
 
@@ -502,10 +628,44 @@ class ZcopyBufferPoolTest(unittest.TestCase):
         self.assertTrue(lease.released)
         self.assertTrue(native_pool.closed)
 
+    def test_external_buffer_registers_and_unregisters(self):
+        store = Mock()
+        store.register_buffer.return_value = 0
+        pool = bench.ZcopyBufferPool(
+            store,
+            FakeBufferPool,
+            value_size=16,
+            slots=2,
+            local_buffer_size=64,
+            external=True,
+        )
+
+        self.assertEqual(FakeBufferPool.instances, [])
+        ptr = pool.base_ptr
+        store.register_buffer.assert_called_once_with(ptr, 32)
+        self.assertEqual(pool.slot_ptr(1), ptr + 16)
+
+        pool.close()
+        store.unregister_buffer.assert_called_once_with(ptr)
+        self.assertEqual(pool.base_ptr, 0)
+
+    def test_external_buffer_rejects_unregistered_buffer(self):
+        store = Mock()
+        store.register_buffer.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "register_buffer failed"):
+            bench.ZcopyBufferPool(
+                store,
+                FakeBufferPool,
+                value_size=16,
+                slots=2,
+                local_buffer_size=64,
+                external=True,
+            )
+
     def test_rejects_pool_larger_than_store_local_buffer(self):
         with self.assertRaisesRegex(ValueError, "increase --local-buffer-size"):
             bench.ZcopyBufferPool(
-                object(), value_size=32, slots=3, local_buffer_size=64
+                object(), FakeBufferPool, value_size=32, slots=3, local_buffer_size=64
             )
         self.assertEqual(FakeBufferPool.instances, [])
 
@@ -514,7 +674,7 @@ class ZcopyBufferPoolTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "buffer pool is exhausted"):
             bench.ZcopyBufferPool(
-                object(), value_size=16, slots=2, local_buffer_size=64
+                object(), FakeBufferPool, value_size=16, slots=2, local_buffer_size=64
             )
 
         self.assertEqual(len(FakeBufferPool.instances), 1)

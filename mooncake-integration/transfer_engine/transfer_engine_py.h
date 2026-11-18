@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <memory>
 #include <stack>
+#include <string>
 #include <vector>
 
 #include "common/base/status.h"
@@ -31,6 +32,14 @@
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+#ifdef USE_CUDA
+// NVLink submits call CUDA APIs synchronously, which a CUDA host function
+// cannot do safely on the driver's callback thread.
+inline bool isCudaHostFuncUnsupportedProtocol(const std::string &protocol) {
+    return protocol == "nvlink_intra";
+}
+#endif
 
 class ScatterTransferTicket;
 
@@ -219,7 +228,8 @@ class TransferEnginePy {
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, TransferOpcode opcode,
         const std::string &transport_hint = "",
-        const std::string &nic_hint = "");
+        const std::string &nic_hint = "",
+        bool enable_completion_notification = false);
 
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 

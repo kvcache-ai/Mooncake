@@ -104,7 +104,7 @@ endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
-option(USE_ASCEND "option for using npu with HCCL" OFF)
+option(USE_ASCEND "option for using npu with Ascend Direct transport" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
 option(USE_ASCEND_HETEROGENEOUS
@@ -115,6 +115,9 @@ option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+option(USE_ENFLAME
+       "option for enabling gpu features for Enflame GCU with TopsRider runtime"
+       OFF)
 option(
   USE_TPU
   "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
@@ -122,6 +125,10 @@ option(
 option(
   USE_XPU
   "option for enabling Intel XPU (oneAPI SYCL) staging support in TENT; this is a direct-link (native) build that requires USE_TENT and the Intel DPC++ compiler (icpx / IntelLLVM) at build time -- there is no dlopen shim"
+  OFF)
+option(
+  USE_XPU_GDS
+  "GDS on Intel XPU through a cuFile-compatible library (cufile.h + libcufile.so)"
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
@@ -131,6 +138,13 @@ option(USE_FABRIC
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 option(USE_MEMFABRIC "option for using memfabric transport" OFF)
+
+# USE_ASCEND and USE_ASCEND_DIRECT both select the Ascend Direct transport; the
+# HCCL transport it used to select is no longer built. Keep the two switches
+# equivalent so existing build commands work either way.
+if(USE_ASCEND)
+  set(USE_ASCEND_DIRECT ON)
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -383,6 +397,26 @@ if(USE_XPU)
     STATUS "Intel XPU (oneAPI SYCL, direct-link) staging support is enabled")
 endif()
 
+if(USE_XPU_GDS)
+  # The GDS transport links libcufile.so; with USE_XPU_GDS it must come from a
+  # cuFile-compatible library for Intel XPU (for example Intel xFile) instead of
+  # NVIDIA GDS. A process can load only one libcufile.so, so the two GDS
+  # flavours are mutually exclusive.
+  if(NOT USE_XPU)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON requires USE_XPU=ON (and therefore USE_TENT=ON).")
+  endif()
+  if(USE_CUDA)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON cannot be combined with USE_CUDA=ON: both resolve "
+        "libcufile.so, and a process can load only one of them.")
+  endif()
+  add_compile_definitions(USE_XPU_GDS)
+  message(STATUS "Intel XPU GDS (cuFile-compatible library) is enabled")
+endif()
+
 if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
   if(DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
     set(NEUWARE_ROOT
@@ -461,6 +495,27 @@ if(USE_SUNRISE)
   add_compile_definitions(USE_SUNRISE)
   message(STATUS "Sunrise (Tang runtime) support is enabled")
   include_directories(${MC_TANGRT_ROOT}/include)
+endif()
+
+if(NOT DEFINED MC_TOPS_PATH OR MC_TOPS_PATH STREQUAL "")
+  if(DEFINED ENV{TOPS_PATH} AND NOT "$ENV{TOPS_PATH}" STREQUAL "")
+    set(MC_TOPS_PATH
+        "$ENV{TOPS_PATH}"
+        CACHE PATH "Path to Enflame TopsRider SDK" FORCE)
+  else()
+    set(MC_TOPS_PATH
+        "/opt/tops"
+        CACHE PATH "Path to Enflame TopsRider SDK" FORCE)
+  endif()
+endif()
+
+if(USE_ENFLAME)
+  add_compile_definitions(USE_ENFLAME)
+  message(STATUS "Enflame GCU (TopsRider) support is enabled")
+  # tops_runtime_api.h / driver_types.h / efdrv.h 均平铺在 <tops>/include 下。
+  # Runtime libs: libtopsrt.so (tops*) + libefrt.so (efdrv*)。
+  include_directories(${MC_TOPS_PATH}/include)
+  link_directories(${MC_TOPS_PATH}/lib)
 endif()
 
 if(USE_MUSA)
@@ -703,8 +758,6 @@ if(USE_ASCEND
 endif()
 
 if(USE_ASCEND)
-  set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
-  link_directories(${ASCEND_DEVLIB_DIR})
   add_compile_definitions(USE_ASCEND)
 endif()
 

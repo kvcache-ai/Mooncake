@@ -66,6 +66,10 @@
 #define NO_THREAD_SAFETY_ANALYSIS \
     THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
 
+// Keep these generically named types out of the global namespace. Other
+// libraries, such as gperftools, define global types with the same names.
+namespace mooncake {
+
 // Simple mutex implementation using std::mutex for exclusive locking only.
 class CAPABILITY("mutex") Mutex {
    private:
@@ -288,5 +292,7 @@ class SCOPED_CAPABILITY SpinLocker {
     // Release lock.
     ~SpinLocker() RELEASE() { lock_->unlock(); }
 };
+
+}  // namespace mooncake
 
 #endif  // THREAD_SAFETY_ANALYSIS_MUTEX_H

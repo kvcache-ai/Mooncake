@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -76,6 +77,8 @@ NvlinkHostNumaAllocation::ProductionDriverApi() {
         cuMemRelease,
         cuMemRetainAllocationHandle,
         cuMemExportToShareableHandle,
+        cuDevicePrimaryCtxRetain,
+        cuDevicePrimaryCtxRelease,
     };
 }
 
@@ -153,7 +156,10 @@ Status NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
 Status NvlinkHostNumaAllocation::ValidateVisibleGpuFabricSupportWithDriverApi(
     const DriverApi& api, std::vector<CUdevice>& visible_devices) {
     visible_devices.clear();
-    if (std::getenv("MC_USE_NVLINK_IPC") != nullptr)
+    // Same meaning as in NvlinkTransport: only MC_USE_NVLINK_IPC=0 keeps
+    // fabric memory, any other value selects IPC.
+    const char* nvlink_ipc = std::getenv("MC_USE_NVLINK_IPC");
+    if (nvlink_ipc != nullptr && std::strcmp(nvlink_ipc, "0") != 0)
         return Status::NotSupportedTransport(
             "MC_USE_NVLINK_IPC disables Fabric allocations");
     if (!api.device_get_count) return missingDriverFunction("cuDeviceGetCount");
@@ -273,6 +279,18 @@ Status NvlinkHostNumaAllocation::GetAllocationGranularityWithDriverApi(
     return Status::OK();
 }
 
+CUdevice NvlinkHostNumaAllocation::GpuLocalToNode(
+    int numa_node, const DriverApi& api, const std::vector<CUdevice>& devices) {
+    for (CUdevice device : devices) {
+        int node = -1;
+        if (api.device_get_attribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
+                                     device) == CUDA_SUCCESS &&
+            node == numa_node)
+            return device;
+    }
+    return -1;
+}
+
 Status NvlinkHostNumaAllocation::Create(
     int numa_node, size_t requested_length, size_t required_va_alignment,
     std::unique_ptr<NvlinkHostNumaAllocation>& allocation) {
@@ -298,6 +316,10 @@ Status NvlinkHostNumaAllocation::CreateWithDriverApi(
     if (!api.mem_unmap) return missingDriverFunction("cuMemUnmap");
     if (!api.mem_address_free) return missingDriverFunction("cuMemAddressFree");
     if (!api.mem_release) return missingDriverFunction("cuMemRelease");
+    if (!api.device_primary_ctx_retain)
+        return missingDriverFunction("cuDevicePrimaryCtxRetain");
+    if (!api.device_primary_ctx_release)
+        return missingDriverFunction("cuDevicePrimaryCtxRelease");
 
     std::vector<CUdevice> visible_devices;
     Status status =
@@ -361,10 +383,27 @@ Status NvlinkHostNumaAllocation::CreateWithDriverApi(
         return cause;
     };
 
+    // When a peer imports the Fabric handle, the driver routes the mapping
+    // through a GPU of this process that sits on the memory's socket, if the
+    // process holds a context on one; otherwise through whichever GPU it has,
+    // and every access then also crosses the host's CPU-to-CPU link at less
+    // than half the rate. Keep such a context alive for as long as the
+    // allocation can be imported.
+    const CUdevice local_gpu = GpuLocalToNode(numa_node, api, visible_devices);
+    if (local_gpu >= 0) {
+        CUcontext context = nullptr;
+        CUresult result = api.device_primary_ctx_retain(&context, local_gpu);
+        if (result != CUDA_SUCCESS)
+            return cudaFailure("cuDevicePrimaryCtxRetain", result);
+        owner->local_gpu_ = local_gpu;
+        owner->context_retained_ = true;
+    }
+
     CUmemAllocationProp prop = hostNumaProp(numa_node);
     CUmemGenericAllocationHandle handle;
     CUresult result = api.mem_create(&handle, length, &prop, 0);
-    if (result != CUDA_SUCCESS) return cudaFailure("cuMemCreate", result);
+    if (result != CUDA_SUCCESS)
+        return rollback(cudaFailure("cuMemCreate", result));
     owner->allocation_handle_ = static_cast<uint64_t>(handle);
     owner->handle_owned_ = true;
 
@@ -440,6 +479,13 @@ Status NvlinkHostNumaAllocation::Release() {
         if (result != CUDA_SUCCESS) return cudaFailure("cuMemRelease", result);
         handle_owned_ = false;
         allocation_handle_ = 0;
+    }
+    if (context_retained_) {
+        CUresult result = driver_api_.device_primary_ctx_release(local_gpu_);
+        if (result != CUDA_SUCCESS)
+            return cudaFailure("cuDevicePrimaryCtxRelease", result);
+        context_retained_ = false;
+        local_gpu_ = -1;
     }
     length_ = 0;
     numa_node_ = -1;

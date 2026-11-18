@@ -13,6 +13,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "common.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -24,15 +25,6 @@
 
 #include "integration_utils.h"
 #include "buffer_pool.h"
-
-// Forward declaration for EngramStore bindings
-namespace mooncake {
-namespace engram {
-void bind_engram_store(py::module &m);
-}
-}  // namespace mooncake
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
 
 namespace py = pybind11;
 
@@ -157,6 +149,23 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
+py::object materialize_contiguous_tensor(const py::handle &tensor) {
+    py::object contiguous = tensor.attr("contiguous")();
+#ifdef USE_MLU
+    if (!contiguous.is(tensor) &&
+        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        // CNRT copies do not wait for work on PyTorch's current MLU stream.
+        // The caller can synchronize its input, but this new copy is ours.
+        // Wait before exposing its pointer to Store, including for TP shards.
+        py::module_::import("torch")
+            .attr("mlu")
+            .attr("current_stream")(contiguous.attr("device"))
+            .attr("synchronize")();
+    }
+#endif
+    return contiguous;
+}
+
 PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                       const std::string &key_name,
                                       bool require_contiguous,
@@ -181,7 +190,7 @@ PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         }
 
         py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
+            require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
         info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = inspected.attr("numel")().cast<size_t>();
@@ -491,6 +500,27 @@ inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
 }
 
+// View a Python buffer as the bytes it covers. `buffer_info::size` counts
+// elements, not bytes, so the byte length is size * itemsize; a span cannot
+// describe a non-contiguous buffer, so those are rejected. Call this before
+// releasing the GIL: it may raise.
+inline std::span<const char> contiguous_buffer_span(
+    const py::buffer_info &info) {
+    if (info.size > 0) {
+        py::ssize_t expected_stride = info.itemsize;
+        for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+            if (info.shape[dim] > 1 && info.strides[dim] != expected_stride) {
+                throw py::value_error(
+                    "value must be a C-contiguous buffer (bytes, bytearray, "
+                    "or a contiguous array); got a strided view");
+            }
+            expected_stride *= info.shape[dim];
+        }
+    }
+    return {static_cast<const char *>(info.ptr),
+            static_cast<size_t>(info.size * info.itemsize)};
+}
+
 #include "store_py_internal.h"
 
 }  // namespace
@@ -499,12 +529,13 @@ class RangedReadSnapshotPy {
    public:
     RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
                          std::vector<std::string> keys)
-        : store_(std::move(store)), keys_(std::move(keys)) {
-        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+        : store_(store), keys_(std::move(keys)) {
+        snapshot_ = store->prepare_get_into_ranges_snapshot(keys_);
     }
 
     bool belongs_to(const std::shared_ptr<PyClient> &store) const {
-        return store_.get() == store.get();
+        const auto owner = store_.lock();
+        return owner && owner.get() == store.get();
     }
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
@@ -514,16 +545,28 @@ class RangedReadSnapshotPy {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (snapshot_.should_refresh()) {
-            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        // A snapshot must not keep a closed Store and its segments alive;
+        // reject use after close instead of reading through a torn-down
+        // client.
+        auto store = store_.lock();
+        if (!store) {
+            throw std::runtime_error(
+                "RangedReadSnapshot is no longer usable: the Store was "
+                "closed");
         }
-        return store_->get_into_ranges_from_snapshot(
+        if (snapshot_.should_refresh()) {
+            store->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store->get_into_ranges_from_snapshot(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
             snapshot_);
     }
 
    private:
-    std::shared_ptr<PyClient> store_;
+    // Weak by design: an idle snapshot must not extend the native client's
+    // lifetime beyond close(), otherwise its segments stay published and a
+    // later reader can observe a stale MEMORY replica (issue #5464).
+    std::weak_ptr<PyClient> store_;
     std::vector<std::string> keys_;
     PyClient::RangedReadSnapshot snapshot_;
     std::mutex mutex_;
@@ -1178,6 +1221,7 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
         if (!config.group_ids && !config.session_ids &&
+            !config.residency_affinity_ids &&
             !config.per_key_preferred_hca_names) {
             return config;
         }
@@ -1201,9 +1245,10 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (!config.HasValidKeyHints(key_count)) {
-            LOG(ERROR) << operation_name
-                       << ": group_ids and per-key HCA hint counts must match "
-                          "keys size";
+            LOG(ERROR)
+                << operation_name
+                << ": group, affinity and per-key HCA hint counts must match "
+                   "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1214,11 +1259,20 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        // Single-tensor TP keeps per-shard group/HCA hints and one source
-        // session ID, which is expanded to all shards below.
-        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
+        // Single-tensor TP keeps per-shard group/HCA hints. Session and
+        // residency affinity IDs describe the source tensor, not each shard.
+        if (!config.ValidSessionIds(1) ||
+            (config.residency_affinity_ids &&
+             config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
+            ReplicateConfig tp_config = config;
+            if (config.residency_affinity_ids) {
+                tp_config.residency_affinity_ids = std::vector<std::string>(
+                    tp_size, config.residency_affinity_ids->front());
+            }
+            if (!tp_config.HasValidKeyHints(tp_size))
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
@@ -1230,7 +1284,6 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            ReplicateConfig tp_config = config;
             if (config.session_ids) {
                 tp_config.session_ids =
                     std::vector<std::string>(tp_size, config.SessionId());
@@ -2175,6 +2228,18 @@ PYBIND11_MODULE(_store, m) {
                 if (ids) config.session_ids = std::move(*ids);
             })
         .def_property(
+            "residency_affinity_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.residency_affinity_ids) return std::nullopt;
+                return *config.residency_affinity_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.residency_affinity_ids.reset();
+                if (ids) config.residency_affinity_ids = std::move(*ids);
+            })
+        .def_property(
             "preferred_hca_names",
             [](const ReplicateConfig &config)
                 -> std::optional<std::vector<std::string>> {
@@ -2274,6 +2339,7 @@ PYBIND11_MODULE(_store, m) {
         .value("PROCESSING", TaskStatus::PROCESSING)
         .value("SUCCESS", TaskStatus::SUCCESS)
         .value("FAILED", TaskStatus::FAILED)
+        .value("CANCELED", TaskStatus::CANCELED)
         .export_values();
 
     py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
@@ -2299,6 +2365,42 @@ PYBIND11_MODULE(_store, m) {
                 << ", message=\"" << self.message << "\")";
             return oss.str();
         });
+
+    py::enum_<JobType>(m, "JobType").value("DRAIN", JobType::DRAIN);
+    py::enum_<JobStatus>(m, "JobStatus")
+        .value("CREATED", JobStatus::CREATED)
+        .value("PLANNING", JobStatus::PLANNING)
+        .value("RUNNING", JobStatus::RUNNING)
+        .value("SUCCEEDED", JobStatus::SUCCEEDED)
+        .value("FAILED", JobStatus::FAILED)
+        .value("CANCELED", JobStatus::CANCELED)
+        .value("CANCELING", JobStatus::CANCELING)
+        .value("TIMED_OUT", JobStatus::TIMED_OUT);
+
+    py::class_<QueryJobResponse>(m, "QueryJobResponse")
+        .def_readonly("id", &QueryJobResponse::id)
+        .def_readonly("type", &QueryJobResponse::type)
+        .def_readonly("status", &QueryJobResponse::status)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryJobResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryJobResponse::last_updated_at_ms_epoch)
+        .def_readonly("segments", &QueryJobResponse::segments)
+        .def_readonly("succeeded_units", &QueryJobResponse::succeeded_units)
+        .def_readonly("failed_units", &QueryJobResponse::failed_units)
+        .def_readonly("blocked_units", &QueryJobResponse::blocked_units)
+        .def_readonly("active_units", &QueryJobResponse::active_units)
+        .def_readonly("migrated_bytes", &QueryJobResponse::migrated_bytes)
+        .def_readonly("message", &QueryJobResponse::message);
+
+    py::class_<ListDrainJobsResponse>(m, "ListDrainJobsResponse")
+        .def_readonly("jobs", &ListDrainJobsResponse::jobs)
+        .def_readonly("next_page_token",
+                      &ListDrainJobsResponse::next_page_token);
+
+    py::class_<ListTasksResponse>(m, "ListTasksResponse")
+        .def_readonly("tasks", &ListTasksResponse::tasks)
+        .def_readonly("next_page_token", &ListTasksResponse::next_page_token);
 
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
@@ -2394,33 +2496,6 @@ PYBIND11_MODULE(_store, m) {
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
-    // Helper function to extract PyClient shared_ptr from
-    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
-    // PyClient We return it as a Python capsule to avoid type registration
-    // issues
-    m.def(
-        "_get_pyclient_from_wrapper",
-        [](MooncakeStorePyWrapper &wrapper) -> py::object {
-            if (!wrapper.store_) {
-                return py::none();
-            }
-            // Return as a capsule containing the shared_ptr
-            // The caller (engram_store_py.cpp) will extract it
-            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
-            // freed; otherwise release() transfers ownership to the capsule.
-            auto ptr =
-                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
-            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
-            py::object cap = py::capsule(raw_ptr, [](void *p) {
-                delete static_cast<std::shared_ptr<PyClient> *>(p);
-            });
-            (void)ptr.release();  // Transfer ownership to capsule
-            return cap;
-        },
-        py::arg("wrapper"),
-        "Get PyClient from MooncakeDistributedStore (internal use, returns "
-        "capsule)");
-
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
@@ -2521,7 +2596,8 @@ PYBIND11_MODULE(_store, m) {
             "  rdma_devices: RDMA device list.\n"
             "  enable_egm_store_pool: Use EGM DRAM for the global Store pool "
             "(default false; requires protocol 'nvlink', "
-            "global_segment_size>0, and local_buffer_size=0).\n"
+            "global_segment_size>0). Local buffers use the existing "
+            "client-buffer allocator.\n"
             "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
             "IDs; default 'auto').\n"
             "  master_server_addr: Master server address.\n"
@@ -2957,12 +3033,9 @@ PYBIND11_MODULE(_store, m) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->upsert(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->upsert(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{},
@@ -3015,9 +3088,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3224,12 +3295,9 @@ PYBIND11_MODULE(_store, m) {
                py::buffer buf,
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->put(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->put(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{})
@@ -3275,9 +3343,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3529,7 +3595,149 @@ PYBIND11_MODULE(_store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        .def(
+            "create_drain_job",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &segments,
+               const std::vector<std::string> &target_segments,
+               int64_t max_concurrency, int64_t timeout_ms) -> py::tuple {
+                if (!self.is_client_initialized() || max_concurrency <= 0 ||
+                    max_concurrency > std::numeric_limits<uint32_t>::max() ||
+                    timeout_ms < 0) {
+                    return py::make_tuple(UUID{},
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                CreateDrainJobRequest request{
+                    segments, target_segments,
+                    static_cast<uint32_t>(max_concurrency)};
+                auto result =
+                    timeout_ms == 0
+                        ? self.store_->create_drain_job(request)
+                        : self.store_->create_timed_drain_job(
+                              request, static_cast<uint64_t>(timeout_ms));
+                py::gil_scoped_acquire acquire;
+                return py::make_tuple(result.value_or(UUID{}),
+                                      result ? 0 : toInt(result.error()));
+            },
+            py::arg("segments"),
+            py::arg("target_segments") = std::vector<std::string>{},
+            py::arg("max_concurrency") = 4, py::arg("timeout_ms") = 0,
+            "Start draining mounted memory segments.\n\n"
+            "Args:\n"
+            "    segments: Source segment names.\n"
+            "    target_segments: Target segment names; an empty list lets "
+            "the master choose.\n"
+            "    max_concurrency: Maximum concurrent tasks (default: 4).\n"
+            "    timeout_ms: Timeout in milliseconds from job creation. "
+            "Defaults to 0, which means no timeout is set.\n\n"
+            "On timeout, the job cancels in-flight tasks and keeps "
+            "unfinished sources DRAINING.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (job ID, error code; 0 on success).")
+        .def(
+            "query_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) -> py::tuple {
+                if (!self.is_client_initialized()) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->query_drain_job(job_id);
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("job_id"),
+            "Return (job, error_code). The job is None on error.")
+        .def(
+            "cancel_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_drain_job(job_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("job_id"),
+            "Request cancellation. In-flight moves may finish; query until "
+            "the job reaches CANCELED, or TIMED_OUT if its deadline triggered "
+            "first. Cancellation may wait for an executor or replication "
+            "cleanup. Returns an error code.")
+        .def(
+            "list_drain_jobs",
+            [](MooncakeStorePyWrapper &self, std::optional<JobStatus> status,
+               const std::optional<std::string> &segment, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_drain_jobs(
+                    {status, segment, page_token,
+                     static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("segment") = py::none(),
+            py::arg("limit") = 100, py::arg("page_token") = "",
+            "Return (page, error_code) for cluster-wide drain jobs. Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "list_tasks",
+            [](MooncakeStorePyWrapper &self, std::optional<TaskStatus> status,
+               std::optional<TaskType> type,
+               std::optional<UUID> assigned_client,
+               const std::optional<std::string> &key, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_tasks(
+                    {.status = status,
+                     .type = type,
+                     .assigned_client = assigned_client,
+                     .key = key,
+                     .page_token = page_token,
+                     .limit = static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("type") = py::none(),
+            py::arg("assigned_client") = py::none(),
+            py::arg("key") = py::none(), py::arg("limit") = 100,
+            py::arg("page_token") = "",
+            "Return (page, error_code) for tasks in this client's tenant. "
+            "Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "cancel_task",
+            [](MooncakeStorePyWrapper &self, const UUID &task_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_task(task_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("task_id"),
+            "Cancel a pending task immediately or request cancellation of a "
+            "processing task. Returns an error code. Query the final status.");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(
@@ -3547,7 +3755,15 @@ PYBIND11_MODULE(_store, m) {
                              << ". Valid range: 0-" << max_node;
             }
 
-            if (numa_run_on_node(node) != 0) {
+            int rc;
+            {
+                // numa_run_on_node() fills libnuma's per-node cpumask cache
+                // on first use; see numaNodeCpuCacheMutex().
+                std::lock_guard<std::mutex> guard(
+                    mooncake::numaNodeCpuCacheMutex());
+                rc = numa_run_on_node(node);
+            }
+            if (rc != 0) {
                 LOG(WARNING) << "numa_run_on_node failed for node " << node;
             }
 
@@ -3561,9 +3777,6 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
-
-    // Add EngramStore bindings
-    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake

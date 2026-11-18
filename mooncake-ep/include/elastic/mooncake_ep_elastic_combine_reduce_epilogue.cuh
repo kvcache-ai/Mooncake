@@ -3,6 +3,8 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
 #include <elastic/mooncake_ep_elastic_layout.cuh>
@@ -10,6 +12,20 @@
 #include <elastic/mooncake_ep_elastic_combine_utils.cuh>
 
 namespace mooncake::elastic {
+
+struct CombineReduceEpilogueKernelArgs {
+    nv_bfloat16* combined_x;
+    float* combined_topk_weights;
+    topk_idx_t* combined_topk_idx;
+    void* recv_buffer;
+    void* bias_0;
+    void* bias_1;
+    int num_combined_tokens;
+};
+
+static_assert(
+    std::is_trivially_copyable<CombineReduceEpilogueKernelArgs>::value,
+    "CombineReduceEpilogueKernelArgs must be trivially copyable");
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction, int kNumSMs,
           int kNumWarps,
@@ -25,14 +41,16 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction, int kNumSMs,
               use_rank_layout<kAllowMultipleReduction, kNumRanks, kNumTopk>(),
           int kNumTokensInLayout = get_num_tokens_in_layout<
               kAllowMultipleReduction, kNumRanks, kNumTopk>()>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
-                                 float* combined_topk_weights,
-                                 topk_idx_t* combined_topk_idx,
-                                 void* recv_buffer, void* bias_0, void* bias_1,
-                                 const int num_combined_tokens,
-                                 const int scaleout_rank_idx,
-                                 const int scaleup_rank_idx) {
+__device__ __forceinline__ void combine_reduce_epilogue_kernel_impl(
+    const CombineReduceEpilogueKernelArgs& args) {
+    nv_bfloat16* combined_x = args.combined_x;
+    float* combined_topk_weights = args.combined_topk_weights;
+    topk_idx_t* combined_topk_idx = args.combined_topk_idx;
+    void* recv_buffer = args.recv_buffer;
+    void* bias_0 = args.bias_0;
+    void* bias_1 = args.bias_1;
+    const int num_combined_tokens = args.num_combined_tokens;
+
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     constexpr int kNumExpertsPerRank =
         kNumExperts / (kNumScaleupRanks * kNumScaleoutRanks);
@@ -208,6 +226,18 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             __syncwarp();
         }
     }
+}
+
+template <bool kUseExpandedLayout, bool kAllowMultipleReduction, int kNumSMs,
+          int kNumWarps, int kNumScaleoutRanks, int kNumScaleupRanks,
+          int kHidden, int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
+          int kNumThreads = kNumWarps * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    combine_reduce_epilogue(const CombineReduceEpilogueKernelArgs args) {
+    combine_reduce_epilogue_kernel_impl<
+        kUseExpandedLayout, kAllowMultipleReduction, kNumSMs, kNumWarps,
+        kNumScaleoutRanks, kNumScaleupRanks, kHidden, kNumMaxTokensPerRank,
+        kNumExperts, kNumTopk>(args);
 }
 
 }  // namespace mooncake::elastic

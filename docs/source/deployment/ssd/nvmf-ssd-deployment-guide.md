@@ -34,9 +34,14 @@ mooncake_master --rpc_address=192.168.65.81
 
 ### 2.3 Deploy the Metadata Service
 
+Set a shared token for this non-loopback bind, replacing the example value with a long random secret:
+
 ```bash
+export MC_METADATA_HTTP_TOKEN="replace-with-a-long-random-token"
 python3 -m mooncake.http_metadata_server --host=192.168.65.81 --port=8080
 ```
+
+Set the same `MC_METADATA_HTTP_TOKEN` on every Transfer Engine process that connects to this service. The server refuses to start on this address when the token is unset.
 
 If an aiohttp-related error occurs during startup, install aiohttp:
 

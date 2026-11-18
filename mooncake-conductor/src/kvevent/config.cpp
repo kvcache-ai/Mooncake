@@ -128,7 +128,8 @@ bool ParseCacheGroup(const Json::Value& raw,
 }  // namespace
 
 std::vector<common::ServiceConfig> ParseConfig(int* http_server_port,
-                                               int* rpc_server_port) {
+                                               int* rpc_server_port,
+                                               size_t* max_blocks_per_context) {
     const std::string config_path =
         common::LoadEnv("CONDUCTOR_CONFIG_PATH", DefaultConductorConfigPath());
 
@@ -162,6 +163,21 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port,
     // RPC channel.
     if (cfg.isMember("rpc_server_port") && cfg["rpc_server_port"].isNumeric()) {
         *rpc_server_port = cfg["rpc_server_port"].asInt();
+    }
+
+    // An absent max_blocks_per_context field keeps the caller's incoming
+    // value, so the compiled-in default stays in effect; 0 disables capacity
+    // eviction. Anything else is a misconfiguration worth stopping on, since
+    // the index would otherwise run with a capacity nobody asked for.
+    if (max_blocks_per_context != nullptr &&
+        cfg.isMember("max_blocks_per_context")) {
+        int64_t parsed = 0;
+        if (!JsonInt64(cfg["max_blocks_per_context"], &parsed) || parsed < 0) {
+            LOG(ERROR) << "Invalid max_blocks_per_context; expected a "
+                          "non-negative integer (0 disables eviction)";
+            std::exit(1);
+        }
+        *max_blocks_per_context = static_cast<size_t>(parsed);
     }
 
     std::vector<common::ServiceConfig> services;

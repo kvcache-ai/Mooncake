@@ -106,16 +106,17 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
 
     // Exclude NICs that have proven unable to GPUDirect-DMA to this GPU. Only
     // engaged once something has actually been learned (permissive fabrics pay
-    // nothing) and only for GPU/cuda locations.
+    // nothing) and only for CUDA/MLU device locations.
     if (GdrReachability::hasAnyExclusion()) {
         LocationParser lp(location);
-        if (lp.type() == "cuda" && lp.index() >= 0) {
+        const int gpu_ordinal = gdrOrdinal(lp);
+        if (gpu_ordinal >= 0) {
             auto& gdr = GdrReachability::instance();
             for (const auto& kv : devices_) {
                 int dev_id = kv.first;
                 if (dev_id < 0 || dev_id >= 64) continue;
                 const auto* nic = local_topology_->getNicEntry(dev_id);
-                if (nic && !gdr.localReachable(nic->name, lp.index()))
+                if (nic && !gdr.localReachable(nic->name, gpu_ordinal))
                     device_mask &= ~(1ULL << dev_id);
             }
         }

@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "client_session/client_session_registry_test_peer.h"
 #include "master_service.h"
 
 namespace mooncake::test {
@@ -53,8 +54,6 @@ class MasterServiceTestPeer {
     // the fields that payload carries.
     static std::string SerializeMetadataForOpLogForTesting(
         MasterService& service, const ObjectMetadata& metadata);
-    static std::string SerializeMetadataForOpLogWithoutMemReplicasForTesting(
-        MasterService& service, const ObjectMetadata& metadata);
     static std::string
     SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
         MasterService& service, const ObjectMetadata& metadata,
@@ -68,6 +67,12 @@ class MasterServiceTestPeer {
                                     double evict_ratio_lowerbound);
 
     void RunDfsEvictionForTesting();
+
+    void ConfigureKvcsCapacityForTesting(
+        std::unique_ptr<KvcsCapacityProvider> provider, bool eviction_enabled,
+        double high_watermark, double low_watermark);
+
+    void RefreshKvcsDfsUsageForTesting();
 
     // Queue one segment through the private HTTP metadata cleanup path, as the
     // client monitor does when a client times out.
@@ -132,18 +137,19 @@ class MasterServiceTestPeer {
         return service.batch_oplog_storage_;
     }
 
-    static auto& ClientLivenessRecords(MasterService& service) {
-        return service.client_liveness_records_;
+    static auto& ClientSessions(MasterService& service) {
+        return service.client_sessions_;
     }
-    static const auto& ClientLivenessRecords(const MasterService& service) {
-        return service.client_liveness_records_;
+    static const auto& ClientSessions(const MasterService& service) {
+        return service.client_sessions_;
     }
-
-    static auto& ClientMutex(MasterService& service) {
-        return service.client_mutex_;
+    // Registry membership by client, not a frozen copy of session state.
+    static auto ClientSessionRecords(const MasterService& service) {
+        return ClientSessionRegistryTestPeer::SnapshotRecords(
+            service.client_sessions_);
     }
-    static const auto& ClientMutex(const MasterService& service) {
-        return service.client_mutex_;
+    static auto& ClientOffboarding(MasterService& service) {
+        return service.client_offboarding_worker_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -174,6 +180,17 @@ class MasterServiceTestPeer {
     }
     static const auto& EnableDfs(const MasterService& service) {
         return service.enable_dfs_;
+    }
+
+    static auto& DfsAllocator(MasterService& service) {
+        return service.dfs_allocator_;
+    }
+    static const auto& DfsAllocator(const MasterService& service) {
+        return service.dfs_allocator_;
+    }
+
+    static bool UsesKvcs(const MasterService& service) {
+        return service.use_kvcs_;
     }
 
     static auto& EnableOplog(MasterService& service) {
@@ -303,6 +320,23 @@ class MasterServiceTestPeer {
         return service.master_state_mutex_;
     }
 
+    // Restore lifecycle (RFC #4700, slice 1).
+    static MasterService::RestoreLifecycleState GetRestoreLifecycleState(
+        MasterService& service) {
+        return service.lifecycle_state_.load(std::memory_order_acquire);
+    }
+
+    // Force a lifecycle state so worker-admission can be tested without
+    // running a real promotion restore.
+    static void SetRestoreLifecycleStateForTesting(
+        MasterService& service, MasterService::RestoreLifecycleState state) {
+        service.lifecycle_state_.store(state, std::memory_order_release);
+    }
+
+    bool AdmitsBusinessWorkersForTesting() const {
+        return service_.AdmitsBusinessWorkers();
+    }
+
     static auto& SoftPinDeadlineIndex(MasterService& service) {
         return service.soft_pin_deadline_index_;
     }
@@ -315,6 +349,20 @@ class MasterServiceTestPeer {
     }
     static const auto& TaskManager(const MasterService& service) {
         return service.task_manager_;
+    }
+
+    static std::unique_lock<std::mutex> LockDrainJobForTesting(
+        MasterService& service, const UUID& job_id) {
+        std::shared_ptr<MasterService::DrainJob> job;
+        {
+            std::lock_guard<std::mutex> lock(service.job_mutex_);
+            auto it = service.drain_jobs_.find(job_id);
+            if (it == service.drain_jobs_.end()) {
+                return {};
+            }
+            job = it->second;
+        }
+        return std::unique_lock<std::mutex>(job->mutex);
     }
 
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
@@ -401,11 +449,6 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
-    }
-
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
@@ -426,6 +469,14 @@ class MasterServiceTestPeer {
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const {
         return DynamicReplicationController::VersionEpoch(metadata);
+    }
+
+    // Submits a dynamic replica proposal under the shared state lock that
+    // SubmitReplicaActionProposalLocked expects.
+    tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
+        const ReplicaActionProposal& proposal) {
+        std::shared_lock<std::shared_mutex> lock(service_.master_state_mutex_);
+        return service_.SubmitReplicaActionProposalLocked(proposal);
     }
 
     size_t EraseReplicasWithCacheTotalAccounting(
@@ -463,7 +514,8 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(service_.client_sessions_,
+                                                   client_id);
     }
 
     // Resolves the namespace, creating it through the table's factory on first

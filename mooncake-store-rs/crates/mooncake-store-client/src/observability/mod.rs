@@ -1201,11 +1201,7 @@ fn seconds_to_us(value: f64) -> u64 {
 }
 
 fn avg_us(total_us: u64, count: u64) -> u64 {
-    if count == 0 {
-        0
-    } else {
-        total_us / count
-    }
+    total_us.checked_div(count).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1392,6 +1388,26 @@ mod tests {
         ));
         assert!(metrics.contains(
             "mooncake_store_reclaim_release_total{tenant=\"default\",action=\"flush_due_reclaims\",result=\"skipped_unavailable_runtime\"} 1"
+        ));
+    }
+
+    #[test]
+    fn eviction_guard_metrics_are_exported_before_any_candidate_is_seen() {
+        let _guard = metrics_test_lock().lock();
+        registry::reset_metrics();
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains(
+            "# HELP mooncake_store_eviction_guard_event_total Eviction guard lifecycle events by source and outcome."
+        ));
+        assert!(metrics.contains(
+            "# HELP mooncake_store_eviction_guard_pending_total Pending eviction guard tokens by phase."
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"route_cas\",outcome=\"outcome_unknown\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_eviction_guard_pending_total{tenant=\"default\",phase=\"pending_confirmation\"} 0"
         ));
     }
 

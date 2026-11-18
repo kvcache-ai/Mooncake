@@ -20,6 +20,8 @@
 #define MOONCAKE_TESTS_RDMA_TEST_PEERS_H
 
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 
 #include "transfer_metadata.h"
@@ -30,6 +32,13 @@ namespace mooncake {
 
 class RdmaTransportTestPeer {
    public:
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    static void recordCongestionMode(RdmaTransport &transport,
+                                     adaptive_congestion_control::Mode mode) {
+        transport.recordClassicCongestionControlMode(mode);
+    }
+#endif
+
     static void bindMetadata(RdmaTransport &transport,
                              std::shared_ptr<TransferMetadata> metadata,
                              std::string local_server_name) {
@@ -54,10 +63,47 @@ class RdmaTransportTestPeer {
     static int initializeResources(RdmaTransport &transport) {
         return transport.initializeRdmaResources();
     }
+
+    // Pending-cleanup state left behind by a failed unregister. An address is
+    // in at most one of the two.
+    static bool hasPendingDereg(RdmaTransport &transport, uint64_t addr) {
+        std::lock_guard<std::mutex> lock(transport.pending_cleanup_mutex_);
+        return transport.pending_dereg_.contains(addr);
+    }
+
+    static bool hasPendingRepublish(RdmaTransport &transport, uint64_t addr) {
+        std::lock_guard<std::mutex> lock(transport.pending_cleanup_mutex_);
+        return transport.pending_republish_.contains(addr);
+    }
+
+    // A widened hugetlb registration's MR base, if the caller address is
+    // aliased; std::nullopt for a registration that succeeded over the range
+    // the caller passed.
+    static std::optional<uint64_t> widenAliasBase(RdmaTransport &transport,
+                                                  uint64_t addr) {
+        std::lock_guard<std::mutex> lock(transport.hugetlb_registry_mutex_);
+        auto it = transport.hugepage_widen_aliases_.find(addr);
+        if (it == transport.hugepage_widen_aliases_.end()) return std::nullopt;
+        return it->second;
+    }
+
+    static bool isHugepageClaimed(RdmaTransport &transport, uint64_t base) {
+        std::lock_guard<std::mutex> lock(transport.hugetlb_registry_mutex_);
+        return transport.hugetlb_registered_regions_.contains(base);
+    }
 };
 
 class RdmaContextTestPeer {
    public:
+    static void setTransferWorkerCount(RdmaContext &context, int count) {
+        context.transfer_worker_count_ = count;
+    }
+
+    static void bindWorkerPool(RdmaContext &context,
+                               std::shared_ptr<WorkerPool> pool) {
+        context.worker_pool_ = std::move(pool);
+    }
+
     static void bindProtectionDomain(RdmaContext &context, ibv_pd *pd) {
         context.pd_ = pd;
     }

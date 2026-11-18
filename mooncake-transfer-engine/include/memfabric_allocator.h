@@ -7,6 +7,11 @@ namespace mooncake {
 
 using MemFabricHostAllocFn = void* (*)(size_t, size_t, bool);
 
+// Store may override the default transport protocol without changing it.
+std::string memfabric_get_protocol(bool store);
+
+bool memfabric_use_fabric_mem(const std::string& protocol);
+
 void* memfabric_allocate_memory(size_t total_size, const std::string& protocol);
 
 void* memfabric_allocate_memory_best_effort(

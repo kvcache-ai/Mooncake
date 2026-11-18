@@ -112,6 +112,11 @@ class MasterClient {
     ~MasterClient();
 
     void EnableHaConnectionPolicy();
+    tl::expected<void, ErrorCode> PublishGatherEndpoint(
+        const std::string& owner, const std::string& endpoint,
+        bool remove = false);
+    tl::expected<std::string, ErrorCode> ResolveGatherEndpoint(
+        const std::string& owner);
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 
@@ -372,6 +377,17 @@ class MasterClient {
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
+
+    /**
+     * @brief Set the soft-pin TTL of existing objects without transferring
+     * data.
+     * @param keys Object keys in this client's tenant.
+     * @param ttl_ms TTL from now; zero clears the soft pin. Must not exceed the
+     * master's max_kv_soft_pin_ttl. Soft pins remain runtime-only hints.
+     * @return One status per key in input order; the batch is not atomic.
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms);
 
     /**
      * @brief Batch remove objects and all their replicas
@@ -730,6 +746,30 @@ class MasterClient {
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelTask(const UUID& task_id);
+    [[nodiscard]] tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& task_id);
+
+    /**
+     * List task summaries in this client's tenant (request.tenant_id is
+     * replaced). Keep filters fixed while following next_page_token.
+     * Pages reflect current state, not a snapshot across calls; completed
+     * tasks may disappear when task-history retention prunes them.
+     */
+    [[nodiscard]] tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        TaskListRequest request = {});
+
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+    [[nodiscard]] tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
+        const UUID& job_id);
+    [[nodiscard]] tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelDrainJob(
+        const UUID& job_id);
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch
@@ -766,7 +806,8 @@ class MasterClient {
      * was never enforced.
      * @param key The object key whose disk replica was evicted
      * @param tenant_id The tenant scope of the object
-     * @param replica_type DISK or LOCAL_DISK
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
      * @param expected_replica_id The replica id the caller failed on
      * @return true if evicted, false if the current record is a different
      * replica (left untouched)

@@ -1,7 +1,4 @@
-#include "../../src/nvme_kv/config/connector_config.h"
-
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include "nvme_kv/connector_config.h"
 
 #include <array>
 #include <cstdint>
@@ -9,6 +6,11 @@
 #include <limits>
 #include <optional>
 #include <string>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "nvme_kv/connector.h"
 
 namespace mooncake::test {
 namespace {
@@ -48,11 +50,13 @@ class NvmeKvConnectorConfigTest : public ::testing::Test {
     }
 
    private:
-    inline static constexpr std::array<const char*, 5> kVariables = {
-        "MOONCAKE_NVME_KV_DEVICE_PATH", "MOONCAKE_NVME_KV_NSID",
+    inline static constexpr std::array<const char*, 6> kVariables = {
+        "MOONCAKE_NVME_KV_DEVICE_PATH",
+        "MOONCAKE_NVME_KV_NSID",
         "MOONCAKE_NVME_KV_QUEUE_DEPTH",
         "MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT",
-        "MOONCAKE_NVME_KV_TRANSPORT"};
+        "MOONCAKE_NVME_KV_TRANSPORT",
+        "MOONCAKE_NVME_KV_DRIVER"};
     std::array<std::optional<std::string>, kVariables.size()> original_;
     bool original_logtostderr_ = false;
 };
@@ -98,6 +102,56 @@ TEST_F(NvmeKvConnectorConfigTest, UnsetOptionalValuesKeepRealExecutorDefaults) {
     EXPECT_EQ(config->queue_depth, 256u);
     EXPECT_EQ(config->runtime_transfer_limit, 270336u);
     EXPECT_EQ(config->transport, NvmeKvTransport::kAuto);
+}
+
+TEST_F(NvmeKvConnectorConfigTest, ExplicitConnectorIgnoresLocalEnvironment) {
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_DEVICE_PATH", "/missing-device", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_TRANSPORT", "invalid", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_DRIVER", "stub", 1), 0);
+
+    NvmeKvConnectorConfig options;
+    options.device_path = "/dev/null";
+    options.transport = NvmeKvTransport::kIoctl;
+    options.queue_depth = 17;
+    options.runtime_transfer_limit = 4096;
+    NvmeKvConnector connector;
+    ASSERT_TRUE(connector.Init(options));
+    EXPECT_EQ(connector.GetCapabilities().queue_depth, 17u);
+    EXPECT_EQ(connector.GetCapabilities().effective_max_value_size, 4096u);
+
+    auto duplicate = connector.Init(options);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error(), ErrorCode::INTERNAL_ERROR);
+
+    // Opening the descriptor does not submit an NVMe command.
+    options.device_path = "/missing-device";
+    NvmeKvConnector missing;
+    auto result = missing.Init(options);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_OPEN_FAIL);
+}
+
+TEST_F(NvmeKvConnectorConfigTest,
+       EnvironmentConnectorUsesCommonInitialization) {
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_DEVICE_PATH", "/dev/null", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_TRANSPORT", "ioctl", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_QUEUE_DEPTH", "17", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", "4096", 1), 0);
+
+    NvmeKvConnector connector;
+    ASSERT_TRUE(connector.Init());
+    EXPECT_EQ(connector.GetCapabilities().queue_depth, 17u);
+    EXPECT_EQ(connector.GetCapabilities().effective_max_value_size, 4096u);
+
+    ASSERT_EQ(unsetenv("MOONCAKE_NVME_KV_DEVICE_PATH"), 0);
+    auto duplicate = connector.Init();
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error(), ErrorCode::INTERNAL_ERROR);
+
+    NvmeKvConnector missing;
+    auto result = missing.Init();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(NvmeKvConnectorConfigTest, PreservesLegacyUnsignedIntegerSyntax) {

@@ -18,7 +18,6 @@ namespace redis {
 namespace {
 
 constexpr auto kRedisConnectTimeout = std::chrono::seconds(3);
-constexpr auto kRedisCommandTimeout = std::chrono::seconds(3);
 
 }  // namespace
 
