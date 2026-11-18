@@ -30,6 +30,7 @@ constexpr ConfigFieldSpec kConfigFields[] = {
     {"policy", ConfigFieldMatch::kSubtree},
     {"qos", ConfigFieldMatch::kSubtree},
     {"metrics/report_interval_seconds", ConfigFieldMatch::kExact},
+    {"memory_engine/join_timeout_s", ConfigFieldMatch::kExact},
 
     // RDMA policy and health knobs do not allocate devices, CQs, or QPs and
     // are candidates for a later staged apply handler.

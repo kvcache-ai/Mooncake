@@ -1005,3 +1005,16 @@ if(USE_MLU)
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+# MemoryEngine API/config unit tests. The backend is a stub in this change;
+# the MemFabric implementation lands in a follow-up.
+add_executable(
+  tent_memory_engine_test
+  memory_engine_test.cpp ../src/memory_engine/memory_engine.cpp
+  ../src/memory_engine/backend/memfabric_backend.cpp)
+target_link_libraries(tent_memory_engine_test PRIVATE gtest gtest_main
+                                                      tent_common)
+target_include_directories(tent_memory_engine_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_memory_engine_test COMMAND tent_memory_engine_test)
+set_tests_properties(tent_memory_engine_test PROPERTIES TIMEOUT 120)
