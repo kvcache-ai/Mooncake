@@ -42,6 +42,13 @@ redis.call('SET', key, next_payload)
 return {2, next_payload}
 "#;
 
+const PRUNE_MISSING_NOF_ROUTE: &str = r#"
+if redis.call('HEXISTS', KEYS[1], 'payload') == 0 then
+    for i = 2, #KEYS do redis.call('SREM', KEYS[i], KEYS[1]) end
+end
+return 1
+"#;
+
 fn route_matches_cold_backing_filter(route: &ObjectRoute, filter: &ColdBackingRouteFilter) -> bool {
     if filter
         .after_key
@@ -249,29 +256,37 @@ impl RedisMetadataBackend {
         &self,
         filter: &NofBackingRouteFilter,
     ) -> Result<Vec<ObjectRoute>> {
-        let Some(index) = self.nof_backing_filter_index(filter) else {
-            return self.scan_object_routes_by_nof_backing(filter);
-        };
+        if filter.limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        self.ensure_nof_backing_indexes()?;
+        let indexes = self
+            .nof_backing_filter_index(filter)
+            .map_or_else(|| self.nof_state_indexes().to_vec(), |index| vec![index]);
         let keys =
             self.query_readonly("redis list object routes by nof backing", |connection| {
-                scan_set_members_bounded(
-                    connection,
-                    &index,
-                    MAX_REDIS_LIST_ITEMS,
-                    MAX_REDIS_SCAN_PAGES,
-                )
+                let mut keys = BTreeSet::new();
+                for index in &indexes {
+                    keys.extend(scan_set_members_bounded(
+                        connection,
+                        index,
+                        MAX_REDIS_LIST_ITEMS,
+                        MAX_REDIS_SCAN_PAGES,
+                    )?);
+                }
+                Ok(keys.into_iter().collect::<Vec<_>>())
             })?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let entries =
             self.query_readonly("redis load nof backing object routes", |connection| {
-                let mut entries = Vec::with_capacity(keys.len());
+                let mut pipe = redis::pipe();
                 for key in &keys {
-                    let payload: Option<String> = redis::cmd("HGET")
-                        .arg(key.as_str())
-                        .arg("payload")
-                        .query(connection)?;
-                    entries.push((key.clone(), payload));
+                    pipe.hget(key, "payload");
                 }
-                Ok(entries)
+                let payloads: Vec<Option<String>> = pipe.query(connection)?;
+                Ok(keys.iter().cloned().zip(payloads).collect::<Vec<_>>())
             })?;
         let mut stale_keys = Vec::new();
         let mut routes = Vec::new();
@@ -284,28 +299,19 @@ impl RedisMetadataBackend {
         }
         if !stale_keys.is_empty() {
             let mut connection = self.connection("redis prune stale nof backing route index")?;
-            connection
-                .srem::<_, _, ()>(&index, stale_keys)
-                .map_err(|error| metadata_error("redis srem nof backing route index", error))?;
-        }
-        if routes.is_empty() {
-            return self.scan_object_routes_by_nof_backing(filter);
+            for key in stale_keys {
+                // Route recreation and its index updates are one CAS. Do not
+                // prune an entry using a pre-recreation missing-payload read.
+                Script::new(PRUNE_MISSING_NOF_ROUTE)
+                    .key(&key)
+                    .key(&indexes)
+                    .invoke::<i64>(&mut connection)
+                    .map_err(|error| {
+                        metadata_error("redis prune nof backing route index", error)
+                    })?;
+            }
         }
         Ok(routes
-            .into_iter()
-            .filter(|route| route_matches_nof_backing_filter(route, filter))
-            .take(filter.limit.unwrap_or(usize::MAX))
-            .collect())
-    }
-
-    fn scan_object_routes_by_nof_backing(
-        &self,
-        filter: &NofBackingRouteFilter,
-    ) -> Result<Vec<ObjectRoute>> {
-        // A qualified trait call would re-enter the Redis override rather than
-        // invoke the trait's default implementation.
-        Ok(self
-            .list_object_routes()?
             .into_iter()
             .filter(|route| route_matches_nof_backing_filter(route, filter))
             .take(filter.limit.unwrap_or(usize::MAX))

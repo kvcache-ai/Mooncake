@@ -1,4 +1,5 @@
 mod cold_tier;
+mod nof_index;
 
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -3497,18 +3498,19 @@ mod tests {
                 .unwrap(),
             vec![cold]
         );
+        // Legacy metadata may be missing a secondary-target index before the
+        // namespace's first NoF lookup migrates its indexes.
+        backend
+            .connection("test remove NoF index")
+            .unwrap()
+            .del::<_, ()>(backend.keyspace.object_nof_target_index("nof-b"))
+            .unwrap();
         assert_eq!(
             backend
                 .list_object_routes_by_nof_backing(&NofBackingRouteFilter::default())
                 .unwrap(),
             vec![nof.clone()]
         );
-        // Force the indexed query through the legacy/missing-index fallback.
-        backend
-            .connection("test remove NoF index")
-            .unwrap()
-            .del::<_, ()>(backend.keyspace.object_nof_target_index("nof-b"))
-            .unwrap();
         let filter = NofBackingRouteFilter {
             target_id: Some("nof-b".to_string()),
             ..Default::default()
@@ -4384,6 +4386,166 @@ mod tests {
             })
             .unwrap();
         assert_eq!(next[0].key, ObjectKey::new("b-cold"));
+    }
+
+    #[test]
+    fn redis_nof_index_migration_handles_large_hot_namespaces_and_legacy_targets() {
+        use mooncake_store_core::{
+            ColdBackingState, NofBackingReplica, NofBackingRoute, NofBackingRouteFilter,
+        };
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url())).unwrap();
+        let mut connection = backend.connection("seed legacy namespace").unwrap();
+        let mut pipe = redis::pipe();
+        for i in 0..4097 {
+            let mut route = sample_route(1);
+            route.key = ObjectKey::new(format!("hot-{i}"));
+            let key = backend.keyspace.object(&route.key);
+            pipe.hset(&key, "payload", serde_json::to_string(&route).unwrap())
+                .ignore();
+            pipe.hset(&key, "version", 1).ignore();
+            pipe.sadd(backend.keyspace.object_index(), &key).ignore();
+        }
+        let mut legacy = sample_route(1);
+        legacy.key = ObjectKey::new("legacy-nof");
+        legacy.nof_backing = Some(NofBackingRoute {
+            owner: sample_runtime(),
+            target_id: "primary".into(),
+            object_locator: "legacy".into(),
+            length: 12,
+            checksum: Some(7),
+            state: ColdBackingState::Materialized,
+            replicas: vec![NofBackingReplica {
+                target_id: "secondary".into(),
+                owner: sample_runtime(),
+                object_locator: "secondary-copy".into(),
+            }],
+        });
+        let legacy_key = backend.keyspace.object(&legacy.key);
+        pipe.hset(
+            &legacy_key,
+            "payload",
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .ignore();
+        pipe.hset(&legacy_key, "version", 1).ignore();
+        pipe.sadd(backend.keyspace.object_index(), &legacy_key)
+            .ignore();
+        pipe.query::<()>(&mut connection).unwrap();
+        drop(connection);
+        let filter = |target: &str| NofBackingRouteFilter {
+            target_id: Some(target.into()),
+            ..Default::default()
+        };
+        assert!(backend
+            .list_object_routes_by_nof_backing(&filter("empty"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&filter("secondary"))
+                .unwrap(),
+            vec![legacy.clone()]
+        );
+
+        let mut connection = backend.connection("poison unrelated route").unwrap();
+        connection
+            .hset::<_, _, _, ()>(
+                backend.keyspace.object(&ObjectKey::new("hot-0")),
+                "payload",
+                "invalid-json",
+            )
+            .unwrap();
+        drop(connection);
+        // A completed namespace must not inspect unrelated hot-route payloads,
+        // including on misses or on an unfiltered NoF lookup.
+        assert!(backend
+            .list_object_routes_by_nof_backing(&filter("another-empty"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&NofBackingRouteFilter::default())
+                .unwrap(),
+            vec![legacy.clone()]
+        );
+
+        let mut connection = backend
+            .connection("simulate legacy target-only indexes")
+            .unwrap();
+        connection
+            .del::<_, ()>(backend.nof_index_ready_key("targets"))
+            .unwrap();
+        connection
+            .del::<_, ()>(backend.keyspace.object_nof_target_index("secondary"))
+            .unwrap();
+        drop(connection);
+        // Known-complete state indexes narrow target repair to NoF routes;
+        // scanning the global index here would hit the poisoned hot payload.
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&filter("secondary"))
+                .unwrap(),
+            vec![legacy]
+        );
+    }
+
+    #[test]
+    fn redis_nof_backfill_does_not_resurrect_indexes_after_concurrent_route_cas() {
+        use mooncake_store_core::{ColdBackingState, NofBackingRoute, NofBackingRouteFilter};
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url())).unwrap();
+        let mut route = sample_route(1);
+        route.nof_backing = Some(NofBackingRoute {
+            owner: sample_runtime(),
+            target_id: "retired".into(),
+            object_locator: "copy".into(),
+            length: 12,
+            checksum: Some(7),
+            state: ColdBackingState::Materialized,
+            replicas: Vec::new(),
+        });
+        backend
+            .compare_and_swap_object_route(&route.key, None, Some(&route))
+            .unwrap();
+        let stale_payload = serde_json::to_string(&route).unwrap();
+        let mut next = route.clone();
+        next.version = RouteVersion(2);
+        next.nof_backing.as_mut().unwrap().target_id = "current".into();
+        assert!(
+            backend
+                .compare_and_swap_object_route(&route.key, Some(route.version), Some(&next))
+                .unwrap()
+                .applied
+        );
+        let mut connection = backend.connection("finish stale migration page").unwrap();
+        backend
+            .repair_nof_index_entry(
+                &mut connection,
+                &backend.keyspace.object(&route.key),
+                &stale_payload,
+            )
+            .unwrap();
+        assert!(!connection
+            .sismember::<_, _, bool>(
+                backend.keyspace.object_nof_target_index("retired"),
+                backend.keyspace.object(&route.key)
+            )
+            .unwrap());
+        drop(connection);
+        assert_eq!(
+            backend
+                .list_object_routes_by_nof_backing(&NofBackingRouteFilter {
+                    target_id: Some("current".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            vec![next]
+        );
     }
 
     #[test]
