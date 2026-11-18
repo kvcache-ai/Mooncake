@@ -615,6 +615,65 @@ def test_bundle_partial_put_failure_cleans_payloads() -> None:
     assert store.objects == {}
 
 
+@pytest.mark.parametrize("missing", ["key_error", "batch_exists", "is_exist"])
+def test_bundle_remove_retries_after_lost_manifest_ack(monkeypatch, missing) -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_bundle(b"meta", {"payload": b"abc"})
+    handle = {"manifest_key": ref.manifest_key}
+    batch_remove = store.batch_remove
+
+    def lose_final_ack(keys, *, force):
+        result = batch_remove(keys, force=force)
+        if ref.manifest_key in keys:
+            raise TimeoutError("lost manifest delete response")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "batch_remove", lose_final_ack)
+        with pytest.raises(TimeoutError, match="lost manifest"):
+            transfer.remove_bundle(handle)
+    assert store.objects == {}
+
+    if missing != "key_error":
+        monkeypatch.setattr(store, "get", lambda key: store.objects.get(key, b""))
+    if missing == "batch_exists":
+        monkeypatch.setattr(
+            store,
+            "batch_is_exist",
+            lambda keys: [int(k in store.objects) for k in keys],
+            raising=False,
+        )
+    elif missing == "is_exist":
+        monkeypatch.setattr(
+            store, "is_exist", store.objects.__contains__, raising=False
+        )
+    MooncakeBundleTransfer(store).remove_bundle(handle)
+    assert store.objects == {}
+
+
+@pytest.mark.parametrize(
+    ("manifest_bytes", "statuses", "error"),
+    [
+        (b"", [1], json.JSONDecodeError),
+        (b"", [-4], RuntimeError),
+        (b"", [], RuntimeError),
+        (b"broken", [0], json.JSONDecodeError),
+    ],
+)
+def test_bundle_remove_requires_confirmed_absence(
+    monkeypatch, manifest_bytes, statuses, error
+) -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_bundle(b"meta", {"payload": b"abc"})
+    before = dict(store.objects)
+    monkeypatch.setattr(store, "get", lambda key: manifest_bytes)
+    monkeypatch.setattr(store, "batch_is_exist", lambda keys: statuses, raising=False)
+    monkeypatch.setattr(store, "is_exist", lambda key: False, raising=False)
+    with pytest.raises(error):
+        transfer.remove_bundle({"manifest_key": ref.manifest_key})
+    assert store.objects == before
+
+
 def test_bundle_cleanup_failure_preserves_put_error() -> None:
     _store, transfer = make_transfer(FailingRemoveStore(fail_on_put=2))
 

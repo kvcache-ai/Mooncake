@@ -432,7 +432,33 @@ class _BundleManifestStore:
         return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
-        manifest = self.resolve_manifest(ref)
+        try:
+            manifest = self.resolve_manifest(ref)
+        except (KeyError, json.JSONDecodeError) as error:
+            if isinstance(ref, RemoteBundleRef) or ref.get("manifest") is not None:
+                raise
+            if isinstance(error, json.JSONDecodeError) and error.doc:
+                raise
+            # A retry can arrive after the final removal took effect. Store-RS
+            # also returns empty bytes on read errors, so confirm absence.
+            key = ref["manifest_key"]
+            batch_is_exist = getattr(self._store, "batch_is_exist", None)
+            if callable(batch_is_exist):
+                statuses = batch_is_exist([key])
+                if len(statuses) != 1 or statuses[0] not in (0, 1):
+                    raise RuntimeError(
+                        f"batch_is_exist failed for {key}: {statuses}"
+                    ) from error
+                if statuses[0] == 0:
+                    return
+            else:
+                is_exist = getattr(self._store, "is_exist", None)
+                if callable(is_exist):
+                    if is_exist(key) == 0:
+                        return
+                elif isinstance(error, KeyError):
+                    return
+            raise
         manifest_key = self._manifest_key(ref, manifest)
         # A manifest-only handle needs the payload list if cleanup is retried.
         _cleanup_keys(self._store, self._payload_keys(manifest), strict=True)
