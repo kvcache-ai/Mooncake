@@ -36,6 +36,9 @@ class LocalSsdTaskMailbox {
     bool ConsumeRemoveAll();
 
    private:
+    // The manager holds this lock in its dynamically-sized lock vector.
+    void AssertMutexHeld() const ASSERT_CAPABILITY(mutex_) {}
+
     mutable Mutex mutex_;
     bool enable_offloading_ GUARDED_BY(mutex_);
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_

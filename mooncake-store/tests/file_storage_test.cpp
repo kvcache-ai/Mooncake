@@ -447,7 +447,10 @@ class FileStorageTest : public ::testing::Test {
         storage.storage_backend_ = backend;
         ASSERT_TRUE(backend->Init());
         ASSERT_TRUE(storage.RegisterLocalMemory());
-        storage.enable_offloading_ = true;
+        {
+            MutexLocker locker(&storage.offloading_mutex_);
+            storage.enable_offloading_ = true;
+        }
         ASSERT_TRUE(storage.Heartbeat());
         ASSERT_EQ(1u, storage.deferred_task_by_storage_key_.size());
         EXPECT_EQ(1u, backend->UngroupedOffloadingObjectsSize());
@@ -530,7 +533,10 @@ class FileStorageTest : public ::testing::Test {
                 config, bucket_config, std::unordered_set<std::string>{}, true);
         }
         file_storage.storage_backend_ = backend;
-        file_storage.enable_offloading_ = true;
+        {
+            MutexLocker locker(&file_storage.offloading_mutex_);
+            file_storage.enable_offloading_ = true;
+        }
         ASSERT_TRUE(backend->Init());
 
         // Carry one real master task across a heartbeat boundary first.
@@ -546,7 +552,10 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), capacity_limit ? ErrorCode::KEYS_ULTRA_LIMIT
                                                  : ErrorCode::FILE_WRITE_FAIL);
-        EXPECT_EQ(file_storage.enable_offloading_, !capacity_limit);
+        {
+            MutexLocker locker(&file_storage.offloading_mutex_);
+            EXPECT_EQ(file_storage.enable_offloading_, !capacity_limit);
+        }
         EXPECT_EQ(file_storage.deferred_task_by_storage_key_.size(),
                   capacity_limit ? 0u : 1u);
         EXPECT_EQ(backend->UngroupedOffloadingObjectsSize(),

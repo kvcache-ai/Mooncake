@@ -355,7 +355,7 @@ class MasterServiceTestPeer {
         MasterService& service, const UUID& job_id) {
         std::shared_ptr<MasterService::DrainJob> job;
         {
-            std::lock_guard<std::mutex> lock(service.job_mutex_);
+            MutexLocker lock(&service.job_mutex_);
             auto it = service.drain_jobs_.find(job_id);
             if (it == service.drain_jobs_.end()) {
                 return {};

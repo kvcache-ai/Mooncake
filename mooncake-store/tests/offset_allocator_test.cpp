@@ -286,11 +286,13 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void TearDown() override {}
 
-    void lockAllocator(const std::shared_ptr<OffsetAllocator>& allocator) {
+    void lockAllocator(const std::shared_ptr<OffsetAllocator>& allocator)
+        ACQUIRE(allocator->m_mutex) {
         allocator->m_mutex.lock();
     }
 
-    void unlockAllocator(const std::shared_ptr<OffsetAllocator>& allocator) {
+    void unlockAllocator(const std::shared_ptr<OffsetAllocator>& allocator)
+        RELEASE(allocator->m_mutex) {
         allocator->m_mutex.unlock();
     }
 

@@ -39,6 +39,9 @@
 #define REQUIRES(...) \
     THREAD_ANNOTATION_ATTRIBUTE__(requires_capability(__VA_ARGS__))
 
+#define REQUIRES_SHARED(...) \
+    THREAD_ANNOTATION_ATTRIBUTE__(requires_shared_capability(__VA_ARGS__))
+
 #define ACQUIRE(...) \
     THREAD_ANNOTATION_ATTRIBUTE__(acquire_capability(__VA_ARGS__))
 

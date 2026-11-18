@@ -77,12 +77,14 @@ TEST(SharedMutexTest, SharedAccessIsConcurrent) {
     EXPECT_GE(peak_readers.load(), 2);  // At least two readers ran concurrently
 }
 
+// Contender lambdas deliberately hand ownership between threads, which the
+// lexical capability model cannot represent.
 TEST(SharedMutexTest, WriterBlocksReaders) {
     SharedMutex mtx;
     mtx.lock();
 
     bool reader_acquired = false;
-    std::thread reader([&]() {
+    std::thread reader([&]() NO_THREAD_SAFETY_ANALYSIS {
         reader_acquired = mtx.try_lock_shared();
         if (reader_acquired) {
             mtx.unlock_shared();
@@ -106,7 +108,7 @@ TEST(SharedMutexTest, LocksOnConstructionExclusive) {
         SharedMutexLocker locker(&mtx);
         bool exclusive_acquired = false;
         bool shared_acquired = false;
-        std::thread contender([&]() {
+        std::thread contender([&]() NO_THREAD_SAFETY_ANALYSIS {
             exclusive_acquired = mtx.try_lock();
             if (exclusive_acquired) {
                 mtx.unlock();
@@ -135,7 +137,7 @@ TEST(SharedMutexTest, LocksOnConstructionShared) {
         SharedMutexLocker locker(&mtx, shared_lock);
         bool shared_acquired = false;
         bool exclusive_acquired = false;
-        std::thread contender([&]() {
+        std::thread contender([&]() NO_THREAD_SAFETY_ANALYSIS {
             shared_acquired = mtx.try_lock_shared();
             if (shared_acquired) {
                 mtx.unlock_shared();
@@ -172,7 +174,9 @@ TEST(SharedMutexTest, ManualLockUnlock) {
     }
 }
 
-TEST(SharedMutexTest, TryLockSuccess) {
+// EXPECT_FALSE does not give the analyzer a branch in which a failed try_lock
+// leaves the capability unacquired.
+TEST(SharedMutexTest, TryLockSuccess) NO_THREAD_SAFETY_ANALYSIS {
     SharedMutex mtx;
     SharedMutexLocker locker(&mtx);
     locker.unlock();  // Ensure it's released first
@@ -183,7 +187,7 @@ TEST(SharedMutexTest, TryLockSuccess) {
     locker.unlock();
 }
 
-TEST(SharedMutexTest, TryLockSharedSuccess) {
+TEST(SharedMutexTest, TryLockSharedSuccess) NO_THREAD_SAFETY_ANALYSIS {
     SharedMutex mtx;
     SharedMutexLocker locker(&mtx, shared_lock);
     locker.unlock();
@@ -213,7 +217,8 @@ class SpinLockTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
-TEST(SpinLockTest, LockUnlockTest) {
+// The main thread and the blocked thread intentionally alternate ownership.
+TEST(SpinLockTest, LockUnlockTest) NO_THREAD_SAFETY_ANALYSIS {
     SpinLock lock;
 
     // The lock is initialized as unlocked.
