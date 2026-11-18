@@ -4341,6 +4341,54 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_FALSE(segment_names.contains("segment_0"));
 }
 
+TEST_F(MasterServiceTest, DrainJobMovesObjectsReadSinceWrittenFirst) {
+    constexpr uint64_t kLeaseTtlMs = 100;
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(kLeaseTtlMs)
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000,
+                         kDefaultSegmentSize);
+    const auto put = [&] {
+        return PutObjectOnSegment(*service, generate_uuid(), "segment_0");
+    };
+    const auto read = [&](const std::string& key) {
+        ASSERT_TRUE(service->GetReplicaList(key, TenantId::Default()));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    std::vector<std::string> unread;
+    for (int i = 0; i < 5; ++i) {
+        unread.push_back(put());
+    }
+    const auto recent_read = put();
+    const auto old_read = put();
+    read(old_read);
+    read(recent_read);
+    // Let the read leases lapse so the newest object has the latest deadline.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2 * kLeaseTtlMs));
+    unread.push_back(put());
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 2;
+    ASSERT_TRUE(service->CreateDrainJob(request));
+
+    std::vector<std::string> moved;
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service, source.client_id, &moved);
+            return moved.size() == 8;
+        },
+        std::chrono::seconds(10));
+    std::vector<std::string> expected{recent_read, old_read};
+    expected.insert(expected.end(), unread.rbegin(), unread.rend());
+    EXPECT_EQ(moved, expected);
+}
+
 TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
     auto config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(10000).build();

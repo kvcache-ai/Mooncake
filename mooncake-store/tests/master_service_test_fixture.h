@@ -408,8 +408,9 @@ class MasterServiceTest : public ::testing::Test {
                 .has_value());
     }
 
-    bool ExecutePendingMoveTasks(MasterService& service,
-                                 const UUID& client_id) const {
+    bool ExecutePendingMoveTasks(
+        MasterService& service, const UUID& client_id,
+        std::vector<std::string>* moved_keys = nullptr) const {
         auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
         EXPECT_TRUE(fetched.has_value());
         if (!fetched.has_value() || fetched->empty()) {
@@ -443,6 +444,9 @@ class MasterServiceTest : public ::testing::Test {
             complete_request.message = "move_done";
             EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
                             .has_value());
+            if (moved_keys != nullptr) {
+                moved_keys->push_back(payload.key);
+            }
             processed = true;
         }
         return processed;
