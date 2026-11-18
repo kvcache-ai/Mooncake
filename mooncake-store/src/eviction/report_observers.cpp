@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -80,6 +81,18 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
+}
+
+void AgeObserver::OnApplied(const ObjectView& view, const Effect& effect) {
+    // Counted exactly like the run's evicted_objects: an object that
+    // released nothing is not an eviction sample.
+    if (effect.released_bytes == 0) {
+        return;
+    }
+    MasterMetricManager::instance().observe_evicted_key_age_seconds(
+        std::chrono::duration<double>(std::chrono::system_clock::now() -
+                                      view.metadata.put_start_time)
+            .count());
 }
 
 }  // namespace eviction
