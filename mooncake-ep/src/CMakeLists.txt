@@ -245,6 +245,44 @@ elseif(USE_MUSA)
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/musa_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/musa_dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/musa_combine_jit.cpp")
+  set(MOONCAKE_EP_JIT_STAGE_ROOT "${CMAKE_BINARY_DIR}/mooncake_ep_jit")
+  set(MOONCAKE_EP_JIT_SOURCE_DIR
+      "${MOONCAKE_EP_JIT_STAGE_ROOT}/include/mooncake_ep")
+  set(MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine")
+  set(MOONCAKE_EP_JIT_HEADERS
+      mooncake_ep_combine.cuh
+      mooncake_ep_configs.cuh
+      mooncake_ep_device.h
+      mooncake_ep_dispatch.cuh
+      mooncake_ep_exception.cuh
+      mooncake_ep_launch.cuh
+      mooncake_ep_utils.cuh)
+  set(MOONCAKE_EP_JIT_TRANSFER_HEADERS
+      include/cuda_alike.h
+      include/cuda_fabric_compat.h
+      include/transport/device/comm_device.cuh
+      include/transport/device/cuda/cuda_ops.cuh
+      include/transport/device/device_ops.cuh
+      include/transport/device/ibgda/mlx5gda.h
+      include/transport/device/ibgda_device.cuh
+      include/transport/device/musa/musa_ops.cuh
+      include/transport/device/nccl_device.cuh
+      include/transport/device/nccl_device_transport.h
+      include/transport/device/p2p_device.cuh
+      tent/include/tent/common/cuda_fabric_compat.h)
+  file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_SOURCE_DIR}")
+  foreach(header IN LISTS MOONCAKE_EP_JIT_HEADERS)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../include/${header}"
+                   "${MOONCAKE_EP_JIT_SOURCE_DIR}/${header}" COPYONLY)
+  endforeach()
+  foreach(header IN LISTS MOONCAKE_EP_JIT_TRANSFER_HEADERS)
+    get_filename_component(header_dir "${header}" DIRECTORY)
+    file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header_dir}")
+    configure_file(
+      "${MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR}/${header}"
+      "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header}" COPYONLY)
+  endforeach()
   if(DEFINED ENV{MUSA_HOME} AND NOT "$ENV{MUSA_HOME}" STREQUAL "")
     set(_ep_musa_compiler_hint "$ENV{MUSA_HOME}/bin")
   else()
@@ -355,8 +393,8 @@ set_target_properties(_ep PROPERTIES INSTALL_RPATH "$ORIGIN")
 if(USE_MUSA)
   target_compile_definitions(
     _ep PRIVATE MOONCAKE_EP_USE_MUSA=1
-    MOONCAKE_EP_JIT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include"
-    MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine")
+    MOONCAKE_EP_JIT_SOURCE_DIR="${MOONCAKE_EP_JIT_SOURCE_DIR}"
+    MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR="${MOONCAKE_EP_JIT_STAGE_ROOT}")
 endif()
 if(USE_MACA)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MACA=1)

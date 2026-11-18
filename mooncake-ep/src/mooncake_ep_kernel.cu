@@ -224,7 +224,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     jit::launch_dispatch_jit(hidden, use_fp8, num_warp_groups,
                              kNumWarpsPerGroup, num_sms, args, stream);
 #endif
-#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#else // MACA-only AOT launch
 #define DISPATCH_LAUNCH_GROUP(hidden, groups) case groups: { \
 constexpr int kNumWarpGroups = groups; \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
@@ -316,7 +316,7 @@ void combine(void* combined_x, int32_t* active_ranks,
     jit::launch_combine_jit(hidden, kNumMaxTopk,
                             kNumWarpGroups, kNumWarpsPerGroup, num_sms, args, stream);
 #endif
-#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#else // MACA-only AOT launch
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, args); } break

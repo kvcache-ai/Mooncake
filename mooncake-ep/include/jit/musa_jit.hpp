@@ -20,8 +20,7 @@ struct MusaJitCompileConfig {
     std::filesystem::path objcopy;
     std::filesystem::path work_dir;
     std::vector<std::filesystem::path> include_dirs;
-    // Set explicitly or through MOONCAKE_MUSA_JIT_ARCH. Runtime compilation
-    // does not probe a device because the compiler environment may be GPU-less.
+    // Set explicitly or through MOONCAKE_MUSA_JIT_ARCH.
     std::string target_arch;
     std::vector<std::string> extra_options;
 };
@@ -37,6 +36,10 @@ struct MusaJitCompileResult {
 // paths and extra compiler options remain overridable without rebuilding the
 // extension.
 void apply_musa_jit_environment(MusaJitCompileConfig* config);
+
+MusaJitCompileConfig make_musa_jit_compile_config();
+bool resolve_musa_jit_target_arch(MusaJitCompileConfig* config,
+                                  std::string* error);
 
 // Compile a MUSA translation unit and extract the device member from the
 // clang offload bundle. The returned image is suitable for muModuleLoadData.

@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <dlfcn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -93,6 +94,15 @@ std::string musa_error(MUresult result) {
     return out.str();
 }
 
+std::filesystem::path library_dir() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&library_dir), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        return {};
+    }
+    return std::filesystem::path(info.dli_fname).parent_path();
+}
+
 }  // namespace
 
 void apply_musa_jit_environment(MusaJitCompileConfig* config) {
@@ -120,6 +130,76 @@ void apply_musa_jit_environment(MusaJitCompileConfig* config) {
     }
 }
 
+MusaJitCompileConfig make_musa_jit_compile_config() {
+    MusaJitCompileConfig config;
+    const char* cache = std::getenv("MOONCAKE_MUSA_JIT_CACHE_DIR");
+    config.work_dir =
+        cache != nullptr && *cache != '\0' ? cache : "/tmp/mooncake-musa-jit";
+    std::filesystem::path source_dir;
+    std::filesystem::path transfer_dir;
+    if (const char* value = std::getenv("MOONCAKE_EP_JIT_SOURCE_DIR");
+        value != nullptr && *value != '\0') {
+        source_dir = value;
+    }
+    if (const char* value =
+            std::getenv("MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR");
+        value != nullptr && *value != '\0') {
+        transfer_dir = value;
+    }
+#ifdef MOONCAKE_EP_JIT_SOURCE_DIR
+    if (source_dir.empty()) source_dir = MOONCAKE_EP_JIT_SOURCE_DIR;
+#endif
+#ifdef MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR
+    if (transfer_dir.empty())
+        transfer_dir = MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR;
+#endif
+    const auto installed_root = library_dir() / "mooncake_ep_jit";
+    const auto installed_source = installed_root / "include" / "mooncake_ep";
+    if (source_dir.empty() || !std::filesystem::is_directory(source_dir)) {
+        source_dir = installed_source;
+    }
+    if (transfer_dir.empty()) transfer_dir = installed_root;
+    config.include_dirs = {source_dir, transfer_dir, transfer_dir / "include"};
+    config.extra_options = {"-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"};
+    apply_musa_jit_environment(&config);
+    return config;
+}
+
+bool resolve_musa_jit_target_arch(MusaJitCompileConfig* config,
+                                  std::string* error) {
+    if (config == nullptr) return false;
+    if (!config->target_arch.empty()) return true;
+    if (const char* value = std::getenv("MOONCAKE_MUSA_JIT_ARCH");
+        value != nullptr && *value != '\0') {
+        config->target_arch = value;
+        return true;
+    }
+    if (muInit(0) != MUSA_SUCCESS) {
+        if (error != nullptr)
+            *error = "muInit failed while detecting MUSA arch";
+        return false;
+    }
+    MUdevice device = 0;
+    int major = 0;
+    int minor = 0;
+    if (muDeviceGet(&device, 0) != MUSA_SUCCESS ||
+        muDeviceGetAttribute(&major,
+                             MU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                             device) != MUSA_SUCCESS ||
+        muDeviceGetAttribute(&minor,
+                             MU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                             device) != MUSA_SUCCESS) {
+        if (error != nullptr) {
+            *error =
+                "could not query MUSA device compute capability; set "
+                "MOONCAKE_MUSA_JIT_ARCH";
+        }
+        return false;
+    }
+    config->target_arch = "mp_" + std::to_string(major) + std::to_string(minor);
+    return true;
+}
+
 MusaJitCompileResult compile_musa_to_image(std::string_view source,
                                            std::string_view stem,
                                            const MusaJitCompileConfig& config) {
@@ -132,16 +212,16 @@ MusaJitCompileResult compile_musa_to_image(std::string_view source,
         return result;
     }
     if (config.target_arch.empty()) {
-        result.log =
-            "MUSA JIT target architecture is unset; set "
-            "MOONCAKE_MUSA_JIT_ARCH or MusaJitCompileConfig::target_arch";
+        result.log = "MUSA JIT target architecture is unset";
         return result;
     }
     const std::string& target_arch = config.target_arch;
-    const auto source_path = config.work_dir / (std::string(stem) + ".cu");
-    const auto object_path = config.work_dir / (std::string(stem) + ".o");
-    const auto bundle_path = config.work_dir / (std::string(stem) + ".bundle");
-    const auto image_path = config.work_dir / (std::string(stem) + ".device.o");
+    const std::string prefix =
+        std::string(stem) + ".p" + std::to_string(getpid());
+    const auto source_path = config.work_dir / (prefix + ".cu");
+    const auto object_path = config.work_dir / (prefix + ".o");
+    const auto bundle_path = config.work_dir / (prefix + ".bundle");
+    const auto image_path = config.work_dir / (prefix + ".device.o");
     if (!write_file(source_path, source)) {
         result.log = "could not write source: " + source_path.string();
         return result;
@@ -151,7 +231,7 @@ MusaJitCompileResult compile_musa_to_image(std::string_view source,
         config.compiler.empty() ? "mcc" : config.compiler.string(),
         "-x",
         "musa",
-        "-std=c++17",
+        "-std=c++20",
         "-O3",
         "-fPIC",
         "-c",
@@ -185,7 +265,7 @@ MusaJitCompileResult compile_musa_to_image(std::string_view source,
 
     // clang-offload-bundler requires both members in --outputs, even though
     // the host member is intentionally discarded.
-    const auto host_path = config.work_dir / (std::string(stem) + ".host.o");
+    const auto host_path = config.work_dir / (prefix + ".host.o");
     const std::string target = "musa-mtgpu-mt-musa--" + target_arch;
     std::vector<std::string> unbundle = {
         config.bundler.empty() ? "clang-offload-bundler"
