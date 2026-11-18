@@ -23,7 +23,8 @@ class NvmeKvStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string> &keys,
                                 std::vector<StorageObjectMetadata> &metadatas)>
             complete_handler,
-        EvictionHandler eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr,
+        const ObjectVersions *versions = nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice> &batched_slices) override;
