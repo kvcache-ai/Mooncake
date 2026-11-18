@@ -11,11 +11,13 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "client_liveness.h"
+#include "client_session_event_dispatcher.h"
 #include "types.h"
 
 namespace mooncake {
@@ -24,9 +26,15 @@ namespace test {
 class ClientSessionRegistryTestPeer;
 }  // namespace test
 
-// Owns per-incarnation admission, registration and staged restore. The caller
-// still drives expiry synchronously and reserves retirement before OFFLINE;
-// owned threads and asynchronous transition delivery follow separately.
+// Owns client session identity: which incarnation is registered under a client
+// ID, whether it may serve or retain resources, the scopes that keep one
+// incarnation stable while an operation runs, and the TTL expiry of sessions
+// that stop heartbeating. It is the only mutator of the liveness records it
+// hands out as read-only identities, so every transition is one it caused
+// itself, and it owns what follows from one: its gauges, its own state for a
+// terminal incarnation, and delivery to listeners. Listeners run on the owned
+// delivery thread, outside every registry lock, so a listener may take
+// segment, metadata or snapshot locks and may reenter the registry.
 class ClientSessionRegistry {
    private:
     enum class RegistrationKind { Register, Remount };
@@ -41,13 +49,11 @@ class ClientSessionRegistry {
     // the registry: a record that left it is never mutated again.
     // Optional expiry admission is checked outside registry locks before each
     // pass, so an owner can pause expiry during recovery. It must not throw
-    // and its captures must outlive the caller's expiry driver.
+    // and its captures must outlive Stop.
     explicit ClientSessionRegistry(
         Clock::duration active_ttl = Clock::duration::max(),
         Clock::duration suspicion_ttl = Clock::duration::max(),
-        std::function<bool()> admits_expiry = {},
-        std::function<void()> reserve_retirement = {},
-        std::function<void(const UUID&, ClientSessionSharedPtr)> retire = {});
+        std::function<bool()> admits_expiry = {});
     ~ClientSessionRegistry();
     ClientSessionRegistry(const ClientSessionRegistry&) = delete;
     ClientSessionRegistry& operator=(const ClientSessionRegistry&) = delete;
@@ -112,19 +118,34 @@ class ClientSessionRegistry {
     // cleanup has not converged. OFFLINE is itself the barrier: whoever can
     // observe it can also observe this, with no separate reservation.
     bool HasRetiredSession() const;
-    // Drops every session. Only allowed once the expiry driver is stopped.
+    // Drops every session. Only allowed once monitoring and event delivery
+    // are stopped.
     void Reset();
 
-    // Driven by one monitor thread. One deterministic expiry pass applies TTLs
-    // to expired sessions while excluding operations; a persistently busy slot
-    // closes its admission turnstile and defers evaluation without blocking the
-    // scanner thread. Skipped while restore/reset holds lifecycle_mutex_;
-    // retirement callbacks run after releasing the slot operation lock.
-    void ExpireSessions(Clock::time_point now);
+    // Register before the first Start; a listener added later is rejected.
+    // Listeners run serially, in registration order, on the delivery thread,
+    // and must not throw. Their owners must outlive Stop. OFFLINE is delivered
+    // once per incarnation, after the registry dropped its own readiness and
+    // host state for it. A recovery and a suspicion of one session come from
+    // different threads and may be delivered out of order; read
+    // event.session for the state that holds now.
+    [[nodiscard]] bool AddListener(
+        ClientSessionEventDispatcher::Listener listener);
+
+    // Enable expiry and delivery. Stop tears them down in the order that
+    // preserves side effects: expiry stops publishing first, then queued
+    // transitions are delivered and the delivery thread joins. Stop rejects
+    // later transitions until Start, and is idempotent. Do not call Stop from
+    // a listener. The destructor stops too, but that is too late for listeners
+    // that reach state destroyed before this registry: those owners must call
+    // Stop themselves, before that state goes away.
+    void Start();
+    void Stop();
 
    private:
     friend class test::ClientSessionRegistryTestPeer;
 
+    static constexpr std::chrono::seconds kExpiryScanInterval{1};
     // A std::shared_mutex may prefer readers (the default on glibc), which
     // would let overlapping operations postpone a state transition forever.
     // Exclusive acquirers increment waiting_writers_ while queuing for mutex_,
@@ -286,6 +307,14 @@ class ClientSessionRegistry {
     void PublishTransition(const UUID& client_id, const Slot& slot,
                            ClientLivenessState previous,
                            ClientLivenessState current);
+    // One deterministic expiry pass. Applies the TTLs to every session,
+    // excluding its operations for the evaluation. A busy session is retried
+    // on the next pass; a persistently busy slot closes its admission gate
+    // without blocking the scanner. The whole pass is
+    // skipped while restore/reset holds the lifecycle barrier -- expiry is
+    // frozen there, heartbeats and lookups are not.
+    void ExpireSessions(Clock::time_point now);
+    void ExpiryThreadFunc();
 
     // Membership-changing operations take this before any other lock.
     // Registration/removal share it; restore/reset own it exclusively.
@@ -293,12 +322,15 @@ class ClientSessionRegistry {
     mutable std::shared_mutex lifecycle_mutex_;
     mutable std::shared_mutex mutex_;
     Slots slots_;
+    ClientSessionEventDispatcher events_;
 
     const Clock::duration active_ttl_;
     const Clock::duration suspicion_ttl_;
     const std::function<bool()> admits_expiry_;
-    const std::function<void()> reserve_retirement_;
-    const std::function<void(const UUID&, ClientSessionSharedPtr)> retire_;
+    std::mutex expiry_mutex_;
+    std::condition_variable expiry_cv_;
+    bool expiry_stopping_{false};
+    std::thread expiry_thread_;
 };
 
 class ClientSessionRegistry::SessionGuard {

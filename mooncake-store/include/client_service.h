@@ -343,9 +343,10 @@ class Client {
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
      */
-    ErrorCode TransferWriteRange(const Replica::Descriptor& replica_descriptor,
-                                 std::vector<Slice>& slices,
-                                 uint64_t dst_offset);
+    ErrorCode TransferWriteRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Batch ranged read against cached replicas. Fragments from all
@@ -631,6 +632,24 @@ class Client {
      * on success, ErrorCode on failure
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
+
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
+
+    tl::expected<void, ErrorCode> CancelTask(const UUID& task_id);
 
     /**
      * @brief Get global segment base address for cxl protocol
@@ -1071,7 +1090,8 @@ class Client {
         std::vector<Slice>& slices, uint64_t src_offset);
     std::optional<TransferFuture> SubmitRangeWrite(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t dst_offset);
+        std::vector<Slice>& slices, uint64_t dst_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferWrite(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
@@ -1295,7 +1315,9 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets, const UUID* task_id);
+
+    bool IsTaskCancellationRequested(const UUID* task_id);
 
     /**
      * @brief Copy an object's replica to target segments
@@ -1315,7 +1337,8 @@ class Client {
         const std::string& key, const std::string& tenant_id,
         const std::string& source, const std::vector<std::string>& targets,
         const UUID& dynamic_replication_lease_id,
-        uint64_t dynamic_replication_version_epoch);
+        uint64_t dynamic_replication_version_epoch,
+        const UUID* task_id = nullptr);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -1330,7 +1353,8 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& tenant_id,
                                        const std::string& source,
-                                       const std::string& target);
+                                       const std::string& target,
+                                       const UUID* task_id = nullptr);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

@@ -77,6 +77,8 @@ add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(client_session_registry_test client_session_registry_test.cpp)
+add_store_test(client_session_event_dispatcher_test
+               client_session_event_dispatcher_test.cpp)
 add_store_test(client_session_expiry_test client_session_expiry_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
@@ -203,6 +205,7 @@ add_test(
 )
 set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
+add_store_test(soft_pin_rpc_test soft_pin_rpc_test.cpp)
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
