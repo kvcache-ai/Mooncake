@@ -107,7 +107,6 @@ struct ObjectMetadata {
 
     // Updated by UpsertStart (Case B) to reflect the new writer.
     UUID client_id;
-    UUID put_reservation{};
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};

@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace mooncake {
@@ -184,6 +185,31 @@ TEST(UdsTransportTest, StopWakesAcceptLoop) {
 
     UdsConnector connector(testSocketPath("stop"));
     EXPECT_FALSE(connector.connect());
+}
+
+TEST(UdsTransportTest, QuarantinedNameRejectsConnectionsAndRebindUntilExit) {
+    const auto name = testSocketPath("quarantine");
+    const pid_t owner = fork();
+    ASSERT_GE(owner, 0);
+    if (owner == 0) {
+        {
+            UdsAcceptor acceptor(name);
+            acceptor.registerHandler([](UdsConnection &) {});
+            if (!acceptor.start()) _exit(1);
+            acceptor.stop(/*retain_socket_name=*/true);
+        }
+        UdsAcceptor replacement(name);
+        replacement.registerHandler([](UdsConnection &) {});
+        if (UdsConnector(name).connect() || replacement.start()) _exit(2);
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(owner, &status, 0), owner);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    UdsAcceptor replacement(name);
+    replacement.registerHandler([](UdsConnection &) {});
+    EXPECT_TRUE(replacement.start());
 }
 
 TEST(UdsTransportTest, StopWakesActiveClientHandler) {

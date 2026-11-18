@@ -531,6 +531,8 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
+    if (cuda_transfer_state_ != CudaTransferState::kActive)
+        return toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     const char* use_fabric_mem_env =
         std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
     if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
@@ -606,7 +608,8 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 return -1;
             }
         }
-        registered_shms_[base_addr] = local_buffer_shm;
+        local_buffer_shm->registered = true;
+        local_buffer_shm->is_local = true;
 
         // Best-effort: request hot cache shm from real client
         if (request_hot_cache_fd() != 0) {
@@ -628,25 +631,15 @@ int DummyClient::tearDownAll() {
         ping_thread_.join();
     }
 
-    {
-        std::lock_guard lock(registered_shms_mutex_);
-        registered_shms_.clear();
-    }
     void* local_buffer_base = local_buffer_base_;
     int cleanup_status = 0;
     {
         std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
-        if (registered_cuda_buffers_.empty()) {
-            if (remote_cleanup_pending_) cleanup_status = unregister_shm();
-        } else {
-            // Queue close behind any CUDA registration whose reply timed out.
-            // Even a failed bulk close may have released some of the MRs.
-            for (auto& [address, registration] : registered_cuda_buffers_) {
-                registration.state = CudaRegistrationState::kReleasing;
-            }
-            cleanup_status =
-                cuda_buffer_ipc_request(IPC_CUDA_UNMAP_CLIENT, 0, {}).status;
-            if (cleanup_status == 0) registered_cuda_buffers_.clear();
+        if (cuda_transfer_state_ == CudaTransferState::kPending ||
+            !registered_cuda_buffers_.empty()) {
+            cleanup_status = unmap_cuda_client_locked();
+        } else if (remote_cleanup_pending_) {
+            cleanup_status = unregister_shm();
         }
         if (cleanup_status == 0) remote_cleanup_pending_ = false;
         connected_.store(false);
@@ -682,31 +675,17 @@ int DummyClient::tearDownAll() {
 }
 
 std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
-    return allocate_dummy_buffer(size, 0);
-}
-
-std::optional<BufferHandle> DummyClient::allocate_dummy_buffer(
-    size_t size, uint64_t staging_id) {
-    using Allocation = std::tuple<uint64_t, size_t>;
-    auto result =
-        staging_id ? invoke_rpc<&RealClient::allocate_session_buffer_dummy,
-                                Allocation>(size, client_id_, staging_id)
-                   : invoke_rpc<&RealClient::allocate_buffer_dummy, Allocation>(
-                         size, client_id_);
+    auto result = invoke_rpc<&RealClient::allocate_buffer_dummy,
+                             std::tuple<uint64_t, size_t>>(size, client_id_);
     if (!result.has_value()) {
         return std::nullopt;
     }
 
     auto [dummy_addr, allocated_size] = result.value();
     void* local_ptr = reinterpret_cast<void*>(dummy_addr);
-    auto release = [this, dummy_addr, staging_id]() {
-        if (staging_id) {
-            (void)invoke_rpc<&RealClient::release_session_buffer_dummy, void>(
-                dummy_addr, client_id_, staging_id);
-        } else {
-            (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(
-                dummy_addr, client_id_);
-        }
+    auto release = [this, dummy_addr]() {
+        (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(dummy_addr,
+                                                                  client_id_);
     };
     return std::make_optional<BufferHandle>(local_ptr, allocated_size,
                                             std::move(release));
@@ -894,12 +873,45 @@ DummyClient::CudaBufferIpcResult DummyClient::register_cuda_via_ipc(
     return result;
 }
 
+// The daemon holds dummy_client_mutex_ in shared mode through data I/O.
+// Its exclusive unmap waits for active handlers, removes the mappings and
+// makes a not-yet-started request from this UUID harmless.
+int DummyClient::unmap_cuda_client_locked() {
+    for (auto& [address, registration] : registered_cuda_buffers_)
+        registration.state = CudaRegistrationState::kReleasing;
+    const int status =
+        cuda_buffer_ipc_request(IPC_CUDA_UNMAP_CLIENT, 0, {}).status;
+    if (status == 0) {
+        registered_cuda_buffers_.clear();
+        remote_cleanup_pending_ = false;
+        if (cuda_transfer_state_ == CudaTransferState::kPending)
+            cuda_transfer_state_ = CudaTransferState::kDrained;
+    } else if (cuda_transfer_state_ == CudaTransferState::kPending) {
+        return toInt(ErrorCode::CUDA_BUFFER_IN_USE);
+    }
+    return status;
+}
+
+ErrorCode DummyClient::drain_failed_cuda_transfer() {
+    std::lock_guard lock(registered_cuda_buffers_mutex_);
+    if (cuda_transfer_state_ == CudaTransferState::kDrained)
+        return ErrorCode::RPC_FAIL;
+    cuda_transfer_state_ = CudaTransferState::kPending;
+    ping_running_ = false;
+    connected_.store(false);
+    return unmap_cuda_client_locked() == 0 ? ErrorCode::RPC_FAIL
+                                           : ErrorCode::CUDA_BUFFER_IN_USE;
+}
+
 int DummyClient::register_cuda_buffer(void* buffer, size_t size) {
     const auto base = reinterpret_cast<uintptr_t>(buffer);
     if (size == 0 || size > std::numeric_limits<uintptr_t>::max() - base) {
         return toInt(ErrorCode::INVALID_PARAMS);
     }
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
+    if (cuda_transfer_pending()) return toInt(ErrorCode::CUDA_BUFFER_IN_USE);
+    if (cuda_transfer_state_ == CudaTransferState::kDrained)
+        return toInt(ErrorCode::RPC_FAIL);
     if (!connected_.load()) return toInt(ErrorCode::RPC_FAIL);
     auto it = registered_cuda_buffers_.find(base);
     if (it != registered_cuda_buffers_.end() && it->second.references == 0) {
@@ -950,6 +962,8 @@ std::optional<int> DummyClient::unregister_cuda_buffer(void* buffer) {
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
     auto it = registered_cuda_buffers_.find(base);
     if (it == registered_cuda_buffers_.end()) return std::nullopt;
+    if (cuda_transfer_state_ == CudaTransferState::kPending)
+        return toInt(ErrorCode::CUDA_BUFFER_IN_USE);
     if (it->second.references > 1) {
         --it->second.references;
         return 0;
@@ -965,6 +979,8 @@ std::optional<int> DummyClient::unregister_cuda_buffer(void* buffer) {
 
 int DummyClient::reregister_cuda_buffers() {
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
+    if (cuda_transfer_state_ != CudaTransferState::kActive)
+        return toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     auto last_ping = std::chrono::steady_clock::now();
     for (auto& [base, registration] : registered_cuda_buffers_) {
         if (registration.references == 0 ||
@@ -1003,15 +1019,14 @@ std::optional<size_t> DummyClient::registered_ascend_buffer_remaining(
 #endif
 
 std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
-    void* buffer, size_t size, bool copy_to_staging, bool copy_back,
-    bool session_range) {
+    void* buffer, size_t size, bool copy_to_staging, bool copy_back) {
     if (buffer == nullptr && size != 0) return std::nullopt;
     if (buffer == nullptr) {
         return PreparedBuffer{nullptr, nullptr, 0, nullptr, false};
     }
     if (auto remaining = registered_cuda_buffer_remaining(buffer)) {
         if (size > *remaining) return std::nullopt;
-        return PreparedBuffer{buffer, buffer, size, nullptr, false};
+        return PreparedBuffer{buffer, buffer, size, nullptr, false, true};
     }
 #if defined(USE_ASCEND_DIRECT)
     if (auto remaining = registered_ascend_buffer_remaining(buffer)) {
@@ -1032,11 +1047,7 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
     auto remaining = external_buffer_remaining(buffer);
     if (!remaining.has_value() || size > *remaining) return std::nullopt;
 
-    const uint64_t staging_id =
-        session_range ? next_staging_id_.fetch_add(1, std::memory_order_relaxed)
-                      : 0;
-    auto allocation =
-        allocate_dummy_buffer(std::max<size_t>(size, 1), staging_id);
+    auto allocation = allocate_client_buffer(std::max<size_t>(size, 1));
     if (!allocation) return std::nullopt;
     auto staging = std::make_unique<BufferHandle>(std::move(*allocation));
     if (copy_to_staging) {
@@ -1045,12 +1056,8 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
         if (!runtime.CopyToHost(staging->ptr(), buffer, size))
             return std::nullopt;
     }
-    return PreparedBuffer{buffer,
-                          staging->ptr(),
-                          size,
-                          std::move(staging),
-                          copy_back || !copy_to_staging,
-                          staging_id};
+    return PreparedBuffer{buffer, staging->ptr(), size, std::move(staging),
+                          copy_back || !copy_to_staging};
 }
 
 std::optional<DummyClient::PreparedBuffer>
@@ -1334,14 +1341,15 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         return -1;
     }
 
-    std::lock_guard lock(registered_shms_mutex_);
-    auto it = registered_shms_.find(buffer);
-    if (it != registered_shms_.end() && it->second.lock() == shm) return 0;
-    if (register_shm_via_ipc(shm.get(), buffer == local_buffer_base_) != 0) {
-        LOG(ERROR) << "Failed to implicitly register new SHM via IPC";
-        return -1;
+    // If this shm is not registered with RealClient yet, do it now
+    if (!shm->registered) {
+        if (register_shm_via_ipc(shm.get(), shm->is_local) != 0) {
+            LOG(ERROR) << "Failed to implicitly register new SHM via IPC";
+            return -1;
+        }
+        shm->registered = true;
     }
-    registered_shms_[buffer] = shm;
+
     return 0;
 }
 
@@ -1395,15 +1403,13 @@ int DummyClient::unregister_buffer(void* buffer) {
     if (!shm) {
         return unregister_external_buffer(buffer);
     }
+    if (!shm->registered) {
+        LOG(ERROR) << "Buffer is not registered with RealClient";
+        return -1;
+    }
     if (reinterpret_cast<uint8_t*>(buffer) !=
         reinterpret_cast<uint8_t*>(shm->base_addr)) {
         LOG(ERROR) << "Invalid buffer address for unregistration";
-        return -1;
-    }
-    std::lock_guard lock(registered_shms_mutex_);
-    auto it = registered_shms_.find(buffer);
-    if (it == registered_shms_.end() || it->second.lock() != shm) {
-        LOG(ERROR) << "Buffer is not registered with RealClient";
         return -1;
     }
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
@@ -1422,7 +1428,7 @@ int DummyClient::unregister_buffer(void* buffer) {
     if (ret.has_value() ||
         (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
                               ret.error() == ErrorCode::INVALID_PARAMS))) {
-        registered_shms_.erase(it);
+        shm->registered = false;
     }
     return to_py_ret(ret);
 }
@@ -2152,49 +2158,26 @@ std::vector<int> DummyClient::batch_put_session_start(
     if (keys.size() != sizes.size()) {
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
-    if (keys.empty()) return {};
-    std::lock_guard lock(put_session_mutex_);
-    auto start = [&] {
-        ++put_control_.sequence;
-        return invoke_rpc<&RealClient::batch_put_session_start_dummy_rpc_v2,
-                          DummyPutStartResponse>(keys, sizes, config,
-                                                 client_id_, put_control_);
-    };
-    auto response = start();
-    if (response && response->context != UUID{} &&
-        response->context != put_control_.context) {
-        // A fresh or recreated context rejects the old epoch before it admits
-        // any keys.
-        put_control_ = {response->context, 0};
-        response = start();
-    }
-    if (!response)
-        return std::vector<int>(keys.size(), toInt(response.error()));
-    return session_results(std::move(response->results), keys.size());
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_start_dummy_helper,
+                   std::vector<int>>(keys, sizes, config, client_id_),
+        keys.size());
 }
 
 std::vector<int> DummyClient::batch_put_session_end(
     const std::vector<std::string>& keys) {
-    return finish_put_sessions(keys, false);
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_end_dummy_helper,
+                   std::vector<int>>(keys, client_id_),
+        keys.size());
 }
 
 std::vector<int> DummyClient::batch_put_session_revoke(
     const std::vector<std::string>& keys) {
-    return finish_put_sessions(keys, true);
-}
-
-std::vector<int> DummyClient::finish_put_sessions(
-    const std::vector<std::string>& keys, bool revoke) {
-    std::lock_guard lock(put_session_mutex_);
-    if (put_control_.context == UUID{})
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
-    ++put_control_.sequence;
-    auto response =
-        revoke ? invoke_rpc<&RealClient::batch_put_session_revoke_dummy_rpc_v2,
-                            std::vector<int>>(keys, client_id_, put_control_)
-               : invoke_rpc<&RealClient::batch_put_session_end_dummy_rpc_v2,
-                            std::vector<int>>(keys, client_id_, put_control_);
-    return session_results(std::move(response), keys.size());
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_revoke_dummy_helper,
+                   std::vector<int>>(keys, client_id_),
+        keys.size());
 }
 
 std::vector<int> DummyClient::batch_get_into_multi_buffer_ranges(
@@ -2220,6 +2203,9 @@ std::vector<int> DummyClient::transfer_session_ranges(
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
     const std::vector<std::vector<size_t>>& all_offsets, bool is_write) {
+    if (cuda_transfer_pending())
+        return std::vector<int>(keys.size(),
+                                toInt(ErrorCode::CUDA_BUFFER_IN_USE));
     std::vector<int> results(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size() ||
         keys.size() != all_offsets.size()) {
@@ -2227,12 +2213,6 @@ std::vector<int> DummyClient::transfer_session_ranges(
     }
 
     std::vector<DummySessionRangeRequest> requests;
-    DummyPutControl put_control;
-    if (is_write) {
-        std::lock_guard lock(put_session_mutex_);
-        // A later start has a greater sequence, even after the key is reused.
-        put_control = put_control_;
-    }
     std::vector<std::vector<PreparedBuffer>> prepared;
     std::vector<size_t> indices;
     requests.reserve(keys.size());
@@ -2265,7 +2245,7 @@ std::vector<int> DummyClient::transfer_session_ranges(
         request.buffers.reserve(all_buffers[i].size());
         for (size_t j = 0; j < all_buffers[i].size(); ++j) {
             auto buffer = prepare_buffer(all_buffers[i][j], all_sizes[i][j],
-                                         is_write, !is_write, true);
+                                         is_write, !is_write);
             if (!buffer) {
                 valid = false;
                 break;
@@ -2274,7 +2254,6 @@ std::vector<int> DummyClient::transfer_session_ranges(
                 reinterpret_cast<uint64_t>(buffer->dummy),
                 static_cast<uint64_t>(all_sizes[i][j]),
                 static_cast<uint64_t>(all_offsets[i][j]),
-                buffer->staging_id,
             });
             row.push_back(std::move(*buffer));
         }
@@ -2291,12 +2270,21 @@ std::vector<int> DummyClient::transfer_session_ranges(
     auto response =
         is_write
             ? invoke_rpc<
-                  &RealClient::batch_put_from_multi_buffer_ranges_dummy_rpc_v2,
-                  std::vector<int>>(requests, device_id_, client_id_,
-                                    put_control)
+                  &RealClient::batch_put_from_multi_buffer_ranges_dummy_helper,
+                  std::vector<int>>(requests, device_id_, client_id_)
             : invoke_rpc<
-                  &RealClient::batch_get_into_multi_buffer_ranges_dummy_rpc_v2,
+                  &RealClient::batch_get_into_multi_buffer_ranges_dummy_helper,
                   std::vector<int>>(requests, device_id_, client_id_);
+    if (!response && cuda_ipc_persistent_registration_) {
+        for (const auto& row : prepared) {
+            if (std::any_of(row.begin(), row.end(), [](const auto& buffer) {
+                    return buffer.direct_cuda;
+                })) {
+                response = tl::unexpected(drain_failed_cuda_transfer());
+                break;
+            }
+        }
+    }
     auto range_results = session_results(std::move(response), requests.size());
     for (size_t i = 0; i < indices.size(); ++i) {
         const size_t result_index = indices[i];
@@ -2577,23 +2565,6 @@ tl::expected<PingResponse, ErrorCode> DummyClient::ping_daemon(
     return invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
 }
 
-bool DummyClient::reregister_shms() {
-    std::lock_guard lock(registered_shms_mutex_);
-    for (const auto& [base, segment] : registered_shms_) {
-        auto shm = segment.lock();
-        if (!shm) continue;
-        const bool local = base == local_buffer_base_;
-        int status = globalConfig().ascend_agent_mode
-                         ? register_ascend_shm(shm.get(), local)
-                         : register_shm_via_ipc(shm.get(), local);
-        if (status != 0) {
-            LOG(WARNING) << "Failed to re-register shared memory at " << base;
-            return false;
-        }
-    }
-    return true;
-}
-
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;
@@ -2635,7 +2606,30 @@ void DummyClient::ping_thread_main() {
                         continue;
                     }
                 }
-                bool all_registered = reregister_shms();
+                // Re-register ALL shms
+                bool all_registered = true;
+                const auto& shms = shm_helper_->get_shms();
+                for (const auto& shm_ptr : shms) {
+                    if (shm_ptr->registered) {
+                        if (globalConfig().ascend_agent_mode) {
+                            if (register_ascend_shm(shm_ptr.get(),
+                                                    shm_ptr->is_local) != 0) {
+                                LOG(WARNING)
+                                    << "Failed to re-register Ascend shared "
+                                       "memory during reconnection";
+                                all_registered = false;
+                                break;
+                            }
+                        } else if (register_shm_via_ipc(
+                                       shm_ptr.get(), shm_ptr->is_local) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register shared memory "
+                                   "during reconnection";
+                            all_registered = false;
+                            break;
+                        }
+                    }
+                }
 
 #if defined(USE_ASCEND_DIRECT)
                 if (all_registered && globalConfig().ascend_agent_mode) {

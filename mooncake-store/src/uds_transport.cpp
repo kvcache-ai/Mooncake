@@ -160,7 +160,7 @@ int UdsConnection::sendRaw(const void *data, size_t len) {
     const char *pos = static_cast<const char *>(data);
     size_t remaining = len;
     while (remaining > 0) {
-        ssize_t sent = ::send(fd_, pos, remaining, 0);
+        ssize_t sent = ::send(fd_, pos, remaining, MSG_NOSIGNAL);
         if (sent < 0 && errno == EINTR) continue;
         if (sent <= 0) return -1;
         pos += sent;
@@ -204,7 +204,7 @@ int UdsConnection::sendFd(int fd, void *data, size_t data_len) {
     memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
 
     while (true) {
-        ssize_t sent = sendmsg(fd_, &msg, 0);
+        ssize_t sent = sendmsg(fd_, &msg, MSG_NOSIGNAL);
         if (sent < 0 && errno == EINTR) continue;
         if (sent < 0) return -1;
         return sent == static_cast<ssize_t>(data_len) ? 0 : -1;
@@ -312,7 +312,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
     return {};
 }
 
-void UdsAcceptor::stop() {
+void UdsAcceptor::stop(bool retain_socket_name) {
     if (!running_.exchange(false)) return;
     wakeAccept();
     int active_client_fd = active_client_fd_.load();
@@ -322,7 +322,15 @@ void UdsAcceptor::stop() {
     }
     if (thread_.joinable()) thread_.join();
     if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
+        if (retain_socket_name) {
+            // The receiver abandoned a live CUDA import. Keep its already
+            // shut-down CLOEXEC socket bound until process exit so another
+            // daemon cannot acknowledge cleanup for this receiver.
+            LOG(ERROR) << "Retaining IPC address for quarantined CUDA memory: "
+                       << socket_name_;
+        } else {
+            ::close(listen_fd_);
+        }
         listen_fd_ = -1;
     }
 }

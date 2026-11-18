@@ -40,6 +40,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::PROMOTION_ALREADY_EXISTS, "PROMOTION_ALREADY_EXISTS"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::CHECKSUM_MISMATCH, "CHECKSUM_MISMATCH"},
+        {ErrorCode::CUDA_BUFFER_IN_USE, "CUDA_BUFFER_IN_USE"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::RPC_TIMEOUT, "RPC_TIMEOUT"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},

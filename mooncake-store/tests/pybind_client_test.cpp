@@ -2245,8 +2245,7 @@ TEST_F(RealClientTest, TestPutSessionKeptAfterEndFailure) {
 
     // Drop Master reservation while keeping the local put session.
     ASSERT_NE(py_client_->client_, nullptr);
-    auto revoked = py_client_->finish_put_sessions(py_client_->real_sessions_,
-                                                   keys, ReplicaType::ALL);
+    auto revoked = py_client_->client_->BatchPutRevoke(keys, ReplicaType::ALL);
     ASSERT_EQ(revoked.size(), 1u);
     ASSERT_TRUE(revoked[0].has_value());
 

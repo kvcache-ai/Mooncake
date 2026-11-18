@@ -27,9 +27,10 @@ namespace mooncake {
 enum IpcRequestType : uint32_t {
     IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
     IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
-    IPC_CUDA_REGISTER = 2,   // dummy → real: register a CUDA DMA-BUF fd
+    // Value 2 belonged to daemons that released the IPC name before draining.
     IPC_CUDA_UNREGISTER = 3,
     IPC_CUDA_UNMAP_CLIENT = 4,
+    IPC_CUDA_REGISTER = 5,  // dummy → real: register a CUDA DMA-BUF fd
 };
 
 // Segment types for IPC_SHM_FD_REQUEST

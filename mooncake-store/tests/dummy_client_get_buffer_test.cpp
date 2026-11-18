@@ -61,8 +61,6 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<
         &RealClient::batch_put_from_multi_buffers_dummy_helper>(&rc);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
-    server.register_handler<&RealClient::allocate_session_buffer_dummy>(&rc);
-    server.register_handler<&RealClient::release_session_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
@@ -76,15 +74,15 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batch_get_session_end_dummy_helper>(
         &rc);
     server.register_handler<
-        &RealClient::batch_get_into_multi_buffer_ranges_dummy_rpc_v2>(&rc);
-    server.register_handler<&RealClient::batch_put_session_start_dummy_rpc_v2>(
+        &RealClient::batch_get_into_multi_buffer_ranges_dummy_helper>(&rc);
+    server.register_handler<&RealClient::batch_put_session_start_dummy_helper>(
         &rc);
-    server.register_handler<&RealClient::batch_put_session_end_dummy_rpc_v2>(
+    server.register_handler<&RealClient::batch_put_session_end_dummy_helper>(
         &rc);
-    server.register_handler<&RealClient::batch_put_session_revoke_dummy_rpc_v2>(
+    server.register_handler<&RealClient::batch_put_session_revoke_dummy_helper>(
         &rc);
     server.register_handler<
-        &RealClient::batch_put_from_multi_buffer_ranges_dummy_rpc_v2>(&rc);
+        &RealClient::batch_put_from_multi_buffer_ranges_dummy_helper>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -871,8 +869,7 @@ class DummyClientSessionTest : public ::testing::Test {
 
 TEST_F(DummyClientSessionTest, PersistentContextRecoversWithoutHostShm) {
     ASSERT_TRUE(SetupStack(true, 0));
-    auto dummy = dummies_.front();
-    ASSERT_NE(AddDummy(), nullptr);
+    auto &dummy = dummies_.front();
     const std::vector<std::string> keys{"gpu_only_context"};
     PutObject(keys.front(), "contents");
     ASSERT_EQ(dummy->batch_get_session_start(keys), std::vector<int>{0});
@@ -887,155 +884,6 @@ TEST_F(DummyClientSessionTest, PersistentContextRecoversWithoutHostShm) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
-    // The other client has a staging pool. Reconnecting the GPU-only client
-    // must not give it a second allocator over that same memfd.
-    EXPECT_FALSE(dummy->allocate_client_buffer(64).has_value());
-}
-
-TEST_F(DummyClientSessionTest, StalePutRequestsCannotChangeAReusedKey) {
-    ASSERT_TRUE(SetupStack());
-    const UUID id = generate_uuid();
-    ASSERT_TRUE(real_->ping_persistent_dummy(id, true));
-    auto *source = AllocateShared(dummies_.front(), 32);
-    ASSERT_NE(source, nullptr);
-    *source = 'x';
-    const auto address = reinterpret_cast<uint64_t>(source);
-    auto mapping = ShmHelper::getInstance()->get_shm(source);
-    ASSERT_NE(mapping, nullptr);
-    ASSERT_TRUE(real_->map_shm_internal(dup(mapping->fd), address,
-                                        mapping->size, false, id));
-    const std::vector<std::string> keys{"reused_session_key"};
-    const std::vector<int> ok{0};
-    const std::vector<int> stale{toInt(ErrorCode::INVALID_VERSION)};
-    auto handshake =
-        real_->batch_put_session_start_dummy_rpc_v2(keys, {32}, {}, id, {});
-    ASSERT_EQ(handshake.results, stale);
-    const auto context = handshake.context;
-    ASSERT_EQ(real_
-                  ->batch_put_session_start_dummy_rpc_v2(keys, {32}, {}, id,
-                                                         {context, 1})
-                  .results,
-              ok);
-    ASSERT_EQ(
-        real_->batch_put_session_revoke_dummy_rpc_v2(keys, id, {context, 3}),
-        ok);
-    ASSERT_EQ(real_
-                  ->batch_put_session_start_dummy_rpc_v2(keys, {32}, {}, id,
-                                                         {context, 4})
-                  .results,
-              ok);
-    // The first control request timed out before reaching the handler. Its
-    // retry completed, and a new put now owns the same logical key.
-    EXPECT_EQ(
-        real_->batch_put_session_revoke_dummy_rpc_v2(keys, id, {context, 2}),
-        stale);
-    EXPECT_EQ(real_->batch_put_session_end_dummy_rpc_v2(keys, id, {context, 2}),
-              stale);
-    const std::vector<DummySessionRangeRequest> ranges{
-        {keys.front(), {{address, 1, 0}}}};
-    EXPECT_EQ(real_->batch_put_from_multi_buffer_ranges_dummy_rpc_v2(
-                  ranges, 0, id, {context, 1}),
-              std::vector<int>{toInt(ErrorCode::INVALID_PARAMS)});
-    EXPECT_EQ(real_->batch_put_from_multi_buffer_ranges_dummy_rpc_v2(
-                  ranges, 0, id, {context, 4}),
-              std::vector<int>{1});
-    EXPECT_EQ(
-        real_->batch_put_session_revoke_dummy_rpc_v2(keys, id, {context, 5}),
-        ok);
-    ASSERT_TRUE(real_->unmap_shm_internal(id));
-    ASSERT_TRUE(real_->ping_persistent_dummy(id, true));
-    EXPECT_EQ(real_
-                  ->batch_put_session_start_dummy_rpc_v2(keys, {32}, {}, id,
-                                                         {context, 6})
-                  .results,
-              stale);
-}
-
-TEST_F(DummyClientSessionTest, StagedRangesRejectRecycledAllocation) {
-    ASSERT_TRUE(SetupStack());
-    const UUID id = generate_uuid();
-    auto *pool = AllocateShared(dummies_.front(), 4096);
-    ASSERT_NE(pool, nullptr);
-    auto mapping = ShmHelper::getInstance()->get_shm(pool);
-    ASSERT_NE(mapping, nullptr);
-    ASSERT_TRUE(real_->map_shm_internal(dup(mapping->fd),
-                                        reinterpret_cast<uint64_t>(pool),
-                                        mapping->size, true, id));
-    const auto first =
-        real_->allocate_session_buffer_dummy(mapping->size, id, 1);
-    ASSERT_TRUE(first);
-    const auto address = std::get<0>(*first);
-    ASSERT_TRUE(real_->release_session_buffer_dummy(address, id, 1));
-    // Taking the full pool forces the allocator to reuse the exact address.
-    auto replacement =
-        real_->allocate_session_buffer_dummy(mapping->size, id, 2);
-    ASSERT_TRUE(replacement);
-    ASSERT_EQ(std::get<0>(*replacement), address);
-    EXPECT_TRUE(real_->release_session_buffer_dummy(address, id, 1));
-
-    const std::vector<std::string> read_keys{"read_cookie"},
-        write_keys{"write_cookie"};
-    PutObject(read_keys.front(), "r");
-    const std::vector<int> ok{0}, one{1},
-        invalid{toInt(ErrorCode::INVALID_PARAMS)};
-    ASSERT_EQ(real_->batch_get_session_start_dummy_helper(read_keys, id), ok);
-    const auto handshake = real_->batch_put_session_start_dummy_rpc_v2(
-        write_keys, {1}, {}, id, {});
-    const DummyPutControl control{handshake.context, 1};
-    ASSERT_EQ(real_
-                  ->batch_put_session_start_dummy_rpc_v2(write_keys, {1}, {},
-                                                         id, control)
-                  .results,
-              ok);
-
-    *pool = 'x';
-    EXPECT_EQ(real_->batch_get_into_multi_buffer_ranges_dummy_rpc_v2(
-                  {{read_keys.front(), {{address, 1, 0, 1}}}}, 0, id),
-              invalid);
-    EXPECT_EQ(*pool, 'x');
-    EXPECT_EQ(real_->batch_put_from_multi_buffer_ranges_dummy_rpc_v2(
-                  {{write_keys.front(), {{address, 1, 0, 1}}}}, 0, id, control),
-              invalid);
-    EXPECT_EQ(real_->batch_get_into_multi_buffer_ranges_dummy_rpc_v2(
-                  {{read_keys.front(), {{address, 1, 0, 2}}}}, 0, id),
-              one);
-    EXPECT_EQ(*pool, 'r');
-    EXPECT_EQ(real_->batch_put_from_multi_buffer_ranges_dummy_rpc_v2(
-                  {{write_keys.front(), {{address, 1, 0, 2}}}}, 0, id, control),
-              one);
-    EXPECT_TRUE(real_->unmap_shm_internal(id));
-}
-
-TEST_F(DummyClientSessionTest, ReconnectRestoresOnlyOwnedShm) {
-    ASSERT_TRUE(SetupStack(true));
-    auto first = dummies_.front();
-    auto second = AddDummy(true);
-    ASSERT_NE(second, nullptr);
-    constexpr size_t size = 64;
-    auto *first_buffer = AllocateShared(first, size);
-    auto *second_buffer = AllocateShared(second, size);
-    ASSERT_NE(first_buffer, nullptr);
-    ASSERT_NE(second_buffer, nullptr);
-    const std::string key = "reconnect_shared";
-    const std::string data(size, 'a');
-    PutObject(key, data);
-
-    ASSERT_EQ(first->unregister_shm(), 0);
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (first->get_into(key, first_buffer, size) != size) {
-        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    EXPECT_EQ(std::string(first_buffer, size), data);
-    EXPECT_LT(first->get_into(key, second_buffer, size), 0);
-    EXPECT_EQ(second->get_into(key, second_buffer, size), size);
-
-    // Explicitly registering the same memfd under a second UUID is valid.
-    ASSERT_EQ(first->register_buffer(second_buffer, size), 0);
-    EXPECT_EQ(first->get_into(key, second_buffer, size), size);
-    EXPECT_EQ(first->unregister_buffer(second_buffer), 0);
-    EXPECT_EQ(second->get_into(key, second_buffer, size), size);
 }
 
 TEST_F(DummyClientSessionTest, LayersAndFragmentsRoundTripThroughCpuAndShm) {

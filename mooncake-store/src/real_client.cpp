@@ -679,7 +679,7 @@ tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
     const UUID &client_id, int fd) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto ctx = shm_contexts_.find(client_id);
-    if (!client_ || ctx == shm_contexts_.end() ||
+    if (closed_.load() || !client_ || ctx == shm_contexts_.end() ||
         ctx->second.sessions_closing || !handle.has_device_uuid ||
         dummy_addr == 0 || handle.size == 0 ||
         handle.size > std::numeric_limits<uint64_t>::max() - dummy_addr) {
@@ -859,6 +859,7 @@ bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
             continue;
         if (dummy_addr >= base && dummy_addr - base < buffer.handle.size &&
             buf_size <= buffer.handle.size - (dummy_addr - base)) {
+            if (closed_.load()) return false;
             out_real = static_cast<char *>(buffer.allocation->mapping.base()) +
                        buffer.handle.offset + (dummy_addr - base);
             VLOG(1) << "Persistent CUDA IPC direct buffer: bytes=" << buf_size;
@@ -2146,11 +2147,11 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
         prefetcher_->Shutdown();
     }
 
-    stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
 
     ErrorCode cleanup_error = ErrorCode::OK;
+    bool retain_ipc_name = false;
     {
         std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
         for (auto &[client_id, context] : shm_contexts_) {
@@ -2161,11 +2162,17 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
                 cleanup_error = result;
             }
         }
+        retain_ipc_name = !cuda_allocations_.empty();
         const ErrorCode real_result = cleanup_session_state(real_sessions_);
         if (real_result != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
             cleanup_error = real_result;
         }
     }
+    // Keep our abstract IPC name until active handlers drain and their CUDA
+    // imports are gone. A replacement daemon can then acknowledge an old
+    // client's unmap. Keep serving cleanup retries after an explicit failure.
+    if (!retain_ipc_name || cleanup_error == ErrorCode::OK || final_teardown)
+        stop_ipc_server(retain_ipc_name);
     if (cleanup_error != ErrorCode::OK && !final_teardown) {
         // Retain Client, reservations, and mappings so an uncertain revoke
         // can be retried by an explicit close. Destruction cannot retry:
@@ -4463,7 +4470,7 @@ RealClient::acquire_buffer_dummy(const std::string &key,
         uint64_t shm_end = shm_start + shm.shm_size;
         if (real_addr >= shm_start && real_addr < shm_end) {
             uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
-            context.active_handles[dummy_addr] = {std::move(buffer_handle)};
+            context.active_handles[dummy_addr] = std::move(buffer_handle);
             return std::make_tuple(dummy_addr, buf_size);
         }
     }
@@ -4473,32 +4480,18 @@ RealClient::acquire_buffer_dummy(const std::string &key,
 
 tl::expected<void, ErrorCode> RealClient::release_buffer_dummy(
     uint64_t dummy_addr, const UUID &client_id) {
-    return release_session_buffer_dummy(dummy_addr, client_id, 0);
-}
-
-tl::expected<void, ErrorCode> RealClient::release_session_buffer_dummy(
-    uint64_t dummy_addr, const UUID &client_id, uint64_t staging_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto &handles = it->second.active_handles;
-    auto handle = handles.find(dummy_addr);
-    if (handle != handles.end() && handle->second.staging_id == staging_id)
-        handles.erase(handle);
+    it->second.active_handles.erase(dummy_addr);
     return {};
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
 RealClient::allocate_buffer_dummy(size_t size, const UUID &client_id) {
-    return allocate_session_buffer_dummy(size, client_id, 0);
-}
-
-tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::allocate_session_buffer_dummy(size_t size, const UUID &client_id,
-                                          uint64_t staging_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4521,11 +4514,9 @@ RealClient::allocate_session_buffer_dummy(size_t size, const UUID &client_id,
     for (const auto &shm : context.mapped_shms) {
         const uint64_t shm_start = reinterpret_cast<uint64_t>(shm.shm_buffer);
         const uint64_t shm_end = shm_start + shm.shm_size;
-        if (real_addr >= shm_start && real_addr < shm_end &&
-            allocated_size <= shm_end - real_addr) {
+        if (real_addr >= shm_start && allocated_size <= shm_end - real_addr) {
             const uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
-            context.active_handles[dummy_addr] = {std::move(handle),
-                                                  staging_id};
+            context.active_handles[dummy_addr] = std::move(handle);
             return std::make_tuple(dummy_addr, allocated_size);
         }
     }
@@ -4628,7 +4619,7 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
             uint64_t start = reinterpret_cast<uint64_t>(shm.shm_buffer);
             if (real_addr >= start && real_addr < start + shm.shm_size) {
                 uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
-                ctx.active_handles[dummy_addr] = {std::move(handles[i])};
+                ctx.active_handles[dummy_addr] = std::move(handles[i]);
                 results[i] = std::make_tuple(dummy_addr, buf_size);
                 found = true;
                 break;
@@ -7727,31 +7718,19 @@ std::vector<int> InvalidDummySessions(size_t count) {
 
 }  // namespace
 
-std::vector<tl::expected<void, ErrorCode>> RealClient::finish_put_sessions(
-    SessionState &sessions, const std::vector<std::string> &keys,
-    ReplicaType type, bool revoke) {
-    if (keys.empty()) return {};
-    std::vector<PutSessionKey> reservations;
-    reservations.reserve(keys.size());
-    {
-        // The control mutex keeps these admissions stable across the Master
-        // RPC.
-        std::lock_guard lock(sessions.mutex);
-        for (const auto &key : keys) {
-            reservations.push_back(
-                {key, sessions.put_sessions.at(key).reservation});
-        }
-    }
-    auto results =
-        client_->master_client_.FinishPutSessions(reservations, type, revoke);
-    if (results.size() != keys.size())
-        return {keys.size(), tl::unexpected(ErrorCode::RPC_FAIL)};
-    return results;
+bool RealClient::claim_session_put_owner(SessionState &sessions,
+                                         const std::string &key) {
+    std::lock_guard<std::mutex> lock(session_put_owners_mutex_);
+    return session_put_owners_.emplace(key, &sessions).second;
 }
 
-void RealClient::erase_put_session(SessionState &sessions,
-                                   const std::string &key) {
-    if (sessions.put_sessions.erase(key)) client_->releaseSessionPut(key);
+void RealClient::release_session_put_owner(SessionState &sessions,
+                                           const std::string &key) {
+    std::lock_guard<std::mutex> lock(session_put_owners_mutex_);
+    auto it = session_put_owners_.find(key);
+    if (it != session_put_owners_.end() && it->second == &sessions) {
+        session_put_owners_.erase(it);
+    }
 }
 
 std::vector<int> RealClient::batch_get_session_start_dummy_helper(
@@ -7774,60 +7753,53 @@ int RealClient::batch_get_session_end_dummy_helper(
     return batch_get_session_end_impl(*it->second.sessions, keys);
 }
 
-DummyPutStartResponse RealClient::batch_put_session_start_dummy_rpc_v2(
+std::vector<int> RealClient::batch_put_session_start_dummy_helper(
     const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
-    const ReplicateConfig &config, const UUID &client_id,
-    const DummyPutControl &control) {
-    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-    auto it = shm_contexts_.find(client_id);
-    if (it == shm_contexts_.end() || it->second.sessions_closing) {
-        return {{}, InvalidDummySessions(keys.size())};
-    }
-    auto &sessions = *it->second.sessions;
-    return {
-        sessions.dummy_context,
-        batch_put_session_start_impl(sessions, keys, sizes, config, &control)};
-}
-
-std::vector<int> RealClient::batch_put_session_end_dummy_rpc_v2(
-    const std::vector<std::string> &keys, const UUID &client_id,
-    const DummyPutControl &control) {
+    const ReplicateConfig &config, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end() || it->second.sessions_closing) {
         return InvalidDummySessions(keys.size());
     }
-    return batch_put_session_end_impl(*it->second.sessions, keys, &control);
+    return batch_put_session_start_impl(*it->second.sessions, keys, sizes,
+                                        config);
 }
 
-std::vector<int> RealClient::batch_put_session_revoke_dummy_rpc_v2(
-    const std::vector<std::string> &keys, const UUID &client_id,
-    const DummyPutControl &control) {
+std::vector<int> RealClient::batch_put_session_end_dummy_helper(
+    const std::vector<std::string> &keys, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end() || it->second.sessions_closing) {
         return InvalidDummySessions(keys.size());
     }
-    return batch_put_session_revoke_impl(*it->second.sessions, keys, &control);
+    return batch_put_session_end_impl(*it->second.sessions, keys);
 }
 
-std::vector<int> RealClient::batch_get_into_multi_buffer_ranges_dummy_rpc_v2(
+std::vector<int> RealClient::batch_put_session_revoke_dummy_helper(
+    const std::vector<std::string> &keys, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end() || it->second.sessions_closing) {
+        return InvalidDummySessions(keys.size());
+    }
+    return batch_put_session_revoke_impl(*it->second.sessions, keys);
+}
+
+std::vector<int> RealClient::batch_get_into_multi_buffer_ranges_dummy_helper(
     const std::vector<DummySessionRangeRequest> &requests, int32_t device_id,
     const UUID &client_id) {
-    return execute_dummy_session_ranges(requests, device_id, client_id,
-                                        nullptr);
+    return execute_dummy_session_ranges(requests, device_id, client_id, false);
 }
 
-std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_dummy_rpc_v2(
+std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_dummy_helper(
     const std::vector<DummySessionRangeRequest> &requests, int32_t device_id,
-    const UUID &client_id, const DummyPutControl &put_control) {
-    return execute_dummy_session_ranges(requests, device_id, client_id,
-                                        &put_control);
+    const UUID &client_id) {
+    return execute_dummy_session_ranges(requests, device_id, client_id, true);
 }
 
 std::vector<int> RealClient::execute_dummy_session_ranges(
     const std::vector<DummySessionRangeRequest> &requests, int32_t device_id,
-    const UUID &client_id, const DummyPutControl *put_control) {
+    const UUID &client_id, bool is_write) {
     auto results = InvalidDummySessions(requests.size());
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" &&
@@ -7846,8 +7818,6 @@ std::vector<int> RealClient::execute_dummy_session_ranges(
         return results;
     }
     auto &context = it->second;
-    if (put_control && put_control->context != context.sessions->dummy_context)
-        return results;
     const MappedShm *last_hit_shm = nullptr;
     std::vector<std::string> keys;
     std::vector<std::vector<void *>> buffers;
@@ -7871,22 +7841,10 @@ std::vector<int> RealClient::execute_dummy_session_ranges(
                 break;
             }
             void *real_buffer = nullptr;
-            if (buffer.staging_id != 0) {
-                // A timed-out RPC can arrive after this allocator address is
-                // reused.
-                auto allocation = context.active_handles.find(buffer.address);
-                if (allocation == context.active_handles.end() ||
-                    allocation->second.staging_id != buffer.staging_id ||
-                    buffer.size > allocation->second.buffer->size()) {
-                    valid = false;
-                    break;
-                }
-                real_buffer = allocation->second.buffer->ptr();
-            } else if ((buffer.address != 0 || buffer.size != 0) &&
-                       !map_dummy_buffer_to_real(
-                           context, buffer.address,
-                           static_cast<size_t>(buffer.size), last_hit_shm,
-                           real_buffer)) {
+            if ((buffer.address != 0 || buffer.size != 0) &&
+                !map_dummy_buffer_to_real(context, buffer.address,
+                                          static_cast<size_t>(buffer.size),
+                                          last_hit_shm, real_buffer)) {
                 valid = false;
                 break;
             }
@@ -7904,11 +7862,10 @@ std::vector<int> RealClient::execute_dummy_session_ranges(
     }
     if (keys.empty()) return results;
     auto transferred =
-        put_control
-            ? batch_put_from_multi_buffer_ranges_impl(
-                  *context.sessions, keys, buffers, sizes, offsets, put_control)
-            : batch_get_into_multi_buffer_ranges_impl(*context.sessions, keys,
-                                                      buffers, sizes, offsets);
+        is_write ? batch_put_from_multi_buffer_ranges_impl(
+                       *context.sessions, keys, buffers, sizes, offsets)
+                 : batch_get_into_multi_buffer_ranges_impl(
+                       *context.sessions, keys, buffers, sizes, offsets);
     if (transferred.size() != indices.size()) {
         for (size_t index : indices) {
             results[index] = toInt(ErrorCode::INTERNAL_ERROR);
@@ -7961,7 +7918,8 @@ ErrorCode RealClient::cleanup_session_state(SessionState &sessions) {
         if (results[i] == toInt(ErrorCode::OBJECT_NOT_FOUND) ||
             results[i] == toInt(ErrorCode::INVALID_WRITE) ||
             results[i] == toInt(ErrorCode::ILLEGAL_CLIENT)) {
-            erase_put_session(sessions, keys[i]);
+            sessions.put_sessions.erase(keys[i]);
+            release_session_put_owner(sessions, keys[i]);
         } else if (error == ErrorCode::OK) {
             error = static_cast<ErrorCode>(results[i]);
         }
@@ -8833,11 +8791,8 @@ void RealClient::wait_session_put_idle(SessionState &sessions,
 
 std::vector<int> RealClient::batch_put_session_start_impl(
     SessionState &sessions, const std::vector<std::string> &keys,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config,
-    const DummyPutControl *control) {
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
     std::lock_guard<std::mutex> control_lock(sessions.put_control_mutex);
-    if (control && !sessions.accept_control(*control))
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_VERSION));
     std::vector<int> results(keys.size(), 0);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -8885,149 +8840,92 @@ std::vector<int> RealClient::batch_put_session_start_impl(
     std::vector<std::string> start_keys;
     std::vector<uint64_t> start_sizes;
     std::vector<size_t> start_indices;
-    start_indices.reserve(keys.size());
-    const UUID reservation = generate_uuid();
-    const auto sent_generation = client_->CapturePutMasterGeneration();
-    ReplicateConfig start_config;
     {
         std::lock_guard<std::mutex> lock(sessions.mutex);
-        // Keep the candidate separate until its Client-wide claim succeeds.
-        // A rejected candidate belongs to another writer.
-        std::optional<size_t> candidate;
-        try {
-            for (size_t i = 0; i < keys.size(); ++i) {
-                auto [it, inserted] = sessions.put_sessions.try_emplace(
-                    keys[i],
-                    PutSessionEntry{
-                        .object_size = sizes[i],
-                        .write_mode = write_mode,
-                        .writable = false,
-                        .dummy_generation = control ? control->sequence : 0,
-                        .master_generation = sent_generation,
-                        .reservation = reservation});
-                if (inserted) {
-                    candidate = i;
-                    if (client_->claimSessionPut(keys[i])) {
-                        start_indices.push_back(i);  // capacity reserved above
-                        candidate.reset();
-                        start_keys.push_back(keys[i]);
-                        start_sizes.push_back(sizes[i]);
-                        continue;
-                    }
-                    sessions.put_sessions.erase(it);
-                    candidate.reset();
-                }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (sessions.put_sessions.count(keys[i]) != 0 ||
+                !claim_session_put_owner(sessions, keys[i])) {
                 LOG(ERROR) << "Put session already exists for key: " << keys[i];
-                results[i] = toInt(ErrorCode::INVALID_PARAMS);
+                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                continue;
             }
-            if (start_indices.empty()) return results;
-            start_config = config.ForKeySubset(start_indices);
-            start_config.put_reservation = reservation;
-        } catch (...) {
-            // Nothing has been dispatched. Undo just this call's admissions.
-            if (candidate) sessions.put_sessions.erase(keys[*candidate]);
-            for (size_t i : start_indices) {
-                erase_put_session(sessions, keys[i]);
-            }
-            throw;
+            start_keys.push_back(keys[i]);
+            start_sizes.push_back(static_cast<uint64_t>(sizes[i]));
+            start_indices.push_back(i);
         }
     }
-
-    // From dispatch onwards every key already has a sealed cleanup record,
-    // including when an exception or malformed reply obscures the outcome.
-    const auto start_time = std::chrono::steady_clock::now();
-    auto start_responses =
-        client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
-    if (start_responses.size() != start_keys.size()) {
-        for (size_t i : start_indices) results[i] = toInt(ErrorCode::RPC_FAIL);
+    if (start_keys.empty()) {
         return results;
     }
-    // A legacy root_fs_dir master adds a DISK reservation independently of
-    // the requested replica types. Ranged writes have no whole file to store.
-    std::vector<std::string> disk_keys;
-    std::vector<size_t> disk_indices;
-    for (size_t j = 0; j < start_keys.size(); ++j) {
-        auto &response = start_responses[j];
-        if (response && std::erase_if(*response, [](const auto &replica) {
-                return replica.is_disk_replica();
-            })) {
-            disk_keys.push_back(start_keys[j]);
-            disk_indices.push_back(start_indices[j]);
-        }
-    }
-    auto disk_revokes =
-        finish_put_sessions(sessions, disk_keys, ReplicaType::DISK);
-    for (size_t k = 0; k < disk_keys.size(); ++k) {
-        if (!disk_revokes[k]) {
-            results[disk_indices[k]] = toInt(disk_revokes[k].error());
-        }
-    }
+
+    ReplicateConfig start_config = config.ForKeySubset(start_indices);
+
+    auto start_responses =
+        client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
     std::vector<std::string> keys_to_revoke;
+    std::vector<std::string> hot_keys_to_remove;
     {
         std::lock_guard<std::mutex> lock(sessions.mutex);
         for (size_t j = 0; j < start_keys.size(); ++j) {
             const size_t i = start_indices[j];
-            // Failed disk cleanup leaves the original sealed record for retry.
-            if (results[i] != 0) continue;
             if (!start_responses[j]) {
                 results[i] =
                     static_cast<int>(toInt(start_responses[j].error()));
-                if (start_responses[j].error() != ErrorCode::RPC_FAIL &&
-                    start_responses[j].error() != ErrorCode::RPC_TIMEOUT) {
-                    erase_put_session(sessions, keys[i]);
+                if (start_responses[j].error() == ErrorCode::RPC_FAIL ||
+                    start_responses[j].error() == ErrorCode::RPC_TIMEOUT) {
+                    // Master may have reserved this key before its reply was
+                    // lost. Keep a sealed entry so revoke/cleanup can resolve
+                    // the outcome before another namespace reuses the key.
+                    sessions.put_sessions[keys[i]] = PutSessionEntry{
+                        .object_size = static_cast<uint64_t>(sizes[i]),
+                        .write_mode = write_mode,
+                        .writable = false,
+                    };
+                } else {
+                    release_session_put_owner(sessions, keys[i]);
                 }
                 continue;
             }
-            auto &entry = sessions.put_sessions.at(keys[i]);
-            entry.replicas = std::move(start_responses[j].value());
-            const auto memory =
-                std::find_if(entry.replicas.begin(), entry.replicas.end(),
-                             [](const auto &replica) {
-                                 return replica.is_memory_replica();
-                             });
-            ErrorCode failure = ErrorCode::INVALID_REPLICA;
-            if (memory != entry.replicas.end()) {
-                const auto &grant =
-                    memory->get_memory_descriptor().put_session_write_grant;
-                // Count from before the start RPC so network delay and any
-                // disk cleanup consume the grant. Missing grants fail closed.
-                const auto max_seconds =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::time_point::max() -
-                        start_time)
-                        .count();
-                failure = ErrorCode::LEASE_EXPIRED;
-                if (grant && grant->master_incarnation != UUID{} &&
-                    grant->ttl_sec <= static_cast<uint64_t>(max_seconds)) {
-                    auto generation = client_->ObservePutMaster(
-                        sent_generation, grant->master_incarnation);
-                    if (generation) {
-                        entry.master_generation = *generation;
-                        entry.write_deadline =
-                            start_time + std::chrono::seconds(grant->ttl_sec);
-                    } else {
-                        failure = ErrorCode::INVALID_VERSION;
-                    }
+            auto replicas = std::move(start_responses[j].value());
+            bool has_memory_replica = false;
+            for (const auto &replica : replicas) {
+                if (replica.is_memory_replica()) {
+                    has_memory_replica = true;
+                    break;
                 }
-                entry.writable =
-                    std::chrono::steady_clock::now() < entry.write_deadline;
             }
-            if (!entry.writable) {
+            if (!has_memory_replica) {
+                sessions.put_sessions[keys[i]] = PutSessionEntry{
+                    .replicas = std::move(replicas),
+                    .object_size = static_cast<uint64_t>(sizes[i]),
+                    .write_mode = write_mode,
+                    .writable = false,
+                };
+                hot_keys_to_remove.push_back(keys[i]);
                 keys_to_revoke.push_back(keys[i]);
-                results[i] = toInt(failure);
+                results[i] =
+                    static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+                continue;
             }
+            sessions.put_sessions[keys[i]] = PutSessionEntry{
+                .replicas = std::move(replicas),
+                .object_size = static_cast<uint64_t>(sizes[i]),
+                .write_mode = write_mode,
+            };
         }
     }
+    if (client_->GetHotCache() && !hot_keys_to_remove.empty()) {
+        client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
+    }
     if (!keys_to_revoke.empty()) {
-        if (client_->GetHotCache())
-            client_->GetHotCache()->RemoveHotKeys(keys_to_revoke);
-        auto revoked =
-            finish_put_sessions(sessions, keys_to_revoke, ReplicaType::ALL);
+        auto revoked = client_->BatchPutRevoke(keys_to_revoke);
         std::lock_guard<std::mutex> lock(sessions.mutex);
         for (size_t i = 0; i < keys_to_revoke.size(); ++i) {
-            if (revoked[i] || revoked[i].error() == ErrorCode::ILLEGAL_CLIENT ||
-                revoked[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                erase_put_session(sessions, keys_to_revoke[i]);
+            if (i < revoked.size() &&
+                (revoked[i] ||
+                 revoked[i].error() == ErrorCode::OBJECT_NOT_FOUND)) {
+                sessions.put_sessions.erase(keys_to_revoke[i]);
+                release_session_put_owner(sessions, keys_to_revoke[i]);
             }
         }
     }
@@ -9038,8 +8936,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_impl(
     SessionState &sessions, const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const std::vector<std::vector<size_t>> &all_dst_offsets,
-    const DummyPutControl *put_control) {
+    const std::vector<std::vector<size_t>> &all_dst_offsets) {
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (!client_ || keys.size() != all_buffers.size() ||
@@ -9050,8 +8947,6 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_impl(
     }
 
     std::vector<std::vector<Replica::Descriptor>> replicas_per_entry;
-    std::vector<std::chrono::steady_clock::time_point> write_deadlines;
-    const auto master_generation = client_->master_generation_.load();
     std::vector<std::vector<Slice>> slices;
     std::vector<std::vector<uint64_t>> dst_offsets;
     std::vector<size_t> idx_map;
@@ -9068,22 +8963,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_impl(
                 continue;
             }
             auto it = sessions.put_sessions.find(keys[i]);
-            if (it == sessions.put_sessions.end() ||
-                (put_control &&
-                 put_control->sequence < it->second.dummy_generation)) {
-                continue;
-            }
-            if (it->second.write_deadline !=
-                    std::chrono::steady_clock::time_point::min() &&
-                std::chrono::steady_clock::now() >= it->second.write_deadline) {
-                it->second.writable = false;
-                results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
-                continue;
-            }
-            if (!it->second.writable) continue;
-            if (it->second.master_generation != master_generation) {
-                it->second.writable = false;
-                results[i] = tl::unexpected(ErrorCode::INVALID_VERSION);
+            if (it == sessions.put_sessions.end() || !it->second.writable) {
                 continue;
             }
             bool overflow = false;
@@ -9104,17 +8984,13 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_impl(
             if (overflow) {
                 continue;
             }
+            ++it->second.inflight_transfers;
             inflight_keys.push_back(keys[i]);
             replicas_per_entry.push_back(it->second.replicas);
-            write_deadlines.push_back(it->second.write_deadline);
             slices.push_back(std::move(entry_slices));
             dst_offsets.push_back(std::move(entry_offsets));
             idx_map.push_back(i);
         }
-        // All allocations above can throw. Publish the counters only once
-        // every row is ready and the guard below can take ownership by move.
-        for (const auto &key : inflight_keys)
-            ++sessions.put_sessions.at(key).inflight_transfers;
     }
 
     if (replicas_per_entry.empty()) {
@@ -9139,9 +9015,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_impl(
         }
     } inflight_guard{&sessions, std::move(inflight_keys)};
 
-    auto transfer = client_->BatchTransferWriteRanges(
-        replicas_per_entry, slices, dst_offsets, TransferIntent::kUnspecified,
-        write_deadlines, master_generation);
+    auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
+                                                      slices, dst_offsets);
     for (size_t k = 0; k < transfer.size(); ++k) {
         results[idx_map[k]] = std::move(transfer[k]);
     }
@@ -9149,11 +9024,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges_impl(
 }
 
 std::vector<int> RealClient::batch_put_session_end_impl(
-    SessionState &sessions, const std::vector<std::string> &keys,
-    const DummyPutControl *control) {
+    SessionState &sessions, const std::vector<std::string> &keys) {
     std::lock_guard<std::mutex> control_lock(sessions.put_control_mutex);
-    if (control && !sessions.accept_control(*control))
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_VERSION));
     std::vector<tl::expected<void, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (!client_) {
@@ -9166,24 +9038,15 @@ std::vector<int> RealClient::batch_put_session_end_impl(
     std::vector<char> has_nof;
     {
         std::unique_lock<std::mutex> lock(sessions.mutex);
-        for (const auto &key : keys) {
-            auto it = sessions.put_sessions.find(key);
-            if (it != sessions.put_sessions.end()) it->second.writable = false;
-        }
-        wait_session_put_idle(sessions, lock, keys);
         for (size_t i = 0; i < keys.size(); ++i) {
             auto it = sessions.put_sessions.find(keys[i]);
             if (it == sessions.put_sessions.end()) {
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            if (std::none_of(it->second.replicas.begin(),
-                             it->second.replicas.end(),
-                             [](const auto &replica) {
-                                 return replica.is_memory_replica();
-                             })) {
-                // An uncertain start or a NoF-only allocation cannot have
-                // accepted a ranged write. Only revoke may resolve it.
+            if (it->second.replicas.empty()) {
+                // An uncertain start has no descriptor proving which ranges
+                // were allocated or written. Only revoke may resolve it.
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
@@ -9194,19 +9057,7 @@ std::vector<int> RealClient::batch_put_session_end_impl(
                     break;
                 }
             }
-            if (!it->second.memory_end_attempted &&
-                std::chrono::steady_clock::now() >= it->second.write_deadline) {
-                // A previous range may have expired before it could write.
-                // Leave the reservation sealed for an explicit revoke.
-                results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
-                continue;
-            }
-            if (!it->second.memory_end_attempted &&
-                it->second.master_generation !=
-                    client_->master_generation_.load()) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_VERSION);
-                continue;
-            }
+            it->second.writable = false;
             if (nof && it->second.write_mode !=
                            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 LOG(ERROR)
@@ -9219,17 +9070,28 @@ std::vector<int> RealClient::batch_put_session_end_impl(
             end_keys.push_back(keys[i]);
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
-            // The RPC may complete MEMORY before its reply is lost. In that
-            // case revoke(ALL) cannot remove the still-processing NoF replica.
-            it->second.memory_end_attempted = true;
+        }
+        if (!end_keys.empty()) {
+            wait_session_put_idle(sessions, lock, end_keys);
         }
     }
     if (end_keys.empty()) {
         return ToPyResults(results);
     }
 
-    auto end_responses = finish_put_sessions(
-        sessions, end_keys, ReplicaType::MEMORY, /*revoke=*/false);
+    std::vector<ObjectMeta> end_metas;
+    end_metas.reserve(end_keys.size());
+    for (const auto &key : end_keys) {
+        end_metas.emplace_back(ObjectMeta{key, std::nullopt});
+    }
+    auto end_responses = client_->BatchPutEnd(end_metas, ReplicaType::MEMORY);
+    if (end_responses.size() != end_keys.size()) {
+        for (size_t j = 0; j < end_keys.size(); ++j) {
+            results[end_indices[j]] = tl::unexpected(ErrorCode::RPC_FAIL);
+        }
+        return ToPyResults(results);
+    }
+
     std::vector<std::string> nof_revoke_keys;
     std::vector<size_t> nof_revoke_end_indices;
     nof_revoke_keys.reserve(end_keys.size());
@@ -9238,10 +9100,6 @@ std::vector<int> RealClient::batch_put_session_end_impl(
         const size_t i = end_indices[j];
         if (!end_responses[j]) {
             results[i] = tl::unexpected(end_responses[j].error());
-            if (end_responses[j].error() == ErrorCode::ILLEGAL_CLIENT) {
-                std::lock_guard lock(sessions.mutex);
-                erase_put_session(sessions, end_keys[j]);
-            }
             continue;
         }
         if (has_nof[j]) {
@@ -9251,7 +9109,8 @@ std::vector<int> RealClient::batch_put_session_end_impl(
         }
         {
             std::lock_guard<std::mutex> lock(sessions.mutex);
-            erase_put_session(sessions, end_keys[j]);
+            sessions.put_sessions.erase(end_keys[j]);
+            release_session_put_owner(sessions, end_keys[j]);
         }
         results[i] = {};
     }
@@ -9261,23 +9120,26 @@ std::vector<int> RealClient::batch_put_session_end_impl(
     }
 
     auto nof_revoke_responses =
-        finish_put_sessions(sessions, nof_revoke_keys, ReplicaType::NOF_SSD);
+        client_->BatchPutRevoke(nof_revoke_keys, ReplicaType::NOF_SSD);
+    if (nof_revoke_responses.size() != nof_revoke_keys.size()) {
+        for (size_t k = 0; k < nof_revoke_keys.size(); ++k) {
+            const size_t j = nof_revoke_end_indices[k];
+            results[end_indices[j]] = tl::unexpected(ErrorCode::RPC_FAIL);
+        }
+        return ToPyResults(results);
+    }
     for (size_t k = 0; k < nof_revoke_keys.size(); ++k) {
         const size_t j = nof_revoke_end_indices[k];
         const size_t i = end_indices[j];
         if (!nof_revoke_responses[k] &&
-            nof_revoke_responses[k].error() != ErrorCode::OBJECT_NOT_FOUND &&
-            nof_revoke_responses[k].error() != ErrorCode::INVALID_WRITE) {
+            nof_revoke_responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
             results[i] = tl::unexpected(nof_revoke_responses[k].error());
-            if (nof_revoke_responses[k].error() == ErrorCode::ILLEGAL_CLIENT) {
-                std::lock_guard lock(sessions.mutex);
-                erase_put_session(sessions, nof_revoke_keys[k]);
-            }
             continue;
         }
         {
             std::lock_guard<std::mutex> lock(sessions.mutex);
-            erase_put_session(sessions, nof_revoke_keys[k]);
+            sessions.put_sessions.erase(nof_revoke_keys[k]);
+            release_session_put_owner(sessions, nof_revoke_keys[k]);
         }
         results[i] = {};
     }
@@ -9285,11 +9147,8 @@ std::vector<int> RealClient::batch_put_session_end_impl(
 }
 
 std::vector<int> RealClient::batch_put_session_revoke_impl(
-    SessionState &sessions, const std::vector<std::string> &keys,
-    const DummyPutControl *control) {
+    SessionState &sessions, const std::vector<std::string> &keys) {
     std::lock_guard<std::mutex> control_lock(sessions.put_control_mutex);
-    if (control && !sessions.accept_control(*control))
-        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_VERSION));
     std::vector<tl::expected<void, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (!client_) {
@@ -9299,9 +9158,6 @@ std::vector<int> RealClient::batch_put_session_revoke_impl(
 
     std::vector<std::string> revoke_keys;
     std::vector<size_t> revoke_indices;
-    std::vector<bool> memory_end_attempted;
-    std::vector<std::string> uncertain_keys;
-    std::vector<size_t> uncertain_indices;
     {
         std::unique_lock<std::mutex> lock(sessions.mutex);
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -9311,96 +9167,43 @@ std::vector<int> RealClient::batch_put_session_revoke_impl(
                 continue;
             }
             it->second.writable = false;
-            if (it->second.replicas.empty()) {
-                uncertain_keys.push_back(keys[i]);
-                uncertain_indices.push_back(i);
-                continue;
-            }
             revoke_keys.push_back(keys[i]);
             revoke_indices.push_back(i);
-            memory_end_attempted.push_back(
-                it->second.memory_end_attempted &&
-                std::any_of(it->second.replicas.begin(),
-                            it->second.replicas.end(), [](const auto &replica) {
-                                return replica.is_nof_replica();
-                            }));
         }
         if (!revoke_keys.empty()) {
             wait_session_put_idle(sessions, lock, revoke_keys);
         }
     }
-    // An uncertain start may have allocated DISK as well. ALL only covers
-    // MEMORY, NoF and DFS. Confirm DISK is gone before releasing the claim.
-    auto disk_revokes =
-        finish_put_sessions(sessions, uncertain_keys, ReplicaType::DISK);
-    for (size_t j = 0; j < uncertain_keys.size(); ++j) {
-        const size_t i = uncertain_indices[j];
-        if (!disk_revokes[j] &&
-            disk_revokes[j].error() != ErrorCode::INVALID_WRITE) {
-            const auto error = disk_revokes[j].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::ILLEGAL_CLIENT) {
-                std::lock_guard lock(sessions.mutex);
-                erase_put_session(sessions, keys[i]);
-            }
-            results[i] = error == ErrorCode::OBJECT_NOT_FOUND
-                             ? tl::expected<void, ErrorCode>{}
-                             : tl::unexpected(error);
-            continue;
-        }
-        // INVALID_WRITE denotes no primary write or a non-processing DISK
-        // replica. Other primary replicas still need the normal revoke below.
-        revoke_keys.push_back(keys[i]);
-        revoke_indices.push_back(i);
-        memory_end_attempted.push_back(false);
-    }
     if (revoke_keys.empty()) {
         return ToPyResults(results);
     }
 
-    if (client_->GetHotCache()) {
+    if (client_->GetHotCache() && !revoke_keys.empty()) {
         client_->GetHotCache()->RemoveHotKeys(revoke_keys);
     }
     auto revoke_responses =
-        finish_put_sessions(sessions, revoke_keys, ReplicaType::ALL);
-    std::vector<std::string> nof_keys;
-    std::vector<size_t> nof_indices;
-    for (size_t j = 0; j < revoke_keys.size(); ++j) {
-        if (memory_end_attempted[j] && !revoke_responses[j] &&
-            revoke_responses[j].error() == ErrorCode::INVALID_WRITE) {
-            nof_keys.push_back(revoke_keys[j]);
-            nof_indices.push_back(j);
-        }
-    }
-    if (!nof_keys.empty()) {
-        auto responses =
-            finish_put_sessions(sessions, nof_keys, ReplicaType::NOF_SSD);
-        for (size_t k = 0; k < nof_keys.size(); ++k) {
-            auto &result = revoke_responses[nof_indices[k]];
-            if (!responses[k] &&
-                responses[k].error() == ErrorCode::INVALID_WRITE) {
-                // No primary write, or the sole NoF replica is already
-                // complete. Neither case leaves a NoF reservation to revoke.
-                result = {};
-            } else {
-                result = std::move(responses[k]);
-            }
-        }
-    }
+        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL);
     std::lock_guard<std::mutex> lock(sessions.mutex);
+    if (revoke_responses.size() != revoke_keys.size()) {
+        for (size_t j = 0; j < revoke_keys.size(); ++j) {
+            results[revoke_indices[j]] = tl::unexpected(ErrorCode::RPC_FAIL);
+        }
+        return ToPyResults(results);
+    }
     for (size_t j = 0; j < revoke_keys.size(); ++j) {
         const size_t i = revoke_indices[j];
         if (!revoke_responses[j]) {
-            const auto error = revoke_responses[j].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::ILLEGAL_CLIENT)
-                erase_put_session(sessions, revoke_keys[j]);
-            results[i] = error == ErrorCode::OBJECT_NOT_FOUND
-                             ? tl::expected<void, ErrorCode>{}
-                             : tl::unexpected(error);
+            if (revoke_responses[j].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                sessions.put_sessions.erase(revoke_keys[j]);
+                release_session_put_owner(sessions, revoke_keys[j]);
+                results[i] = {};
+            } else {
+                results[i] = tl::unexpected(revoke_responses[j].error());
+            }
             continue;
         }
-        erase_put_session(sessions, revoke_keys[j]);
+        sessions.put_sessions.erase(revoke_keys[j]);
+        release_session_put_owner(sessions, revoke_keys[j]);
         results[i] = {};
     }
     return ToPyResults(results);
@@ -10131,9 +9934,9 @@ int RealClient::start_ipc_server() {
     return 0;
 }
 
-int RealClient::stop_ipc_server() {
+int RealClient::stop_ipc_server(bool retain_socket_name) {
     if (uds_acceptor_) {
-        uds_acceptor_->stop();
+        uds_acceptor_->stop(retain_socket_name);
         uds_acceptor_.reset();
     }
     return 0;

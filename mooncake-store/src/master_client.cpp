@@ -101,16 +101,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutStart> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::StartPutSessions> {
-    static constexpr const char* value = "StartPutSessions";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::FinishPutSessions> {
-    static constexpr const char* value = "FinishPutSessions";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::PutEnd> {
     static constexpr const char* value = "PutEnd";
 };
@@ -499,20 +489,10 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
-                ErrorCode err_code =
-                    result.error().code == coro_rpc::errc::timed_out
+                const ErrorCode err_code =
+                    (result.error().code == coro_rpc::errc::timed_out)
                         ? ErrorCode::RPC_TIMEOUT
                         : ErrorCode::RPC_FAIL;
-                if constexpr (std::is_same_v<
-                                  RpcNameTraits<ServiceMethod>,
-                                  RpcNameTraits<&WrappedMasterService::
-                                                    StartPutSessions>>) {
-                    // The old Master never invoked a handler or acquired a
-                    // reservation.
-                    if (result.error().code ==
-                        coro_rpc::errc::function_not_registered)
-                        err_code = ErrorCode::NOT_SUPPORTED;
-                }
                 LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
                 std::vector<tl::expected<ResultType, ErrorCode>> error_results;
                 error_results.reserve(input_size);
@@ -842,14 +822,6 @@ MasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
-    // An older Master must reject a fenced start before it allocates any
-    // replicas.
-    if (config.put_reservation) {
-        return invoke_batch_rpc<&WrappedMasterService::StartPutSessions,
-                                std::vector<Replica::Descriptor>>(
-            keys.size(), client_id_, keys, total_slice_lengths, config,
-            tenant_id_.value());
-    }
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
         keys.size(), client_id_, keys, total_slice_lengths, config,
@@ -867,12 +839,6 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
         client_id_, object_meta, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::FinishPutSessions(
-    const std::vector<PutSessionKey>& keys, ReplicaType type, bool revoke) {
-    return invoke_batch_rpc<&WrappedMasterService::FinishPutSessions, void>(
-        keys.size(), client_id_, keys, type, revoke, tenant_id_.value());
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(

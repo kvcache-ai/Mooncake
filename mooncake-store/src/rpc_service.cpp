@@ -66,35 +66,6 @@ auto WithRequestTenantBatch(std::string_view raw, size_t result_count,
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
 }
 
-// Ordinary and ranged writes contribute to the same batch completion metrics.
-template <typename KeyAt>
-void RecordPutFinish(const std::vector<tl::expected<void, ErrorCode>>& results,
-                     bool revoke, KeyAt key_at, ScopedVLogTimer& timer) {
-    size_t failed = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (results[i]) continue;
-        ++failed;
-        LOG(ERROR) << (revoke ? "BatchPutRevoke" : "BatchPutEnd")
-                   << " failed for key[" << i << "] '" << key_at(i)
-                   << "': " << toString(results[i].error());
-    }
-    auto& metrics = MasterMetricManager::instance();
-    if (failed == results.size()) {
-        if (revoke)
-            metrics.inc_batch_put_revoke_failures(failed);
-        else
-            metrics.inc_batch_put_end_failures(failed);
-    } else if (failed) {
-        if (revoke)
-            metrics.inc_batch_put_revoke_partial_success(failed);
-        else
-            metrics.inc_batch_put_end_partial_success(failed);
-    }
-    timer.LogResponse("total=", results.size(),
-                      ", success=", results.size() - failed,
-                      ", failures=", failed);
-}
-
 template <typename Fn>
 auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
     using Result = std::invoke_result_t<Fn, const TenantId&>;
@@ -675,66 +646,6 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     return results;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedMasterService::StartPutSessions(const UUID& client_id,
-                                       const std::vector<std::string>& keys,
-                                       const std::vector<uint64_t>& sizes,
-                                       const ReplicateConfig& config,
-                                       const std::string& tenant_id) {
-    if (!config.put_reservation || *config.put_reservation == UUID{})
-        return {keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)};
-    auto results = BatchPutStart(client_id, keys, sizes, config, tenant_id);
-    for (auto& result : results) {
-        if (!result) continue;
-        for (auto& replica : *result) {
-            if (replica.is_memory_replica()) {
-                replica.get_memory_descriptor().put_session_write_grant =
-                    master_service_.GetPutSessionWriteGrant();
-            }
-        }
-    }
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>>
-WrappedMasterService::FinishPutSessions(const UUID& client_id,
-                                        const std::vector<PutSessionKey>& keys,
-                                        ReplicaType type, bool revoke,
-                                        const std::string& tenant_id) {
-    ScopedVLogTimer timer(1, "FinishPutSessions");
-    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size());
-    auto& metrics = MasterMetricManager::instance();
-    if (revoke)
-        metrics.inc_batch_put_revoke_requests(keys.size());
-    else
-        metrics.inc_batch_put_end_requests(keys.size());
-    auto results = WithRequestTenantBatch(
-        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
-                                               : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& tenant) {
-            std::vector<tl::expected<void, ErrorCode>> results;
-            results.reserve(keys.size());
-            for (const auto& [key, reservation] : keys) {
-                if (reservation == UUID{}) {
-                    results.emplace_back(
-                        tl::unexpected(ErrorCode::INVALID_PARAMS));
-                } else if (revoke) {
-                    results.emplace_back(master_service_.PutRevoke(
-                        client_id, key, tenant, type, reservation));
-                } else {
-                    results.emplace_back(master_service_.PutEnd(
-                        client_id, ObjectMeta{key, std::nullopt}, tenant, type,
-                        reservation));
-                }
-            }
-            return results;
-        });
-    RecordPutFinish(
-        results, revoke, [&](size_t i) -> const auto& { return keys[i].key; },
-        timer);
-    return results;
-}
-
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     ReplicaType replica_type, const std::string& tenant_id) {
@@ -751,9 +662,27 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
                 client_id, object_metas, resolved_tenant_id, replica_type);
         });
 
-    RecordPutFinish(
-        results, false,
-        [&](size_t i) -> const auto& { return object_metas[i].key; }, timer);
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
+                       << object_metas[i].key << "': " << toString(error);
+        }
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_end_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
     return results;
 }
 
@@ -769,12 +698,36 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchPutRevoke(
-                client_id, keys, resolved_tenant_id, replica_type);
+            std::vector<tl::expected<void, ErrorCode>> batch_results;
+            batch_results.reserve(keys.size());
+            for (const auto& key : keys) {
+                batch_results.emplace_back(master_service_.PutRevoke(
+                    client_id, key, resolved_tenant_id, replica_type));
+            }
+            return batch_results;
         });
 
-    RecordPutFinish(
-        results, true, [&](size_t i) -> const auto& { return keys[i]; }, timer);
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
+        }
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_revoke_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
     return results;
 }
 
@@ -2131,8 +2084,6 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
-        &WrappedMasterService::StartPutSessions,
-        &WrappedMasterService::FinishPutSessions,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,

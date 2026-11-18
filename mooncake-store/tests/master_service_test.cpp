@@ -421,44 +421,6 @@ TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
     EXPECT_LT(buffer.buffer_address_, original.base + original.size);
 }
 
-TEST_F(MasterServiceTest, LatePutSessionClosePreservesReplacement) {
-    MasterService service(MasterServiceConfig::builder()
-                              .set_memory_allocator(BufferAllocatorType::OFFSET)
-                              .build());
-    const UUID client = generate_uuid();
-    ASSERT_TRUE(service.MountSegment(MakeSegment("put-session"), client));
-    const auto tenant = TenantId::Default();
-    const ObjectMeta object{"reused-key", std::nullopt};
-    ReplicateConfig config;
-    const UUID old = generate_uuid();
-    config.put_reservation = old;
-    ASSERT_TRUE(service.PutStart(client, object.key, tenant, 4096, config));
-    ASSERT_TRUE(
-        service.PutRevoke(client, object.key, tenant, ReplicaType::ALL, old));
-    const UUID current = generate_uuid();
-    config.put_reservation = current;
-    ASSERT_TRUE(service.PutStart(client, object.key, tenant, 4096, config));
-    for (const UUID stale : {old, UUID{}}) {
-        EXPECT_EQ(
-            service
-                .PutRevoke(client, object.key, tenant, ReplicaType::ALL, stale)
-                .error(),
-            ErrorCode::ILLEGAL_CLIENT);
-        EXPECT_EQ(
-            service.PutEnd(client, object, tenant, ReplicaType::MEMORY, stale)
-                .error(),
-            ErrorCode::ILLEGAL_CLIENT);
-    }
-    ASSERT_TRUE(service.PutRevoke(client, object.key, tenant, ReplicaType::ALL,
-                                  current));
-    ASSERT_TRUE(service.PutStart(client, object.key, tenant, 4096, {}));
-    EXPECT_EQ(
-        service.PutRevoke(client, object.key, tenant, ReplicaType::ALL, current)
-            .error(),
-        ErrorCode::ILLEGAL_CLIENT);
-    EXPECT_TRUE(service.PutEnd(client, object, tenant, ReplicaType::MEMORY));
-}
-
 TEST_F(MasterServiceTest, ReplicaDescriptorCarriesTheMountedProtocol) {
     MasterService service(MasterServiceConfig::builder()
                               .set_memory_allocator(BufferAllocatorType::OFFSET)

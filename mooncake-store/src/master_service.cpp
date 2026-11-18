@@ -3512,8 +3512,6 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
-        metadata.put_reservation =
-            standby_meta.put_reservation.value_or(UUID{});
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -5085,8 +5083,6 @@ auto MasterService::InsertMetadata(
                      config.with_hard_pin, config.data_type, group_id,
                      tenant_id, key, residency_affinity_id);
     auto& metadata = accessor.Get();
-    if (config.put_reservation)
-        metadata.put_reservation = *config.put_reservation;
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
                                 std::move(eligible_replica_ids));
@@ -5371,8 +5367,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                           const TenantId& tenant_id, ReplicaType replica_type,
-                           const UUID& reservation)
+                           const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -5384,8 +5379,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id ||
-        reservation != metadata.put_reservation) {
+    if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
@@ -5687,7 +5681,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type, const UUID& reservation)
+                              ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -5699,8 +5693,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
-    if (client_id != metadata.client_id ||
-        reservation != metadata.put_reservation) {
+    if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
                    << key << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
@@ -6100,7 +6093,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
-                    metadata.put_reservation = {};
                     metadata.put_start_time = now;
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -8081,9 +8073,7 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    PingResponse response(view_version_, client_sessions_.Ping(client_id));
-    response.master_incarnation = master_incarnation_;
-    return response;
+    return PingResponse(view_version_, client_sessions_.Ping(client_id));
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -11602,8 +11592,6 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
     payload.residency_affinity_id = metadata.residency_affinity_id;
-    if (metadata.put_reservation != UUID{})
-        payload.put_reservation = metadata.put_reservation;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

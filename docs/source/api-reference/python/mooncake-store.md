@@ -2332,10 +2332,10 @@ calls concurrently. Close stops local services. For an EGM Provider, close
 also stops `FileStorage` workers before unmounting EGM segments and
 releasing their backing memory.
 
-Close is terminal: both real-client and dummy-client handles are cleared from
-the Python object even when cleanup fails. Further `close()` calls are
-idempotent, not cleanup retries. Repeated `setup()` calls are not a recovery
-mechanism.
+Close normally clears the native handle even when cleanup fails. For a
+persistent CUDA DummyClient, `CUDA_BUFFER_IN_USE` (-802) means the daemon
+may still access its registered buffers. Keep those allocations and their
+contents intact and retry `close()` on the same store until it succeeds.
 
 If EGM setup fails, Mooncake attempts cleanup even for failed or uncertain
 mounts. When unmount cannot be confirmed, it logs the error and retains the
@@ -2350,7 +2350,8 @@ def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = terminal cleanup failure).
+- `int`: 0 on success, -802 while a CUDA transfer still needs to be drained,
+  or another nonzero status on terminal cleanup failure.
 
 **Example:**
 ```python
@@ -3227,30 +3228,17 @@ buffer and scatter it. If a key
 has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
 it has only NOF replicas — `batch_get_session_start` returns
 `INVALID_REPLICA` for that key and does not open a session. Put sessions
-reserve space on the Master. Each reservation has an ID so a retried end or
-revoke can only modify the write that created it. Upgrade the Master before
-using ranged puts with an updated client.
+reserve object space via Master `BatchPutStart` and finalize with
+`BatchPutEnd`.
 
-Put sessions write MEMORY replicas only. If the Master has `root_fs_dir` set,
-session start releases the unused legacy DISK reservation before accepting
-range writes. `nof_replica_num > 0` is accepted only for
+Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
 `batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
 Reliable multi-replica NoF configs are rejected at session start. DFS configs
 (`dfs_replica_num > 0`, including DFS-only) are also rejected at session start with
 `INVALID_PARAMS`; use `put` / `batch_put_from` for DFS placement. `end` / `revoke`
 seal the session (no further range writes) and wait for in-flight range transfers
-before talking to Master. Finish all range writes and call `end` within the
-Master's `put_start_discard_timeout_sec` window (30 seconds by default).
-After `LEASE_EXPIRED`, revoke the session and restart the write.
-The interval between the discard and release timeouts provides time for
-already submitted transfers to finish before the Master can reuse their buffers.
-Range writes use cached replica addresses. After the client observes a Master
-change, further range writes on the old sessions return `INVALID_VERSION`.
-Revoke those sessions and restart them. Drain active writes before a planned
-Master restart or failover.
-Until the client observes the change, it can still submit to an old address.
-A transfer already submitted can also outlive the failover.
+before talking to Master.
 
 ⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
 Store-managed registered memory. DFS session reads use temporary staging; the
@@ -3259,12 +3247,9 @@ staging allocation is released after the synchronous read and scatter finish.
 These APIs are also available after `setup_dummy`. Each DummyClient has its own
 session state in the RealClient, while sharing the RealClient's Transfer Engine.
 Starting or ending a get session does not change another client's session for
-the same key. While a put session owns a key, ordinary `put` and `upsert`
-calls through the same RealClient return `INVALID_WRITE` for that key. This
-also applies when the session start timed out and its result is still unknown.
-Disconnect cleanup revokes that client's unfinished put sessions.
-Upgrade DummyClient and the `mooncake_client` daemon together for ranged
-operations. Peers with incompatible session RPCs return an error.
+the same key. Disconnect cleanup revokes that client's unfinished put sessions.
+Both the DummyClient and the `mooncake_client` daemon must include session RPC
+support; older daemons return an RPC error.
 
 In DummyClient mode, session transfers use the RealClient's mapping for
 registered shared memory. External CPU buffers and, by default, CUDA buffers
@@ -3274,10 +3259,16 @@ the GPU allocation. Persistent registration supports the classic Transfer
 Engine. With RDMA, turn off `MC_RDMA_DATA_DIRECT` to use this mode. A daemon
 using TENT or RDMA Data Direct returns an error before importing the allocation.
 An application with only registered GPU buffers can set `local_buffer_size=0`.
-Synchronize device producer streams before range writes. If a range RPC times
-out or loses its connection, the daemon may still use the registered buffer.
-Keep caller-owned buffers alive and their contents stable until the transfer
-is confirmed or the DummyClient context has been closed successfully.
+Use matching DummyClient and daemon versions for persistent registration.
+Synchronize device producer streams before range writes. If a range read or
+write using a persistent CUDA registration loses its RPC reply, the DummyClient
+asks the daemon to finish outstanding accesses and remove this client's
+mappings. After the daemon acknowledges, the range call returns `RPC_FAIL`
+and the caller can reuse the buffers.
+If that acknowledgement also fails, the transfer returns `CUDA_BUFFER_IN_USE`
+(-802). Keep all the client's registered buffers and their contents intact
+and retry `close()` on the same store. After cleanup, set up a new DummyClient
+and register the buffers again to resume transfers.
 
 In persistent mode, match each successful `register_buffer` call with an
 `unregister_buffer` call. Finish in-flight transfers before the final
@@ -3286,7 +3277,9 @@ registration fails after reaching the daemon, including a lost reply, the
 daemon may still hold the mapping. Retry registration to use the buffer, or
 retry unregistration to confirm cleanup before releasing it. If the daemon
 cannot confirm that a failed memory registration was rolled back, keep the
-allocation alive until the daemon exits.
+allocation alive until the daemon exits. If the daemon shuts down with a CUDA
+mapping still held, its process retains the IPC socket name until exit so a
+replacement daemon cannot acknowledge cleanup on its behalf.
 
 #### batch_get_session_start()
 

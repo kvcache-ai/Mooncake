@@ -29,6 +29,10 @@ class DummyClient : public PyClient {
     // Drains in-flight RPCs before the pool member is released (#3909).
     ~DummyClient();
 
+    bool cuda_transfer_pending() const {
+        return cuda_transfer_state_.load() == CudaTransferState::kPending;
+    }
+
     int64_t unregister_shm();
 
     int setup_real(const std::string &local_hostname,
@@ -258,7 +262,7 @@ class DummyClient : public PyClient {
         size_t size = 0;
         std::unique_ptr<BufferHandle> staging;
         bool copy_back = false;
-        uint64_t staging_id = 0;
+        bool direct_cuda = false;
     };
 
     bool is_device_buffer(void *buffer) const;
@@ -286,11 +290,7 @@ class DummyClient : public PyClient {
 #endif
     std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
                                                  bool copy_to_staging,
-                                                 bool copy_back = false,
-                                                 bool session_range = false);
-    std::optional<BufferHandle> allocate_dummy_buffer(size_t size,
-                                                      uint64_t staging_id);
-    std::atomic<uint64_t> next_staging_id_{1};
+                                                 bool copy_back = false);
     std::optional<PreparedBuffer> prepare_ranged_read_buffer(
         void *buffer, std::vector<std::vector<size_t>> &dst_offsets,
         const std::vector<std::vector<size_t>> &sizes);
@@ -311,10 +311,6 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_offsets, bool is_write);
-    std::vector<int> finish_put_sessions(const std::vector<std::string> &keys,
-                                         bool revoke);
-    std::mutex put_session_mutex_;
-    DummyPutControl put_control_;
 
     struct ExternalBufferRegistration {
         size_t size = 0;
@@ -340,6 +336,13 @@ class DummyClient : public PyClient {
         CudaRegistrationState state = CudaRegistrationState::kUnconfirmed;
     };
     const bool cuda_ipc_persistent_registration_;
+    // Once a direct transfer loses its reply, this UUID can never import
+    // GPU memory again. A delayed data request may still carry its address.
+    enum class CudaTransferState { kActive, kPending, kDrained };
+    std::atomic<CudaTransferState> cuda_transfer_state_{
+        CudaTransferState::kActive};
+    ErrorCode drain_failed_cuda_transfer();
+    int unmap_cuda_client_locked();
     mutable std::mutex registered_cuda_buffers_mutex_;
     std::unordered_map<uintptr_t, CudaBufferRegistration>
         registered_cuda_buffers_;
@@ -418,10 +421,6 @@ class DummyClient : public PyClient {
 
     // For shared memory management
     ShmHelper *shm_helper_ = nullptr;
-    std::mutex registered_shms_mutex_;
-    std::unordered_map<void *, std::weak_ptr<ShmHelper::ShmSegment>>
-        registered_shms_;
-    bool reregister_shms();
     std::string ipc_socket_path_;
     void *local_buffer_base_ = nullptr;
 

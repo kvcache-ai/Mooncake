@@ -66,7 +66,7 @@ class UdsAcceptor {
 
     void registerHandler(Handler handler);
     tl::expected<void, std::string> start();
-    void stop();
+    void stop(bool retain_socket_name = false);
 
    private:
     void acceptLoop();

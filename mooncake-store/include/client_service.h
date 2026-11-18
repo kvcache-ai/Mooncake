@@ -7,14 +7,12 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <span>
 #include <string>
 #include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
-#include <unordered_map>
 #include <unordered_set>
 
 #include "client_metric.h"
@@ -83,7 +81,6 @@ class QueryResult {
  * @brief Client for interacting with the mooncake distributed object store
  */
 class Client {
-    friend class RealClient;
     friend class test::RealClientTeardownTest;
 
    public:
@@ -395,10 +392,7 @@ class Client {
         const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& dst_offsets,
-        TransferIntent intent = TransferIntent::kUnspecified,
-        const std::vector<std::chrono::steady_clock::time_point>&
-            write_deadlines = {},
-        std::optional<uint64_t> master_generation = std::nullopt);
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -1028,15 +1022,6 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
-    // The Master uses this Client's identity for every writer. Reserve a
-    // session key through end/revoke, including uncertain RPC outcomes.
-    // A zero count denotes a session. Positive counts are ordinary writes.
-    std::mutex put_claims_mutex_;
-    std::unordered_map<ObjectKey, size_t> put_claims_;
-    class OrdinaryWriteClaims;
-    bool claimSessionPut(const ObjectKey& key);
-    void releaseSessionPut(const ObjectKey& key);
-
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1265,23 +1250,8 @@ class Client {
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
-    std::shared_mutex leader_switch_mutex_;
+    std::mutex leader_switch_mutex_;
     std::optional<ha::MasterView> current_master_view_;
-    // The watcher can temporarily clear current_master_view_ during recovery.
-    std::optional<ha::MasterView> last_connected_master_view_;
-    std::atomic<uint64_t> master_generation_{0};
-    UUID observed_master_incarnation_{};
-    uint64_t incarnation_generation_{0};
-    ClientStatus last_storage_status_{ClientStatus::UNDEFINED};
-    uint64_t CapturePutMasterGeneration() {
-        // The endpoint and its generation must both have been published before
-        // starting an RPC on a freshly connected leader.
-        std::shared_lock lock(leader_switch_mutex_);
-        return master_generation_.load();
-    }
-    std::optional<uint64_t> ObservePutMaster(
-        uint64_t sent_generation, const UUID& incarnation,
-        ClientStatus storage_status = ClientStatus::UNDEFINED);
     std::string direct_master_address_;
     std::thread leader_monitor_thread_;
     std::atomic<bool> leader_monitor_running_{false};
