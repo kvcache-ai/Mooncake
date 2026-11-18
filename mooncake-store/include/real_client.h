@@ -754,8 +754,11 @@ class RealClient : public PyClient {
 
     using LocalDiskOffloadObjects =
         std::unordered_map<std::string, std::vector<Slice>>;
+    using LocalDiskObjectVersions =
+        std::unordered_map<std::string, ObjectIncarnation>;
     using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
-        const std::string &, LocalDiskOffloadObjects &)>;
+        const std::string &, LocalDiskOffloadObjects &,
+        const LocalDiskObjectVersions &)>;
 
     // Dependency-injected overload used to verify routing decisions without
     // requiring multiple live SSD offload servers.
@@ -935,6 +938,11 @@ class RealClient : public PyClient {
                                     const std::vector<int64_t> &sizes,
                                     const std::vector<int64_t> &object_sizes);
 
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_versioned_offload_object(
+        const VersionedOffloadReadRequest &request);
+
     /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
@@ -983,6 +991,7 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const LocalDiskObjectVersions &versions,
         const OffloadReadRange *read_range = nullptr);
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
@@ -999,6 +1008,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const std::vector<ObjectIncarnation> &incarnations,
         bool allow_pinned = true,
         const std::vector<int64_t> *value_offsets = nullptr,
         const std::vector<int64_t> *object_sizes = nullptr);

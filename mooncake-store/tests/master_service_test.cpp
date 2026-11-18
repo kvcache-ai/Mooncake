@@ -4061,11 +4061,36 @@ TEST_F(MasterServiceTest, VersionedLocalDiskReattachesAfterCatalogRestore) {
     ASSERT_TRUE(restored.NotifyOffloadSuccess(client_id, {scan}, {disk}));
     const auto after_current = restored.GetReplicaList(key, tenant);
     ASSERT_TRUE(after_current);
-    EXPECT_TRUE(std::any_of(after_current->replicas.begin(),
-                            after_current->replicas.end(),
-                            [](const Replica::Descriptor& replica) {
-                                return replica.is_local_disk_replica();
-                            }));
+    EXPECT_TRUE(std::any_of(
+        after_current->replicas.begin(), after_current->replicas.end(),
+        [incarnation](const Replica::Descriptor& replica) {
+            return replica.is_local_disk_replica() &&
+                   replica.get_local_disk_descriptor().GetObjectIncarnation() ==
+                       incarnation;
+        }));
+
+    const auto restarted_holder = generate_uuid();
+    ASSERT_TRUE(restored.MountLocalDiskSegment(restarted_holder, true,
+                                               /*versioned=*/true));
+    disk.transport_endpoint = "restarted-disk-endpoint";
+    ASSERT_TRUE(
+        restored.NotifyOffloadSuccess(restarted_holder, {scan}, {disk}));
+    ASSERT_TRUE(
+        restored.NotifyOffloadSuccess(restarted_holder, {scan}, {disk}));
+    const auto after_restart = restored.GetReplicaList(key, tenant);
+    ASSERT_TRUE(after_restart);
+    EXPECT_EQ(
+        std::count_if(
+            after_restart->replicas.begin(), after_restart->replicas.end(),
+            [&](const Replica::Descriptor& replica) {
+                if (!replica.is_local_disk_replica()) return false;
+                const auto& descriptor = replica.get_local_disk_descriptor();
+                return descriptor.client_id == restarted_holder &&
+                       descriptor.transport_endpoint ==
+                           disk.transport_endpoint &&
+                       descriptor.GetObjectIncarnation() == incarnation;
+            }),
+        1);
 }
 
 TEST_F(MasterServiceTest, OldOffloadAckDoesNotAttachToRecreatedKey) {
@@ -4117,6 +4142,8 @@ TEST_F(MasterServiceTest, OldOffloadAckDoesNotAttachToRecreatedKey) {
     ASSERT_NE(disk, replicas->replicas.end());
     EXPECT_EQ(disk->get_local_disk_descriptor().transport_endpoint,
               "current-endpoint");
+    EXPECT_EQ(disk->get_local_disk_descriptor().GetObjectIncarnation(),
+              current_tasks->front().GetObjectIncarnation());
 }
 
 TEST_F(MasterServiceTest, OldOffloadNackKeepsRecreatedKeysSourcePinned) {
@@ -4198,6 +4225,43 @@ TEST_F(MasterServiceTest, LateDiskRegistrationDoesNotAttachToRecreatedKey) {
     const auto after_legacy_scan = service.GetReplicaList(key, tenant);
     ASSERT_TRUE(after_legacy_scan);
     EXPECT_EQ(after_legacy_scan->replicas.size(), 1u);
+}
+
+TEST_F(MasterServiceTest, VersionedDiskRescanCannotRevivePendingRemoval) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const auto [segment_id, original_holder] = PrepareSimpleSegment(service);
+    const auto new_holder = generate_uuid();
+    const auto tenant = TenantId::Default();
+    const std::string key = "pending-removal-offload-registration";
+    ASSERT_TRUE(service.MountLocalDiskSegment(original_holder, true,
+                                              /*versioned=*/true));
+    ASSERT_TRUE(service.MountLocalDiskSegment(new_holder, true,
+                                              /*versioned=*/true));
+    PutCompletedObject(service, original_holder, key, ReplicateConfig{});
+    const auto tasks = service.OffloadObjectHeartbeat(original_holder, true);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(tasks->size(), 1u);
+    OffloadTaskItem scan = tasks->front();
+    StorageObjectMetadata disk{1, 0, 0, 1024, "original-endpoint"};
+    disk.object_incarnation = scan.object_incarnation;
+    ASSERT_TRUE(service.NotifyOffloadSuccess(original_holder, *tasks, {disk}));
+    scan.attempt_id.reset();
+    disk.transport_endpoint = "new-endpoint";
+
+    {
+        // MarkRemovedAndPersist leaves these marks until its durable callback.
+        auto object =
+            MasterServiceTestPeer::WriteObject(service, {tenant, key});
+        ASSERT_TRUE(object);
+        object->metadata().VisitReplicas(&Replica::fn_is_completed,
+                                         [](Replica& r) { r.mark_removed(); });
+    }
+    ASSERT_TRUE(service.NotifyOffloadSuccess(new_holder, {scan}, {disk}));
+    const auto result = service.GetReplicaList(key, tenant);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST_F(MasterServiceTest, OffloadRetryAndInPlaceUpsertUseDistinctIdentities) {

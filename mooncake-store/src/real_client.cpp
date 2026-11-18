@@ -1596,6 +1596,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object_ranges>(
                 this);
         offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_versioned_offload_object>(
+                this);
+        offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
         offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
             this);
@@ -4095,20 +4098,22 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
-        const auto &endpoint =
-            best_replica->get_local_disk_descriptor().transport_endpoint;
+        const auto &disk = best_replica->get_local_disk_descriptor();
+        const auto &endpoint = disk.transport_endpoint;
         std::unordered_map<std::string, std::vector<Slice>> objects;
         objects.emplace(
             key, std::vector<Slice>{{buffer_handle->ptr(), total_length}});
-        auto read_result =
-            batch_get_into_offload_object_internal(endpoint, objects);
+        auto read_result = batch_get_into_offload_object_internal(
+            endpoint, objects, {{key, disk.GetObjectIncarnation()}});
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
             // Same heal as the batch path: the owner proves the backing file
             // gone (evict + re-query) or present (retry the same replica
             // once). kUnknown surfaces the plain miss.
-            if (heal_dangling_disk_replica) {
+            if (heal_dangling_disk_replica &&
+                disk.GetObjectIncarnation().IsZero() &&
+                read_result.error() != ErrorCode::INVALID_VERSION) {
                 const auto heal = heal_disk_replica_for_read(
                     key, *best_replica,
                     query_result.value().resolved_tenant_id);
@@ -4592,6 +4597,7 @@ RealClient::batch_get_buffer_internal(
         // occurrence and its verified bytes are fanned out locally below.
         std::unordered_map<std::string, size_t> disk_key_to_idx;
         std::vector<std::pair<size_t, size_t>> duplicate_disk_ops;
+        LocalDiskObjectVersions versions;
 
         for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
             auto &op = disk_ops[idx];
@@ -4607,25 +4613,28 @@ RealClient::batch_get_buffer_internal(
                 LOG(ERROR) << "No LOCAL_DISK replica found for key: " << op.key;
                 continue;
             }
+            const auto &disk = replica_ptr->get_local_disk_descriptor();
+            const auto version = disk.GetObjectIncarnation();
             auto [primary_it, first_seen] =
                 disk_key_to_idx.emplace(op.key, idx);
             if (!first_seen) {
-                duplicate_disk_ops.emplace_back(idx, primary_it->second);
+                if (versions.at(op.key) == version) {
+                    duplicate_disk_ops.emplace_back(idx, primary_it->second);
+                }
                 continue;
             }
-            const auto &replica = *replica_ptr;
-            offload_objects[replica.get_local_disk_descriptor()
-                                .transport_endpoint]
-                .emplace(op.key, std::vector<Slice>{
-                                     {op.buffer_handle->ptr(), op.total_size}});
+            versions.emplace(op.key, version);
+            offload_objects[disk.transport_endpoint].emplace(
+                op.key,
+                std::vector<Slice>{{op.buffer_handle->ptr(), op.total_size}});
         }
 
         std::vector<tl::expected<int64_t, ErrorCode>> op_status(
             disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         for (auto &[endpoint, objects] : offload_objects) {
             if (objects.empty()) continue;
-            auto read_result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            auto read_result = batch_get_into_offload_object_internal(
+                endpoint, objects, versions);
             for (auto &[key, slices] : objects) {
                 auto idx_it = disk_key_to_idx.find(key);
                 if (idx_it == disk_key_to_idx.end()) continue;
@@ -4668,7 +4677,9 @@ RealClient::batch_get_buffer_internal(
                     // this op's own buffer and op_status flips to success, so
                     // the duplicate fan-out and handle assembly below treat
                     // the healed key like any other successful read.
-                    if (client_ && heal_dangling_disk_replica) {
+                    if (client_ && heal_dangling_disk_replica &&
+                        versions.at(key).IsZero() &&
+                        read_result.error() != ErrorCode::INVALID_VERSION) {
                         const Replica::Descriptor *failed_replica = nullptr;
                         for (const auto &r : op.query_result.replicas) {
                             if (r.is_local_disk_replica() &&
@@ -5025,14 +5036,14 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // directly to SSD RPC (same pattern as single-buffer batch_get_into;
         // GPU buffers are pre-registered by vLLM via register_buffer).
         if (replica.is_local_disk_replica()) {
-            const auto &endpoint =
-                replica.get_local_disk_descriptor().transport_endpoint;
+            const auto &disk = replica.get_local_disk_descriptor();
+            const auto &endpoint = disk.transport_endpoint;
             std::unordered_map<std::string, std::vector<Slice>> objects;
             objects.emplace(
                 key, std::vector<Slice>{
                          {static_cast<char *>(buffer) + dst_offset, size}});
-            auto result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            auto result = batch_get_into_offload_object_internal(
+                endpoint, objects, {{key, disk.GetObjectIncarnation()}});
             if (!result) return tl::unexpected(result.error());
             if (verify_checksum) {
                 auto checksum_result = client_->VerifyObjectChecksum(
@@ -5176,8 +5187,10 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     };
 
     if (replica.is_local_disk_replica()) {
-        const auto &endpoint =
-            replica.get_local_disk_descriptor().transport_endpoint;
+        const auto &disk = replica.get_local_disk_descriptor();
+        const auto &endpoint = disk.transport_endpoint;
+        const LocalDiskObjectVersions versions{
+            {key, disk.GetObjectIncarnation()}};
         if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -5188,7 +5201,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             {key, {{dst, size}}}};
         if (can_use_pinned_restore_arena(endpoint, objects)) {
             auto result = batch_get_into_offload_object_internal(
-                endpoint, objects, &read_range);
+                endpoint, objects, versions, &read_range);
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
@@ -5198,8 +5211,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(key, std::vector<Slice>{
                                          {static_cast<char *>(tmp_buf), size}});
-                return batch_get_into_offload_object_internal(endpoint, objects,
-                                                              &read_range);
+                return batch_get_into_offload_object_internal(
+                    endpoint, objects, versions, &read_range);
             },
             size);
     }
@@ -6915,8 +6928,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     const auto query_results = client_->BatchQuery(keys);
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
+        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects,
+               const LocalDiskObjectVersions &versions) {
+            return batch_get_into_offload_object_internal(endpoint, objects,
+                                                          versions);
         });
 }
 
@@ -7039,6 +7054,13 @@ RealClient::batch_get_into_internal(
                 // primary; its verified bytes are fanned out to this
                 // duplicate's buffer after the SSD reads below.
                 const auto &primary = valid_local_disk_operations.at(key);
+                if (primary.replica.get_local_disk_descriptor()
+                        .GetObjectIncarnation() !=
+                    replica.get_local_disk_descriptor()
+                        .GetObjectIncarnation()) {
+                    results[i] = tl::unexpected(ErrorCode::INVALID_VERSION);
+                    continue;
+                }
                 local_disk_dup_jobs.push_back(DuplicateFanOutJob{
                     .dup_result_index = i,
                     .primary_result_index = primary.original_index,
@@ -7259,11 +7281,14 @@ RealClient::batch_get_into_internal(
     std::unordered_map<std::string,
                        std::unordered_map<std::string, std::vector<Slice>>>
         offload_objects;
+    LocalDiskObjectVersions versions;
 
     for (const auto &op_it : valid_local_disk_operations) {
         const auto &replica = op_it.second.replica;
-        auto [store_segment_it, _] = offload_objects.try_emplace(
-            replica.get_local_disk_descriptor().transport_endpoint);
+        const auto &disk = replica.get_local_disk_descriptor();
+        auto [store_segment_it, _] =
+            offload_objects.try_emplace(disk.transport_endpoint);
+        versions.emplace(op_it.first, disk.GetObjectIncarnation());
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
@@ -7273,7 +7298,7 @@ RealClient::batch_get_into_internal(
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = local_disk_reader(
-            offload_objects_it.first, offload_objects_it.second);
+            offload_objects_it.first, offload_objects_it.second, versions);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
@@ -7880,6 +7905,7 @@ void RealClient::execute_session_local_disk_range_reads(
         int64_t object_size{0};
         int64_t window_offset{0};
         int64_t window_length{0};
+        ObjectIncarnation incarnation;
         std::vector<const SessionRangeReadRequest *> key_requests;
     };
     std::unordered_map<std::string, std::unordered_map<std::string, KeyPlan>>
@@ -7892,12 +7918,16 @@ void RealClient::execute_session_local_disk_range_reads(
                 static_cast<int>(toInt(ErrorCode::BUFFER_OVERFLOW));
             continue;
         }
-        const auto &endpoint =
-            request.selected_replica.get_local_disk_descriptor()
-                .transport_endpoint;
-        auto &plan = endpoint_plans[endpoint][request.object_key];
+        const auto &disk = request.selected_replica.get_local_disk_descriptor();
+        const auto incarnation = disk.GetObjectIncarnation();
+        auto &plan =
+            endpoint_plans[disk.transport_endpoint][request.object_key];
         if (plan.key_requests.empty()) {
             plan.object_size = static_cast<int64_t>(total_size);
+            plan.incarnation = incarnation;
+        } else if (plan.incarnation != incarnation) {
+            results[request.result_index] = toInt(ErrorCode::INVALID_VERSION);
+            continue;
         }
         plan.key_requests.push_back(&request);
     }
@@ -7907,10 +7937,12 @@ void RealClient::execute_session_local_disk_range_reads(
         std::vector<int64_t> restore_sizes;
         std::vector<int64_t> restore_offsets;
         std::vector<int64_t> object_sizes;
+        std::vector<ObjectIncarnation> incarnations;
         restore_keys.reserve(keys.size());
         restore_sizes.reserve(keys.size());
         restore_offsets.reserve(keys.size());
         object_sizes.reserve(keys.size());
+        incarnations.reserve(keys.size());
         for (const auto &[key, plan] : keys) {
             std::vector<std::pair<size_t, size_t>> ranges;
             for (const auto *request : plan.key_requests) {
@@ -7945,13 +7977,14 @@ void RealClient::execute_session_local_disk_range_reads(
             restore_sizes.push_back(mutable_plan.window_length);
             restore_offsets.push_back(mutable_plan.window_offset);
             object_sizes.push_back(mutable_plan.object_size);
+            incarnations.push_back(mutable_plan.incarnation);
         }
         if (restore_keys.empty()) {
             continue;
         }
 
         auto restored = restore_offload_objects(
-            endpoint, restore_keys, restore_sizes, {},
+            endpoint, restore_keys, restore_sizes, {}, incarnations,
             /*allow_pinned=*/false, &restore_offsets, &object_sizes);
         if (!restored) {
             for (const auto &key : restore_keys) {
@@ -8869,6 +8902,21 @@ RealClient::batch_get_into_multi_buffers_internal(
                 // Duplicate key: the first occurrence stays the transfer
                 // primary; its verified bytes fan out to this duplicate's
                 // buffers in the read paths below.
+                const auto &primary = valid_local_disk_ops.at(key).replica;
+                const auto primary_version =
+                    primary.is_local_disk_replica()
+                        ? primary.get_local_disk_descriptor()
+                              .GetObjectIncarnation()
+                        : ObjectIncarnation{};
+                const auto version = replica.is_local_disk_replica()
+                                         ? replica.get_local_disk_descriptor()
+                                               .GetObjectIncarnation()
+                                         : ObjectIncarnation{};
+                if (version != primary_version) {
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::INVALID_VERSION));
+                    continue;
+                }
                 duplicate_disk_ops.push_back(
                     DuplicateDiskOp{.original_index = i,
                                     .key = key,
@@ -8972,6 +9020,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                 std::string,
                 std::unordered_map<std::string, std::vector<Slice>>>
                 offload_objects;
+            LocalDiskObjectVersions versions;
 
             for (auto &[key, op] : valid_local_disk_ops) {
                 if (!op.is_local_disk) continue;
@@ -8998,15 +9047,16 @@ RealClient::batch_get_into_multi_buffers_internal(
                         tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
-                offload_objects[replica.get_local_disk_descriptor()
-                                    .transport_endpoint]
-                    .emplace(key, std::move(user_slices));
+                const auto &disk = replica.get_local_disk_descriptor();
+                offload_objects[disk.transport_endpoint].emplace(
+                    key, std::move(user_slices));
+                versions.emplace(key, disk.GetObjectIncarnation());
             }
 
             for (auto &[endpoint, objects] : offload_objects) {
                 if (objects.empty()) continue;
-                auto read_result =
-                    batch_get_into_offload_object_internal(endpoint, objects);
+                auto read_result = batch_get_into_offload_object_internal(
+                    endpoint, objects, versions);
                 // On success: results[original_index] was already pre-filled
                 // with total_size when valid_local_disk_ops was built; nothing
                 // to update. Only overwrite on failure.
@@ -9549,6 +9599,38 @@ RealClient::batch_get_offload_object_ranges(
         file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
+async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+RealClient::batch_get_versioned_offload_object(
+    const VersionedOffloadReadRequest &request) {
+    if (!file_storage_ || request.keys.size() != request.incarnations.size() ||
+        request.offsets.empty() != request.object_sizes.empty()) {
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    struct CallState {
+        VersionedOffloadReadRequest request;
+        std::shared_ptr<FileStorage> file_storage;
+    };
+    auto state = std::make_unique<CallState>(CallState{request, file_storage_});
+    auto *s = state.get();
+    auto pending = co_await coro_io::post([s]() {
+        const auto &read = s->request;
+        return read.offsets.empty()
+                   ? s->file_storage->BatchGet(read.keys, read.sizes,
+                                               read.incarnations)
+                   : s->file_storage->BatchGetRanges(
+                         read.keys, read.offsets, read.sizes, read.object_sizes,
+                         read.incarnations);
+    });
+    auto result = pending.value();
+    if (!result) {
+        co_return tl::make_unexpected(result.error());
+    }
+    co_return BatchGetOffloadObjectResponse(
+        result->batch_id, std::move(result->pointers),
+        client_->GetSegmentEndpoint(),
+        state->file_storage->config_.client_buffer_gc_ttl_ms);
+}
+
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
     if (!file_storage_) {
         LOG(WARNING)
@@ -9748,9 +9830,11 @@ RealClient::restore_offload_objects(
     const std::vector<std::string> &keys,
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
-    bool allow_pinned, const std::vector<int64_t> *value_offsets,
+    const std::vector<ObjectIncarnation> &incarnations, bool allow_pinned,
+    const std::vector<int64_t> *value_offsets,
     const std::vector<int64_t> *object_sizes) {
     if (keys.size() != restore_sizes.size() ||
+        keys.size() != incarnations.size() ||
         (value_offsets != nullptr && value_offsets->size() != keys.size()) ||
         (object_sizes != nullptr && object_sizes->size() != keys.size()) ||
         ((value_offsets == nullptr) != (object_sizes == nullptr))) {
@@ -9773,6 +9857,21 @@ RealClient::restore_offload_objects(
     auto response =
         [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {
         if (!local_batch) {
+            if (std::ranges::any_of(incarnations, [](const auto &incarnation) {
+                    return !incarnation.IsZero();
+                })) {
+                VersionedOffloadReadRequest request{std::move(storage_keys),
+                                                    restore_sizes,
+                                                    incarnations,
+                                                    {},
+                                                    {}};
+                if (value_offsets != nullptr) {
+                    request.offsets = *value_offsets;
+                    request.object_sizes = *object_sizes;
+                }
+                return client_requester_->batch_get_versioned_offload_object(
+                    target_rpc_service_addr, request);
+            }
             if (value_offsets != nullptr) {
                 return client_requester_->batch_get_offload_object_ranges(
                     target_rpc_service_addr, storage_keys, *value_offsets,
@@ -9781,12 +9880,12 @@ RealClient::restore_offload_objects(
             return client_requester_->batch_get_offload_object(
                 target_rpc_service_addr, storage_keys, restore_sizes);
         }
-        auto result =
-            value_offsets != nullptr
-                ? file_storage_->BatchGetLocalRanges(
-                      storage_keys, *value_offsets, restore_sizes,
-                      *object_sizes)
-                : file_storage_->BatchGetLocal(storage_keys, restore_sizes);
+        auto result = value_offsets != nullptr
+                          ? file_storage_->BatchGetLocalRanges(
+                                storage_keys, *value_offsets, restore_sizes,
+                                *object_sizes, incarnations)
+                          : file_storage_->BatchGetLocal(
+                                storage_keys, restore_sizes, incarnations);
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -9817,14 +9916,21 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
+    const LocalDiskObjectVersions &versions,
     const OffloadReadRange *read_range) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
+    std::vector<ObjectIncarnation> incarnations;
     if (read_range && objects.size() != 1) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     for (const auto &object_it : objects) {
+        const auto version = versions.find(object_it.first);
+        if (version == versions.end()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         keys.emplace_back(object_it.first);
+        incarnations.emplace_back(version->second);
         uint64_t total = 0;
         for (const auto &slice : object_it.second) {
             if (slice.size > std::numeric_limits<uint64_t>::max() - total) {
@@ -9862,9 +9968,9 @@ RealClient::batch_get_into_offload_object_internal(
         offsets_arg = &value_offsets;
         object_sizes_arg = &object_sizes;
     }
-    auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
-                                true, offsets_arg, object_sizes_arg);
+    auto restored = restore_offload_objects(target_rpc_service_addr, keys,
+                                            sizes, objects, incarnations, true,
+                                            offsets_arg, object_sizes_arg);
     if (!restored) {
         return tl::unexpected(restored.error());
     }
@@ -9981,6 +10087,14 @@ ClientRequester::verify_disk_replica(const std::string &client_addr,
                    << client_addr << ", error is: " << result.error();
     }
     return result;
+}
+
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+ClientRequester::batch_get_versioned_offload_object(
+    const std::string &client_addr,
+    const VersionedOffloadReadRequest &request) {
+    return invoke_rpc<&RealClient::batch_get_versioned_offload_object,
+                      BatchGetOffloadObjectResponse>(client_addr, request);
 }
 
 void ClientRequester::release_offload_buffer(const std::string &client_addr,

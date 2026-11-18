@@ -166,6 +166,11 @@ class ClientRequester {
                                     const std::vector<int64_t> &sizes,
                                     const std::vector<int64_t> &object_sizes);
 
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_versioned_offload_object(
+        const std::string &client_addr,
+        const VersionedOffloadReadRequest &request);
+
     /**
      * @brief Notifies remote FileStorage to release buffer after transfer
      * completion. This is a fire-and-forget call - errors are logged but not
