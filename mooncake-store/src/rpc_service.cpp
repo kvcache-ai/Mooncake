@@ -1740,6 +1740,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode>
+WrappedMasterService::MountVersionedLocalDiskSegment(const UUID& client_id,
+                                                     bool enable_offloading) {
+    return master_service_.MountLocalDiskSegment(client_id, enable_offloading,
+                                                 /*versioned=*/true);
+}
+
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
@@ -2109,6 +2116,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::BatchExistKey,
         &WrappedMasterService::BatchProbeKey,
         &WrappedMasterService::MountLocalDiskSegment,
+        &WrappedMasterService::MountVersionedLocalDiskSegment,
         &WrappedMasterService::UnmountLocalDiskSegment,
         &WrappedMasterService::OffloadObjectHeartbeat,
         &WrappedMasterService::ReportSsdCapacity,

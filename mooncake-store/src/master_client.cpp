@@ -246,6 +246,10 @@ struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MountVersionedLocalDiskSegment>
+    : RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
     static constexpr const char* value = "UnmountLocalDiskSegment";
 };
@@ -1167,14 +1171,33 @@ MasterClient::GetStorageConfig() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
+    const UUID& client_id, bool enable_offloading,
+    bool supports_versioned_offload) {
     ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
     timer.LogRequest("client_id=", client_id,
                      ", enable_offloading=", enable_offloading);
 
+    // Keep negotiation and registration on the same endpoint if Connect()
+    // retargets the active pool while this request is in flight.
+    const auto pool = client_accessor_.GetClientPool();
+    bool versioned = false;
+    if (supports_versioned_offload) {
+        const auto config =
+            invoke_rpc_with_client_pool<&WrappedMasterService::GetStorageConfig,
+                                        GetStorageConfigResponse>(pool);
+        if (!config) {
+            return tl::make_unexpected(config.error());
+        }
+        versioned = config->requires_versioned_local_disk.value_or(false);
+    }
     auto result =
-        invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
-            client_id, enable_offloading);
+        versioned
+            ? invoke_rpc_with_client_pool<
+                  &WrappedMasterService::MountVersionedLocalDiskSegment, void>(
+                  pool, client_id, enable_offloading)
+            : invoke_rpc_with_client_pool<
+                  &WrappedMasterService::MountLocalDiskSegment, void>(
+                  pool, client_id, enable_offloading);
     timer.LogResponseExpected(result);
     return result;
 }

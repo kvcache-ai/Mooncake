@@ -258,7 +258,9 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
         ASSERT_TRUE(client->RegisterLocalMemory(
             allocator.getBase(), kSegmentSize, "cpu:0", false, false));
-        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        const auto legacy_mount = client->MountLocalDiskSegment(true);
+        ASSERT_FALSE(legacy_mount);
+        EXPECT_EQ(legacy_mount.error(), ErrorCode::INVALID_VERSION);
 
         FileStorageConfig config = FileStorageConfig::FromEnvironment();
         config.storage_backend_type = StorageBackendType::kBucket;
@@ -276,6 +278,7 @@ class FileStorageTest : public ::testing::Test {
         };
         auto holder = open_holder();
         ASSERT_TRUE(holder->storage_backend_->Init());
+        ASSERT_TRUE(holder->MountLocalDiskSegment(true));
         ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
         const std::string key = "same-key-rescan";
         constexpr size_t kValueSize = 128;
@@ -304,10 +307,10 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_EQ(disk_replicas(), 1);
         holder.reset();
         ASSERT_TRUE(client->UnmountLocalDiskSegment());
-        ASSERT_TRUE(client->MountLocalDiskSegment(true));
         ASSERT_EQ(disk_replicas(), 0);
         holder = open_holder();
         ASSERT_TRUE(holder->storage_backend_->Init());
+        ASSERT_TRUE(holder->MountLocalDiskSegment(true));
         ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
         ASSERT_EQ(disk_replicas(), 1);
         const auto storage_key = TenantId::Default().MakeScopedKey(key);

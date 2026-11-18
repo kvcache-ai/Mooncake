@@ -268,6 +268,8 @@ class FileStorage {
      */
     static bool IsPerBucketSoftOffloadError(ErrorCode error);
 
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
      * 1. Sends object status (e.g., access frequency, size) to the master via
