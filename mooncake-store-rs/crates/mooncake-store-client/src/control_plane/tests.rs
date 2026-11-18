@@ -84,6 +84,22 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
             .collect()
     }
 
+    fn batch_get_route_presence(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<mooncake_store_core::Result<mooncake_store_route::RouteAuthorityPresence>> {
+        keys.iter()
+            .map(|key| {
+                Ok(mooncake_store_route::RouteAuthorityPresence {
+                    live_version: self.routes.lock().get(&key.0).map(|route| route.version),
+                    delete_version: self.delete_versions.lock().get(&key.0).copied(),
+                })
+            })
+            .collect()
+    }
+
     fn list_routes_by_replica_owner(
         &self,
         _namespace: &str,
@@ -2430,10 +2446,17 @@ fn legacy_contains_stream_reply_is_unsupported_for_presence() {
         panic!("expected presence response");
     };
     assert_eq!(records.len(), 1);
-    assert!(matches!(
-        records.pop().expect("legacy presence item"),
-        Err(StoreError::Unsupported(_))
-    ));
+    let error = records
+        .pop()
+        .expect("legacy presence item")
+        .expect_err("legacy boolean must not decode as presence");
+    assert!(matches!(error, StoreError::Unsupported(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("legacy contains reply without presence"),
+        "unexpected legacy presence error: {error}"
+    );
     handle.shutdown();
 }
 

@@ -1444,7 +1444,8 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             self.authority.clone(),
             self.allocator.clone(),
             self.eviction.clone(),
-        );
+        )
+        .with_legacy_contains(self.legacy_contains);
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         let stats = self.stats.clone();
