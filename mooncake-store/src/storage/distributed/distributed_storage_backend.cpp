@@ -982,7 +982,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             tickets[i].emplace(read_flights_.Acquire(identity));
             if (!tickets[i]->IsLeader()) continue;
         }
-        leaders.push_back(validated[i]);
+        leaders.push_back(std::move(validated[i]));
         leader_indices.push_back(i);
     }
 
@@ -1094,6 +1094,7 @@ DistributedStorageBackend::BatchReadOnce(
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
         for (const auto& slice : request.slices)
             iovs.push_back({slice.ptr, slice.size});
         const auto bytes = CalculateSliceBytes(request.slices);
