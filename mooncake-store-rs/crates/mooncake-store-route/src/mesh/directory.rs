@@ -9,7 +9,7 @@ use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
     ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
     ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteReplicaReference, RouteState, RouteVersion, StoreError,
+    RouteOwnerScanStatus, RouteReplicaReference, RouteState, RouteVersion, StoreError,
     ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
@@ -31,9 +31,9 @@ use crate::mesh::registry::{
     local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
-    authority_candidates, merge_authority_candidates, ranked_authorities,
-    ranked_merged_authorities, ranked_top_authorities, retained_authority_candidates,
-    select_authorities_for_requests, RouteAuthoritySelection,
+    authority_candidates, merge_authority_candidates, owner_scan_authority_candidates,
+    ranked_authorities, ranked_merged_authorities, ranked_top_authorities,
+    retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::{record_cas_outcome, record_delete_marker_event};
 use crate::shim::{
@@ -119,6 +119,17 @@ fn value_from_authority_record(record: RouteAuthorityRecord) -> Option<RouteAuth
     record.delete_version.map(RouteAuthorityValue::DeleteMarker)
 }
 
+fn observer_start_rank(observer: &ClientLease, topk: usize) -> usize {
+    if topk <= 1 {
+        return 0;
+    }
+    let id = &observer.runtime.stable_id.0;
+    let hash = id
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    (hash as usize) % topk
+}
+
 struct BaselineState {
     member_ids: HashSet<String>,
     candidates: Vec<ClientLease>,
@@ -134,6 +145,11 @@ struct EmbeddedWrhRouteDirectory {
     membership: Arc<dyn RouteMembershipProvider>,
     async_mirror: AsyncRouteMirrorWorker,
     baseline: Mutex<BaselineState>,
+}
+
+struct RouteReadOptions<'a> {
+    repairs: Option<&'a mut [RouteReadRepairState]>,
+    read_all: bool,
 }
 
 struct RouteContainsProbe<'a> {
@@ -267,6 +283,10 @@ impl EmbeddedWrhRouteDirectory {
 
     fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
         authority_candidates(self.membership.as_ref(), observer, false)
+    }
+
+    fn owner_scan_authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
+        owner_scan_authority_candidates(self.membership.as_ref(), observer)
     }
 
     fn authority_candidates_force_refresh(
@@ -412,132 +432,6 @@ impl EmbeddedWrhRouteDirectory {
         )
     }
 
-    fn contains_local_batch(
-        &self,
-        authority: &ClientStableId,
-        keys: &[ObjectKey],
-    ) -> Result<Vec<bool>> {
-        authority_contains_many(&self.namespace, authority, keys)
-    }
-
-    fn contains_authority_batch(
-        &self,
-        authority: &ClientLease,
-        keys: &[ObjectKey],
-    ) -> Result<Vec<Result<bool>>> {
-        if self.authority_is_local(authority) {
-            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
-                return Ok(service.batch_contains_routes(
-                    &self.namespace,
-                    &authority.runtime.stable_id,
-                    keys,
-                ));
-            }
-            return self
-                .contains_local_batch(&authority.runtime.stable_id, keys)
-                .map(|results| results.into_iter().map(Ok).collect());
-        }
-        self.authority_client.batch_contains_routes(
-            authority,
-            &self.namespace,
-            &authority.runtime.stable_id,
-            keys,
-        )
-    }
-
-    fn contains_ranked_authorities(
-        &self,
-        keys: &[ObjectKey],
-        ranked_authorities: &[Vec<ClientLease>],
-        rank: usize,
-        resolved: &mut [bool],
-        mut probe: RouteContainsProbe<'_>,
-        failure_message: &'static str,
-    ) -> Result<bool> {
-        let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
-        for (index, authorities) in ranked_authorities.iter().enumerate() {
-            if resolved[index] {
-                continue;
-            }
-            if probe.should_probe.is_some_and(|probe| !probe[index]) {
-                continue;
-            }
-            let Some(authority) = authorities.get(rank).cloned() else {
-                continue;
-            };
-            groups
-                .entry(authority.runtime.stable_id.0.clone())
-                .or_insert_with(|| (authority, Vec::new()))
-                .1
-                .push(index);
-        }
-        if groups.is_empty() {
-            return Ok(false);
-        }
-
-        for (_, (authority, indices)) in groups {
-            let batch_keys = indices
-                .iter()
-                .map(|index| keys[*index].clone())
-                .collect::<Vec<_>>();
-            match self.contains_authority_batch(&authority, &batch_keys) {
-                Ok(results) => {
-                    for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
-                        match result {
-                            Ok(true) => {
-                                trace!(
-                                    namespace = %self.namespace,
-                                    key = %key.0,
-                                    authority = %authority.runtime,
-                                    rank,
-                                    source = route_read_source(rank, self.route_topk),
-                                    "route authority contains object route"
-                                );
-                                resolved[index] = true;
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                if let Some(retry) = probe.retry_on_error.as_deref_mut() {
-                                    retry[index] = true;
-                                }
-                                self.maybe_mark_authority_suspect(
-                                    &authority,
-                                    &error,
-                                    "route_batch_contains_failed",
-                                );
-                                warn!(
-                                    runtime = %authority.runtime,
-                                    key = %key.0,
-                                    error = %error,
-                                    "{failure_message}"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    if let Some(retry) = probe.retry_on_error.as_deref_mut() {
-                        for index in &indices {
-                            retry[*index] = true;
-                        }
-                    }
-                    self.maybe_mark_authority_suspect(
-                        &authority,
-                        &error,
-                        "route_batch_contains_transport_failed",
-                    );
-                    warn!(
-                        runtime = %authority.runtime,
-                        error = %error,
-                        items = batch_keys.len(),
-                        "{failure_message}"
-                    );
-                }
-            }
-        }
-        Ok(true)
-    }
-
     fn cas_local_batch(
         &self,
         authority: &ClientStableId,
@@ -634,9 +528,9 @@ impl EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
         require_snapshot: bool,
-    ) -> Result<()> {
+    ) -> Result<RouteOwnerScanStatus> {
         let mut scans = Vec::new();
-        let authorities = self.authority_candidates(observer)?;
+        let authorities = self.owner_scan_authority_candidates(observer)?;
         if authorities.is_empty() {
             return Err(StoreError::InvalidState(format!(
                 "owner-route scan for {owner} has no route authorities"
@@ -652,6 +546,7 @@ impl EmbeddedWrhRouteDirectory {
                 require_snapshot,
             ) {
                 Ok(page) => {
+                    self.membership.clear_suspect(&authority.runtime);
                     let mut seen_cursors = HashSet::new();
                     validate_owner_route_page(None, &page, &mut seen_cursors)?;
                     if require_snapshot && page.snapshot_epoch.is_none() {
@@ -701,8 +596,10 @@ impl EmbeddedWrhRouteDirectory {
         }
 
         loop {
-            for scan in &mut scans {
+            let mut next_scans = Vec::with_capacity(scans.len());
+            for mut scan in scans {
                 if !scan.routes.is_empty() || scan.next_cursor.is_none() {
+                    next_scans.push(scan);
                     continue;
                 }
                 let cursor = scan
@@ -722,6 +619,7 @@ impl EmbeddedWrhRouteDirectory {
                     require_snapshot,
                 ) {
                     Ok(page) => {
+                        self.membership.clear_suspect(&authority.runtime);
                         if require_snapshot && page.snapshot_epoch != expected_epoch {
                             return Err(StoreError::StaleEpoch(format!(
                                 "route authority {} changed owner-route snapshot while scanning {owner}",
@@ -749,6 +647,7 @@ impl EmbeddedWrhRouteDirectory {
                         validate_owner_route_page(Some(&cursor), &page, &mut scan.seen_cursors)?;
                         scan.routes = VecDeque::from(page.routes);
                         scan.next_cursor = page.next_cursor;
+                        next_scans.push(scan);
                     }
                     Err(error) => {
                         if !matches!(
@@ -767,10 +666,14 @@ impl EmbeddedWrhRouteDirectory {
                             error = %error,
                             "route-owner scan is incomplete after continuation page failure"
                         );
-                        return Err(error);
+                        if require_snapshot {
+                            return Err(error);
+                        }
+                        last_error = Some(error);
                     }
                 }
             }
+            scans = next_scans;
 
             let Some(next_key) = scans
                 .iter()
@@ -781,7 +684,11 @@ impl EmbeddedWrhRouteDirectory {
                 if require_snapshot {
                     self.validate_owner_route_scan_snapshot(observer, owner, &scans)?;
                 }
-                return Ok(());
+                return Ok(if last_error.is_some() {
+                    RouteOwnerScanStatus::Incomplete
+                } else {
+                    RouteOwnerScanStatus::Complete
+                });
             };
             let mut merged = BTreeMap::new();
             for scan in &mut scans {
@@ -887,13 +794,153 @@ impl EmbeddedWrhRouteDirectory {
         ))
     }
 
+    fn contains_local_batch(
+        &self,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<bool>> {
+        authority_contains_many(&self.namespace, authority, keys)
+    }
+
+    fn contains_authority_batch(
+        &self,
+        authority: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<bool>>> {
+        if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return Ok(service.batch_contains_routes(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    keys,
+                ));
+            }
+            return self
+                .contains_local_batch(&authority.runtime.stable_id, keys)
+                .map(|results| results.into_iter().map(Ok).collect());
+        }
+        self.authority_client.batch_contains_routes(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            keys,
+        )
+    }
+
+    fn contains_ranked_authorities(
+        &self,
+        keys: &[ObjectKey],
+        ranked_authorities: &[Vec<ClientLease>],
+        rank: usize,
+        resolved: &mut [bool],
+        mut probe: RouteContainsProbe<'_>,
+        failure_message: &'static str,
+    ) -> Result<bool> {
+        let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
+        for (index, authorities) in ranked_authorities.iter().enumerate() {
+            if resolved[index] {
+                continue;
+            }
+            if probe.should_probe.is_some_and(|probe| !probe[index]) {
+                continue;
+            }
+            let Some(authority) = authorities.get(rank).cloned() else {
+                continue;
+            };
+            groups
+                .entry(authority.runtime.stable_id.0.clone())
+                .or_insert_with(|| (authority, Vec::new()))
+                .1
+                .push(index);
+        }
+        if groups.is_empty() {
+            return Ok(false);
+        }
+
+        for (_, (authority, indices)) in groups {
+            let batch_keys = indices
+                .iter()
+                .map(|index| keys[*index].clone())
+                .collect::<Vec<_>>();
+            match self.contains_authority_batch(&authority, &batch_keys) {
+                Ok(results) => {
+                    if results.len() != batch_keys.len() {
+                        if let Some(retry) = probe.retry_on_error.as_deref_mut() {
+                            for index in &indices {
+                                retry[*index] = true;
+                            }
+                        }
+                        warn!(
+                            runtime = %authority.runtime,
+                            expected = batch_keys.len(),
+                            actual = results.len(),
+                            "{failure_message}"
+                        );
+                        continue;
+                    }
+                    for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
+                        match result {
+                            Ok(true) => {
+                                trace!(
+                                    namespace = %self.namespace,
+                                    key = %key.0,
+                                    authority = %authority.runtime,
+                                    rank,
+                                    source = route_read_source(rank, self.route_topk),
+                                    "route authority contains object route"
+                                );
+                                resolved[index] = true;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                if let Some(retry) = probe.retry_on_error.as_deref_mut() {
+                                    retry[index] = true;
+                                }
+                                self.maybe_mark_authority_suspect(
+                                    &authority,
+                                    &error,
+                                    "route_batch_contains_failed",
+                                );
+                                warn!(
+                                    runtime = %authority.runtime,
+                                    key = %key.0,
+                                    error = %error,
+                                    "{failure_message}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(retry) = probe.retry_on_error.as_deref_mut() {
+                        for index in &indices {
+                            retry[*index] = true;
+                        }
+                    }
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_batch_contains_transport_failed",
+                    );
+                    warn!(
+                        runtime = %authority.runtime,
+                        error = %error,
+                        items = batch_keys.len(),
+                        "{failure_message}"
+                    );
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn read_ranked_authorities(
         &self,
         keys: &[ObjectKey],
         ranked_authorities: &[Vec<ClientLease>],
         rank: usize,
         resolved: &mut [Option<RouteAuthorityValue>],
-        repairs: Option<&mut [RouteReadRepairState]>,
+        mut options: RouteReadOptions<'_>,
         failure_message: &'static str,
     ) -> Result<bool> {
         let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
@@ -902,7 +949,8 @@ impl EmbeddedWrhRouteDirectory {
                 continue;
             };
             if resolved[index].is_some()
-                && (repairs.is_none() || !self.authority_is_local(&authority))
+                && !options.read_all
+                && (options.repairs.is_none() || !self.authority_is_local(&authority))
             {
                 continue;
             }
@@ -916,7 +964,6 @@ impl EmbeddedWrhRouteDirectory {
             return Ok(false);
         }
 
-        let mut repairs = repairs;
         for (_, (authority, indices)) in groups {
             let batch_keys = indices
                 .iter()
@@ -952,7 +999,7 @@ impl EmbeddedWrhRouteDirectory {
                                         "sampled route authority object route"
                                     );
                                 }
-                                if let Some(states) = repairs.as_mut() {
+                                if let Some(states) = options.repairs.as_mut() {
                                     set_repair_observation(
                                         &mut states[index],
                                         rank,
@@ -968,7 +1015,7 @@ impl EmbeddedWrhRouteDirectory {
                                 );
                             }
                             Ok(None) => {
-                                if let Some(states) = repairs.as_mut() {
+                                if let Some(states) = options.repairs.as_mut() {
                                     set_repair_observation(
                                         &mut states[index],
                                         rank,
@@ -1291,6 +1338,152 @@ impl EmbeddedWrhRouteDirectory {
             last_errors,
         }
     }
+
+    fn contains_object_routes_with_readable_filter(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+        ranked_authorities: &[Vec<ClientLease>],
+        baseline_ranked_authorities: Option<&[Vec<ClientLease>]>,
+    ) -> Result<Vec<bool>> {
+        let start_rank = observer_start_rank(observer, self.route_topk);
+        let mut resolved = vec![false; keys.len()];
+        let mut probe_failed = vec![false; keys.len()];
+        for step in 0..self.route_topk {
+            if step > 0 && resolved.iter().all(|present| *present) {
+                break;
+            }
+            let rank = (start_rank + step) % self.route_topk;
+            self.contains_ranked_authorities(
+                keys,
+                ranked_authorities,
+                rank,
+                &mut resolved,
+                RouteContainsProbe {
+                    should_probe: None,
+                    retry_on_error: Some(probe_failed.as_mut_slice()),
+                },
+                if step == 0 {
+                    "authority bounded route contains failed; trying mirrored authorities"
+                } else {
+                    "mirrored bounded route contains failed; trying other authorities"
+                },
+            )?;
+        }
+        if let Some(baseline_ranked) = baseline_ranked_authorities {
+            for step in 0..self.route_topk {
+                if step > 0 && resolved.iter().all(|present| *present) {
+                    break;
+                }
+                let rank = (start_rank + step) % self.route_topk;
+                self.contains_ranked_authorities(
+                    keys,
+                    baseline_ranked,
+                    rank,
+                    &mut resolved,
+                    RouteContainsProbe {
+                        should_probe: None,
+                        retry_on_error: Some(probe_failed.as_mut_slice()),
+                    },
+                    "baseline authority fallback route contains failed",
+                )?;
+            }
+        }
+        if let Some((index, _)) = probe_failed.iter().enumerate().find(|(_, failed)| **failed) {
+            return Err(StoreError::Transport(format!(
+                "contains readable-filter probe could not confirm route state for key {}",
+                keys[index].0
+            )));
+        }
+
+        let positives = resolved
+            .iter()
+            .enumerate()
+            .filter(|(_, present)| **present)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let positive_keys = positives
+            .iter()
+            .map(|&index| keys[index].clone())
+            .collect::<Vec<_>>();
+        let positive_ranked = positives
+            .iter()
+            .map(|&index| ranked_authorities[index].clone())
+            .collect::<Vec<_>>();
+        let positive_baseline_ranked = baseline_ranked_authorities.map(|baseline| {
+            positives
+                .iter()
+                .map(|&index| baseline[index].clone())
+                .collect::<Vec<_>>()
+        });
+        let validated = self.validate_contains_object_routes(
+            &positive_keys,
+            &positive_ranked,
+            positive_baseline_ranked.as_deref(),
+        )?;
+        for (index, present) in positives.into_iter().zip(validated) {
+            resolved[index] = present;
+        }
+        Ok(resolved)
+    }
+
+    fn validate_contains_object_routes(
+        &self,
+        keys: &[ObjectKey],
+        ranked_authorities: &[Vec<ClientLease>],
+        baseline_ranked_authorities: Option<&[Vec<ClientLease>]>,
+    ) -> Result<Vec<bool>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ranked_authorities = ranked_authorities.to_vec();
+        if let Some(baseline_ranked) = baseline_ranked_authorities {
+            for (authorities, baseline) in ranked_authorities.iter_mut().zip(baseline_ranked) {
+                for authority in baseline {
+                    if !authorities
+                        .iter()
+                        .any(|existing| existing.runtime.stable_id == authority.runtime.stable_id)
+                    {
+                        authorities.push(authority.clone());
+                    }
+                }
+            }
+        }
+        let rank_count = ranked_authorities.iter().map(Vec::len).max().unwrap_or(0);
+        let mut resolved = vec![None; keys.len()];
+        let mut observations =
+            vec![vec![RouteAuthorityObservation::Unobserved; rank_count]; keys.len()];
+        for rank in 0..rank_count {
+            self.read_ranked_authorities(
+                keys,
+                &ranked_authorities,
+                rank,
+                &mut resolved,
+                RouteReadOptions {
+                    repairs: Some(observations.as_mut_slice()),
+                    read_all: true,
+                },
+                "contains validation route batch read failed",
+            )?;
+        }
+        for (index, key) in keys.iter().enumerate() {
+            let selected = ranked_authorities[index].len();
+            let incomplete = selected == 0
+                || observations[index][..selected].iter().any(|observation| {
+                    matches!(observation, RouteAuthorityObservation::Unobserved)
+                });
+            if incomplete {
+                return Err(StoreError::Transport(format!(
+                    "contains validation could not confirm route state for key {}",
+                    key.0
+                )));
+            }
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|value| matches!(value, Some(RouteAuthorityValue::Route(_))))
+            .collect())
+    }
 }
 
 impl Drop for EmbeddedWrhRouteDirectory {
@@ -1584,7 +1777,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 &ranked_authorities,
                 rank,
                 &mut resolved,
-                Some(repairs.as_mut_slice()),
+                RouteReadOptions {
+                    repairs: Some(repairs.as_mut_slice()),
+                    read_all: false,
+                },
                 if rank == 0 {
                     "authority route batch read failed; trying mirrored authorities"
                 } else {
@@ -1599,7 +1795,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             &ranked_authorities,
             rank,
             &mut resolved,
-            None,
+            RouteReadOptions {
+                repairs: None,
+                read_all: false,
+            },
             "fallback authority route batch read failed; trying other authorities",
         )? {
             rank = rank.saturating_add(1);
@@ -1632,7 +1831,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 &ranked_authorities,
                 rank,
                 &mut resolved,
-                None,
+                RouteReadOptions {
+                    repairs: None,
+                    read_all: false,
+                },
                 if rank == 0 {
                     "authority bounded route batch read failed; trying mirrored authorities"
                 } else {
@@ -1661,93 +1863,64 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             return Ok(Vec::new());
         }
         let candidates = self.authority_candidates(observer)?;
+        if candidates.is_empty() {
+            return Ok(vec![false; keys.len()]);
+        }
         let ranked_authorities = keys
             .iter()
             .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
-        let start_rank = observer_start_rank(observer, self.route_topk);
-        let mut resolved = vec![false; keys.len()];
-        for step in 0..self.route_topk {
-            if step > 0 && resolved.iter().all(|r| *r) {
-                break;
+        let baseline_candidates = {
+            let mut baseline = self.baseline.lock();
+            let has_removed_members = baseline
+                .member_ids
+                .iter()
+                .any(|id| !candidates.iter().any(|c| c.runtime.stable_id.0 == *id));
+            if baseline.created_at.elapsed() >= BASELINE_TTL || has_removed_members {
+                baseline.member_ids = candidates
+                    .iter()
+                    .map(|c| c.runtime.stable_id.0.clone())
+                    .collect();
+                baseline.candidates = candidates.clone();
+                baseline.created_at = Instant::now();
+                None
+            } else {
+                let has_new_members = candidates
+                    .iter()
+                    .any(|c| !baseline.member_ids.contains(&c.runtime.stable_id.0));
+                if has_new_members && !baseline.candidates.is_empty() {
+                    Some(baseline.candidates.clone())
+                } else {
+                    None
+                }
             }
-            let rank = (start_rank + step) % self.route_topk;
-            self.contains_ranked_authorities(
+        };
+        let baseline_ranked_authorities = baseline_candidates.map(|baseline_candidates| {
+            keys.iter()
+                .map(|key| {
+                    ranked_top_authorities(
+                        &self.namespace,
+                        &baseline_candidates,
+                        key,
+                        self.route_topk,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        if crate::is_readable_filter_active(&self.namespace) {
+            self.contains_object_routes_with_readable_filter(
+                observer,
                 keys,
                 &ranked_authorities,
-                rank,
-                &mut resolved,
-                RouteContainsProbe {
-                    should_probe: None,
-                    retry_on_error: None,
-                },
-                if step == 0 {
-                    "authority bounded route contains failed; trying mirrored authorities"
-                } else {
-                    "mirrored bounded route contains failed; trying other authorities"
-                },
-            )?;
+                baseline_ranked_authorities.as_deref(),
+            )
+        } else {
+            self.validate_contains_object_routes(
+                keys,
+                &ranked_authorities,
+                baseline_ranked_authorities.as_deref(),
+            )
         }
-
-        if !resolved.iter().all(|r| *r) {
-            let fallback_candidates = {
-                let mut baseline = self.baseline.lock();
-                let has_removed_members = baseline
-                    .member_ids
-                    .iter()
-                    .any(|id| !candidates.iter().any(|c| c.runtime.stable_id.0 == *id));
-                if baseline.created_at.elapsed() >= BASELINE_TTL || has_removed_members {
-                    baseline.member_ids = candidates
-                        .iter()
-                        .map(|c| c.runtime.stable_id.0.clone())
-                        .collect();
-                    baseline.candidates = candidates.clone();
-                    baseline.created_at = Instant::now();
-                    None
-                } else {
-                    let has_new_members = candidates
-                        .iter()
-                        .any(|c| !baseline.member_ids.contains(&c.runtime.stable_id.0));
-                    if has_new_members && !baseline.candidates.is_empty() {
-                        Some(baseline.candidates.clone())
-                    } else {
-                        None
-                    }
-                }
-            };
-            if let Some(baseline_candidates) = fallback_candidates {
-                let baseline_ranked = keys
-                    .iter()
-                    .map(|key| {
-                        ranked_top_authorities(
-                            &self.namespace,
-                            &baseline_candidates,
-                            key,
-                            self.route_topk,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                for step in 0..self.route_topk {
-                    if resolved.iter().all(|r| *r) {
-                        break;
-                    }
-                    let rank = (start_rank + step) % self.route_topk;
-                    self.contains_ranked_authorities(
-                        keys,
-                        &baseline_ranked,
-                        rank,
-                        &mut resolved,
-                        RouteContainsProbe {
-                            should_probe: None,
-                            retry_on_error: None,
-                        },
-                        "baseline authority fallback route contains failed",
-                    )?;
-                }
-            }
-        }
-
-        Ok(resolved)
     }
 
     fn compare_and_swap_object_route(
@@ -1903,7 +2076,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
         let mut routes = Vec::new();
-        self.visit_routes_by_replica_owner_pages(observer, owner, &mut |route| {
+        let status = self.visit_routes_by_replica_owner_pages(observer, owner, &mut |route| {
             if routes.len() == DEFAULT_ROUTE_OWNER_PAGE_SIZE {
                 return Err(StoreError::Unsupported(
                     "complete owner-route listing exceeds the bounded compatibility page; use the visitor API"
@@ -1913,7 +2086,12 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             routes.push(route);
             Ok(())
         }, false)?;
-        Ok(routes)
+        match status {
+            RouteOwnerScanStatus::Complete => Ok(routes),
+            RouteOwnerScanStatus::Incomplete => Err(StoreError::Transport(
+                "owner route scan incomplete".to_string(),
+            )),
+        }
     }
 
     fn visit_routes_by_replica_owner(
@@ -1922,7 +2100,12 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
-        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)
+        match self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)? {
+            RouteOwnerScanStatus::Complete => Ok(()),
+            RouteOwnerScanStatus::Incomplete => Err(StoreError::Transport(
+                "owner route scan incomplete".to_string(),
+            )),
+        }
     }
 
     fn visit_routes_by_replica_owner_consistent(
@@ -1931,7 +2114,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
-        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, true)
+        match self.visit_routes_by_replica_owner_pages(observer, owner, visitor, true)? {
+            RouteOwnerScanStatus::Complete => Ok(()),
+            RouteOwnerScanStatus::Incomplete => Err(StoreError::Transport(
+                "owner route scan incomplete".to_string(),
+            )),
+        }
+    }
+
+    fn visit_routes_by_replica_owner_with_status(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<RouteOwnerScanStatus> {
+        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)
     }
 
     fn list_routes_in_scope(
@@ -2128,17 +2325,6 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
     }
 }
 
-fn observer_start_rank(observer: &ClientLease, topk: usize) -> usize {
-    if topk <= 1 {
-        return 0;
-    }
-    let id = &observer.runtime.stable_id.0;
-    let hash = id
-        .bytes()
-        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
-    (hash as usize) % topk
-}
-
 #[cfg(test)]
 mod owner_page_contract_tests {
     use super::*;
@@ -2156,6 +2342,34 @@ mod owner_page_contract_tests {
         leases: Vec<ClientLease>,
     }
 
+    struct MutableMembership {
+        leases: Mutex<Vec<ClientLease>>,
+    }
+
+    impl RouteMembershipProvider for MutableMembership {
+        fn live_clients(
+            &self,
+            _force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            Ok(self.leases.lock().clone())
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
     impl RouteMembershipProvider for TestMembership {
         fn live_clients(
             &self,
@@ -2166,6 +2380,8 @@ mod owner_page_contract_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
@@ -2210,6 +2426,8 @@ mod owner_page_contract_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -2238,6 +2456,8 @@ mod owner_page_contract_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
@@ -2272,6 +2492,8 @@ mod owner_page_contract_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -2292,6 +2514,8 @@ mod owner_page_contract_tests {
 
     struct RecordingConfirmationClient {
         routes: BTreeMap<String, Option<ObjectRoute>>,
+        delete_versions: BTreeMap<String, Option<RouteVersion>>,
+        read_failures: BTreeSet<String>,
         queried_authorities: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2304,13 +2528,23 @@ mod owner_page_contract_tests {
             keys: &[ObjectKey],
         ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
             self.queried_authorities.lock().push(authority.0.clone());
+            if self.read_failures.contains(&authority.0) {
+                return Err(StoreError::Transport(format!(
+                    "injected route read failure for {}",
+                    authority.0
+                )));
+            }
             let route = self.routes.get(&authority.0).cloned().unwrap_or(None);
             Ok(keys
                 .iter()
                 .map(|_| {
                     Ok(RouteAuthorityRecord {
                         route: route.clone(),
-                        delete_version: None,
+                        delete_version: self
+                            .delete_versions
+                            .get(&authority.0)
+                            .cloned()
+                            .unwrap_or(None),
                     })
                 })
                 .collect())
@@ -2320,10 +2554,22 @@ mod owner_page_contract_tests {
             &self,
             _lease: &ClientLease,
             _namespace: &str,
-            _authority: &ClientStableId,
-            _keys: &[ObjectKey],
+            authority: &ClientStableId,
+            keys: &[ObjectKey],
         ) -> Result<Vec<Result<bool>>> {
-            Err(StoreError::Unsupported("unused test operation".to_string()))
+            if self.read_failures.contains(&authority.0) {
+                return Err(StoreError::Transport(format!(
+                    "injected contains failure for {}",
+                    authority.0
+                )));
+            }
+            let present = self
+                .routes
+                .get(&authority.0)
+                .cloned()
+                .unwrap_or(None)
+                .is_some();
+            Ok(keys.iter().map(|_| Ok(present)).collect())
         }
 
         fn batch_compare_and_swap_routes(
@@ -2341,9 +2587,9 @@ mod owner_page_contract_tests {
             _lease: &ClientLease,
             _namespace: &str,
             _authority: &ClientStableId,
-            _requests: &[RouteCasRequest],
+            requests: &[RouteCasRequest],
         ) -> Result<Vec<Result<()>>> {
-            Err(StoreError::Unsupported("unused test operation".to_string()))
+            Ok(requests.iter().map(|_| Ok(())).collect())
         }
 
         fn list_routes_by_replica_owner_page(
@@ -2806,6 +3052,8 @@ mod owner_page_contract_tests {
             &observer,
             Arc::new(RecordingConfirmationClient {
                 routes,
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::new(),
                 queried_authorities: queried_authorities.clone(),
             }),
             Arc::new(RetainedMembership { current, retained }),
@@ -3084,6 +3332,511 @@ mod owner_page_contract_tests {
         assert_eq!(live.version, RouteVersion(6));
         assert_eq!(live.replicas[0].allocation_id, Some(8));
         unregister_local_authority(&directory.namespace, &peer.runtime.stable_id);
+    }
+
+    #[test]
+    fn contains_reads_merge_remote_delete_marker_versions() {
+        for (live_version, expected) in [(2, false), (6, true)] {
+            let observer = test_lease(&format!("contains-remote-observer-{live_version}"));
+            let candidates = vec![
+                test_lease(&format!("contains-remote-a-{live_version}")),
+                test_lease(&format!("contains-remote-b-{live_version}")),
+            ];
+            let key = ObjectKey::new(format!("contains-remote-key-{live_version}"));
+            let metadata = Arc::new(InMemoryMetadataBackend::new());
+            let namespace = metadata.route_namespace();
+            let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+            let mut live = test_route(&key.0, &observer.runtime);
+            live.version = RouteVersion(live_version);
+            let (live_rank, marker_rank) = if expected { (1, 0) } else { (0, 1) };
+            let routes = BTreeMap::from([
+                (ranked[live_rank].runtime.stable_id.0.clone(), Some(live)),
+                (ranked[marker_rank].runtime.stable_id.0.clone(), None),
+            ]);
+            let delete_versions = BTreeMap::from([
+                (ranked[live_rank].runtime.stable_id.0.clone(), None),
+                (
+                    ranked[marker_rank].runtime.stable_id.0.clone(),
+                    Some(RouteVersion(5)),
+                ),
+            ]);
+            let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+            let directory = EmbeddedWrhRouteDirectory::new(
+                2,
+                metadata,
+                &observer,
+                Arc::new(RecordingConfirmationClient {
+                    routes,
+                    delete_versions,
+                    read_failures: BTreeSet::new(),
+                    queried_authorities: queried_authorities.clone(),
+                }),
+                Arc::new(TestMembership {
+                    leases: candidates.clone(),
+                }),
+            );
+
+            assert_eq!(
+                directory.contains_object_route(&observer, &key).unwrap(),
+                expected
+            );
+            assert_eq!(
+                queried_authorities
+                    .lock()
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                ranked
+                    .iter()
+                    .map(|lease| lease.runtime.stable_id.0.clone())
+                    .collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn contains_without_authorities_returns_false() {
+        let observer = test_lease("contains-no-authorities-observer");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership { leases: Vec::new() }),
+        );
+        let keys = vec![
+            ObjectKey::new("contains-no-authorities-a"),
+            ObjectKey::new("contains-no-authorities-b"),
+        ];
+
+        assert_eq!(
+            directory
+                .contains_object_routes_bounded(&observer, &keys)
+                .unwrap(),
+            vec![false; keys.len()]
+        );
+    }
+
+    #[test]
+    fn contains_uses_one_bounded_record_pass_for_hits_and_misses() {
+        for present in [true, false] {
+            for key_count in [1, 16] {
+                let observer = test_lease(&format!(
+                    "contains-single-pass-observer-{present}-{key_count}"
+                ));
+                let candidates = (0..4)
+                    .map(|index| {
+                        test_lease(&format!(
+                            "contains-single-pass-authority-{present}-{key_count}-{index}"
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let metadata = Arc::new(InMemoryMetadataBackend::new());
+                let namespace = metadata.route_namespace();
+                let keys = (0..key_count)
+                    .map(|index| {
+                        ObjectKey::new(format!(
+                            "contains-single-pass-key-{present}-{key_count}-{index}"
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let ranked = keys
+                    .iter()
+                    .map(|key| ranked_top_authorities(&namespace, &candidates, key, 2))
+                    .collect::<Vec<_>>();
+                let expected_record_queries = (0..2)
+                    .map(|rank| {
+                        ranked
+                            .iter()
+                            .filter_map(|authorities| authorities.get(rank))
+                            .map(|authority| authority.runtime.stable_id.0.clone())
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                    })
+                    .sum::<usize>();
+                let route = test_route("contains-single-pass-route", &observer.runtime);
+                let routes = candidates
+                    .iter()
+                    .map(|authority| {
+                        (
+                            authority.runtime.stable_id.0.clone(),
+                            present.then(|| route.clone()),
+                        )
+                    })
+                    .collect();
+                let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+                let directory = EmbeddedWrhRouteDirectory::new(
+                    2,
+                    metadata,
+                    &observer,
+                    Arc::new(RecordingConfirmationClient {
+                        routes,
+                        delete_versions: BTreeMap::new(),
+                        read_failures: BTreeSet::new(),
+                        queried_authorities: queried_authorities.clone(),
+                    }),
+                    Arc::new(TestMembership { leases: candidates }),
+                );
+
+                assert_eq!(
+                    directory
+                        .contains_object_routes_bounded(&observer, &keys)
+                        .unwrap(),
+                    vec![present; key_count]
+                );
+                assert_eq!(queried_authorities.lock().len(), expected_record_queries);
+            }
+        }
+    }
+
+    #[test]
+    fn full_route_reads_keep_remote_short_circuit() {
+        let observer = test_lease("full-route-short-circuit-observer");
+        let candidates = vec![
+            test_lease("full-route-short-circuit-a"),
+            test_lease("full-route-short-circuit-b"),
+        ];
+        let key = ObjectKey::new("full-route-short-circuit-key");
+        let route = test_route(&key.0, &observer.runtime);
+        let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: candidates
+                    .iter()
+                    .map(|authority| (authority.runtime.stable_id.0.clone(), Some(route.clone())))
+                    .collect(),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::new(),
+                queried_authorities: queried_authorities.clone(),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        assert_eq!(
+            directory.get_object_route(&observer, &key).unwrap(),
+            Some(route)
+        );
+        assert_eq!(queried_authorities.lock().len(), 1);
+    }
+
+    #[test]
+    fn contains_validation_rejects_incomplete_live_route() {
+        let observer = test_lease("contains-incomplete-live-observer");
+        let candidates = vec![
+            test_lease("contains-incomplete-live-a"),
+            test_lease("contains-incomplete-live-b"),
+        ];
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = ObjectKey::new("contains-incomplete-live-key");
+        let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+        let live = &ranked[0];
+        let failed = &ranked[1];
+        let mut route = test_route(&key.0, &observer.runtime);
+        route.version = RouteVersion(2);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([
+                    (live.runtime.stable_id.0.clone(), Some(route)),
+                    (failed.runtime.stable_id.0.clone(), None),
+                ]),
+                delete_versions: BTreeMap::from([(
+                    failed.runtime.stable_id.0.clone(),
+                    Some(RouteVersion(5)),
+                )]),
+                read_failures: BTreeSet::from([failed.runtime.stable_id.0.clone()]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a stale live route must not hide a failed delete-marker read");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn readable_filter_contains_rejects_partial_probe_failure() {
+        let observer = test_lease("contains-readable-filter-error-observer");
+        let candidates = vec![
+            test_lease("contains-readable-filter-error-a"),
+            test_lease("contains-readable-filter-error-b"),
+        ];
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = ObjectKey::new("contains-readable-filter-error-key");
+        let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+        let failed = &ranked[0];
+        let missing = &ranked[1];
+        let route = test_route(&key.0, &observer.runtime);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([
+                    (failed.runtime.stable_id.0.clone(), Some(route)),
+                    (missing.runtime.stable_id.0.clone(), None),
+                ]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::from([failed.runtime.stable_id.0.clone()]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        let error = directory
+            .contains_object_routes_with_readable_filter(
+                &observer,
+                std::slice::from_ref(&key),
+                std::slice::from_ref(&ranked),
+                None,
+            )
+            .expect_err("a peer miss must not hide a failed readable-filter probe");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_reads_baseline_when_current_authorities_hit() {
+        let observer = test_lease("contains-current-hit-baseline-observer");
+        let original = test_lease("contains-current-hit-baseline-original");
+        let current = std::iter::once(original.clone())
+            .chain(
+                (1..3).map(|index| test_lease(&format!("contains-current-hit-baseline-{index}"))),
+            )
+            .collect::<Vec<_>>();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = (0..100)
+            .map(|index| ObjectKey::new(format!("contains-current-hit-baseline-key-{index}")))
+            .find(|key| {
+                ranked_top_authorities(&namespace, &current, key, 2)
+                    .iter()
+                    .all(|authority| authority.runtime.stable_id != original.runtime.stable_id)
+            })
+            .expect("a key should exclude the original authority from current top-k");
+        let current_top = ranked_top_authorities(&namespace, &current, &key, 2);
+        let mut route = test_route(&key.0, &observer.runtime);
+        route.version = RouteVersion(2);
+        let mut routes = current_top
+            .iter()
+            .map(|authority| (authority.runtime.stable_id.0.clone(), Some(route.clone())))
+            .collect::<BTreeMap<_, _>>();
+        routes.insert(original.runtime.stable_id.0.clone(), None);
+        let membership = Arc::new(MutableMembership {
+            leases: Mutex::new(vec![original.clone()]),
+        });
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes,
+                delete_versions: BTreeMap::from([(
+                    original.runtime.stable_id.0.clone(),
+                    Some(RouteVersion(5)),
+                )]),
+                read_failures: BTreeSet::new(),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            membership.clone(),
+        );
+        *membership.leases.lock() = current;
+
+        assert!(!directory.contains_object_route(&observer, &key).unwrap());
+
+        let baseline_ranked = ranked_top_authorities(
+            &directory.namespace,
+            std::slice::from_ref(&original),
+            &key,
+            2,
+        );
+        assert_eq!(
+            directory
+                .contains_object_routes_with_readable_filter(
+                    &observer,
+                    std::slice::from_ref(&key),
+                    std::slice::from_ref(&current_top),
+                    Some(std::slice::from_ref(&baseline_ranked)),
+                )
+                .unwrap(),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn contains_validation_propagates_route_read_failures() {
+        let observer = test_lease("contains-read-error-observer");
+        let authority = test_lease("contains-read-error-authority");
+        let authority_id = authority.runtime.stable_id.0.clone();
+        let key = ObjectKey::new("contains-read-error-key");
+        let route = test_route(&key.0, &observer.runtime);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([(authority_id.clone(), Some(route))]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::from([authority_id]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![authority],
+            }),
+        );
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a raw hit without a successful route read must not prove absence");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_rejects_partial_current_absence() {
+        let observer = test_lease("contains-partial-current-observer");
+        let candidates = vec![
+            test_lease("contains-partial-current-a"),
+            test_lease("contains-partial-current-b"),
+        ];
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = ObjectKey::new("contains-partial-current-key");
+        let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
+        let failed = &ranked[0];
+        let missing = &ranked[1];
+        let route = test_route(&key.0, &observer.runtime);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([
+                    (failed.runtime.stable_id.0.clone(), Some(route)),
+                    (missing.runtime.stable_id.0.clone(), None),
+                ]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::from([failed.runtime.stable_id.0.clone()]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a peer miss must not hide a failed raw-positive authority read");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_rejects_partial_baseline_delete_marker() {
+        let observer = test_lease("contains-partial-baseline-observer");
+        let original = test_lease("contains-partial-baseline-original");
+        let current = std::iter::once(original.clone())
+            .chain((1..3).map(|index| test_lease(&format!("contains-partial-baseline-{index}"))))
+            .collect::<Vec<_>>();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = (0..100)
+            .map(|index| ObjectKey::new(format!("contains-partial-baseline-key-{index}")))
+            .find(|key| {
+                ranked_authorities(&namespace, &current, key)
+                    .last()
+                    .is_some_and(|authority| {
+                        authority.runtime.stable_id == original.runtime.stable_id
+                    })
+            })
+            .expect("a key should rank the original authority last");
+        let current_top = ranked_top_authorities(&namespace, &current, &key, 2);
+        let route = test_route(&key.0, &observer.runtime);
+        let membership = Arc::new(MutableMembership {
+            leases: Mutex::new(vec![original.clone()]),
+        });
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([(original.runtime.stable_id.0.clone(), Some(route))]),
+                delete_versions: BTreeMap::from([(
+                    current_top[0].runtime.stable_id.0.clone(),
+                    Some(RouteVersion(5)),
+                )]),
+                read_failures: BTreeSet::from([original.runtime.stable_id.0.clone()]),
+                queried_authorities: Arc::new(Mutex::new(Vec::new())),
+            }),
+            membership.clone(),
+        );
+        *membership.leases.lock() = current;
+
+        let error = directory
+            .contains_object_route(&observer, &key)
+            .expect_err("a delete marker must not hide a failed baseline authority read");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+
+    #[test]
+    fn contains_validation_stays_bounded_during_baseline_fallback() {
+        let observer = test_lease("contains-growth-observer");
+        let original = test_lease("contains-growth-original");
+        let current = std::iter::once(original.clone())
+            .chain((1..32).map(|index| test_lease(&format!("contains-growth-{index}"))))
+            .collect::<Vec<_>>();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let key = (0..1000)
+            .map(|index| ObjectKey::new(format!("contains-growth-key-{index}")))
+            .find(|key| {
+                ranked_authorities(&namespace, &current, key)
+                    .last()
+                    .is_some_and(|authority| {
+                        authority.runtime.stable_id == original.runtime.stable_id
+                    })
+            })
+            .expect("a key should rank the original authority last");
+        let current_top = ranked_top_authorities(&namespace, &current, &key, 2);
+        let route = test_route(&key.0, &observer.runtime);
+        let membership = Arc::new(MutableMembership {
+            leases: Mutex::new(vec![original.clone()]),
+        });
+        let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes: BTreeMap::from([(original.runtime.stable_id.0.clone(), Some(route))]),
+                delete_versions: BTreeMap::new(),
+                read_failures: BTreeSet::new(),
+                queried_authorities: queried_authorities.clone(),
+            }),
+            membership.clone(),
+        );
+        *membership.leases.lock() = current;
+
+        assert!(directory.contains_object_route(&observer, &key).unwrap());
+
+        let expected_queries = current_top
+            .iter()
+            .chain(std::iter::once(&original))
+            .map(|authority| authority.runtime.stable_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let queried = queried_authorities.lock();
+        assert_eq!(queried.len(), expected_queries.len());
+        assert_eq!(
+            queried.iter().cloned().collect::<BTreeSet<_>>(),
+            expected_queries
+        );
     }
 
     #[test]
@@ -3574,6 +4327,8 @@ mod snapshot_tests {
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
 
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
+
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false
         }
@@ -3606,6 +4361,8 @@ mod snapshot_tests {
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn clear_suspect(&self, _runtime: &ClientRuntimeId) {}
 
         fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
             false

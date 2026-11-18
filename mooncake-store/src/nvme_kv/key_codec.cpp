@@ -54,9 +54,17 @@ uint32_t ComputeNvmeKvChecksum(std::span<const uint8_t> data) {
     return static_cast<uint32_t>(XXH32(data.data(), data.size(), 0));
 }
 
+uint64_t ComputeNvmeKvCanonicalIdentitySize(uint64_t logical_key_size) {
+    return sizeof(kIdentityEncodingVersion) + sizeof(uint32_t) +
+           logical_key_size;
+}
+
 std::string SerializeNvmeKvCanonicalIdentity(
     const NvmeKvObjectIdentity& identity) {
-    std::string encoded(1, static_cast<char>(kIdentityEncodingVersion));
+    std::string encoded;
+    encoded.reserve(
+        ComputeNvmeKvCanonicalIdentitySize(identity.logical_key.size()));
+    encoded.push_back(static_cast<char>(kIdentityEncodingVersion));
     AppendU32(encoded, static_cast<uint32_t>(identity.logical_key.size()));
     encoded.append(identity.logical_key);
     return encoded;

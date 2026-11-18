@@ -76,6 +76,11 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
+        // Runtime event (e.g. cudaEvent_t) the source must wait on before the
+        // copy, TENT only. Must stay valid, and must not be re-recorded, until
+        // the request reaches a terminal state: runtime-queue dispatch and
+        // transport failover may still read it after submitTransfer returns.
+        void *producer_event = nullptr;
         // Business intent for TENT scheduling (0 = unspecified).
         int intent_type = 0;
         // Adjacent requests in a group may be scheduled as one unit.

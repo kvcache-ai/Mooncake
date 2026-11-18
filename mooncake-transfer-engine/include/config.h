@@ -33,11 +33,14 @@ enum class EndpointStoreType {
     SIEVE = 1,
 };
 
-// Which NICs the EFA transport registers a buffer on.
-enum class EfaNicSelection {
+// Which NICs the EFA or RDMA transport registers a buffer on.
+enum class NicSelection {
     ALL = 0,    // every NIC, the historical behavior
     LOCAL = 1,  // device memory only on that GPU's topology-local NICs
 };
+
+// Former EFA-only name, kept so existing code keeps building.
+using EfaNicSelection = NicSelection;
 
 enum class HipKfdPinFix {
     OFF = 0,    // never hold a KFD pin anchor
@@ -162,6 +165,12 @@ struct GlobalConfig {
     // memory is always registered on every NIC. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
     EfaNicSelection efa_nic_selection = EfaNicSelection::LOCAL;
+    // Which NICs a buffer is registered on in the RDMA transport. ALL
+    // (default) registers every buffer on every opened HCA. LOCAL registers
+    // GPU memory only on the HCAs the topology prefers for that GPU and
+    // publishes zero keys for the others; host memory keeps every HCA. Set via
+    // MC_RDMA_NIC_SELECTION=all|local.
+    NicSelection rdma_nic_selection = NicSelection::ALL;
     // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
     // cap.
     int efa_cq_threads = 1;
