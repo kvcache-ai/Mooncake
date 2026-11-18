@@ -1919,11 +1919,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ExecuteWriteRange(
     auto it =
         std::upper_bound(plan.iov_ends.begin(), plan.iov_ends.end(), offset);
     size_t index = std::distance(plan.iov_ends.begin(), it);
-    const long system_limit = ::sysconf(_SC_IOV_MAX);
-    const size_t iov_limit =
-        system_limit > 0 ? static_cast<size_t>(system_limit) : 1024;
+    // _SC_IOV_MAX is constant per process; hoist the lookup and the iovec
+    // scratch buffer out of the per-chunk loop (this runs on worker threads
+    // per sub-batch, so the buffer stays invocation-local).
+    static const size_t iov_limit = [] {
+        const long system_limit = ::sysconf(_SC_IOV_MAX);
+        return system_limit > 0 ? static_cast<size_t>(system_limit) : 1024;
+    }();
+    std::vector<iovec> iovs;
     while (offset < limit) {
-        std::vector<iovec> iovs;
+        iovs.clear();
         size_t bytes = 0;
         for (; index < plan.iovs.size() && iovs.size() < iov_limit; ++index) {
             const size_t source_begin =
@@ -3908,7 +3913,7 @@ void BucketStorageBackend::DiskUsageScanLoop() {
         scan_lock.unlock();
         uint64_t write_start = 0;
         uint64_t pending_start = 0;
-        std::vector<int64_t> per_disk_pending;
+        std::vector<uint64_t> per_disk_pending;
         tl::expected<std::vector<int64_t>, ErrorCode> scanned =
             tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         try {

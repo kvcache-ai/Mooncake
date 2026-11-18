@@ -29,12 +29,23 @@ class BucketStorageBackendTestPeer {
         return backend.ActualDiskBytesUsedLocked();
     }
 
+    // Wait for scanner progress without acquiring backend.mutex_ while
+    // holding disk_scan_mutex_ (the scanner takes these locks in the
+    // opposite order). Each publish wakes the wait; the predicate runs
+    // outside the mutex.
     static bool WaitForUsage(BucketStorageBackend& backend,
                              const std::function<bool(int64_t)>& predicate) {
-        std::unique_lock<std::mutex> lock(backend.disk_scan_mutex_);
-        return backend.disk_scan_cv_.wait_for(
-            lock, std::chrono::seconds(3),
-            [&] { return predicate(Usage(backend)); });
+        for (int i = 0; i < 100; ++i) {
+            {
+                // Wait for the next publish (or 30 ms) without holding
+                // disk_scan_mutex_ while acquiring backend.mutex_.
+                std::unique_lock<std::mutex> lock(backend.disk_scan_mutex_);
+                backend.disk_scan_cv_.wait_for(lock,
+                                               std::chrono::milliseconds(30));
+            }
+            if (predicate(Usage(backend))) return true;
+        }
+        return predicate(Usage(backend));
     }
 
     static bool HasScanner(BucketStorageBackend& backend) {

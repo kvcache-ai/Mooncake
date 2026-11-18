@@ -864,8 +864,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
             if (res == ErrorCode::OK) {
-                for (const auto& key : keys)
-                    bucket->reported_keys.at(key) = true;
+                for (const auto& key : keys) {
+                    auto it = bucket->reported_keys.find(key);
+                    if (it == bucket->reported_keys.end()) {
+                        LOG(WARNING) << "Unexpected key in offload "
+                                        "completion callback: "
+                                     << key;
+                        continue;
+                    }
+                    it->second = true;
+                }
             }
             try {
                 if (res == ErrorCode::OK && ssd_metric_) {
