@@ -76,7 +76,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             intel-oneapi-compiler-dpcpp-cpp-2026.1 \
-            python3.12-dev python3.12-venv iproute2 librdmacm-dev
+            python3.12-dev python3.12-venv iproute2 librdmacm-dev file
           bash dependencies.sh -y
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           /usr/bin/python3.12 -m venv "$RUNNER_TEMP/xpu-build-env"
