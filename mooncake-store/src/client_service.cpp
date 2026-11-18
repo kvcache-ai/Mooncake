@@ -499,98 +499,78 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
-    task_poll_running_ = false;
-    if (task_poll_thread_.joinable()) {
-        task_poll_thread_.join();
+    DrainWorkers();
+    auto result = UnmountAllSegments();
+    if (!result) {
+        LOG(ERROR) << "Failed to unmount segment in destructor: "
+                   << toString(result.error());
     }
 
-    storage_heartbeat_running_ = false;
-    if (storage_heartbeat_thread_.joinable()) {
-        storage_heartbeat_thread_.join();
-    }
-    if (!gather_endpoint_.empty())
-        (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
-                                                   gather_endpoint_, true);
-
-    leader_monitor_running_ = false;
-    if (leader_monitor_thread_.joinable()) {
-        leader_monitor_thread_.join();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
-        graceful_unmount_timer_stopping_ = true;
-    }
-    graceful_unmount_timer_cv_.notify_all();
-
-    // Stop queued timer/task callbacks before tearing down segment state.
-    task_running_ = false;
-    task_thread_pool_.stop();
-
-    // Unmount callbacks must finish before the service and sources are drained.
-    gather_service_.reset();
-    gather_clients_.clear();
-
-    // Make copies to avoid modifying while iterating
-    std::vector<Segment> mounted_segments_copy;
-    std::vector<Segment> gracefully_unmounting_segments_copy;
-    std::vector<std::pair<UUID, std::function<void(const UUID&)>>>
-        graceful_cleanup_callbacks;
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        mounted_segments_copy.reserve(mounted_segments_.size());
-        for (auto& entry : mounted_segments_) {
-            mounted_segments_copy.emplace_back(entry.second);
-        }
-        for (auto& entry : gracefully_unmounting_segments_) {
-            gracefully_unmounting_segments_copy.emplace_back(entry.second);
-        }
-        graceful_cleanup_callbacks.reserve(
-            graceful_unmount_cleanup_callbacks_.size());
-        for (auto& entry : graceful_unmount_cleanup_callbacks_) {
-            graceful_cleanup_callbacks.emplace_back(entry.first,
-                                                    std::move(entry.second));
-        }
-        graceful_unmount_cleanup_callbacks_.clear();
-    }
-
-    // Unmount mounted segments: notify master + local cleanup
-    for (auto& segment : mounted_segments_copy) {
-        auto result =
-            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
-        if (!result) {
-            LOG(ERROR) << "Failed to unmount segment in destructor: "
-                       << toString(result.error());
-        }
-    }
-
-    // Unregister gracefully unmounting segments: master already has timer
-    for (auto& segment : gracefully_unmounting_segments_copy) {
-        int rc = transfer_engine_->unregisterLocalMemory(
-            reinterpret_cast<void*>(segment.base));
-        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
-            LOG(ERROR) << "Failed to unregister transfer buffer in destructor: "
-                       << rc;
-        }
-    }
-
-    // Clear any remaining segments
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        mounted_segments_.clear();
-        gracefully_unmounting_segments_.clear();
-    }
-
-    for (auto& entry : graceful_cleanup_callbacks) {
-        if (entry.second) {
-            entry.second(entry.first);
-        }
-    }
-
-    // Stop hot cache handler before unregistering/freeing its backing memory.
-    hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
+}
+
+void Client::DrainWorkers() {
+    std::call_once(worker_drain_once_, [this] {
+        task_poll_running_ = false;
+        if (task_poll_thread_.joinable()) {
+            task_poll_thread_.join();
+        }
+
+        storage_heartbeat_running_ = false;
+        if (storage_heartbeat_thread_.joinable()) {
+            storage_heartbeat_thread_.join();
+        }
+        if (!gather_endpoint_.empty())
+            (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
+                                                       gather_endpoint_, true);
+
+        leader_monitor_running_ = false;
+        if (leader_monitor_thread_.joinable()) {
+            leader_monitor_thread_.join();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
+            graceful_unmount_timer_stopping_ = true;
+        }
+        graceful_unmount_timer_cv_.notify_all();
+
+        // Stop queued timer/task callbacks before tearing down segment state.
+        task_running_ = false;
+        task_thread_pool_.stop();
+        write_thread_pool_.stop();
+
+        // Unmount callbacks must finish before the service and sources are
+        // drained.
+        gather_service_.reset();
+        gather_clients_.clear();
+        hot_cache_handler_.reset();
+        // These pools can still execute a transfer after a caller's wait timed
+        // out. Keep their dependencies alive until their own synchronous joins
+        // finish.
+        transfer_submitter_.reset();
+    });
+}
+
+tl::expected<void, ErrorCode> Client::UnmountAllSegments() {
+    // Cancel grace through the same confirmed Master + TE barrier as unmount.
+    std::vector<UUID> segment_ids;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (const auto& entry : mounted_segments_)
+            segment_ids.push_back(entry.first);
+        for (const auto& entry : gracefully_unmounting_segments_)
+            segment_ids.push_back(entry.first);
+    }
+    ErrorCode first_error = ErrorCode::OK;
+    for (const auto& id : segment_ids) {
+        auto result = UnmountSegmentById(id);
+        if (!result && first_error == ErrorCode::OK)
+            first_error = result.error();
+    }
+    if (first_error != ErrorCode::OK) return tl::unexpected(first_error);
+    return {};
 }
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
@@ -4007,8 +3987,8 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
-    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
-    auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    const Segment& segment) {
+    auto unmount_result = master_client_.UnmountSegment(segment.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
@@ -4016,44 +3996,54 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
+    return UnregisterSegment(segment);
+}
+
+tl::expected<void, ErrorCode> Client::UnregisterSegment(
+    const Segment& segment) {
     if (gather_service_)
-        gather_service_->removeSource(reinterpret_cast<void*>(it->second.base));
+        gather_service_->removeSource(reinterpret_cast<void*>(segment.base));
     int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
+        reinterpret_cast<void*>(segment.base));
+    if (rc == ERR_ADDRESS_NOT_REGISTERED &&
+        pending_segment_unregisters_.contains(segment.id)) {
+        rc = transfer_engine_->getMetadata()->updateLocalSegmentDesc();
+    }
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
                    << rc;
         if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+            pending_segment_unregisters_.insert(segment.id);
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
     }
-
-    mounted_segments_.erase(it);
+    pending_segment_unregisters_.erase(segment.id);
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
                                                      size_t size) {
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-    auto segment = mounted_segments_.end();
-
-    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
-         ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
-            it->second.size == size) {
-            segment = it;
-            break;
+    std::optional<UUID> segment_id;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (const auto* segments :
+             {&mounted_segments_, &gracefully_unmounting_segments_}) {
+            for (const auto& [id, segment] : *segments) {
+                if (segment.base == reinterpret_cast<uintptr_t>(buffer) &&
+                    segment.size == size) {
+                    segment_id = id;
+                    break;
+                }
+            }
         }
     }
-    if (segment == mounted_segments_.end()) {
+    if (!segment_id) {
         LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return UnmountSegmentImpl(segment);
+    return UnmountSegmentById(*segment_id);
 }
 
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
@@ -4155,7 +4145,24 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     const UUID& segment_id, uint64_t grace_period_ms,
     std::function<void(const UUID&)> cleanup_callback) {
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    std::unique_lock<std::mutex> lock(mounted_segments_mutex_);
+    if (grace_period_ms == 0) {
+        auto graceful = gracefully_unmounting_segments_.find(segment_id);
+        if (graceful != gracefully_unmounting_segments_.end()) {
+            auto result = UnmountSegmentImpl(graceful->second);
+            if (!result) return result;
+            gracefully_unmounting_segments_.erase(graceful);
+            std::function<void(const UUID&)> callback;
+            auto it = graceful_unmount_cleanup_callbacks_.find(segment_id);
+            if (it != graceful_unmount_cleanup_callbacks_.end()) {
+                callback = std::move(it->second);
+                graceful_unmount_cleanup_callbacks_.erase(it);
+            }
+            lock.unlock();
+            if (callback) callback(segment_id);
+            return {};
+        }
+    }
     auto segment = mounted_segments_.find(segment_id);
     if (segment == mounted_segments_.end()) {
         LOG(ERROR) << "segment_not_found id=" << UuidToString(segment_id);
@@ -4163,7 +4170,9 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     }
 
     if (grace_period_ms == 0) {
-        return UnmountSegmentImpl(segment);
+        auto result = UnmountSegmentImpl(segment->second);
+        if (result) mounted_segments_.erase(segment);
+        return result;
     }
 
     auto result =
@@ -4229,33 +4238,26 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 
     if (removed) {
         std::function<void(const UUID&)> cleanup_callback;
+        bool cleaned = false;
         {
             std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
             auto it = gracefully_unmounting_segments_.find(segment_id);
-            if (it != gracefully_unmounting_segments_.end()) {
-                if (gather_service_)
-                    gather_service_->removeSource(
-                        reinterpret_cast<void*>(it->second.base));
-                int rc = transfer_engine_->unregisterLocalMemory(
-                    reinterpret_cast<void*>(it->second.base));
-                if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
-                    LOG(ERROR)
-                        << "Failed to unregister TE MR for graceful unmount: "
-                        << rc;
-                }
+            if (it == gracefully_unmounting_segments_.end()) return;
+            if (UnregisterSegment(it->second)) {
                 gracefully_unmounting_segments_.erase(it);
-            }
-            auto callback_it =
-                graceful_unmount_cleanup_callbacks_.find(segment_id);
-            if (callback_it != graceful_unmount_cleanup_callbacks_.end()) {
-                cleanup_callback = std::move(callback_it->second);
-                graceful_unmount_cleanup_callbacks_.erase(callback_it);
+                cleaned = true;
+                auto callback_it =
+                    graceful_unmount_cleanup_callbacks_.find(segment_id);
+                if (callback_it != graceful_unmount_cleanup_callbacks_.end()) {
+                    cleanup_callback = std::move(callback_it->second);
+                    graceful_unmount_cleanup_callbacks_.erase(callback_it);
+                }
             }
         }
         if (cleanup_callback) {
             cleanup_callback(segment_id);
         }
-        return;
+        if (cleaned) return;
     }
 
     if (retry_left > 0) {

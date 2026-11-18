@@ -1012,6 +1012,11 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class RealClient;
+    void DrainWorkers();
+    tl::expected<void, ErrorCode> UnmountAllSegments();
+    std::once_flag worker_drain_once_;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1204,8 +1209,11 @@ class Client {
      * @brief Internal helper to unmount a segment by iterator.
      *        Caller must hold mounted_segments_mutex_.
      */
-    tl::expected<void, ErrorCode> UnmountSegmentImpl(
-        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(const Segment& segment);
+    tl::expected<void, ErrorCode> UnregisterSegment(const Segment& segment);
+    // A local descriptor miss cannot confirm an earlier failed publication.
+    // Guarded by mounted_segments_mutex_; retained until TE cleanup succeeds.
+    std::unordered_set<UUID, boost::hash<UUID>> pending_segment_unregisters_;
 
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);
