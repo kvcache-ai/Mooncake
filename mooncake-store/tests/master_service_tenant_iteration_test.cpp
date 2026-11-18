@@ -133,7 +133,6 @@ TEST_F(TenantIterationTest, ReadCursorVisitsEachObjectOfItsTenantOnce) {
     for (auto object : NamespaceOf(service, kTenantA)->objects.ReadCursor()) {
         EXPECT_EQ(object.ref().key, object.key());
         EXPECT_EQ(object.ref().generation, object.generation());
-        EXPECT_EQ(object.metadata().user_key, object.key());
     }
 }
 
