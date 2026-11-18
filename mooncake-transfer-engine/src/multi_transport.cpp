@@ -662,7 +662,8 @@ Status MultiTransport::submitTransfer(
     }
     {
         // Four inline spans cover the usual single-request submit without a
-        // heap allocation. Larger submits allocate once, outside the shard lock.
+        // heap allocation. Larger submits allocate once, outside the shard
+        // lock.
         constexpr size_t kInlineSpans = 4;
         BatchDesc::QuiesceSpan inline_spans[kInlineSpans];
         std::vector<BatchDesc::QuiesceSpan> heap_spans;
@@ -671,8 +672,8 @@ Status MultiTransport::submitTransfer(
         for (size_t ti = task_base; ti < task_list.size(); ++ti) {
             for (size_t k = 0; k < task_list[ti].request_count; ++k, ++req_i) {
                 const auto& req = entries[req_i];
-                BatchDesc::QuiesceSpan span{reinterpret_cast<uintptr_t>(req.source),
-                                            req.length, ti};
+                BatchDesc::QuiesceSpan span{
+                    reinterpret_cast<uintptr_t>(req.source), req.length, ti};
                 if (heap_spans.empty() && span_count < kInlineSpans) {
                     inline_spans[span_count++] = span;
                     continue;
@@ -1613,7 +1614,8 @@ bool MultiTransport::memoryReferencedByBatch(BatchID batch_id, void* addr,
             __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
         bool on_wire = true;
         if (posted == 0) {
-            on_wire = __atomic_load_n(&task.quiesce_settled, __ATOMIC_ACQUIRE) == 0;
+            on_wire =
+                __atomic_load_n(&task.quiesce_settled, __ATOMIC_ACQUIRE) == 0;
         } else {
             const uint64_t ok =
                 __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
