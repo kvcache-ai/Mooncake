@@ -23,7 +23,9 @@ use crate::{
     MooncakeCompatibilityFacade, StoreClient, StoreClientBuilder,
 };
 
-use super::{storage_config, storage_config_with_bytes, test_future_expiry_ms};
+use super::{
+    storage_config, storage_config_with_bytes, test_future_expiry_ms, RecoverableMetadataBackend,
+};
 
 // ===========================================================================
 // Helpers
@@ -759,6 +761,61 @@ fn retire_empty_draining_segment_succeeds() {
     client.drain_segment(&expanded).expect("drain");
     let retired = client.retire_segment(&expanded).expect("retire");
     assert!(retired, "retire of empty draining segment must succeed");
+}
+
+#[test]
+fn retire_segment_retries_after_unpublish_failure() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let meta = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let stable_id = "seg-retire-retry";
+    let segment = format!("{stable_id}-seg");
+    let transport = Arc::new(TestTransport::new(&segment));
+    let factory = transport.factory();
+    let client = StoreClientBuilder::new(meta.clone(), stable_id)
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:0")
+        .segment_name(&segment)
+        .transport(Arc::new(transport.peer(&segment)))
+        .transport_factory(factory)
+        .local_memory(storage_config_with_bytes(8 * 1024))
+        .build(test_future_expiry_ms())
+        .expect("build");
+    let owner = client.runtime_id().clone();
+    client.register_local_memory().expect("register");
+    let expanded = client
+        .expand_local_memory(4 * 1024)
+        .expect("expand")
+        .segment_name;
+    client.drain_segment(&expanded).expect("drain");
+    meta.fail_next_segment_unpublishes(1);
+
+    let error = client
+        .retire_segment(&expanded)
+        .expect_err("injected unpublish failure must be returned");
+    assert!(matches!(error, StoreError::Metadata(_)));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_some());
+    let local = client.list_segments().expect("local segment listing");
+    let expanded_local = local
+        .iter()
+        .find(|segment| segment.segment_name == expanded)
+        .expect("failed retire must preserve the local segment");
+    assert_eq!(expanded_local.state, SegmentLifecycleState::Draining);
+
+    assert!(client
+        .retire_segment(&expanded)
+        .expect("retire should retry after unpublish failure"));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing should succeed")
+        .iter()
+        .any(|segment| segment.segment_name == expanded));
 }
 
 #[test]

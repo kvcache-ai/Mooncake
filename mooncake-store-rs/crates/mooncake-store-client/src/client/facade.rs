@@ -1373,6 +1373,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
             tracker.finish(&result, 0);
             return result;
         }
+        let result = self
+            .metadata
+            .unpublish_segment(&self.lease.runtime, segment)
+            .map(|_| true);
+        if result.is_err() {
+            tracker.finish(&result, 0);
+            registry::record_segment_lifecycle("retire_segment", "error");
+            return result;
+        }
         {
             let mut state = self.state.lock();
             let transport = if segment == &self.segment_name()? {
@@ -1397,10 +1406,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
             segment = %segment.0,
             "retired drained segment"
         );
-        let result = self
-            .metadata
-            .unpublish_segment(&self.lease.runtime, segment)
-            .map(|_| true);
         tracker.finish(&result, 0);
         if result.as_ref().copied().unwrap_or(false) {
             registry::record_segment_lifecycle("retire_segment", "ok");

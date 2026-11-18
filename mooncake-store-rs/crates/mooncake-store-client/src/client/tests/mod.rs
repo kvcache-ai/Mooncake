@@ -298,6 +298,7 @@ struct BlockingCasGateState {
 #[derive(Default)]
 struct RecoverableMetadataState {
     lease_failures_remaining: usize,
+    unpublish_failures_remaining: usize,
     hidden_clients: BTreeSet<String>,
     hidden_segments: BTreeSet<String>,
     hide_route_policy: bool,
@@ -637,6 +638,13 @@ impl RecoverableMetadataBackend {
             .lease_failures_remaining = count;
     }
 
+    fn fail_next_segment_unpublishes(&self, count: usize) {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .unpublish_failures_remaining = count;
+    }
+
     fn hide_runtime_metadata(&self, runtime: &ClientRuntimeId) {
         let segments = self
             .inner
@@ -935,6 +943,18 @@ impl MetadataBackend for RecoverableMetadataBackend {
         owner: &ClientRuntimeId,
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<()> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("recoverable metadata state lock should succeed");
+            if state.unpublish_failures_remaining > 0 {
+                state.unpublish_failures_remaining -= 1;
+                return Err(StoreError::Metadata(
+                    "simulated segment unpublish outage".to_string(),
+                ));
+            }
+        }
         self.inner.unpublish_segment(owner, segment)
     }
 
