@@ -944,6 +944,8 @@ class RealClient : public PyClient {
         const std::string &segment_name = "") override;
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
+    tl::expected<PingResponse, ErrorCode> ping_persistent_dummy(
+        const UUID &client_id, bool establish_context);
 
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -1210,6 +1212,7 @@ class RealClient : public PyClient {
     NofRuntime nof_runtime_{};
 
     struct MappedShm {
+        UUID owner{};
         std::string shm_name;
         // Offset = real_base - dummy_base
         uintptr_t shm_addr_offset = 0;
@@ -1243,6 +1246,7 @@ class RealClient : public PyClient {
         ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
         bool writable{true};
         size_t inflight_transfers{0};
+        bool memory_end_attempted{false};
     };
     struct SessionState {
         // Serialize control RPCs so a late end/revoke cannot act on a new put.
@@ -1267,6 +1271,9 @@ class RealClient : public PyClient {
         std::shared_ptr<CudaRegisteredAllocation> allocation;
     };
     struct ShmContext {
+        // A host mapping may recreate this UUID after its old MRs expired.
+        // Only the persistent client's setup/reconnect marks the new context.
+        bool persistent_dummy = false;
         std::unordered_map<uint64_t, CudaRegisteredBuffer> cuda_buffers;
         std::shared_ptr<SessionState> sessions =
             std::make_shared<SessionState>();
@@ -1290,8 +1297,7 @@ class RealClient : public PyClient {
     // Remember uncertain imports after releasing the client's other resources.
     // An unmap acknowledgement would allow the exporter to free its allocation.
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_quarantined_cuda_;
-    tl::expected<void, ErrorCode> unmap_shm(const UUID &client_id,
-                                            bool missing_ok);
+    bool retry_dummy_quarantine_locked(const UUID &client_id);
     tl::expected<void, ErrorCode> unregister_cuda_buffer_locked(
         ShmContext &context, uint64_t dummy_addr);
     tl::expected<void, ErrorCode> register_cuda_buffer_with_fd(
@@ -1313,12 +1319,7 @@ class RealClient : public PyClient {
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     SessionState real_sessions_;
-    std::mutex session_put_owners_mutex_;
-    std::unordered_map<std::string, SessionState *> session_put_owners_;
-    bool claim_session_put_owner(SessionState &sessions,
-                                 const std::string &key);
-    void release_session_put_owner(SessionState &sessions,
-                                   const std::string &key);
+    void erase_put_session(SessionState &sessions, const std::string &key);
 
     void wait_session_put_idle(SessionState &sessions,
                                std::unique_lock<std::mutex> &lock,
@@ -1402,6 +1403,8 @@ class RealClient : public PyClient {
     std::atomic<int64_t> offload_rpc_read_count_{0};
 
     // Dummy Client manage related members
+    tl::expected<PingResponse, ErrorCode> ping_dummy(const UUID &client_id,
+                                                     bool require_context);
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
     void stop_dummy_client_monitor();

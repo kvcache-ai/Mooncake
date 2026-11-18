@@ -850,11 +850,13 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
         if (ret == ERR_ADDRESS_NOT_REGISTERED) {
             already_removed = true;
-            // TCP only removes a descriptor. Classic RDMA tracks pending MR
-            // deregistration. Other transports can lose their descriptor while
-            // still holding an MR after a failed unregister.
+            // TCP and SHM only remove a descriptor. Both classic RDMA modes
+            // track pending MR deregistration. Other transports can lose
+            // their descriptor while still holding an MR.
             std::string_view name = transport->getName();
-            if (name != "tcp" && name != "rdma") unconfirmed_removal = true;
+            if (name != "tcp" && name != "shm" && name != "rdma" &&
+                name != "rdma_twosided")
+                unconfirmed_removal = true;
         } else if (ret && !first_error) {
             first_error = ret;
         }

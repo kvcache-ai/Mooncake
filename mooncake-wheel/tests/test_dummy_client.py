@@ -1405,6 +1405,55 @@ class TestDummyClientCudaSessions(unittest.TestCase):
     def tearDownClass(cls):
         cls.store.close()
 
+    def test_persistent_gpu_only_batch_put_and_adjacent_range_reads(self):
+        torch = self.torch
+        store = MooncakeDistributedStore()
+        self.assertEqual(
+            store.setup_dummy(
+                0,
+                0,
+                os.environ["MC_CUDA_REAL_CLIENT"],
+                cuda_ipc_persistent_registration=True,
+            ),
+            0,
+        )
+        size = 256
+        pool = torch.zeros((4, size), dtype=torch.uint8, device="cuda")
+        pool[0].fill_(17)
+        pool[1].fill_(53)
+        torch.cuda.synchronize()
+        ptrs = [row.data_ptr() for row in pool]
+        registered = []
+        key = f"gpu_only_{uuid.uuid4().hex}"
+        try:
+            # Register adjacent slices separately, from highest address first.
+            for ptr in reversed(ptrs):
+                self.assertEqual(store.register_buffer(ptr, size), 0)
+                registered.append(ptr)
+            config = mooncake_store.ReplicateConfig()
+            config.replica_num = 1
+            config.prefer_alloc_in_same_node = True
+            self.assertEqual(
+                store.batch_put_from([key, key], ptrs[:2], [size, size], config),
+                [0, 0],
+            )
+            self.assertEqual(
+                store.get_into_ranges(
+                    ptrs[2:],
+                    [[key], [key]],
+                    [[[0]], [[0]]],
+                    [[[0]], [[0]]],
+                    [[[size]], [[size]]],
+                ),
+                [[[size]], [[size]]],
+            )
+            self.assertTrue(bool(torch.all(pool[2:].cpu() == 17)))
+        finally:
+            for ptr in reversed(registered):
+                self.assertEqual(store.unregister_buffer(ptr), 0)
+            store.remove(key, force=True)
+            self.assertEqual(store.close(), 0)
+
     def test_registered_cuda_layers_fragments_bounds_and_partial_results(self):
         torch = self.torch
         layers, page, count, guard = 3, 64, 3, 8

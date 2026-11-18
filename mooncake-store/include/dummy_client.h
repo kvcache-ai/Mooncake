@@ -13,6 +13,7 @@
 #include "client_metric.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "pyclient.h"
+#include "rpc_types.h"
 #include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
 #include <memory>
@@ -335,6 +336,8 @@ class DummyClient : public PyClient {
         registered_cuda_buffers_;
 
     ErrorCode connect(const std::string &server_address);
+    tl::expected<PingResponse, ErrorCode> ping_daemon(
+        bool establish_context = false);
 
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
                             bool is_local = false);
@@ -422,6 +425,8 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+    // A failed close still needs its unmap RPC after connected_ is cleared.
+    bool remote_cleanup_pending_ = false;
 
 #if defined(USE_ASCEND_DIRECT)
     mutable std::mutex external_fabric_registration_mutex_;

@@ -13,6 +13,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "client_metric.h"
@@ -81,6 +82,7 @@ class QueryResult {
  * @brief Client for interacting with the mooncake distributed object store
  */
 class Client {
+    friend class RealClient;
     friend class test::RealClientTeardownTest;
 
    public:
@@ -843,6 +845,10 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool IsUsingTent() const {
+        return transfer_engine_ && transfer_engine_->isUsingTent();
+    }
+
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
         return transfer_engine_ && !transfer_engine_->isUsingTent() &&
                transfer_engine_->getTransport(protocol) != nullptr;
@@ -1018,6 +1024,15 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    // The Master uses this Client's identity for every writer. Reserve a
+    // session key through end/revoke, including uncertain RPC outcomes.
+    // A zero count denotes a session. Positive counts are ordinary writes.
+    std::mutex put_claims_mutex_;
+    std::unordered_map<ObjectKey, size_t> put_claims_;
+    class OrdinaryWriteClaims;
+    bool claimSessionPut(const ObjectKey& key);
+    void releaseSessionPut(const ObjectKey& key);
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

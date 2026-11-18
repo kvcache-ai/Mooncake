@@ -181,8 +181,17 @@ namespace mooncake {
 template <auto ServiceMethod>
 constexpr bool can_invoke_when_disconnected() {
     using Method = std::remove_reference_t<decltype(ServiceMethod)>;
+    if constexpr (std::is_same_v<Method,
+                                 decltype(&RealClient::unmap_shm_internal)>) {
+        if (ServiceMethod == &RealClient::unmap_shm_internal ||
+            ServiceMethod == &RealClient::ascend_unmap_shm_internal)
+            return true;
+    }
     return std::is_same_v<
                Method, std::remove_reference_t<decltype(&RealClient::ping)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ping_persistent_dummy)>> ||
            std::is_same_v<Method,
                           std::remove_reference_t<
                               decltype(&RealClient::service_ready_internal)>> ||
@@ -204,6 +213,7 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
     auto pool = client_accessor_.GetClientPool();
+    if (!pool) return tl::unexpected(ErrorCode::RPC_FAIL);
 
     if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
         if (!connected_.load()) {
@@ -363,6 +373,7 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
         return result.error();
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
+    remote_cleanup_pending_ = true;
     connected_.store(true);
     return ErrorCode::OK;
 }
@@ -554,6 +565,13 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 
     ipc_socket_path_ = ipc_socket_path;
     shm_helper_ = ShmHelper::getInstance();
+    if (cuda_ipc_persistent_registration_) {
+        auto result = ping_daemon(true);
+        if (!result || result->client_status == ClientStatus::NEED_REMOUNT) {
+            LOG(ERROR) << "Failed to establish persistent DummyClient context";
+            return -1;
+        }
+    }
     if (local_buffer_size > 0) {
         try {
             base_addr = shm_helper_->allocate(local_buffer_size);
@@ -612,21 +630,22 @@ int DummyClient::tearDownAll() {
     }
 
     void* local_buffer_base = local_buffer_base_;
-    int cuda_cleanup_status = 0;
+    int cleanup_status = 0;
     {
         std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
         if (registered_cuda_buffers_.empty()) {
-            (void)unregister_shm();
+            if (remote_cleanup_pending_) cleanup_status = unregister_shm();
         } else {
             // Queue close behind any CUDA registration whose reply timed out.
             // Even a failed bulk close may have released some of the MRs.
             for (auto& [address, registration] : registered_cuda_buffers_) {
                 registration.state = CudaRegistrationState::kReleasing;
             }
-            cuda_cleanup_status =
+            cleanup_status =
                 cuda_buffer_ipc_request(IPC_CUDA_UNMAP_CLIENT, 0, {}).status;
-            if (cuda_cleanup_status == 0) registered_cuda_buffers_.clear();
+            if (cleanup_status == 0) registered_cuda_buffers_.clear();
         }
+        if (cleanup_status == 0) remote_cleanup_pending_ = false;
         connected_.store(false);
     }
     if (local_buffer_base && shm_helper_ &&
@@ -656,7 +675,7 @@ int DummyClient::tearDownAll() {
         registered_device_buffers_.clear();
     }
 #endif
-    return cuda_cleanup_status;
+    return cleanup_status;
 }
 
 std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
@@ -929,6 +948,7 @@ std::optional<int> DummyClient::unregister_cuda_buffer(void* buffer) {
 
 int DummyClient::reregister_cuda_buffers() {
     std::lock_guard<std::mutex> lock(registered_cuda_buffers_mutex_);
+    auto last_ping = std::chrono::steady_clock::now();
     for (auto& [base, registration] : registered_cuda_buffers_) {
         if (registration.references == 0 ||
             registration.state == CudaRegistrationState::kReleasing) {
@@ -938,6 +958,15 @@ int DummyClient::reregister_cuda_buffers() {
         auto result = register_cuda_via_ipc(base, registration.handle);
         if (result.status != 0) return result.status;
         registration.state = CudaRegistrationState::kRegistered;
+        // Replay runs on the heartbeat thread. Renew the context while a
+        // large pool's multiple registrations are being restored.
+        if (std::chrono::steady_clock::now() - last_ping >=
+            std::chrono::seconds(DEFAULT_CLIENT_LIVE_TTL_SEC / 2)) {
+            auto ping = ping_daemon();
+            if (!ping || ping->client_status != ClientStatus::OK)
+                return toInt(ErrorCode::RPC_FAIL);
+            last_ping = std::chrono::steady_clock::now();
+        }
     }
     return 0;
 }
@@ -1924,6 +1953,22 @@ std::vector<int> DummyClient::batch_put_from(
     if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
+    if (cuda_ipc_persistent_registration_ &&
+        std::any_of(buffer_ptrs.begin(), buffer_ptrs.end(), [this](void* ptr) {
+            return registered_cuda_buffer_remaining(ptr).has_value();
+        })) {
+        // Use the same positional rows and placement policy as CUDA IPC
+        // writes, with each persistent address translated by the daemon.
+        std::vector<std::vector<void*>> rows;
+        std::vector<std::vector<size_t>> row_sizes;
+        rows.reserve(keys.size());
+        row_sizes.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            rows.push_back({buffer_ptrs[i]});
+            row_sizes.push_back({sizes[i]});
+        }
+        return batch_put_from_multi_buffers(keys, rows, row_sizes, config);
+    }
     // CUDA IPC requests carry a process-local allocation handle.  Only export
     // buffers that are currently registered with the Dummy client; otherwise
     // an unregistered allocation (or a stale pointer after unregister) would
@@ -2465,6 +2510,15 @@ tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
     return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
 }
 
+tl::expected<PingResponse, ErrorCode> DummyClient::ping_daemon(
+    bool establish_context) {
+    if (cuda_ipc_persistent_registration_) {
+        return invoke_rpc<&RealClient::ping_persistent_dummy, PingResponse>(
+            client_id_, establish_context);
+    }
+    return invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+}
+
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;
@@ -2474,8 +2528,7 @@ void DummyClient::ping_thread_main() {
     int ping_fail_count = 0;
 
     while (ping_running_) {
-        auto ping_result =
-            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        auto ping_result = ping_daemon();
 
         if (ping_result.has_value() &&
             ping_result.value().client_status == ClientStatus::OK) {
@@ -2498,6 +2551,15 @@ void DummyClient::ping_thread_main() {
 
             // Reconnection Loop
             while (ping_running_) {
+                if (cuda_ipc_persistent_registration_) {
+                    auto context = ping_daemon(true);
+                    if (!context ||
+                        context->client_status != ClientStatus::OK) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(
+                            retry_connect_interval_ms));
+                        continue;
+                    }
+                }
                 // Re-register ALL shms
                 bool all_registered = true;
                 const auto& shms = shm_helper_->get_shms();
@@ -2552,8 +2614,7 @@ void DummyClient::ping_thread_main() {
                     // Try to validate RPC connection
                     // Even if register_shm_via_ipc succeeded, we should check
                     // if RPC is responsive
-                    auto check_rpc =
-                        invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+                    auto check_rpc = ping_daemon();
                     if (check_rpc.has_value() &&
                         check_rpc.value().client_status == ClientStatus::OK) {
                         LOG(INFO) << "RPC connection restored";

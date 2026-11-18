@@ -685,6 +685,21 @@ tl::expected<void, ErrorCode> RealClient::register_cuda_buffer_with_fd(
         handle.size > std::numeric_limits<uint64_t>::max() - dummy_addr) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (client_->IsUsingTent()) {
+        // TENT cannot confirm every MR removal and metadata publication on
+        // retry. The exporter may free the allocation after our final ack.
+        LOG(ERROR) << "Persistent CUDA IPC registration requires classic TE";
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (globalConfig().rdma_data_direct &&
+        (client_->HasClassicTransport("rdma") ||
+         client_->HasClassicTransport("rdma_twosided"))) {
+        // The exporter supplies an ordinary DMA-BUF. Data Direct requires a
+        // PCIe mapping and the GPU PCI root for NIC pairing.
+        LOG(ERROR) << "Persistent CUDA IPC registration does not support "
+                      "RDMA Data Direct";
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     auto &buffers = ctx->second.cuda_buffers;
     const std::string key = CudaAllocationKey(handle);
     for (const auto &[base, buffer] : buffers) {
@@ -834,7 +849,7 @@ bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
     for (const auto &[base, buffer] : shm_ctx.cuda_buffers) {
         if (buffer.allocation->state != CudaRegistrationState::kRegistered)
             continue;
-        if (dummy_addr >= base && dummy_addr - base <= buffer.handle.size &&
+        if (dummy_addr >= base && dummy_addr - base < buffer.handle.size &&
             buf_size <= buffer.handle.size - (dummy_addr - base)) {
             out_real = static_cast<char *>(buffer.allocation->mapping.base()) +
                        buffer.handle.offset + (dummy_addr - base);
@@ -3542,6 +3557,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     close(fd);  // Close FD after mapping
 
     MappedShm shm{};
+    shm.owner = client_id;
     shm.shm_name = shm_name;
     shm.shm_buffer = shm_buffer;
     shm.shm_size = shm_size;
@@ -3623,21 +3639,22 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
-    const UUID &client_id) {
-    return unmap_shm(client_id, false);
+bool RealClient::retry_dummy_quarantine_locked(const UUID &client_id) {
+    (void)RetryQuarantinedShmsLocked();
+    return !clients_with_quarantined_cuda_.count(client_id) &&
+           std::none_of(
+               quarantine_shms_.begin(), quarantine_shms_.end(),
+               [&](const MappedShm &shm) { return shm.owner == client_id; });
 }
 
-tl::expected<void, ErrorCode> RealClient::unmap_shm(const UUID &client_id,
-                                                    bool missing_ok) {
+tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
+    const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    bool failed = !retry_dummy_quarantine_locked(client_id);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        if (clients_with_quarantined_cuda_.count(client_id))
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        if (missing_ok) return {};
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        if (failed) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return {};
     }
 
     auto &context = it->second;
@@ -3647,11 +3664,6 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm(const UUID &client_id,
     context.active_handles.clear();
     context.client_buffer_allocator.reset();
 
-    // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context. Failures stay quarantined for teardown.
-    (void)RetryQuarantinedShmsLocked();
-
-    bool failed = false;
     // Keep the quarantine push_back below from reallocating (and throwing
     // bad_alloc) in the middle of tearing a context down.
     quarantine_shms_.reserve(quarantine_shms_.size() +
@@ -3726,7 +3738,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm(const UUID &client_id,
     context.mapped_shms.clear();
     if (cuda_error != ErrorCode::OK) return tl::unexpected(cuda_error);
     shm_contexts_.erase(it);
-    if (failed || clients_with_quarantined_cuda_.count(client_id)) {
+    if (failed) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return {};
@@ -3788,6 +3800,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
     }
 
     MappedShm region;
+    region.owner = client_id;
     region.shm_name = "vmm_" + std::to_string(client_id.first) + "_" +
                       std::to_string(client_id.second);
     region.shm_buffer = mapped_va;
@@ -3868,6 +3881,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
     }
 
     MappedShm region;
+    region.owner = client_id;
     region.shm_name = "ipc_" + std::to_string(client_id.first) + "_" +
                       std::to_string(client_id.second);
     region.shm_buffer = mapped_va;
@@ -3933,11 +3947,11 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     LOG(INFO) << "[ascend_unmap_shm] client_id=" << client_id
               << ", action=unmapping";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    bool failed = !retry_dummy_quarantine_locked(client_id);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "[ascend_unmap_shm] client_id=" << client_id
-                   << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        if (failed) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return {};
     }
 
     auto &context = it->second;
@@ -3948,16 +3962,11 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         return tl::unexpected(result);
     context.client_buffer_allocator.reset();
 
-    // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context. Failures stay quarantined for teardown.
-    (void)RetryQuarantinedShmsLocked();
-
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
     std::vector<MappedShm> shms = std::move(context.mapped_shms);
     context.mapped_shms.clear();
 
-    bool failed = false;
     for (auto &shm : shms) {
         if (!shm.shm_buffer) {
             continue;
@@ -7661,21 +7670,21 @@ std::vector<int> InvalidDummySessions(size_t count) {
     return std::vector<int>(count, toInt(ErrorCode::INVALID_PARAMS));
 }
 
-}  // namespace
-
-bool RealClient::claim_session_put_owner(SessionState &sessions,
-                                         const std::string &key) {
-    std::lock_guard<std::mutex> lock(session_put_owners_mutex_);
-    return session_put_owners_.emplace(key, &sessions).second;
+std::vector<tl::expected<void, ErrorCode>> RevokeSessionReplicas(
+    Client &client, const std::vector<std::string> &keys, ReplicaType type) {
+    if (keys.empty()) return {};
+    auto revoked = client.BatchPutRevoke(keys, type);
+    if (revoked.size() != keys.size()) {
+        return {keys.size(), tl::unexpected(ErrorCode::RPC_FAIL)};
+    }
+    return revoked;
 }
 
-void RealClient::release_session_put_owner(SessionState &sessions,
-                                           const std::string &key) {
-    std::lock_guard<std::mutex> lock(session_put_owners_mutex_);
-    auto it = session_put_owners_.find(key);
-    if (it != session_put_owners_.end() && it->second == &sessions) {
-        session_put_owners_.erase(it);
-    }
+}  // namespace
+
+void RealClient::erase_put_session(SessionState &sessions,
+                                   const std::string &key) {
+    if (sessions.put_sessions.erase(key)) client_->releaseSessionPut(key);
 }
 
 std::vector<int> RealClient::batch_get_session_start_dummy_helper(
@@ -7863,8 +7872,7 @@ ErrorCode RealClient::cleanup_session_state(SessionState &sessions) {
         if (results[i] == toInt(ErrorCode::OBJECT_NOT_FOUND) ||
             results[i] == toInt(ErrorCode::INVALID_WRITE) ||
             results[i] == toInt(ErrorCode::ILLEGAL_CLIENT)) {
-            sessions.put_sessions.erase(keys[i]);
-            release_session_put_owner(sessions, keys[i]);
+            erase_put_session(sessions, keys[i]);
         } else if (error == ErrorCode::OK) {
             error = static_cast<ErrorCode>(results[i]);
         }
@@ -8785,92 +8793,114 @@ std::vector<int> RealClient::batch_put_session_start_impl(
     std::vector<std::string> start_keys;
     std::vector<uint64_t> start_sizes;
     std::vector<size_t> start_indices;
+    start_indices.reserve(keys.size());
+    ReplicateConfig start_config;
     {
         std::lock_guard<std::mutex> lock(sessions.mutex);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (sessions.put_sessions.count(keys[i]) != 0 ||
-                !claim_session_put_owner(sessions, keys[i])) {
+        // Keep the candidate separate until its Client-wide claim succeeds.
+        // A rejected candidate belongs to another writer.
+        std::optional<size_t> candidate;
+        try {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                auto [it, inserted] = sessions.put_sessions.try_emplace(
+                    keys[i], PutSessionEntry{.object_size = sizes[i],
+                                             .write_mode = write_mode,
+                                             .writable = false});
+                if (inserted) {
+                    candidate = i;
+                    if (client_->claimSessionPut(keys[i])) {
+                        start_indices.push_back(i);  // capacity reserved above
+                        candidate.reset();
+                        start_keys.push_back(keys[i]);
+                        start_sizes.push_back(sizes[i]);
+                        continue;
+                    }
+                    sessions.put_sessions.erase(it);
+                    candidate.reset();
+                }
                 LOG(ERROR) << "Put session already exists for key: " << keys[i];
-                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-                continue;
+                results[i] = toInt(ErrorCode::INVALID_PARAMS);
             }
-            start_keys.push_back(keys[i]);
-            start_sizes.push_back(static_cast<uint64_t>(sizes[i]));
-            start_indices.push_back(i);
+            if (start_indices.empty()) return results;
+            start_config = config.ForKeySubset(start_indices);
+        } catch (...) {
+            // Nothing has been dispatched. Undo just this call's admissions.
+            if (candidate) sessions.put_sessions.erase(keys[*candidate]);
+            for (size_t i : start_indices) {
+                erase_put_session(sessions, keys[i]);
+            }
+            throw;
         }
     }
-    if (start_keys.empty()) {
-        return results;
-    }
 
-    ReplicateConfig start_config = config.ForKeySubset(start_indices);
-
+    // From dispatch onwards every key already has a sealed cleanup record,
+    // including when an exception or malformed reply obscures the outcome.
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
+    if (start_responses.size() != start_keys.size()) {
+        for (size_t i : start_indices) results[i] = toInt(ErrorCode::RPC_FAIL);
+        return results;
+    }
+    // A legacy root_fs_dir master adds a DISK reservation independently of
+    // the requested replica types. Ranged writes have no whole file to store.
+    std::vector<std::string> disk_keys;
+    std::vector<size_t> disk_indices;
+    for (size_t j = 0; j < start_keys.size(); ++j) {
+        auto &response = start_responses[j];
+        if (response && std::erase_if(*response, [](const auto &replica) {
+                return replica.is_disk_replica();
+            })) {
+            disk_keys.push_back(start_keys[j]);
+            disk_indices.push_back(start_indices[j]);
+        }
+    }
+    auto disk_revokes =
+        RevokeSessionReplicas(*client_, disk_keys, ReplicaType::DISK);
+    for (size_t k = 0; k < disk_keys.size(); ++k) {
+        if (!disk_revokes[k]) {
+            results[disk_indices[k]] = toInt(disk_revokes[k].error());
+        }
+    }
     std::vector<std::string> keys_to_revoke;
-    std::vector<std::string> hot_keys_to_remove;
     {
         std::lock_guard<std::mutex> lock(sessions.mutex);
         for (size_t j = 0; j < start_keys.size(); ++j) {
             const size_t i = start_indices[j];
+            // Failed disk cleanup leaves the original sealed record for retry.
+            if (results[i] != 0) continue;
             if (!start_responses[j]) {
                 results[i] =
                     static_cast<int>(toInt(start_responses[j].error()));
-                if (start_responses[j].error() == ErrorCode::RPC_FAIL ||
-                    start_responses[j].error() == ErrorCode::RPC_TIMEOUT) {
-                    // Master may have reserved this key before its reply was
-                    // lost. Keep a sealed entry so revoke/cleanup can resolve
-                    // the outcome before another namespace reuses the key.
-                    sessions.put_sessions[keys[i]] = PutSessionEntry{
-                        .object_size = static_cast<uint64_t>(sizes[i]),
-                        .write_mode = write_mode,
-                        .writable = false,
-                    };
-                } else {
-                    release_session_put_owner(sessions, keys[i]);
+                if (start_responses[j].error() != ErrorCode::RPC_FAIL &&
+                    start_responses[j].error() != ErrorCode::RPC_TIMEOUT) {
+                    erase_put_session(sessions, keys[i]);
                 }
                 continue;
             }
-            auto replicas = std::move(start_responses[j].value());
-            bool has_memory_replica = false;
-            for (const auto &replica : replicas) {
-                if (replica.is_memory_replica()) {
-                    has_memory_replica = true;
-                    break;
-                }
-            }
-            if (!has_memory_replica) {
-                sessions.put_sessions[keys[i]] = PutSessionEntry{
-                    .replicas = std::move(replicas),
-                    .object_size = static_cast<uint64_t>(sizes[i]),
-                    .write_mode = write_mode,
-                    .writable = false,
-                };
-                hot_keys_to_remove.push_back(keys[i]);
+            auto &entry = sessions.put_sessions.at(keys[i]);
+            entry.replicas = std::move(start_responses[j].value());
+            entry.writable =
+                std::any_of(entry.replicas.begin(), entry.replicas.end(),
+                            [](const auto &replica) {
+                                return replica.is_memory_replica();
+                            });
+            if (!entry.writable) {
                 keys_to_revoke.push_back(keys[i]);
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
-                continue;
             }
-            sessions.put_sessions[keys[i]] = PutSessionEntry{
-                .replicas = std::move(replicas),
-                .object_size = static_cast<uint64_t>(sizes[i]),
-                .write_mode = write_mode,
-            };
         }
     }
-    if (client_->GetHotCache() && !hot_keys_to_remove.empty()) {
-        client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
-    }
     if (!keys_to_revoke.empty()) {
-        auto revoked = client_->BatchPutRevoke(keys_to_revoke);
+        if (client_->GetHotCache())
+            client_->GetHotCache()->RemoveHotKeys(keys_to_revoke);
+        auto revoked =
+            RevokeSessionReplicas(*client_, keys_to_revoke, ReplicaType::ALL);
         std::lock_guard<std::mutex> lock(sessions.mutex);
         for (size_t i = 0; i < keys_to_revoke.size(); ++i) {
-            if (i < revoked.size() &&
-                (revoked[i] ||
-                 revoked[i].error() == ErrorCode::OBJECT_NOT_FOUND)) {
-                sessions.put_sessions.erase(keys_to_revoke[i]);
-                release_session_put_owner(sessions, keys_to_revoke[i]);
+            if (revoked[i] ||
+                revoked[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                erase_put_session(sessions, keys_to_revoke[i]);
             }
         }
     }
@@ -8989,9 +9019,13 @@ std::vector<int> RealClient::batch_put_session_end_impl(
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            if (it->second.replicas.empty()) {
-                // An uncertain start has no descriptor proving which ranges
-                // were allocated or written. Only revoke may resolve it.
+            if (std::none_of(it->second.replicas.begin(),
+                             it->second.replicas.end(),
+                             [](const auto &replica) {
+                                 return replica.is_memory_replica();
+                             })) {
+                // An uncertain start or a NoF-only allocation cannot have
+                // accepted a ranged write. Only revoke may resolve it.
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
@@ -9015,6 +9049,9 @@ std::vector<int> RealClient::batch_put_session_end_impl(
             end_keys.push_back(keys[i]);
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
+            // The RPC may complete MEMORY before its reply is lost. In that
+            // case revoke(ALL) cannot remove the still-processing NoF replica.
+            if (nof) it->second.memory_end_attempted = true;
         }
         if (!end_keys.empty()) {
             wait_session_put_idle(sessions, lock, end_keys);
@@ -9054,8 +9091,7 @@ std::vector<int> RealClient::batch_put_session_end_impl(
         }
         {
             std::lock_guard<std::mutex> lock(sessions.mutex);
-            sessions.put_sessions.erase(end_keys[j]);
-            release_session_put_owner(sessions, end_keys[j]);
+            erase_put_session(sessions, end_keys[j]);
         }
         results[i] = {};
     }
@@ -9077,14 +9113,14 @@ std::vector<int> RealClient::batch_put_session_end_impl(
         const size_t j = nof_revoke_end_indices[k];
         const size_t i = end_indices[j];
         if (!nof_revoke_responses[k] &&
-            nof_revoke_responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
+            nof_revoke_responses[k].error() != ErrorCode::OBJECT_NOT_FOUND &&
+            nof_revoke_responses[k].error() != ErrorCode::INVALID_WRITE) {
             results[i] = tl::unexpected(nof_revoke_responses[k].error());
             continue;
         }
         {
             std::lock_guard<std::mutex> lock(sessions.mutex);
-            sessions.put_sessions.erase(nof_revoke_keys[k]);
-            release_session_put_owner(sessions, nof_revoke_keys[k]);
+            erase_put_session(sessions, nof_revoke_keys[k]);
         }
         results[i] = {};
     }
@@ -9103,6 +9139,9 @@ std::vector<int> RealClient::batch_put_session_revoke_impl(
 
     std::vector<std::string> revoke_keys;
     std::vector<size_t> revoke_indices;
+    std::vector<bool> memory_end_attempted;
+    std::vector<std::string> uncertain_keys;
+    std::vector<size_t> uncertain_indices;
     {
         std::unique_lock<std::mutex> lock(sessions.mutex);
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -9112,12 +9151,41 @@ std::vector<int> RealClient::batch_put_session_revoke_impl(
                 continue;
             }
             it->second.writable = false;
+            if (it->second.replicas.empty()) {
+                uncertain_keys.push_back(keys[i]);
+                uncertain_indices.push_back(i);
+                continue;
+            }
             revoke_keys.push_back(keys[i]);
             revoke_indices.push_back(i);
+            memory_end_attempted.push_back(it->second.memory_end_attempted);
         }
         if (!revoke_keys.empty()) {
             wait_session_put_idle(sessions, lock, revoke_keys);
         }
+    }
+    // An uncertain start may have allocated DISK as well. ALL only covers
+    // MEMORY, NoF and DFS. Confirm DISK is gone before releasing the claim.
+    auto disk_revokes =
+        RevokeSessionReplicas(*client_, uncertain_keys, ReplicaType::DISK);
+    for (size_t j = 0; j < uncertain_keys.size(); ++j) {
+        const size_t i = uncertain_indices[j];
+        if (!disk_revokes[j] &&
+            disk_revokes[j].error() != ErrorCode::INVALID_WRITE) {
+            if (disk_revokes[j].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                std::lock_guard lock(sessions.mutex);
+                erase_put_session(sessions, keys[i]);
+                results[i] = {};
+            } else {
+                results[i] = tl::unexpected(disk_revokes[j].error());
+            }
+            continue;
+        }
+        // INVALID_WRITE denotes no primary write or a non-processing DISK
+        // replica. Other primary replicas still need the normal revoke below.
+        revoke_keys.push_back(keys[i]);
+        revoke_indices.push_back(i);
+        memory_end_attempted.push_back(false);
     }
     if (revoke_keys.empty()) {
         return ToPyResults(results);
@@ -9127,28 +9195,44 @@ std::vector<int> RealClient::batch_put_session_revoke_impl(
         client_->GetHotCache()->RemoveHotKeys(revoke_keys);
     }
     auto revoke_responses =
-        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL);
-    std::lock_guard<std::mutex> lock(sessions.mutex);
-    if (revoke_responses.size() != revoke_keys.size()) {
-        for (size_t j = 0; j < revoke_keys.size(); ++j) {
-            results[revoke_indices[j]] = tl::unexpected(ErrorCode::RPC_FAIL);
+        RevokeSessionReplicas(*client_, revoke_keys, ReplicaType::ALL);
+    std::vector<std::string> nof_keys;
+    std::vector<size_t> nof_indices;
+    for (size_t j = 0; j < revoke_keys.size(); ++j) {
+        if (memory_end_attempted[j] && !revoke_responses[j] &&
+            revoke_responses[j].error() == ErrorCode::INVALID_WRITE) {
+            nof_keys.push_back(revoke_keys[j]);
+            nof_indices.push_back(j);
         }
-        return ToPyResults(results);
     }
+    if (!nof_keys.empty()) {
+        auto responses =
+            RevokeSessionReplicas(*client_, nof_keys, ReplicaType::NOF_SSD);
+        for (size_t k = 0; k < nof_keys.size(); ++k) {
+            auto &result = revoke_responses[nof_indices[k]];
+            if (!responses[k] &&
+                responses[k].error() == ErrorCode::INVALID_WRITE) {
+                // No primary write, or the sole NoF replica is already
+                // complete. Neither case leaves a NoF reservation to revoke.
+                result = {};
+            } else {
+                result = std::move(responses[k]);
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(sessions.mutex);
     for (size_t j = 0; j < revoke_keys.size(); ++j) {
         const size_t i = revoke_indices[j];
         if (!revoke_responses[j]) {
             if (revoke_responses[j].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                sessions.put_sessions.erase(revoke_keys[j]);
-                release_session_put_owner(sessions, revoke_keys[j]);
+                erase_put_session(sessions, revoke_keys[j]);
                 results[i] = {};
             } else {
                 results[i] = tl::unexpected(revoke_responses[j].error());
             }
             continue;
         }
-        sessions.put_sessions.erase(revoke_keys[j]);
-        release_session_put_owner(sessions, revoke_keys[j]);
+        erase_put_session(sessions, revoke_keys[j]);
         results[i] = {};
     }
     return ToPyResults(results);
@@ -9720,6 +9804,23 @@ RealClient::batch_get_into_multi_buffers_internal(
 }
 
 tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
+    return ping_dummy(client_id, false);
+}
+
+tl::expected<PingResponse, ErrorCode> RealClient::ping_persistent_dummy(
+    const UUID &client_id, bool establish_context) {
+    if (establish_context) {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (!client_) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        // GPU-only clients can register their first allocation without a
+        // host SHM mapping. Keep an existing context intact across retries.
+        shm_contexts_[client_id].persistent_dummy = true;
+    }
+    return ping_dummy(client_id, true);
+}
+
+tl::expected<PingResponse, ErrorCode> RealClient::ping_dummy(
+    const UUID &client_id, bool require_context) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
 
     if (!client_) {
@@ -9727,6 +9828,12 @@ tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    if (require_context) {
+        auto ctx = shm_contexts_.find(client_id);
+        if (ctx == shm_contexts_.end() || !ctx->second.persistent_dummy ||
+            ctx->second.sessions_closing)
+            return PingResponse(view_version_, ClientStatus::NEED_REMOUNT);
+    }
     ClientStatus client_status =
         client_->is_ping_healthy() ? ClientStatus::OK : ClientStatus::UNDEFINED;
 
@@ -9884,7 +9991,7 @@ void RealClient::handle_ipc_cuda_request(UdsConnection &connection,
         result = unregister_cuda_buffer_internal(request.dummy_addr,
                                                  request.handle, client_id);
     } else {
-        result = unmap_shm(client_id, true);
+        result = unmap_shm_internal(client_id);
     }
     int status = to_py_ret(result);
     (void)connection.sendRaw(&status, sizeof(status));

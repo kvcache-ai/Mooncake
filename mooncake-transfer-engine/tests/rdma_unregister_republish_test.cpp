@@ -52,6 +52,8 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
 #endif
@@ -353,6 +355,36 @@ TEST_F(RdmaUnregisterRepublishTest, MissingDescriptorCanLeaveAnUnconfirmedMr) {
     EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), ERR_CONTEXT);
     EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
     EXPECT_EQ(plugin_->setCalls(), sets_before);
+}
+
+TEST_F(RdmaUnregisterRepublishTest,
+       ShmAndTwoSidedRdmaRetryAfterPartialRemoval) {
+    TransferEngineImpl engine;
+    auto shm = std::make_shared<ShmTransport>();
+    shm->meta() = metadata_;
+    auto rdma = std::make_shared<RdmaTwoSidedTransport>();
+    RdmaTransportTestPeer::bindMetadata(*rdma, metadata_, kSegmentName);
+    RdmaTransportTestPeer::addContext(*rdma, context_);
+    TransferEngineImplTestPeer::setTransports(
+        engine, metadata_, {{"shm", shm}, {"rdma_twosided", rdma}});
+    void *addr = shm->allocateSharedMemory(kLen);
+    ASSERT_NE(addr, nullptr);
+    ASSERT_EQ(engine.registerLocalMemory(addr, kLen, "cpu:0", true, true), 0);
+
+    // RDMA has finished its part of a previous attempt. The first SHM
+    // removal drops its descriptor before the metadata backend rejects it.
+    ASSERT_EQ(rdma->unregisterLocalMemory(addr, false), 0);
+    ASSERT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, addr));
+    plugin_->failNextSet(2);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        EXPECT_EQ(engine.unregisterLocalMemory(addr, true), ERR_METADATA);
+        EXPECT_FALSE(hasLocalBuffer(addr));
+        EXPECT_TRUE(engine.checkOverlap(addr, kLen));
+    }
+    EXPECT_EQ(engine.unregisterLocalMemory(addr, true), 0);
+    EXPECT_FALSE(engine.checkOverlap(addr, kLen));
+    EXPECT_EQ(g_fake_dereg_calls.load(), 1);
+    EXPECT_EQ(shm->freeSharedMemory(addr), 0);
 }
 
 #ifdef USE_TCP

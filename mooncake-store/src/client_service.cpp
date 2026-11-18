@@ -1,6 +1,7 @@
 #include "client_service.h"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/container/small_vector.hpp>
 #include <glog/logging.h>
 
 #include "ascii_string.h"
@@ -2115,9 +2116,56 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+bool Client::claimSessionPut(const ObjectKey& key) {
+    std::lock_guard lock(put_claims_mutex_);
+    return put_claims_.try_emplace(key, 0).second;
+}
+
+void Client::releaseSessionPut(const ObjectKey& key) {
+    std::lock_guard lock(put_claims_mutex_);
+    put_claims_.erase(key);
+}
+
+class Client::OrdinaryWriteClaims {
+   public:
+    OrdinaryWriteClaims(Client& client, size_t key_count) : client_(client) {
+        keys_.reserve(key_count);
+    }
+    OrdinaryWriteClaims(const OrdinaryWriteClaims&) = delete;
+    ~OrdinaryWriteClaims() {
+        std::lock_guard lock(client_.put_claims_mutex_);
+        for (const auto* key : keys_) {
+            auto it = client_.put_claims_.find(*key);
+            if (--it->second == 0) client_.put_claims_.erase(it);
+        }
+    }
+
+    bool acquire(const ObjectKey& key) {
+        std::lock_guard lock(client_.put_claims_mutex_);
+        return acquireLocked(key);
+    }
+    void acquire(std::vector<PutOperation>& ops);
+
+   private:
+    bool acquireLocked(const ObjectKey& key) {
+        auto [it, inserted] = client_.put_claims_.try_emplace(key, 0);
+        if (!inserted && it->second == 0) return false;
+        ++it->second;
+        // The map owns this key until its last claim is released. Its address
+        // stays stable across rehashes and outlives a caller's temporary key.
+        keys_.push_back(&it->first);
+        return true;
+    }
+
+    Client& client_;
+    boost::container::small_vector<const ObjectKey*, 1> keys_;
+};
+
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    OrdinaryWriteClaims claims(*this, 1);
+    if (!claims.acquire(key)) return tl::unexpected(ErrorCode::INVALID_WRITE);
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2330,6 +2378,8 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    OrdinaryWriteClaims claims(*this, 1);
+    if (!claims.acquire(key)) return tl::unexpected(ErrorCode::INVALID_WRITE);
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2591,6 +2641,14 @@ class PutOperation {
         return state == PutOperationState::SUCCESS && result.has_value();
     }
 };
+
+void Client::OrdinaryWriteClaims::acquire(std::vector<PutOperation>& ops) {
+    std::lock_guard lock(client_.put_claims_mutex_);
+    for (auto& op : ops) {
+        if (!op.IsResolved() && !acquireLocked(op.key))
+            op.SetError(ErrorCode::INVALID_WRITE, "Key held by a put session");
+    }
+}
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
@@ -3732,6 +3790,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(*err));
         }
     }
+    OrdinaryWriteClaims claims(*this, ops.size());
+    claims.acquire(ops);
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
@@ -3783,6 +3843,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         }
     }
 
+    OrdinaryWriteClaims claims(*this, ops.size());
+    claims.acquire(ops);
     StartBatchUpsert(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
@@ -4901,9 +4963,16 @@ void Client::PutToLocalFile(const std::string& key,
         }
     }
 
-    // Async StoreObject + PutEnd (unchanged from original)
+    // The foreground claim ends when Put returns. Hold another claim until
+    // the disk worker has finalized this key at the master.
+    auto disk_claim = std::make_shared<OrdinaryWriteClaims>(*this, 1);
+    if (!disk_claim->acquire(key)) {
+        LOG(ERROR) << "Cannot enqueue a disk write for a session key: " << key;
+        return;
+    }
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
-                                value = std::move(value), path] {
+                                value = std::move(value), path,
+                                disk_claim = std::move(disk_claim)] {
         ReplicaType replica_type = ReplicaType::DISK;
         // Store the object
         auto store_result = backend->StoreObject(

@@ -41,6 +41,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
                                 RealClient &rc) {
     server.register_handler<&RealClient::service_ready_internal>(&rc);
     server.register_handler<&RealClient::ping>(&rc);
+    server.register_handler<&RealClient::ping_persistent_dummy>(&rc);
     server.register_handler<&RealClient::map_shm_internal>(&rc);
     server.register_handler<&RealClient::unmap_shm_internal>(&rc);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);
@@ -57,6 +58,8 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
         &rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&rc);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
@@ -801,7 +804,8 @@ class DummyClientSessionTest : public ::testing::Test {
         master_.Stop();
     }
 
-    bool SetupStack() {
+    bool SetupStack(std::optional<bool> persistent = std::nullopt,
+                    size_t local_buffer_size = kLocalBufferSize) {
         if (!master_.Start(InProcMasterConfigBuilder().build())) return false;
         real_ = RealClient::create();
         const auto te_port = getFreeTcpPort();
@@ -820,14 +824,14 @@ class DummyClientSessionTest : public ::testing::Test {
         RegisterRpcHandlers(*rpc_server_, *real_);
         if (rpc_server_->async_start().hasResult()) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        return AddDummy() != nullptr;
+        return AddDummy(persistent, local_buffer_size) != nullptr;
     }
 
-    std::shared_ptr<DummyClient> AddDummy() {
-        auto dummy = std::make_shared<DummyClient>();
-        // A local staging region is sufficient; session callers provide their
-        // own registered buffers rather than allocate from a dummy pool.
-        if (dummy->setup_dummy(0, kLocalBufferSize, rpc_address_, ipc_path_) !=
+    std::shared_ptr<DummyClient> AddDummy(
+        std::optional<bool> persistent = std::nullopt,
+        size_t local_buffer_size = kLocalBufferSize) {
+        auto dummy = std::make_shared<DummyClient>(persistent);
+        if (dummy->setup_dummy(0, local_buffer_size, rpc_address_, ipc_path_) !=
             0) {
             return nullptr;
         }
@@ -862,6 +866,25 @@ class DummyClientSessionTest : public ::testing::Test {
     std::string ipc_path_;
     std::string rpc_address_;
 };
+
+TEST_F(DummyClientSessionTest, PersistentContextRecoversWithoutHostShm) {
+    ASSERT_TRUE(SetupStack(true, 0));
+    auto &dummy = dummies_.front();
+    const std::vector<std::string> keys{"gpu_only_context"};
+    PutObject(keys.front(), "contents");
+    ASSERT_EQ(dummy->batch_get_session_start(keys), std::vector<int>{0});
+    ASSERT_EQ(dummy->batch_get_session_end(keys), 0);
+
+    // Remove the context as the TTL monitor does, without disconnecting RPC.
+    ASSERT_EQ(dummy->unregister_shm(), 0);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (dummy->batch_get_session_start(keys) != std::vector<int>{0}) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+}
 
 TEST_F(DummyClientSessionTest, LayersAndFragmentsRoundTripThroughCpuAndShm) {
     ASSERT_TRUE(SetupStack());

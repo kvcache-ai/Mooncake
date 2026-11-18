@@ -37,6 +37,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
                                 RealClient &rc) {
     server.register_handler<&RealClient::service_ready_internal>(&rc);
     server.register_handler<&RealClient::ping>(&rc);
+    server.register_handler<&RealClient::ping_persistent_dummy>(&rc);
     server.register_handler<&RealClient::map_shm_internal>(&rc);
     server.register_handler<&RealClient::unmap_shm_internal>(&rc);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);

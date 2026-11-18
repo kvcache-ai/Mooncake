@@ -1,16 +1,23 @@
 #include <gtest/gtest.h>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include <chrono>
 #include <future>
 #include <thread>
 
+#include "common/network.h"
 #include "dummy_client.h"
+#include "real_client.h"
 
 namespace mooncake {
 
 // Own a blocked background reader without depending on RPC reconnect timing.
 class DummyClientTeardownTestPeer {
    public:
+    static ErrorCode Connect(DummyClient& client, const std::string& address) {
+        return client.connect(address);
+    }
+
     static void StartReader(DummyClient& client, void* primary,
                             std::promise<void>& stopped,
                             std::shared_future<void> release) {
@@ -42,6 +49,32 @@ class DummyClientTeardownTestPeer {
         if (client.ping_thread_.joinable()) client.ping_thread_.join();
     }
 };
+
+TEST(DummyClientTeardownTest, ReturnsUnmapErrorAndRetriesWhileDisconnected) {
+    struct UnmapHandler {
+        std::atomic<int> calls{0};
+        tl::expected<void, ErrorCode> Unmap(const UUID&) {
+            if (++calls == 1) return tl::unexpected(ErrorCode::RPC_TIMEOUT);
+            return {};
+        }
+    } handler;
+    RealClient real;
+    const auto port = getFreeTcpPort();
+    coro_rpc::coro_rpc_server server(1, port, "127.0.0.1");
+    server.register_handler<&RealClient::service_ready_internal>(&real);
+    server.register_handler<&UnmapHandler::Unmap>(
+        &handler, coro_rpc::func_id<&RealClient::unmap_shm_internal>());
+    ASSERT_FALSE(server.async_start().hasResult());
+
+    DummyClient client(false);
+    ASSERT_EQ(DummyClientTeardownTestPeer::Connect(
+                  client, "127.0.0.1:" + std::to_string(port)),
+              ErrorCode::OK);
+    EXPECT_EQ(client.tearDownAll(), toInt(ErrorCode::RPC_TIMEOUT));
+    EXPECT_EQ(client.tearDownAll(), 0);
+    EXPECT_EQ(client.tearDownAll(), 0);
+    EXPECT_EQ(handler.calls.load(), 2);
+}
 
 TEST(DummyClientTeardownTest, RetainsPrimaryShmUntilBackgroundReaderExits) {
     using namespace std::chrono_literals;

@@ -3230,7 +3230,9 @@ it has only NOF replicas — `batch_get_session_start` returns
 reserve object space via Master `BatchPutStart` and finalize with
 `BatchPutEnd`.
 
-Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
+Put sessions write MEMORY replicas only. If the Master has `root_fs_dir` set,
+session start releases the unused legacy DISK reservation before accepting
+range writes. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
 `batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
 Reliable multi-replica NoF configs are rejected at session start. DFS configs
@@ -3246,7 +3248,10 @@ staging allocation is released after the synchronous read and scatter finish.
 These APIs are also available after `setup_dummy`. Each DummyClient has its own
 session state in the RealClient, while sharing the RealClient's Transfer Engine.
 Starting or ending a get session does not change another client's session for
-the same key. Disconnect cleanup revokes that client's unfinished put sessions.
+the same key. While a put session owns a key, ordinary `put` and `upsert`
+calls through the same RealClient return `INVALID_WRITE` for that key. This
+also applies when the session start timed out and its result is still unknown.
+Disconnect cleanup revokes that client's unfinished put sessions.
 Both the DummyClient and the `mooncake_client` daemon must include session RPC
 support; older daemons return an RPC error.
 
@@ -3254,7 +3259,11 @@ In DummyClient mode, session transfers use the RealClient's mapping for
 registered shared memory. External CPU buffers and, by default, CUDA buffers
 use shared-memory staging. With `setup_dummy(..., cuda_ipc_persistent_registration=True)`,
 the RealClient keeps a CUDA IPC mapping and a Transfer Engine registration for
-the GPU allocation. Synchronize device producer streams before range writes.
+the GPU allocation. Persistent registration supports the classic Transfer
+Engine. With RDMA, turn off `MC_RDMA_DATA_DIRECT` to use this mode. A daemon
+using TENT or RDMA Data Direct returns an error before importing the allocation.
+An application with only registered GPU buffers can set `local_buffer_size=0`.
+Synchronize device producer streams before range writes.
 
 In persistent mode, match each successful `register_buffer` call with an
 `unregister_buffer` call. Finish in-flight transfers before the final
