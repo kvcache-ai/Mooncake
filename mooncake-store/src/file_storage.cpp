@@ -6,15 +6,18 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
+#include "file_storage_notify_retry.h"
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
@@ -86,6 +89,35 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
                                         .size = size});
     }
     return tasks;
+}
+
+// Startup re-registration wrapper around
+// NotifyRangesWithBackpressureRetry() (see
+// file_storage_notify_retry.h for the retry/split strategy and the
+// rationale for keeping the background re-registration path retry-free).
+// Note: the range vectors are rebuilt per RPC attempt (the slices are
+// small compared to the payload they describe); the normal path makes a
+// single attempt, so this only allocates repeatedly under sustained
+// backpressure.
+tl::expected<void, ErrorCode> NotifyOffloadSuccessWithRetry(
+    const std::shared_ptr<Client>& client,
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    if (tasks.size() != metadatas.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return NotifyRangesWithBackpressureRetry(
+        tasks.size(),
+        [&client, &tasks, &metadatas](size_t begin, size_t end) {
+            std::vector<OffloadTaskItem> range_tasks(tasks.begin() + begin,
+                                                     tasks.begin() + end);
+            std::vector<StorageObjectMetadata> range_metadatas(
+                metadatas.begin() + begin, metadatas.begin() + end);
+            return client->NotifyOffloadSuccess(range_tasks, range_metadatas);
+        },
+        [](int backoff_ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        });
 }
 
 }  // namespace
@@ -289,7 +321,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             }
             auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
             auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
+                NotifyOffloadSuccessWithRetry(client_, tasks, metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -1943,6 +1975,11 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                     metadata.transport_endpoint = local_rpc_addr_;
                 }
                 auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+                // No retry here on purpose: this background scan runs
+                // against a bucket snapshot, and an eviction during a
+                // backoff window could invalidate the pending entries.
+                // Backpressure fails this round; the periodic scan resumes
+                // on the next heartbeat.
                 auto add_object_result =
                     client_->NotifyOffloadSuccess(tasks, metadatas);
                 if (!add_object_result) {
