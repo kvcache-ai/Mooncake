@@ -1039,6 +1039,8 @@ MasterService::~MasterService() {
     segment_manager_.releaseCapacityMetrics();
 
     client_sessions_.Reset();
+    // Terminal writers can still own queued delete reservations.
+    ordered_oplog_writer_.reset();
 }
 
 void MasterService::SetBatchOpLogTerminalCallback(
@@ -2673,7 +2675,14 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.local_ssd_unregistered) {
-            auto capacity = local_ssd_manager_.UnregisterClient(job.client_id);
+            snapshot_lock.unlock();
+            std::optional<int64_t> capacity;
+            {
+                std::unique_lock lock(master_state_mutex_);
+                offset_delete_mounts_.erase(job.client_id);
+                capacity = local_ssd_manager_.UnregisterClient(job.client_id);
+            }
+            snapshot_lock.lock();
             if (capacity && *capacity > 0) {
                 MasterMetricManager::instance().dec_total_file_capacity(
                     *capacity);
@@ -3569,6 +3578,15 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
     std::vector<PreparedObject>& objects,
     std::vector<std::pair<TenantId, route::ObjectRef>>& installed) {
     for (const auto& object : objects) {
+        const auto& targets = object.entry->metadata.offset_write_targets;
+        if (targets && !targets->empty() &&
+            (!SupportsOffsetDelete() ||
+             targets->size() > kMaxLocalDeleteTasks ||
+             !object.entry->metadata.object_incarnation ||
+             object.entry->metadata.object_incarnation->IsZero() ||
+             std::ranges::find(*targets, UUID{}) != targets->end())) {
+            return tl::unexpected(ErrorCode::INVALID_VERSION);
+        }
         if (MetadataAccessorRO(this, {object.tenant_id, object.user_key})
                 .IsPublished()) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -3599,6 +3617,8 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         const uint8_t live_media = KvMediaMasksForMetadata(metadata).live;
         accessor.GetState().announced_kv_media = live_media;
         accessor.GetState().live_kv_media = live_media;
+        metadata.offset_write_targets =
+            standby_meta.offset_write_targets.value_or(std::vector<UUID>{});
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -3645,10 +3665,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const std::vector<LocalDeleteTask>& pending_local_deletes) {
     return RestoreFromStandbyState(&objects, nullptr, initial_oplog_sequence_id,
                                    segments, objects.size(), std::nullopt,
-                                   &weight_metadata);
+                                   &weight_metadata, &pending_local_deletes);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
@@ -3703,7 +3724,30 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
-    const WeightMetadataSnapshot* legacy_weight_metadata) {
+    const WeightMetadataSnapshot* legacy_weight_metadata,
+    const std::vector<LocalDeleteTask>* legacy_local_deletes) {
+    const auto pending =
+        metadata_store
+            ? metadata_store->CopyLocalDeleteTasks()
+            : (legacy_local_deletes ? *legacy_local_deletes
+                                    : std::vector<LocalDeleteTask>{});
+    LocalDeleteTasks restored_tasks;
+    if (!pending.empty() && !SupportsOffsetDelete()) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (pending.size() > kMaxPendingLocalDeletes) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto& task : pending) {
+        if (task.storage_id == UUID{} || task.task_id == UUID{} ||
+            task.incarnation.IsZero() || !TenantId(task.tenant_id).IsValid() ||
+            task.key.empty() ||
+            !restored_tasks
+                 .emplace(std::pair{task.storage_id, task.task_id}, task)
+                 .second) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
     // Lifecycle bookkeeping around the restore (RFC #4700, slice 1). The
     // restore itself keeps its existing retry semantics: a replacement
     // restore from Ready or Failed is still allowed and is exercised by
@@ -3744,6 +3788,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     auto result = RestoreFromStandbyStateCore(
         legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
         chunk_object_count, expected_max_replica_id, legacy_weight_metadata);
+
+    if (result) {
+        std::lock_guard lock(local_delete_mutex_);
+        pending_local_deletes_.swap(restored_tasks);
+    }
 
     lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
                                               : RestoreLifecycleState::kFailed,
@@ -4789,9 +4838,13 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         }
     }
 
-    return GetReplicaListResponse(std::move(replica_list),
+    GetReplicaListResponse result(std::move(replica_list),
                                   default_kv_lease_ttl_,
                                   metadata.GetPart(0).checksum());
+    if (!metadata.incarnation.IsZero()) {
+        result.object_incarnation = metadata.incarnation;
+    }
+    return result;
 }
 
 void MasterService::ReadFollowUps::Run(MasterService& service) const {
@@ -5704,6 +5757,15 @@ auto MasterService::AddReplicaForRetainedClient(
          accessor.InProcessing())) {
         return false;
     }
+    const auto offset_mount = offset_delete_mounts_.find(client_id);
+    if (offset_mount != offset_delete_mounts_.end()) {
+        if (!scanned_incarnation) return false;
+        const auto& targets = accessor.Get().offset_write_targets;
+        if (std::ranges::find(targets, offset_mount->second.storage_id) ==
+            targets.end()) {
+            return false;
+        }
+    }
     if (!accessor.IsPublished()) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
@@ -6202,6 +6264,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.incarnation = versioned_local_disk_
                                                ? GenerateObjectIncarnation()
                                                : ObjectIncarnation{};
+                    metadata.offset_write_targets.clear();
+                    metadata.offset_write_target_sequence = 0;
 
                     if (has_local_disk_replica) {
                         EraseReplicasWithCacheTotalAccounting(
@@ -7388,36 +7452,46 @@ auto MasterService::RemoveObject(const std::string& key,
                                  const TenantId& tenant_id, bool force,
                                  bool allow_managed_weight)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    std::future<ErrorCode> finalized;
+    auto result = [&]() -> tl::expected<void, ErrorCode> {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", error=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
 
-    auto& metadata = accessor.Get();
-    if (!allow_managed_weight &&
-        weight_manager_.IsManagedGroup(metadata.group_id)) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
-    auto removable = CheckRemovable(metadata, accessor.GetState(), force,
-                                    std::chrono::system_clock::now());
-    if (!removable) {
-        LogRemoveRefused(key, removable.error());
-        return removable;
-    }
+        auto& metadata = accessor.Get();
+        if (!allow_managed_weight &&
+            weight_manager_.IsManagedGroup(metadata.group_id)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        auto removable = CheckRemovable(metadata, accessor.GetState(), force,
+                                        std::chrono::system_clock::now());
+        if (!removable) {
+            LogRemoveRefused(key, removable.error());
+            return removable;
+        }
 
-    if (enable_ha_ && enable_oplog_) {
-        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
+        if (enable_ha_ && enable_oplog_) {
+            return MarkRemovedAndPersist(object_id.tenant_id, key, metadata,
+                                         finalized);
+        }
+        accessor.Erase();
+        return {};
+    }();
+    if (result && finalized.valid()) {
+        const auto error = finalized.get();
+        if (error != ErrorCode::OK) return tl::unexpected(error);
     }
-    accessor.Erase();
-    return {};
+    return result;
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
-    const TenantId& tenant_id, const std::string& key,
-    ObjectMetadata& metadata) {
+    const TenantId& tenant_id, const std::string& key, ObjectMetadata& metadata,
+    std::future<ErrorCode>& finalized) {
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
@@ -7427,12 +7501,60 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
                            [&removed_ids](const Replica& replica) {
                                removed_ids.push_back(replica.id());
                            });
+    std::shared_ptr<std::promise<ErrorCode>> completion;
+    std::shared_ptr<LocalDeleteTasks> tasks;
+    std::shared_ptr<void> reserved;
+    OpType type = OpType::REMOVE;
+    std::string payload;
+    if (!metadata.offset_write_targets.empty()) {
+        if (!SupportsOffsetDelete() || metadata.incarnation.IsZero() ||
+            metadata.offset_write_targets.size() > kMaxLocalDeleteTasks) {
+            return tl::unexpected(ErrorCode::INVALID_VERSION);
+        }
+        LocalDeleteRemove operation;
+        operation.incarnation = metadata.incarnation;
+        tasks = std::make_shared<LocalDeleteTasks>();
+        for (const auto& storage_id : metadata.offset_write_targets) {
+            const auto task_id = generate_uuid();
+            operation.targets.push_back({task_id, storage_id});
+            tasks->emplace(
+                std::pair{storage_id, task_id},
+                LocalDeleteTask{task_id, storage_id, tenant_id.value(), key,
+                                metadata.incarnation});
+        }
+        const auto encoded = struct_pack::serialize(operation);
+        payload.assign(encoded.begin(), encoded.end());
+        const size_t count = tasks->size();
+        {
+            std::lock_guard lock(local_delete_mutex_);
+            if (pending_local_deletes_.size() + reserved_local_deletes_ +
+                    count >
+                kMaxPendingLocalDeletes) {
+                return tl::unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+            }
+            reserved_local_deletes_ += count;
+        }
+        reserved = std::shared_ptr<void>(nullptr, [this, count](void*) {
+            std::lock_guard lock(local_delete_mutex_);
+            reserved_local_deletes_ -= count;
+        });
+        completion = std::make_shared<std::promise<ErrorCode>>();
+        type = OpType::LOCAL_DELETE_REMOVE;
+    }
     auto persist_result = AppendReservedOpLogWithDurableFinalize(
-        std::move(reservation.value()), OpType::REMOVE, tenant_id.value(), key,
-        {},
-        [this, removed_ids =
-                   std::move(removed_ids)](const OpLogEntry& durable_entry) {
+        std::move(reservation.value()), type, tenant_id.value(), key, payload,
+        [this, tasks, reserved = std::move(reserved), completion,
+         removed_ids =
+             std::move(removed_ids)](const OpLogEntry& durable_entry) mutable {
             FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
+            if (tasks) {
+                {
+                    std::lock_guard lock(local_delete_mutex_);
+                    pending_local_deletes_.merge(*tasks);
+                }
+                reserved.reset();
+            }
+            if (completion) completion->set_value(ErrorCode::OK);
         });
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
@@ -7442,7 +7564,22 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
     // which the caller holds, so it cannot run before the marks land.
     metadata.VisitReplicas(&Replica::fn_is_completed,
                            [](Replica& replica) { replica.mark_removed(); });
+    if (completion) {
+        finalized = completion->get_future();
+        NotifyLocalDeletePersistenceFailure(persist_result->sequence_id,
+                                            std::move(completion));
+    }
     return {};
+}
+
+void MasterService::RemoveResult::AwaitFinalizations() {
+    for (auto& [bytes, finalized] : finalizations) {
+        if (finalized.get() != ErrorCode::OK) {
+            skipped_object = true;
+            --removed_count;
+            freed_bytes -= bytes;
+        }
+    }
 }
 
 tl::expected<void, ErrorCode> MasterService::CheckRemovable(
@@ -7517,9 +7654,14 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
             metadata.TotalLength() *
             metadata.CountReplicas(&Replica::fn_is_memory_replica);
         if (enable_ha_ && enable_oplog_) {
-            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata)) {
+            std::future<ErrorCode> finalized;
+            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata,
+                                       finalized)) {
                 result.skipped_object = true;
                 continue;
+            }
+            if (finalized.valid()) {
+                result.finalizations.emplace_back(freed, std::move(finalized));
             }
         } else {
             accessor.Erase();
@@ -7545,11 +7687,13 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const RemoveResult result = RemoveTenantObjects(
+    RemoveResult result = RemoveTenantObjects(
         ResolveRequestTenantId(tenant_id), force,
         std::chrono::system_clock::now(), [&pattern](const std::string& key) {
             return std::regex_search(key, pattern);
         });
+    shared_lock.unlock();
+    result.AwaitFinalizations();
 
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
             << ", removed_count=" << result.removed_count;
@@ -7572,14 +7716,13 @@ long MasterService::RemoveAll(bool force) {
     const auto epoch_baseline = SnapshotKvTenantEpochs(track_cleared_tenants);
     std::unordered_set<std::string> tenants_seen;
     std::unordered_set<std::string> tenants_with_remaining_objects;
+    std::vector<std::pair<TenantId, RemoveResult>> durable_removals;
 
     // Remove per object so managed weights and concurrent imports survive.
     VisitNamespaces(
         [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
-            const RemoveResult result =
+            RemoveResult result =
                 RemoveTenantObjects(tenant_id, force, now, nullptr);
-            removed_count += result.removed_count;
-            total_freed_size += result.freed_bytes;
             // Record the tenant only once the walk actually reached an object.
             // A tenant row can outlive its objects, and recording it
             // unconditionally made every empty-but-present tenant look like a
@@ -7595,7 +7738,26 @@ long MasterService::RemoveAll(bool force) {
             if (kv_remove_all_tenant_hook_) {
                 kv_remove_all_tenant_hook_(tenant_id);
             }
+            if (result.finalizations.empty()) {
+                removed_count += result.removed_count;
+                total_freed_size += result.freed_bytes;
+            } else {
+                durable_removals.emplace_back(tenant_id, std::move(result));
+            }
         });
+
+    if (!durable_removals.empty()) {
+        shared_lock.unlock();
+        for (auto& [tenant, result] : durable_removals) {
+            result.AwaitFinalizations();
+            removed_count += result.removed_count;
+            total_freed_size += result.freed_bytes;
+            if (track_cleared_tenants && result.skipped_object) {
+                tenants_with_remaining_objects.insert(tenant.value());
+            }
+        }
+        shared_lock.lock();
+    }
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -7629,10 +7791,15 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     // that never existed looks empty, and under HA+oplog the erase is deferred
     // to the durable callback so a full wipe still looks non-empty. Count what
     // the walk actually did instead.
-    const RemoveResult result =
+    RemoveResult result =
         RemoveTenantObjects(normalized_tenant, force, now, nullptr);
     if (kv_remove_all_tenant_hook_) {
         kv_remove_all_tenant_hook_(normalized_tenant);
+    }
+    if (!result.finalizations.empty()) {
+        shared_lock.unlock();
+        result.AwaitFinalizations();
+        shared_lock.lock();
     }
 
     if (result.saw_object && !result.skipped_object) {
@@ -7650,6 +7817,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                                 const TenantId& tenant_id, bool force)
     -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    std::vector<std::pair<size_t, std::future<ErrorCode>>> finalizations;
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
 
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
@@ -7716,14 +7884,23 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         }
 
         if (enable_ha_ && enable_oplog_) {
-            results[original_idx] =
-                MarkRemovedAndPersist(normalized_tenant, key, metadata);
+            std::future<ErrorCode> finalized;
+            results[original_idx] = MarkRemovedAndPersist(
+                normalized_tenant, key, metadata, finalized);
+            if (finalized.valid()) {
+                finalizations.emplace_back(original_idx, std::move(finalized));
+            }
             continue;
         }
         accessor.Erase();
         results[original_idx] = {};  // Success
     }
 
+    snapshot_lock.unlock();
+    for (auto& [index, finalized] : finalizations) {
+        const auto error = finalized.get();
+        if (error != ErrorCode::OK) results[index] = tl::unexpected(error);
+    }
     return results;
 }
 
@@ -8198,7 +8375,153 @@ MasterService::GetStorageConfig() const {
     if (versioned_local_disk_) {
         config.requires_versioned_local_disk = true;
     }
+    if (SupportsOffsetDelete()) config.supports_offset_delete = true;
     return config;
+}
+
+bool MasterService::SupportsOffsetDelete() const {
+    return versioned_local_disk_ && enable_ha_ && enable_oplog_;
+}
+
+tl::expected<UUID, ErrorCode> MasterService::MountOffsetDeleteStorage(
+    const UUID& client_id, bool enable_offloading, const UUID& storage_id) {
+    if (!enable_offload_) return tl::unexpected(ErrorCode::UNABLE_OFFLOAD);
+    if (!SupportsOffsetDelete() || storage_id == UUID{}) {
+        return tl::unexpected(ErrorCode::INVALID_VERSION);
+    }
+    auto registration = client_sessions_.BeginRegistration(client_id);
+    if (!registration) {
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    const auto epoch = generate_uuid();
+    int64_t reclaimed_capacity = 0;
+    {
+        std::unique_lock lock(master_state_mutex_);
+        const auto current = offset_delete_mounts_.find(client_id);
+        if (current != offset_delete_mounts_.end() &&
+            current->second.storage_id != storage_id) {
+            return tl::unexpected(ErrorCode::INVALID_VERSION);
+        }
+        const auto error =
+            local_ssd_manager_.RegisterClient(client_id, enable_offloading);
+        if (error != ErrorCode::OK &&
+            error != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            return tl::unexpected(error);
+        }
+        std::erase_if(offset_delete_mounts_, [&](const auto& entry) {
+            if (entry.first == client_id ||
+                entry.second.storage_id != storage_id) {
+                return false;
+            }
+            reclaimed_capacity +=
+                local_ssd_manager_.UnregisterClient(entry.first).value_or(0);
+            return true;
+        });
+        offset_delete_mounts_.insert_or_assign(
+            client_id, OffsetDeleteMount{storage_id, epoch});
+    }
+    registration->Commit();
+    if (reclaimed_capacity > 0) {
+        MasterMetricManager::instance().dec_total_file_capacity(
+            reclaimed_capacity);
+        NotifyPolicyCapacityChanged();
+    }
+    return epoch;
+}
+
+bool MasterService::MatchesOffsetDeleteMount(const UUID& client_id,
+                                             const UUID& storage_id,
+                                             const UUID& epoch) const {
+    const auto mount = offset_delete_mounts_.find(client_id);
+    return mount != offset_delete_mounts_.end() &&
+           mount->second.storage_id == storage_id &&
+           mount->second.epoch == epoch;
+}
+
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+MasterService::FetchLocalDeletes(const UUID& client_id, const UUID& storage_id,
+                                 const UUID& epoch, uint32_t limit) {
+    if (limit == 0 || limit > kMaxLocalDeleteTasks) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto session = client_sessions_.TryAcquireServingSession(client_id);
+    std::shared_lock state_lock(master_state_mutex_);
+    if (!session || !MatchesOffsetDeleteMount(client_id, storage_id, epoch) ||
+        !HasMountedLocalDiskSegment(client_id)) {
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    std::lock_guard lock(local_delete_mutex_);
+    std::vector<LocalDeleteTask> result;
+    for (auto it = pending_local_deletes_.lower_bound({storage_id, UUID{}});
+         it != pending_local_deletes_.end() && it->first.first == storage_id &&
+         result.size() < limit;
+         ++it) {
+        result.push_back(it->second);
+    }
+    return result;
+}
+
+void MasterService::NotifyLocalDeletePersistenceFailure(
+    uint64_t sequence, std::shared_ptr<std::promise<ErrorCode>> completion) {
+    // Durability success precedes callbacks. Report it from the apply
+    // callback, and report only failures from the writer's prefix waiter.
+    [[maybe_unused]] auto failure =
+        ordered_oplog_writer_->AwaitDurable(sequence).thenValue(
+            [completion = std::move(completion)](ErrorCode error) {
+                if (error != ErrorCode::OK) completion->set_value(error);
+            });
+}
+
+tl::expected<void, ErrorCode> MasterService::AckLocalDeletes(
+    const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+    const std::vector<UUID>& task_ids) {
+    if (task_ids.size() > kMaxLocalDeleteTasks) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto completion = std::make_shared<std::promise<ErrorCode>>();
+    auto finalized = completion->get_future();
+    {
+        auto session = client_sessions_.TryAcquireServingSession(client_id);
+        std::shared_lock state_lock(master_state_mutex_);
+        if (!session ||
+            !MatchesOffsetDeleteMount(client_id, storage_id, epoch) ||
+            !HasMountedLocalDiskSegment(client_id)) {
+            return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        LocalDeleteAck operation;
+        operation.storage_id = storage_id;
+        {
+            std::lock_guard lock(local_delete_mutex_);
+            for (const auto& task_id : task_ids) {
+                if (pending_local_deletes_.contains({storage_id, task_id})) {
+                    operation.task_ids.push_back(task_id);
+                }
+            }
+        }
+        if (operation.task_ids.empty()) return {};
+        std::ranges::sort(operation.task_ids);
+        operation.task_ids.erase(
+            std::unique(operation.task_ids.begin(), operation.task_ids.end()),
+            operation.task_ids.end());
+        const auto encoded = struct_pack::serialize(operation);
+        const std::string payload(encoded.begin(), encoded.end());
+        auto appended = AppendOpLogWithDurableFinalize(
+            OpType::LOCAL_DELETE_ACK, TenantId::Default().value(), {}, payload,
+            [this, operation = std::move(operation),
+             completion](const OpLogEntry&) {
+                std::lock_guard lock(local_delete_mutex_);
+                for (const auto& task_id : operation.task_ids) {
+                    pending_local_deletes_.erase(
+                        {operation.storage_id, task_id});
+                }
+                completion->set_value(ErrorCode::OK);
+            });
+        if (!appended) return tl::unexpected(appended.error());
+        NotifyLocalDeletePersistenceFailure(appended->sequence_id, completion);
+    }
+    const auto error = finalized.get();
+    if (error != ErrorCode::OK) return tl::unexpected(error);
+    return {};
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,
@@ -8255,6 +8578,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     std::optional<int64_t> reported_capacity;
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        offset_delete_mounts_.erase(client_id);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
     }
     if (!reported_capacity) {
@@ -8297,7 +8621,79 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         return tl::make_unexpected(pending.error());
     }
     if (enable_offloading) {
-        return std::move(*pending);
+        const auto mount = offset_delete_mounts_.find(client_id);
+        if (mount == offset_delete_mounts_.end()) return std::move(*pending);
+        const auto [storage_id, mount_epoch] = mount->second;
+        std::vector<OffloadTaskItem> admitted;
+        admitted.reserve(pending->size());
+        uint64_t last_sequence = 0;
+        for (auto& item : *pending) {
+            const auto object_id =
+                MakeObjectIdentity(item.key, TenantId(item.tenant_id));
+            MetadataAccessorRW accessor(this, object_id);
+            if (!accessor.Exists() || accessor.InProcessing()) continue;
+            auto& metadata = accessor.Get();
+            auto& state = accessor.GetState();
+            if (!item.attempt_id || !state.offloading_task ||
+                *item.attempt_id != state.offloading_task->attempt_id ||
+                item.GetObjectIncarnation().IsZero() ||
+                item.GetObjectIncarnation() != metadata.incarnation ||
+                !metadata.HasReplica(&Replica::fn_is_completed) ||
+                std::ranges::find(state.offloading_task->mirror_clients,
+                                  client_id) ==
+                    state.offloading_task->mirror_clients.end()) {
+                continue;
+            }
+            if (item.key.empty() || item.key.size() > kMaxOpLogObjectKeySize) {
+                FailOffloadMirror(metadata, state, client_id, item);
+                continue;
+            }
+            auto& targets = metadata.offset_write_targets;
+            if (std::ranges::find(targets, storage_id) == targets.end()) {
+                if (targets.size() >= kMaxLocalDeleteTasks) {
+                    FailOffloadMirror(metadata, state, client_id, item);
+                    continue;
+                }
+                targets.push_back(storage_id);
+                auto persisted = AppendOpLogVisibleBeforeDurable(
+                    OpType::PUT_END, object_id.tenant_id.value(), item.key,
+                    SerializeMetadataForOpLog(metadata));
+                if (!persisted) {
+                    targets.pop_back();
+                    FailOffloadMirror(metadata, state, client_id, item);
+                    continue;
+                }
+                metadata.offset_write_target_sequence = *persisted;
+            }
+            last_sequence =
+                std::max(last_sequence, metadata.offset_write_target_sequence);
+            admitted.push_back(std::move(item));
+        }
+        shared_lock.unlock();
+        if (last_sequence != 0) {
+            auto durable = std::make_shared<std::promise<ErrorCode>>();
+            auto result = durable->get_future();
+            [[maybe_unused]] auto waiter =
+                ordered_oplog_writer_->AwaitDurable(last_sequence)
+                    .thenValue([durable](ErrorCode error) {
+                        durable->set_value(error);
+                    });
+            const auto error = result.get();
+            if (error != ErrorCode::OK) return tl::unexpected(error);
+        }
+        shared_lock.lock();
+        if (!MatchesOffsetDeleteMount(client_id, storage_id, mount_epoch)) {
+            return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        std::erase_if(admitted, [&](const auto& item) {
+            const auto id =
+                MakeObjectIdentity(item.key, TenantId(item.tenant_id));
+            MetadataAccessorRO accessor(this, id);
+            return !accessor.Exists() ||
+                   accessor.Get().incarnation != item.GetObjectIncarnation() ||
+                   !accessor.Get().HasReplica(&Replica::fn_is_completed);
+        });
+        return admitted;
     }
     // Offloading is disabled: clear the pending queue to prevent unbounded
     // growth that would trigger KEYS_ULTRA_LIMIT in PushOffloadingQueue. We
@@ -8444,7 +8840,8 @@ auto MasterService::NotifyOffloadSuccess(
                 // marker, fall through to the regular registration check.
                 if (offloading_task) {
                     if (versioned_local_disk_ &&
-                        (offloading_task->attempt_id != *task.attempt_id ||
+                        (!obj_metadata.HasReplica(&Replica::fn_is_completed) ||
+                         offloading_task->attempt_id != *task.attempt_id ||
                          obj_metadata.incarnation !=
                              task.GetObjectIncarnation() ||
                          std::ranges::find(offloading_task->mirror_clients,
@@ -8471,6 +8868,30 @@ auto MasterService::NotifyOffloadSuccess(
                                           client_id, task);
                         refused_unmounted = true;
                         continue;
+                    }
+                    const auto offset_mount =
+                        offset_delete_mounts_.find(client_id);
+                    if (offset_mount != offset_delete_mounts_.end()) {
+                        const auto& targets = obj_metadata.offset_write_targets;
+                        if (std::ranges::find(
+                                targets, offset_mount->second.storage_id) ==
+                            targets.end()) {
+                            continue;
+                        }
+                        if (!obj_metadata.HasReplica(
+                                &Replica::fn_is_local_disk_replica)) {
+                            auto replicas = BuildRemainingReplicaDescriptors(
+                                obj_metadata,
+                                [](const Replica&) { return false; });
+                            replicas.push_back(replica.get_descriptor());
+                            auto queued = AppendOpLogVisibleBeforeDurable(
+                                OpType::PUT_END,
+                                request_object_id.tenant_id.value(),
+                                request_object_id.user_key,
+                                SerializeMetadataForOpLogFromReplicaDescriptors(
+                                    obj_metadata, replicas));
+                            if (!queued) return tl::unexpected(queued.error());
+                        }
                     }
                     auto source =
                         obj_metadata.GetReplicaByID(offloading_task->source_id);
@@ -11924,6 +12345,9 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.residency_affinity_id = metadata.residency_affinity_id;
     if (!metadata.incarnation.IsZero()) {
         payload.object_incarnation = metadata.incarnation;
+    }
+    if (!metadata.offset_write_targets.empty()) {
+        payload.offset_write_targets = metadata.offset_write_targets;
     }
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());

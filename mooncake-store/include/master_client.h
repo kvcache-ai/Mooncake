@@ -17,6 +17,7 @@
 #include "client_metric.h"
 #include "config/rpc_protocol_config.h"
 #include "config/rpc_timeout_config.h"
+#include "local_delete_types.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -502,6 +503,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
         const UUID& client_id, bool enable_offloading,
         bool supports_versioned_offload = false);
+
+    [[nodiscard]] tl::expected<UUID, ErrorCode> MountOffsetDeleteStorage(
+        const UUID& client_id, bool enable_offloading, const UUID& storage_id);
+
+    [[nodiscard]] tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+    FetchLocalDeletes(const UUID& client_id, const UUID& storage_id,
+                      const UUID& epoch, uint32_t limit);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> AckLocalDeletes(
+        const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+        const std::vector<UUID>& task_ids);
 
     /**
      * @brief Deregisters this client's local disk segment from the master,

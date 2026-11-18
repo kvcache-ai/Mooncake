@@ -255,6 +255,21 @@ struct RpcNameTraits<&WrappedMasterService::MountVersionedLocalDiskSegment>
     : RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {};
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MountOffsetDeleteStorage> {
+    static constexpr const char* value = "MountOffsetDeleteStorage";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::FetchLocalDeletes> {
+    static constexpr const char* value = "FetchLocalDeletes";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::AckLocalDeletes> {
+    static constexpr const char* value = "AckLocalDeletes";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
     static constexpr const char* value = "UnmountLocalDiskSegment";
 };
@@ -1256,6 +1271,36 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
                   pool, client_id, enable_offloading);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::MountOffsetDeleteStorage(
+    const UUID& client_id, bool enable_offloading, const UUID& storage_id) {
+    const auto pool = client_accessor_.GetClientPool();
+    auto config =
+        invoke_rpc_with_client_pool<&WrappedMasterService::GetStorageConfig,
+                                    GetStorageConfigResponse>(pool);
+    if (!config) return tl::make_unexpected(config.error());
+    if (!config->supports_offset_delete.value_or(false)) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return invoke_rpc_with_client_pool<
+        &WrappedMasterService::MountOffsetDeleteStorage, UUID>(
+        pool, client_id, enable_offloading, storage_id);
+}
+
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+MasterClient::FetchLocalDeletes(const UUID& client_id, const UUID& storage_id,
+                                const UUID& epoch, uint32_t limit) {
+    return invoke_rpc<&WrappedMasterService::FetchLocalDeletes,
+                      std::vector<LocalDeleteTask>>(client_id, storage_id,
+                                                    epoch, limit);
+}
+
+tl::expected<void, ErrorCode> MasterClient::AckLocalDeletes(
+    const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+    const std::vector<UUID>& task_ids) {
+    return invoke_rpc<&WrappedMasterService::AckLocalDeletes, void>(
+        client_id, storage_id, epoch, task_ids);
 }
 
 tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegment(

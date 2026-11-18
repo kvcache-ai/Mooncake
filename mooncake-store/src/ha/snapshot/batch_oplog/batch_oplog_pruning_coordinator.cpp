@@ -86,6 +86,15 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
                              weights.crc32c))
             return false;
     }
+    if (manifest->pending_local_deletes) {
+        const auto& tasks = *manifest->pending_local_deletes;
+        if (tasks.key != ha::BuildBatchOpLogSnapshotLocalDeletesKey(
+                             root, descriptor.snapshot_id) ||
+            !InspectArtifact(store, tasks.key, tasks.stored_size, tasks.crc32c,
+                             true)) {
+            return false;
+        }
+    }
     return true;
 }
 

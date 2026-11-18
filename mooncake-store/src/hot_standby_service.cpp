@@ -784,10 +784,12 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
         out.object_storage = metadata_store_->SnapshotObjectReplicas();
+        out.pending_local_deletes = metadata_store_->CopyLocalDeleteTasks();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
         out.object_storage = ObjectReplicaSnapshot{};
+        out.pending_local_deletes.reset();
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
@@ -933,10 +935,12 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
         out.object_storage = metadata_store_->SnapshotObjectReplicas();
+        out.pending_local_deletes = metadata_store_->CopyLocalDeleteTasks();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
         out.object_storage = ObjectReplicaSnapshot{};
+        out.pending_local_deletes.reset();
     }
 
     // Export segments from OpLogApplier's registry (Patch B)
@@ -1032,6 +1036,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
         capture.object_storage = metadata_store_->SnapshotObjectReplicas();
+        capture.pending_local_deletes = metadata_store_->CopyLocalDeleteTasks();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }

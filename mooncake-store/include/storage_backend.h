@@ -1443,8 +1443,20 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
     // Same buffer requirement as BatchLoad.
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices,
+        const ObjectVersions& expected_incarnations);
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
+
+    bool SupportsDurableDeletes() const {
+        return cfg_.persist_mode == OffsetPersistMode::kStrict;
+    }
+
+    // Load or enroll the stable identity of this directory while holding its
+    // ownership lock. Missing markers are returned only before enrollment.
+    tl::expected<std::optional<UUID>, ErrorCode> GetDeleteStorageId(
+        bool create_if_missing);
 
     // Success means all requested versions are durably invalidated. Keys are
     // already scoped to their tenant.

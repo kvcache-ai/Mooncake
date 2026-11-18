@@ -374,6 +374,64 @@ TEST(ObjectReplicaStateTest, OrderedReplayRejectsInvalidEntries) {
         store.SnapshotObjectReplicas().records.front().upload_finished);
 }
 
+TEST(LocalDeleteReplayTest, OldAckCannotRemoveNewPendingTask) {
+    StandbyMetadataStore store;
+    OpLogApplier applier(&store);
+    const auto apply = [&](uint64_t seq, OpType type, const auto& payload) {
+        OpLogEntry entry;
+        entry.sequence_id = seq;
+        entry.tenant_id = "default";
+        entry.object_key = "same-key";
+        entry.op_type = type;
+        entry.payload = struct_pack::serialize<std::string>(payload);
+        entry.checksum = ComputeOpLogChecksum(entry.payload);
+        return applier.ApplyOpLogEntry(entry);
+    };
+    const UUID storage_id{1, 2};
+    const LocalDeleteTask old_task{
+        {1, 3}, storage_id, "default", "same-key", {1, 4}};
+    const LocalDeleteTask new_task{
+        {2, 3}, storage_id, "default", "same-key", {2, 4}};
+    StandbyObjectMetadata metadata;
+    metadata.object_incarnation = old_task.incarnation;
+    ASSERT_TRUE(store.PutMetadata("default", old_task.key, metadata));
+    ASSERT_TRUE(store.PutMetadata("other", old_task.key, metadata));
+
+    const LocalDeleteRemove old_remove{
+        1, old_task.incarnation, {{old_task.task_id, old_task.storage_id}}};
+    ASSERT_TRUE(apply(1, OpType::LOCAL_DELETE_REMOVE, old_remove));
+    EXPECT_FALSE(store.Exists("default", old_task.key));
+    EXPECT_TRUE(store.Exists("other", old_task.key));
+    EXPECT_EQ(store.CopyLocalDeleteTasks(), std::vector{old_task});
+
+    const LocalDeleteAck old_ack{1, storage_id, {old_task.task_id}};
+    ASSERT_TRUE(apply(2, OpType::LOCAL_DELETE_ACK, old_ack));
+    EXPECT_TRUE(store.CopyLocalDeleteTasks().empty());
+
+    metadata.object_incarnation = new_task.incarnation;
+    ASSERT_TRUE(store.PutMetadata("default", new_task.key, metadata));
+    EXPECT_FALSE(apply(3, OpType::LOCAL_DELETE_REMOVE, old_remove));
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 3u);
+    EXPECT_TRUE(store.Exists("default", new_task.key));
+    EXPECT_TRUE(store.CopyLocalDeleteTasks().empty());
+
+    const LocalDeleteRemove new_remove{
+        1, new_task.incarnation, {{new_task.task_id, new_task.storage_id}}};
+    ASSERT_TRUE(apply(3, OpType::LOCAL_DELETE_REMOVE, new_remove));
+    // Repeated delivery can appear in a new committed entry.
+    ASSERT_TRUE(apply(4, OpType::LOCAL_DELETE_ACK, old_ack));
+    EXPECT_EQ(store.CopyLocalDeleteTasks(), std::vector{new_task});
+    const LocalDeleteAck wrong_storage{1, {2, 2}, {new_task.task_id}};
+    EXPECT_TRUE(apply(5, OpType::LOCAL_DELETE_ACK, wrong_storage));
+    const LocalDeleteAck invalid_ack{2, storage_id, {new_task.task_id}};
+    EXPECT_FALSE(apply(6, OpType::LOCAL_DELETE_ACK, invalid_ack));
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 6u);
+    EXPECT_EQ(store.CopyLocalDeleteTasks(), std::vector{new_task});
+    const LocalDeleteAck new_ack{1, storage_id, {new_task.task_id}};
+    ASSERT_TRUE(apply(6, OpType::LOCAL_DELETE_ACK, new_ack));
+    EXPECT_TRUE(store.CopyLocalDeleteTasks().empty());
+}
+
 TEST(ObjectReplicaStateTest, PromotionDetectsBothRecoveryHandoffs) {
     ha::PromotionContext handoff;
     EXPECT_FALSE(handoff.HasObjectReplicaState());

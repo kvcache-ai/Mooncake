@@ -23,6 +23,10 @@ inline constexpr uint32_t kBatchOpLogObjectSnapshotSchemaVersion = 3;
 inline constexpr char kBatchOpLogObjectSnapshotFormat[] =
     "standby-oplog-materialized/v3";
 
+inline constexpr uint32_t kBatchOpLogLocalDeleteSnapshotSchemaVersion = 4;
+inline constexpr char kBatchOpLogLocalDeleteSnapshotFormat[] =
+    "standby-oplog-materialized/v4";
+
 struct BatchOpLogSnapshotDescriptor {
     uint32_t schema_version{kBatchOpLogSnapshotSchemaVersion};
     std::string snapshot_format{kBatchOpLogSnapshotFormat};
@@ -61,6 +65,7 @@ struct BatchOpLogSnapshotManifest {
     std::vector<BatchOpLogSnapshotChunkDescriptor> object_chunks;
     std::optional<BatchOpLogSnapshotObjectDescriptor> weight_metadata;
     std::optional<BatchOpLogSnapshotObjectDescriptor> object_storage;
+    std::optional<BatchOpLogSnapshotObjectDescriptor> pending_local_deletes;
 };
 
 std::string EncodeBatchOpLogSnapshotDescriptor(
@@ -99,6 +104,9 @@ std::string BuildBatchOpLogSnapshotWeightMetadataKey(
     const std::string& snapshot_root, std::string_view snapshot_id);
 
 std::string BuildBatchOpLogSnapshotObjectStorageKey(
+    const std::string& snapshot_root, std::string_view snapshot_id);
+
+std::string BuildBatchOpLogSnapshotLocalDeletesKey(
     const std::string& snapshot_root, std::string_view snapshot_id);
 
 }  // namespace mooncake::ha

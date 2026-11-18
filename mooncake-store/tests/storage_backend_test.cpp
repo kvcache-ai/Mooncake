@@ -5461,6 +5461,44 @@ TEST_F(StorageBackendTest, OffsetDeleteRootRejectsSecondOwner) {
     EXPECT_EQ(result.error(), ErrorCode::FILE_OPEN_FAIL);
 }
 
+TEST_F(StorageBackendTest, OffsetDeleteStorageIdentitySurvivesReopen) {
+    const auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig strict_cfg;
+    strict_cfg.persist_mode = OffsetPersistMode::kStrict;
+    const auto marker = data_path + "/kv_cache.storage.v1";
+    UUID id{};
+    {
+        OffsetAllocatorStorageBackend backend(config, strict_cfg);
+        ASSERT_TRUE(backend.Init());
+        const auto missing = backend.GetDeleteStorageId(false);
+        ASSERT_TRUE(missing);
+        EXPECT_FALSE(missing->has_value());
+        EXPECT_FALSE(fs::exists(marker));
+        const auto created = backend.GetDeleteStorageId(true);
+        ASSERT_TRUE(created);
+        ASSERT_TRUE(created->has_value());
+        id = **created;
+        EXPECT_NE(id, UUID{});
+        EXPECT_EQ(ReadOffsetFile(marker), UuidToString(id));
+        ASSERT_NE(PutVersionedOffset(backend, "sentinel", "keep", {1, 1}), -1);
+    }
+    {
+        OffsetAllocatorBackendConfig legacy_cfg;
+        legacy_cfg.persist_mode = OffsetPersistMode::kDisabled;
+        OffsetAllocatorStorageBackend legacy(config, legacy_cfg);
+        const auto disabled = legacy.Init();
+        ASSERT_FALSE(disabled);
+        EXPECT_EQ(disabled.error(), ErrorCode::NOT_SUPPORTED);
+    }
+    OffsetAllocatorStorageBackend reopened(config, strict_cfg);
+    ASSERT_TRUE(reopened.Init());
+    const auto stored = reopened.GetDeleteStorageId(true);
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(**stored, id);
+    EXPECT_EQ(ReadVersionedOffset(reopened, "sentinel", 4, {1, 1}), "keep");
+}
+
 TEST_F(
     StorageBackendTest,
     OffsetAllocatorStorageBackend_Persist_PinnedRetirementAcrossCheckpoints) {

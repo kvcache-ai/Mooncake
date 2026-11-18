@@ -319,6 +319,10 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
+    // Apply any recovered delete work before re-advertising SSD replicas.
+    auto deleted = ProcessOffsetDeletes();
+    if (!deleted) return deleted;
+
     auto scan_meta_result = storage_backend_->ScanMeta(
         [this](const std::vector<std::string>& keys,
                std::vector<StorageObjectMetadata>& metadatas) {
@@ -738,10 +742,86 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 
 tl::expected<void, ErrorCode> FileStorage::MountLocalDiskSegment(
     bool enable_offloading) {
+    auto* offset =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (offset && offset->SupportsDurableDeletes()) {
+        auto known_id = offset->GetDeleteStorageId(false);
+        if (!known_id) return tl::make_unexpected(known_id.error());
+        auto capable = client_->SupportsOffsetDelete();
+        if (!capable) return tl::make_unexpected(capable.error());
+        if (*capable) {
+            auto id = offset->GetDeleteStorageId(true);
+            if (!id) return tl::make_unexpected(id.error());
+            if (!*id) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            auto epoch =
+                client_->MountOffsetDeleteStorage(enable_offloading, **id);
+            if (!epoch) return tl::make_unexpected(epoch.error());
+            if (*epoch == UUID{}) {
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            }
+            offset_delete_mount_ = OffsetDeleteMount{**id, *epoch};
+            offset_remount_required_ = false;
+            return {};
+        }
+        if (*known_id || offset_delete_mount_) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+    }
     const bool supports_versioned_offload =
         dynamic_cast<BucketStorageBackend*>(storage_backend_.get()) != nullptr;
     return client_->MountLocalDiskSegment(enable_offloading,
                                           supports_versioned_offload);
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessOffsetDeletes() {
+    MutexLocker locker(&offloading_mutex_);
+    if (!offset_delete_mount_ || draining_.load() || disk_fenced_.load()) {
+        return {};
+    }
+    const auto& [storage_id, epoch] = *offset_delete_mount_;
+    const auto retry_mount = [this](ErrorCode error) {
+        if (error == ErrorCode::SEGMENT_NOT_FOUND ||
+            error == ErrorCode::INVALID_VERSION) {
+            offset_remount_required_ = true;
+        }
+        return tl::make_unexpected(error);
+    };
+    auto tasks =
+        client_->FetchLocalDeletes(storage_id, epoch, kMaxLocalDeleteTasks);
+    if (!tasks) return retry_mount(tasks.error());
+    if (tasks->empty()) return {};
+    if (tasks->size() > kMaxLocalDeleteTasks) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<std::pair<std::string, ObjectIncarnation>> versions;
+    std::vector<UUID> task_ids;
+    versions.reserve(tasks->size());
+    task_ids.reserve(tasks->size());
+    for (const auto& task : *tasks) {
+        const TenantId tenant(task.tenant_id);
+        if (task.storage_id != storage_id || task.task_id == UUID{} ||
+            !tenant.IsValid() || tenant.value() != task.tenant_id ||
+            task.key.empty() || task.incarnation.IsZero()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        versions.emplace_back(tenant.MakeScopedKey(task.key), task.incarnation);
+        task_ids.push_back(task.task_id);
+    }
+    {
+        ColdReadInvalidation invalidate(*this);
+        auto& offset =
+            static_cast<OffsetAllocatorStorageBackend&>(*storage_backend_);
+        auto deleted = offset.DeleteVersions(versions);
+        if (!deleted) return deleted;
+    }
+    // A full backend can have disabled its offload queue. Advertise the
+    // newly available capacity on the next heartbeat.
+    auto enabled = IsEnableOffloading();
+    if (enabled) enable_offloading_ = *enabled;
+    auto ack = client_->AckLocalDeletes(storage_id, epoch, task_ids);
+    if (!ack) return retry_mount(ack.error());
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -767,13 +847,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                     [](const OffloadTaskItem& task) {
                         return task.attempt_id.has_value();
                     })) {
-        std::vector<StorageObjectMetadata> failures(
-            offloading_objects.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
-        const auto rejected =
-            client_->NotifyOffloadSuccess(offloading_objects, failures);
-        if (!rejected) return rejected;
-        LOG(ERROR) << "Versioned offload requires the Bucket backend";
-        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        bool versioned_offset = false;
+        {
+            MutexLocker locker(&offloading_mutex_);
+            versioned_offset = offset_delete_mount_.has_value();
+        }
+        if (!versioned_offset) {
+            std::vector<StorageObjectMetadata> failures(
+                offloading_objects.size(),
+                StorageObjectMetadata{-1, 0, 0, -1, ""});
+            const auto rejected =
+                client_->NotifyOffloadSuccess(offloading_objects, failures);
+            if (!rejected) return rejected;
+            LOG(ERROR) << "Versioned offload requires a compatible backend";
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
     }
 
     // Merge in tasks carried across a bucket deferral (see
@@ -882,17 +970,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
             std::vector<std::string> user_keys;
+            std::vector<ObjectIncarnation> incarnations;
             user_keys.reserve(storage_keys.size());
+            incarnations.reserve(storage_keys.size());
             for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key.at(storage_key).key);
+                const auto& task = task_by_storage_key.at(storage_key);
+                user_keys.push_back(task.key);
+                incarnations.push_back(offset_delete_mount_
+                                           ? task.GetObjectIncarnation()
+                                           : ObjectIncarnation{});
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
-                user_keys, tenant_id, user_batch_object);
-            // BatchQuerySegmentSlices is now best-effort: it always returns
-            // OK. Keys present in user_batch_object go to batch_object; the
-            // rest are reported as failed.
+            BatchQuerySegmentSlices(user_keys, tenant_id, incarnations,
+                                    user_batch_object);
+            // Keys without matching source slices are reported as failed.
             for (const auto& storage_key : storage_keys) {
                 const auto& task = task_by_storage_key.at(storage_key);
                 auto it = user_batch_object.find(task.key);
@@ -1245,7 +1337,11 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
             return client_->OffloadObjectHeartbeat(enable_offloading_,
                                                    offloading_objects);
         };
-        auto heartbeat_result = fetch_offload_tasks();
+        tl::expected<void, ErrorCode> heartbeat_result =
+            offset_remount_required_
+                ? tl::expected<void, ErrorCode>(
+                      tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND))
+                : fetch_offload_tasks();
         if (!heartbeat_result) {
             ErrorCode err = heartbeat_result.error();
             if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -1310,13 +1406,20 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // Generic removal reclaims files through metadata-checked eviction, not a
     // backend-wide wipe that could remove managed objects or another tenant.
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
-    if (!offloading_objects.empty() || !deferred_task_by_storage_key_.empty()) {
-        auto offload_result = OffloadObjects(offloading_objects);
-        if (!offload_result) {
-            LOG(ERROR) << "Failed to persist objects with error: "
-                       << offload_result.error();
-            return offload_result;
-        }
+    auto offload_result = OffloadObjects(offloading_objects);
+
+    // Finish every drained Offset write before fetching its delete. This
+    // orders deletion after an old write that was already in flight, and
+    // still drains deletions when writes failed under capacity pressure.
+    auto deleted = ProcessOffsetDeletes();
+    if (!deleted) {
+        LOG(WARNING) << "OffsetAllocator delete heartbeat failed: "
+                     << deleted.error();
+    }
+    if (!offload_result) {
+        LOG(ERROR) << "Failed to persist objects with error: "
+                   << offload_result.error();
+        return offload_result;
     }
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
@@ -1796,17 +1899,21 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object,
     const StorageBackendInterface::ObjectVersions& expected_incarnations) {
     if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    auto* bucket =
-        expected_incarnations.empty()
-            ? nullptr
-            : dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
-    if (!expected_incarnations.empty() && bucket == nullptr) {
-        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
-    }
     auto start_time = std::chrono::steady_clock::now();
-    auto result = bucket
-                      ? bucket->BatchLoad(batch_object, expected_incarnations)
-                      : storage_backend_->BatchLoad(batch_object);
+    auto result = [&]() -> tl::expected<void, ErrorCode> {
+        if (expected_incarnations.empty()) {
+            return storage_backend_->BatchLoad(batch_object);
+        }
+        if (auto* bucket =
+                dynamic_cast<BucketStorageBackend*>(storage_backend_.get())) {
+            return bucket->BatchLoad(batch_object, expected_incarnations);
+        }
+        if (auto* offset = dynamic_cast<OffsetAllocatorStorageBackend*>(
+                storage_backend_.get())) {
+            return offset->BatchLoad(batch_object, expected_incarnations);
+        }
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }();
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
@@ -1862,17 +1969,15 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
     return result;
 }
 
-tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
+void FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
+    const std::vector<ObjectIncarnation>& incarnations,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    auto batched_query_results = client_->BatchQuery(keys, tenant_id);
-    if (batched_query_results.empty()) {
-        return {};
-    }
-    for (size_t i = 0; i < batched_query_results.size(); ++i) {
-        if (batched_query_results[i]) {
-            for (const auto& descriptor :
-                 batched_query_results[i].value().replicas) {
+    const auto queries = client_->BatchQuery(keys, tenant_id);
+    for (size_t i = 0; i < queries.size(); ++i) {
+        if (queries[i] && (incarnations[i].IsZero() ||
+                           queries[i]->object_incarnation == incarnations[i])) {
+            for (const auto& descriptor : queries[i]->replicas) {
                 if (client_->IsReplicaOnLocalMemory(descriptor)) {
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
@@ -1887,7 +1992,6 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
             }
         }
     }
-    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
