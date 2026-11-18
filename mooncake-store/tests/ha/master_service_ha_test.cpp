@@ -3905,6 +3905,133 @@ TEST_F(MasterServiceHATest, NoFRemountPreservesRestoredAllocationRanges) {
     }
 }
 
+TEST_F(MasterServiceHATest, NoFRemountKeepsRemovedRangeUntilFinalize) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr uint64_t kRemoveSequence = 1;
+    for (auto allocator :
+         {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {
+        SCOPED_TRACE(static_cast<int>(allocator));
+        auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+        const auto config = MasterServiceConfig::builder()
+                                .set_enable_ha(true)
+                                .set_enable_oplog(true)
+                                .set_cluster_id("test_nof_remount_remove")
+                                .set_oplog_batch_max_entries(1)
+                                .set_memory_allocator(allocator)
+                                .set_eviction_ratio(0)
+                                .set_nof_eviction_ratio(0)
+                                .set_nof_heartbeat_interval_sec(3600)
+                                .build();
+        MasterService service(config);
+        MasterServiceTestPeer(service).SetNoFProbeFnForTesting(
+            [](const std::string&, uint32_t, std::string*) { return true; });
+        auto* writer = InstallGatedWriter(service, backend);
+        ASSERT_NE(writer, nullptr);
+
+        const auto owner = generate_uuid();
+        const auto segment = MakeNoFSegment(
+            "recovered-nof", "recovered-nof-endpoint",
+            allocator == BufferAllocatorType::OFFSET ? 0 : kDefaultSegmentBase);
+        const std::string key = "pending-remove";
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+        NoFDescriptor nof;
+        nof.buffer_descriptor = {kObjectSize, segment.base, "nvmeof",
+                                 segment.te_endpoint};
+        replica.descriptor_variant = nof;
+        StandbyObjectMetadata metadata;
+        metadata.client_id = owner;
+        metadata.size = kObjectSize;
+        metadata.replicas = {replica};
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+            {{kDefaultTenant.value(), key, metadata}}, 0, {}));
+
+        writer->HoldCallbacks();
+        backend->BlockTxn();
+        // Keep assertions nonfatal until the transaction is unblocked.
+        EXPECT_TRUE(service.Remove(key, kDefaultTenant, /*force=*/true));
+        EXPECT_TRUE(backend->WaitForBlockedTxn());
+        EXPECT_TRUE(service.ReMountNoFSegment({segment}, owner));
+        EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes,
+                  kObjectSize);
+        EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant));
+        backend->AllowTxn();
+
+        auto durable_promise = std::make_shared<std::promise<ErrorCode>>();
+        auto durable = durable_promise->get_future();
+        [[maybe_unused]] auto notification =
+            writer->AwaitDurable(kRemoveSequence)
+                .thenValue([durable_promise](ErrorCode error) {
+                    durable_promise->set_value(error);
+                });
+        ASSERT_EQ(durable.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        ASSERT_EQ(durable.get(), ErrorCode::OK);
+        EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes,
+                  kObjectSize);
+
+        ASSERT_TRUE(writer->RunCallbacksThrough(kRemoveSequence));
+        EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes, 0u);
+        EXPECT_TRUE(
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key).empty());
+    }
+}
+
+TEST_F(MasterServiceHATest, NoFRemountSkipsRemovedDescriptorsFromStandby) {
+    constexpr size_t kObjectSize = 4096;
+    const auto owner = generate_uuid();
+    const auto segment =
+        MakeNoFSegment("recovered-nof", "recovered-nof-endpoint", 0);
+    const std::string key = "restored";
+    Replica::Descriptor live;
+    live.id = 1;
+    live.status = ReplicaStatus::COMPLETE;
+    NoFDescriptor nof;
+    nof.buffer_descriptor = {kObjectSize, segment.base, "nvmeof",
+                             segment.te_endpoint};
+    live.descriptor_variant = nof;
+    auto removed = live;
+    removed.id = 2;
+    removed.status = ReplicaStatus::REMOVED;
+    StandbyObjectMetadata metadata;
+    metadata.client_id = owner;
+    metadata.size = kObjectSize;
+    metadata.replicas = {removed, live};
+
+    for (bool use_batch_restore : {false, true}) {
+        SCOPED_TRACE(use_batch_restore ? "batch restore" : "snapshot restore");
+        const auto config =
+            MasterServiceConfig::builder()
+                .set_memory_allocator(BufferAllocatorType::OFFSET)
+                .set_eviction_ratio(0)
+                .set_nof_eviction_ratio(0)
+                .set_nof_heartbeat_interval_sec(3600)
+                .build();
+        MasterService service(config);
+        MasterServiceTestPeer(service).SetNoFProbeFnForTesting(
+            [](const std::string&, uint32_t, std::string*) { return true; });
+        if (use_batch_restore) {
+            StandbyMetadataStore store;
+            ASSERT_TRUE(
+                store.RestoreMetadata(kDefaultTenant.value(), key, metadata));
+            ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(
+                store, DurablePrefix{1, 1}, {}, removed.id, 1));
+        } else {
+            ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+                {{kDefaultTenant.value(), key, metadata}}, 1, {}));
+        }
+
+        ASSERT_TRUE(service.ReMountNoFSegment({segment}, owner));
+        EXPECT_EQ(service.GetStorageUsageSnapshot().nof.used_bytes,
+                  kObjectSize);
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas);
+        ASSERT_EQ(replicas->replicas.size(), 1u);
+        EXPECT_EQ(replicas->replicas.front().id, live.id);
+    }
+}
+
 TEST_F(MasterServiceHATest, NoFImportedBuffersInvalidateOnUnmount) {
     for (auto allocator :
          {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {

@@ -1139,8 +1139,10 @@ tl::expected<void, ErrorCode> MasterService::MountNoFSegmentLocked(
             for (auto object : ns.objects.WriteCursor()) {
                 object.metadata().VisitReplicas(
                     [](const Replica& replica) {
+                        // Restore skips historical REMOVED descriptors.
+                        // Replicas removed since restore still own their
+                        // ranges until the durable callback releases them.
                         return replica.is_nof_replica() &&
-                               replica.status() != ReplicaStatus::REMOVED &&
                                replica.status() != ReplicaStatus::FAILED;
                     },
                     [&](Replica& replica) {
@@ -3499,6 +3501,10 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     construction_ok = false;
                     break;
                 }
+                // Restored tombstones have no local removal callback.
+                if (desc.status == ReplicaStatus::REMOVED) {
+                    continue;
+                }
                 auto& alloc = ctx.nof_allocators[buffer.transport_endpoint_];
                 if (!alloc) {
                     alloc = std::make_shared<DummyBufferAllocator>(
@@ -4071,6 +4077,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                                    << "descriptor, tenant=" << tenant_id.value()
                                    << ", key=" << user_key;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    // Restored tombstones have no local removal callback.
+                    if (desc.status == ReplicaStatus::REMOVED) {
+                        dropped_stale_replica = true;
+                        continue;
                     }
                     auto& alloc =
                         restored_nof_allocators[buffer.transport_endpoint_];
