@@ -989,7 +989,8 @@ class MasterServiceHATest : public ::testing::Test {
 
     static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
     }
 
     static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
@@ -1119,15 +1120,19 @@ class MasterServiceHATest : public ::testing::Test {
         return task.get().has_value() && reached_discovery && metadata_released;
     }
 
-    // PutStart is the only caller in these tests that holds the snapshot
-    // barrier shared, so a barrier that cannot be taken exclusively while the
-    // client lock is free means PutStart reached it and let the client lock
-    // go.
+    // PutStart is the only caller in this test that holds the snapshot
+    // barrier shared. The test holds its key, so an unavailable barrier means
+    // PutStart finished the session lookups and is waiting for that key.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
         MasterService& service) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
             MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
+    }
+
+    static void StopClientSessionsForTesting(MasterService& service) {
+        // These tests drive residual jobs manually, without live listeners.
+        MasterServiceTestPeer::ClientSessions(service).Stop();
     }
 
     static ClientSessionRegistry::RestoreBatch RestoreClientsForTesting(
@@ -2267,23 +2272,18 @@ TEST_F(MasterServiceHATest,
 
     const auto liveness = ClientRecordForTesting(service, client_id);
     ASSERT_TRUE(liveness);
+    StopClientSessionsForTesting(service);
     const auto now = ClientLivenessRecord::Clock::now();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    MasterMetricManager::instance().client_liveness_became_offline();
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     writer->RejectNextCommit();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
@@ -2321,23 +2321,18 @@ TEST_F(MasterServiceHATest,
 
     const auto liveness = ClientRecordForTesting(service, client_id);
     ASSERT_TRUE(liveness);
+    StopClientSessionsForTesting(service);
     const auto now = ClientLivenessRecord::Clock::now();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    MasterMetricManager::instance().client_liveness_became_offline();
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     writer->RejectNextSegmentUnmount();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
@@ -2861,7 +2856,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
               metric_before);
 
-    // Rollback leaves nothing behind: no metadata, no liveness records. A
+    // Rollback leaves nothing behind: no metadata, no client sessions. A
     // retry must see an empty index rather than already-existing objects.
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_survivor"),
