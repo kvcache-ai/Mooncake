@@ -379,6 +379,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Set the soft-pin TTL of existing objects without transferring
+     * data.
+     * @param keys Object keys in this client's tenant.
+     * @param ttl_ms TTL from now; zero clears the soft pin. Must not exceed the
+     * master's max_kv_soft_pin_ttl. Soft pins remain runtime-only hints.
+     * @return One status per key in input order; the batch is not atomic.
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms);
+
+    /**
      * @brief Batch remove objects and all their replicas
      * @param keys List of keys to remove
      * @param force If true, skip lease and replication task checks

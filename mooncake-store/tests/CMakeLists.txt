@@ -203,6 +203,7 @@ add_test(
 )
 set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
+add_store_test(soft_pin_rpc_test soft_pin_rpc_test.cpp)
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
