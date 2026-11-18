@@ -1155,10 +1155,10 @@ class MasterService {
                                                  uint64_t target_bytes);
 
     // Caller holds the Replica owner's retaining guard.
-    auto AddReplicaForRetainedClient(const UUID& client_id,
-                                     const std::string& key,
-                                     const TenantId& tenant_id,
-                                     Replica& replica)
+    auto AddReplicaForRetainedClient(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, Replica& replica,
+        std::optional<ObjectIncarnation> scanned_incarnation = std::nullopt)
         -> tl::expected<bool, ErrorCode>;
 
     void ClearInvalidHandles();
@@ -1535,7 +1535,14 @@ class MasterService {
     // appended to it on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        const ObjectIncarnation& incarnation, const UUID& attempt_id,
+        std::vector<UUID>* mirror_clients);
+
+    // Removes a failed mirror and releases the source once the last one ends.
+    // The caller holds the object's key lock.
+    bool FailOffloadMirror(ObjectMetadata& metadata, route::ObjectState& state,
+                           const UUID& client_id,
+                           const OffloadTaskItem& report);
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -1926,6 +1933,7 @@ class MasterService {
     const bool enable_ha_;
 
     const bool enable_offload_;
+    const bool versioned_local_disk_;
 
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)

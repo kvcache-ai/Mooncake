@@ -483,7 +483,7 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    EvictionHandler eviction_handler) {
+    EvictionHandler eviction_handler, const ObjectVersions* /*versions*/) {
     if (!UsesObjectStorage()) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }

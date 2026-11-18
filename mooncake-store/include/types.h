@@ -269,17 +269,38 @@ static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 static constexpr size_t DEFAULT_SSD_PREFETCH_COOLDOWN_SEC = 5;
 static constexpr size_t DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC = 30;
 
+// Identifies a content version independently of its key and replicas.
+struct ObjectIncarnation {
+    uint64_t high{0};
+    uint64_t low{0};
+
+    [[nodiscard]] bool IsZero() const { return high == 0 && low == 0; }
+    auto operator<=>(const ObjectIncarnation&) const = default;
+};
+YLT_REFL(ObjectIncarnation, high, low);
+
+ObjectIncarnation GenerateObjectIncarnation();
+
 struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
+    // Absent for startup registrations, which carry only the disk version.
+    struct_pack::compatible<UUID, 1> attempt_id{};
+
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return object_incarnation.value_or(ObjectIncarnation{});
+    }
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size &&
+               GetObjectIncarnation() == other.GetObjectIncarnation() &&
+               attempt_id.value_or(UUID{}) == other.attempt_id.value_or(UUID{});
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, object_incarnation, attempt_id);
 
 struct PromotionTaskItem {
     std::string tenant_id;
@@ -598,8 +619,14 @@ struct StorageObjectMetadata {
     int64_t key_size;
     int64_t data_size;
     std::string transport_endpoint;
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
+
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return object_incarnation.value_or(ObjectIncarnation{});
+    }
+
     YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
-             transport_endpoint);
+             transport_endpoint, object_incarnation);
 };
 
 }  // namespace mooncake

@@ -56,7 +56,8 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
         std::function<ErrorCode(const std::vector<std::string>&,
                                 std::vector<StorageObjectMetadata>&)>
             complete,
-        EvictionHandler eviction = nullptr) override {
+        EvictionHandler eviction = nullptr,
+        const ObjectVersions* versions = nullptr) override {
         std::unordered_map<std::string, std::vector<Slice>> duplicates;
         for (const auto& key : duplicate_keys_) {
             duplicates.emplace(key, batch.at(key));
@@ -65,13 +66,13 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
             // The local commit survives even if its Master notification was
             // lost. The retry must release its own task without claiming a
             // new disk replica for the skipped write.
-            auto result =
-                BucketStorageBackend::BatchOffload(duplicates, nullptr);
+            auto result = BucketStorageBackend::BatchOffload(
+                duplicates, nullptr, nullptr, versions);
             if (!result) return result;
         }
         if (fail_write_) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        return BucketStorageBackend::BatchOffload(batch, std::move(complete),
-                                                  std::move(eviction));
+        return BucketStorageBackend::BatchOffload(
+            batch, std::move(complete), std::move(eviction), versions);
     }
 
    private:
@@ -111,10 +112,11 @@ class FailingReadBackend : public BucketStorageBackend {
         std::function<ErrorCode(const std::vector<std::string>&,
                                 std::vector<StorageObjectMetadata>&)>
             complete,
-        EvictionHandler eviction = nullptr) override {
+        EvictionHandler eviction = nullptr,
+        const ObjectVersions* versions = nullptr) override {
         ++offloads;
-        return BucketStorageBackend::BatchOffload(batch, std::move(complete),
-                                                  std::move(eviction));
+        return BucketStorageBackend::BatchOffload(
+            batch, std::move(complete), std::move(eviction), versions);
     }
 
     int loads = 0;
@@ -222,6 +224,113 @@ class FileStorageTest : public ::testing::Test {
         storage.config_.disk_eviction_low_watermark_ratio = 0.5e-12;
         ASSERT_TRUE(storage.Heartbeat());
         EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunVersionedBucketRescanScenario() {
+        testing::InProcMaster master;
+        const char* previous = std::getenv("MOONCAKE_LOCAL_DISK_INCARNATIONS");
+        const std::optional<std::string> saved =
+            previous ? std::make_optional<std::string>(previous) : std::nullopt;
+        SetEnv("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+        const bool started = master.Start(InProcMasterConfigBuilder()
+                                              .set_enable_offload(true)
+                                              .set_default_kv_lease_ttl(0)
+                                              .set_root_fs_dir("")
+                                              .build());
+        if (saved) {
+            SetEnv("MOONCAKE_LOCAL_DISK_INCARNATIONS", *saved);
+        } else {
+            UnsetEnv("MOONCAKE_LOCAL_DISK_INCARNATIONS");
+        }
+        ASSERT_TRUE(started);
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kBucket;
+        config.storage_filepath = data_path + "/versioned_rescan";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        auto open_holder = [&] {
+            auto storage =
+                std::make_unique<FileStorage>(config, client, endpoint);
+            BucketBackendConfig bucket_config;
+            bucket_config.bucket_keys_limit = 1;
+            storage->storage_backend_ =
+                std::make_shared<BucketStorageBackend>(config, bucket_config);
+            return storage;
+        };
+        auto holder = open_holder();
+        ASSERT_TRUE(holder->storage_backend_->Init());
+        ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
+        const std::string key = "same-key-rescan";
+        constexpr size_t kValueSize = 128;
+        auto* buffer = allocator.allocate(kValueSize);
+        ASSERT_NE(buffer, nullptr);
+        std::vector<Slice> slices{{buffer, kValueSize}};
+        ReplicateConfig replicate;
+        std::memset(buffer, 'a', kValueSize);
+        ASSERT_TRUE(client->Put(key, slices, replicate));
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(tasks.size(), 1u);
+        ASSERT_FALSE(tasks.front().GetObjectIncarnation().IsZero());
+        ASSERT_TRUE(holder->OffloadObjects(tasks));
+
+        auto disk_replicas = [&]() {
+            auto result = client->QueryReadOnly(key);
+            EXPECT_TRUE(result);
+            if (!result) return -1L;
+            return std::count_if(result->replicas.begin(),
+                                 result->replicas.end(),
+                                 [](const Replica::Descriptor& replica) {
+                                     return replica.is_local_disk_replica();
+                                 });
+        };
+        ASSERT_EQ(disk_replicas(), 1);
+        holder.reset();
+        ASSERT_TRUE(client->UnmountLocalDiskSegment());
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        ASSERT_EQ(disk_replicas(), 0);
+        holder = open_holder();
+        ASSERT_TRUE(holder->storage_backend_->Init());
+        ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
+        ASSERT_EQ(disk_replicas(), 1);
+        const auto storage_key = TenantId::Default().MakeScopedKey(key);
+        std::string contents(kValueSize, '\0');
+        std::unordered_map<std::string, Slice> load{
+            {storage_key, {contents.data(), contents.size()}}};
+        ASSERT_TRUE(holder->storage_backend_->BatchLoad(load));
+        EXPECT_EQ(contents, std::string(kValueSize, 'a'));
+
+        ASSERT_TRUE(client->Remove(key, true));
+        std::memset(buffer, 'b', kValueSize);
+        ASSERT_TRUE(client->Put(key, slices, replicate));
+        std::vector<OffloadTaskItem> new_tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, new_tasks));
+        ASSERT_EQ(new_tasks.size(), 1u);
+        EXPECT_NE(tasks.front().GetObjectIncarnation(),
+                  new_tasks.front().GetObjectIncarnation());
+        ASSERT_TRUE(holder->ReRegisterOffloadedObjects());
+        EXPECT_EQ(disk_replicas(), 0);
+        auto upsert = client->Upsert(key, slices, replicate);
+        ASSERT_FALSE(upsert);
+        EXPECT_EQ(upsert.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        allocator.deallocate(buffer, kValueSize);
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
@@ -1464,6 +1573,10 @@ class FileStorageTest : public ::testing::Test {
 
 TEST_F(FileStorageTest, SkippedOffloadAllDuplicatesReleaseSourceTasks) {
     RunSkippedOffloadScenario(2, false);
+}
+
+TEST_F(FileStorageTest, BucketRescanPreservesIdentityAcrossHolderRestart) {
+    RunVersionedBucketRescanScenario();
 }
 
 TEST_F(FileStorageTest, SkippedOffloadMixedBatchReleasesSourceTasks) {
