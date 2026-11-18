@@ -136,6 +136,21 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         }
     }
 
+    fn batch_get_route_presence(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<mooncake_store_route::RouteAuthorityPresence>> {
+        match crate::route_directory::authority_get_presence_many(namespace, authority, keys) {
+            Ok(presence) => presence.into_iter().map(Ok).collect(),
+            Err(error) => keys
+                .iter()
+                .map(|_| Err(StoreError::NotFound(error.to_string())))
+                .collect(),
+        }
+    }
+
     fn batch_contains_routes(
         &self,
         namespace: &str,
