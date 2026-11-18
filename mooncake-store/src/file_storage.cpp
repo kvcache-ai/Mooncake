@@ -1869,7 +1869,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     auto start_time = std::chrono::steady_clock::now();
     auto result =
-        storage_backend_->BatchLoad(batch_object, expected_incarnations);
+        expected_incarnations.empty()
+            ? storage_backend_->BatchLoad(batch_object)
+            : storage_backend_->BatchLoad(batch_object, expected_incarnations);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
