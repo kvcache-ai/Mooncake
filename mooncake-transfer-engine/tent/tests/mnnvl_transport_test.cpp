@@ -1240,6 +1240,54 @@ TEST_F(MnnvlCompletionTest, CpuBlockAndReadKeepExistingOrdering) {
     expectPattern(source_, 0x69);
 }
 
+TEST_F(MnnvlCompletionTest, CopyWaitsForRequestProducerEvent) {
+    CUDAStreamPool pool;
+    CUDAStreamHandle producer_stream;
+    ASSERT_TRUE(pool.acquire(producer_stream, 0).ok());
+    ASSERT_EQ(cudaMemset(source_, 0, kBufferLength), cudaSuccess);
+    cudaEvent_t producer_event = nullptr;
+    ASSERT_EQ(cudaEventCreateWithFlags(&producer_event, cudaEventDisableTiming),
+              cudaSuccess);
+
+    struct Gate {
+        std::atomic<bool> released{false};
+        cudaStream_t stream;
+        ~Gate() {
+            released.store(true);
+            cudaStreamSynchronize(stream);
+        }
+    } gate{{false}, producer_stream.get()};
+    ASSERT_EQ(cudaLaunchHostFunc(
+                  producer_stream.get(),
+                  [](void* data) {
+                      auto& gate = *static_cast<Gate*>(data);
+                      // Bound the wait even if the test exits unexpectedly.
+                      auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(5);
+                      while (!gate.released.load() &&
+                             std::chrono::steady_clock::now() < deadline)
+                          std::this_thread::yield();
+                  },
+                  &gate),
+              cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(source_, 0x5a, kBufferLength, producer_stream.get()),
+        cudaSuccess);
+    ASSERT_EQ(cudaEventRecord(producer_event, producer_stream.get()),
+              cudaSuccess);
+
+    auto req = request();
+    req.producer_event = producer_event;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {req}).ok());
+    TransferStatus before_release{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch_, 0, before_release).ok());
+    EXPECT_EQ(before_release.s, PENDING);
+    gate.released.store(true);
+    EXPECT_EQ(finish(0).s, COMPLETED);
+    expectPattern(target_, 0x5a);
+    EXPECT_EQ(cudaEventDestroy(producer_event), cudaSuccess);
+}
+
 TEST_F(MnnvlCompletionTest, FailedValidationPreservesEarlierTasks) {
     ASSERT_EQ(cudaMemset(source_, 0x12, kBufferLength), cudaSuccess);
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request()}).ok());

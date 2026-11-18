@@ -273,6 +273,9 @@ Status ConfigHelper::loadFromEnv(Config& config) {
                   "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
                   "transports/rdma/strict_local_numa");
+    // Same-name remote NIC affinity. Workers read this key when selecting.
+    setBoolConfig(config, "MC_ENABLE_DEST_DEVICE_AFFINITY",
+                  "transports/rdma/dest_device_affinity");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works

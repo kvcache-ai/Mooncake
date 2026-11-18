@@ -1,0 +1,5 @@
+#pragma once
+
+#define MOONCAKE_EP_JIT_SOURCE_DIR ""
+#define MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR ""
+#define MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR ""

@@ -96,6 +96,7 @@ struct SelectionContext {
     // Only XpuTransport may carry the request: the device memory has neither
     // a dma-buf RDMA registration nor a host staging route.
     bool xpu_ipc_only{false};
+    bool rdma_device_direct{true};
 };
 
 /**
