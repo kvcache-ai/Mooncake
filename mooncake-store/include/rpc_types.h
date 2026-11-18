@@ -125,6 +125,7 @@ struct GetStorageConfigResponse {
     std::string fsdir;
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    struct_pack::compatible<bool, 1> requires_versioned_local_disk;
 
     GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
@@ -133,7 +134,8 @@ struct GetStorageConfigResponse {
           enable_disk_eviction(enable_eviction),
           quota_bytes(quota) {}
 };
-YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
+         requires_versioned_local_disk);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;

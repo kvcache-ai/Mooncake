@@ -4437,9 +4437,9 @@ WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
-    bool enable_offloading) {
-    auto response =
-        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+    bool enable_offloading, bool supports_versioned_offload) {
+    auto response = master_client_.MountLocalDiskSegment(
+        client_id_, enable_offloading, supports_versioned_offload);
 
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "

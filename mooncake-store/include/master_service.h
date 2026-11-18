@@ -729,7 +729,8 @@ class MasterService {
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
+    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading,
+                               bool versioned = false)
         -> tl::expected<void, ErrorCode>;
 
     /**
