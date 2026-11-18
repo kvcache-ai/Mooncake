@@ -68,7 +68,8 @@ tl::expected<void, ErrorCode> MasterService::WaitObjectDurable(
 tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
 MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
                                  OpLogEntry entry,
-                                 DurableFinalizeCallback callback) {
+                                 DurableFinalizeCallback callback,
+                                 uint64_t* object_sequence) {
     if (!object_uploads_ ||
         (entry.op_type != OpType::OBJECT_STORAGE_MUTATION &&
          entry.op_type != OpType::REMOVE && entry.op_type != OpType::PUT_END &&
@@ -195,7 +196,7 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
     if (!object_uploads_->ApplyObjectReplicaMutation(
             entry.tenant_id, entry.object_key, mutation))
         throw std::logic_error("Validated object record transition failed");
-    object_storage_last_sequence_ = pending->sequence_id();
+    if (object_sequence) *object_sequence = pending->sequence_id();
     for (const auto& record : mutation.records)
         object_upload_sequences_[record.object.object_key] =
             pending->sequence_id();
@@ -375,14 +376,6 @@ auto MasterService::PutEnd(const UUID& writer, const ObjectMeta& meta,
     -> tl::expected<void, ErrorCode> {
     if (meta.object_storage_target)
         return CommitObjectStorage(writer, meta, tenant, type);
-    // Object writes cannot bypass their exact-attempt completion protocol.
-    if (object_uploads_) {
-        std::shared_lock lock(master_state_mutex_);
-        MetadataAccessorRW accessor(
-            this, MakeObjectIdentityForRequest(meta.key, tenant));
-        if (accessor.Exists() && accessor.Get().object_storage_write_attempt)
-            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    }
     return PutEndImpl(writer, meta, tenant, type);
 }
 
@@ -753,13 +746,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
     {
         std::lock_guard lock(object_storage_mutex_);
         object_upload_sequences_.clear();
-        object_storage_last_sequence_ = 0;
         object_pending_deadlines_.clear();
         object_work_.clear();
     }
     if (!snapshot.target) return {};
     const auto deadline = ObjectNowMs() + default_kv_lease_ttl_;
+    uint64_t pending_sequence = 0;
+    size_t pending_count = 0;
     for (auto record : snapshot.records) {
+        if (pending_count && pending_count >= oplog_batch_max_entries_) {
+            auto durable = WaitObjectDurable(pending_sequence);
+            if (!durable) return durable;
+            pending_count = 0;
+        }
         std::shared_lock lock(master_state_mutex_);
         MetadataAccessorRW accessor(this,
                                     {TenantId(record.tenant_id), record.key});
@@ -794,24 +793,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
             OpType::OBJECT_STORAGE_MUTATION, record.tenant_id, record.key,
             EncodeObjectMutation(mutation), {});
         if (!appended) return tl::make_unexpected(appended.error());
+        pending_sequence = appended->sequence_id;
+        ++pending_count;
     }
+    if (pending_count) return WaitObjectDurable(pending_sequence);
     return {};
 }
-tl::expected<void, ErrorCode> MasterService::AwaitObjectMutations() {
-    uint64_t sequence;
-    {
-        std::lock_guard lock(object_storage_mutex_);
-        sequence = object_storage_last_sequence_;
-    }
-    return sequence ? WaitObjectDurable(sequence)
-                    : tl::expected<void, ErrorCode>{};
-}
-
 auto MasterService::RemoveObject(const std::string& key, const TenantId& tenant,
                                  bool force, bool allow_managed)
     -> tl::expected<void, ErrorCode> {
-    auto result = RemoveObjectImpl(key, tenant, force, allow_managed);
-    if (result && object_uploads_) return AwaitObjectMutations();
+    uint64_t sequence = 0;
+    auto result = RemoveObjectImpl(key, tenant, force, allow_managed, sequence);
+    if (result && sequence) return WaitObjectDurable(sequence);
     return result;
 }
 }  // namespace mooncake

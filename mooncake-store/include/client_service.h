@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -1056,8 +1057,8 @@ class Client {
     std::shared_ptr<ObjectStorageBackend> object_storage_backend_;
     std::string object_storage_namespace_;
     std::mutex object_storage_completions_mutex_;
-    std::unordered_map<std::string, ObjectUploadOutcome>
-        object_storage_completions_;
+    std::map<std::string, ObjectUploadOutcome> object_storage_completions_;
+    std::string last_polled_object_;  // Owned by the task poll thread.
 
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,

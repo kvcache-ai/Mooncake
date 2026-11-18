@@ -1381,7 +1381,7 @@ class MasterService {
     // and the object with them.
     tl::expected<void, ErrorCode> MarkRemovedAndPersist(
         const TenantId& tenant_id, const std::string& key,
-        ObjectMetadata& metadata);
+        ObjectMetadata& metadata, uint64_t& object_sequence);
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.
@@ -1389,6 +1389,7 @@ class MasterService {
         const ObjectMetadata& metadata, const route::ObjectState& state,
         bool force, std::chrono::system_clock::time_point now);
     struct RemoveResult {
+        uint64_t object_sequence{0};
         long removed_count{0};
         int64_t freed_bytes{0};
         // Whether the walk reached any object, and whether it left any
@@ -2306,10 +2307,8 @@ class MasterService {
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
-    tl::expected<void, ErrorCode> AwaitObjectMutations();
-    auto RemoveObjectImpl(const std::string&, const TenantId&, bool, bool)
-        -> tl::expected<void, ErrorCode>;
-    uint64_t object_storage_last_sequence_{0};
+    auto RemoveObjectImpl(const std::string&, const TenantId&, bool, bool,
+                          uint64_t&) -> tl::expected<void, ErrorCode>;
     ObjectStorageConfig object_storage_config_;
     std::shared_ptr<ObjectStorageAdapter> object_storage_adapter_;
     std::unique_ptr<StandbyMetadataStore> object_uploads_;
@@ -2344,7 +2343,8 @@ class MasterService {
     tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t);
     tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
     CommitObjectAware(OrderedOpLogWriter::Reservation&&, OpLogEntry,
-                      DurableFinalizeCallback);
+                      DurableFinalizeCallback,
+                      uint64_t* object_sequence = nullptr);
     auto PutStartImpl(const UUID&, const std::string&, const TenantId&,
                       uint64_t, const ReplicateConfig&)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -2379,7 +2379,8 @@ class MasterService {
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
         OrderedOpLogWriter::Reservation&& reservation, OpType type,
         const std::string& tenant_id, const std::string& key,
-        const std::string& payload, DurableFinalizeCallback callback);
+        const std::string& payload, DurableFinalizeCallback callback,
+        uint64_t* object_sequence = nullptr);
 
     // Standby-restored memory endpoints remain unreadable until the owning
     // Client has successfully remounted them.

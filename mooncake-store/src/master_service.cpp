@@ -4353,6 +4353,7 @@ auto MasterService::BatchReplicaClear(
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     std::vector<std::string> cleared_keys;
+    uint64_t object_sequence = 0;
     cleared_keys.reserve(object_keys.size());
     const bool clear_all_segments = segment_name.empty();
     const TenantId requested_tenant(tenant_id);
@@ -4427,7 +4428,8 @@ auto MasterService::BatchReplicaClear(
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
                                     durable_entry, removed_ids);
-                            });
+                            },
+                            &object_sequence);
                     if (!persist_result) {
                         continue;
                     }
@@ -4500,7 +4502,8 @@ auto MasterService::BatchReplicaClear(
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
                                     durable_entry, removed_ids);
-                            });
+                            },
+                            &object_sequence);
                     } else {
                         persist_result = AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::PUT_END,
@@ -4511,7 +4514,8 @@ auto MasterService::BatchReplicaClear(
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
                                     durable_entry, removed_ids);
-                            });
+                            },
+                            &object_sequence);
                     }
                     if (!persist_result) {
                         continue;
@@ -4545,8 +4549,8 @@ auto MasterService::BatchReplicaClear(
     }
 
     shared_lock.unlock();
-    if (object_uploads_) {
-        auto durable = AwaitObjectMutations();
+    if (object_sequence) {
+        auto durable = WaitObjectDurable(object_sequence);
         if (!durable) return tl::make_unexpected(durable.error());
     }
     return cleared_keys;
@@ -5447,6 +5451,10 @@ auto MasterService::PutEndImpl(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
+    const auto& attempt = metadata.object_storage_write_attempt;
+    if (attempt.has_value() != object_meta.object_storage_target.has_value() ||
+        (attempt && *attempt != *object_meta.object_storage_target))
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
@@ -5676,6 +5684,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
+    // A key-only rescan may describe an older value even after this write
+    // commits. Skip its disk replica and let the rest of the scan continue.
+    if (metadata.object_storage_write_attempt) return false;
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
@@ -7345,7 +7356,8 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
 
 auto MasterService::RemoveObjectImpl(const std::string& key,
                                      const TenantId& tenant_id, bool force,
-                                     bool allow_managed_weight)
+                                     bool allow_managed_weight,
+                                     uint64_t& object_sequence)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -7368,15 +7380,16 @@ auto MasterService::RemoveObjectImpl(const std::string& key,
     }
 
     if (enable_ha_ && enable_oplog_) {
-        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
+        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata,
+                                     object_sequence);
     }
     accessor.Erase();
     return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
-    const TenantId& tenant_id, const std::string& key,
-    ObjectMetadata& metadata) {
+    const TenantId& tenant_id, const std::string& key, ObjectMetadata& metadata,
+    uint64_t& object_sequence) {
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
@@ -7392,7 +7405,8 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
         [this, removed_ids =
                    std::move(removed_ids)](const OpLogEntry& durable_entry) {
             FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
-        });
+        },
+        &object_sequence);
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
     }
@@ -7476,7 +7490,8 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
             metadata.TotalLength() *
             metadata.CountReplicas(&Replica::fn_is_memory_replica);
         if (enable_ha_ && enable_oplog_) {
-            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata)) {
+            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata,
+                                       result.object_sequence)) {
                 result.skipped_object = true;
                 continue;
             }
@@ -7513,14 +7528,15 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
             << ", removed_count=" << result.removed_count;
     shared_lock.unlock();
-    if (object_uploads_) {
-        auto durable = AwaitObjectMutations();
+    if (result.object_sequence) {
+        auto durable = WaitObjectDurable(result.object_sequence);
         if (!durable) return tl::make_unexpected(durable.error());
     }
     return result.removed_count;
 }
 
 long MasterService::RemoveAll(bool force) {
+    uint64_t object_sequence = 0;
     long removed_count = 0;
     int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -7542,6 +7558,7 @@ long MasterService::RemoveAll(bool force) {
                         metadata::Namespace& /*ns*/) {
         const RemoveResult result =
             RemoveTenantObjects(tenant_id, force, now, nullptr);
+        object_sequence = std::max(object_sequence, result.object_sequence);
         removed_count += result.removed_count;
         total_freed_size += result.freed_bytes;
         // Record the tenant only once the walk actually reached an object. A
@@ -7578,7 +7595,7 @@ long MasterService::RemoveAll(bool force) {
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     shared_lock.unlock();
-    if (object_uploads_ && !AwaitObjectMutations()) return -1;
+    if (object_sequence && !WaitObjectDurable(object_sequence)) return -1;
     return removed_count;
 }
 
@@ -7610,7 +7627,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             << ", removed_count=" << result.removed_count
             << ", total_freed_size=" << result.freed_bytes;
     shared_lock.unlock();
-    if (object_uploads_ && !AwaitObjectMutations()) return -1;
+    if (result.object_sequence && !WaitObjectDurable(result.object_sequence))
+        return -1;
     return result.removed_count;
 }
 
@@ -7622,6 +7640,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
+    std::vector<std::pair<size_t, uint64_t>> object_removals;
     const auto now = std::chrono::system_clock::now();
     for (size_t original_idx = 0; original_idx < keys.size(); ++original_idx) {
         const std::string& key = keys[original_idx];
@@ -7684,8 +7703,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         }
 
         if (enable_ha_ && enable_oplog_) {
-            results[original_idx] =
-                MarkRemovedAndPersist(normalized_tenant, key, metadata);
+            uint64_t object_sequence = 0;
+            results[original_idx] = MarkRemovedAndPersist(
+                normalized_tenant, key, metadata, object_sequence);
+            if (object_sequence)
+                object_removals.emplace_back(original_idx, object_sequence);
             continue;
         }
         accessor.Erase();
@@ -7693,11 +7715,13 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     }
 
     snapshot_lock.unlock();
-    if (object_uploads_) {
-        auto durable = AwaitObjectMutations();
-        if (!durable)
-            for (auto& result : results)
-                if (result) result = tl::make_unexpected(durable.error());
+    // A durable prefix covers all earlier removals. If the writer stopped
+    // partway through the batch, report failure only for its undurable tail.
+    for (auto it = object_removals.rbegin(); it != object_removals.rend();
+         ++it) {
+        auto durable = WaitObjectDurable(it->second);
+        if (durable) break;
+        results[it->first] = tl::make_unexpected(durable.error());
     }
     return results;
 }
@@ -11838,7 +11862,8 @@ tl::expected<OpLogEntry, ErrorCode>
 MasterService::AppendReservedOpLogWithDurableFinalize(
     OrderedOpLogWriter::Reservation&& reservation, OpType type,
     const std::string& tenant_id, const std::string& key,
-    const std::string& payload, DurableFinalizeCallback callback) {
+    const std::string& payload, DurableFinalizeCallback callback,
+    uint64_t* object_sequence) {
     if (!enable_oplog_) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -11853,8 +11878,8 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
     entry.tenant_id = resolved_tenant.value();
     entry.object_key = key;
     entry.payload = payload;
-    auto pending =
-        CommitObjectAware(std::move(reservation), entry, std::move(callback));
+    auto pending = CommitObjectAware(std::move(reservation), entry,
+                                     std::move(callback), object_sequence);
     if (!pending) {
         return tl::unexpected(pending.error());
     }

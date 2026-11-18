@@ -91,15 +91,24 @@ void Client::AcknowledgeObjectStorageWrite(
 }
 void Client::PollObjectStorage() {
     if (!object_storage_backend_) return;
-    std::unordered_map<std::string, ObjectUploadOutcome> pending;
+    std::vector<std::pair<std::string, ObjectUploadOutcome>> pending;
     {
         std::lock_guard lock(object_storage_completions_mutex_);
-        pending.swap(object_storage_completions_);
+        auto it = object_storage_completions_.upper_bound(last_polled_object_);
+        const auto count =
+            std::min(kTaskBatchSize, object_storage_completions_.size());
+        for (size_t i = 0; i < count; ++i) {
+            if (it == object_storage_completions_.end())
+                it = object_storage_completions_.begin();
+            pending.push_back(*it++);
+        }
     }
     for (const auto& [name, outcome] : pending) {
-        if (!master_client_.FinishObjectStorageUpload(name, outcome)) {
+        if (!task_poll_running_.load()) break;
+        last_polled_object_ = name;
+        if (master_client_.FinishObjectStorageUpload(name, outcome)) {
             std::lock_guard lock(object_storage_completions_mutex_);
-            object_storage_completions_.emplace(name, outcome);
+            object_storage_completions_.erase(name);
         }
     }
 }
