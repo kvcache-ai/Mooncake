@@ -256,18 +256,30 @@ namespace tent {
 namespace {
 
 const char* kEnvKeys[] = {
+    "MC_ASCEND_TRANSFER_TIMEOUT",
     "ASCEND_TRANSFER_TIMEOUT",
+    "MC_ASCEND_LOCAL_COMM_RES",
     "ASCEND_LOCAL_COMM_RES",
+    "MC_ASCEND_ENABLE_USE_FABRIC_MEM",
     "ASCEND_ENABLE_USE_FABRIC_MEM",
+    "MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
     "ASCEND_GLOBAL_RESOURCE_CONFIG",
+    "MC_ASCEND_RDMA_TC",
     "ASCEND_RDMA_TC",
+    "MC_ASCEND_RDMA_SL",
     "ASCEND_RDMA_SL",
     "HCCL_RDMA_TC",
     "HCCL_RDMA_SL",
     "HCCL_INTRA_ROCE_ENABLE",
+    "MC_ASCEND_BASE_PORT",
     "ASCEND_BASE_PORT",
+    "MC_ASCEND_THREAD_POOL_SIZE",
+    "ASCEND_THREAD_POOL_SIZE",
+    "MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
     "ASCEND_STANDALONE_SINGLE_SEGMENT",
+    "MC_ASCEND_BUFFER_POOL",
     "ASCEND_BUFFER_POOL",
+    "MC_ASCEND_USE_SHMEM",
     "ASCEND_USE_SHMEM",
 };
 
@@ -594,6 +606,66 @@ TEST_F(AscendDirectTransportTest, TimeoutMsFromEnv) {
     setenv("ASCEND_TRANSFER_TIMEOUT", "2500", 1);
     auto options = LoadAscendDirectOptions(nullptr);
     EXPECT_EQ(options.transfer_timeout_ms, 2500);
+    setenv("MC_ASCEND_TRANSFER_TIMEOUT", "3500", 1);
+    options = LoadAscendDirectOptions(nullptr);
+    EXPECT_EQ(options.transfer_timeout_ms, 3500);
+}
+
+TEST_F(AscendDirectTransportTest, ThreadPoolSizeAndBasePortFromEnvAndConfig) {
+    auto defaults = LoadAscendDirectOptions(nullptr);
+    EXPECT_EQ(defaults.thread_pool_size, kAscendDefaultThreadPoolSize);
+    EXPECT_EQ(defaults.base_port, kAscendDefaultBasePort);
+
+    setenv("ASCEND_THREAD_POOL_SIZE", "8", 1);
+    setenv("ASCEND_BASE_PORT", "21000", 1);
+    auto legacy = LoadAscendDirectOptions(nullptr);
+    EXPECT_EQ(legacy.thread_pool_size, 8u);
+    EXPECT_EQ(legacy.base_port, 21000);
+
+    setenv("MC_ASCEND_THREAD_POOL_SIZE", "24", 1);
+    setenv("MC_ASCEND_BASE_PORT", "22000", 1);
+    auto mc = LoadAscendDirectOptions(nullptr);
+    EXPECT_EQ(mc.thread_pool_size, 24u);
+    EXPECT_EQ(mc.base_port, 22000);
+
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/thread_pool_size", 4);
+    conf->set("transports/ascend_direct/base_port", 23000);
+    auto from_conf = LoadAscendDirectOptions(conf);
+    EXPECT_EQ(from_conf.thread_pool_size, 4u);
+    EXPECT_EQ(from_conf.base_port, 23000);
+
+    setenv("MC_ASCEND_THREAD_POOL_SIZE", "0", 1);
+    EXPECT_EQ(LoadAscendDirectOptions(nullptr).thread_pool_size,
+              kAscendDefaultThreadPoolSize);
+    setenv("MC_ASCEND_THREAD_POOL_SIZE", "33", 1);
+    EXPECT_EQ(LoadAscendDirectOptions(nullptr).thread_pool_size,
+              kAscendDefaultThreadPoolSize);
+}
+
+TEST_F(AscendDirectTransportTest, McAscendEnvPrecedenceForOptions) {
+    setenv("ASCEND_LOCAL_COMM_RES", R"({"version":"1.2"})", 1);
+    setenv("MC_ASCEND_LOCAL_COMM_RES", R"({"version":"1.5"})", 1);
+    setenv("ASCEND_RDMA_TC", "10", 1);
+    setenv("MC_ASCEND_RDMA_TC", "20", 1);
+    setenv("ASCEND_RDMA_SL", "1", 1);
+    setenv("MC_ASCEND_RDMA_SL", "2", 1);
+    setenv("ASCEND_USE_SHMEM", "0", 1);
+    setenv("MC_ASCEND_USE_SHMEM", "1", 1);
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    setenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0", 1);
+    setenv("MC_ASCEND_ENABLE_USE_FABRIC_MEM", "1", 1);
+
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/store_te_init", true);
+    auto opts = LoadAscendDirectOptions(conf);
+    EXPECT_EQ(opts.local_comm_res, R"({"version":"1.5"})");
+    EXPECT_EQ(opts.rdma_tc, "20");
+    EXPECT_EQ(opts.rdma_sl, "2");
+    EXPECT_TRUE(opts.use_shmem);
+    EXPECT_TRUE(opts.standalone_single_segment);
+    EXPECT_TRUE(opts.use_fabric_mem);
 }
 
 TEST_F(AscendDirectTransportTest, BuildHixlInitOptionsNeverSetsBufferPool) {
@@ -1802,13 +1874,13 @@ TEST_F(AscendDirectTransportTest, SingleSegmentRejectsBufferPool) {
     auto conf = std::make_shared<Config>();
     conf->set("transports/ascend_direct/agent_mode", true);
     ASSERT_TRUE(Install(conf).ok());
-    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    setenv("MC_ASCEND_BUFFER_POOL", "4:8", 1);
     std::vector<BufferDesc> buffers(1);
     buffers[0].addr = 0x55000;
     buffers[0].length = 4096;
     buffers[0].location = "*";
     EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
-    unsetenv("ASCEND_BUFFER_POOL");
+    unsetenv("MC_ASCEND_BUFFER_POOL");
     EXPECT_EQ(state_->register_calls, 0);
 }
 

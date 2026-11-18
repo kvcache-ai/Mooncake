@@ -49,20 +49,6 @@ namespace tent {
 
 namespace {
 
-bool EnvFlagEnabled(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0') {
-        return false;
-    }
-    std::string text(value);
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return text == "1" || text == "true" || text == "yes" || text == "on";
-}
-
-}  // namespace
-namespace {
-
 constexpr int64_t kMillisToNano = 1000000;
 constexpr int kMaxHixlInitAttempts = 4;
 // Monotonic nanoseconds for queued-timeout/cache windows. CLOCK_REALTIME can
@@ -73,16 +59,9 @@ int64_t SteadyTimeInNano() {
         .count();
 }
 
-// Workers that hand remote groups to HIXL, and workers that issue one local
-// copy stream each. Both are compile-time constants on purpose so every engine
-// gets the same layout regardless of configuration. Sixteen transfer workers
-// per engine match the classic Ascend transport's per-device dispatch pool
-// (DefaultSliceDispatcher's kDefaultThreadPoolSize), so both transports expose
-// the same submission concurrency for the same NPU layout.
-// One copy worker per stream matches LocalCopyEngine's six streams, so a group
-// spread over them issues in parallel instead of serializing inside the pool.
-// Keep the two counts in sync.
-constexpr size_t kTransferThreadsPerEngine = 16;
+// Workers that issue one local copy stream each. One copy worker per stream
+// matches LocalCopyEngine's six streams, so a group spread over them issues in
+// parallel instead of serializing inside the pool. Keep the two counts in sync.
 constexpr size_t kCopyThreadsPerEngine = 6;
 // Every task of a remote group shares one HIXL request, and HIXL serializes
 // status queries per peer. Querying that request once per task would spend the
@@ -270,11 +249,10 @@ Status AscendDirectTransport::install(std::string& local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     options_ = LoadAscendDirectOptions(conf_);
-    use_shmem_ = EnvFlagEnabled("ASCEND_USE_SHMEM");
+    use_shmem_ = options_.use_shmem;
     // Latched with the allocator flags below. Default off; registration also
     // requires agent_mode and remote access.
-    standalone_single_segment_ =
-        ParseEnvEnabled("ASCEND_STANDALONE_SINGLE_SEGMENT");
+    standalone_single_segment_ = options_.standalone_single_segment;
     auto cann_status = CheckCannVersion();
     if (!cann_status.ok()) {
         return cann_status;
@@ -285,7 +263,7 @@ Status AscendDirectTransport::install(std::string& local_segment_name,
     // reading globalConfig() live, which takes precedence over these.
     mooncake::ascend_allocator_set_runtime_flags(
         options_.agent_mode, options_.use_fabric_mem,
-        ParseEnvEnabled("ASCEND_STANDALONE_SINGLE_SEGMENT"));
+        options_.standalone_single_segment);
 #endif
     init_options_ = BuildHixlInitOptions(options_);
     transfer_timeout_ns_ =
@@ -309,7 +287,8 @@ Status AscendDirectTransport::install(std::string& local_segment_name,
               << " agent_mode=" << options_.agent_mode
               << " fabric_mem=" << options_.use_fabric_mem
               << " roce_mode=" << options_.roce_mode
-              << " timeout_ms=" << options_.transfer_timeout_ms;
+              << " timeout_ms=" << options_.transfer_timeout_ms
+              << " thread_pool_size=" << options_.thread_pool_size;
     return Status::OK();
 }
 
@@ -434,7 +413,7 @@ void AscendDirectTransport::startPools(
         }
         const std::string index = std::to_string(i);
         transfer_pools_.push_back(std::make_unique<AscendThreadPool>(
-            kTransferThreadsPerEngine, "tw" + index + "-", cpus));
+            options_.thread_pool_size, "tw" + index + "-", cpus));
         copy_pools_.push_back(std::make_unique<AscendThreadPool>(
             kCopyThreadsPerEngine, "tc" + index + "-", cpus));
         AscendThreadPool* copy_pool = copy_pools_.back().get();
@@ -1554,13 +1533,15 @@ Status AscendDirectTransport::addMemoryBuffer(
             registered.push_back(reinterpret_cast<void*>(desc.addr));
             continue;
         }
-        const char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+        const char* buffer_pool =
+            GetAscendEnv("MC_ASCEND_BUFFER_POOL", "ASCEND_BUFFER_POOL");
         if (buffer_pool != nullptr && buffer_pool[0] != '\0' &&
             std::strcmp(buffer_pool, "0:0") != 0) {
             rollback(registered);
             return Status::InvalidArgument(
+                "MC_ASCEND_STANDALONE_SINGLE_SEGMENT/"
                 "ASCEND_STANDALONE_SINGLE_SEGMENT requires "
-                "ASCEND_BUFFER_POOL=0:0" LOC_MARK);
+                "MC_ASCEND_BUFFER_POOL/ASCEND_BUFFER_POOL=0:0" LOC_MARK);
         }
         bool host =
             IsHostMem(desc.location, reinterpret_cast<void*>(desc.addr));

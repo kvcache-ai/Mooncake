@@ -27,6 +27,7 @@ namespace mooncake {
 namespace {
 
 TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
     unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
     GlobalConfig defaults;
     loadGlobalConfig(defaults);
@@ -38,6 +39,20 @@ TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
         EXPECT_EQ(config.ascend_standalone_single_segment,
                   std::string(value) == "1" || std::string(value) == "true");
     }
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    GlobalConfig mc_override;
+    loadGlobalConfig(mc_override);
+    EXPECT_TRUE(mc_override.ascend_standalone_single_segment);
+
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    GlobalConfig mc_disable;
+    mc_disable.ascend_standalone_single_segment = true;
+    loadGlobalConfig(mc_disable);
+    EXPECT_FALSE(mc_disable.ascend_standalone_single_segment);
+
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
     unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
 }
 

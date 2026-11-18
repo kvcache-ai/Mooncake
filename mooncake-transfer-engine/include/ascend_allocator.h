@@ -23,7 +23,7 @@ void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
                                           AscendConfigBoolFn use_fabric_mem);
 
 // Independent of the two switches above. Priority matches them: this provider,
-// then the runtime flag, then ASCEND_STANDALONE_SINGLE_SEGMENT.
+// then the runtime flag, defaulting to false.
 void ascend_allocator_set_single_segment_provider(AscendConfigBoolFn fn);
 
 // Set the fallback switches used when no config provider is registered.

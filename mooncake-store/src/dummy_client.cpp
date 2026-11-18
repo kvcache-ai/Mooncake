@@ -8,6 +8,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
@@ -496,10 +497,15 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
-    const char* use_fabric_mem_env =
-        std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
-    if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
-        globalConfig().ascend_use_fabric_mem = true;
+    const char* use_fabric_mem_env = getEnvWithFallback(
+        "MC_ASCEND_ENABLE_USE_FABRIC_MEM", "ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (use_fabric_mem_env) {
+        std::string val(use_fabric_mem_env);
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (val == "1" || val == "true") {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
     }
 
     void* base_addr = nullptr;

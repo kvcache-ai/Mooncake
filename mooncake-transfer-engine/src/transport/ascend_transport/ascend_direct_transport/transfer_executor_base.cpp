@@ -39,8 +39,8 @@ namespace mooncake {
 
 namespace {
 
-bool EnvFlagEnabled(const char* name) {
-    const char* value = std::getenv(name);
+bool EnvFlagEnabled(const char* primary, const char* fallback = nullptr) {
+    const char* value = getEnvWithFallback(primary, fallback);
     if (value == nullptr || *value == '\0') {
         return false;
     }
@@ -117,7 +117,7 @@ TransferExecutorBase::TransferExecutorBase(const InitParams& params)
     : params_(params),
       local_engine_contexts_(params.local_engine_contexts),
       metadata_(params.metadata) {
-    use_shmem_ = EnvFlagEnabled("ASCEND_USE_SHMEM");
+    use_shmem_ = EnvFlagEnabled("MC_ASCEND_USE_SHMEM", "ASCEND_USE_SHMEM");
 }
 
 TransferExecutorBase::~TransferExecutorBase() = default;
@@ -133,7 +133,8 @@ std::unique_ptr<TransferExecutorBase> TransferExecutorBase::Create(
 }
 
 void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
-    char* connect_timeout_str = std::getenv("ASCEND_CONNECT_TIMEOUT");
+    const char* connect_timeout_str = getEnvWithFallback(
+        "MC_ASCEND_CONNECT_TIMEOUT", "ASCEND_CONNECT_TIMEOUT");
     if (connect_timeout_str) {
         auto connect_timeout = parseFromString<int32_t>(connect_timeout_str);
         if (connect_timeout.has_value()) {
@@ -141,7 +142,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
             LOG(INFO) << "Set connection timeout to:" << params.connect_timeout;
         }
     }
-    char* transfer_timeout_str = std::getenv("ASCEND_TRANSFER_TIMEOUT");
+    const char* transfer_timeout_str = getEnvWithFallback(
+        "MC_ASCEND_TRANSFER_TIMEOUT", "ASCEND_TRANSFER_TIMEOUT");
     if (transfer_timeout_str) {
         auto transfer_timeout = parseFromString<int32_t>(transfer_timeout_str);
         if (transfer_timeout.has_value()) {
@@ -189,7 +191,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
                    "MC_TRANSFER_TIMEOUT or lower ASCEND_TRANSFER_TIMEOUT.";
         }
     }
-    char* use_short_connection_str = std::getenv("ASCEND_USE_SHORT_CONNECTION");
+    const char* use_short_connection_str = getEnvWithFallback(
+        "MC_ASCEND_USE_SHORT_CONNECTION", "ASCEND_USE_SHORT_CONNECTION");
     if (use_short_connection_str) {
         auto use_short_connection =
             parseFromString<int32_t>(use_short_connection_str);
@@ -200,20 +203,29 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
                       << params.use_short_connection;
         }
     }
-    char* use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
+    const char* use_async = getEnvWithFallback("MC_ASCEND_USE_ASYNC_TRANSFER",
+                                               "ASCEND_USE_ASYNC_TRANSFER");
     if (use_async) {
-        params.use_async_transfer = true;
+        std::string text(use_async);
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (text != "0" && text != "false" && text != "off" && text != "no") {
+            params.use_async_transfer = true;
+        }
     }
-    char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
+    const char* auto_connect =
+        getEnvWithFallback("MC_ASCEND_AUTO_CONNECT", "ASCEND_AUTO_CONNECT");
     if (auto_connect) {
         auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
         if (!auto_connect_opt.has_value()) {
-            LOG(WARNING) << "ASCEND_AUTO_CONNECT is not valid, value:"
+            LOG(WARNING) << "MC_ASCEND_AUTO_CONNECT/ASCEND_AUTO_CONNECT is not "
+                            "valid, value:"
                          << auto_connect << ", defaulting to disabled";
             params.auto_connect = false;
         } else {
             params.auto_connect = (*auto_connect_opt == 1);
-            LOG(INFO) << "Set auto_connect from ASCEND_AUTO_CONNECT to: "
+            LOG(INFO) << "Set auto_connect from "
+                         "MC_ASCEND_AUTO_CONNECT/ASCEND_AUTO_CONNECT to: "
                       << *auto_connect_opt;
         }
     } else if (adxl::IsAdxlFeatureSupported(adxl::AUTO_CONNECT)) {
@@ -222,7 +234,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     }
     params.client_server_mode =
         adxl::IsAdxlFeatureSupported(adxl::CLIENT_SERVER_COMM);
-    char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+    const char* buffer_pool =
+        getEnvWithFallback("MC_ASCEND_BUFFER_POOL", "ASCEND_BUFFER_POOL");
     if (buffer_pool && std::strcmp(buffer_pool, "0:0") != 0) {
         params.use_buffer_pool = true;
     }
@@ -272,29 +285,26 @@ int TransferExecutorBase::initEngines() {
     }
 
     std::map<adxl::AscendString, adxl::AscendString> options;
-    char* rdma_tc = std::getenv("ASCEND_RDMA_TC");
+    const char* rdma_tc =
+        getEnvWithFallback("MC_ASCEND_RDMA_TC", "ASCEND_RDMA_TC");
+    if (!rdma_tc) {
+        rdma_tc = std::getenv("HCCL_RDMA_TC");
+    }
     if (rdma_tc) {
         options["adxl.RdmaTrafficClass"] = rdma_tc;
         LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc;
-    } else {
-        rdma_tc = std::getenv("HCCL_RDMA_TC");
-        if (rdma_tc) {
-            options["adxl.RdmaTrafficClass"] = rdma_tc;
-            LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc;
-        }
     }
-    char* rdma_sl = std::getenv("ASCEND_RDMA_SL");
+    const char* rdma_sl =
+        getEnvWithFallback("MC_ASCEND_RDMA_SL", "ASCEND_RDMA_SL");
+    if (!rdma_sl) {
+        rdma_sl = std::getenv("HCCL_RDMA_SL");
+    }
     if (rdma_sl) {
         options["adxl.RdmaServiceLevel"] = rdma_sl;
         LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
-    } else {
-        rdma_sl = std::getenv("HCCL_RDMA_SL");
-        if (rdma_sl) {
-            options["adxl.RdmaServiceLevel"] = rdma_sl;
-            LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
-        }
     }
-    char* local_comm_res = std::getenv("ASCEND_LOCAL_COMM_RES");
+    const char* local_comm_res =
+        getEnvWithFallback("MC_ASCEND_LOCAL_COMM_RES", "ASCEND_LOCAL_COMM_RES");
     if (local_comm_res) {
         options["adxl.LocalCommRes"] = local_comm_res;
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
@@ -305,7 +315,8 @@ int TransferExecutorBase::initEngines() {
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
 
     options["adxl.BufferPool"] = "0:0";
-    char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+    const char* buffer_pool =
+        getEnvWithFallback("MC_ASCEND_BUFFER_POOL", "ASCEND_BUFFER_POOL");
     if (buffer_pool) {
         options["adxl.BufferPool"] = buffer_pool;
         if (std::strcmp(buffer_pool, "0:0") != 0) {
@@ -324,7 +335,8 @@ int TransferExecutorBase::initEngines() {
 
     const char* store_te =
         globalConfig().ascend_store_te_init ? "true" : "false";
-    char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    const char* global_resource_config = getEnvWithFallback(
+        "MC_ASCEND_GLOBAL_RESOURCE_CONFIG", "ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved_resource_config =
         ResolveAscendGlobalResourceConfig(global_resource_config);
     // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON

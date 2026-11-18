@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -266,6 +267,17 @@ uint16_t getDefaultHandshakePort();
 // Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
 std::pair<int, int> ValidatePortRange(int min_port, int max_port,
                                       int default_min, int default_max);
+
+// Returns the primary environment variable when set and non-empty, otherwise
+// falls back to the legacy environment variable name.
+inline const char* getEnvWithFallback(const char* primary,
+                                      const char* fallback) {
+    const char* value = primary != nullptr ? std::getenv(primary) : nullptr;
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return fallback != nullptr ? std::getenv(fallback) : nullptr;
+}
 
 }  // namespace mooncake
 

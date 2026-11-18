@@ -213,7 +213,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // subtree.
     hccs_device_protocol_ = HasHccsDeviceProtocolDescInGlobalResourceConfig(
         ResolveAscendGlobalResourceConfig(
-            std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+            getEnvWithFallback("MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+                               "ASCEND_GLOBAL_RESOURCE_CONFIG"))
             .c_str());
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
@@ -225,7 +226,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
                       : "");
-    char* adxl_base_port = std::getenv("ASCEND_BASE_PORT");
+    const char* adxl_base_port =
+        getEnvWithFallback("MC_ASCEND_BASE_PORT", "ASCEND_BASE_PORT");
     if (adxl_base_port) {
         std::optional<int32_t> base_port =
             parseFromString<int32_t>(adxl_base_port);
@@ -233,7 +235,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
             base_port_ = base_port.value();
             LOG(INFO) << "Set base port to:" << base_port_;
         } else {
-            LOG(WARNING) << "ASCEND_BASE_PORT is not valid, value:"
+            LOG(WARNING) << "MC_ASCEND_BASE_PORT/ASCEND_BASE_PORT is not "
+                            "valid, value:"
                          << adxl_base_port;
         }
     }
@@ -442,8 +445,9 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
     const bool all_engines = single_segment_ && remote_accessible;
     if (all_engines) {
         if (transfer_executor_->getUseBufferPool()) {
-            LOG(ERROR) << "ASCEND_STANDALONE_SINGLE_SEGMENT requires "
-                          "ASCEND_BUFFER_POOL=0:0";
+            LOG(ERROR) << "MC_ASCEND_STANDALONE_SINGLE_SEGMENT/"
+                          "ASCEND_STANDALONE_SINGLE_SEGMENT requires "
+                          "MC_ASCEND_BUFFER_POOL/ASCEND_BUFFER_POOL=0:0";
             return ERR_INVALID_ARGUMENT;
         }
         // Register once per engine, keeping every handle under this address.

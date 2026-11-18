@@ -967,6 +967,7 @@ class AscendDirectTransportTest : public ::testing::Test {
    protected:
     void SetUp() override {
         // Unit tests mock explicit Connect(); disable auto-connect by default.
+        unsetenv("MC_ASCEND_AUTO_CONNECT");
         setenv("ASCEND_AUTO_CONNECT", "0", 1);
         unsetenv("MC_CUSTOM_TOPO_JSON");
         mock_acl::reset();
@@ -993,9 +994,25 @@ class AscendDirectTransportTest : public ::testing::Test {
     void TearDown() override {
         globalConfig().ascend_standalone_single_segment = false;
         globalConfig().ascend_agent_mode = false;
+        unsetenv("MC_ASCEND_AUTO_CONNECT");
         unsetenv("ASCEND_AUTO_CONNECT");
         unsetenv("MC_CUSTOM_TOPO_JSON");
+        unsetenv("MC_ASCEND_GLOBAL_RESOURCE_CONFIG");
         unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+        unsetenv("MC_ASCEND_LOCAL_COMM_RES");
+        unsetenv("ASCEND_LOCAL_COMM_RES");
+        unsetenv("MC_ASCEND_RDMA_TC");
+        unsetenv("ASCEND_RDMA_TC");
+        unsetenv("MC_ASCEND_RDMA_SL");
+        unsetenv("ASCEND_RDMA_SL");
+        unsetenv("MC_ASCEND_BUFFER_POOL");
+        unsetenv("ASCEND_BUFFER_POOL");
+        unsetenv("MC_ASCEND_USE_ASYNC_TRANSFER");
+        unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+        unsetenv("MC_ASCEND_THREAD_POOL_SIZE");
+        unsetenv("ASCEND_THREAD_POOL_SIZE");
+        unsetenv("MC_ASCEND_BASE_PORT");
+        unsetenv("ASCEND_BASE_PORT");
         unsetenv("HCCL_INTRA_ROCE_ENABLE");
         ContextManager::getInstance().finalize();
         google::ShutdownGoogleLogging();
@@ -4243,6 +4260,25 @@ TEST_F(ClientServerModeTest, AcceptZeroBufferPoolInClientServerMode) {
     auto transport = createTransport();
     EXPECT_NE(transport, nullptr);
     unsetenv("ASCEND_BUFFER_POOL");
+}
+
+TEST_F(ClientServerModeTest, McAscendEnvTakesPrecedenceOverLegacy) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_LOCAL_COMM_RES", R"({"version":"1.2"})", 1);
+    setenv("MC_ASCEND_LOCAL_COMM_RES", R"({"version":"1.5"})", 1);
+    setenv("ASCEND_RDMA_TC", "10", 1);
+    setenv("MC_ASCEND_RDMA_TC", "20", 1);
+    setenv("ASCEND_RDMA_SL", "1", 1);
+    setenv("MC_ASCEND_RDMA_SL", "2", 1);
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    setenv("MC_ASCEND_BUFFER_POOL", "0:0", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    EXPECT_EQ(opts.at("adxl.LocalCommRes"), R"({"version":"1.5"})");
+    EXPECT_EQ(opts.at("adxl.RdmaTrafficClass"), "20");
+    EXPECT_EQ(opts.at("adxl.RdmaServiceLevel"), "2");
+    EXPECT_EQ(opts.at("adxl.BufferPool"), "0:0");
 }
 
 // Bind the real transport without a remote server; only device resolution

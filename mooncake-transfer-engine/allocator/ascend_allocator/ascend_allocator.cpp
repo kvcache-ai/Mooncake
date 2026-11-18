@@ -58,6 +58,16 @@ bool AgentModeEnabled() {
     return false;
 }
 
+std::optional<bool> ParseBoolValue(const char* value);
+
+const char* GetEnvWithFallback(const char* primary, const char* fallback) {
+    const char* value = std::getenv(primary);
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return fallback != nullptr ? std::getenv(fallback) : nullptr;
+}
+
 bool FabricMemEnabled() {
     AscendConfigBoolFn provider =
         g_use_fabric_mem_provider.load(std::memory_order_acquire);
@@ -68,12 +78,15 @@ bool FabricMemEnabled() {
     if (flags >= 0) {
         return (flags & kRuntimeFabricMem) != 0;
     }
-    // Classic store semantics: the variable being set enables fabric memory,
-    // whatever its value is.
-    return std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM") != nullptr;
+    const char* value = GetEnvWithFallback("MC_ASCEND_ENABLE_USE_FABRIC_MEM",
+                                           "ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (value == nullptr) {
+        return false;
+    }
+    const auto parsed = ParseBoolValue(value);
+    // Classic store semantics: any non-falsy value enables fabric memory.
+    return parsed.value_or(true);
 }
-
-std::optional<bool> ParseBoolValue(const char* value);
 
 bool SingleSegmentEnabled() {
     AscendConfigBoolFn provider =
@@ -85,9 +98,7 @@ bool SingleSegmentEnabled() {
     if (flags >= 0) {
         return (flags & kRuntimeSingleSegment) != 0;
     }
-    const auto parsed =
-        ParseBoolValue(std::getenv("ASCEND_STANDALONE_SINGLE_SEGMENT"));
-    return parsed.value_or(false);
+    return false;
 }
 
 // Small self-contained bool parser (the classic bool_parser.h dependency is a
@@ -217,17 +228,20 @@ void add_store_memory_range(void* ptr, size_t size) {
     g_store_mem_ranges.push_back({ptr, size});
 }
 
-// ASCEND_USE_SHMEM. Opt-in: allocate a memfd a peer on this machine can map.
-// Parsed here so the store and GlobalConfig do not have to carry the switch.
+// MC_ASCEND_USE_SHMEM / ASCEND_USE_SHMEM. Opt-in: allocate a memfd a peer on
+// this machine can map. Parsed here so the store and GlobalConfig do not have
+// to carry the switch.
 bool SharedHostMemRequested() {
-    const char* value = std::getenv("ASCEND_USE_SHMEM");
+    const char* value =
+        GetEnvWithFallback("MC_ASCEND_USE_SHMEM", "ASCEND_USE_SHMEM");
     if (value == nullptr) {
         return false;
     }
     const auto parsed = ParseBoolValue(value);
     if (!parsed.has_value()) {
         LOG(WARNING) << "Invalid value '" << value
-                     << "' for ASCEND_USE_SHMEM, treating it as disabled";
+                     << "' for MC_ASCEND_USE_SHMEM/ASCEND_USE_SHMEM, treating "
+                        "it as disabled";
         return false;
     }
     return *parsed;
@@ -267,7 +281,8 @@ bool HostMmapRequested() {
     if (CustomTopologyConfigured()) {
         return true;
     }
-    const char* config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    const char* config = GetEnvWithFallback("MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+                                            "ASCEND_GLOBAL_RESOURCE_CONFIG");
     return HasRoceHostProtocolDesc(config);
 }
 
@@ -552,7 +567,8 @@ void* AllocateStoreMemoryImpl(size_t total_size, const std::string& protocol) {
     }
     if (protocol == "ubshmem") {
         LOG(ERROR) << "ubshmem protocol only support fabric mem, please "
-                      "configure ASCEND_ENABLE_USE_FABRIC_MEM environment.";
+                      "configure MC_ASCEND_ENABLE_USE_FABRIC_MEM/"
+                      "ASCEND_ENABLE_USE_FABRIC_MEM environment.";
         return nullptr;
     }
 
