@@ -78,6 +78,8 @@ NVMe KV commands use a 16-byte physical key, while Mooncake logical keys can be 
 
 The backend probes up to 64 collision slots. It inserts new roots and chunks with store-if-not-exists. A root owned by another logical key stays in place. When rewriting the same logical key, the backend stages all chunks first, reusing identical bytes and trying another slot for differing bytes. It then updates the existing root with store-if-key-exists. Readers that already resolved the previous manifest can finish against its immutable chunks.
 
+During recovery, a writer can reuse a matching chunk when the current root references it or when an immutable copy of the proposed manifest already identifies the complete chunk set. Otherwise the chunk may still belong to a writer that can roll it back, so recovery tries another slot. Before updating a root, recovery stores a copy of the new manifest under a separate physical-key role. It also retains a previously published chunked root before replacing it, so its chunks can be reused after reopening. These records add metadata writes on rewrites. Readers continue to use only the root and its chunks.
+
 Reads probe until the root identity matches the logical key and verify its physical address and slot. All chunk addresses in a manifest must derive from the same logical key and chunk slot. A reader checks the current root before reusing cached chunk offsets.
 
 ## Object Layout

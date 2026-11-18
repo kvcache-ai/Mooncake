@@ -4,6 +4,7 @@
 #include <array>
 #include <limits>
 #include <mutex>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -12,6 +13,16 @@
 namespace mooncake {
 
 namespace {
+
+tl::expected<bool, ErrorCode> StoredValueMatches(NvmeKvConnector &connector,
+                                                 const NvmeKvPhysicalKey &key,
+                                                 std::string_view value) {
+    auto existing =
+        NvmeKvKeyConflictPolicy::ResolveExistingObject(connector, key, value);
+    if (!existing) return tl::make_unexpected(existing.error());
+    return *existing ==
+           NvmeKvKeyConflictPolicy::ExistingObjectDecision::kSameObject;
+}
 
 tl::expected<NvmeKvResolvedRoot, ErrorCode> ResolveRoot(
     NvmeKvConnector &connector, const std::string &logical_key) {
@@ -86,14 +97,30 @@ class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
                 LOG(WARNING) << "NVMe KV abort cleanup failed";
             }
         };
-        if (attempt.root_written) {
-            delete_key(attempt.write_plan->root_key);
+        auto chunks = std::exchange(attempt.written_chunk_keys, {});
+        const bool published = std::exchange(attempt.root_written, false);
+        if (published || chunks.empty()) return;
+        // A failed completion can follow a successful root insert. It may
+        // already have been read or superseded by the time we handle it.
+        try {
+            const auto &plan = *attempt.write_plan;
+            auto live =
+                StoredValueMatches(connector, plan.root_key, plan.root_blob);
+            if (!live || *live) return;
+            auto retained = StoredValueMatches(
+                connector,
+                EncodeNvmeKvRetainedManifestKey(plan.identity, plan.root_blob),
+                plan.root_blob);
+            if (!retained || *retained) return;
+        } catch (const std::exception &error) {
+            LOG(WARNING) << "NVMe KV could not confirm chunk ownership: "
+                         << error.what();
+            return;
+        } catch (...) {
+            LOG(WARNING) << "NVMe KV could not confirm chunk ownership";
+            return;
         }
-        for (const auto &key : attempt.written_chunk_keys) {
-            delete_key(key);
-        }
-        attempt.root_written = false;
-        attempt.written_chunk_keys.clear();
+        for (const auto &key : chunks) delete_key(key);
     }
 
    private:
@@ -333,6 +360,30 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
         !ValidateNvmeKvReadRoot({key.logical_key}, current->physical_key,
                                 current->slot, std::nullopt, current->root))
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    const bool current_manifest =
+        current && current->root.header.object_type ==
+                       static_cast<uint32_t>(NvmeKvObjectType::kManifest);
+    if (current_manifest) {
+        NvmeKvManifestMetadata metadata{};
+        const auto blob = current->root.Payload();
+        if (ComputeNvmeKvPayloadChecksum(blob) !=
+                current->root.header.payload_checksum ||
+            !ParseNvmeKvManifest(blob, metadata, current->root.chunks)) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+    const auto retain_manifest =
+        [&](const std::string &blob) -> tl::expected<void, ErrorCode> {
+        const auto record =
+            EncodeNvmeKvRetainedManifestKey({key.logical_key}, blob);
+        auto saved = connector->Store(record, blob);
+        if (saved || saved.error() != ErrorCode::OBJECT_ALREADY_EXISTS)
+            return saved;
+        auto matches = StoredValueMatches(*connector, record, blob);
+        if (!matches) return tl::make_unexpected(matches.error());
+        if (*matches) return {};
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    };
     const auto mode = current ? NvmeKvCommandExecutor::StoreMode::kUpdate
                               : NvmeKvCommandExecutor::StoreMode::kInsert;
     for (uint32_t slot = current ? current->slot : 0;
@@ -351,63 +402,26 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
         const auto &chunk_store_values = write_plan.chunk_values;
         if (store_inline && current && current->root.blob == root_blob)
             return NvmeKvPutResult{.stored = true, .inserted = false};
+        const auto publish_root = [&]() -> tl::expected<void, ErrorCode> {
+            // A root originally inserted by the batch path may be the only
+            // proof that its chunks were published. Keep it before replacing
+            // it.
+            if (current_manifest) {
+                auto saved = retain_manifest(current->root.blob);
+                if (!saved) return saved;
+            }
+            return connector->Store(physical_key, root_blob, mode);
+        };
 
         auto &written_chunk_keys = attempt.written_chunk_keys;
         auto &root_written = attempt.root_written;
-        const auto cleanup_new_writes = [&]() {
-            if (root_written) {
-                auto delete_res = connector->Delete(physical_key);
-                if (!delete_res &&
-                    delete_res.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                    LOG(WARNING)
-                        << "NVMe KV failed to clean orphan root for "
-                        << key.logical_key
-                        << " key=" << NvmeKvPhysicalKeyToHex(physical_key)
-                        << " error=" << toString(delete_res.error());
-                }
-                root_written = false;
-            }
-            if (written_chunk_keys.empty()) {
-                return;
-            }
-            for (const auto &chunk_key : written_chunk_keys) {
-                auto delete_res = connector->Delete(chunk_key);
-                if (!delete_res &&
-                    delete_res.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                    LOG(WARNING) << "NVMe KV failed to clean orphan chunk for "
-                                 << key.logical_key
-                                 << " key=" << NvmeKvPhysicalKeyToHex(chunk_key)
-                                 << " error=" << toString(delete_res.error());
-                }
-            }
-            written_chunk_keys.clear();
-        };
-        const auto resolve_existing_root =
-            [&]() -> tl::expected<NvmeKvPutResult, ErrorCode> {
-            auto decision_res = NvmeKvKeyConflictPolicy::ResolveExistingObject(
-                *connector, physical_key, root_blob);
-            if (!decision_res) {
-                return tl::make_unexpected(decision_res.error());
-            }
-            if (decision_res.value() ==
-                NvmeKvKeyConflictPolicy::ExistingObjectDecision::kNotFound) {
-                return NvmeKvPutResult{};
-            }
-            if (decision_res.value() ==
-                NvmeKvKeyConflictPolicy::ExistingObjectDecision::
-                    kDifferentObject) {
-                return NvmeKvPutResult{};
-            }
-            return NvmeKvPutResult{.stored = true, .inserted = false};
-        };
-
         size_t added_payload_bytes = 0;
         bool write_success = true;
         bool slot_collision = false;
         ErrorCode &write_error = attempt.error;
         write_error = ErrorCode::OK;
         if (store_inline) {
-            auto store_res = connector->Store(physical_key, root_blob, mode);
+            auto store_res = publish_root();
             if (!store_res) {
                 write_success = false;
                 write_error = store_res.error();
@@ -424,31 +438,33 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                 }
             }
         } else {
-            const auto handle_chunk_store_error =
-                [&](const NvmeKvPhysicalKey &chunk_key,
-                    std::string_view chunk_blob, ErrorCode error) -> bool {
-                if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                    auto existing_chunk_res =
-                        NvmeKvKeyConflictPolicy::ResolveExistingObject(
-                            *connector, chunk_key, chunk_blob);
-                    if (existing_chunk_res &&
-                        existing_chunk_res.value() ==
-                            NvmeKvKeyConflictPolicy::ExistingObjectDecision::
-                                kSameObject) {
+            std::optional<bool> recorded_manifest;
+            const auto reusable_chunk =
+                [&](size_t index) -> tl::expected<bool, ErrorCode> {
+                const auto &[chunk_key, bytes] = chunk_store_values[index];
+                auto equal = StoredValueMatches(*connector, chunk_key, bytes);
+                if (!equal || !*equal) return equal;
+                // Only a published manifest releases another writer's chunks
+                // from rollback. Identical staged bytes alone carry no
+                // ownership.
+                if (current_manifest && index < current->root.chunks.size()) {
+                    const auto &old = current->root.chunks[index];
+                    const auto &candidate = write_plan.manifest_records[index];
+                    if (old.physical_key == candidate.physical_key &&
+                        old.payload_size == candidate.payload_size &&
+                        old.payload_checksum == candidate.payload_checksum)
                         return true;
-                    }
-                    if (!existing_chunk_res) {
-                        write_error = existing_chunk_res.error();
-                    } else {
-                        write_error = ErrorCode::OBJECT_ALREADY_EXISTS;
-                        slot_collision = true;
-                    }
-                } else {
-                    write_error = error;
                 }
-                write_success = false;
-                cleanup_new_writes();
-                return false;
+                if (!recorded_manifest.has_value()) {
+                    auto recorded =
+                        StoredValueMatches(*connector,
+                                           EncodeNvmeKvRetainedManifestKey(
+                                               write_plan.identity, root_blob),
+                                           root_blob);
+                    if (!recorded) return tl::make_unexpected(recorded.error());
+                    recorded_manifest = *recorded;
+                }
+                return *recorded_manifest;
             };
             std::vector<NvmeKvCommandExecutor::StoreRequest> chunk_requests;
             chunk_requests.reserve(chunk_store_values.size());
@@ -470,18 +486,20 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                 }
             }
 
-            for (size_t chunk_index = 0;
-                 chunk_index < chunk_store_values.size(); ++chunk_index) {
-                const auto &[chunk_key, chunk_blob] =
-                    chunk_store_values[chunk_index];
-                const auto &chunk_res = chunk_requests[chunk_index].result;
-                if (!chunk_res) {
-                    if (!handle_chunk_store_error(chunk_key, chunk_blob,
-                                                  chunk_res.error())) {
-                        break;
-                    }
-                    continue;
+            for (size_t i = 0; i < chunk_requests.size(); ++i) {
+                const auto &result = chunk_requests[i].result;
+                if (result) continue;
+                write_error = result.error();
+                if (write_error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                    auto reusable = reusable_chunk(i);
+                    if (reusable && *reusable) continue;
+                    if (reusable)
+                        slot_collision = true;
+                    else
+                        write_error = reusable.error();
                 }
+                write_success = false;
+                break;
             }
             if (write_success) {
                 if (current && current->root.blob == root_blob) {
@@ -489,16 +507,22 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                         .stored = true,
                         .added_payload_bytes = added_payload_bytes};
                 }
-                // Completion can be lost after an update reaches the device.
-                // Keep staged immutable chunks available for readers and
-                // retries.
-                if (current) written_chunk_keys.clear();
-                auto store_res =
-                    connector->Store(physical_key, root_blob, mode);
+                // Once the record can be observed, another writer may publish
+                // these chunks even if our own completion is lost.
+                if (current) {
+                    if (!recorded_manifest.value_or(false)) {
+                        auto saved = retain_manifest(root_blob);
+                        if (!saved) {
+                            AbortWrite(connector_ref, attempt);
+                            return tl::make_unexpected(saved.error());
+                        }
+                    }
+                    written_chunk_keys.clear();
+                }
+                auto store_res = publish_root();
                 if (!store_res) {
                     write_success = false;
                     write_error = store_res.error();
-                    cleanup_new_writes();
                 } else {
                     root_written = !current;
                 }
@@ -507,23 +531,18 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
 
         if (!write_success && !slot_collision &&
             write_error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            auto existing_res = resolve_existing_root();
-            if (existing_res && existing_res.value().stored) {
-                return existing_res;
-            }
-            if (!existing_res) {
-                write_error = existing_res.error();
-            } else {
+            auto existing =
+                StoredValueMatches(*connector, physical_key, root_blob);
+            if (existing && *existing)
+                return NvmeKvPutResult{.stored = true, .inserted = false};
+            if (existing)
                 slot_collision = true;
-                cleanup_new_writes();
-            }
+            else
+                write_error = existing.error();
         }
 
         if (!write_success) {
-            if (!slot_collision && !store_inline) {
-                cleanup_new_writes();
-            }
-            written_chunk_keys.clear();
+            AbortWrite(connector_ref, attempt);
             if (slot_collision) {
                 continue;
             }
