@@ -9,13 +9,6 @@
 namespace mooncake {
 namespace {
 
-bool ValidLocalDeleteTask(const LocalDeleteTask& task) {
-    return task.task_id != UUID{} && task.storage_id != UUID{} &&
-           !task.tenant_id.empty() && TenantId(task.tenant_id).IsValid() &&
-           task.key.size() <= kMaxOpLogObjectKeySize &&
-           !task.incarnation.IsZero();
-}
-
 bool ValidTarget(const ObjectReplicaTarget& target) {
     return (target.provider == "oss" || target.provider == "s3") &&
            !target.endpoint.empty() && !target.bucket.empty() &&
@@ -199,7 +192,7 @@ bool StandbyMetadataStore::ApplyLocalDeleteRemove(
     for (const auto& target : removal.targets) {
         LocalDeleteTask task{target.task_id, target.storage_id, tenant_id, key,
                              removal.incarnation};
-        if (!ValidLocalDeleteTask(task) ||
+        if (!IsValidLocalDeleteTask(task) ||
             !tasks.emplace(std::pair{task.storage_id, task.task_id}, task)
                  .second) {
             return false;
@@ -250,7 +243,7 @@ bool StandbyMetadataStore::RestoreLocalDeleteTasks(
     if (tasks.size() > kMaxPendingLocalDeletes) return false;
     LocalDeleteTaskMap restored;
     for (const auto& task : tasks) {
-        if (!ValidLocalDeleteTask(task) ||
+        if (!IsValidLocalDeleteTask(task) ||
             !restored.emplace(std::pair{task.storage_id, task.task_id}, task)
                  .second) {
             return false;

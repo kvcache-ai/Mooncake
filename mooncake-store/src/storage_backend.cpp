@@ -4682,12 +4682,15 @@ class OffsetDeleteJournal {
 
     explicit OffsetDeleteJournal(const std::string& path)
         : fd_(open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
-                   0644)) {}
+                   0644)),
+          file_(path, fd_) {
+        file_.SetDeleteOnWriteFail(false);
+    }
 
     bool Open(const std::string& path, size_t max_key_size) {
         struct stat info{};
-        if (fd_.get() < 0 || fstat(fd_.get(), &info) != 0 ||
-            !S_ISREG(info.st_mode) || !SyncDirectoryForFile(path)) {
+        if (fd_ < 0 || fstat(fd_, &info) != 0 || !S_ISREG(info.st_mode) ||
+            !SyncDirectoryForFile(path)) {
             return false;
         }
         while (info.st_size - end_ >= static_cast<off_t>(sizeof(Header))) {
@@ -4736,20 +4739,14 @@ class OffsetDeleteJournal {
             bytes.append(key);
         }
         if (bytes.empty()) return true;
-        size_t written = 0;
-        while (written < bytes.size()) {
-            const auto count = pwrite(fd_.get(), bytes.data() + written,
-                                      bytes.size() - written, end_ + written);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) break;
-            written += count;
-        }
-        if (written != bytes.size() || fdatasync(fd_.get()) != 0) {
+        const iovec iov{bytes.data(), bytes.size()};
+        const auto written = file_.vector_write(&iov, 1, end_);
+        if (!written || *written != bytes.size() || !file_.datasync()) {
             // Do not append past a partial frame, even if rollback fails.
             healthy_ = Resize(end_);
             return false;
         }
-        end_ += written;
+        end_ += *written;
         entries_.merge(pending);
         return true;
     }
@@ -4759,10 +4756,10 @@ class OffsetDeleteJournal {
         // The checkpoint that supersedes these records is already durable.
         // A crash may leave old journal records, which are still safe to
         // replay.
-        if (ftruncate(fd_.get(), 0) == 0) {
+        if (ftruncate(fd_, 0) == 0) {
             end_ = 0;
             entries_.clear();
-            if (fdatasync(fd_.get()) == 0) return;
+            if (file_.datasync()) return;
         }
         LOG(WARNING) << "Failed to retire OffsetAllocator delete journal"
                      << ErrnoSuffix(errno);
@@ -4786,24 +4783,18 @@ class OffsetDeleteJournal {
         return crc.Final();
     }
 
-    bool Read(void* buffer, size_t size, off_t offset) const {
-        auto* bytes = static_cast<char*>(buffer);
-        size_t read = 0;
-        while (read < size) {
-            const auto count =
-                pread(fd_.get(), bytes + read, size - read, offset + read);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) return false;
-            read += count;
-        }
-        return true;
+    bool Read(void* buffer, size_t size, off_t offset) {
+        const iovec iov{buffer, size};
+        const auto read = file_.vector_read(&iov, 1, offset);
+        return read && *read == size;
     }
 
     bool Resize(off_t size) {
-        return ftruncate(fd_.get(), size) == 0 && fdatasync(fd_.get()) == 0;
+        return ftruncate(fd_, size) == 0 && file_.datasync().has_value();
     }
 
-    FdGuard fd_;
+    const int fd_;  // Owned by file_.
+    PosixFile file_;
     off_t end_ = 0;
     std::set<Item> entries_;
     bool healthy_ = true;
@@ -4879,23 +4870,16 @@ OffsetAllocatorStorageBackend::GetDeleteStorageId(bool create_if_missing) {
     const int fd =
         open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd >= 0) {
-        FdGuard file(fd);
+        PosixFile file(path, fd);
         struct stat info{};
         // Two uint64_t decimal representations plus a single separator.
         if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
             info.st_size <= 0 || info.st_size > 41) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        std::string bytes(static_cast<size_t>(info.st_size), '\0');
-        size_t done = 0;
-        while (done < bytes.size()) {
-            const auto count =
-                read(fd, bytes.data() + done, bytes.size() - done);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) {
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            done += static_cast<size_t>(count);
+        std::string bytes;
+        if (!file.read(bytes, static_cast<size_t>(info.st_size))) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
         UUID id{};
         if (!StringToUuid(bytes, id) || id == UUID{} ||

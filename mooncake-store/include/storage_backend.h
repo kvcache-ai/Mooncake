@@ -331,6 +331,15 @@ class StorageBackendInterface {
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
+    virtual tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices,
+        const ObjectVersions& expected_incarnations) {
+        if (!expected_incarnations.empty()) {
+            return tl::unexpected(ErrorCode::INVALID_VERSION);
+        }
+        return BatchLoad(batched_slices);
+    }
+
     // Reads a byte window of each value. The default reads the whole value
     // and copies the window. Backends that can seek override this so a layer
     // read does not load the rest of the object.
@@ -893,7 +902,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices,
-        const ObjectVersions& expected_incarnations);
+        const ObjectVersions& expected_incarnations) override;
 
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
@@ -1437,7 +1446,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices,
-        const ObjectVersions& expected_incarnations);
+        const ObjectVersions& expected_incarnations) override;
 
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
