@@ -741,13 +741,11 @@ tl::expected<void, ErrorCode> FileStorage::MountLocalDiskSegment(
     auto* offset =
         dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
     if (offset && offset->SupportsDurableDeletes()) {
-        auto known_id = offset->GetDeleteStorageId(false);
-        if (!known_id) return tl::make_unexpected(known_id.error());
         auto capable = client_->SupportsOffsetDelete();
         if (!capable) return tl::make_unexpected(capable.error());
+        auto id = offset->GetDeleteStorageId(*capable);
+        if (!id) return tl::make_unexpected(id.error());
         if (*capable) {
-            auto id = offset->GetDeleteStorageId(true);
-            if (!id) return tl::make_unexpected(id.error());
             if (!*id) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             auto epoch =
                 client_->MountOffsetDeleteStorage(enable_offloading, **id);
@@ -759,7 +757,7 @@ tl::expected<void, ErrorCode> FileStorage::MountLocalDiskSegment(
             offset_remount_required_ = false;
             return {};
         }
-        if (*known_id || offset_delete_mount_) {
+        if (*id || offset_delete_mount_) {
             return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
         }
     }

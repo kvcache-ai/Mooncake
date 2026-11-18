@@ -1692,11 +1692,6 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Alignment O_DIRECT wants for buffer, length and file offset.
     static constexpr uint64_t kDirectIoAlignment = 4096;
 
-    // Maximum key length accepted by BatchOffload and trusted on recovery.
-    // Write-side enforcement (BatchOffload) and recovery-side validation
-    // (RebuildShardMapsFromAllocator) must agree on this bound.
-    static constexpr uint32_t kMaxKeyLen = 1024 * 1024;
-
     // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
     // freed when last shared_ptr reference drops.
     struct RefCountedAllocationHandle {

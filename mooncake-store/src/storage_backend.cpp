@@ -4954,7 +4954,7 @@ tl::expected<void, ErrorCode>
 OffsetAllocatorStorageBackend::OpenDeleteJournal() {
     const auto path = GetMetaFilePath() + ".delete.v1";
     auto journal = std::make_unique<OffsetDeleteJournal>(path);
-    if (!journal->Open(path, kMaxKeyLen)) {
+    if (!journal->Open(path, kMaxOffsetStorageKeySize)) {
         LOG(ERROR) << "Cannot open OffsetAllocator delete journal " << path;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
@@ -5617,7 +5617,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator(
         }
         RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
-        if (header.key_len > kMaxKeyLen) {
+        if (header.key_len > kMaxOffsetStorageKeySize) {
             LOG(ERROR) << "[Recover] Invalid key_len " << header.key_len
                        << " at " << real_offset;
             free_leaked_node(alloc_size);
@@ -6351,11 +6351,12 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             continue;
         }
 
-        if (key.size() > kMaxKeyLen) {
-            // Recovery rejects key_len above kMaxKeyLen; refuse such keys
-            // at write time so they cannot silently vanish on restart.
+        if (key.size() > kMaxOffsetStorageKeySize) {
+            // Recovery rejects key_len above kMaxOffsetStorageKeySize; refuse
+            // such keys at write time so they cannot silently vanish on
+            // restart.
             LOG(ERROR) << "Key too large for SSD offload: " << key.size()
-                       << " bytes (max " << kMaxKeyLen << ")";
+                       << " bytes (max " << kMaxOffsetStorageKeySize << ")";
             continue;
         }
 
@@ -6742,9 +6743,9 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
 
 struct OffsetAllocatorStorageBackend::ReadPlan {
     std::string key;
-    uint64_t offset;           // where the record starts in the data file
-    uint32_t value_size;       // size of the whole value
-    uint64_t value_offset;     // first value byte wanted
+    uint64_t offset;        // where the record starts in the data file
+    uint32_t value_size;    // size of the whole value
+    uint64_t value_offset;  // first value byte wanted
     // Version the caller expects the record to carry. Zero is a read from a
     // caller that predates record versions.
     ObjectIncarnation incarnation;
@@ -6979,7 +6980,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadRecordsDirect(
         const auto& head = reads[record.head_read];
         if (!head.completed ||
             head.bytes_read < record.head_shift + RecordHeader::SIZE +
-                                 plan.key.size() + plan.VersionSize()) {
+                                  plan.key.size() + plan.VersionSize()) {
             LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
@@ -7014,7 +7015,8 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::DeleteVersions(
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     for (const auto& [key, version] : objects) {
-        if (key.empty() || key.size() > kMaxKeyLen || version.IsZero()) {
+        if (key.empty() || key.size() > kMaxOffsetStorageKeySize ||
+            version.IsZero()) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
