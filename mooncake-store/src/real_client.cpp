@@ -9298,7 +9298,17 @@ int RealClient::start_ipc_server() {
             LOG(ERROR) << "Unknown IPC request type: " << req_type;
         }
     });
-    auto start_result = uds_acceptor_->start();
+    int backlog = UdsAcceptor::kDefaultListenBacklog;
+    if (auto value = Environ::Process().Get("MOONCAKE_UDS_LISTEN_BACKLOG")) {
+        auto parsed = TryParseEnvironmentValue<int>(*value);
+        if (parsed && *parsed > 0) {
+            backlog = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MOONCAKE_UDS_LISTEN_BACKLOG; using "
+                         << backlog;
+        }
+    }
+    auto start_result = uds_acceptor_->start(backlog);
     if (!start_result) {
         LOG(ERROR) << start_result.error();
         uds_acceptor_.reset();
