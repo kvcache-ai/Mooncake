@@ -374,6 +374,10 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
         ctx.object_storage =
             snapshot.object_storage.value_or(ObjectReplicaSnapshot{});
+        if (snapshot.pending_local_deletes) {
+            ctx.pending_local_deletes =
+                std::move(*snapshot.pending_local_deletes);
+        }
 
         return ctx;
     }

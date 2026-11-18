@@ -4,8 +4,17 @@
 #include <limits>
 #include <unordered_set>
 
+#include "ha/oplog/oplog_types.h"
+
 namespace mooncake {
 namespace {
+
+bool ValidLocalDeleteTask(const LocalDeleteTask& task) {
+    return task.task_id != UUID{} && task.storage_id != UUID{} &&
+           !task.tenant_id.empty() && TenantId(task.tenant_id).IsValid() &&
+           task.key.size() <= kMaxOpLogObjectKeySize &&
+           !task.incarnation.IsZero();
+}
 
 bool ValidTarget(const ObjectReplicaTarget& target) {
     return (target.provider == "oss" || target.provider == "s3") &&
@@ -178,6 +187,91 @@ ObjectReplicaSnapshot StandbyMetadataStore::SnapshotObjectReplicas() const {
     return snapshot;
 }
 
+bool StandbyMetadataStore::ApplyLocalDeleteRemove(
+    const std::string& tenant_id, const std::string& key,
+    const LocalDeleteRemove& removal) {
+    if (removal.version != 1 || removal.incarnation.IsZero() ||
+        removal.targets.empty() ||
+        removal.targets.size() > kMaxLocalDeleteTasks) {
+        return false;
+    }
+    LocalDeleteTaskMap tasks;
+    for (const auto& target : removal.targets) {
+        LocalDeleteTask task{target.task_id, target.storage_id, tenant_id, key,
+                             removal.incarnation};
+        if (!ValidLocalDeleteTask(task) ||
+            !tasks.emplace(std::pair{task.storage_id, task.task_id}, task)
+                 .second) {
+            return false;
+        }
+    }
+
+    std::lock_guard lock(mutex_);
+    if (pending_local_deletes_.size() + tasks.size() >
+            kMaxPendingLocalDeletes ||
+        std::ranges::any_of(tasks, [&](const auto& entry) {
+            return pending_local_deletes_.contains(entry.first);
+        })) {
+        return false;
+    }
+    auto tenant = store_.find(tenant_id);
+    if (tenant != store_.end()) {
+        auto object = tenant->second.find(key);
+        if (object != tenant->second.end()) {
+            if (object->second.object_incarnation.value_or(
+                    ObjectIncarnation{}) != removal.incarnation) {
+                return false;
+            }
+            tenant->second.erase(object);
+            if (tenant->second.empty()) {
+                store_.erase(tenant);
+            }
+        }
+    }
+    pending_local_deletes_.merge(tasks);
+    return true;
+}
+
+bool StandbyMetadataStore::ApplyLocalDeleteAck(const LocalDeleteAck& ack) {
+    if (ack.version != 1 || ack.storage_id == UUID{} || ack.task_ids.empty() ||
+        ack.task_ids.size() > kMaxLocalDeleteTasks ||
+        std::ranges::find(ack.task_ids, UUID{}) != ack.task_ids.end()) {
+        return false;
+    }
+    std::lock_guard lock(mutex_);
+    for (const auto& id : ack.task_ids) {
+        pending_local_deletes_.erase({ack.storage_id, id});
+    }
+    return true;
+}
+
+bool StandbyMetadataStore::RestoreLocalDeleteTasks(
+    const std::vector<LocalDeleteTask>& tasks) {
+    if (tasks.size() > kMaxPendingLocalDeletes) return false;
+    LocalDeleteTaskMap restored;
+    for (const auto& task : tasks) {
+        if (!ValidLocalDeleteTask(task) ||
+            !restored.emplace(std::pair{task.storage_id, task.task_id}, task)
+                 .second) {
+            return false;
+        }
+    }
+    std::lock_guard lock(mutex_);
+    pending_local_deletes_ = std::move(restored);
+    return true;
+}
+
+std::vector<LocalDeleteTask> StandbyMetadataStore::CopyLocalDeleteTasks()
+    const {
+    std::lock_guard lock(mutex_);
+    std::vector<LocalDeleteTask> tasks;
+    tasks.reserve(pending_local_deletes_.size());
+    for (const auto& [id, task] : pending_local_deletes_) {
+        tasks.push_back(task);
+    }
+    return tasks;
+}
+
 bool StandbyMetadataStore::PutMetadata(const std::string& tenant_id,
                                        const std::string& key,
                                        const StandbyObjectMetadata& metadata) {
@@ -255,6 +349,7 @@ void StandbyMetadataStore::Clear() {
     object_storage_target_.reset();
     object_uploads_.clear();
     object_upload_names_.clear();
+    pending_local_deletes_.clear();
     weight_metadata_.clear();
     weight_metadata_tombstones_.clear();
     weight_leases_.clear();

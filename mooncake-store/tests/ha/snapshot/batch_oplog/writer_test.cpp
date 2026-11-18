@@ -380,7 +380,8 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         size_t object_count,
         const WeightMetadataSnapshot* weight_metadata = nullptr,
         const std::vector<std::pair<std::string, ObjectReplicaMutation>>&
-            object_mutations = {}) {
+            object_mutations = {},
+        const std::vector<LocalDeleteTask>& local_deletes = {}) {
         backend_ = std::make_shared<FakeHaKvBackend>();
         auto batch = MakeObjectBatch(object_count);
         const auto append = [&](OpType type, const std::string& key,
@@ -440,6 +441,11 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         }
         for (const auto& [key, mutation] : object_mutations) {
             append(OpType::OBJECT_STORAGE_MUTATION, key, mutation);
+        }
+        for (const auto& task : local_deletes) {
+            append(OpType::LOCAL_DELETE_REMOVE, task.key,
+                   LocalDeleteRemove{
+                       1, task.incarnation, {{task.task_id, task.storage_id}}});
         }
         if (!batch.entries.empty()) {
             EXPECT_EQ(ErrorCode::OK,
@@ -1372,6 +1378,75 @@ TEST_F(BatchOpLogSnapshotWriterTest,
     StandbySegmentRegistry empty_registry;
     EXPECT_FALSE(provider.RestoreBaseline(corrupt, empty_registry));
     EXPECT_FALSE(corrupt.Exists("tenant", "key-0"));
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       PendingLocalDeletesSurviveCompactionAndStaleAckSuffix) {
+    const UUID disk{1, 2};
+    const LocalDeleteTask old_task{{1, 3}, disk, "default", "same-key", {1, 4}};
+    const LocalDeleteTask new_task{{2, 3}, disk, "default", "same-key", {2, 4}};
+    auto capture = StartCapture(1, nullptr, {}, {old_task, new_task});
+    ASSERT_TRUE(capture);
+    ASSERT_EQ(capture->last_included_seq, 3u);
+    EXPECT_EQ(capture->pending_local_deletes,
+              (std::vector{old_task, new_task}));
+
+    FakeObjectStore objects;
+    BatchOpLogSnapshotWriter writer(objects);
+    auto descriptor =
+        writer.Write(*standby_, *capture, "snapshots", "1-45", 2, 1234);
+    ASSERT_TRUE(descriptor) << descriptor.error();
+    const auto decoded = ha::DecodeBatchOpLogSnapshotDescriptor(*descriptor);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->schema_version,
+              ha::kBatchOpLogLocalDeleteSnapshotSchemaVersion);
+    standby_->Stop();
+
+    FakeHaKvBackend compacted;
+    ASSERT_EQ(compacted.Put(ha::BuildBatchOpLogSnapshotLatestKey(kClusterId),
+                            *descriptor),
+              ErrorCode::OK);
+    ASSERT_EQ(
+        compacted.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey(kClusterId),
+                      "1"),
+        ErrorCode::OK);
+    OpLogBatchRecord suffix;
+    suffix.batch_id = 2;
+    suffix.first_seq = 4;
+    suffix.last_seq = 5;
+    OpLogEntry ack;
+    ack.sequence_id = 4;
+    ack.op_type = OpType::LOCAL_DELETE_ACK;
+    ack.payload = struct_pack::serialize<std::string>(
+        LocalDeleteAck{1, disk, {old_task.task_id}});
+    ack.checksum = ComputeOpLogChecksum(ack.payload);
+    suffix.entries.push_back(ack);
+    ++ack.sequence_id;
+    suffix.entries.push_back(ack);
+    ASSERT_EQ(compacted.Put(BuildBatchRecordKey(kClusterId, 2),
+                            EncodeOpLogBatchRecord(suffix)),
+              ErrorCode::OK);
+    ASSERT_EQ(compacted.Put(BuildDurablePrefixKey(kClusterId),
+                            EncodeDurablePrefix({2, 5})),
+              ErrorCode::OK);
+
+    BatchOpLogSnapshotProvider provider(kClusterId, compacted, objects,
+                                        "snapshots");
+    StandbyMetadataStore restored;
+    StandbySegmentRegistry registry;
+    const auto result = provider.RestoreBaseline(restored, registry);
+    ASSERT_TRUE(result) << toString(result.error());
+    EXPECT_EQ(result->last_applied_seq, 5u);
+    EXPECT_EQ(restored.CopyLocalDeleteTasks(), std::vector{new_task});
+    EXPECT_TRUE(restored.Exists("tenant", "key-0"));
+    EXPECT_FALSE(restored.Exists("default", old_task.key));
+
+    objects.PutExisting(
+        ha::BuildBatchOpLogSnapshotLocalDeletesKey("snapshots", "1-45"));
+    StandbyMetadataStore corrupt;
+    StandbySegmentRegistry empty_registry;
+    EXPECT_FALSE(provider.RestoreBaseline(corrupt, empty_registry));
+    EXPECT_TRUE(corrupt.CopyLocalDeleteTasks().empty());
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest,

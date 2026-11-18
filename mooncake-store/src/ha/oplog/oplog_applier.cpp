@@ -97,6 +97,21 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
                 entry.tenant_id, entry.object_key, mutation);
             break;
         }
+        case OpType::LOCAL_DELETE_REMOVE: {
+            LocalDeleteRemove remove;
+            applied = struct_pack::deserialize_to(remove, entry.payload) ==
+                          struct_pack::errc::ok &&
+                      metadata_store_->ApplyLocalDeleteRemove(
+                          entry.tenant_id, entry.object_key, remove);
+            break;
+        }
+        case OpType::LOCAL_DELETE_ACK: {
+            LocalDeleteAck ack;
+            applied = struct_pack::deserialize_to(ack, entry.payload) ==
+                          struct_pack::errc::ok &&
+                      metadata_store_->ApplyLocalDeleteAck(ack);
+            break;
+        }
         case OpType::PUT_END:
             ApplyPutEnd(entry);
             break;

@@ -9,6 +9,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
+#include "local_delete_types.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
@@ -246,6 +247,17 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountVersionedLocalDiskSegment(
         const UUID& client_id, bool enable_offloading);
 
+    tl::expected<UUID, ErrorCode> MountOffsetDeleteStorage(
+        const UUID& client_id, bool enable_offloading, const UUID& storage_id);
+
+    tl::expected<std::vector<LocalDeleteTask>, ErrorCode> FetchLocalDeletes(
+        const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+        uint32_t limit);
+
+    tl::expected<void, ErrorCode> AckLocalDeletes(
+        const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+        const std::vector<UUID>& task_ids);
+
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
         const UUID& client_id);
 
@@ -347,7 +359,8 @@ class WrappedMasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const std::vector<LocalDeleteTask>& pending_local_deletes = {});
     // Copies objects out of the handoff; the caller keeps ownership.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const BatchOpLogPromotionHandoff& handoff,

@@ -274,6 +274,7 @@ class FileStorage {
     static bool IsPerBucketSoftOffloadError(ErrorCode error);
 
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+    tl::expected<void, ErrorCode> ProcessOffsetDeletes();
 
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
@@ -338,8 +339,9 @@ class FileStorage {
         const std::vector<int64_t>& object_sizes, bool prefer_pinned,
         const std::vector<ObjectIncarnation>& expected_incarnations);
 
-    tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
+    void BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
+        const std::vector<ObjectIncarnation>& incarnations,
         std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
@@ -498,6 +500,13 @@ class FileStorage {
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
+    struct OffsetDeleteMount {
+        UUID storage_id;
+        UUID epoch;
+    };
+    std::optional<OffsetDeleteMount> GUARDED_BY(offloading_mutex_)
+        offset_delete_mount_;
+    bool GUARDED_BY(offloading_mutex_) offset_remount_required_{false};
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;

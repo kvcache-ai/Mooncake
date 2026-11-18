@@ -91,6 +91,7 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    struct_pack::compatible<ObjectIncarnation, 2> object_incarnation;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -102,7 +103,7 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, object_incarnation);
 
 struct CachedQueryResultResponse {
     bool success;
@@ -126,6 +127,7 @@ struct GetStorageConfigResponse {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
     struct_pack::compatible<bool, 1> requires_versioned_local_disk;
+    struct_pack::compatible<bool, 2> supports_offset_delete;
 
     GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
@@ -135,7 +137,7 @@ struct GetStorageConfigResponse {
           quota_bytes(quota) {}
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
-         requires_versioned_local_disk);
+         requires_versioned_local_disk, supports_offset_delete);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;

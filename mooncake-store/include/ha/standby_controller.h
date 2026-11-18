@@ -32,6 +32,7 @@ struct PromotionContext {
     std::vector<StandbySegmentInfo> segments;
     WeightMetadataSnapshot weight_metadata;
     ObjectReplicaSnapshot object_storage;
+    std::vector<LocalDeleteTask> pending_local_deletes;
     std::unique_ptr<StandbyMetadataStore> metadata_store;
     DurablePrefix applied_cursor;
     ViewVersionId producer_view_version{0};

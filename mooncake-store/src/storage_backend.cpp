@@ -83,6 +83,7 @@ namespace {
 constexpr std::string_view kBucketIncarnationSuffix = ".incarnation";
 constexpr uint32_t kBucketIncarnationFormat = 1;
 constexpr char kLocalDiskOwnerLockName[] = ".mooncake_local_disk.lock";
+constexpr char kOffsetDeleteStorageIdName[] = "kv_cache.storage.v1";
 
 struct BucketFileStamp {
     uint64_t inode;
@@ -4866,6 +4867,80 @@ std::string OffsetAllocatorStorageBackend::GetMetaFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.meta").string();
 }
 
+tl::expected<std::optional<UUID>, ErrorCode>
+OffsetAllocatorStorageBackend::GetDeleteStorageId(bool create_if_missing) {
+    std::lock_guard mutation_lock(mutation_mutex_);
+    if (!initialized_.load(std::memory_order_acquire) || owner_lock_fd_ < 0) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    const auto path =
+        (std::filesystem::path(storage_path_) / kOffsetDeleteStorageIdName)
+            .string();
+    const int fd =
+        open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd >= 0) {
+        FdGuard file(fd);
+        struct stat info{};
+        // Two uint64_t decimal representations plus a single separator.
+        if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_size <= 0 || info.st_size > 41) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        std::string bytes(static_cast<size_t>(info.st_size), '\0');
+        size_t done = 0;
+        while (done < bytes.size()) {
+            const auto count =
+                read(fd, bytes.data() + done, bytes.size() - done);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            done += static_cast<size_t>(count);
+        }
+        UUID id{};
+        if (!StringToUuid(bytes, id) || id == UUID{} ||
+            UuidToString(id) != bytes) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        // The previous creation attempt may have failed after rename.
+        if (create_if_missing && !SyncDirectoryForFile(path)) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return std::optional<UUID>{id};
+    }
+    if (errno != ENOENT || delete_journal_) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (!create_if_missing) return std::optional<UUID>{};
+    if (!SupportsDurableDeletes()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    const UUID id = generate_uuid();
+    const std::string bytes = UuidToString(id);
+    const std::string temporary_path = path + ".tmp";
+    const int temporary_fd =
+        open(temporary_path.c_str(),
+             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+             0644);
+    if (temporary_fd < 0) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    PosixFile temporary(temporary_path, temporary_fd);
+    struct stat info{};
+    if (fstat(temporary_fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    auto written = temporary.write(bytes, bytes.size());
+    if (id == UUID{} || !written || *written != bytes.size() ||
+        !temporary.datasync() ||
+        rename(temporary_path.c_str(), path.c_str()) != 0 ||
+        !SyncDirectoryForFile(path)) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return std::optional<UUID>{id};
+}
+
 tl::expected<void, ErrorCode>
 OffsetAllocatorStorageBackend::OpenDeleteJournal() {
     const auto path = GetMetaFilePath() + ".delete.v1";
@@ -5026,6 +5101,14 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         }
 
         // ---- Recovery path ----
+        if (!SupportsDurableDeletes()) {
+            struct stat info{};
+            const auto marker =
+                fs::path(storage_path_) / kOffsetDeleteStorageIdName;
+            if (lstat(marker.c_str(), &info) == 0 || errno != ENOENT) {
+                return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+            }
+        }
         const auto journal_path = GetMetaFilePath() + ".delete.v1";
         if (fs::exists(journal_path)) {
             if (cfg_.persist_mode != OffsetPersistMode::kStrict) {
@@ -6619,10 +6702,21 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    return BatchLoad(batched_slices, {});
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
+    std::unordered_map<std::string, Slice>& batched_slices,
+    const ObjectVersions& expected_incarnations) {
     std::unordered_map<std::string, StorageValueSpan> spans;
     spans.reserve(batched_slices.size());
     for (const auto& [key, slice] : batched_slices) {
-        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+        const auto version = expected_incarnations.find(key);
+        spans.emplace(key,
+                      StorageValueSpan{0, slice.size, slice,
+                                       version == expected_incarnations.end()
+                                           ? ObjectIncarnation{}
+                                           : version->second});
     }
     return ReadOffsetValues(spans, true);
 }
