@@ -319,10 +319,6 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    // Apply any recovered delete work before re-advertising SSD replicas.
-    auto deleted = ProcessOffsetDeletes();
-    if (!deleted) return deleted;
-
     auto scan_meta_result = storage_backend_->ScanMeta(
         [this](const std::vector<std::string>& keys,
                std::vector<StorageObjectMetadata>& metadatas) {
@@ -799,13 +795,11 @@ tl::expected<void, ErrorCode> FileStorage::ProcessOffsetDeletes() {
     versions.reserve(tasks->size());
     task_ids.reserve(tasks->size());
     for (const auto& task : *tasks) {
-        const TenantId tenant(task.tenant_id);
-        if (task.storage_id != storage_id || task.task_id == UUID{} ||
-            !tenant.IsValid() || tenant.value() != task.tenant_id ||
-            task.key.empty() || task.incarnation.IsZero()) {
+        if (task.storage_id != storage_id || !IsValidLocalDeleteTask(task)) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        versions.emplace_back(tenant.MakeScopedKey(task.key), task.incarnation);
+        versions.emplace_back(TenantId(task.tenant_id).MakeScopedKey(task.key),
+                              task.incarnation);
         task_ids.push_back(task.task_id);
     }
     {
@@ -1900,20 +1894,8 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     const StorageBackendInterface::ObjectVersions& expected_incarnations) {
     if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     auto start_time = std::chrono::steady_clock::now();
-    auto result = [&]() -> tl::expected<void, ErrorCode> {
-        if (expected_incarnations.empty()) {
-            return storage_backend_->BatchLoad(batch_object);
-        }
-        if (auto* bucket =
-                dynamic_cast<BucketStorageBackend*>(storage_backend_.get())) {
-            return bucket->BatchLoad(batch_object, expected_incarnations);
-        }
-        if (auto* offset = dynamic_cast<OffsetAllocatorStorageBackend*>(
-                storage_backend_.get())) {
-            return offset->BatchLoad(batch_object, expected_incarnations);
-        }
-        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
-    }();
+    auto result =
+        storage_backend_->BatchLoad(batch_object, expected_incarnations);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)

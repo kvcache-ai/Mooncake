@@ -83,7 +83,7 @@ store.setup_dummy(
 )
 ```
 
-> **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
+> **Note:** The real client scans recovered SSD metadata on startup and reports it to the master. OffsetAllocator requires persistence to retain its cache across restarts. Its default mode starts with an empty cache.
 
 ---
 
@@ -305,6 +305,23 @@ Best for: debugging or small-scale deployments.
 
 Pre-allocates a single large file and manages offset-based allocation within it. Highest concurrency via 1024-shard metadata.
 
+For durable per-object deletion, set `MOONCAKE_OFFSET_PERSIST_MODE=strict` on
+each OffsetAllocator holder. Enable HA, OpLog and
+`MOONCAKE_LOCAL_DISK_INCARNATIONS=1` on every Master. Upgrade the Masters and
+holders together before enabling this mode. Each holder needs its own
+persistent directory. Once enrolled, the directory requires strict persistence
+and a Master that supports this protocol.
+
+A successful explicit remove records the logical deletion and the SSD work
+in the OpLog. The holder journals the object version before releasing its
+index entry. Active reads keep the extent pinned until they finish. Future
+writes can reuse the extent inside the existing file. The file retains its
+allocated size and the deletion does not overwrite the payload.
+
+The Master retries unacknowledged work when a holder remounts the same
+directory. A permanently retired directory leaves its tasks pending. Direct
+Upsert and automatic catalog cleanup follow ordinary eviction for old extents.
+
 > **Warning:** This backend does **not** support metadata recovery on restart. On initialization, the data file is truncated and all in-memory metadata is cleared. Any previously offloaded objects become inaccessible after a process restart.
 
 **Capacity:** `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` is used directly as the pre-allocated file size (100%, no safety margin). Unlike `bucket_storage_backend`, there is no separate quota variable — this is the sole disk usage control. Set it below the physical disk capacity to avoid filling the disk; writes are rejected once usage reaches this limit.
@@ -405,7 +422,7 @@ mooncake_client \
 
 - `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected. With `bucket_storage_backend` the value may be a comma-separated list of such directories, one per disk; see {ref}`Multiple disks <ssd-offload-multiple-disks>`.
 - Each live Real Client needs its **own** offload directory — with several disks, its own directory on every disk. Sharing one path across TP ranks fails at `Init()` under the LOCAL_DISK ownership lock, which is taken on every configured directory.
-- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
+- On real client restart, the holder reports recovered SSD metadata to the Master. OffsetAllocator recovery requires persistence. In the durable deletion mode described above, the Master also checks the object version and storage identity before accepting recovered OffsetAllocator replicas.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
 

@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "ha/oplog/oplog_types.h"
+#include "tenant_id.h"
 #include "types.h"
 
 namespace mooncake {
@@ -22,6 +24,13 @@ struct LocalDeleteTask {
     bool operator==(const LocalDeleteTask&) const = default;
 };
 YLT_REFL(LocalDeleteTask, task_id, storage_id, tenant_id, key, incarnation);
+
+inline bool IsValidLocalDeleteTask(const LocalDeleteTask& task) {
+    return task.task_id != UUID{} && task.storage_id != UUID{} &&
+           !task.tenant_id.empty() && TenantId(task.tenant_id).IsValid() &&
+           !task.key.empty() && task.key.size() <= kMaxOpLogObjectKeySize &&
+           !task.incarnation.IsZero();
+}
 
 struct LocalDeleteTarget {
     UUID task_id;

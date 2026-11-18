@@ -3739,9 +3739,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     for (const auto& task : pending) {
-        if (task.storage_id == UUID{} || task.task_id == UUID{} ||
-            task.incarnation.IsZero() || !TenantId(task.tenant_id).IsValid() ||
-            task.key.empty() ||
+        if (!IsValidLocalDeleteTask(task) ||
             !restored_tasks
                  .emplace(std::pair{task.storage_id, task.task_id}, task)
                  .second) {

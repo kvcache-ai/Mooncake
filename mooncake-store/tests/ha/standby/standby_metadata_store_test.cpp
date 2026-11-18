@@ -377,11 +377,12 @@ TEST(ObjectReplicaStateTest, OrderedReplayRejectsInvalidEntries) {
 TEST(LocalDeleteReplayTest, OldAckCannotRemoveNewPendingTask) {
     StandbyMetadataStore store;
     OpLogApplier applier(&store);
-    const auto apply = [&](uint64_t seq, OpType type, const auto& payload) {
+    const auto apply = [&](uint64_t seq, OpType type, const auto& payload,
+                           std::string key = "same-key") {
         OpLogEntry entry;
         entry.sequence_id = seq;
         entry.tenant_id = "default";
-        entry.object_key = "same-key";
+        entry.object_key = std::move(key);
         entry.op_type = type;
         entry.payload = struct_pack::serialize<std::string>(payload);
         entry.checksum = ComputeOpLogChecksum(entry.payload);
@@ -399,6 +400,9 @@ TEST(LocalDeleteReplayTest, OldAckCannotRemoveNewPendingTask) {
 
     const LocalDeleteRemove old_remove{
         1, old_task.incarnation, {{old_task.task_id, old_task.storage_id}}};
+    EXPECT_FALSE(apply(1, OpType::LOCAL_DELETE_REMOVE, old_remove, ""));
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 1u);
+    EXPECT_TRUE(store.CopyLocalDeleteTasks().empty());
     ASSERT_TRUE(apply(1, OpType::LOCAL_DELETE_REMOVE, old_remove));
     EXPECT_FALSE(store.Exists("default", old_task.key));
     EXPECT_TRUE(store.Exists("other", old_task.key));
