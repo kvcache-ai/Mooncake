@@ -42,6 +42,13 @@ class ClientSessionRegistryTestPeer {
         registry.ExpireSessions(now);
     }
 
+    static bool WaitForExpiryStop(ClientSessionRegistry& registry,
+                                  Clock::duration timeout) {
+        std::unique_lock lock(registry.expiry_mutex_);
+        return registry.expiry_cv_.wait_for(
+            lock, timeout, [&] { return registry.expiry_stopping_; });
+    }
+
     // Ping at an explicit time, so a recovery goes through the registry (and
     // is published) like a production heartbeat, not past it.
     static ClientStatus Ping(ClientSessionRegistry& registry,

@@ -1002,19 +1002,19 @@ TEST_F(ClientSessionRegistryTest,
     Slot slot;
     ClientSessionRegistry registry(10s, 20s);
     ASSERT_TRUE(registry.AddListener([&](const ClientSessionEvent& event) {
-            if (event.current != State::OFFLINE) return;
-            const auto& id = event.client_id;
-            const auto& session = event.session;
-            EXPECT_EQ(id, kClient);
-            EXPECT_EQ(session, record);
-            EXPECT_EQ(session->state(), State::OFFLINE);
-            EXPECT_TRUE(registry.GetHostId(kClient).empty());
-            EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
-            // Retirement runs after releasing the slot operation lock.
-            EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
-            retired_session = std::move(session);
-            retired = true;
-        }));
+        if (event.current != State::OFFLINE) return;
+        const auto& id = event.client_id;
+        const auto& session = event.session;
+        EXPECT_EQ(id, kClient);
+        EXPECT_EQ(session, record);
+        EXPECT_EQ(session->state(), State::OFFLINE);
+        EXPECT_TRUE(registry.GetHostId(kClient).empty());
+        EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+        // Retirement runs after releasing the slot operation lock.
+        EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
+        retired_session = std::move(session);
+        retired = true;
+    }));
 
     record = Register(registry);
     slot = FindSlot(registry, kClient);

@@ -117,7 +117,17 @@ TEST(ClientSessionExpiryTest,
 
 TEST(ClientSessionExpiryTest, StopPreservesInFlightRetirementNotification) {
     int offline_events = 0;
-    ClientSessionRegistry registry(0s, 0s);
+    bool pause_next_pass = false;
+    std::promise<void> pass_entered;
+    ClientSessionRegistry registry(0s, 0s, [&] {
+        if (!std::exchange(pause_next_pass, false)) return true;
+        pass_entered.set_value();
+        // Let the in-flight pass publish OFFLINE only after Stop has started.
+        const bool stopping =
+            ClientSessionRegistryTestPeer::WaitForExpiryStop(registry, 5s);
+        EXPECT_TRUE(stopping);
+        return stopping;
+    });
     ASSERT_TRUE(registry.AddListener([&](const auto& event) {
         if (event.current == State::OFFLINE) {
             ++offline_events;
@@ -126,19 +136,11 @@ TEST(ClientSessionExpiryTest, StopPreservesInFlightRetirementNotification) {
     auto record = Register(registry);
     Poll(registry, Clock::now());
     ASSERT_EQ(record->state(), State::SUSPECTED);
-    auto guard = registry.TryAcquireRetainingSession(kClient);
-    ASSERT_TRUE(guard);
-    // Make the next pass queue for the slot instead of skipping it, so the
-    // retirement below is published from inside a pass that Stop must await.
-    for (int pass = 0; pass < 3; ++pass) {
-        Poll(registry, Clock::now());
-    }
-    ASSERT_EQ(record->state(), State::SUSPECTED);
+    pause_next_pass = true;
     registry.Start();
-    auto stopped = std::async(std::launch::async, [&] { registry.Stop(); });
-    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
-    guard.reset();
-    stopped.get();
+    EXPECT_EQ(pass_entered.get_future().wait_for(5s),
+              std::future_status::ready);
+    registry.Stop();
     // Stop drains what the awaited pass published instead of dropping it.
     EXPECT_EQ(record->state(), State::OFFLINE);
     EXPECT_EQ(offline_events, 1);
