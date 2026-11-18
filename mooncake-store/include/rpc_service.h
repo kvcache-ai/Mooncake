@@ -123,6 +123,17 @@ class WrappedMasterService {
                   const ReplicateConfig& config,
                   const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    StartPutSessions(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& sizes,
+                     const ReplicateConfig& config,
+                     const std::string& tenant_id);
+
+    std::vector<tl::expected<void, ErrorCode>> FinishPutSessions(
+        const UUID& client_id, const std::vector<PutSessionKey>& keys,
+        ReplicaType type, bool revoke, const std::string& tenant_id);
+
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,

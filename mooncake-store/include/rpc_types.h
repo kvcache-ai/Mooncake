@@ -24,20 +24,39 @@ struct ObjectMeta {
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
 
+struct PutSessionKey {
+    std::string key;
+    UUID reservation;
+};
+YLT_REFL(PutSessionKey, key, reservation);
+
 // A range of one Store object using a DummyClient SHM address. External
 // host/device buffers are staged through the existing registered SHM pool.
 struct DummySessionBuffer {
     uint64_t address = 0;
     uint64_t size = 0;
     uint64_t object_offset = 0;
+    uint64_t staging_id = 0;
 };
-YLT_REFL(DummySessionBuffer, address, size, object_offset);
+YLT_REFL(DummySessionBuffer, address, size, object_offset, staging_id);
 
 struct DummySessionRangeRequest {
     std::string key;
     std::vector<DummySessionBuffer> buffers;
 };
 YLT_REFL(DummySessionRangeRequest, key, buffers);
+
+struct DummyPutControl {
+    UUID context{};
+    uint64_t sequence = 0;
+};
+YLT_REFL(DummyPutControl, context, sequence);
+
+struct DummyPutStartResponse {
+    UUID context{};
+    std::vector<int> results;
+};
+YLT_REFL(DummyPutStartResponse, context, results);
 
 enum class ReplicaActionType {
     ADD = 0,
@@ -82,6 +101,7 @@ YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
+    struct_pack::compatible<UUID, 1> master_incarnation;
 
     PingResponse() = default;
     PingResponse(ViewVersionId view_version, ClientStatus status)
@@ -94,7 +114,7 @@ struct PingResponse {
                   << ", client_status: " << response.client_status << " }";
     }
 };
-YLT_REFL(PingResponse, view_version_id, client_status);
+YLT_REFL(PingResponse, view_version_id, client_status, master_incarnation);
 
 /**
  * @brief Response structure for GetReplicaList operation

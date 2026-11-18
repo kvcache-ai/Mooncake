@@ -3227,8 +3227,9 @@ buffer and scatter it. If a key
 has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
 it has only NOF replicas — `batch_get_session_start` returns
 `INVALID_REPLICA` for that key and does not open a session. Put sessions
-reserve object space via Master `BatchPutStart` and finalize with
-`BatchPutEnd`.
+reserve space on the Master. Each reservation has an ID so a retried end or
+revoke can only modify the write that created it. Upgrade the Master before
+using ranged puts with an updated client.
 
 Put sessions write MEMORY replicas only. If the Master has `root_fs_dir` set,
 session start releases the unused legacy DISK reservation before accepting
@@ -3239,7 +3240,17 @@ Reliable multi-replica NoF configs are rejected at session start. DFS configs
 (`dfs_replica_num > 0`, including DFS-only) are also rejected at session start with
 `INVALID_PARAMS`; use `put` / `batch_put_from` for DFS placement. `end` / `revoke`
 seal the session (no further range writes) and wait for in-flight range transfers
-before talking to Master.
+before talking to Master. Finish all range writes and call `end` within the
+Master's `put_start_discard_timeout_sec` window (30 seconds by default).
+After `LEASE_EXPIRED`, revoke the session and restart the write.
+The interval between the discard and release timeouts provides time for
+already submitted transfers to finish before the Master can reuse their buffers.
+Range writes use cached replica addresses. After the client observes a Master
+change, further range writes on the old sessions return `INVALID_VERSION`.
+Revoke those sessions and restart them. Drain active writes before a planned
+Master restart or failover.
+Until the client observes the change, it can still submit to an old address.
+A transfer already submitted can also outlive the failover.
 
 ⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
 Store-managed registered memory. DFS session reads use temporary staging; the
@@ -3252,8 +3263,8 @@ the same key. While a put session owns a key, ordinary `put` and `upsert`
 calls through the same RealClient return `INVALID_WRITE` for that key. This
 also applies when the session start timed out and its result is still unknown.
 Disconnect cleanup revokes that client's unfinished put sessions.
-Both the DummyClient and the `mooncake_client` daemon must include session RPC
-support; older daemons return an RPC error.
+Upgrade DummyClient and the `mooncake_client` daemon together for ranged
+operations. Peers with incompatible session RPCs return an error.
 
 In DummyClient mode, session transfers use the RealClient's mapping for
 registered shared memory. External CPU buffers and, by default, CUDA buffers
@@ -3263,7 +3274,10 @@ the GPU allocation. Persistent registration supports the classic Transfer
 Engine. With RDMA, turn off `MC_RDMA_DATA_DIRECT` to use this mode. A daemon
 using TENT or RDMA Data Direct returns an error before importing the allocation.
 An application with only registered GPU buffers can set `local_buffer_size=0`.
-Synchronize device producer streams before range writes.
+Synchronize device producer streams before range writes. If a range RPC times
+out or loses its connection, the daemon may still use the registered buffer.
+Keep caller-owned buffers alive and their contents stable until the transfer
+is confirmed or the DummyClient context has been closed successfully.
 
 In persistent mode, match each successful `register_buffer` call with an
 `unregister_buffer` call. Finish in-flight transfers before the final

@@ -295,6 +295,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
         const ObjectMeta& object_meta, ReplicaType replica_type);
 
+    // Only a matching reservation can complete or revoke a ranged write.
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> FinishPutSessions(
+        const std::vector<PutSessionKey>& keys, ReplicaType type, bool revoke);
+
     /**
      * @brief Ends a put operation for a batch of objects
      * @param keys Vector of object keys

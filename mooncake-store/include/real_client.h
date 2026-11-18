@@ -310,19 +310,24 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys, const UUID &client_id);
     int batch_get_session_end_dummy_helper(const std::vector<std::string> &keys,
                                            const UUID &client_id);
-    std::vector<int> batch_put_session_start_dummy_helper(
+    // Distinct RPC names keep unfenced peers from dispatching these requests.
+    DummyPutStartResponse batch_put_session_start_dummy_rpc_v2(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
-        const ReplicateConfig &config, const UUID &client_id);
-    std::vector<int> batch_put_session_end_dummy_helper(
-        const std::vector<std::string> &keys, const UUID &client_id);
-    std::vector<int> batch_put_session_revoke_dummy_helper(
-        const std::vector<std::string> &keys, const UUID &client_id);
-    std::vector<int> batch_get_into_multi_buffer_ranges_dummy_helper(
+        const ReplicateConfig &config, const UUID &client_id,
+        const DummyPutControl &control);
+    std::vector<int> batch_put_session_end_dummy_rpc_v2(
+        const std::vector<std::string> &keys, const UUID &client_id,
+        const DummyPutControl &control);
+    std::vector<int> batch_put_session_revoke_dummy_rpc_v2(
+        const std::vector<std::string> &keys, const UUID &client_id,
+        const DummyPutControl &control);
+    std::vector<int> batch_get_into_multi_buffer_ranges_dummy_rpc_v2(
         const std::vector<DummySessionRangeRequest> &requests,
         int32_t device_id, const UUID &client_id);
-    std::vector<int> batch_put_from_multi_buffer_ranges_dummy_helper(
+    std::vector<int> batch_put_from_multi_buffer_ranges_dummy_rpc_v2(
         const std::vector<DummySessionRangeRequest> &requests,
-        int32_t device_id, const UUID &client_id);
+        int32_t device_id, const UUID &client_id,
+        const DummyPutControl &put_control);
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -548,6 +553,11 @@ class RealClient : public PyClient {
 
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
         size_t size, const UUID &client_id);
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+    allocate_session_buffer_dummy(size_t size, const UUID &client_id,
+                                  uint64_t staging_id);
+    tl::expected<void, ErrorCode> release_session_buffer_dummy(
+        uint64_t dummy_addr, const UUID &client_id, uint64_t staging_id);
 
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
@@ -771,7 +781,8 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        bool stage_nof_device_reads = false);
 
     using LocalDiskOffloadObjects =
         std::unordered_map<std::string, std::vector<Slice>>;
@@ -784,7 +795,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-        const LocalDiskOffloadReader &local_disk_reader);
+        const LocalDiskOffloadReader &local_disk_reader,
+        bool stage_nof_device_reads = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -1247,10 +1259,24 @@ class RealClient : public PyClient {
         bool writable{true};
         size_t inflight_transfers{0};
         bool memory_end_attempted{false};
+        uint64_t dummy_generation{0};
+        uint64_t master_generation{0};
+        UUID reservation{};
+        std::chrono::steady_clock::time_point write_deadline =
+            std::chrono::steady_clock::time_point::min();
     };
     struct SessionState {
         // Serialize control RPCs so a late end/revoke cannot act on a new put.
         std::mutex put_control_mutex;
+        const UUID dummy_context = generate_uuid();
+        uint64_t last_dummy_control = 0;
+        bool accept_control(const DummyPutControl &control) {
+            if (control.context != dummy_context ||
+                control.sequence <= last_dummy_control)
+                return false;
+            last_dummy_control = control.sequence;
+            return true;
+        }
         std::mutex mutex;
         std::condition_variable cv;
         std::unordered_map<std::string, QueryResult> get_sessions;
@@ -1261,6 +1287,7 @@ class RealClient : public PyClient {
         kQuarantined,  // Initial registration did not confirm MR ownership.
         kRegistered,
         kUnregisterPending,
+        kClosePending,  // No MR remains; only the CUDA import needs closing.
     };
     struct CudaRegisteredAllocation {
         device::CudaIpcBufferMapping mapping;
@@ -1285,8 +1312,11 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
         // Buffers held by dummy via acquire_buffer; keyed by dummy address
-        std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
-            active_handles;
+        struct ActiveHandle {
+            std::shared_ptr<BufferHandle> buffer;
+            uint64_t staging_id = 0;
+        };
+        std::unordered_map<uint64_t, ActiveHandle> active_handles;
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
@@ -1319,6 +1349,9 @@ class RealClient : public PyClient {
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     SessionState real_sessions_;
+    std::vector<tl::expected<void, ErrorCode>> finish_put_sessions(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        ReplicaType type, bool revoke = true);
     void erase_put_session(SessionState &sessions, const std::string &key);
 
     void wait_session_put_idle(SessionState &sessions,
@@ -1335,22 +1368,27 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_src_offsets);
     std::vector<int> batch_put_session_start_impl(
         SessionState &sessions, const std::vector<std::string> &keys,
-        const std::vector<size_t> &sizes, const ReplicateConfig &config);
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        const DummyPutControl *control = nullptr);
     std::vector<int> batch_put_from_multi_buffer_ranges_impl(
         SessionState &sessions, const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const std::vector<std::vector<size_t>> &all_dst_offsets);
+        const std::vector<std::vector<size_t>> &all_dst_offsets,
+        const DummyPutControl *put_control = nullptr);
     std::vector<int> batch_put_session_end_impl(
-        SessionState &sessions, const std::vector<std::string> &keys);
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const DummyPutControl *control = nullptr);
     std::vector<int> batch_put_session_revoke_impl(
-        SessionState &sessions, const std::vector<std::string> &keys);
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const DummyPutControl *control = nullptr);
     ErrorCode cleanup_dummy_sessions(ShmContext &context);
     ErrorCode unregister_dummy_cuda_buffers(ShmContext &context);
     ErrorCode cleanup_session_state(SessionState &sessions);
     std::vector<int> execute_dummy_session_ranges(
         const std::vector<DummySessionRangeRequest> &requests,
-        int32_t device_id, const UUID &client_id, bool is_write);
+        int32_t device_id, const UUID &client_id,
+        const DummyPutControl *put_control);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

@@ -240,6 +240,12 @@ class ScatterRangeBuilder {
 
     bool empty() const { return ranges_.empty(); }
 
+    void clear() {
+        ranges_.clear();
+        remote_offsets_.clear();
+        lengths_.clear();
+    }
+
     const std::vector<TransferEngine::ScatterTransferRange>& ranges() const {
         return ranges_;
     }
@@ -826,7 +832,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         direct_master_address_ = master_server_entry;
         {
-            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            std::lock_guard lock(leader_switch_mutex_);
             current_master_view_.reset();
         }
         last_ping_success_.store(true);
@@ -853,7 +859,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
-    std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+    std::lock_guard lock(leader_switch_mutex_);
 
     if (current_master_view_.has_value()) {
         const auto& current_view = current_master_view_.value();
@@ -874,9 +880,48 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
         return err;
     }
 
+    if (last_connected_master_view_ &&
+        (target_view.view_version !=
+             last_connected_master_view_->view_version ||
+         target_view.leader_address !=
+             last_connected_master_view_->leader_address)) {
+        ++master_generation_;
+        observed_master_incarnation_ = {};
+        last_storage_status_ = ClientStatus::UNDEFINED;
+    }
+    last_connected_master_view_ = target_view;
     current_master_view_ = target_view;
     last_ping_success_.store(true);
     return ErrorCode::OK;
+}
+
+std::optional<uint64_t> Client::ObservePutMaster(uint64_t sent_generation,
+                                                 const UUID& incarnation,
+                                                 ClientStatus status) {
+    std::unique_lock lock(leader_switch_mutex_);
+    auto current = master_generation_.load();
+    if (sent_generation != current) {
+        // Concurrent starts can receive the same new grant. A delayed RPC
+        // must never undo a later leader, process, or remount observation.
+        if (status == ClientStatus::UNDEFINED &&
+            sent_generation + 1 == current &&
+            incarnation_generation_ == current && incarnation != UUID{} &&
+            incarnation == observed_master_incarnation_)
+            return current;
+        return std::nullopt;
+    }
+    if (incarnation != UUID{} && incarnation != observed_master_incarnation_) {
+        observed_master_incarnation_ = incarnation;
+        incarnation_generation_ = ++master_generation_;
+        last_storage_status_ = ClientStatus::UNDEFINED;
+    }
+    if (status != ClientStatus::UNDEFINED) {
+        if (last_storage_status_ == ClientStatus::OK &&
+            status == ClientStatus::NEED_REMOUNT)
+            ++master_generation_;
+        last_storage_status_ = status;
+    }
+    return master_generation_.load();
 }
 
 void Client::LeaderMonitorThreadMain() {
@@ -893,7 +938,7 @@ void Client::LeaderMonitorThreadMain() {
     while (leader_monitor_running_.load()) {
         std::optional<ViewVersionId> known_version;
         {
-            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            std::shared_lock lock(leader_switch_mutex_);
             if (current_master_view_.has_value()) {
                 known_version = current_master_view_->view_version;
             }
@@ -915,7 +960,7 @@ void Client::LeaderMonitorThreadMain() {
             // view version.
             if (view_change->changed &&
                 !view_change->current_view.has_value()) {
-                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                std::lock_guard lock(leader_switch_mutex_);
                 // Do not let a stale empty watch result erase a newer view
                 // installed concurrently by the heartbeat recovery path.
                 const bool still_on_observed_view =
@@ -5237,10 +5282,13 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
     const std::vector<std::vector<Slice>>& slices,
     const std::vector<std::vector<uint64_t>>& dst_offsets,
-    TransferIntent intent) {
+    TransferIntent intent,
+    const std::vector<std::chrono::steady_clock::time_point>& write_deadlines,
+    std::optional<uint64_t> master_generation) {
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         replicas_per_entry.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    if (replicas_per_entry.size() != slices.size() ||
+    if ((!write_deadlines.empty() && write_deadlines.size() != slices.size()) ||
+        replicas_per_entry.size() != slices.size() ||
         replicas_per_entry.size() != dst_offsets.size()) {
         LOG(ERROR) << "BatchTransferWriteRanges size mismatch: entries="
                    << replicas_per_entry.size() << ", slices=" << slices.size()
@@ -5262,44 +5310,71 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     ScatterRangeBuilder builder(fragment_count);
     std::vector<std::optional<ErrorCode>> entry_errors(
         replicas_per_entry.size());
-    for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
-        if (slices[i].size() != dst_offsets[i].size()) {
-            LOG(ERROR) << "BatchTransferWriteRanges fragment count mismatch, "
-                       << "entry=" << i << ", slices=" << slices[i].size()
-                       << ", offsets=" << dst_offsets[i].size();
-            continue;  // results[i] stays INVALID_PARAMS
-        }
-
-        // Logical bytes: counted once per fragment, not per replica.
-        int64_t transferred = 0;
-        for (const auto& slice : slices[i]) {
-            transferred += static_cast<int64_t>(slice.size);
-        }
-        bool submitted = false;
-        for (const auto& replica : replicas_per_entry[i]) {
-            if (!replica.is_memory_replica()) {
+    // A grant may expire while preparing a large batch. Rebuild only in that
+    // case so live entries can still transfer without using expired addresses.
+    std::chrono::steady_clock::time_point submit_by;
+    std::shared_lock observation(leader_switch_mutex_, std::defer_lock);
+    do {
+        if (observation.owns_lock()) observation.unlock();
+        builder.clear();
+        const auto now = std::chrono::steady_clock::now();
+        submit_by = std::chrono::steady_clock::time_point::max();
+        for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
+            if (!write_deadlines.empty() && now >= write_deadlines[i]) {
+                results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
                 continue;
             }
-            const auto& handle =
-                replica.get_memory_descriptor().buffer_descriptor;
-            for (size_t j = 0; j < slices[i].size(); ++j) {
-                builder.Add(TransferRequest::WRITE, handle, slices[i][j],
-                            dst_offsets[i][j], &entry_errors[i]);
-                submitted = true;
+            if (slices[i].size() != dst_offsets[i].size()) {
+                LOG(ERROR)
+                    << "BatchTransferWriteRanges fragment count mismatch, "
+                    << "entry=" << i << ", slices=" << slices[i].size()
+                    << ", offsets=" << dst_offsets[i].size();
+                continue;  // results[i] stays INVALID_PARAMS
+            }
+
+            // Logical bytes: counted once per fragment, not per replica.
+            int64_t transferred = 0;
+            for (const auto& slice : slices[i]) {
+                transferred += static_cast<int64_t>(slice.size);
+            }
+            bool submitted = false;
+            for (const auto& replica : replicas_per_entry[i]) {
+                if (!replica.is_memory_replica()) {
+                    continue;
+                }
+                const auto& handle =
+                    replica.get_memory_descriptor().buffer_descriptor;
+                for (size_t j = 0; j < slices[i].size(); ++j) {
+                    builder.Add(TransferRequest::WRITE, handle, slices[i][j],
+                                dst_offsets[i][j], &entry_errors[i]);
+                    submitted = true;
+                }
+            }
+            if (!submitted) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+                continue;
+            }
+            if (!write_deadlines.empty()) {
+                submit_by = std::min(submit_by, write_deadlines[i]);
+            }
+            results[i] = transferred;  // optimistic; corrected on await
+        }
+
+        if (builder.empty()) {
+            return results;
+        }
+        if (master_generation) {
+            observation.lock();
+            if (*master_generation != master_generation_.load()) {
+                for (auto& result : results)
+                    if (result)
+                        result = tl::unexpected(ErrorCode::INVALID_VERSION);
+                return results;
             }
         }
-        if (!submitted) {
-            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
-            continue;
-        }
-        results[i] = transferred;  // optimistic; corrected on await
-    }
-
-    if (builder.empty()) {
-        return results;
-    }
-
+    } while (std::chrono::steady_clock::now() >= submit_by);
     auto operation = SubmitScatterNative(builder.ranges(), intent);
+    if (observation.owns_lock()) observation.unlock();
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range write";
         for (auto& result : results) {
@@ -5316,7 +5391,15 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         MarkScatterOperationFailure(results, entry_errors, status);
     }
 
+    const auto completed = std::chrono::steady_clock::now();
     for (size_t i = 0; i < results.size(); ++i) {
+        if (master_generation && results[i] &&
+            *master_generation != master_generation_.load())
+            results[i] = tl::unexpected(ErrorCode::INVALID_VERSION);
+        if (!write_deadlines.empty() && results[i] &&
+            completed >= write_deadlines[i]) {
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
         if (!results[i].has_value() || !entry_errors[i].has_value()) {
             continue;
         }
@@ -5847,11 +5930,15 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
+        const auto sent_generation = CapturePutMasterGeneration();
         auto ping_result = metrics_
                                ? metrics_->master_heartbeat_metric.ObservePing(
                                      [this] { return master_client_.Ping(); })
                                : master_client_.Ping();
         if (ping_result) {
+            ObservePutMaster(sent_generation,
+                             ping_result->master_incarnation.value_or(UUID{}),
+                             ping_result->client_status);
             // Ephemeral gather discovery survives Master restart/failover
             // through the existing owner heartbeat, not snapshot metadata.
             std::string gather_endpoint;

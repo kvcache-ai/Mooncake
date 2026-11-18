@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -74,6 +75,11 @@ std::atomic<uint32_t> g_fake_next_key{1};
 // them (and TearDown can release whatever is left after the transport is gone).
 std::mutex g_fake_mr_mutex;
 std::set<ibv_mr *> g_fake_live_mrs;
+
+struct DeregPause {
+    std::promise<void> entered, resume;
+};
+DeregPause *g_pause_dereg = nullptr;
 
 // rdma-core exposes ibv_reg_mr as a function-like macro over __ibv_reg_mr, so
 // the definition below would be macro-expanded. Same pattern as
@@ -118,6 +124,10 @@ extern "C" struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr,
 
 extern "C" int ibv_dereg_mr(struct ibv_mr *mr) {
     ++g_fake_dereg_calls;
+    if (g_pause_dereg) {
+        g_pause_dereg->entered.set_value();
+        g_pause_dereg->resume.get_future().wait();
+    }
     // Claim a failure token with a CAS loop: batch paths call this from one
     // worker thread per buffer, and a check-then-decrement race would hand one
     // token to two callers.
@@ -338,6 +348,41 @@ TEST_F(RdmaUnregisterRepublishTest, MissingTransportDoesNotMaskLiveMr) {
     EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, addrA()));
     EXPECT_FALSE(engine.checkOverlap(addrA(), kLen));
     EXPECT_EQ(plugin_->setCalls(), sets_before);
+}
+
+TEST_F(RdmaUnregisterRepublishTest, ConcurrentUnregisterCannotReleaseLiveMr) {
+    TransferEngineImpl engine;
+    TransferEngineImplTestPeer::setTransports(
+        engine, metadata_, {{"rdma", std::move(transport_)}});
+    ASSERT_EQ(engine.registerLocalMemory(addrA(), kLen, "cpu:0", true, true),
+              0);
+
+    // The first caller has removed and published the descriptor but its MR
+    // is still live. It will fail deregistration when the provider resumes.
+    DeregPause pause;
+    g_pause_dereg = &pause;
+    g_fake_dereg_failures_remaining = 1;
+    auto first = std::async(std::launch::async, [&] {
+        return engine.unregisterLocalMemory(addrA(), true);
+    });
+    auto entered = pause.entered.get_future();
+    if (entered.wait_for(std::chrono::seconds(5)) ==
+        std::future_status::ready) {
+        EXPECT_FALSE(hasLocalBuffer(addrA()));
+        EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), ERR_CONTEXT);
+        EXPECT_EQ(engine.unregisterLocalMemoryBatch({addrA()}), ERR_CONTEXT);
+        EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
+    } else {
+        ADD_FAILURE() << "unregister did not reach the verbs provider";
+    }
+    pause.resume.set_value();
+    EXPECT_EQ(first.get(), ERR_CONTEXT);
+    g_pause_dereg = nullptr;
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, addrA()));
+    EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), 0);
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, addrA()));
+    EXPECT_FALSE(engine.checkOverlap(addrA(), kLen));
 }
 
 TEST_F(RdmaUnregisterRepublishTest, MissingDescriptorCanLeaveAnUnconfirmedMr) {

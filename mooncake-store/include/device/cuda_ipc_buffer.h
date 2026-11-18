@@ -31,6 +31,11 @@ class CudaIpcBufferMapping {
 
     static tl::expected<CudaIpcBufferMapping, ErrorCode> Open(
         const CudaIpcBufferHandle &handle);
+    // Open into an empty owner. If validation fails after CUDA opened the
+    // handle, the owner retains the import so its caller can confirm Close().
+    tl::expected<void, ErrorCode> OpenInto(const CudaIpcBufferHandle &handle);
+    // Keep the handle for another attempt if CUDA cannot confirm the close.
+    tl::expected<void, ErrorCode> Close();
 
     // Leave the CUDA mapping open until process exit when an MR may still
     // reference it after its owner shuts down.
@@ -41,14 +46,6 @@ class CudaIpcBufferMapping {
     size_t allocation_size() const { return allocation_size_; }
 
    private:
-    CudaIpcBufferMapping(void *base, void *ptr, int32_t device_id, size_t size)
-        : base_(base),
-          ptr_(ptr),
-          device_id_(device_id),
-          allocation_size_(size) {}
-
-    void Close();
-
     void *base_ = nullptr;
     void *ptr_ = nullptr;
     int32_t device_id_ = -1;

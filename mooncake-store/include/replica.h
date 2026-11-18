@@ -140,6 +140,9 @@ struct ReplicateConfig {
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
 
+    // Internal identity of one ranged put; ordinary writes leave it unset.
+    struct_pack::compatible<UUID, 5> put_reservation;
+
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
                (!residency_affinity_ids ||
@@ -361,10 +364,19 @@ struct DfsReplicaData {
     DistributedFSDescriptor descriptor;
 };
 
+struct PutSessionWriteGrant {
+    uint64_t ttl_sec = 0;
+    UUID master_incarnation{};
+    YLT_REFL(PutSessionWriteGrant, ttl_sec, master_incarnation);
+};
+
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     struct_pack::compatible<SegmentLocality, 1> locality;
-    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality);
+    // Present only in a fenced ranged-put start reply.
+    struct_pack::compatible<PutSessionWriteGrant, 2> put_session_write_grant;
+    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality,
+             put_session_write_grant);
 };
 
 struct NoFDescriptor {

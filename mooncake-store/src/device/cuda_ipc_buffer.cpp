@@ -270,21 +270,29 @@ CudaIpcBufferMapping &CudaIpcBufferMapping::operator=(
     CudaIpcBufferMapping &&other) noexcept {
     if (this != &other) {
         Close();
-        base_ = std::exchange(other.base_, nullptr);
-        ptr_ = std::exchange(other.ptr_, nullptr);
-        device_id_ = std::exchange(other.device_id_, -1);
-        allocation_size_ = std::exchange(other.allocation_size_, 0);
+        std::swap(base_, other.base_);
+        std::swap(ptr_, other.ptr_);
+        std::swap(device_id_, other.device_id_);
+        std::swap(allocation_size_, other.allocation_size_);
     }
     return *this;
 }
 
 tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     const CudaIpcBufferHandle &handle) {
+    CudaIpcBufferMapping mapping;
+    auto result = mapping.OpenInto(handle);
+    if (!result) return tl::unexpected(result.error());
+    return mapping;
+}
+
+tl::expected<void, ErrorCode> CudaIpcBufferMapping::OpenInto(
+    const CudaIpcBufferHandle &handle) {
 #if defined(USE_CUDA)
     static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize,
                   "Unexpected CUDA IPC handle size");
 
-    if (handle.size == 0 || AddOverflows(handle.offset, handle.size)) {
+    if (base_ || handle.size == 0 || AddOverflows(handle.offset, handle.size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -309,13 +317,13 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     CUdeviceptr allocation_base = 0;
     size_t allocation_size = 0;
     if (ret == cudaSuccess && base != nullptr) {
+        base_ = base;
+        device_id_ = *resolved_device;
         CUresult cu_ret = GetCudaAllocationRange(
             &allocation_base, &allocation_size, (CUdeviceptr)base);
         if (cu_ret != CUDA_SUCCESS || allocation_base != (CUdeviceptr)base ||
             allocation_size == 0 || AddOverflows(handle.offset, handle.size) ||
             handle.offset + handle.size > allocation_size) {
-            cudaIpcCloseMemHandle(base);
-            base = nullptr;
             ret = cudaErrorInvalidValue;
         }
     }
@@ -325,15 +333,16 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto *ptr = static_cast<char *>(base) + handle.offset;
-    return CudaIpcBufferMapping(base, ptr, *resolved_device, allocation_size);
+    ptr_ = static_cast<char *>(base) + handle.offset;
+    allocation_size_ = allocation_size;
+    return {};
 #else
     (void)handle;
     return tl::unexpected(ErrorCode::INVALID_PARAMS);
 #endif
 }
 
-void CudaIpcBufferMapping::Close() {
+tl::expected<void, ErrorCode> CudaIpcBufferMapping::Close() {
 #if defined(USE_CUDA)
     if (base_ != nullptr) {
         int current_device = -1;
@@ -341,12 +350,18 @@ void CudaIpcBufferMapping::Close() {
             cudaGetDevice(&current_device) == cudaSuccess;
         if (device_id_ >= 0 && cudaSetDevice(device_id_) != cudaSuccess) {
             ClearCudaError();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        cudaIpcCloseMemHandle(base_);
+        const auto result = cudaIpcCloseMemHandle(base_);
         if (restore_device) cudaSetDevice(current_device);
+        if (result != cudaSuccess) {
+            ClearCudaError();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
 #endif
     Abandon();
+    return {};
 }
 
 void CudaIpcBufferMapping::Abandon() noexcept {

@@ -121,6 +121,10 @@ class MasterService {
     ~MasterService();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+    PutSessionWriteGrant GetPutSessionWriteGrant() const {
+        return {static_cast<uint64_t>(put_start_discard_timeout_sec_.count()),
+                master_incarnation_};
+    }
     // Whether requests name their tenant, which multi-tenancy turns on.
     bool IsTenantQuotaEnabled() const {
         return tenant_quota_policy_ != nullptr;
@@ -438,8 +442,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const UUID& reservation = {}) -> tl::expected<void, ErrorCode>;
 
     auto PutEnd(const UUID& client_id, const std::string& key,
                 const TenantId& tenant_id, ReplicaType replica_type)
@@ -459,7 +463,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const UUID& reservation = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1887,6 +1892,7 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     ViewVersionId view_version_;
+    const UUID master_incarnation_ = generate_uuid();
 
     ClientSessionRegistry client_sessions_;
     ClientOffboardingWorker client_offboarding_worker_{this};

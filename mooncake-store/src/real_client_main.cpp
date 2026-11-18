@@ -83,17 +83,17 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::batch_get_session_end_dummy_helper>(
         &real_client);
-    server.register_handler<&RealClient::batch_put_session_start_dummy_helper>(
+    server.register_handler<&RealClient::batch_put_session_start_dummy_rpc_v2>(
         &real_client);
-    server.register_handler<&RealClient::batch_put_session_end_dummy_helper>(
+    server.register_handler<&RealClient::batch_put_session_end_dummy_rpc_v2>(
         &real_client);
-    server.register_handler<&RealClient::batch_put_session_revoke_dummy_helper>(
-        &real_client);
-    server.register_handler<
-        &RealClient::batch_get_into_multi_buffer_ranges_dummy_helper>(
+    server.register_handler<&RealClient::batch_put_session_revoke_dummy_rpc_v2>(
         &real_client);
     server.register_handler<
-        &RealClient::batch_put_from_multi_buffer_ranges_dummy_helper>(
+        &RealClient::batch_get_into_multi_buffer_ranges_dummy_rpc_v2>(
+        &real_client);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffer_ranges_dummy_rpc_v2>(
         &real_client);
     server.register_handler<&RealClient::get_into_range_shm_helper>(
         &real_client);
@@ -122,6 +122,10 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(
         &real_client);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&real_client);
+    server.register_handler<&RealClient::allocate_session_buffer_dummy>(
+        &real_client);
+    server.register_handler<&RealClient::release_session_buffer_dummy>(
+        &real_client);
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);

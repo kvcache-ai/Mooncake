@@ -1454,6 +1454,50 @@ class TestDummyClientCudaSessions(unittest.TestCase):
             store.remove(key, force=True)
             self.assertEqual(store.close(), 0)
 
+    @unittest.skipUnless(
+        os.getenv("MC_TEST_CUDA_NOF") == "1",
+        "Set MC_TEST_CUDA_NOF=1 with a mounted NVMe-oF replica",
+    )
+    def test_persistent_gpu_batch_put_get_nof_with_unaligned_subranges(self):
+        store = MooncakeDistributedStore()
+        torch = self.torch
+        size = 4096
+        source = torch.full((size + 1,), 91, dtype=torch.uint8, device="cuda")
+        dest = torch.zeros_like(source)
+        torch.cuda.synchronize()
+        key = f"cuda_nof_{uuid.uuid4().hex}"
+        registered = []
+        self.assertEqual(
+            store.setup_dummy(
+                0,
+                0,
+                os.environ["MC_CUDA_REAL_CLIENT"],
+                cuda_ipc_persistent_registration=True,
+            ),
+            0,
+        )
+        try:
+            for tensor in (source, dest):
+                self.assertEqual(store.register_buffer(tensor.data_ptr(), size + 1), 0)
+                registered.append(tensor)
+            config = mooncake_store.ReplicateConfig()
+            config.replica_num = 0
+            config.nof_replica_num = 1
+            self.assertEqual(
+                store.batch_put_from([key], [source.data_ptr() + 1], [size], config),
+                [0],
+            )
+            self.assertEqual(
+                store.batch_get_into([key], [dest.data_ptr() + 1], [size]), [size]
+            )
+            self.assertEqual(dest[0].item(), 0)
+            self.assertTrue(torch.equal(dest[1:].cpu(), source[1:].cpu()))
+        finally:
+            store.remove(key, force=True)
+            for tensor in registered:
+                self.assertEqual(store.unregister_buffer(tensor.data_ptr()), 0)
+            self.assertEqual(store.close(), 0)
+
     def test_registered_cuda_layers_fragments_bounds_and_partial_results(self):
         torch = self.torch
         layers, page, count, guard = 3, 64, 3, 8

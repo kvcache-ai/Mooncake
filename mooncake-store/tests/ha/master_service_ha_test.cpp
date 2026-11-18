@@ -5762,14 +5762,15 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     config.replica_num = 1;
     config.preferred_segments = {"batch_put_end_segment"};
     config.with_hard_pin = true;
+    const UUID reservation = generate_uuid();
+    config.put_reservation = reservation;
     const std::string key = "batch_put_end_key";
+    const ObjectMeta object{key, std::nullopt};
     auto put_start =
         service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
     ASSERT_TRUE(put_start.has_value());
-    ASSERT_TRUE(
-        service
-            .PutEnd(mounted.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(service.PutEnd(mounted.client_id, object, kDefaultTenant,
+                               ReplicaType::MEMORY, reservation));
 
     for (int i = 0; i < 50; ++i) {
         read_err = storage.ReadBatch(2, batch);
@@ -5788,6 +5789,26 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
               struct_pack::deserialize_to(payload, batch.entries[0].payload));
     EXPECT_TRUE(payload.hard_pinned.value_or(false));
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
+
+    // If the successful End reply was lost before promotion, only the same
+    // reservation may retry against the restored, already complete object.
+    StandbySnapshot snapshot;
+    snapshot.oplog_sequence_id = batch.entries[0].sequence_id;
+    snapshot.segments = {MakeStandbyMemorySegment("batch_put_end_segment")};
+    snapshot.objects = {
+        {kDefaultTenant.value(), key, payload.ToStandbyMetadata()}};
+    auto recovered = struct_pack::deserialize<StandbySnapshot>(
+        struct_pack::serialize(snapshot));
+    ASSERT_TRUE(recovered);
+    MasterService promoted;
+    ASSERT_TRUE(promoted.RestoreFromStandbySnapshot(
+        recovered->objects, recovered->oplog_sequence_id, recovered->segments));
+    EXPECT_TRUE(promoted.PutEnd(mounted.client_id, object, kDefaultTenant,
+                                ReplicaType::MEMORY, reservation));
+    const auto unfenced = promoted.PutEnd(mounted.client_id, key,
+                                          kDefaultTenant, ReplicaType::MEMORY);
+    ASSERT_FALSE(unfenced);
+    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, unfenced.error());
 
     DurablePrefix prefix;
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
