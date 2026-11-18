@@ -1383,6 +1383,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     void ClearFileCache();
 };
 
+class OffsetDeleteJournal;
+
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     friend class OffsetAllocatorStorageBackendTestPeer;
 
@@ -1436,6 +1438,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
 
+    // Success means all requested versions are durably invalidated. Keys are
+    // already scoped to their tenant.
+    tl::expected<void, ErrorCode> DeleteVersions(
+        const std::vector<std::pair<std::string, ObjectIncarnation>>& objects);
+
     /**
      * @brief Checks whether an object with the specified key exists in the
      * storage system.
@@ -1487,7 +1494,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // such as GDS):
     //
     //   [u32 key_len][u32 value_len][u64 seq][u32 flags][u32 crc32]
-    //   [key bytes][zero padding][value bytes]
+    //   [key bytes][optional incarnation][zero padding][value bytes]
     //
     // The value region always starts at a kValueAlignment boundary within
     // the record so that DMA engines (e.g. cuFile) operate on aligned file
@@ -1524,10 +1531,13 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
         // flags: crc32 field carries a valid CRC-32C of this record.
         static constexpr uint32_t kFlagHasCrc = 1u << 0;
+        static constexpr uint32_t kFlagHasIncarnation = 1u << 1;
+        static constexpr uint32_t kIncarnationSize = 2 * sizeof(uint64_t);
 
         // All currently defined flag bits; recovery drops records with
         // unknown bits set (written by a newer format).
-        static constexpr uint32_t kKnownFlags = kFlagHasCrc;
+        static constexpr uint32_t kKnownFlags =
+            kFlagHasCrc | kFlagHasIncarnation;
 
         // File-offset alignment of the value region within a record.
         // 4 KiB covers the logical block size of currently supported NVMe
@@ -1545,24 +1555,31 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
             sizeof(uint32_t) * 2 + sizeof(uint64_t) + sizeof(uint32_t);
 
         // Zero-padding between key and value for the given key length.
-        static constexpr uint32_t ValuePadding(uint32_t key_len) {
-            const uint64_t head = SIZE + key_len;
+        static constexpr uint32_t ValuePadding(uint32_t key_len,
+                                               uint32_t extra = 0) {
+            const uint64_t head = SIZE + key_len + extra;
             return static_cast<uint32_t>(
                 (kValueAlignment - head % kValueAlignment) % kValueAlignment);
         }
 
         // Offset of the value region relative to the record start.
-        static constexpr uint64_t ValueOffsetInRecord(uint32_t key_len) {
-            return SIZE + key_len + ValuePadding(key_len);
+        static constexpr uint64_t ValueOffsetInRecord(uint32_t key_len,
+                                                      uint32_t extra = 0) {
+            return SIZE + key_len + extra + ValuePadding(key_len, extra);
         }
 
         // Total on-disk record size including padding.
         static constexpr uint64_t RecordSize(uint32_t key_len,
-                                             uint32_t value_len) {
-            return ValueOffsetInRecord(key_len) + value_len;
+                                             uint32_t value_len,
+                                             uint32_t extra = 0) {
+            return ValueOffsetInRecord(key_len, extra) + value_len;
         }
 
         bool HasCrc() const { return (flags & kFlagHasCrc) != 0; }
+
+        uint32_t IncarnationSize() const {
+            return (flags & kFlagHasIncarnation) ? kIncarnationSize : 0;
+        }
 
         void WritePrefixTo(char* out) const {
             std::memcpy(out, &key_len, sizeof(key_len));
@@ -1665,14 +1682,17 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // fifo_index_ (seq -> key). Used during eviction to detect stale
         // index entries (lazy-repair) and to remove old slots on overwrite.
         uint64_t fifo_seq = 0;
+        ObjectIncarnation incarnation;
 
         ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
-                    AllocationPtr alloc_ptr, uint64_t seq = 0)
+                    AllocationPtr alloc_ptr, uint64_t seq = 0,
+                    ObjectIncarnation version = {})
             : offset(off),
               total_size(total),
               value_size(val),
               allocation(std::move(alloc_ptr)),
-              fifo_seq(seq) {}
+              fifo_seq(seq),
+              incarnation(version) {}
     };
 
     // Keeps evicted metadata and allocation handles alive until the master
@@ -1796,6 +1816,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     std::string GetMetaFilePath() const;
 
+    tl::expected<void, ErrorCode> OpenDeleteJournal();
+    tl::expected<void, ErrorCode> EnsureDeleteJournal();
+
     bool ShouldPersistNow() const;
 
     tl::expected<void, ErrorCode> SaveMetadata(
@@ -1834,6 +1857,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     std::atomic<int64_t> last_persist_time_us_{0};
     std::unordered_set<std::string> all_evicted_this_batch_;
     std::atomic<bool> metadata_dirty_{false};
+    std::mutex mutation_mutex_;
+    std::unique_ptr<OffsetDeleteJournal> delete_journal_;
+    int owner_lock_fd_ = -1;
 
     // ---- Persistence metrics ----
     std::atomic<int64_t> last_save_metadata_cost_us_{0};
