@@ -12,6 +12,10 @@
 
 namespace mooncake {
 
+namespace test {
+class BatchOpLogPruningWorkerTestPeer;
+}
+
 class BatchOpLogPruningWorker {
    public:
     BatchOpLogPruningWorker(OpLogBatchStorage& storage,
@@ -25,12 +29,15 @@ class BatchOpLogPruningWorker {
     void Stop();
 
    private:
+    friend class test::BatchOpLogPruningWorkerTestPeer;
+
     enum class WaitState { kNone, kPacing, kIdlePoll, kErrorRetry };
 
     std::chrono::steady_clock::duration ComputePacingDelay(
+        uint64_t batches_advanced,
         std::chrono::steady_clock::duration delete_duration) const;
     ErrorCode RunOneChunkLocked(
-        bool& deleted_chunk,
+        uint64_t& batches_advanced,
         std::chrono::steady_clock::duration& delete_duration);
     ErrorCode RefreshFloor();
     ErrorCode RecoverCursor(uint64_t floor);

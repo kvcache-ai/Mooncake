@@ -16,6 +16,25 @@
 #include "ha_metric_manager.h"
 
 namespace mooncake::test {
+
+class BatchOpLogPruningWorkerTestPeer {
+   public:
+    using Duration = std::chrono::steady_clock::duration;
+
+    static ErrorCode RunOneChunk(BatchOpLogPruningWorker& worker,
+                                 uint64_t& batches_advanced) {
+        std::lock_guard lock(worker.cycle_mutex_);
+        Duration delete_duration{};
+        return worker.RunOneChunkLocked(batches_advanced, delete_duration);
+    }
+
+    static Duration PacingDelay(const BatchOpLogPruningWorker& worker,
+                                uint64_t batches_advanced,
+                                Duration delete_duration = Duration::zero()) {
+        return worker.ComputePacingDelay(batches_advanced, delete_duration);
+    }
+};
+
 namespace {
 
 class FakeHaKvBackend : public HaKvBackend {
@@ -254,6 +273,100 @@ TEST(BatchOpLogPruningWorkerTest,
     EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 11)));
     EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 15)));
     EXPECT_EQ(2u, backend.delete_calls());
+}
+
+TEST(BatchOpLogPruningWorkerTest, PacesPartialChunkByAdvancedBatchIds) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "partial-chunk";
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put("/oplog/partial-chunk/snapshot/compaction_floor", "1"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10000, 50);
+    uint64_t batches_advanced = 0;
+
+    ASSERT_EQ(ErrorCode::OK, BatchOpLogPruningWorkerTestPeer::RunOneChunk(
+                                 worker, batches_advanced));
+    ASSERT_EQ(1u, batches_advanced);
+    EXPECT_EQ(
+        std::chrono::milliseconds(20),
+        BatchOpLogPruningWorkerTestPeer::PacingDelay(worker, batches_advanced));
+    EXPECT_EQ(std::chrono::milliseconds(15),
+              BatchOpLogPruningWorkerTestPeer::PacingDelay(
+                  worker, batches_advanced, std::chrono::milliseconds(5)));
+    EXPECT_EQ(std::chrono::steady_clock::duration::zero(),
+              BatchOpLogPruningWorkerTestPeer::PacingDelay(
+                  worker, batches_advanced, std::chrono::milliseconds(25)));
+}
+
+TEST(BatchOpLogPruningWorkerTest, PacesSparseChunkByIdSpanNotDeletedKeyCount) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "sparse-chunk";
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put("/oplog/sparse-chunk/snapshot/compaction_floor", "10000"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 10000), "record"));
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10000, 50);
+    uint64_t batches_advanced = 0;
+
+    ASSERT_EQ(ErrorCode::OK, BatchOpLogPruningWorkerTestPeer::RunOneChunk(
+                                 worker, batches_advanced));
+    ASSERT_EQ(10000u, batches_advanced);
+    EXPECT_EQ(
+        std::chrono::seconds(200),
+        BatchOpLogPruningWorkerTestPeer::PacingDelay(worker, batches_advanced));
+    EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 1)));
+    EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 10000)));
+}
+
+TEST(BatchOpLogPruningWorkerTest,
+     RetainsAdvancedCountWhenPostDeleteFloorRefreshFails) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "partial-chunk-refresh-failure";
+    const std::string floor_key =
+        "/oplog/partial-chunk-refresh-failure/snapshot/compaction_floor";
+    ASSERT_EQ(ErrorCode::OK, backend.Put(floor_key, "1"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+    backend.FailGetOnCall(floor_key, 2, ErrorCode::ETCD_OPERATION_ERROR);
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10000, 50);
+    uint64_t batches_advanced = 0;
+
+    EXPECT_EQ(
+        ErrorCode::ETCD_OPERATION_ERROR,
+        BatchOpLogPruningWorkerTestPeer::RunOneChunk(worker, batches_advanced));
+    ASSERT_EQ(1u, batches_advanced);
+    EXPECT_EQ(
+        std::chrono::milliseconds(20),
+        BatchOpLogPruningWorkerTestPeer::PacingDelay(worker, batches_advanced));
+    EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 1)));
+}
+
+TEST(BatchOpLogPruningWorkerTest, FailedDeleteDoesNotAdvanceBatchIds) {
+    FakeHaKvBackend backend;
+    const std::string cluster = "failed-chunk";
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put("/oplog/failed-chunk/snapshot/compaction_floor", "1"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+    backend.FailDelete(ErrorCode::ETCD_OPERATION_ERROR);
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10000, 50);
+    uint64_t batches_advanced = 10000;
+
+    EXPECT_EQ(
+        ErrorCode::ETCD_OPERATION_ERROR,
+        BatchOpLogPruningWorkerTestPeer::RunOneChunk(worker, batches_advanced));
+    EXPECT_EQ(0u, batches_advanced);
+    EXPECT_TRUE(backend.Has(BuildBatchRecordKey(cluster, 1)));
 }
 
 TEST(BatchOpLogPruningWorkerTest,

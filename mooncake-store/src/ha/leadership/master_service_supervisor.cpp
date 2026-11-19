@@ -761,9 +761,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 // release the last service owner. A terminal writer callback
                 // captures wrapped_master_service by reference.
                 serving_state.RequestShutdown([] {});
+                wrapped_master_service->RequestStopBatchOpLogPruningWorker();
                 worker_pool.reset();
                 StopLeadershipMonitor(monitor);
-                wrapped_master_service->RequestStopBatchOpLogPruningWorker();
                 wrapped_master_service->StopBatchOpLogPruningWorker();
                 wrapped_master_service->StopBatchOpLogWriter();
                 DeactivateServingState(admin_server, label_reconciler);
@@ -782,8 +782,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                               term_lease);  // Does not return.
             }
             serving_state.RequestShutdown([] {});
-            worker_pool.reset();
             wrapped_master_service->RequestStopBatchOpLogPruningWorker();
+            worker_pool.reset();
             wrapped_master_service->StopBatchOpLogPruningWorker();
             wrapped_master_service->StopBatchOpLogWriter();
             wrapped_master_service.reset();
@@ -967,6 +967,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 label_reconciler.SetLeader(false);
                 SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                 LOG(INFO) << "Trying to stop server, reason=shutdown requested";
+                wrapped_master_service->RequestStopBatchOpLogPruningWorker();
                 server.stop();
             });
         });
@@ -1066,13 +1067,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         auto server_err = std::move(ec.value()).get();
         shutdown_trigger.Stop();
+        wrapped_master_service->RequestStopBatchOpLogPruningWorker();
         // Finish the calls the workers still hold before the term's OpLog
         // writer and leadership go, as inline handlers would have.
         worker_pool.reset();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
-        wrapped_master_service->RequestStopBatchOpLogPruningWorker();
         wrapped_master_service->StopBatchOpLogPruningWorker();
         wrapped_master_service->StopBatchOpLogWriter();
         DeactivateServingState(admin_server, label_reconciler);

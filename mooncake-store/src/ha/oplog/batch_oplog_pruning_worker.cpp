@@ -5,6 +5,7 @@
 
 #include <glog/logging.h>
 
+#include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
 
 namespace mooncake {
@@ -50,8 +51,12 @@ ErrorCode BatchOpLogPruningWorker::Start() {
 
 ErrorCode BatchOpLogPruningWorker::RunOneChunk(bool& deleted_chunk) {
     std::lock_guard cycle_lock(cycle_mutex_);
+    uint64_t batches_advanced = 0;
     Clock::duration delete_duration{};
-    return RunOneChunkLocked(deleted_chunk, delete_duration);
+    const ErrorCode error =
+        RunOneChunkLocked(batches_advanced, delete_duration);
+    deleted_chunk = batches_advanced != 0;
+    return error;
 }
 
 void BatchOpLogPruningWorker::RequestStop() {
@@ -72,9 +77,9 @@ void BatchOpLogPruningWorker::Stop() {
 }
 
 Clock::duration BatchOpLogPruningWorker::ComputePacingDelay(
-    Clock::duration delete_duration) const {
+    uint64_t batches_advanced, Clock::duration delete_duration) const {
     const std::chrono::duration<double> target_seconds(
-        static_cast<double>(chunk_batch_count_) /
+        static_cast<double>(batches_advanced) /
         static_cast<double>(max_batches_per_second_));
     if (target_seconds >=
         std::chrono::duration<double>(Clock::duration::max())) {
@@ -87,8 +92,8 @@ Clock::duration BatchOpLogPruningWorker::ComputePacingDelay(
 }
 
 ErrorCode BatchOpLogPruningWorker::RunOneChunkLocked(
-    bool& deleted_chunk, Clock::duration& delete_duration) {
-    deleted_chunk = false;
+    uint64_t& batches_advanced, Clock::duration& delete_duration) {
+    batches_advanced = 0;
     delete_duration = Clock::duration::zero();
     if (chunk_batch_count_ == 0 || max_batches_per_second_ == 0) {
         return ErrorCode::INVALID_PARAMS;
@@ -121,7 +126,7 @@ ErrorCode BatchOpLogPruningWorker::RunOneChunkLocked(
     }
 
     cursor_ = last_id;
-    deleted_chunk = true;
+    batches_advanced = count;
     HAMetricManager::instance().inc_batch_oplog_pruner_chunks_deleted();
     HAMetricManager::instance().inc_batch_oplog_pruner_batch_ids_advanced(
         count);
@@ -228,31 +233,34 @@ void BatchOpLogPruningWorker::WorkerLoop() {
         }
         retry_cycle_immediately = false;
 
-        bool deleted_chunk = false;
+        uint64_t batches_advanced = 0;
         Clock::duration delete_duration{};
         ErrorCode error = ErrorCode::OK;
         {
             std::lock_guard cycle_lock(cycle_mutex_);
-            error = RunOneChunkLocked(deleted_chunk, delete_duration);
+            error = RunOneChunkLocked(batches_advanced, delete_duration);
         }
         if (stop_requested_.load()) break;
         if (error != ErrorCode::OK) {
             LOG(ERROR) << "Batch OpLog pruning worker chunk failed: "
                        << toString(error) << "; retrying";
             Clock::duration delay = kErrorRetryInterval;
-            if (deleted_chunk) {
-                delay = std::max(delay, ComputePacingDelay(delete_duration));
+            if (batches_advanced != 0) {
+                delay = std::max(delay, ComputePacingDelay(batches_advanced,
+                                                           delete_duration));
             }
             if (!WaitFor(delay, WaitState::kErrorRetry)) break;
             retry_cycle_immediately = true;
-        } else if (deleted_chunk) {
-            const auto delay = ComputePacingDelay(delete_duration);
+        } else if (batches_advanced != 0) {
+            const auto delay =
+                ComputePacingDelay(batches_advanced, delete_duration);
             if (delay > Clock::duration::zero() &&
                 !WaitFor(delay, WaitState::kPacing)) {
                 break;
             }
         }
     }
+    TestFailPoint::Wait("batch_oplog_pruner_before_exit");
 }
 
 }  // namespace mooncake
