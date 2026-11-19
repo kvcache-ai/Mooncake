@@ -17,13 +17,10 @@
 
 #include <atomic>
 #include <array>
-#include <chrono>
-#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 #include <unordered_set>
 #include <cn_api.h>
@@ -147,24 +144,12 @@ class MluTransport : public Transport {
     Status drainBuffer(uint64_t addr, size_t size);
     std::shared_ptr<void> relocate(SegmentID target_id, uint64_t &addr,
                                    size_t length);
-    void reapImports();
-    void evictIdleSegments(std::chrono::steady_clock::time_point now);
 
-    // Serialize install/uninstall while the reaper is joined outside mutex_.
-    std::mutex lifecycle_mutex_;
     std::mutex mutex_;
-    std::condition_variable import_reaper_cv_;
-    std::thread import_reaper_;
-    // Guarded by mutex_; durations are fixed before starting the reaper.
-    bool stop_import_reaper_ = true;
-    std::chrono::milliseconds import_idle_timeout_{std::chrono::minutes(5)};
-    std::chrono::milliseconds import_scan_interval_{std::chrono::minutes(5)};
     // D2H/D2D on the source context, H2D on the destination context.
     std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 2>> queues_;
     std::unordered_set<MluSubBatch *> batches_;
     std::map<SegmentID, std::vector<mlu_detail::ImportEntry>> imports_;
-    std::map<SegmentID, std::chrono::steady_clock::time_point>
-        last_import_request_;
     std::map<SegmentID, uint64_t> high_water_;
     std::string machine_id_;
     bool installed_ = false;

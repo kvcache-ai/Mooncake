@@ -213,48 +213,16 @@ class MluTransportTestPeer {
                                                     SegmentID target_id) {
         std::unique_lock<std::mutex> lock(transport.mutex_, std::try_to_lock);
         return lock.owns_lock() && !transport.imports_.count(target_id) &&
-               !transport.last_import_request_.count(target_id) &&
                !transport.high_water_.count(target_id);
     }
 
-    static void seedImportCache(
-        MluTransport &transport, SegmentID target_id,
-        std::vector<mlu_detail::ImportEntry> entries, uint64_t generation,
-        std::chrono::steady_clock::time_point last_request =
-            std::chrono::steady_clock::now()) {
+    static void seedImportCache(MluTransport &transport, SegmentID target_id,
+                                std::vector<mlu_detail::ImportEntry> entries,
+                                uint64_t generation) {
         std::lock_guard<std::mutex> lock(transport.mutex_);
         transport.machine_id_ = "test-machine";
         transport.imports_[target_id] = std::move(entries);
         transport.high_water_[target_id] = generation;
-        transport.last_import_request_[target_id] = last_request;
-    }
-
-    static void evictIdleSegments(MluTransport &transport,
-                                  std::chrono::steady_clock::time_point now) {
-        transport.evictIdleSegments(now);
-    }
-
-    static std::pair<size_t, uint64_t> cacheState(MluTransport &transport,
-                                                  SegmentID target_id) {
-        std::lock_guard<std::mutex> lock(transport.mutex_);
-        auto entries = transport.imports_.find(target_id);
-        auto watermark = transport.high_water_.find(target_id);
-        return {
-            entries == transport.imports_.end() ? 0 : entries->second.size(),
-            watermark == transport.high_water_.end() ? 0 : watermark->second};
-    }
-
-    static std::shared_ptr<void> relocate(MluTransport &transport,
-                                          SegmentID target_id, uint64_t &addr,
-                                          size_t length) {
-        std::lock_guard<std::mutex> lock(transport.mutex_);
-        return transport.relocate(target_id, addr, length);
-    }
-
-    static void setScanInterval(MluTransport &transport,
-                                std::chrono::milliseconds interval) {
-        // Tests call this only between uninstall and install.
-        transport.import_scan_interval_ = interval;
     }
 };
 
@@ -410,144 +378,6 @@ TEST_P(MluImportCleanupTest, DestroysCachedMappingsOutsideTransportLock) {
 
 INSTANTIATE_TEST_SUITE_P(CloseAndUninstall, MluImportCleanupTest,
                          ::testing::Bool());
-
-TEST(MluSegmentIdleCacheTest,
-     EvictsWholeSegmentOutsideLockButTaskKeepsMapping) {
-    const auto now = std::chrono::steady_clock::now();
-    MluTransport transport;
-    MluTask task;
-    task.imported_target = std::make_shared<int>(7);
-    std::weak_ptr<void> held = task.imported_target;
-    auto idle = std::shared_ptr<void>(new int(0), [&](void *ptr) {
-        auto check = std::async(std::launch::async, [&] {
-            return MluTransportTestPeer::cacheState(transport, 42);
-        });
-        EXPECT_EQ(check.get(), std::make_pair(size_t{0}, uint64_t{10}));
-        delete static_cast<int *>(ptr);
-    });
-    std::weak_ptr<void> unheld = idle;
-    MluTransportTestPeer::seedImportCache(
-        transport, 42,
-        {{"one", 0x1000, kChunk, task.imported_target},
-         {"two", 0x20000, kChunk, std::move(idle)}},
-        10, now - std::chrono::minutes(5));
-    auto recent = std::make_shared<int>(1);
-    MluTransportTestPeer::seedImportCache(transport, 43,
-                                          {{"recent", 0x1000, kChunk, recent}},
-                                          20, now - std::chrono::minutes(4));
-    MluTransportTestPeer::evictIdleSegments(transport, now);
-    EXPECT_TRUE(unheld.expired());
-    EXPECT_FALSE(held.expired());
-    EXPECT_EQ(MluTransportTestPeer::cacheState(transport, 42),
-              std::make_pair(size_t{0}, uint64_t{10}));
-    EXPECT_EQ(MluTransportTestPeer::cacheState(transport, 43),
-              std::make_pair(size_t{1}, uint64_t{20}));
-    task.imported_target.reset();
-    EXPECT_TRUE(held.expired());
-}
-
-TEST(MluSegmentIdleCacheTest, RelocateRenewsAllMappingsOfOnlyItsTarget) {
-    const auto now = std::chrono::steady_clock::now();
-    MluTransport transport;
-    for (SegmentID target_id : {42, 43}) {
-        MluTransportTestPeer::seedImportCache(
-            transport, target_id,
-            {{"one", 0x1000, kChunk, std::make_shared<int>(1)},
-             {"two", 0x20000, kChunk, std::make_shared<int>(2)}},
-            10, now - std::chrono::minutes(10));
-    }
-    uint64_t addr = 0x1000;
-    auto task_mapping = MluTransportTestPeer::relocate(transport, 42, addr, 1);
-    ASSERT_NE(task_mapping, nullptr);
-    MluTransportTestPeer::evictIdleSegments(transport, now);
-    EXPECT_EQ(MluTransportTestPeer::cacheState(transport, 42),
-              std::make_pair(size_t{2}, uint64_t{10}));
-    EXPECT_EQ(MluTransportTestPeer::cacheState(transport, 43),
-              std::make_pair(size_t{0}, uint64_t{10}));
-}
-
-TEST_F(MluTransportTest, PrepareRenewsEntireSegmentIdleTime) {
-    std::vector<uint8_t> source(kChunk);
-    auto a = ipcBuffer(0x1000, kChunk, 101);
-    auto b = ipcBuffer(0x20000, kChunk, 102);
-    for (uint64_t generation : {9, 10, 11}) {
-        const auto now = std::chrono::steady_clock::now();
-        auto snapshot = ipcSnapshot(generation, {a, b});
-        MluTransportTestPeer::seedImportCache(
-            transport_, 42,
-            {{a.transport_attrs.at(MLU), a.addr, a.length,
-              std::make_shared<int>(1)},
-             {b.transport_attrs.at(MLU), b.addr, b.length,
-              std::make_shared<int>(2)}},
-            10, now - std::chrono::minutes(10));
-        ASSERT_TRUE(transport_.prepareRemoteBuffer(
-            42, snapshot, a, source.data(), Request::WRITE));
-        MluTransportTestPeer::evictIdleSegments(transport_, now);
-        EXPECT_EQ(
-            MluTransportTestPeer::cacheState(transport_, 42),
-            std::make_pair(size_t{2}, std::max(uint64_t{10}, generation)));
-    }
-}
-
-TEST_F(MluTransportTest, IdleSegmentRejectsOldSnapshotAndRemapsCurrent) {
-    uint8_t *device = nullptr;
-    ASSERT_NO_FATAL_FAILURE(allocDevice(&device, kChunk));
-    stub_ipc_mapping = device;
-    std::vector<uint8_t> source(kChunk);
-    auto entry = ipcBuffer(0x1000, kChunk, 101);
-    auto current = ipcSnapshot(10, {entry});
-    auto older = ipcSnapshot(9, {entry});
-    MluTransportTestPeer::seedImportCache(transport_, 42, {}, 10);
-    const int maps_before = ipc_map_calls;
-    const int unmaps_before = ipc_unmap_calls;
-    ASSERT_TRUE(transport_.prepareRemoteBuffer(42, current, entry,
-                                               source.data(), Request::WRITE));
-    MluTransportTestPeer::evictIdleSegments(
-        transport_,
-        std::chrono::steady_clock::now() + std::chrono::minutes(10));
-    EXPECT_EQ(ipc_unmap_calls.load(), unmaps_before + 1);
-    // Keep the existing false/fallback behavior; do not import a stale token.
-    EXPECT_FALSE(transport_.prepareRemoteBuffer(42, older, entry, source.data(),
-                                                Request::WRITE));
-    EXPECT_EQ(ipc_map_calls.load(), maps_before + 1);
-    EXPECT_TRUE(transport_.prepareRemoteBuffer(42, current, entry,
-                                               source.data(), Request::WRITE));
-    EXPECT_EQ(ipc_map_calls.load(), maps_before + 2);
-    transport_.closeRemoteSegment(42);
-    EXPECT_EQ(ipc_unmap_calls.load(), unmaps_before + 2);
-    stub_ipc_mapping = nullptr;
-    EXPECT_TRUE(loader_->free(device, kChunk).ok());
-}
-
-TEST_F(MluTransportTest, SegmentReaperRunsWithoutRequestsAndRestarts) {
-    ASSERT_TRUE(transport_.uninstall().ok());
-    MluTransportTestPeer::setScanInterval(transport_,
-                                          std::chrono::milliseconds(5));
-    std::string segment = "local";
-    for (int cycle = 0; cycle < 2; ++cycle) {
-        ASSERT_TRUE(transport_.install(segment, nullptr, nullptr).ok());
-        auto released = std::make_shared<std::promise<void>>();
-        auto future = released->get_future();
-        auto mapping = std::shared_ptr<void>(new int(0), [released](void *ptr) {
-            delete static_cast<int *>(ptr);
-            released->set_value();
-        });
-        MluTransportTestPeer::seedImportCache(
-            transport_, 42, {{"idle", 0x1000, kChunk, std::move(mapping)}}, 10,
-            std::chrono::steady_clock::now() - std::chrono::minutes(10));
-        EXPECT_EQ(future.wait_for(std::chrono::seconds(3)),
-                  std::future_status::ready);
-        EXPECT_EQ(MluTransportTestPeer::cacheState(transport_, 42),
-                  std::make_pair(size_t{0}, uint64_t{10}));
-        ASSERT_TRUE(transport_.uninstall().ok());
-    }
-    MluTransportTestPeer::setScanInterval(transport_, std::chrono::minutes(5));
-    ASSERT_TRUE(transport_.install(segment, nullptr, nullptr).ok());
-    const auto start = std::chrono::steady_clock::now();
-    ASSERT_TRUE(transport_.uninstall().ok());
-    EXPECT_LT(std::chrono::steady_clock::now() - start,
-              std::chrono::seconds(2));
-}
 
 TEST_F(MluTransportTest, DroppedIpcAttributeIsNotReturnedByLaterPrepare) {
     // Cache reconciliation is independent of device peer accessibility.

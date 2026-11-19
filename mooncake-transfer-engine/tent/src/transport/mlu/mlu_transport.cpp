@@ -20,7 +20,6 @@
 #include <algorithm>
 #include <charconv>
 #include <sstream>
-#include <system_error>
 #include <unordered_set>
 #include <utility>
 
@@ -201,7 +200,6 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
                              std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> /*local_topology*/,
                              std::shared_ptr<Config> conf) {
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (installed_) {
         return Status::InvalidArgument(
@@ -228,16 +226,6 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
                 }));
         }
     }
-    if (ipc_enabled_) {
-        stop_import_reaper_ = false;
-        try {
-            import_reaper_ = std::thread(&MluTransport::reapImports, this);
-        } catch (const std::system_error &error) {
-            stop_import_reaper_ = true;
-            return Status::InternalError(
-                std::string("Cannot start MLU import reaper: ") + error.what());
-        }
-    }
     installed_ = true;
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
@@ -246,21 +234,11 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
 }
 
 Status MluTransport::uninstall() {
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_import_reaper_ = true;
-    }
-    import_reaper_cv_.notify_all();
-    // Stop before draining: even a failed drain must not leave a joinable
-    // thread behind on destruction. Never join while holding mutex_.
-    if (import_reaper_.joinable()) import_reaper_.join();
     // Declared before the lock so cached mappings are unmapped after unlock.
     decltype(imports_) dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
     dropped.swap(imports_);
-    last_import_request_.clear();
     high_water_.clear();
     queues_.clear();
     metadata_.reset();
@@ -268,35 +246,6 @@ Status MluTransport::uninstall() {
     installed_ = false;
     machine_id_.clear();
     return Status::OK();
-}
-
-void MluTransport::reapImports() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (!import_reaper_cv_.wait_for(
-        lock, import_scan_interval_, [this] { return stop_import_reaper_; })) {
-        lock.unlock();
-        evictIdleSegments(std::chrono::steady_clock::now());
-        lock.lock();
-    }
-}
-
-void MluTransport::evictIdleSegments(
-    std::chrono::steady_clock::time_point now) {
-    // Drop only cache references. Tasks may still hold these mappings; the
-    // last reference unmaps them, outside the transport lock.
-    decltype(imports_) dropped;
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = last_import_request_.begin();
-         it != last_import_request_.end();) {
-        if (now - it->second < import_idle_timeout_) {
-            ++it;
-            continue;
-        }
-        dropped.insert(imports_.extract(it->first));
-        it = last_import_request_.erase(it);
-    }
-    // Preserve high_water_: old snapshots must not recreate expired imports.
-    // They follow the existing IPC failure/fallback path on a cache miss.
 }
 
 Status MluTransport::quiesce() {
@@ -867,7 +816,6 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     std::vector<std::shared_ptr<void>> dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     auto &entries = imports_[target_id];
-    last_import_request_[target_id] = std::chrono::steady_clock::now();
     auto &watermark = high_water_[target_id];
     if (generation < watermark) {
         // A newer snapshot has already removed stale imports. Reuse a mapping
@@ -945,7 +893,6 @@ std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
         if (!rangeWithin(addr, length, entry.base, entry.size)) continue;
         addr =
             addr - entry.base + reinterpret_cast<uint64_t>(entry.mapping.get());
-        last_import_request_[target_id] = std::chrono::steady_clock::now();
         return entry.mapping;
     }
     return nullptr;
@@ -956,7 +903,6 @@ void MluTransport::closeRemoteSegment(SegmentID target_id) {
     decltype(imports_)::node_type dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     dropped = imports_.extract(target_id);
-    last_import_request_.erase(target_id);
     high_water_.erase(target_id);
 }
 
