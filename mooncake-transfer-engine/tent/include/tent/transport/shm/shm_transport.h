@@ -93,16 +93,18 @@ class ShmTransport : public Transport {
     struct OpenedShmEntry {
         void *shm_addr;
         uint64_t length;
+        std::string shm_path;
     };
 
     using RelocateMap = std::unordered_map<uint64_t, OpenedShmEntry>;
     using HashMap = std::unordered_map<SegmentID, RelocateMap>;
 
     static bool tryResolve(const RelocateMap &relocate_map, uint64_t &dest_addr,
-                           uint64_t length);
+                           uint64_t length, const BufferDesc &buffer);
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
+    std::vector<OpenedShmEntry> retired_mappings_;
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
