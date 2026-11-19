@@ -3243,6 +3243,20 @@ before talking to Master.
 Store-managed registered memory. DFS session reads use temporary staging; the
 staging allocation is released after the synchronous read and scatter finish.
 
+These APIs are also available after `setup_dummy`. Each DummyClient has its own
+session state in the RealClient, while sharing the RealClient's Transfer Engine.
+Starting or ending a get session does not change another client's session for
+the same key. Disconnect cleanup revokes that client's unfinished put sessions.
+Both the DummyClient and the `mooncake_client` daemon must include session RPC
+support; older daemons return an RPC error.
+
+In DummyClient mode, registered shared-memory buffers are transferred through
+the RealClient's mapping. Other buffers accepted by `register_buffer`, including
+CUDA buffers, use the existing shared-memory staging and copy-back path. This
+does not persistently import or RDMA-register GPU allocations in the RealClient.
+Keep buffers registered and alive until the synchronous call returns, and
+synchronize device producer streams before range writes.
+
 #### batch_get_session_start()
 
 Query replicas once and open a get session for the given keys.
