@@ -457,6 +457,10 @@ TEST(TransferEngineAutoDiscoverTest,
     char path[] = "/tmp/mc_custom_topo_XXXXXX";
     int fd = mkstemp(path);
     ASSERT_NE(fd, -1);
+    struct UnlinkGuard {
+        const char* p;
+        ~UnlinkGuard() { unlink(p); }
+    } unlink_guard{path};
     const std::string json = R"({"cpu:0": [["mc_fake_0"], ["mc_fake_1"]]})";
     const ssize_t written = write(fd, json.data(), json.size());
     close(fd);
@@ -500,7 +504,6 @@ TEST(TransferEngineAutoDiscoverTest,
         EXPECT_EQ(intra_engine.getTransport("rdma"), nullptr);
 #endif
     }
-    unlink(path);
 }
 #endif
 
