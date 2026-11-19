@@ -5,6 +5,7 @@ import ctypes
 import importlib
 import io
 import json
+import operator
 import sys
 import uuid
 from collections.abc import MutableMapping
@@ -168,6 +169,35 @@ class _TensorObjectBufferPayload:
                 "tensor object buffer requires batch_size for DataProto use"
             )
         return self.batch_size
+
+
+@dataclass(frozen=True)
+class RegisteredSourceBuffer:
+    """Caller-owned memory used as a structured-object member source.
+
+    ``ptr`` and ``nbytes`` describe the readable byte range. ``owner`` keeps the
+    allocation alive until the payload write completes. When ``pre_registered``
+    is true, the range must already be registered with Mooncake.
+
+    ``dtype`` and ``shape`` are optional ndarray metadata. They must be supplied
+    together and describe exactly ``nbytes`` bytes.
+    """
+
+    ptr: int
+    nbytes: int
+    owner: Any
+    pre_registered: bool = False
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
+class _RegisteredSourcePutPlan:
+    payload_spec: dict[str, Any]
+    chunk_keys: tuple[str, ...]
+    chunk_ptrs: tuple[int, ...]
+    chunk_sizes: tuple[int, ...]
+    source: RegisteredSourceBuffer
 
 
 @dataclass(frozen=True)
@@ -4087,6 +4117,20 @@ class _BundleManifestStore:
         manifest_key = f"{base_key}/manifest"
         written_keys: list[str] = []
         buffer_specs: dict[str, Any] = {}
+        registered_source_plans: list[_RegisteredSourcePutPlan] = []
+        registered_sources = tuple(
+            value
+            for value in buffers.values()
+            if isinstance(value, RegisteredSourceBuffer)
+        )
+        if registered_sources and transfer_policy.copy_mode == "copy":
+            raise ValueError(
+                "registered source buffers do not support copy_mode='copy'"
+            )
+        if any(
+            _validate_registered_source_buffer(value)[1] for value in registered_sources
+        ):
+            self._transport.require_registered_source_batch_put()
         try:
             meta_spec, meta_keys = self._put_payload(
                 f"{base_key}/meta",
@@ -4106,6 +4150,15 @@ class _BundleManifestStore:
                         transfer_policy,
                         config=config,
                     )
+                elif isinstance(value, RegisteredSourceBuffer):
+                    source_plan = self._plan_registered_source_payload(
+                        payload_key,
+                        value,
+                        target_chunk_bytes,
+                    )
+                    payload_spec = source_plan.payload_spec
+                    payload_keys = list(source_plan.chunk_keys)
+                    registered_source_plans.append(source_plan)
                 elif isinstance(value, _MultiBufferPayload):
                     payload_spec, payload_keys = self._put_multi_buffer_payload(
                         payload_key,
@@ -4132,6 +4185,10 @@ class _BundleManifestStore:
                     )
                 buffer_specs[name] = payload_spec
                 written_keys.extend(payload_keys)
+            self._transport.put_registered_source_buffer_plans(
+                registered_source_plans,
+                config=config,
+            )
             manifest = {
                 "version": 1,
                 "layout": "bundle",
@@ -4152,6 +4209,39 @@ class _BundleManifestStore:
             _cleanup_keys(self._store, written_keys, strict=False)
             raise
         return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
+
+    def _plan_registered_source_payload(
+        self,
+        key: str,
+        value: RegisteredSourceBuffer,
+        chunk_bytes: int,
+    ) -> _RegisteredSourcePutPlan:
+        source_ptr, source_nbytes = _validate_registered_source_buffer(value)
+        chunk_sizes = tuple(
+            min(chunk_bytes, source_nbytes - offset)
+            for offset in range(0, source_nbytes, chunk_bytes)
+        )
+        chunk_keys = tuple(
+            key if len(chunk_sizes) == 1 else f"{key}/chunk/{index}"
+            for index in range(len(chunk_sizes))
+        )
+        chunk_ptrs = tuple(
+            source_ptr + offset for offset in range(0, source_nbytes, chunk_bytes)
+        )
+        return _RegisteredSourcePutPlan(
+            payload_spec={
+                "key": key,
+                "bytes": source_nbytes,
+                "chunks": [
+                    {"key": chunk_key, "bytes": size}
+                    for chunk_key, size in zip(chunk_keys, chunk_sizes)
+                ],
+            },
+            chunk_keys=chunk_keys,
+            chunk_ptrs=chunk_ptrs,
+            chunk_sizes=chunk_sizes,
+            source=value,
+        )
 
     def put_bundle_manifest(
         self,
@@ -4778,6 +4868,68 @@ class _MooncakePayloadTransport:
         self._get_into_ranges = getattr(store, "get_into_ranges", None)
         self._register_buffer = getattr(store, "register_buffer", None)
         self._unregister_buffer = getattr(store, "unregister_buffer", None)
+
+    def require_registered_source_batch_put(self) -> None:
+        if not callable(self._batch_put_from):
+            raise RuntimeError(
+                "registered source buffers require object-level batch_put_from"
+            )
+
+    def put_registered_source_buffer_plans(
+        self,
+        plans: Sequence[_RegisteredSourcePutPlan],
+        config: Any = None,
+    ) -> None:
+        active_plans = [plan for plan in plans if plan.chunk_keys]
+        if not active_plans:
+            return
+        self.require_registered_source_batch_put()
+        batch_put_from = self._batch_put_from
+        assert callable(batch_put_from)
+        registration_ranges: dict[int, int] = {}
+        chunk_keys: list[str] = []
+        chunk_ptrs: list[int] = []
+        chunk_sizes: list[int] = []
+        for plan in active_plans:
+            source_ptr, source_nbytes = _validate_registered_source_buffer(plan.source)
+            if not plan.source.pre_registered:
+                registration_ranges[source_ptr] = max(
+                    source_nbytes, registration_ranges.get(source_ptr, 0)
+                )
+            chunk_keys.extend(plan.chunk_keys)
+            chunk_ptrs.extend(plan.chunk_ptrs)
+            chunk_sizes.extend(plan.chunk_sizes)
+        registration_ptrs = list(registration_ranges)
+        registered_ptrs = (
+            self._register_buffers(
+                registration_ptrs,
+                [registration_ranges[ptr] for ptr in registration_ptrs],
+                False,
+                "structured registered source",
+            )
+            if registration_ptrs
+            else []
+        )
+        put_succeeded = False
+        try:
+            results = _batch_put_from_with_optional_config(
+                batch_put_from,
+                chunk_keys,
+                chunk_ptrs,
+                chunk_sizes,
+                config,
+            )
+            self._check_batch_put_results(results, chunk_keys, "batch_put_from")
+            put_succeeded = True
+        finally:
+            if registered_ptrs:
+                try:
+                    self._unregister_buffers(
+                        registered_ptrs, "structured registered source"
+                    )
+                except Exception:
+                    if put_succeeded:
+                        raise
 
     def _store_can_auto_create_buffer_pool(self) -> bool:
         get_capsule = getattr(self._store, "_get_pyclient_capsule", None)
@@ -6025,6 +6177,28 @@ def tensor_object_buffer(
     )
 
 
+def registered_source_buffer(
+    ptr: int,
+    nbytes: int,
+    owner: Any,
+    *,
+    pre_registered: bool = False,
+    dtype: str | None = None,
+    shape: Sequence[int] | None = None,
+) -> RegisteredSourceBuffer:
+    """Describe caller-owned memory for a direct structured-object PUT."""
+    source = RegisteredSourceBuffer(
+        ptr=ptr,
+        nbytes=nbytes,
+        owner=owner,
+        pre_registered=pre_registered,
+        dtype=dtype,
+        shape=None if shape is None else tuple(shape),
+    )
+    _validate_registered_source_buffer(source)
+    return source
+
+
 def raw_destination(
     ptr: int, size: int, owner: Any = None, *, pre_registered: bool = False
 ) -> _RawDestinationBuffer:
@@ -6034,6 +6208,15 @@ def raw_destination(
 
 
 def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
+    if isinstance(value, RegisteredSourceBuffer):
+        _validate_registered_source_buffer(value)
+        if value.dtype is not None and value.shape is not None:
+            return {
+                "encoding": "ndarray",
+                "dtype": np.dtype(value.dtype).str,
+                "shape": list(value.shape),
+            }, value
+        return {"encoding": "bytes"}, value
     if isinstance(value, _TensorObjectBufferPayload):
         return {"encoding": "torch_tensor"}, value
     if isinstance(value, _TensorPayload):
@@ -6058,6 +6241,61 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
             "shape": list(value.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
+
+
+def _validate_registered_source_buffer(
+    value: RegisteredSourceBuffer,
+) -> tuple[int, int]:
+    try:
+        ptr = operator.index(value.ptr)
+        nbytes = operator.index(value.nbytes)
+    except TypeError as error:
+        raise TypeError("registered source ptr and nbytes must be integers") from error
+    if nbytes < 0:
+        raise ValueError("registered source nbytes must be non-negative")
+    if ptr < 0 or (nbytes > 0 and ptr == 0):
+        raise ValueError("registered source ptr must be positive for non-empty data")
+    address_space_bytes = 1 << (ctypes.sizeof(ctypes.c_void_p) * 8)
+    if ptr >= address_space_bytes or ptr + nbytes > address_space_bytes:
+        raise ValueError("registered source range exceeds the process address space")
+    if nbytes > 0 and value.owner is None:
+        raise ValueError("registered source owner is required for non-empty data")
+    if not isinstance(value.pre_registered, bool):
+        raise TypeError("registered source pre_registered must be a bool")
+    if (value.dtype is None) != (value.shape is None):
+        raise ValueError("registered source dtype and shape must be provided together")
+    if value.dtype is None:
+        return ptr, nbytes
+    try:
+        dtype = np.dtype(value.dtype)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"registered source dtype is invalid: {value.dtype!r}"
+        ) from error
+    if dtype.itemsize <= 0:
+        raise ValueError("registered source dtype must have a positive item size")
+    assert value.shape is not None
+    try:
+        shape = tuple(operator.index(dim) for dim in value.shape)
+    except TypeError as error:
+        raise TypeError(
+            "registered source shape dimensions must be integers"
+        ) from error
+    if any(dim < 0 for dim in shape):
+        raise ValueError("registered source shape dimensions must be non-negative")
+    element_count = 1
+    for dim in shape:
+        element_count *= dim
+    expected_nbytes = element_count * dtype.itemsize
+    if expected_nbytes != nbytes:
+        raise ValueError(
+            f"registered source shape requires {expected_nbytes} bytes, got {nbytes}"
+        )
+    if ptr % dtype.itemsize or nbytes % dtype.itemsize:
+        raise ValueError(
+            f"registered source ptr and nbytes must be aligned to {dtype.itemsize} bytes"
+        )
+    return ptr, nbytes
 
 
 def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
