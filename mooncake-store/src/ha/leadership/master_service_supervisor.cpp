@@ -87,6 +87,8 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
         .connstring = connstring,
         .cluster_namespace = config.cluster_id,
         .leader_lease_ttl_sec = config.ha_leader_lease_ttl_sec,
+        .ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard,
     };
 }
 

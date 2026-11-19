@@ -2877,6 +2877,9 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                                                  const PreparedSubmit& prepared,
                                                  QueueOwnerKind owner_kind) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (mnnvl_config_.gpu_wait)
+        return Status::InvalidArgument(
+            "MNNVL gpu_wait prohibits deferred runtime dispatch");
     if (prepared.tasks.empty()) return Status::OK();
     if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
         return Status::TooManyRequests(
