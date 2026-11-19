@@ -625,15 +625,15 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         const bool legacy_deadline_reached =
             policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
             poll_started >= legacy_deadline;
-        // The legacy total deadline can expire before the suffix timeout.
-        // Verify a pending suffix once before failing at that deadline.
-        const bool strong_revalidation_due =
-            suffix_wait_since &&
-            (legacy_deadline_reached ||
-             poll_started - *suffix_wait_since >= no_progress_timeout);
-        if (legacy_deadline_reached && !strong_revalidation_due) {
+        if (legacy_deadline_reached) {
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
+        // Legacy promotion has a shorter total budget than the suffix timeout.
+        // Revalidate its first suffix wait while time remains to drain pages.
+        const bool strong_revalidation_due =
+            suffix_wait_since &&
+            (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline ||
+             poll_started - *suffix_wait_since >= no_progress_timeout);
         const uint64_t expected_before =
             oplog_applier_->GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
@@ -677,12 +677,15 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             result.durable_prefix.last_seq) {
             return ErrorCode::OK;
         }
-        if (legacy_deadline_reached) {
-            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
+            result.disposition ==
+                OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+            continue;
         }
         if (!made_progress && !wait_to_retry()) {
-            if (result.disposition ==
-                OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+            if (policy == PromotionCatchUpPolicy::kBoundedNoProgress &&
+                result.disposition ==
+                    OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
                 const auto expected_before_revalidation =
                     oplog_applier_->GetExpectedSequenceId();
                 const auto cursor_before_revalidation =

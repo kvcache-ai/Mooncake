@@ -206,11 +206,15 @@ AttemptResult ReplaySuffix(
         }
         const uint64_t applied = applier.GetExpectedSequenceId() - 1;
         if (applied == poll.durable_prefix.last_seq) {
+            const auto cursor = reader.GetLastAppliedDurablePrefix();
+            if (!cursor || *cursor != poll.durable_prefix) {
+                return Invalid(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+            }
             metric_timer.error = 0;
             return {AttemptDisposition::kSuccess,
                     ErrorCode::OK,
-                    {.last_included_seq = poll.durable_prefix.last_seq,
-                     .last_included_batch_id = poll.durable_prefix.batch_id}};
+                    {.last_included_seq = cursor->last_seq,
+                     .last_included_batch_id = cursor->batch_id}};
         }
         if (poll.disposition ==
             OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {

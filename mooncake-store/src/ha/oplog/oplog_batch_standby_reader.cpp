@@ -176,7 +176,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
         if (batch.batch_id > prefix.batch_id) {
             break;
         }
-        if (batch.last_seq > prefix.last_seq) {
+        // Every batch after this one must contain a higher sequence.
+        if (batch.last_seq > prefix.last_seq ||
+            (batch.batch_id < prefix.batch_id &&
+             batch.last_seq == prefix.last_seq)) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }

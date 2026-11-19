@@ -1308,6 +1308,61 @@ TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {
     EXPECT_EQ(1u, out.oplog_sequence_id);
 }
 
+TEST_F(PromotionCatchUpTest, RevalidatesSuffixBeforeLegacyDeadlineAcrossPages) {
+    class LaggingBackend final : public FakeHaKvBackend {
+       public:
+        ErrorCode RangeSerializable(std::string_view begin,
+                                    std::string_view end, size_t limit,
+                                    std::vector<KvPair>& output) override {
+            if (lagging.load()) {
+                output.clear();
+                return ErrorCode::OK;
+            }
+            return FakeHaKvBackend::RangeSerializable(begin, end, limit,
+                                                      output);
+        }
+        std::atomic<bool> lagging{false};
+    };
+    auto backend = std::make_shared<LaggingBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    config_.oplog_standby_max_batches_per_poll = 1;
+    config_.batch_oplog_retry_timeout_sec = 180;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    // Pause background replication before publishing the promotion backlog.
+    auto capture = service_->BeginBatchOpLogSnapshotCapture();
+    ASSERT_TRUE(capture);
+    for (uint64_t id = 1; id <= 3; ++id) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend->Put(BuildBatchRecordKey(cluster_id_, id),
+                               EncodeOpLogBatchRecord(MakeBatch(id, id, id))));
+    }
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 3, .last_seq = 3})));
+    backend->lagging.store(true);
+    StandbySnapshot snapshot;
+    auto promoted = std::async(std::launch::async, [this, &snapshot] {
+        return service_->PromoteAndExportSnapshot(snapshot);
+    });
+
+    const auto status = promoted.wait_for(std::chrono::seconds(1));
+    // Release lag on failure so a regression does not stall the test for 30 s.
+    backend->lagging.store(false);
+    const auto error = promoted.get();
+
+    EXPECT_EQ(std::future_status::ready, status);
+    EXPECT_EQ(ErrorCode::OK, error);
+    EXPECT_EQ(3u, snapshot.oplog_sequence_id);
+    EXPECT_EQ(3u, snapshot.objects.size());
+    EXPECT_GE(backend->range_calls(), 3);
+}
+
 TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
     constexpr uint64_t kBatchCount = 1025;
     auto batch_backend = std::make_shared<FakeHaKvBackend>();

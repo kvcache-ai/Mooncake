@@ -412,6 +412,82 @@ TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest,
+       RejectsReplayThatReachesTargetSequenceBeforeTargetBatch) {
+    EmptyBackend backend;
+    LocalFileSnapshotObjectStore objects(root_);
+    // Batch 2 consumes sequence 3, which the prefix assigns to batch 3.
+    // Neither a full page nor a short page can prove this suffix complete.
+    OpLogBatchRecord batch;
+    batch.batch_id = 2;
+    batch.first_seq = 2;
+    batch.last_seq = 3;
+    for (uint64_t seq = 2; seq <= 3; ++seq) {
+        OpLogEntry entry;
+        entry.sequence_id = seq;
+        entry.op_type = OpType::REMOVE;
+        entry.object_key = "missing";
+        batch.entries.push_back(std::move(entry));
+    }
+    ASSERT_EQ(ErrorCode::OK, backend.Put(BuildBatchRecordKey("clusterA", 2),
+                                         EncodeOpLogBatchRecord(batch)));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 3})));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey("clusterA"),
+                    "1"));
+    const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    const auto segments_key =
+        ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", "1-7");
+    ASSERT_TRUE(objects.UploadBuffer(segments_key, segments));
+    ha::BatchOpLogSnapshotManifest manifest;
+    manifest.snapshot_id = "1-7";
+    manifest.last_included_batch_id = manifest.last_included_seq = 1;
+    manifest.segments = {
+        .key = segments_key,
+        .stored_size = segments.size(),
+        .crc32c = Crc32cValue(segments.data(), segments.size())};
+    const auto manifest_bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
+    ha::BatchOpLogSnapshotDescriptor descriptor;
+    descriptor.snapshot_id = "1-7";
+    descriptor.last_included_batch_id = descriptor.last_included_seq = 1;
+    descriptor.manifest_key =
+        ha::BuildBatchOpLogSnapshotManifestKey("snapshots", "1-7");
+    descriptor.manifest_size = manifest_bytes.size();
+    descriptor.manifest_crc32c =
+        Crc32cValue(manifest_bytes.data(), manifest_bytes.size());
+    ASSERT_TRUE(objects.UploadString(descriptor.manifest_key, manifest_bytes));
+    const auto descriptor_bytes =
+        ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
+    ASSERT_TRUE(objects.UploadString(
+        ha::BuildBatchOpLogSnapshotDescriptorKey("snapshots", "1-7"),
+        descriptor_bytes));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotLatestKey("clusterA"),
+                          descriptor_bytes));
+
+    for (const size_t page_size : {1u, 2u}) {
+        SCOPED_TRACE(page_size);
+        BatchOpLogSnapshotProvider provider("clusterA", backend, objects,
+                                            "snapshots", page_size);
+        StandbyMetadataStore metadata;
+        StandbySegmentRegistry registry;
+        OpLogApplier applier(&metadata, "clusterA");
+
+        const auto result =
+            provider.RestoreBaseline(metadata, registry, &applier);
+
+        EXPECT_FALSE(result.has_value());
+        if (result) continue;
+        EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, result.error());
+        EXPECT_EQ(0u, metadata.GetKeyCount());
+        EXPECT_TRUE(registry.GetAllSegments().empty());
+        EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+    }
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
        ReplaysCompleteHistoryAfterBothPointersAreInvalid) {
     LocalFileSnapshotObjectStore object_store(root_);
     EmptyBackend backend;

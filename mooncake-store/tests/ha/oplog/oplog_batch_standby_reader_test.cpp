@@ -764,6 +764,41 @@ TEST(OpLogBatchStandbyReaderTest, StartsFromEarliestExistingBatch) {
     EXPECT_EQ(45u, applier.GetExpectedSequenceId());
 }
 
+TEST(OpLogBatchStandbyReaderTest, RejectsEarlierBatchAtDurablePrefixSequence) {
+    for (const auto mode : {OpLogBatchStandbyReadMode::SERIALIZABLE,
+                            OpLogBatchStandbyReadMode::LINEARIZABLE}) {
+        for (const size_t page_size : {1u, 2u}) {
+            SCOPED_TRACE(static_cast<int>(mode));
+            SCOPED_TRACE(page_size);
+            FakeHaKvBackend backend;
+            ASSERT_EQ(ErrorCode::OK,
+                      backend.Put(
+                          BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 3})));
+            ASSERT_EQ(ErrorCode::OK,
+                      backend.Put(BuildBatchRecordKey("clusterA", 2),
+                                  EncodeOpLogBatchRecord(MakeBatch(2, 2, 3))));
+            MockMetadataStore metadata;
+            OpLogApplier applier(&metadata, "clusterA");
+            applier.Recover(1);
+            OpLogBatchStandbyReader reader("clusterA", backend, applier);
+            ASSERT_EQ(ErrorCode::OK,
+                      reader.SetBaselineCursor({.batch_id = 1, .last_seq = 1}));
+
+            const auto result = reader.PollOnce(page_size, mode);
+
+            EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, result.error);
+            EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL,
+                      result.disposition);
+            EXPECT_EQ(0u, result.applied_entries);
+            EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+            ASSERT_TRUE(reader.GetLastAppliedDurablePrefix());
+            EXPECT_EQ(1u, reader.GetLastAppliedDurablePrefix()->batch_id);
+            EXPECT_EQ(1u, reader.GetLastAppliedDurablePrefix()->last_seq);
+        }
+    }
+}
+
 TEST(OpLogBatchStandbyReaderTest, RejectsSequenceOverlapAcrossBatches) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
