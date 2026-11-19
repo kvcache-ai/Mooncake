@@ -323,7 +323,8 @@ RdmaTransport::~RdmaTransport() {
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
 #endif
-    metadata_->removeSegmentDesc(local_server_name_);
+    if (local_segment_registered_)
+        metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
     for (auto &[_, anchor] : kfd_pin_anchors_) deregKfdPinAnchor(anchor.mr);
     kfd_pin_anchors_.clear();
@@ -371,6 +372,7 @@ int RdmaTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    local_segment_registered_ = true;
     ret = startHandshakeDaemon(local_server_name);
     if (ret) {
         LOG(ERROR) << "RdmaTransport: cannot start handshake daemon";
