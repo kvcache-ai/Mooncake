@@ -71,6 +71,22 @@ func TestTypedErrorAndQueryJSON(t *testing.T) {
 	}
 }
 
+func TestRegisteredServiceNestsRootDigest(t *testing.T) {
+	data, err := json.Marshal(RegisteredService{InstanceID: "engine", HashProfile: ResolvedHashProfile{RootDigest: "abc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw struct {
+		RootDigest  *string `json:"root_digest"`
+		HashProfile struct {
+			RootDigest string `json:"root_digest"`
+		} `json:"hash_profile"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil || raw.RootDigest != nil || raw.HashProfile.RootDigest != "abc" {
+		t.Fatalf("%s: %v", data, err)
+	}
+}
+
 func TestLifecycleAndConcurrentClose(t *testing.T) {
 	c, err := New()
 	if err != nil {

@@ -92,7 +92,7 @@ func TestEventsToGoQuery(t *testing.T) {
 		t.Fatalf("services %v %v", svcs, err)
 	}
 	for _, s := range svcs {
-		if s.TenantID != "default" || len(s.RootDigest) != 64 && s.PublisherType == conductor.PublisherVLLM {
+		if s.TenantID != "default" || len(s.HashProfile.RootDigest) != 64 && s.PublisherType == conductor.PublisherVLLM {
 			t.Fatalf("unresolved service %+v", s)
 		}
 	}

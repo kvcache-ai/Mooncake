@@ -52,9 +52,20 @@ type ServiceConfig struct {
 	HashProfile    HashProfileConfig `json:"hash_profile"`
 }
 
+// RegisteredService is a service as reported by the conductor. Unlike
+// ServiceConfig, its hash profile includes the server-resolved root digest.
 type RegisteredService struct {
-	ServiceConfig
-	RootDigest string `json:"root_digest"`
+	InstanceID     string              `json:"instance_id"`
+	Endpoint       string              `json:"endpoint"`
+	ReplayEndpoint string              `json:"replay_endpoint"`
+	PublisherType  PublisherType       `json:"publisher_type"`
+	ModelName      string              `json:"model_name"`
+	LoRAName       string              `json:"lora_name"`
+	TenantID       string              `json:"tenant_id"`
+	BlockSize      int64               `json:"block_size"`
+	DPRank         int32               `json:"dp_rank"`
+	CacheGroup     *int64              `json:"cache_group"`
+	HashProfile    ResolvedHashProfile `json:"hash_profile"`
 }
 
 type QueryRequest struct {

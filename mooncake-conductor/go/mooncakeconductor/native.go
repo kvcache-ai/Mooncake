@@ -188,8 +188,8 @@ func (n *nativeClient) query(req QueryRequest) (QueryResult, error) {
 	return out, nil
 }
 
-func hashConfig(p C.mooncake_conductor_hash_profile_t) HashProfileConfig {
-	return HashProfileConfig{Strategy: C.GoString(p.strategy), Algorithm: C.GoString(p.algorithm), PythonHashSeed: C.GoString(p.python_hash_seed), IndexProjection: C.GoString(p.index_projection)}
+func resolvedHashProfile(p C.mooncake_conductor_hash_profile_t) ResolvedHashProfile {
+	return ResolvedHashProfile{HashProfileConfig: HashProfileConfig{Strategy: C.GoString(p.strategy), Algorithm: C.GoString(p.algorithm), PythonHashSeed: C.GoString(p.python_hash_seed), IndexProjection: C.GoString(p.index_projection)}, RootDigest: C.GoString(p.root_digest)}
 }
 
 func (n *nativeClient) list() ([]RegisteredService, error) {
@@ -200,12 +200,12 @@ func (n *nativeClient) list() ([]RegisteredService, error) {
 	defer C.mooncake_conductor_service_list_free(&result)
 	out := make([]RegisteredService, 0, int(result.service_count))
 	for _, c := range unsafe.Slice(result.services, int(result.service_count)) {
-		g := ServiceConfig{InstanceID: C.GoString(c.instance_id), Endpoint: C.GoString(c.endpoint), ReplayEndpoint: C.GoString(c.replay_endpoint), PublisherType: publisherType(c.publisher_kind), ModelName: C.GoString(c.model_name), LoRAName: C.GoString(c.lora_name), TenantID: C.GoString(c.tenant_id), BlockSize: int64(c.block_size), DPRank: int32(c.dp_rank), HashProfile: hashConfig(c.hash_profile)}
+		s := RegisteredService{InstanceID: C.GoString(c.instance_id), Endpoint: C.GoString(c.endpoint), ReplayEndpoint: C.GoString(c.replay_endpoint), PublisherType: publisherType(c.publisher_kind), ModelName: C.GoString(c.model_name), LoRAName: C.GoString(c.lora_name), TenantID: C.GoString(c.tenant_id), BlockSize: int64(c.block_size), DPRank: int32(c.dp_rank), HashProfile: resolvedHashProfile(c.hash_profile)}
 		if c.has_cache_group != 0 {
 			group := int64(c.cache_group)
-			g.CacheGroup = &group
+			s.CacheGroup = &group
 		}
-		out = append(out, RegisteredService{ServiceConfig: g, RootDigest: C.GoString(c.hash_profile.root_digest)})
+		out = append(out, s)
 	}
 	return out, nil
 }
@@ -218,7 +218,7 @@ func (n *nativeClient) global() (GlobalView, error) {
 	defer C.mooncake_conductor_global_view_free(&result)
 	out := GlobalView{ContextCount: int32(result.context_count), Contexts: make([]ContextView, 0, int(result.context_count))}
 	for _, c := range unsafe.Slice(result.contexts, int(result.context_count)) {
-		v := ContextView{ModelName: C.GoString(c.model_name), LoRAName: C.GoString(c.lora_name), TenantID: C.GoString(c.tenant_id), BlockSize: int64(c.block_size), PrefixCount: uint64(c.prefix_count), HashProfile: ResolvedHashProfile{HashProfileConfig: hashConfig(c.hash_profile), RootDigest: C.GoString(c.hash_profile.root_digest)}, Instances: make(map[string][]int64, int(c.instance_count))}
+		v := ContextView{ModelName: C.GoString(c.model_name), LoRAName: C.GoString(c.lora_name), TenantID: C.GoString(c.tenant_id), BlockSize: int64(c.block_size), PrefixCount: uint64(c.prefix_count), HashProfile: resolvedHashProfile(c.hash_profile), Instances: make(map[string][]int64, int(c.instance_count))}
 		for _, instance := range unsafe.Slice(c.instances, int(c.instance_count)) {
 			ranks := make([]int64, int(instance.rank_count))
 			for i, r := range unsafe.Slice(instance.ranks, int(instance.rank_count)) {
