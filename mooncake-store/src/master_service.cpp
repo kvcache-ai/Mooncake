@@ -8120,6 +8120,34 @@ bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
     return local_ssd_manager_.GetUsage(client_id).has_value();
 }
 
+namespace {
+
+// Under the object's write lock, consume this client's report. Keep the task
+// and its source pin while a pending disk owner still owes its Upsert ACK.
+bool FinishOffloadMirror(ObjectMetadata& metadata,
+                         HeapOptional<OffloadingTask>& task,
+                         const UUID& client_id) {
+    if (!task) return false;
+    auto& mirrors = task->mirror_clients;
+    if (!mirrors.empty() && std::erase(mirrors, client_id) == 0) return false;
+    if (!mirrors.empty() &&
+        metadata.HasReplica([&mirrors](const Replica& replica) {
+            const auto owner = replica.get_local_disk_client_id();
+            return replica.is_processing() && owner &&
+                   std::find(mirrors.begin(), mirrors.end(), *owner) !=
+                       mirrors.end();
+        })) {
+        return true;
+    }
+    if (auto* source = metadata.GetReplicaByID(task->source_id)) {
+        source->dec_refcnt();
+    }
+    task.reset();
+    return true;
+}
+
+}  // namespace
+
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
@@ -8148,15 +8176,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             MakeObjectIdentity(task.key, TenantId(task.tenant_id));
         MetadataAccessorRW accessor(this, object_id);
         if (accessor.Exists()) {
-            auto& offloading_task = accessor.GetState().offloading_task;
-            if (offloading_task) {
-                auto source =
-                    accessor.Get().GetReplicaByID(offloading_task->source_id);
-                if (source) {
-                    source->dec_refcnt();
-                }
-                offloading_task.reset();
-            }
+            FinishOffloadMirror(accessor.Get(),
+                                accessor.GetState().offloading_task, client_id);
         }
     }
     return std::vector<OffloadTaskItem>{};
@@ -8231,24 +8252,17 @@ auto MasterService::NotifyOffloadSuccess(
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task_tenant);
 
-        // NACK sentinel: offload failed on worker. Clean up the
-        // offloading_task + dec_refcnt but skip AddReplica.
+        // A negative size reports a failed mirror without publishing a replica.
         if (metadata.data_size < 0) {
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
-            if (accessor.Exists()) {
-                auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
-                    MasterMetricManager::instance().inc_offload_failed(
-                        UuidToString(client_id));
-                }
+            if (accessor.Exists() &&
+                FinishOffloadMirror(accessor.Get(),
+                                    accessor.GetState().offloading_task,
+                                    client_id)) {
+                MasterMetricManager::instance().inc_offload_failed(
+                    UuidToString(client_id));
             }
             continue;
         }
@@ -8292,14 +8306,8 @@ auto MasterService::NotifyOffloadSuccess(
                 // Existing orphan objects can only bypass tenant registration
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
-                if (offloading_task) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
-
+                if (FinishOffloadMirror(obj_metadata, offloading_task,
+                                        client_id)) {
                     if (!segment_mounted) {
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
