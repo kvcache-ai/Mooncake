@@ -156,8 +156,8 @@ class TcpUnregisterRepublishTest : public ::testing::Test {
     std::shared_ptr<FakeMetadataStoragePlugin> plugin_;
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<TcpTransport> transport_;
-    std::vector<char> first_{4096};
-    std::vector<char> second_{4096};
+    std::vector<char> first_ = std::vector<char>(4096);
+    std::vector<char> second_ = std::vector<char>(4096);
 };
 
 TEST_F(TcpUnregisterRepublishTest, SingleRetryCompletesPublication) {
