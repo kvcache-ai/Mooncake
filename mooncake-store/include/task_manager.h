@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ostream>
+#include "client_liveness.h"
 #include "types.h"
 #include "mutex.h"
 #include "master_config.h"
@@ -16,6 +17,8 @@ namespace mooncake {
 enum class TaskType {
     REPLICA_COPY,
     REPLICA_MOVE,
+    // Only used in TaskAssignment. Task queries still expose REPLICA_MOVE.
+    DRAIN_MOVE,
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TaskType& type) {
@@ -25,6 +28,9 @@ inline std::ostream& operator<<(std::ostream& os, const TaskType& type) {
             break;
         case TaskType::REPLICA_MOVE:
             os << "REPLICA_MOVE";
+            break;
+        case TaskType::DRAIN_MOVE:
+            os << "DRAIN_MOVE";
             break;
         default:
             os << "UNKNOWN_TASK_TYPE";
@@ -70,6 +76,13 @@ inline std::ostream& operator<<(std::ostream& os, const TaskStatus& status) {
     return os;
 }
 
+struct DrainSource {
+    UUID segment_id;
+    ClientSessionSharedPtr session;
+
+    bool operator==(const DrainSource&) const = default;
+};
+
 struct Task {
     UUID id;
     TaskType type;
@@ -86,6 +99,8 @@ struct Task {
     // A drain must observe the final result before this task can be pruned.
     // In particular, a processing timeout is not proof that its worker stopped.
     bool retained_by_drain = false;
+    std::optional<DrainSource> drain_source;
+    bool drain_move_started = false;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -207,12 +222,16 @@ class ScopedTaskWriteAccess {
     tl::expected<UUID, ErrorCode> submit_task_typed(
         const UUID& client_id,
         const typename TaskPayloadTraits<Type>::type& payload,
-        bool retained_by_drain = false) {
+        bool retained_by_drain = false,
+        std::optional<DrainSource> drain_source = std::nullopt) {
         std::string json = serialize_payload(payload);
-        return submit_task(client_id, Type, json, retained_by_drain);
+        return submit_task(client_id, Type, json, retained_by_drain,
+                           std::move(drain_source));
     }
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
+
+    bool start_drain_move(const UUID& task_id);
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
@@ -229,10 +248,9 @@ class ScopedTaskWriteAccess {
     void prune_expired_tasks();
 
    private:
-    tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
-                                              TaskType type,
-                                              const std::string& payload,
-                                              bool retained_by_drain);
+    tl::expected<UUID, ErrorCode> submit_task(
+        const UUID& client_id, TaskType type, const std::string& payload,
+        bool retained_by_drain, std::optional<DrainSource> drain_source);
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;

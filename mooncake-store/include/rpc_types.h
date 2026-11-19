@@ -322,7 +322,7 @@ struct TaskAssignment {
     TaskAssignment() = default;
     TaskAssignment(const Task& task)
         : id(task.id),
-          type(task.type),
+          type(task.drain_source ? TaskType::DRAIN_MOVE : task.type),
           payload(task.payload),
           created_at_ms_epoch(static_cast<int64_t>(
               std::chrono::duration_cast<std::chrono::milliseconds>(

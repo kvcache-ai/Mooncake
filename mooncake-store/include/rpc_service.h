@@ -425,6 +425,12 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
+    tl::expected<MoveStartResponse, ErrorCode> StartDrainMove(
+        const UUID& client_id, const UUID& task_id);
+    tl::expected<void, ErrorCode> FinishDrainMove(const UUID& client_id,
+                                                  const UUID& task_id,
+                                                  bool commit,
+                                                  bool writes_drained);
 
     tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
                                                    const std::string& key,

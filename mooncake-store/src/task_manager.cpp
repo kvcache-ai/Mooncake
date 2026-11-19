@@ -36,6 +36,8 @@ bool MatchesTaskPayload(const Task& task, const TenantId& tenant,
                 struct_json::from_json(payload, task.payload);
                 return matches(payload);
             }
+            case TaskType::DRAIN_MOVE:
+                return false;  // Assignment-only type.
         }
     } catch (const std::exception&) {
         // A malformed payload cannot be attributed to a tenant.
@@ -146,7 +148,7 @@ size_t ScopedTaskReadAccess::size() const {
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload,
-    bool retained_by_drain) {
+    bool retained_by_drain, std::optional<DrainSource> drain_source) {
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -167,7 +169,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .message = "",
                  .assigned_client = client_id,
                  .max_retry_attempts = manager_->max_retry_attempts_,
-                 .retained_by_drain = retained_by_drain};
+                 .retained_by_drain = retained_by_drain,
+                 .drain_source = std::move(drain_source)};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push_back(task.id);
@@ -229,6 +232,17 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
     return result;
 }
 
+bool ScopedTaskWriteAccess::start_drain_move(const UUID& task_id) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end() ||
+        it->second.status != TaskStatus::PROCESSING ||
+        !it->second.drain_source || it->second.drain_move_started) {
+        return false;
+    }
+    it->second.drain_move_started = true;
+    return true;
+}
+
 ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,
@@ -262,6 +276,10 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
     if (task.status == TaskStatus::PENDING &&
         manager_->total_pending_tasks_ > 0) {
         manager_->total_pending_tasks_--;
+        if (auto queue = manager_->pending_tasks_.find(client_id);
+            queue != manager_->pending_tasks_.end()) {
+            std::erase(queue->second, task_id);
+        }
     }
     task.mark_complete(status, message);
 
@@ -403,10 +421,6 @@ ErrorCode ScopedTaskWriteAccess::cancel_task(const UUID& task_id,
     Task& task = it->second;
     switch (task.status) {
         case TaskStatus::PENDING: {
-            auto queue = manager_->pending_tasks_.find(task.assigned_client);
-            if (queue != manager_->pending_tasks_.end()) {
-                std::erase(queue->second, task_id);
-            }
             return complete_task(task.assigned_client, task_id,
                                  TaskStatus::CANCELED, "Task canceled");
         }
