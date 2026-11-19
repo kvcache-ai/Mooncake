@@ -185,10 +185,27 @@ local-target plans. It is disabled by default; existing planner, Reader, Sink,
 and Store callers do not read its environment variables or use it
 automatically. See [configuration and costs](plan_cache.md).
 
-`MC_RESHARD_PLAN_CACHE_ENABLED=1` enables the cache when an explicit caller
-uses `WeightTransferPlanCache.from_environment()`. `MC_RESHARD_PLAN_CACHE_MAX_ENTRIES` sets a positive
+`MC_RESHARD_PLAN_CACHE_ENABLED=1` enables the cache when the new same-fleet
+entry point is constructed. `MC_RESHARD_PLAN_CACHE_MAX_ENTRIES` sets a positive
 entry limit (default `2`). Limits count entries, not bytes, and every execution
 still obtains and validates fresh runtime bindings and allocation guards.
+
+## Explicit Same-Fleet Weight Transfer
+
+`InplaceWeightResharder(reader)` adds an opt-in entry point for complete source
+and target placements with the same participant ID set. It calls the existing
+local-target planner, binds the logical plan to the current runtime bindings,
+and executes through the supplied `MooncakeTransferEngineReader`. A configured
+cache can reuse only the logical plan; bound plans, addresses, leases and native
+engine state are not retained in that cache.
+
+The framework owner must stop source writes, discard KV, provision distinct
+target storage within its memory budget, and retain all source allocations
+until global completion. Same participants do not prove physical GPU identity
+or permit destructive overlapping writes. This helper does not allocate GPU
+weights, switch a production scheduler, provide a distributed completion fence,
+or automatically fall back after unknown completion. The reader's existing
+quarantine and allocation-lifetime contracts remain in force.
 
 ## Transfer Engine Execution
 

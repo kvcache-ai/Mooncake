@@ -84,9 +84,11 @@ from .te import (
     WeightAllocationGuardProviders,
 )
 from .plan_cache import WeightTransferPlanCache
+from .inplace import InplaceWeightResharder
 
 __all__ = [
     "WeightTransferPlanCache",
+    "InplaceWeightResharder",
     "BoundTiledCOOReadPlan",
     "TiledCOODenseFragment",
     "TiledCOOIndexRange",
