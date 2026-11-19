@@ -1945,6 +1945,40 @@ TEST_F(FileStorageTest, StagingAllocReleaseInWaitGapIsNotLost) {
     EXPECT_EQ(waiter_result.total_size, 2 * 1024 * 1024);
 }
 
+TEST_F(FileStorageTest, StagingAllocTwoMultiSliceReadersDoNotDeadlock) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    // Each reader wants a 6 MiB batch (two 3 MiB slices) in an 8 MiB arena, so
+    // neither fits alongside the other and they must take turns.
+    file_storage_config.local_buffer_size = 8 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 3000;
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    const std::vector<int64_t> two_slices = {3 * 1024 * 1024, 3 * 1024 * 1024};
+    AllocOutcome a{ErrorCode::INTERNAL_ERROR, 0};
+    AllocOutcome b{ErrorCode::INTERNAL_ERROR, 0};
+    auto start = std::chrono::steady_clock::now();
+    std::thread ra(
+        [&] { a = TryAllocate(fileStorage, {"a0", "a1"}, two_slices); });
+    std::thread rb(
+        [&] { b = TryAllocate(fileStorage, {"b0", "b1"}, two_slices); });
+    ra.join();
+    rb.join();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // Before batch-level admission, each reader could park holding its first
+    // slice and leave too little for the other's second slice, so both waited
+    // out the budget. Whole-batch admission makes them take turns instead.
+    EXPECT_EQ(a.error, ErrorCode::OK) << "reader A must not time out";
+    EXPECT_EQ(b.error, ErrorCode::OK) << "reader B must not time out";
+    EXPECT_LT(elapsed, std::chrono::milliseconds(3000))
+        << "two multi-slice readers must complete by taking turns, not both "
+           "wait out the budget";
+    EXPECT_EQ(a.total_size, 6 * 1024 * 1024);
+    EXPECT_EQ(b.total_size, 6 * 1024 * 1024);
+}
+
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     std::unordered_map<std::string, int64_t> offloading_objects;
     for (size_t i = 0; i < 35; i++) {
