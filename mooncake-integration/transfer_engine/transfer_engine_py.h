@@ -35,14 +35,6 @@ namespace py = nanobind;
 
 using namespace mooncake;
 
-#ifdef USE_CUDA
-// NVLink submits call CUDA APIs synchronously, which a CUDA host function
-// cannot do safely on the driver's callback thread.
-inline bool isCudaHostFuncUnsupportedProtocol(const std::string &protocol) {
-    return protocol == "nvlink_intra";
-}
-#endif
-
 class ScatterTransferTicket;
 
 const static size_t kDefaultBufferCapacity = 2ull * 1024 * 1024 * 1024;
