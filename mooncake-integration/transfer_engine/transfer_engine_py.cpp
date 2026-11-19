@@ -1266,10 +1266,14 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         batch_id = engine_->allocateBatchID(batch_size);
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-
-        auto start_ts = getCurrentTimeInNano();
-        batch_desc->start_timestamp = start_ts;
+        if (batch_id == 0 || batch_id == INVALID_BATCH_ID ||
+            batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+            return 0;
+        }
+        if (!engine_->isUsingTent()) {
+            auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+            batch_desc->start_timestamp = getCurrentTimeInNano();
+        }
 
         if (enable_completion_notification) {
             Status enable =
@@ -1404,21 +1408,27 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
-    TransferStatus status;
-    Status s = engine_->getTransferStatus(batch_id, 0, status);
-    LOG_ASSERT(s.ok());
-    if (status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(batch_id);
-        return 1;
-    } else if (status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(batch_id);
+    if (!engine_ || batch_id == 0 || batch_id == INVALID_BATCH_ID ||
+        batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
         return -1;
-    } else if (status.s == TransferStatusEnum::TIMEOUT) {
-        engine_->freeBatchID(batch_id);
-        return -2;
-    } else {
+    }
+    TransferStatus status;
+    Status s = engine_->getBatchTransferStatus(batch_id, status);
+    if (!s.ok()) {
+        return -1;
+    }
+    if (status.s == TransferStatusEnum::WAITING ||
+        status.s == TransferStatusEnum::PENDING) {
         return 0;
     }
+    engine_->freeBatchID(batch_id);
+    if (status.s == TransferStatusEnum::COMPLETED) {
+        return 1;
+    }
+    if (status.s == TransferStatusEnum::TIMEOUT) {
+        return -2;
+    }
+    return -1;
 }
 
 int TransferEnginePy::batchRegisterMemory(
