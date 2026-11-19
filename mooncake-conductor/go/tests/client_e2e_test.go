@@ -208,8 +208,7 @@ func TestEventsToGoQuery(t *testing.T) {
 	}{
 		{conductor.ClientConfig{Address: "invalid"}, conductor.InvalidParams},
 		{conductor.ClientConfig{Address: addr + "\x00suffix"}, conductor.InvalidParams},
-		{conductor.ClientConfig{Address: addr, ConnectTimeout: -1}, conductor.InvalidParams},
-		{conductor.ClientConfig{Address: addr, RequestTimeout: -1}, conductor.InvalidParams},
+		{conductor.ClientConfig{Address: addr, ConnectTimeout: time.Duration(1<<63 - 1)}, conductor.InvalidParams},
 		{conductor.ClientConfig{Address: addr, RequestTimeout: time.Duration(1<<63 - 1)}, conductor.InvalidParams},
 		{conductor.ClientConfig{Address: "127.0.0.1:0"}, conductor.RPCFail},
 	} {
@@ -225,6 +224,16 @@ func TestEventsToGoQuery(t *testing.T) {
 		if err = c.Setup(conductor.ClientConfig{Address: addr}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Negative timeouts disable the native timers instead of failing setup.
+	if err = c.Setup(conductor.ClientConfig{Address: addr, ConnectTimeout: -1, RequestTimeout: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if status, e := c.HealthCheck(); status != conductor.Healthy || e != nil {
+		t.Fatalf("untimed health %v %v", status, e)
+	}
+	if err = c.Setup(conductor.ClientConfig{Address: addr}); err != nil {
+		t.Fatal(err)
 	}
 	for _, svc := range fixtures.Services {
 		u, e := c.Unregister(svc.InstanceID, svc.TenantID, svc.DPRank)

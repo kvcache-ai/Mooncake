@@ -17,7 +17,8 @@ func TestTimeoutMillis(t *testing.T) {
 		invalid bool
 	}{
 		{0, 1000, false}, {time.Nanosecond, 1, false}, {1500 * time.Microsecond, 2, false},
-		{time.Second, 1000, false}, {-1, 0, true}, {time.Duration(1<<63 - 1), 0, true},
+		{time.Second, 1000, false}, {-1, -1, false}, {time.Duration(-1 << 63), -1, false},
+		{time.Duration(1<<63 - 1), 0, true},
 	} {
 		got, err := timeoutMillis(tc.input, time.Second)
 		if got != tc.want || (err != nil) != tc.invalid {
@@ -85,7 +86,7 @@ func TestLifecycleAndConcurrentClose(t *testing.T) {
 	if err := c.Setup(ClientConfig{Address: "invalid"}); !errors.Is(err, &Error{Code: InvalidParams}) {
 		t.Fatal(err)
 	}
-	if err := c.Setup(ClientConfig{Address: "invalid", RequestTimeout: -1}); !errors.Is(err, &Error{Code: InvalidParams}) {
+	if err := c.Setup(ClientConfig{Address: "invalid", RequestTimeout: time.Duration(1<<63 - 1)}); !errors.Is(err, &Error{Code: InvalidParams}) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup

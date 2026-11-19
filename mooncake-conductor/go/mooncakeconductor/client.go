@@ -24,8 +24,12 @@ func New() (*Client, error) {
 }
 
 func timeoutMillis(value, fallback time.Duration) (int64, error) {
+	// Native setup treats any negative timeout as disabled.
+	if value < 0 {
+		return -1, nil
+	}
 	// Rounded milliseconds must remain representable as native nanoseconds.
-	if value < 0 || value > time.Duration((1<<63-1)/int64(time.Millisecond))*time.Millisecond {
+	if value > time.Duration((1<<63-1)/int64(time.Millisecond))*time.Millisecond {
 		return 0, &Error{Op: "setup", Code: InvalidParams}
 	}
 	if value == 0 {
@@ -39,7 +43,8 @@ func timeoutMillis(value, fallback time.Duration) (int64, error) {
 }
 
 // Setup replaces any previous connection, including on failure. Zero timeouts
-// use 1s/3s defaults. After Close, Setup creates a fresh native client.
+// use 1s/3s defaults; negative timeouts disable the timeout. After Close,
+// Setup creates a fresh native client.
 func (c *Client) Setup(config ClientConfig) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

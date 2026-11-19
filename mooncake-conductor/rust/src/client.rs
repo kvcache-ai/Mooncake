@@ -93,8 +93,10 @@ unsafe fn hash_profile(raw: &ffi::mooncake_conductor_hash_profile_t) -> HashProf
     }
 }
 
+/// Round up so a nonzero duration never becomes the rejected 0 ms; values
+/// past `i64::MAX` saturate and setup rejects them as out of range.
 fn millis(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX)
 }
 
 impl ConductorClient {
@@ -337,7 +339,10 @@ mod tests {
     }
 
     #[test]
-    fn millis_saturates() {
+    fn millis_rounds_up_and_saturates() {
+        assert_eq!(millis(Duration::ZERO), 0);
+        assert_eq!(millis(Duration::from_nanos(1)), 1);
+        assert_eq!(millis(Duration::from_micros(1500)), 2);
         assert_eq!(millis(Duration::from_millis(1500)), 1500);
         assert_eq!(millis(Duration::MAX), i64::MAX);
     }

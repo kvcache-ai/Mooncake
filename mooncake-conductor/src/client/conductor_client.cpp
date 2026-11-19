@@ -7,6 +7,7 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <mutex>
@@ -54,14 +55,20 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
     // Every setup attempt replaces the previous connection, even if the new
     // address is invalid or the connection fails.
     impl_->Close();
+    // A negative timeout disables the ylt timer. Zero would expire at once,
+    // and larger values overflow ylt's nanosecond conversion.
     constexpr int64_t max_timeout_ms =
         std::numeric_limits<int64_t>::max() / 1000000;
-    if (config.connect_timeout_ms <= 0 || config.request_timeout_ms <= 0 ||
+    if (config.connect_timeout_ms == 0 || config.request_timeout_ms == 0 ||
         config.connect_timeout_ms > max_timeout_ms ||
         config.request_timeout_ms > max_timeout_ms) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    impl_->request_timeout_ms = config.request_timeout_ms;
+    // Clamp negatives to -1 so the nanosecond conversion cannot overflow.
+    const int64_t connect_timeout_ms =
+        std::max<int64_t>(config.connect_timeout_ms, -1);
+    impl_->request_timeout_ms =
+        std::max<int64_t>(config.request_timeout_ms, -1);
     // Split "host:port" for coro_rpc_client::connect(host, port).
     const auto colon = config.conductor_addr.rfind(':');
     if (colon == std::string::npos) {
@@ -71,7 +78,7 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
     const std::string port = config.conductor_addr.substr(colon + 1);
     impl_->cleanup_drained = false;
     auto ec = async_simple::coro::syncAwait(impl_->client.connect(
-        host, port, std::chrono::milliseconds(config.connect_timeout_ms)));
+        host, port, std::chrono::milliseconds(connect_timeout_ms)));
     if (ec) {
         impl_->Close();
         return tl::make_unexpected(ErrorCode::RPC_FAIL);

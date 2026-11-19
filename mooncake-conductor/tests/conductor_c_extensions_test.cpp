@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -95,14 +96,34 @@ TEST(ConductorCExtensions, HealthErrorsAndServerUnregisterKey) {
 
     // Existing Rust status-only semantics remain unchanged after a Close or
     // failed replacement setup; detailed callers also retain the native code.
+    // A zero timeout would expire at once, so setup rejects it.
     EXPECT_EQ(
-        mooncake_conductor_setup(client.get(), "127.0.0.1:19336", -1, 3000),
+        mooncake_conductor_setup(client.get(), "127.0.0.1:19336", 0, 3000),
         MOONCAKE_CONDUCTOR_INVALID_PARAMS);
     EXPECT_EQ(mooncake_conductor_health_check(client.get()),
               MOONCAKE_CONDUCTOR_HEALTH_UNREACHABLE);
     EXPECT_EQ(mooncake_conductor_health_check_ex(client.get(), &status),
               MOONCAKE_CONDUCTOR_UNAVAILABLE);
     EXPECT_EQ(status, MOONCAKE_CONDUCTOR_HEALTH_UNREACHABLE);
+    constexpr int64_t too_large =
+        std::numeric_limits<int64_t>::max() / 1000000 + 1;
+    EXPECT_EQ(mooncake_conductor_setup(client.get(), "127.0.0.1:19336",
+                                       too_large, 3000),
+              MOONCAKE_CONDUCTOR_INVALID_PARAMS);
+    EXPECT_EQ(mooncake_conductor_setup(client.get(), "127.0.0.1:19336", 1000,
+                                       too_large),
+              MOONCAKE_CONDUCTOR_INVALID_PARAMS);
+    // Negative timeouts disable the timers, including values far below -1.
+    ASSERT_EQ(mooncake_conductor_setup(client.get(), "127.0.0.1:19336", -1, -1),
+              0);
+    EXPECT_EQ(mooncake_conductor_health_check_ex(client.get(), &status), 0);
+    EXPECT_EQ(status, MOONCAKE_CONDUCTOR_HEALTH_OK);
+    ASSERT_EQ(mooncake_conductor_setup(client.get(), "127.0.0.1:19336",
+                                       std::numeric_limits<int64_t>::min(),
+                                       std::numeric_limits<int64_t>::min()),
+              0);
+    EXPECT_EQ(mooncake_conductor_health_check_ex(client.get(), &status), 0);
+    EXPECT_EQ(status, MOONCAKE_CONDUCTOR_HEALTH_OK);
     ASSERT_EQ(
         mooncake_conductor_setup(client.get(), "127.0.0.1:19336", 1000, 3000),
         0);

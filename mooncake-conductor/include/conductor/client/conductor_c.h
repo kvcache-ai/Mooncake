@@ -236,7 +236,11 @@ mooncake_conductor_t mooncake_conductor_create(void);
 /* Closes the connection and releases the handle; NULL is a no-op. */
 void mooncake_conductor_destroy(mooncake_conductor_t conductor);
 
-/* Connects to "host:port". Setup may be called again after close. */
+/*
+ * Connects to "host:port". Setup may be called again after close. A negative
+ * timeout disables that timeout; 0 or a value above INT64_MAX / 1000000
+ * returns MOONCAKE_CONDUCTOR_INVALID_PARAMS.
+ */
 int mooncake_conductor_setup(mooncake_conductor_t conductor,
                              const char *conductor_addr,
                              int64_t connect_timeout_ms,

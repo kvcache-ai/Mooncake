@@ -13,6 +13,8 @@ namespace mooncake::conductor {
 
 struct ConductorClientConfig {
     std::string conductor_addr;  // RPC server address, "host:port"
+    // Negative disables the timeout. Setup rejects 0 and values above
+    // INT64_MAX / 1000000 with INVALID_PARAMS.
     int64_t connect_timeout_ms = 1000;
     int64_t request_timeout_ms = 3000;
 };
