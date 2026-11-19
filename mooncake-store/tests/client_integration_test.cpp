@@ -32,10 +32,6 @@
 #include "crc_checksum.h"
 #include "../src/config/client_object_checksum_config.h"
 
-#ifdef MOONCAKE_TEST_UB_MOCK
-#include "loopback_urma_adapter.h"
-#endif
-
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
@@ -789,56 +785,6 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
         << "Remove operation failed: " << toString(remove_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
-
-#ifdef MOONCAKE_TEST_UB_MOCK
-// Only meaningful in client_integration_ub_mock_test, where the TENT UB
-// loopback adapter is the sole data transport. Checks the adapter's own
-// counters, so a run that silently fell back to another path fails here.
-TEST_F(ClientIntegrationTest, UbMockCarriesPutAndGet) {
-    namespace ub_mock = ::mooncake::tent::ub::mock;
-    if (!ub_mock::loopbackRequested()) {
-        GTEST_SKIP() << ub_mock::kLoopbackEnv << " is not set";
-    }
-    constexpr size_t kSize = 1024 * 1024;
-    const std::string key = "ub_mock_put_get_key";
-    ub_mock::resetLoopbackStats();
-
-    void* source = client_buffer_allocator_->allocate(kSize);
-    ASSERT_NE(source, nullptr);
-    for (size_t i = 0; i < kSize; ++i) {
-        static_cast<uint8_t*>(source)[i] = static_cast<uint8_t>(i * 13 + 7);
-    }
-    std::vector<Slice> slices{{source, kSize}};
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_result = test_client_->Put(key, slices, config);
-    ASSERT_TRUE(put_result.has_value())
-        << "Put operation failed: " << toString(put_result.error());
-    const auto after_put = ub_mock::loopbackStats();
-    EXPECT_GT(after_put.write_requests, 0u);
-    EXPECT_GE(after_put.bytes, kSize);
-
-    void* target = client_buffer_allocator_->allocate(kSize);
-    ASSERT_NE(target, nullptr);
-    memset(target, 0, kSize);
-    slices = {{target, kSize}};
-    auto get_result = test_client_->Get(key, slices);
-    ASSERT_TRUE(get_result.has_value())
-        << "Get operation failed: " << toString(get_result.error());
-    EXPECT_EQ(memcmp(target, source, kSize), 0);
-    const auto after_get = ub_mock::loopbackStats();
-    EXPECT_GT(after_get.read_requests, 0u);
-    EXPECT_GE(after_get.bytes - after_put.bytes, kSize);
-
-    client_buffer_allocator_->deallocate(source, kSize);
-    client_buffer_allocator_->deallocate(target, kSize);
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(default_kv_lease_ttl_));
-    auto remove_result = test_client_->Remove(key);
-    EXPECT_TRUE(remove_result.has_value())
-        << "Remove operation failed: " << toString(remove_result.error());
-}
-#endif
 
 constexpr size_t kReplicaCheckSize = 256 * 1024;
 

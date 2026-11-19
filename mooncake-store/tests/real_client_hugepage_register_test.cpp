@@ -32,7 +32,6 @@
 
 #include <cstdlib>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,20 +48,6 @@ long nrHugepages() {
         f >> pages;
     }
     return pages;
-}
-
-long hugepagesFree() {
-    std::ifstream f("/proc/meminfo");
-    std::string key;
-    long value = -1;
-    while (f >> key) {
-        if (key == "HugePages_Free:") {
-            f >> value;
-            break;
-        }
-        f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    }
-    return value;
 }
 }  // namespace
 
@@ -89,7 +74,6 @@ class RealClientHugepageRegisterTest : public ::testing::Test {
                          << "(/proc/sys/vm/nr_hugepages)";
         }
 
-        hugepages_free_before_setup_ = hugepagesFree();
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
             << "Failed to start in-proc master";
         master_address_ = master_.master_address();
@@ -114,7 +98,6 @@ class RealClientHugepageRegisterTest : public ::testing::Test {
     std::shared_ptr<RealClient> client_;
     InProcMaster master_;
     std::string master_address_;
-    long hugepages_free_before_setup_ = -1;
 
     static inline std::string protocol_ = "tcp";
     static inline std::string device_name_;
@@ -325,23 +308,6 @@ TEST_F(RealClientHugepageRegisterTest, SubHugepageMaxMrSizeIsRejected) {
     }
 
     EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
-}
-
-// With MC_STORE_USE_HUGEPAGE the global segment is a HugeTLB mmap, so teardown
-// must munmap it. For protocol "ub" it used to go through ub_free_memory(),
-// which only knows numa_alloc_local() memory: with USE_UB the pages stayed
-// mapped, and without USE_UB free() ran on an mmap pointer.
-TEST_F(RealClientHugepageRegisterTest,
-       SetupSegmentHugepagesReleasedOnTeardown) {
-    ASSERT_GE(hugepages_free_before_setup_, 0);
-    ASSERT_LT(hugepagesFree(), hugepages_free_before_setup_)
-        << "setup did not map any hugepages";
-
-    client_->tearDownAll();
-    client_.reset();
-
-    EXPECT_EQ(hugepagesFree(), hugepages_free_before_setup_)
-        << "hugepages mapped by setup were not released on teardown";
 }
 
 // Sub-range registrations are not special-cased at the store layer: an

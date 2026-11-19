@@ -793,9 +793,8 @@ jobs:
             build_targets: ''
           # Exercise the native UB target with its injected mock adapter. A
           # Debug build also catches ODR/link errors hidden by optimization.
-          # USE_UB_MOCK adds the test-only loopback URMA adapter, which lets
-          # the two Store test executables below run over TENT UB without
-          # hardware.
+          # USE_UB_MOCK adds the test-only loopback URMA adapter for focused
+          # TENT and Store tests without UB hardware.
           - name: ub-mock
             cmake_flags: >-
               -DUSE_CUDA=OFF -DUSE_UB=ON -DUSE_UB_MOCK=ON
@@ -804,7 +803,7 @@ jobs:
             metrics_flags: ''
             build_targets: >-
               mooncake-transfer-engine/all
-              client_integration_test real_client_hugepage_register_test
+              store_tent_ub_mock_test
           # Compile against stub ACL headers and embed host-only ACL stubs in
           # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
           - name: memfabric-mock
@@ -923,7 +922,7 @@ jobs:
       run: |
         sudo sysctl -w vm.nr_hugepages=64 || true
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^(client_integration_ub_mock_test|real_client_hugepage_ub_mock_test)$'
+          -R '^store_tent_ub_mock_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
