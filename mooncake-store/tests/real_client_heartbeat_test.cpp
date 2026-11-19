@@ -1,9 +1,13 @@
+#include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <string_view>
 #include <thread>
 
 #include "dummy_client.h"
@@ -16,12 +20,6 @@ class RealClientHeartbeatTestPeer {
     using RegistrationGuard = RealClient::DummyRegistrationGuard;
     static auto& Mutex(RealClient& c) { return c.dummy_heartbeat_mutex_; }
     static auto& Heartbeats(RealClient& c) { return c.dummy_heartbeats_; }
-    static auto& Registrations(RealClient& c) {
-        return c.dummy_registrations_in_progress_;
-    }
-    static auto& LastRegistration(RealClient& c) {
-        return c.last_dummy_registration_;
-    }
     static auto& PingClient(RealClient& c) { return c.dummy_ping_client_; }
     static bool TryExpire(RealClient& c, const UUID& id) {
         return c.try_expire_dummy_client(id);
@@ -55,49 +53,77 @@ bool NeedsRemount(RealClient& client, const UUID& id) {
            it->second.needs_remount;
 }
 
-TEST(RealClientHeartbeatTest, InitialControlRegistrationDoesNotRequestRemount) {
-    RealClient client;
-    const UUID id{1, 3};
-    {
-        RealClientHeartbeatTestPeer::RegistrationGuard control(client, id,
-                                                               true);
-    }
-    {
-        RealClientHeartbeatTestPeer::RegistrationGuard data(client, id, false);
-    }
-    EXPECT_FALSE(NeedsRemount(client, id));
-}
+class ReconnectLogSink : public google::LogSink {
+   public:
+    ReconnectLogSink() { google::AddLogSink(this); }
+    ~ReconnectLogSink() override { google::RemoveLogSink(this); }
 
-TEST(RealClientHeartbeatTest, RegistrationAndGraceProtectQueuedClients) {
+    void send(google::LogSeverity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        if (std::string_view(message, message_len) ==
+            "RealClient lost, entering reconnection loop...") {
+            reconnect_started.store(true);
+        }
+    }
+
+    std::atomic<bool> reconnect_started{false};
+};
+
+TEST(RealClientHeartbeatTest, RegistrationProtectsOnlyItsOwnClient) {
     RealClient client;
-    const UUID registering{1, 1}, queued{1, 2};
+    const UUID registering{1, 1}, stale{1, 2};
     Expire(client, registering);
-    Expire(client, queued);
+    Expire(client, stale);
     {
         RealClientHeartbeatTestPeer::RegistrationGuard registration(
             client, registering);
-        RealClientHeartbeatTestPeer::TryExpire(client, queued);
-        EXPECT_FALSE(NeedsRemount(client, registering));
-        EXPECT_FALSE(NeedsRemount(client, queued));
+        EXPECT_FALSE(
+            RealClientHeartbeatTestPeer::TryExpire(client, registering));
+        EXPECT_TRUE(RealClientHeartbeatTestPeer::TryExpire(client, stale));
     }
-    RealClientHeartbeatTestPeer::TryExpire(client, queued);
-    EXPECT_EQ(RealClientHeartbeatTestPeer::Registrations(client), 0u);
-    EXPECT_FALSE(NeedsRemount(client, queued));
+    EXPECT_TRUE(RealClientHeartbeatTestPeer::TryExpire(client, registering));
 }
 
-TEST(RealClientHeartbeatTest, ExpiryNotificationSurvivesLateRegistration) {
+TEST(RealClientHeartbeatTest, InvalidRegistrationDoesNotTrackClient) {
     RealClient client;
-    const UUID id{3, 1};
-    Expire(client, id);
-    RealClientHeartbeatTestPeer::TryExpire(client, id);
-    ASSERT_TRUE(NeedsRemount(client, id));
+    const UUID id{1, 3};
+    auto result = client.map_shm_internal(-1, 1, 4096, true, id);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_TRUE(RealClientHeartbeatTestPeer::Heartbeats(client).empty());
-    {
-        RealClientHeartbeatTestPeer::RegistrationGuard late_registration(client,
-                                                                         id);
-        EXPECT_TRUE(NeedsRemount(client, id));
-    }
-    EXPECT_TRUE(NeedsRemount(client, id));
+}
+
+TEST(RealClientHeartbeatTest, DuplicateRegistrationDoesNotRenewExpiry) {
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    auto client = RealClient::create();
+    ASSERT_EQ(
+        client->setup_real("127.0.0.1:" + std::to_string(getFreeTcpPort()),
+                           "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                           "tcp", "", master.master_address(), nullptr, ""),
+        0);
+    const UUID id{3, 1};
+    auto* helper = ShmHelper::getInstance();
+    void* buffer = helper->allocate(4096);
+    auto shm = helper->get_shm(buffer);
+    ASSERT_TRUE(shm);
+    const auto address = reinterpret_cast<uint64_t>(buffer);
+    ASSERT_TRUE(
+        client->map_shm_internal(dup(shm->fd), address, shm->size, true, id));
+    EXPECT_FALSE(NeedsRemount(*client, id));
+    Expire(*client, id);
+    ASSERT_TRUE(
+        client->map_shm_internal(dup(shm->fd), address, shm->size, true, id));
+    ASSERT_TRUE(RealClientHeartbeatTestPeer::TryExpire(*client, id));
+    EXPECT_TRUE(RealClientHeartbeatTestPeer::Heartbeats(*client).empty());
+
+    ASSERT_TRUE(
+        client->map_shm_internal(dup(shm->fd), address, shm->size, false, id));
+    EXPECT_TRUE(NeedsRemount(*client, id));
+    EXPECT_FALSE(RealClientHeartbeatTestPeer::TryExpire(*client, id));
+    EXPECT_EQ(client->tearDownAll(), 0);
+    EXPECT_EQ(helper->free(buffer), 0);
 }
 
 TEST(RealClientHeartbeatTest, ExplicitUnmapDoesNotRequestRemount) {
@@ -113,17 +139,37 @@ TEST(RealClientHeartbeatTest, ZeroBufferClientCanAcknowledgeRemount) {
     testing::InProcMaster master;
     ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
     auto client = RealClient::create();
-    ASSERT_EQ(
-        client->setup_real("127.0.0.1:" + std::to_string(getFreeTcpPort()),
-                           "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
-                           "tcp", "", master.master_address(), nullptr, ""),
-        0);
-    ASSERT_FALSE(RealClientHeartbeatTestPeer::PingClient(*client).expired());
+    const auto setup = [&] {
+        return client->setup_real(
+            "127.0.0.1:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
+            16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+            master.master_address(), nullptr, "");
+    };
     const UUID id{5, 1};
-    ASSERT_TRUE(Eventually([&] {
-        auto result = client->ping(id);
-        return result && result->client_status == ClientStatus::OK;
-    }));
+    EXPECT_FALSE(client->ping(id));
+    EXPECT_TRUE(RealClientHeartbeatTestPeer::Heartbeats(*client).empty());
+    ASSERT_EQ(setup(), 0);
+    ASSERT_FALSE(RealClientHeartbeatTestPeer::PingClient(*client).expired());
+    auto initial = client->ping(id);
+    ASSERT_TRUE(initial);
+    EXPECT_EQ(initial->client_status, ClientStatus::NEED_REMOUNT);
+
+    const auto port = getFreeTcpPort();
+    const auto endpoint = "127.0.0.1:" + std::to_string(port);
+    coro_rpc::coro_rpc_server server(1, port, "127.0.0.1");
+    server.register_handler<&RealClient::service_ready_internal>(client.get());
+    server.register_handler<&RealClient::ping>(client.get());
+    server.register_handler<&RealClient::unmap_shm_internal>(client.get());
+    auto running = server.async_start();
+    ASSERT_FALSE(running.hasResult());
+    ReconnectLogSink reconnect_log;
+    DummyClient dummy;
+    ASSERT_EQ(dummy.setup_dummy(16 * 1024 * 1024, 0, endpoint, ""), 0);
+    EXPECT_EQ(dummy.health_check(), HC_HEALTHY);
+    EXPECT_EQ(dummy.tearDownAll(), 0);
+    EXPECT_FALSE(reconnect_log.reconnect_started.load());
+    server.stop();
+
     // A fresh successful heartbeat invalidates a previously stale candidate.
     Expire(*client, id);
     ASSERT_TRUE(client->ping(id).has_value());
@@ -141,6 +187,13 @@ TEST(RealClientHeartbeatTest, ZeroBufferClientCanAcknowledgeRemount) {
     EXPECT_EQ(acknowledged->client_status, ClientStatus::OK);
     EXPECT_EQ(client->tearDownAll(), 0);
     EXPECT_TRUE(RealClientHeartbeatTestPeer::PingClient(*client).expired());
+    EXPECT_FALSE(client->ping(id));
+    EXPECT_TRUE(RealClientHeartbeatTestPeer::Heartbeats(*client).empty());
+    ASSERT_EQ(setup(), 0);
+    auto after_setup = client->ping(id);
+    ASSERT_TRUE(after_setup);
+    EXPECT_EQ(after_setup->client_status, ClientStatus::NEED_REMOUNT);
+    EXPECT_EQ(client->tearDownAll(), 0);
     master.Stop();
 }
 
@@ -181,12 +234,6 @@ TEST(RealClientHeartbeatTest, DummyAutomaticallyReregistersAfterExpiry) {
     ASSERT_GT(mappings, 0);
     ASSERT_TRUE(Eventually([&] {
         Expire(*real, id);
-        {
-            std::lock_guard lock(RealClientHeartbeatTestPeer::Mutex(*real));
-            RealClientHeartbeatTestPeer::LastRegistration(*real) =
-                Clock::now() -
-                std::chrono::seconds(DEFAULT_CLIENT_LIVE_TTL_SEC + 1);
-        }
         return RealClientHeartbeatTestPeer::TryExpire(*real, id);
     }));
     ASSERT_TRUE(Eventually([&] {

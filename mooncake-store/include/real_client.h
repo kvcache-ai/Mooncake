@@ -1353,20 +1353,22 @@ class RealClient : public PyClient {
     std::unordered_map<UUID, DummyClientHeartbeat, boost::hash<UUID>>
         dummy_heartbeats_;
     std::weak_ptr<Client> dummy_ping_client_;
-    size_t dummy_registrations_in_progress_ = 0;
-    std::chrono::steady_clock::time_point last_dummy_registration_{};
+    std::unordered_map<UUID, size_t, boost::hash<UUID>>
+        pending_dummy_registrations_;
     const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     class DummyRegistrationGuard {
        public:
-        DummyRegistrationGuard(RealClient &owner, const UUID &client_id,
-                               bool is_local_buffer = false);
+        DummyRegistrationGuard(RealClient &owner, const UUID &client_id);
         ~DummyRegistrationGuard();
         DummyRegistrationGuard(const DummyRegistrationGuard &) = delete;
         DummyRegistrationGuard &operator=(const DummyRegistrationGuard &) =
             delete;
 
+        void mark_registered(bool is_local_buffer);
+
        private:
         RealClient &owner_;
+        UUID client_id_;
     };
     // Call with dummy_client_mutex_ held exclusively.
     tl::expected<void, ErrorCode> unmap_shm_locked(const UUID &client_id);
