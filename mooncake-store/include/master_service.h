@@ -2174,6 +2174,8 @@ class MasterService {
         size_t outstanding{0};
         bool drained{false};
         bool awaiting_reclamation{false};
+        bool scan_incomplete{false};
+        uint64_t registration_version{0};
         std::chrono::steady_clock::time_point verify_after{};
         std::unordered_map<std::string, route::Generation> exhausted_attempts;
     };
@@ -2184,6 +2186,7 @@ class MasterService {
         std::deque<DrainCandidate> ready;
         std::deque<DrainCandidate> delayed;
         uint64_t blocked_units{0};
+        uint64_t checked_registration_version{0};
     };
 
     enum class DrainStopReason { NONE, USER, TIMEOUT };

@@ -10550,8 +10550,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
 
         metadata.VisitReplicas(
             [](const Replica&) { return true; },
-            [this, &source, &source_exists, &source_is_serving,
-             &source_session](const Replica& replica) {
+            [this, &source, &source_exists, &source_is_serving, &source_session,
+             retained_by_drain](const Replica& replica) {
                 const auto names = replica.get_segment_names();
                 const bool matches = std::any_of(
                     names.begin(), names.end(), [&source](const auto& name) {
@@ -10559,7 +10559,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
                     });
                 if (matches) {
                     source_exists = true;
-                    if (IsReplicaReadable(replica)) {
+                    if ((!retained_by_drain || !source_is_serving) &&
+                        IsReplicaReadable(replica)) {
                         source_is_serving = true;
                         source_session = replica.getClientSession();
                     }
@@ -10576,12 +10577,18 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-        ErrorCode error =
-            segment_accessor.GetClientIdBySegmentName(source, select_client);
-        if (error != ErrorCode::OK) {
-            LOG(ERROR) << "key=" << key << ", segment_name=" << source
-                       << ", error=client_id_not_found";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        if (retained_by_drain && source_session) {
+            // A new registration can take over the name index while existing
+            // replicas still belong to earlier registrations.
+            select_client = source_session->ClientId();
+        } else {
+            const auto error = segment_accessor.GetClientIdBySegmentName(
+                source, select_client);
+            if (error != ErrorCode::OK) {
+                LOG(ERROR) << "key=" << key << ", segment_name=" << source
+                           << ", error=client_id_not_found";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
         }
     }
 
@@ -10609,12 +10616,16 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
     const auto& metadata = submission_metadata.Get();
     ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
     UUID current_source_client;
-    if (submission_access.GetClientIdBySegmentName(
-            source, current_source_client) != ErrorCode::OK ||
-        current_source_client != select_client ||
+    if ((!retained_by_drain &&
+         (submission_access.GetClientIdBySegmentName(
+              source, current_source_client) != ErrorCode::OK ||
+          current_source_client != select_client)) ||
         !submission_access.IsSegmentAllocatable(target) ||
-        !metadata.HasReplica([this, &source](const Replica& replica) {
-            if (!IsReplicaReadable(replica)) {
+        !metadata.HasReplica([this, &source, &source_session,
+                              retained_by_drain](const Replica& replica) {
+            if (!IsReplicaReadable(replica) ||
+                (retained_by_drain &&
+                 replica.getClientSession() != source_session)) {
                 return false;
             }
             const auto names = replica.get_segment_names();
@@ -10821,7 +10832,6 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
         deadline =
             now + std::chrono::milliseconds(static_cast<int64_t>(timeout_ms));
     }
-    std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
@@ -10830,32 +10840,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
             return tl::make_unexpected(valid.error());
         }
 
-        draining_segments.reserve(request.segments.size());
         for (const auto& segment_name : request.segments) {
-            SegmentStatus previous = SegmentStatus::UNDEFINED;
-            auto err =
-                segment_access.GetSegmentStatusByName(segment_name, previous);
-            if (err != ErrorCode::OK) {
-                for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(
-                        updated_segment, SegmentStatus::OK);
-                }
-                return tl::make_unexpected(err);
-            }
-            // Preserve a pre-existing DRAINING or DRAINED status on retry.
-            if (previous != SegmentStatus::OK) {
-                continue;
-            }
-            err = segment_access.SetSegmentStatusByName(
-                segment_name, SegmentStatus::DRAINING);
-            if (err != ErrorCode::OK) {
-                for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(
-                        updated_segment, SegmentStatus::OK);
-                }
-                return tl::make_unexpected(err);
-            }
-            draining_segments.push_back(segment_name);
+            segment_access.SetDrainSourceStatus(segment_name,
+                                                SegmentStatus::DRAINING);
         }
     }
 
@@ -11076,13 +11063,7 @@ bool MasterService::FinishDrainJobCancellation(DrainJob& job) {
     // The job lock keeps queries and scheduling behind segment restoration.
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     for (const auto& segment_name : job.request.segments) {
-        SegmentStatus status = SegmentStatus::UNDEFINED;
-        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                ErrorCode::OK &&
-            status != SegmentStatus::UNMOUNTING) {
-            (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                        SegmentStatus::OK);
-        }
+        segment_access.SetDrainSourceStatus(segment_name, SegmentStatus::OK);
     }
     job.status = JobStatus::CANCELED;
     job.last_updated_at = std::chrono::system_clock::now();
@@ -11343,72 +11324,123 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     auto& plan = *job.plan;
-    if (std::none_of(
-            plan.sources.begin(), plan.sources.end(),
-            [](const auto& source) { return source.outstanding == 0; })) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool needs_candidates =
+        plan.ready.empty() &&
+        job.active_tasks.size() < job.request.max_concurrency;
+    const auto retry_incomplete_scan = [&](const DrainSourceProgress& source) {
+        return needs_candidates && source.scan_incomplete &&
+               source.verify_after <= now;
+    };
+    if (plan.checked_registration_version ==
+            segment_manager_.GetRegistrationVersion() &&
+        std::none_of(
+            plan.sources.begin(), plan.sources.end(), [&](const auto& source) {
+                return source.outstanding == 0 || retry_incomplete_scan(source);
+            })) {
         return false;
     }
 
     struct SourceScan {
         size_t index;
+        uint64_t registration_version;
         bool has_exhausted_candidate{false};
+        std::unordered_set<std::string> outstanding_keys{};
     };
     std::unordered_map<std::string_view, SourceScan> scans;
-    const auto now = std::chrono::steady_clock::now();
     bool all_idle = true;
+    bool reconciling = false;
     {
         auto segments = segment_manager_.getSegmentAccess();
+        plan.checked_registration_version =
+            segment_manager_.GetRegistrationVersion();
         for (size_t i = 0; i < plan.sources.size(); ++i) {
             auto& source = plan.sources[i];
+            const auto& name = job.request.segments[i];
+            const auto version = segments.GetRegistrationVersion(name);
+            const bool registration_changed =
+                version != source.registration_version;
+            if (registration_changed) {
+                // Fence every mounted ID under this name before reconciling.
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                source.drained = false;
+            }
+
             if (source.outstanding != 0) {
                 all_idle = false;
+                if (registration_changed || retry_incomplete_scan(source)) {
+                    scans.emplace(name, SourceScan{i, version});
+                    reconciling = true;
+                }
                 continue;
             }
 
-            const auto& name = job.request.segments[i];
             SegmentStatus status = SegmentStatus::UNDEFINED;
             (void)segments.GetSegmentStatusByName(name, status);
             if (status == SegmentStatus::OK) {
-                // A source mounted again under this name must stop accepting
-                // allocations before the next verification.
-                (void)segments.SetSegmentStatusByName(name,
-                                                      SegmentStatus::DRAINING);
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
                 source.drained = false;
                 source.verify_after = {};
             } else if (source.drained && status == SegmentStatus::DRAINING) {
                 source.drained = false;
                 source.verify_after = {};
             }
-            if (!source.drained && (source.verify_after <= now ||
-                                    (source.awaiting_reclamation &&
-                                     !segments.HasAllocatedMemory(name)))) {
-                scans.emplace(name, SourceScan{i});
+            if (registration_changed ||
+                (!source.drained && (source.verify_after <= now ||
+                                     (source.awaiting_reclamation &&
+                                      !segments.HasAllocatedMemory(name))))) {
+                scans.emplace(name, SourceScan{i, version});
+            }
+        }
+        if (all_idle && !scans.empty()) {
+            // Use the same walk to confirm earlier failures before deciding
+            // the overall job outcome.
+            for (size_t i = 0; i < plan.sources.size(); ++i) {
+                if (!plan.sources[i].drained) {
+                    const auto& name = job.request.segments[i];
+                    scans.try_emplace(
+                        name,
+                        SourceScan{i, segments.GetRegistrationVersion(name)});
+                }
             }
         }
     }
     if (scans.empty()) {
         return false;
     }
-    if (all_idle) {
-        // Use the same walk to confirm any earlier failures before deciding
-        // the overall job outcome.
-        for (size_t i = 0; i < plan.sources.size(); ++i) {
-            if (!plan.sources[i].drained) {
-                scans.try_emplace(job.request.segments[i], SourceScan{i});
+
+    if (reconciling) {
+        const auto remember = [&](const DrainCandidate& candidate) {
+            auto scan =
+                scans.find(job.request.segments[candidate.source_index]);
+            if (scan != scans.end()) {
+                scan->second.outstanding_keys.insert(
+                    candidate.tenant_id.MakeScopedKey(candidate.object.key));
             }
+        };
+        for (const auto& candidate : plan.ready) {
+            remember(candidate);
+        }
+        for (const auto& candidate : plan.delayed) {
+            remember(candidate);
+        }
+        for (const auto& [_, task] : job.active_tasks) {
+            remember(task.candidate);
         }
     }
 
+    bool skipped_busy_keys = false;
     {
         std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
-        // Include namespaces whose first write has allocated on a source but
-        // has yet to publish. The cursor waits for that write's key guard.
+        // Include first writes in empty namespaces. The allocator check below
+        // protects unpublished source buffers even when their keys are busy.
         namespaces_.Visit([&](const TenantId& tenant_id,
                               metadata::Namespace& ns) {
             if (DrainJobStopRequested(job)) {
                 return;
             }
-            for (auto object : ns.objects.ReadCursor()) {
+            auto cursor = ns.objects.ReadCursorSkippingBusyKeys();
+            for (auto object : cursor) {
                 if (DrainJobStopRequested(job)) {
                     return;
                 }
@@ -11419,30 +11451,37 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                         std::find(names.begin(), it, *it) != it) {
                         continue;
                     }
-                    auto& [index, has_exhausted_candidate] = scan->second;
-                    auto& source = plan.sources[index];
+                    auto& entry = scan->second;
+                    auto& source = plan.sources[entry.index];
+                    if (!entry.outstanding_keys.empty() &&
+                        entry.outstanding_keys.contains(
+                            tenant_id.MakeScopedKey(object.key()))) {
+                        continue;
+                    }
                     if (!source.exhausted_attempts.empty()) {
                         const auto failed = source.exhausted_attempts.find(
                             tenant_id.MakeScopedKey(object.key()));
                         if (failed != source.exhausted_attempts.end()) {
                             if (failed->second == object.generation()) {
-                                has_exhausted_candidate = true;
+                                entry.has_exhausted_candidate = true;
                                 continue;
                             }
                             source.exhausted_attempts.erase(failed);
                         }
                     }
-                    plan.ready.push_back({tenant_id, object.ref(), index});
+                    plan.ready.push_back(
+                        {tenant_id, object.ref(), entry.index});
                     ++source.outstanding;
                 }
             }
+            skipped_busy_keys |= cursor.skipped_busy_keys();
         });
     }
     if (DrainJobStopRequested(job)) {
         return false;
     }
 
-    bool can_fail = all_idle;
+    bool can_finish = all_idle;
     bool all_drained;
     {
         auto segments = segment_manager_.getSegmentAccess();
@@ -11450,58 +11489,72 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             std::chrono::steady_clock::now() + kDrainSourceVerificationInterval;
         for (const auto& [_, scan] : scans) {
             auto& source = plan.sources[scan.index];
-            const auto& segment = job.request.segments[scan.index];
+            const auto& name = job.request.segments[scan.index];
+            if (scan.registration_version !=
+                segments.GetRegistrationVersion(name)) {
+                // The next round will reconcile the registration that raced
+                // with this scan, even if this walk queued candidates.
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                can_finish = false;
+                continue;
+            }
+            source.registration_version = scan.registration_version;
             source.verify_after = {};
             source.awaiting_reclamation = false;
+            source.scan_incomplete = skipped_busy_keys;
             if (source.outstanding != 0) {
-                can_fail = false;
+                if (source.scan_incomplete) {
+                    source.verify_after = verify_after;
+                }
+                can_finish = false;
                 continue;
             }
 
             SegmentStatus status = SegmentStatus::UNDEFINED;
-            (void)segments.GetSegmentStatusByName(segment, status);
+            (void)segments.GetSegmentStatusByName(name, status);
             if (status == SegmentStatus::OK) {
-                // The segment was remounted during the metadata walk.
-                (void)segments.SetSegmentStatusByName(segment,
-                                                      SegmentStatus::DRAINING);
-                can_fail = false;
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                can_finish = false;
                 continue;
             }
-
             if (scan.has_exhausted_candidate) {
+                // A skipped key may still contain a movable replica.
+                can_finish = can_finish && !source.scan_incomplete;
                 source.verify_after = verify_after;
                 continue;
             }
-            if (segments.HasAllocatedMemory(segment)) {
-                // A detached buffer can outlive its metadata. Check it
-                // cheaply between verification walks.
+            if (segments.HasAllocatedMemory(name)) {
+                // A detached buffer can outlive its metadata. Check it cheaply
+                // between verification walks.
                 source.awaiting_reclamation = true;
                 source.verify_after = verify_after;
-                can_fail = false;
+                can_finish = false;
                 continue;
             }
-            (void)segments.SetSegmentStatusByName(segment,
-                                                  SegmentStatus::DRAINED);
+            segments.SetDrainSourceStatus(name, SegmentStatus::DRAINED);
             source.drained = true;
+            source.scan_incomplete = false;
             source.exhausted_attempts.clear();
         }
-        if (!can_fail || DrainJobStopRequested(job)) {
+        if (!can_finish || DrainJobStopRequested(job)) {
             return false;
         }
         for (size_t i = 0; i < plan.sources.size(); ++i) {
             auto& source = plan.sources[i];
-            if (!source.drained) {
-                continue;
-            }
-            SegmentStatus status = SegmentStatus::UNDEFINED;
-            (void)segments.GetSegmentStatusByName(job.request.segments[i],
-                                                  status);
-            if (status == SegmentStatus::OK ||
-                status == SegmentStatus::DRAINING) {
-                // A source was mounted while another source was verified.
-                source.drained = false;
-                source.verify_after = {};
+            const auto& name = job.request.segments[i];
+            if (source.registration_version !=
+                segments.GetRegistrationVersion(name)) {
                 return false;
+            }
+            if (source.drained) {
+                SegmentStatus status = SegmentStatus::UNDEFINED;
+                (void)segments.GetSegmentStatusByName(name, status);
+                if (status == SegmentStatus::OK ||
+                    status == SegmentStatus::DRAINING) {
+                    source.drained = false;
+                    source.verify_after = {};
+                    return false;
+                }
             }
         }
         all_drained =
@@ -11509,19 +11562,14 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                         [](const auto& source) { return source.drained; });
         if (!all_drained) {
             for (const auto& name : job.request.segments) {
-                SegmentStatus status = SegmentStatus::UNDEFINED;
-                if (segments.GetSegmentStatusByName(name, status) ==
-                        ErrorCode::OK &&
-                    status != SegmentStatus::UNMOUNTING) {
-                    (void)segments.SetSegmentStatusByName(name,
-                                                          SegmentStatus::OK);
-                }
+                segments.SetDrainSourceStatus(name, SegmentStatus::OK);
             }
         }
-    }
 
+        // Serialize the terminal decision with registration changes.
+        job.status = all_drained ? JobStatus::SUCCEEDED : JobStatus::FAILED;
+    }
     job.plan.reset();
-    job.status = all_drained ? JobStatus::SUCCEEDED : JobStatus::FAILED;
     job.last_updated_at = std::chrono::system_clock::now();
     job.message = all_drained ? "Drain job finished successfully"
                               : "Drain job failed: unrecoverable units remain";
