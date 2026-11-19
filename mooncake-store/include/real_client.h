@@ -1396,6 +1396,9 @@ class RealClient : public PyClient {
     std::mutex teardown_mutex_;
     ErrorCode storage_shutdown_error_ = ErrorCode::OK;
     RpcDrainGuard offload_rpc_drain_;
+    // Admits mounts until teardown starts, so none lands after the graceful
+    // unmount takes its snapshot.
+    RpcDrainGuard mount_drain_;
     friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 

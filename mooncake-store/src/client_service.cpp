@@ -6285,11 +6285,15 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     // Fallback: the replica's endpoint may address one of this client's
     // mounted segments by segment name or TE endpoint (e.g. when the writer
     // published the segment under a name different from local_hostname_).
+    // A gracefully unmounting segment still holds the objects its drain moves.
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-    for (const auto& [segment_id, segment] : mounted_segments_) {
-        if (replica_transfer_endpoint == segment.name ||
-            replica_transfer_endpoint == segment.te_endpoint) {
-            return true;
+    for (const auto* segments :
+         {&mounted_segments_, &gracefully_unmounting_segments_}) {
+        for (const auto& [segment_id, segment] : *segments) {
+            if (replica_transfer_endpoint == segment.name ||
+                replica_transfer_endpoint == segment.te_endpoint) {
+                return true;
+            }
         }
     }
     return false;
