@@ -72,6 +72,7 @@ class CompletionNotificationFallback : public std::runtime_error {
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#include "cuda_host_func_guard.h"
 #endif
 
 static void* (*allocateMemory)(size_t) = nullptr;
