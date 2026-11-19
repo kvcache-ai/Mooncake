@@ -365,15 +365,19 @@ TEST(MnnvlConfigTest, DefaultsAndBootstrapLifecycle) {
     MnnvlConfig options;
     ASSERT_TRUE(parseMnnvlConfig(config, options).ok());
     EXPECT_FALSE(options.require_fabric);
-    for (const auto* key : {"require_fabric"}) {
+    EXPECT_FALSE(options.gpu_wait);
+    for (const auto* key : {"require_fabric", "sync_mode"}) {
         EXPECT_EQ(classifyConfigPath(std::string("transports/mnnvl/") + key),
                   ConfigLifecycle::kBootstrapOnly);
     }
 }
 
 TEST(MnnvlConfigTest, RejectsMalformedControlsWithoutUpdatingOptions) {
-    for (const auto& entry : std::vector<std::pair<std::string, json>>{
-             {"require_fabric", "true"}, {"require_fabric", nullptr}}) {
+    for (const auto& entry :
+         std::vector<std::pair<std::string, json>>{{"require_fabric", "true"},
+                                                   {"require_fabric", nullptr},
+                                                   {"sync_mode", true},
+                                                   {"sync_mode", "invalid"}}) {
         Config config;
         config.set("transports/mnnvl/" + entry.first, entry.second);
         MnnvlConfig options;
@@ -401,12 +405,24 @@ TEST(MnnvlConfigTest, StrictRejectsDisabledAndNonFabricConfigurations) {
     }
 }
 
+TEST(MnnvlConfigTest, GpuWaitRejectsDeferredDispatch) {
+    Config config;
+    config.set("transports/mnnvl/sync_mode", "gpu_wait");
+    config.set("enable_runtime_queue", true);
+    MnnvlConfig options;
+    EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument());
+    config.set("transports/mnnvl/sync_mode", "cpu_block");
+    EXPECT_TRUE(parseMnnvlConfig(config, options).ok());
+}
+
 TEST(MnnvlConfigTest, EnvironmentOverridesAndMalformedBooleans) {
     EnvVarGuard conf_guard("MC_TENT_CONF", "{}");
     EnvVarGuard strict_guard("MC_MNNVL_REQUIRE_FABRIC", "1");
+    EnvVarGuard sync_guard("MC_MNNVL_SYNC_MODE", "gpu_wait");
     Config config;
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
     EXPECT_TRUE(config.get("transports/mnnvl/require_fabric", false));
+    EXPECT_EQ(config.get("transports/mnnvl/sync_mode", ""), "gpu_wait");
     EnvVarGuard invalid_guard("MC_MNNVL_REQUIRE_FABRIC", "tru");
     EXPECT_TRUE(ConfigHelper().loadFromEnv(config).IsInvalidArgument());
 }
