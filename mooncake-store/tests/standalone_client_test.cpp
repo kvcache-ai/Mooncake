@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <span>
@@ -77,6 +78,34 @@ TEST_F(StandaloneClientTest, PutGetWithoutExternalMaster) {
                           buffer_handle->size()),
               test_data);
     EXPECT_EQ(client_->isExist(key), 1);
+}
+
+TEST_F(StandaloneClientTest, TearDownWaitsOutShutdownGracePeriod) {
+    auto setup = client_->setup_internal(
+        "localhost", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+        FLAGS_protocol, rdma_devices(),
+        /*master_server_addr=*/"",
+        /*transfer_engine=*/nullptr,
+        /*ipc_socket_path=*/"",
+        /*local_rpc_port=*/50052,
+        /*enable_ssd_offload=*/false,
+        /*start_offload_rpc_server=*/true,
+        /*ssd_offload_path=*/"",
+        /*tenant_id=*/"default",
+        /*enable_client_http_server=*/false,
+        /*client_http_port=*/DEFAULT_CLIENT_HTTP_PORT,
+        /*enable_embedded_master=*/true);
+    ASSERT_TRUE(setup.has_value());
+
+    // Grace, then one lease hold after the master removes the segment.
+    client_->set_shutdown_grace_period(1);
+    const auto lease_hold =
+        std::chrono::milliseconds(DEFAULT_DEFAULT_KV_LEASE_TTL);
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(client_->tearDownAll(), 0);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(elapsed, std::chrono::seconds(1) + lease_hold);
+    EXPECT_LT(elapsed, std::chrono::seconds(8) + lease_hold);
 }
 
 TEST_F(StandaloneClientTest, ConfigDictOmitsMasterAddress) {

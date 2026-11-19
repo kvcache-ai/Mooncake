@@ -1462,6 +1462,7 @@ mooncake_client \
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
+| `--shutdown_grace_seconds` | `0` | On SIGTERM, SIGINT or SIGHUP, gracefully unmount all segments with this grace period. Other clients can still read the objects on them, and this client keeps running the drain tasks the master sends it, until the master removes them, and for the 10 s default read lease after that; then it exits. Its `/health` endpoint reports `not_initialized` from the start. Keep it at least 20 s below the Kubernetes `terminationGracePeriodSeconds`. `0` exits right away |
 
 The real client queues shared-memory registration connections while serving
 another client. It reads `MOONCAKE_UDS_LISTEN_BACKLOG` to configure its UDS
