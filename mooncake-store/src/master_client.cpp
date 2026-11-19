@@ -166,6 +166,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpdateSoftPin> {
+    static constexpr const char* value = "BatchUpdateSoftPin";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
     static constexpr const char* value = "BatchRemove";
 };
@@ -345,6 +350,46 @@ struct RpcNameTraits<&WrappedMasterService::CreateMoveTask> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::QueryTask> {
     static constexpr const char* value = "QueryTask";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ListTasks> {
+    static constexpr const char* value = "ListTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CreateDrainJob> {
+    static constexpr const char* value = "CreateDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CreateTimedDrainJob> {
+    static constexpr const char* value = "CreateTimedDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::QueryDrainJob> {
+    static constexpr const char* value = "QueryDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CancelDrainJob> {
+    static constexpr const char* value = "CancelDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ListDrainJobs> {
+    static constexpr const char* value = "ListDrainJobs";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CancelTask> {
+    static constexpr const char* value = "CancelTask";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::IsTaskCancellationRequested> {
+    static constexpr const char* value = "IsTaskCancellationRequested";
 };
 
 template <>
@@ -997,6 +1042,17 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     return result;
 }
 
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpdateSoftPin(
+    const std::vector<std::string>& keys, uint64_t ttl_ms) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchUpdateSoftPin");
+    timer.LogRequest("keys_count=", keys.size(), ", ttl_ms=", ttl_ms);
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchUpdateSoftPin, void>(
+            keys.size(), keys, ttl_ms, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
     const std::vector<std::string>& keys, bool force) {
     ScopedVLogTimer timer(1, "MasterClient::BatchRemove");
@@ -1416,6 +1472,77 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
             task_id);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<ListTasksResponse, ErrorCode> MasterClient::ListTasks(
+    TaskListRequest request) {
+    request.tenant_id = tenant_id_.value();
+    ScopedVLogTimer timer(1, "MasterClient::ListTasks");
+    timer.LogRequest("tenant_id=", request.tenant_id,
+                     ", limit=", request.limit);
+    auto result =
+        invoke_rpc<&WrappedMasterService::ListTasks, ListTasksResponse>(
+            request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateDrainJob");
+    timer.LogRequest("segments_count=", request.segments.size(),
+                     ", target_segments_count=", request.target_segments.size(),
+                     ", max_concurrency=", request.max_concurrency);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CreateDrainJob, UUID>(request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateTimedDrainJob(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return CreateDrainJob(request);
+    }
+    return invoke_rpc<&WrappedMasterService::CreateTimedDrainJob, UUID>(
+        request, timeout_ms);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> MasterClient::QueryDrainJob(
+    const UUID& job_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryDrainJob");
+    timer.LogRequest("job_id=", job_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::QueryDrainJob, QueryJobResponse>(
+            job_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CancelDrainJob(const UUID& job_id) {
+    ScopedVLogTimer timer(1, "MasterClient::CancelDrainJob");
+    timer.LogRequest("job_id=", job_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CancelDrainJob, void>(job_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> MasterClient::ListDrainJobs(
+    const DrainJobListRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ListDrainJobs,
+                      ListDrainJobsResponse>(request);
+}
+
+tl::expected<void, ErrorCode> MasterClient::CancelTask(const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::CancelTask, void>(
+        task_id, tenant_id_.value());
+}
+
+tl::expected<bool, ErrorCode> MasterClient::IsTaskCancellationRequested(
+    const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::IsTaskCancellationRequested, bool>(
+        client_id_, task_id);
 }
 
 tl::expected<void, ErrorCode> MasterClient::CopyEnd(const std::string& key) {
