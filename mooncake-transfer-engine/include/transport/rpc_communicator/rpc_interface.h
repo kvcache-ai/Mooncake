@@ -80,6 +80,11 @@ class RpcInterface {
                               std::string_view dtype);
 
    private:
+    friend void bind_rpc_interface(py::module_& m);
+    static int traversePythonReferences(PyObject* self, visitproc visit,
+                                        void* arg);
+    static int clearPythonReferences(PyObject* self);
+
     std::unique_ptr<Impl> impl_;
 };
 

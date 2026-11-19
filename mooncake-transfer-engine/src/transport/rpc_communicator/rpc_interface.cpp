@@ -53,6 +53,27 @@ class __attribute__((visibility("hidden"))) RpcInterface::Impl {
     py::callable tensor_receive_callback;
 };
 
+int RpcInterface::traversePythonReferences(PyObject* self, visitproc visit,
+                                           void* arg) {
+    Py_VISIT(Py_TYPE(self));
+    if (py::inst_ready(self)) {
+        const auto& impl = *py::inst_ptr<RpcInterface>(self)->impl_;
+        Py_VISIT(impl.data_receive_callback.ptr());
+        Py_VISIT(impl.tensor_receive_callback.ptr());
+    }
+    return 0;
+}
+
+int RpcInterface::clearPythonReferences(PyObject* self) {
+    if (py::inst_ready(self)) {
+        auto& impl = *py::inst_ptr<RpcInterface>(self)->impl_;
+        // Clear both fields before releasing either Python reference.
+        auto data_callback = std::move(impl.data_receive_callback);
+        auto tensor_callback = std::move(impl.tensor_receive_callback);
+    }
+    return 0;
+}
+
 // Constructor
 RpcInterface::RpcInterface() : impl_(std::make_unique<Impl>()) {}
 
@@ -408,16 +429,17 @@ void RpcInterface::handleIncomingData(std::string_view source,
     }
 
     // Handle as regular data if not tensor data
-    if (!impl_->data_receive_callback) return;
-
     try {
         py::gil_scoped_acquire acquire;
+        auto callback = impl_->data_receive_callback;
+        if (!callback) return;
+
         py::dict received;
         received["source"] =
             std::string(source);  // Convert to string for Python
         received["data"] = py::bytes(data.data(), data.size());
 
-        impl_->data_receive_callback(received);
+        callback(received);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Error in data receive callback: " << e.what();
     }
@@ -431,23 +453,22 @@ void RpcInterface::handleIncomingTensor(std::string_view source,
               << " - source: " << source << ", data size: " << data.size()
               << ", dtype: " << dtype << ", shape size: " << shape.size();
 
-    if (!impl_->tensor_receive_callback) {
-        LOG(WARNING) << "No tensor receive callback set!";
-        return;
-    }
-
-    LOG(INFO) << "Calling Python tensor receive callback...";
-
     try {
         py::gil_scoped_acquire acquire;
+        auto callback = impl_->tensor_receive_callback;
+        if (!callback) {
+            LOG(WARNING) << "No tensor receive callback set!";
+            return;
+        }
 
+        LOG(INFO) << "Calling Python tensor receive callback...";
         ReceivedTensor received;
         received.source_address = std::string(source);
         received.data = std::string(data);
         received.shape = shape;
         received.dtype = std::string(dtype);
 
-        impl_->tensor_receive_callback(received);
+        callback(received);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Error in tensor receive callback: " << e.what();
     }
@@ -491,8 +512,14 @@ void bind_rpc_interface(py::module_& m) {
         .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
         .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
 
-    // Bind RpcInterface
-    py::class_<RpcInterface>(m, "RpcInterface")
+    static PyType_Slot rpc_slots[] = {
+        {Py_tp_traverse,
+         reinterpret_cast<void*>(&RpcInterface::traversePythonReferences)},
+        {Py_tp_clear,
+         reinterpret_cast<void*>(&RpcInterface::clearPythonReferences)},
+        {0, nullptr},
+    };
+    py::class_<RpcInterface>(m, "RpcInterface", py::type_slots(rpc_slots))
         .def(py::init<>())
         .def("initialize", &RpcInterface::initialize,
              py::arg("listen_address") = "", py::arg("thread_count") = 0,
