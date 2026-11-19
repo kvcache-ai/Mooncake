@@ -419,6 +419,14 @@ add_ha_test(batch_oplog_snapshot_writer_test
             ha/snapshot/batch_oplog/writer_test.cpp)
 add_ha_test(batch_oplog_snapshot_provider_test
             ha/snapshot/batch_oplog/provider_test.cpp)
+find_package(AWSSDK QUIET COMPONENTS s3)
+if(AWSSDK_FOUND)
+  add_ha_test(s3_snapshot_object_store_test
+              ha/snapshot/object/backends/s3/s3_snapshot_object_store_test.cpp)
+  target_compile_definitions(s3_snapshot_object_store_test PRIVATE HAVE_AWS_SDK)
+  target_link_libraries(s3_snapshot_object_store_test
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
 add_ha_test(batch_oplog_snapshot_publisher_test
             ha/snapshot/batch_oplog/publisher_test.cpp)
 add_ha_test(batch_oplog_pruning_coordinator_test
