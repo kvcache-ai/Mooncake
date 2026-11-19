@@ -2141,6 +2141,15 @@ impl MetadataBackend for RedisMetadataBackend {
         self.redis_list_object_routes_by_nof_backing(filter)
     }
 
+    fn scan_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+        cursor: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<mooncake_store_core::ColdBackingRoutePage> {
+        self.redis_scan_object_routes_by_cold_backing(filter, cursor, max_candidates)
+    }
+
     fn compare_and_swap_object_route(
         &self,
         key: &ObjectKey,
@@ -3571,6 +3580,180 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var(self.0);
         }
+    }
+
+    #[test]
+    fn redis_nof_busy_repair_releases_single_pool_slot() {
+        use mooncake_store_core::NofBackingRouteFilter;
+        use std::sync::mpsc;
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let client = redis::Client::open(server.url()).unwrap();
+        let mut backend =
+            RedisMetadataBackend::new(RedisMetadataConfig::new(server.url())).unwrap();
+        backend.connection_pool = Arc::new(RedisConnectionPool::with_size(client.clone(), 1));
+        let backend = Arc::new(backend);
+        let route = sample_route(1);
+        backend
+            .compare_and_swap_object_route(&route.key, None, Some(&route))
+            .unwrap();
+        let mut external = client.get_connection().unwrap();
+        let lock = format!("{}/repair", backend.nof_index_ready_key("targets"));
+        external
+            .set_ex::<_, _, ()>(&lock, "another-worker", 30)
+            .unwrap();
+        let before = redis_command_calls(&mut external, "evalsha");
+        let (nof_tx, nof_rx) = mpsc::channel();
+        let worker = backend.clone();
+        let nof = std::thread::spawn(move || {
+            nof_tx
+                .send(worker.list_object_routes_by_nof_backing(&NofBackingRouteFilter::default()))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while redis_command_calls(&mut external, "evalsha") == before && Instant::now() < deadline {
+            sleep(Duration::from_millis(1));
+        }
+        let acquisition_started = redis_command_calls(&mut external, "evalsha") > before;
+        let (point_tx, point_rx) = mpsc::channel();
+        let worker = backend.clone();
+        let key = route.key.clone();
+        let point = std::thread::spawn(move || {
+            point_tx.send(worker.get_object_route(&key)).unwrap();
+        });
+        let point_result = point_rx.recv_timeout(Duration::from_secs(1));
+        let nof_result = nof_rx.recv_timeout(Duration::from_secs(1));
+        let still_held: bool = external.exists(&lock).unwrap();
+        // Release even on the old implementation so failed assertions cannot strand a waiter.
+        external.del::<_, ()>(&lock).unwrap();
+        nof.join().unwrap();
+        point.join().unwrap();
+        assert!(acquisition_started && still_held);
+        assert_eq!(point_result.unwrap().unwrap(), Some(route));
+        assert!(matches!(
+            nof_result.unwrap(),
+            Err(StoreError::Backpressure(_))
+        ));
+        assert!(backend
+            .list_object_routes_by_nof_backing(&NofBackingRouteFilter::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    fn redis_command_calls(connection: &mut redis::Connection, command: &str) -> usize {
+        let stats: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query(connection)
+            .unwrap();
+        stats
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!("cmdstat_{command}:"))?
+                    .split(',')
+                    .find_map(|field| field.strip_prefix("calls=")?.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn redis_pending_delete_pages_bound_candidates_and_ignore_large_hot_index() {
+        use mooncake_store_core::{ColdBackingRoute, ColdBackingRouteFilter, ColdBackingState};
+        use std::collections::BTreeSet;
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url())).unwrap();
+        let mut connection = redis::Client::open(server.url())
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let pending = backend
+            .keyspace
+            .object_cold_backing_state_index(ColdBackingState::PendingDelete);
+        let mut pipe = redis::pipe();
+        for i in 0..4097 {
+            let key = backend
+                .keyspace
+                .object(&ObjectKey::new(format!("unrelated-hot-{i}")));
+            pipe.sadd(backend.keyspace.object_index(), &key).ignore();
+            // If any global fallback loads these unrelated payloads, decoding fails.
+            pipe.hset(&key, "payload", "unrelated-hot-payload").ignore();
+            pipe.sadd(
+                &pending,
+                backend
+                    .keyspace
+                    .object(&ObjectKey::new(format!("dangling-{i}"))),
+            )
+            .ignore();
+        }
+        pipe.query::<()>(&mut connection).unwrap();
+        let mut expected = BTreeSet::new();
+        for i in 0..64 {
+            let mut route = sample_route(1);
+            route.key = ObjectKey::new(format!("pending-{i}"));
+            route.cold_backing = Some(ColdBackingRoute {
+                owner: sample_runtime(),
+                cold_tier_id: "gc-device".into(),
+                object_locator: format!("payload-{i}"),
+                length: 12,
+                checksum: None,
+                state: ColdBackingState::PendingDelete,
+                replicas: Vec::new(),
+            });
+            expected.insert(route.key.clone());
+            backend
+                .compare_and_swap_object_route(&route.key, None, Some(&route))
+                .unwrap();
+        }
+        let mut cursor = None;
+        let mut found = BTreeSet::new();
+        let filter = ColdBackingRouteFilter {
+            state: Some(ColdBackingState::PendingDelete),
+            ..Default::default()
+        };
+        for page_number in 0..10000 {
+            let before = redis_command_calls(&mut connection, "hget");
+            let page = backend
+                .scan_object_routes_by_cold_backing(&filter, cursor.as_deref(), 3)
+                .unwrap();
+            assert!(redis_command_calls(&mut connection, "hget") - before <= 3);
+            assert!(page.routes.len() <= 3);
+            found.extend(page.routes.into_iter().map(|route| route.key));
+            cursor = page.next_cursor;
+            if page_number == 0 {
+                let device_filter = ColdBackingRouteFilter {
+                    device_id: Some("gc-device".into()),
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    backend.scan_object_routes_by_cold_backing(
+                        &device_filter,
+                        cursor.as_deref(),
+                        1
+                    ),
+                    Err(StoreError::InvalidState(_))
+                ));
+            }
+            if cursor.is_none() {
+                break;
+            }
+            assert!(
+                page_number < 9999,
+                "the pending-delete scan must make progress"
+            );
+        }
+        assert_eq!(found, expected);
+        let before = redis_command_calls(&mut connection, "hget");
+        assert!(
+            backend
+                .scan_object_routes_by_cold_backing(&filter, None, 1)
+                .unwrap()
+                .routes
+                .len()
+                <= 1
+        );
+        assert!(redis_command_calls(&mut connection, "hget") - before <= 1);
     }
 
     #[test]

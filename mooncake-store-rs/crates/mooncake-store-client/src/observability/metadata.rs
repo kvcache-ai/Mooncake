@@ -253,6 +253,18 @@ impl MetadataBackend for ObservedMetadataBackend {
         })
     }
 
+    fn scan_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+        cursor: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<mooncake_store_core::ColdBackingRoutePage> {
+        self.observe("scan_object_routes_by_cold_backing", || {
+            self.inner
+                .scan_object_routes_by_cold_backing(filter, cursor, max_candidates)
+        })
+    }
+
     fn list_object_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         self.observe("list_object_routes_in_scope", || {
             self.inner.list_object_routes_in_scope(scope)

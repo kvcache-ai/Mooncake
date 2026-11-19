@@ -1,6 +1,3 @@
-use std::thread::sleep;
-use std::time::Duration;
-
 use mooncake_store_core::{ColdBackingState, ObjectRoute, Result, StoreError};
 use redis::{Commands, Script};
 
@@ -60,19 +57,23 @@ impl RedisMetadataBackend {
         let lock = format!("{ready}/repair");
         let sequence = format!("{ready}/sequence");
         let mut connection = self.connection("redis prepare NoF indexes")?;
-        let token = loop {
-            let token: i64 = Script::new(ACQUIRE_REPAIR)
-                .key(&ready)
-                .key(&lock)
-                .key(&sequence)
-                .invoke(&mut connection)
-                .map_err(|error| metadata_error("redis acquire NoF index repair", error))?;
-            match token {
-                -1 => return Ok(()),
-                0 => sleep(Duration::from_millis(10)),
-                token => break token,
+        let token: i64 = Script::new(ACQUIRE_REPAIR)
+            .key(&ready)
+            .key(&lock)
+            .key(&sequence)
+            .invoke(&mut connection)
+            .map_err(|error| metadata_error("redis acquire NoF index repair", error))?;
+        match token {
+            -1 => return Ok(()),
+            // Drop the pooled connection on return. Waiting for another worker
+            // here would block unrelated metadata operations on a small pool.
+            0 => {
+                return Err(StoreError::Backpressure(
+                    "NoF index repair is in progress; retry later".into(),
+                ))
             }
-        };
+            _ => {}
+        }
         let result = (|| {
             let complete: bool = connection
                 .exists(&states_ready)
