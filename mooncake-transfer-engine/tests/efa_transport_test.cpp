@@ -448,6 +448,68 @@ TEST(EFALocalNicMapTest, InvertsPreferredHca) {
     EXPECT_TRUE(EfaTransport::buildLocalNicMap({}, devices).empty());
 }
 
+// Pure planning, no hardware needed. 16 NICs, two per GPU, as on p6-b300.
+TEST(EFANicPlanTest, DeviceBufferKeepsLocalNicsWhenSplit) {
+    using Kind = EfaTransport::NicPlanKind;
+    using Plan = std::vector<std::vector<size_t>>;
+    const size_t nics = 16;
+    const std::vector<size_t> local{8, 9};
+
+    auto single = EfaTransport::planChunkNics(1, nics, &local, true);
+    EXPECT_EQ(single.kind, Kind::kSingleLocal);
+    EXPECT_EQ(single.assignments, (Plan{{8, 9}}));
+
+    // A 100 GiB KV cache on 4 KB pages: two chunks over the PTE budget, one
+    // local NIC each instead of NICs 0-7 and 8-15.
+    auto split = EfaTransport::planChunkNics(2, nics, &local, false);
+    EXPECT_EQ(split.kind, Kind::kLocalPartition);
+    EXPECT_EQ(split.assignments, (Plan{{8}, {9}}));
+
+    auto covered = EfaTransport::planChunkNics(2, nics, &local, true);
+    EXPECT_EQ(covered.kind, Kind::kLocalCoverage);
+    EXPECT_EQ(covered.assignments, (Plan{{8, 9}, {8, 9}}));
+
+    const std::vector<size_t> four{4, 5, 6, 7};
+    auto pairs = EfaTransport::planChunkNics(2, 32, &four, false);
+    EXPECT_EQ(pairs.kind, Kind::kLocalPartition);
+    EXPECT_EQ(pairs.assignments, (Plan{{4, 5}, {6, 7}}));
+
+    // More chunks than local NICs falls back to the all-NIC partition.
+    auto overflow = EfaTransport::planChunkNics(3, nics, &local, false);
+    EXPECT_EQ(overflow.kind, Kind::kPartition);
+    EXPECT_EQ(overflow.assignments[0], (std::vector<size_t>{0, 1, 2, 3, 4, 5}));
+    EXPECT_EQ(overflow.assignments[2],
+              (std::vector<size_t>{11, 12, 13, 14, 15}));
+}
+
+// Host memory and MC_EFA_NIC_SELECTION=all pass no local set.
+TEST(EFANicPlanTest, NoLocalSetKeepsEveryNic) {
+    using Kind = EfaTransport::NicPlanKind;
+    using Plan = std::vector<std::vector<size_t>>;
+
+    auto single = EfaTransport::planChunkNics(1, 4, nullptr, true);
+    EXPECT_EQ(single.kind, Kind::kSingleAll);
+    EXPECT_EQ(single.assignments, (Plan{{0, 1, 2, 3}}));
+
+    auto covered = EfaTransport::planChunkNics(2, 4, nullptr, true);
+    EXPECT_EQ(covered.kind, Kind::kFullCoverage);
+    EXPECT_EQ(covered.assignments, (Plan{{0, 1, 2, 3}, {0, 1, 2, 3}}));
+
+    auto split = EfaTransport::planChunkNics(2, 16, nullptr, false);
+    EXPECT_EQ(split.kind, Kind::kPartition);
+    EXPECT_EQ(split.assignments[0],
+              (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+    EXPECT_EQ(split.assignments[1],
+              (std::vector<size_t>{8, 9, 10, 11, 12, 13, 14, 15}));
+
+    auto rr = EfaTransport::planChunkNics(5, 2, nullptr, false);
+    EXPECT_EQ(rr.kind, Kind::kRoundRobin);
+    EXPECT_EQ(rr.assignments, (Plan{{0}, {1}, {0}, {1}, {0}}));
+
+    EXPECT_TRUE(
+        EfaTransport::planChunkNics(0, 4, nullptr, true).assignments.empty());
+}
+
 // Test 9: Larger transfer (64 MB total split into 1 MB slices) to exercise
 // the WR / CQ pacing logic in EfaContext::submitSlicesOnPeer beyond what the
 // 16 x 64 KB MultiWrite test reaches.
