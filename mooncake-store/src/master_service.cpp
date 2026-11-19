@@ -10903,7 +10903,8 @@ void MasterService::StartExitEvacuations() {
                 }
                 it->second.segments.push_back({segment.id, client_id});
             }
-            if (!ready) {
+            // Another client may serve writes under the same name.
+            if (!ready || segment_access.HasOkSegment(name)) {
                 waiting.insert(waiting.end(), it->second.requests.begin(),
                                it->second.requests.end());
                 it = evacuations.erase(it);
@@ -10942,19 +10943,9 @@ bool MasterService::ExitEvacuationSuperseded(const DrainJob& job) {
     if (job.evacuated_segments.empty()) {
         return false;
     }
-    const auto& name = job.request.segments.front();
-    std::vector<Segment> client_segments;
+    // Any client, the leaving one included, may mount the name again.
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    (void)segment_access.GetClientSegments(
-        job.evacuated_segments.front().client_id, client_segments);
-    return std::any_of(client_segments.begin(), client_segments.end(),
-                       [&](const Segment& segment) {
-                           SegmentStatus status = SegmentStatus::UNDEFINED;
-                           return segment.name == name &&
-                                  segment_access.GetSegmentStatusById(
-                                      segment.id, status) == ErrorCode::OK &&
-                                  status == SegmentStatus::OK;
-                       });
+    return segment_access.HasOkSegment(job.request.segments.front());
 }
 
 void MasterService::UnmountEvacuatedSegments(

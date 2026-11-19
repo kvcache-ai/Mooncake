@@ -4596,8 +4596,10 @@ TEST_F(MasterServiceTest, EvacuationStopsWhenTheNameIsMountedAgain) {
         return page.has_value() && page->jobs.size() == 1;
     });
 
+    // A restarted process mounts the name with a new client id.
+    const UUID restarted_client = generate_uuid();
     const Segment remounted = MakeSegment("leaving", 0x500000000);
-    ASSERT_TRUE(service->MountSegment(remounted, client_id));
+    ASSERT_TRUE(service->MountSegment(remounted, restarted_client));
     WaitUntil([&] {
         auto page = service->ListDrainJobs(filter);
         return page.has_value() && page->jobs.size() == 1 &&
@@ -4610,6 +4612,38 @@ TEST_F(MasterServiceTest, EvacuationStopsWhenTheNameIsMountedAgain) {
     auto status = service->QuerySegmentStatusById(remounted.id);
     ASSERT_TRUE(status.has_value());
     EXPECT_EQ(status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, EvacuationWaitsWhileAnotherClientServesTheName) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(0)
+                      .set_evacuate_on_graceful_unmount(true)
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const UUID leaving_client = generate_uuid();
+    const Segment leaving = MakeSegment("shared", 0x300000000);
+    ASSERT_TRUE(service->MountSegment(leaving, leaving_client));
+    PutObjectOnSegment(*service, leaving_client, "shared");
+    const UUID serving_client = generate_uuid();
+    const Segment serving = MakeSegment("shared", 0x500000000);
+    ASSERT_TRUE(service->MountSegment(serving, serving_client));
+    PrepareSimpleSegment(*service, "target", 0x400000000, kDefaultSegmentSize);
+
+    ASSERT_TRUE(
+        service->GracefulUnmountSegment(leaving.id, leaving_client, 60000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    DrainJobListRequest filter;
+    filter.segment = "shared";
+    auto before = service->ListDrainJobs(filter);
+    ASSERT_TRUE(before.has_value());
+    EXPECT_TRUE(before->jobs.empty());
+
+    ASSERT_TRUE(
+        service->GracefulUnmountSegment(serving.id, serving_client, 60000));
+    WaitUntil([&] {
+        auto page = service->ListDrainJobs(filter);
+        return page.has_value() && page->jobs.size() == 1;
+    });
 }
 
 TEST_F(MasterServiceTest, CanceledDrainKeepsGracefullyUnmountingSegmentClosed) {

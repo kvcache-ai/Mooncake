@@ -740,6 +740,14 @@ bool ScopedSegmentAccess::HasAllocatedMemory(const UUID& segment_id) const {
            mounted->second.buf_allocator->size() != 0;
 }
 
+bool ScopedSegmentAccess::HasOkSegment(const std::string& segment_name) const {
+    const auto& mounted = segment_manager_->mounted_segments_;
+    return std::any_of(mounted.begin(), mounted.end(), [&](const auto& entry) {
+        return entry.second.segment.name == segment_name &&
+               entry.second.status == SegmentStatus::OK;
+    });
+}
+
 ErrorCode ScopedSegmentAccess::GetUnreadySegments(
     std::vector<std::pair<Segment, UUID>>& unready_segments) const {
     unready_segments.clear();
