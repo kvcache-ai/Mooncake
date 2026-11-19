@@ -205,6 +205,64 @@ def test_buffer_pool_releases_from_destructor() -> None:
     pool.close()
 
 
+def test_overflow_release_failure_is_retryable_and_concurrent_safe() -> None:
+    store = create_store()
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class StoreProxy:
+        fail_unregister = True
+
+        def _get_pyclient_capsule(self):
+            return store._get_pyclient_capsule()
+
+        def register_buffer(self, ptr: int, size: int) -> int:
+            return store.register_buffer(ptr, size)
+
+        def unregister_buffer(self, ptr: int) -> int:
+            if self.fail_unregister:
+                entered.set()
+                assert finish.wait(5)
+                return -1
+            return store.unregister_buffer(ptr)
+
+    proxy = StoreProxy()
+    pool = BufferPool(proxy, max_regions=2, block_on_exhaustion=False)
+    local = pool.acquire(4 * 1024 * 1024)
+    overflow = pool.acquire(4096)
+    errors = []
+
+    def release_overflow() -> None:
+        try:
+            overflow.release()
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    thread = threading.Thread(target=release_overflow)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(RuntimeError, match="already in progress"):
+            overflow.release()
+        with pytest.raises(RuntimeError, match="release is in progress"):
+            _ = overflow.ptr
+        with pytest.raises(RuntimeError, match="closed or releasing"):
+            _ = overflow.buffer
+    finally:
+        finish.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert errors == ["overflow buffer unregistration failed"]
+    with pytest.raises(RuntimeError, match="exhausted"):
+        pool.acquire(1)
+
+    proxy.fail_unregister = False
+    overflow.release()
+    local.release()
+    pool.close()
+
+
 def test_buffer_pool_rejects_close_with_active_lease() -> None:
     store = create_store()
     pool = BufferPool(store, 1024 * 1024, min_size_class=4096, alignment=4096)
