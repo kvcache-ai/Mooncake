@@ -279,6 +279,9 @@ class TransferMetadata {
     int syncSegmentCache(const std::string &segment_name);
 
     int removeSegmentDesc(const std::string &segment_name);
+    // Drop only the local remote-descriptor cache; preserve authoritative data
+    // and reject LOCAL_SEGMENT_ID. Caller must quiesce users of cached handles.
+    int invalidateRemoteSegmentCache(const std::string &segment_name);
 
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);

@@ -207,6 +207,23 @@ weights, switch a production scheduler, provide a distributed completion fence,
 or automatically fall back after unknown completion. The reader's existing
 quarantine and allocation-lifetime contracts remain in force.
 
+`MooncakeTransferEngineReader(engine, transfer_executor=executor)` accepts an
+explicit executor with the same engine, no pending transfers, and matching
+completion-drain settings. Omitting it creates the original executor. A
+collective executor requires its caller to coordinate participant order and
+completion; local completion is not a world fence.
+
+The native `reset_reshard_peers_quiescent(peers)` method explicitly clears cached
+peer mappings and metadata. The caller must first drain transfers on all
+participants, prevent concurrent registration, submission and unregistration,
+and fence completion. The method is not a drain or cancellation API. A failure
+may leave only some peers reset and requires restarting the participating
+engines. Existing GPU and DRAM transfer paths never invoke it automatically.
+
+Model parameter semantics, framework tensor layouts, packing policy, and
+serving lifecycle belong in the framework integration. They are not part of
+this model-independent entry point.
+
 ## Transfer Engine Execution
 
 `mooncake.reshard.transfer_engine` executes resource-neutral physical batches
