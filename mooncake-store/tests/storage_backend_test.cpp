@@ -2984,6 +2984,50 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadWithMixedBuckets) {
     EXPECT_EQ(std::string(readB2.get(), valueB2.size()), valueB2);
 }
 
+TEST_F(StorageBackendTest, ReadSubBatchesAcrossBuckets) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.read_io_workers = 3;
+    bucket_config.read_sub_batch_max_iovecs = 4;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    constexpr size_t kPagesPerBucket = 7;
+    std::vector<std::string> values(2 * kPagesPerBucket);
+    std::vector<std::string> full_values(values.size());
+    std::vector<std::string> ranges(values.size(), std::string(9, '\0'));
+    std::unordered_map<std::string, Slice> full;
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    for (size_t bucket = 0; bucket < 2; ++bucket) {
+        BucketStorageBackend::OffloadObjects objects;
+        for (size_t i = 0; i < kPagesPerBucket; ++i) {
+            const size_t index = bucket * kPagesPerBucket + i;
+            auto key = "read_" + std::to_string(index);
+            values[index] = "offset_" + std::to_string(index) + "_payload";
+            full_values[index].resize(values[index].size());
+            objects.emplace(key, std::vector<Slice>{{values[index].data(),
+                                                     values[index].size()}});
+            full.emplace(key, Slice{full_values[index].data(),
+                                    full_values[index].size()});
+            spans.emplace(
+                key, StorageValueSpan{
+                         4, values[index].size(), {ranges[index].data(), 9}});
+        }
+        ASSERT_TRUE(backend.BatchOffload(
+            objects, [](const auto&, auto&) { return ErrorCode::OK; }));
+    }
+
+    auto full_read =
+        std::async(std::launch::async, [&] { return backend.BatchLoad(full); });
+    ASSERT_TRUE(backend.BatchLoadSpans(spans));
+    ASSERT_TRUE(full_read.get());
+    EXPECT_EQ(full_values, values);
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(ranges[i], values[i].substr(4, 9));
+    }
+}
+
 TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
     FileStorageConfig config;
     config.storage_filepath = data_path;

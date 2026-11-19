@@ -1427,6 +1427,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+    std::unique_ptr<BatchIoScheduler> read_io_scheduler_;
     std::unique_ptr<BatchIoScheduler> write_io_scheduler_;
     std::atomic<size_t> active_reads_{0};
     std::atomic<bool> write_stopping_{false};

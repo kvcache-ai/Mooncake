@@ -1642,6 +1642,7 @@ BucketStorageBackend::~BucketStorageBackend() {
     write_stopping_.store(true, std::memory_order_release);
     StopDiskUsageScanner();
     if (write_io_scheduler_) write_io_scheduler_->Shutdown();
+    if (read_io_scheduler_) read_io_scheduler_->Shutdown();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -2257,6 +2258,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
         int64_t value_offset;
         Slice dest_slice;
         int disk_index;
+        StorageValueSpan* destination;
     };
 
     // Group by bucket for efficient file access
@@ -2266,7 +2268,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
 
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        for (const auto& [key, span] : spans) {
+        for (auto& [key, span] : spans) {
             const Slice& dest_slice = span.slice;
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
@@ -2333,7 +2335,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             bucket_read_plans[metadata.bucket_id].push_back(
                 ReadPlan{key, metadata.bucket_id, metadata.offset,
                          metadata.key_size, metadata.data_size, value_offset,
-                         dest_slice, bucket_it->second->disk_index});
+                         dest_slice, bucket_it->second->disk_index, &span});
         }
     }
     // Lock released here - bucket files protected by BucketReadGuards
@@ -2341,7 +2343,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
-    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+    const auto read_bucket = [this](int64_t bucket_id,
+                                    std::span<const ReadPlan> read_plans)
+        -> tl::expected<void, ErrorCode> {
         // Open file for this bucket (cheap syscall, no lock needed).
         // Every plan in a bucket came from that bucket's metadata, so they all
         // carry the same disk. The vector is never empty: entries are only
@@ -2433,11 +2437,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                         << "), got: " << desc.bytes_read;
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
-                spans.at(plan.key).slice.ptr =
+                plan.destination->slice.ptr =
                     static_cast<char*>(plan.dest_slice.ptr) +
                     batch_plan.offset_in_buffer;
             }
-            continue;
+            return {};
         }
 #endif
 
@@ -2461,9 +2465,37 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
-    }
+        return {};
+    };
 
-    // bucket_guards go out of scope here, decrementing inflight_reads_
+    if (read_io_scheduler_) {
+        BatchIoScheduler::PendingBatch pending;
+        const size_t max_iovecs =
+            bucket_backend_config_.read_sub_batch_max_iovecs;
+        for (const auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto plans = std::span<const ReadPlan>(read_plans);
+            while (!plans.empty()) {
+                // Prepare each chunk separately to keep the read cap strict.
+                const auto chunk =
+                    plans.first(std::min(plans.size(), max_iovecs));
+                auto prepared = read_io_scheduler_->PrepareSubBatches(
+                    pending, chunk.size(), max_iovecs,
+                    [&read_bucket, bucket_id, chunk](size_t begin, size_t end) {
+                        return read_bucket(bucket_id,
+                                           chunk.subspan(begin, end - begin));
+                    });
+                if (!prepared) return prepared;
+                plans = plans.subspan(chunk.size());
+            }
+        }
+        // Publish the entire request together. Keep the bucket guards and
+        // destination spans alive until every running task has finished.
+        return read_io_scheduler_->SubmitAndWait(pending);
+    }
+    for (const auto& [bucket_id, read_plans] : bucket_read_plans) {
+        auto result = read_bucket(bucket_id, read_plans);
+        if (!result) return result;
+    }
     return {};
 }
 
@@ -2898,6 +2930,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         } else {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
+        }
+        if (bucket_backend_config_.read_io_workers > 0) {
+            auto reader = BatchIoScheduler::Create(
+                bucket_backend_config_.read_io_workers, {},
+                std::chrono::milliseconds{300}, "mc-ssd-r");
+            if (!reader) return tl::make_unexpected(reader.error());
+            read_io_scheduler_ = std::move(reader.value());
         }
         if (bucket_backend_config_.write_io_workers > 0) {
             auto writer = BatchIoScheduler::Create(
