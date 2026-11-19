@@ -1292,6 +1292,72 @@ TEST_F(WeightGroupLifecycleTest,
 }
 
 TEST_F(WeightGroupLifecycleTest,
+       NonActionableColdMembersLeaveMigrationBudgetForOffload) {
+    for (const bool leased : {false, true}) {
+        for (const int budget : {0, 1, 2}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "leased=" << leased << ", budget=" << budget);
+            MasterServiceConfig config;
+            config.default_kv_lease_ttl = 0;
+            config.enable_offload = true;
+            config.offload_on_evict = true;
+            config.weight_migration_max_members_per_round = budget == 0 ? 1 : 2;
+            config.weight_migration_max_bytes_per_round =
+                budget == 1 ? 1024 : 2048;
+            MasterService service(config);
+            const auto context = PrepareSimpleSegment(service);
+            ASSERT_TRUE(service.MountLocalDiskSegment(context.client_id, true));
+            const auto ready = PublishReadyWithPayloads(
+                service, context.client_id,
+                {{"payload-a", 1024, "a"},
+                 {"payload-b", 1024, leased ? "b" : "a"}});
+            AddLocalDiskReplica(service, context.client_id, "payload-a", 1024,
+                                "test_segment");
+            if (leased) {
+                ASSERT_TRUE(service.AcquireWeightRevisionLease({
+                    .identity = ready.identity,
+                    .expected_metadata_generation = ready.metadata_generation,
+                    .holder = "reader",
+                    .ttl_ms = 60'000,
+                }));
+            }
+            ASSERT_TRUE(service.StartWeightResidencyOperation({
+                .identity = ready.identity,
+                .expected_metadata_generation = ready.metadata_generation,
+                .target_residency = WeightResidencyState::COLD,
+            }));
+            const auto before = GetWeightGroupResidencyForTest(
+                service, ready.identity, ready.manifest.payload_group_id);
+            for (const auto& member : before) {
+                ASSERT_TRUE(member.has_memory) << member.key;
+                if (member.data_type == ObjectDataType::WEIGHT) {
+                    ASSERT_EQ(member.key == "payload-a", member.has_cold);
+                }
+            }
+            if (budget == 2) {
+                MasterServiceTestPeer(service)
+                    .RunWeightReconciliationForTesting(ready.updated_at_ms, 1);
+            } else {
+                ASSERT_TRUE(service.ReconcileWeightRevision(
+                    {.identity = ready.identity}));
+            }
+            const auto queue =
+                service.OffloadObjectHeartbeat(context.client_id, true);
+            ASSERT_TRUE(queue);
+            EXPECT_EQ(1u, queue->size());
+            if (queue->size() == 1) {
+                EXPECT_EQ("payload-b", queue->front().key);
+            }
+            const auto after = GetWeightGroupResidencyForTest(
+                service, ready.identity, ready.manifest.payload_group_id);
+            for (const auto& member : after) {
+                EXPECT_TRUE(member.has_memory) << member.key;
+            }
+        }
+    }
+}
+
+TEST_F(WeightGroupLifecycleTest,
        MemberAndByteBudgetsConvergeWithOversizedAffinitiesAndMembers) {
     for (const uint64_t first_member_bytes : {600u, 1600u}) {
         SCOPED_TRACE(first_member_bytes);
