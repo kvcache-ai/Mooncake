@@ -2239,6 +2239,12 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(_store, m) {
+#ifdef USE_NOF
+    m.attr("NOF_ENABLED") = py::bool_(true);
+#else
+    m.attr("NOF_ENABLED") = py::bool_(false);
+#endif
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -2375,6 +2381,9 @@ PYBIND11_MODULE(_store, m) {
         .def("is_local_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_local_disk_replica))
+        .def("is_nof_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_nof_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()

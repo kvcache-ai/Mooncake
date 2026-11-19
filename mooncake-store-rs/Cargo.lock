@@ -1328,6 +1328,8 @@ dependencies = [
  "mooncake-store-rs-runtime",
  "mooncake-store-rs-tensor",
  "pyo3",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

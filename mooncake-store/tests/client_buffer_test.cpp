@@ -61,6 +61,30 @@ class ClientBufferTest : public ::testing::Test {
     }
 };
 
+TEST_F(ClientBufferTest, DmaStagingPoolHasBlockAlignedBaseAndSlices) {
+    constexpr size_t block_size = 4096;
+    struct RecordingDmaAllocator : SystemDmaAllocator {
+        size_t requested_alignment = 0;
+        void* Alloc(size_t size, size_t align, int socket_id) override {
+            requested_alignment = align;
+            return SystemDmaAllocator::Alloc(size, align, socket_id);
+        }
+    };
+    auto dma = std::make_shared<RecordingDmaAllocator>();
+    auto allocator =
+        ClientBufferAllocator::create(4 * block_size, "tcp", false, dma);
+    EXPECT_GE(dma->requested_alignment, block_size);
+    VerifyAlignment(allocator->getBase(), block_size);
+    std::vector<BufferHandle> handles;
+    for (int i = 0; i < 4; ++i) {
+        auto handle = allocator->allocate(block_size);
+        ASSERT_TRUE(handle.has_value());
+        VerifyAlignment(handle->ptr(), block_size);
+        VerifyBufferHandle(*handle, block_size);
+        handles.push_back(std::move(*handle));
+    }
+}
+
 // Test allocator zero size
 TEST_F(ClientBufferTest, ZeroSizeAllocator) {
     auto allocator = ClientBufferAllocator::create(0);

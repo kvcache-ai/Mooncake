@@ -8,6 +8,7 @@ from types import ModuleType
 
 _CPP_EXPORTS = frozenset(
     {
+        "NOF_ENABLED",
         "RangedReadSnapshot",
         "ObjectDataType",
         "SoftPinAction",
@@ -74,6 +75,7 @@ _CPP_INTERNAL_EXPORTS = frozenset(
 
 _RS_EXPORTS = frozenset(
     {
+        "NOF_ENABLED",
         "MooncakeDistributedStore",
         "MooncakeHostMemAllocator",
         "BufferPool",

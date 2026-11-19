@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 import importlib
 import json
@@ -27,7 +28,54 @@ def load_store_module(backend: str):
     )
 
 
+@contextmanager
+def rs_nof_environment(args: argparse.Namespace):
+    overrides = {
+        "MC_STORE_RS_NOF_TARGETS": None,
+        "MC_STORE_RS_NOF_REPLICA_COUNT": None,
+    }
+    if args.nof_replica_num and args.rs_nof_targets:
+        with open(args.rs_nof_targets, encoding="utf-8") as targets:
+            specs = json.load(targets)
+        if not isinstance(specs, list) or len(specs) < args.nof_replica_num:
+            raise ValueError(
+                "--rs-nof-targets must contain at least --nof-replica-num targets"
+            )
+        overrides["MC_STORE_RS_NOF_TARGETS"] = json.dumps(specs)
+        overrides["MC_STORE_RS_NOF_REPLICA_COUNT"] = str(args.nof_replica_num)
+        args._rs_nof_target_specs = specs
+    with temporary_environment(overrides):
+        yield
+
+
+@contextmanager
+def temporary_environment(overrides: dict):
+    previous = {name: os.environ.get(name) for name in overrides}
+    try:
+        for name, value in overrides.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 LOG = logging.getLogger("store_kv_bench")
+
+
+def nof_copy_only(args: argparse.Namespace) -> bool:
+    return (
+        args.nof_replica_num > 0
+        and args.memory_replica_num == 0
+        and args.dfs_replica_num == 0
+        and args.io_api == "plain"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
             "mixed_metadata",
             "remove_perf",
             "replay",
+            "capabilities",
         ],
         help="Benchmark scenario to execute.",
     )
@@ -129,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--memory-replica-num", type=int, default=1)
     parser.add_argument("--nof-replica-num", type=int, default=0)
+    parser.add_argument(
+        "--rs-nof-targets",
+        default="",
+        help="JSON file describing exclusive Store-RS SPDK NoF targets.",
+    )
     parser.add_argument("--dfs-replica-num", type=int, default=0)
 
     parser.add_argument("--verify", action="store_true")
@@ -156,6 +210,95 @@ def setup_logging(level: str) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def capability_status(state: str, reason: str) -> dict:
+    return {
+        "capability": state,
+        "result": {
+            "not_configured": "SKIP_NOT_CONFIGURED",
+            "not_implemented": "SKIP_NOT_IMPLEMENTED",
+        }.get(state),
+        "reason": reason,
+    }
+
+
+def probe_nof_capabilities(args: argparse.Namespace) -> dict:
+    """Report NoF support without setting up a client or contacting a target."""
+    if args.store_backend == "rs":
+        state = "not_configured"
+        reason = "Set --rs-nof-targets and --nof-replica-num to configure NoF copy I/O."
+        if args.nof_replica_num > 0 and args.rs_nof_targets:
+            module = load_store_module("rs")
+            if getattr(module, "NOF_ENABLED", False):
+                state = "supported"
+                reason = "The Store-RS Python build enables SPDK NoF targets."
+            else:
+                reason = (
+                    "Rebuild the Store-RS Python extension with the nof-spdk feature."
+                )
+        return {
+            "nof_replica_count": capability_status(state, reason),
+            "nof_promotion": capability_status(
+                "not_implemented", "Store-RS does not implement NoF promotion."
+            ),
+            "nof_zero_copy_read": capability_status(
+                "not_implemented", "Store-RS does not implement NoF zero-copy reads."
+            ),
+            "nof_zero_copy_write": capability_status(
+                "not_implemented", "No dedicated NoF zero-copy write workload exists."
+            ),
+        }
+
+    state = "not_configured"
+    reason = "Set --nof-replica-num > 0 and install a USE_NOF=ON C++ Store build."
+    if args.nof_replica_num > 0:
+        module = load_store_module(args.store_backend)
+        nof_enabled = getattr(module, "NOF_ENABLED", None)
+        if nof_enabled is True:
+            state = "supported"
+            reason = "The C++ Store build enables NoF and NoF replicas are requested."
+        elif nof_enabled is False:
+            reason = "The C++ Store was built with USE_NOF=OFF."
+        else:
+            reason = "This C++ Store binding does not report NOF_ENABLED; rebuild it."
+
+    promotion = capability_status(state, reason)
+    if state == "supported" and args.memory_replica_num == 0:
+        promotion = capability_status(
+            "not_configured", "NoF promotion requires --memory-replica-num > 0."
+        )
+    zero_copy_read = capability_status(state, reason)
+    if state == "supported" and args.io_api != "zcopy":
+        zero_copy_read = capability_status(
+            "not_configured", "NoF zero-copy reads require --io-api=zcopy."
+        )
+    return {
+        "nof_replica_count": capability_status(state, reason),
+        "nof_promotion": promotion,
+        "nof_zero_copy_read": zero_copy_read,
+        "nof_zero_copy_write": capability_status(
+            "not_implemented", "No dedicated NoF zero-copy write workload exists."
+        ),
+    }
+
+
+def report_capabilities(args: argparse.Namespace) -> None:
+    if min(args.memory_replica_num, args.nof_replica_num, args.dfs_replica_num) < 0:
+        raise ValueError("replica counts must be >= 0")
+    report = {
+        "schema_version": 1,
+        "scenario": "capabilities",
+        "backend": summarize_backend(args),
+        "capabilities": probe_nof_capabilities(args),
+    }
+    # A supported capability has no result until an I/O workload actually runs.
+    print(json.dumps(report, indent=2))
+    path = args.summary_json
+    if not path and args.output_dir:
+        path = os.path.join(args.output_dir, "summary.json")
+    if path:
+        write_json_atomic(path, report)
 
 
 @dataclass
@@ -592,8 +735,22 @@ class StoreSession:
         values = [self.payload_factory.build(object_id) for object_id in object_ids]
         if self.args.io_api == "plain":
             if len(object_ids) == 1 and self.args.batch_size == 1:
-                return [self.store.put(keys[0], values[0], config=self.config)]
-            return [self.store.put_batch(keys, values, config=self.config)]
+                results = [self.store.put(keys[0], values[0], config=self.config)]
+            else:
+                results = [self.store.put_batch(keys, values, config=self.config)]
+            if nof_copy_only(self.args) and all(result == 0 for result in results):
+                # Include the DRAM -> NoF handoff and its checks in the timed
+                # request. A successful hot put alone is not a NoF write.
+                if self.args.store_backend == "rs":
+                    result = self.store.debug_evict_all()
+                    if (
+                        not result["completed"]
+                        or result["remaining_hot_replicas"]
+                        or result["dropped_without_cold"]
+                    ):
+                        raise RuntimeError(f"NoF handoff failed: {result}")
+                self._verify_nof_routes(keys)
+            return results
 
         assert self._zcopy is not None
         ptrs = self._zcopy.fill_write_buffers(values)
@@ -602,7 +759,38 @@ class StoreSession:
             return [self.store.put_from(keys[0], ptrs[0], sizes[0], config=self.config)]
         return list(self.store.batch_put_from(keys, ptrs, sizes, config=self.config))
 
+    def _verify_nof_routes(
+        self, keys: List[str], *, allow_missing: bool = False
+    ) -> None:
+        for key in keys:
+            if self.args.store_backend == "cpp":
+                replicas = self.store.get_replica_desc(key)
+                if not replicas and allow_missing:
+                    continue
+                if len(replicas) != self.args.nof_replica_num or not all(
+                    replica.is_nof_replica() and replica.status.name == "COMPLETE"
+                    for replica in replicas
+                ):
+                    raise RuntimeError(f"expected NoF-only replicas for {key}")
+                continue
+            route = self.store.query_route(key)
+            if route is None and allow_missing:
+                continue
+            backing = (route or {}).get("nof_backing")
+            if (
+                not backing
+                or route.get("state") != "Active"
+                or backing["state"] != "Materialized"
+                or backing["replica_count"] != self.args.nof_replica_num
+                or route["replicas"]
+            ):
+                raise RuntimeError(
+                    f"expected a materialized NoF-only route for {key}: {route}"
+                )
+
     def _get_payloads_plain(self, keys: List[str]) -> List[bytes]:
+        if nof_copy_only(self.args):
+            self._verify_nof_routes(keys, allow_missing=True)
         if len(keys) == 1 and self.args.batch_size == 1:
             return [self.store.get(keys[0])]
         return list(self.store.get_batch(keys))
@@ -755,7 +943,12 @@ class StoreRuntime:
     def _replica_config(self, args: argparse.Namespace):
         config = self.module.ReplicateConfig()
         config.replica_num = args.memory_replica_num
-        # Store-RS exposes only replica_num; NoF and DFS are C++ only.
+        if self.is_rs and args.nof_replica_num:
+            # Store-RS stages each write through one hot replica and drains it
+            # before acknowledging the benchmark request.
+            config.replica_num = 1
+        # C++ carries NoF in its per-put config; Store-RS configures NoF targets
+        # and replication when constructing the runtime.
         if hasattr(config, "nof_replica_num"):
             config.nof_replica_num = args.nof_replica_num
         if hasattr(config, "dfs_replica_num"):
@@ -773,35 +966,42 @@ class StoreRuntime:
                 args.rs_route_control,
                 args.memory_replica_num,
             )
-            return self.store.setup(
-                args.local_hostname,
-                args.rs_transport_metadata_url,
-                args.global_segment_size,
-                args.local_buffer_size,
-                args.protocol,
-                args.device_name,
-                args.rs_metadata_url,
-                tenant=args.tenant_id,
-                replica_count=args.memory_replica_num,
-                keyspace=args.rs_keyspace or None,
-                route_control=args.rs_route_control,
-            )
+            with rs_nof_environment(args):
+                return self.store.setup(
+                    args.local_hostname,
+                    args.rs_transport_metadata_url,
+                    args.global_segment_size,
+                    args.local_buffer_size,
+                    args.protocol,
+                    args.device_name,
+                    args.rs_metadata_url,
+                    tenant=args.tenant_id,
+                    replica_count=1
+                    if args.nof_replica_num
+                    else args.memory_replica_num,
+                    keyspace=args.rs_keyspace or None,
+                    route_control=args.rs_route_control,
+                )
         LOG.info(
             "cpp store setup: metadata_server=%s master=%s protocol=%s",
             args.metadata_server,
             args.master_server,
             args.protocol,
         )
-        return self.store.setup(
-            args.local_hostname,
-            args.metadata_server,
-            args.global_segment_size,
-            args.local_buffer_size,
-            args.protocol,
-            args.device_name,
-            args.master_server,
-            enable_ssd_offload=args.enable_ssd_offload,
+        overrides = (
+            {"MC_STORE_LOCAL_HOT_CACHE_SIZE": None} if nof_copy_only(args) else {}
         )
+        with temporary_environment(overrides):
+            return self.store.setup(
+                args.local_hostname,
+                args.metadata_server,
+                args.global_segment_size,
+                args.local_buffer_size,
+                args.protocol,
+                args.device_name,
+                args.master_server,
+                enable_ssd_offload=args.enable_ssd_offload,
+            )
 
     def make_session(
         self,
@@ -846,8 +1046,12 @@ def summarize_backend(args: argparse.Namespace) -> dict:
         "protocol": args.protocol,
         "tenant": args.tenant_id,
         "replica_num": args.memory_replica_num,
+        "nof_replica_num": args.nof_replica_num,
+        "dfs_replica_num": args.dfs_replica_num,
+        "io_api": args.io_api,
         "global_segment_size": args.global_segment_size,
         "local_buffer_size": args.local_buffer_size,
+        "nof_copy_only": nof_copy_only(args),
     }
     if args.store_backend == "rs":
         return {
@@ -856,6 +1060,11 @@ def summarize_backend(args: argparse.Namespace) -> dict:
             "transport_metadata": args.rs_transport_metadata_url,
             "routing": args.rs_route_control,
             "keyspace": args.rs_keyspace or None,
+            "nof_targets_file": args.rs_nof_targets or None,
+            "nof_targets": getattr(args, "_rs_nof_target_specs", None),
+            "nof_write_completion": "materialized_no_hot_replicas"
+            if args.nof_replica_num
+            else None,
             **common,
         }
     return {
@@ -980,16 +1189,28 @@ class BenchmarkRunner:
         self.lane_count = args.numjobs * args.iodepth
         self._sessions: Optional[List[StoreSession]] = None
         self._runtime: Optional[StoreRuntime] = None
+        self.capability: Optional[dict] = None
         self._journal_records: List[List[dict]] = [[] for _ in range(self.lane_count)]
         self._validate_args()
 
     def _validate_args(self) -> None:
+        if (
+            min(
+                self.args.memory_replica_num,
+                self.args.nof_replica_num,
+                self.args.dfs_replica_num,
+            )
+            < 0
+        ):
+            raise ValueError("replica counts must be >= 0")
         if self.args.numjobs <= 0 or self.args.iodepth <= 0:
             raise ValueError("numjobs and iodepth must be > 0")
         if self.args.batch_size <= 0:
             raise ValueError("batch-size must be > 0")
         if self.args.value_size <= 0:
             raise ValueError("value-size must be > 0")
+        if nof_copy_only(self.args) and self.args.value_size % 4096:
+            raise ValueError("NoF copy comparison requires a 4 KiB-aligned value-size")
         if self.args.key_size <= 0:
             raise ValueError("key-size must be > 0")
         if self.args.nr_objects <= 0:
@@ -1025,8 +1246,19 @@ class BenchmarkRunner:
         if self.args.store_backend == "rs":
             if not self.args.rs_metadata_url:
                 raise ValueError("rs backend requires --rs-metadata-url")
-            if self.args.nof_replica_num != 0:
-                raise ValueError("rs backend does not support --nof-replica-num")
+            if self.args.nof_replica_num and self.args.rs_nof_targets:
+                if (
+                    self.args.memory_replica_num
+                    or self.args.dfs_replica_num
+                    or self.args.io_api != "plain"
+                ):
+                    raise ValueError(
+                        "Store-RS NoF copy requires --memory-replica-num=0, --dfs-replica-num=0 and --io-api=plain"
+                    )
+                if self.lane_count != 1:
+                    raise ValueError(
+                        "Store-RS NoF handoff requires --numjobs=1 and --iodepth=1"
+                    )
         if self.args.phase_gap_mode == "sleep" and self.args.phase_gap_sec <= 0:
             raise ValueError("phase-gap-sec must be > 0 when phase-gap-mode=sleep")
         if self.args.phase_gap_mode == "file" and not self.args.phase_gap_file:
@@ -1311,15 +1543,23 @@ class BenchmarkRunner:
             summary_path = os.path.join(self.args.output_dir, "summary.json")
         if summary_path:
             overall = merge_stats("overall", phases)
+            skipped = (
+                self.capability is not None and self.capability["result"] is not None
+            )
+            ok = overall.failed_kvs == 0 and overall.verify_failures == 0
             write_json_atomic(
                 summary_path,
                 {
                     "schema_version": 1,
                     "scenario": self.args.scenario,
                     "backend": summarize_backend(self.args),
-                    "ok": overall.failed_kvs == 0 and overall.verify_failures == 0,
+                    "ok": None if skipped else ok,
+                    "result": self.capability["result"]
+                    if skipped
+                    else ("PASS" if ok else "FAIL"),
+                    "capability": self.capability,
                     "phases": {phase.name: summarize_stats(phase) for phase in phases},
-                    "overall": summarize_stats(overall),
+                    "overall": None if skipped else summarize_stats(overall),
                     "journal_records": len(records),
                 },
             )
@@ -1523,6 +1763,22 @@ class BenchmarkRunner:
         return None
 
     def run(self) -> List[PhaseStats]:
+        if self.args.nof_replica_num > 0:
+            capabilities = probe_nof_capabilities(self.args)
+            name = (
+                "nof_zero_copy_read"
+                if self.args.scenario == "read_perf" and self.args.io_api == "zcopy"
+                else "nof_replica_count"
+            )
+            self.capability = {"name": name, **capabilities[name]}
+            if self.capability["result"] is not None:
+                LOG.info(
+                    "%s capability=%s: %s",
+                    self.capability["result"],
+                    self.capability["capability"],
+                    self.capability["reason"],
+                )
+                return []
         LOG.info(
             "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d dfs_replica_num=%d verify=%s",
             self.args.scenario,
@@ -1633,9 +1889,13 @@ def main() -> int:
     setup_logging(args.log_level)
     runner: Optional[BenchmarkRunner] = None
     try:
+        if args.scenario == "capabilities":
+            report_capabilities(args)
+            return 0
         runner = BenchmarkRunner(args)
         phases = runner.run()
-        log_overall_summary(phases)
+        if phases:
+            log_overall_summary(phases)
         runner.write_outputs(phases)
         if any(phase.verify_failures > 0 for phase in phases):
             return 20

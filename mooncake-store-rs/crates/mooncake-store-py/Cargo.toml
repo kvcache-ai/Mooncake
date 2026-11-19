@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 python-extension = ["pyo3/extension-module"]
+nof-spdk = ["mooncake-store-client/nof-spdk"]
 
 [lib]
 name = "_store_rs"
@@ -18,6 +19,8 @@ mooncake-store-core = { path = "../mooncake-store-core" }
 mooncake-store-rs-runtime = { path = "../mooncake-store-rs-runtime" }
 mooncake-store-rs-tensor = { path = "../mooncake-store-rs-tensor" }
 pyo3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

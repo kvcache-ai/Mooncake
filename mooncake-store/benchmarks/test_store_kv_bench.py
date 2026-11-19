@@ -1,5 +1,6 @@
 import ctypes
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -77,6 +78,17 @@ class StoreModuleCompatibilityTest(unittest.TestCase):
 
 
 class ReplicaConfigTest(unittest.TestCase):
+    def test_rejects_negative_replica_counts(self):
+        for kind in ("memory", "nof", "dfs"):
+            with self.subTest(kind=kind):
+                args = bench.build_parser().parse_args(
+                    ["--scenario=read_perf", f"--{kind}-replica-num=-1"]
+                )
+                with self.assertRaisesRegex(ValueError, "replica counts must be >= 0"):
+                    bench.BenchmarkRunner(args)
+                with self.assertRaisesRegex(ValueError, "replica counts must be >= 0"):
+                    bench.report_capabilities(args)
+
     def test_rejects_all_replica_counts_zero(self):
         args = bench.build_parser().parse_args(
             [
@@ -591,10 +603,402 @@ class StoreBackendTest(unittest.TestCase):
         self.assertEqual(summary["routing"], "metadata_only")
         self.assertEqual(summary["keyspace"], "mc/test")
 
-    def test_rs_backend_rejects_nof_replica_num(self):
+    def test_rs_backend_skips_unconfigured_nof_replica_num(self):
         args = self._args(["--store-backend=rs", "--nof-replica-num=1"])
-        with self.assertRaisesRegex(ValueError, "does not support --nof-replica-num"):
+        runner = bench.BenchmarkRunner(args)
+        with patch.object(bench, "load_store_module") as load:
+            self.assertEqual(runner.run(), [])
+        load.assert_not_called()
+        self.assertEqual(runner.capability["result"], "SKIP_NOT_CONFIGURED")
+
+
+class NofCapabilityTest(unittest.TestCase):
+    def _args(self, *extra):
+        return bench.build_parser().parse_args(["--scenario=capabilities", *extra])
+
+    def test_rs_matrix_distinguishes_unwired_copy_from_missing_operations(self):
+        with patch.object(bench, "load_store_module") as load:
+            capabilities = bench.probe_nof_capabilities(
+                self._args("--store-backend=rs", "--nof-replica-num=1")
+            )
+        load.assert_not_called()
+        self.assertEqual(
+            capabilities["nof_replica_count"]["result"], "SKIP_NOT_CONFIGURED"
+        )
+        for name in ("nof_promotion", "nof_zero_copy_read", "nof_zero_copy_write"):
+            self.assertEqual(capabilities[name]["capability"], "not_implemented")
+            self.assertEqual(capabilities[name]["result"], "SKIP_NOT_IMPLEMENTED")
+            self.assertTrue(capabilities[name]["reason"])
+
+    def test_cpp_default_report_does_not_need_a_native_module_or_target(self):
+        with patch.object(bench, "load_store_module") as load:
+            capabilities = bench.probe_nof_capabilities(self._args())
+        load.assert_not_called()
+        self.assertEqual(
+            capabilities["nof_replica_count"]["result"], "SKIP_NOT_CONFIGURED"
+        )
+        self.assertEqual(
+            capabilities["nof_zero_copy_write"]["result"], "SKIP_NOT_IMPLEMENTED"
+        )
+
+    def test_cpp_build_flag_is_required_even_when_config_exposes_nof(self):
+        args = self._args("--nof-replica-num=1", "--io-api=zcopy")
+        for enabled in (True, False, None):
+            with self.subTest(enabled=enabled):
+                module = SimpleNamespace(
+                    NOF_ENABLED=enabled,
+                    ReplicateConfig=store_module.ReplicateConfig,
+                    MooncakeDistributedStore=Mock(),
+                )
+                with patch.object(bench, "load_store_module", return_value=module):
+                    capabilities = bench.probe_nof_capabilities(args)
+                module.MooncakeDistributedStore.assert_not_called()
+                for name in (
+                    "nof_replica_count",
+                    "nof_promotion",
+                    "nof_zero_copy_read",
+                ):
+                    self.assertEqual(
+                        capabilities[name]["capability"],
+                        "supported" if enabled else "not_configured",
+                    )
+                    # Discovering support is not a successful benchmark run.
+                    self.assertEqual(
+                        capabilities[name]["result"],
+                        None if enabled else "SKIP_NOT_CONFIGURED",
+                    )
+
+    def test_cpp_promotion_and_registered_reads_require_their_configuration(self):
+        args = self._args("--nof-replica-num=1", "--memory-replica-num=0")
+        with patch.object(
+            bench, "load_store_module", return_value=SimpleNamespace(NOF_ENABLED=True)
+        ):
+            capabilities = bench.probe_nof_capabilities(args)
+        self.assertEqual(capabilities["nof_replica_count"]["capability"], "supported")
+        self.assertIn("memory-replica-num", capabilities["nof_promotion"]["reason"])
+        self.assertIn("io-api=zcopy", capabilities["nof_zero_copy_read"]["reason"])
+
+    def test_report_cli_writes_only_capabilities_without_performance_results(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.json"
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "store_kv_bench.py",
+                        "--scenario=capabilities",
+                        "--store-backend=rs",
+                        f"--output-dir={directory}",
+                    ],
+                ),
+                patch.object(bench, "load_store_module") as load,
+                patch.object(sys, "stdout", new_callable=io.StringIO) as output,
+            ):
+                self.assertEqual(bench.main(), 0)
+            load.assert_not_called()
+            summary = json.loads(path.read_text())
+            self.assertEqual(json.loads(output.getvalue()), summary)
+            self.assertEqual(len(summary["capabilities"]), 4)
+            self.assertNotIn("overall", summary)
+            self.assertNotIn("ok", summary)
+
+    def test_skipped_cli_writes_no_throughput_or_success_and_never_sets_up(self):
+        for backend, enabled, io_api, expected in (
+            ("rs", None, "plain", "SKIP_NOT_CONFIGURED"),
+            ("rs", None, "zcopy", "SKIP_NOT_IMPLEMENTED"),
+            ("cpp", False, "plain", "SKIP_NOT_CONFIGURED"),
+        ):
+            with self.subTest(
+                backend=backend, io_api=io_api
+            ), TemporaryDirectory() as root:
+                module = SimpleNamespace(
+                    NOF_ENABLED=enabled, MooncakeDistributedStore=Mock()
+                )
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "store_kv_bench.py",
+                            "--scenario=read_perf",
+                            f"--store-backend={backend}",
+                            f"--io-api={io_api}",
+                            "--nof-replica-num=1",
+                            "--memory-replica-num=0",
+                            f"--summary-json={root}/result.json",
+                        ],
+                    ),
+                    patch.object(bench, "load_store_module", return_value=module),
+                ):
+                    self.assertEqual(bench.main(), 0)
+                module.MooncakeDistributedStore.assert_not_called()
+                summary = json.loads((Path(root) / "result.json").read_text())
+                self.assertEqual(summary["result"], expected)
+                self.assertIsNone(summary["ok"])
+                self.assertIsNone(summary["overall"])
+                self.assertEqual(summary["phases"], {})
+                self.assertTrue(summary["capability"]["reason"])
+
+    def test_configured_cpp_executes_io_and_reports_real_success_or_failure(self):
+        for put_result in (0, -800):
+            with self.subTest(put_result=put_result), TemporaryDirectory() as root:
+                store = Mock()
+                store.setup.return_value = 0
+                store.put.return_value = put_result
+                module = SimpleNamespace(
+                    NOF_ENABLED=True,
+                    MooncakeDistributedStore=Mock(return_value=store),
+                    ReplicateConfig=store_module.ReplicateConfig,
+                )
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "store_kv_bench.py",
+                            "--scenario=write_perf",
+                            "--nr-objects=1",
+                            "--nof-replica-num=1",
+                            f"--output-dir={root}",
+                        ],
+                    ),
+                    patch.object(bench, "load_store_module", return_value=module),
+                ):
+                    self.assertEqual(bench.main(), 0)
+                store.put.assert_called_once()
+                self.assertEqual(
+                    store.put.call_args.kwargs["config"].nof_replica_num, 1
+                )
+                store.close.assert_called_once()
+                summary = json.loads((Path(root) / "summary.json").read_text())
+                self.assertEqual(
+                    summary["result"], "PASS" if put_result == 0 else "FAIL"
+                )
+                self.assertEqual(summary["overall"]["requests"], 1)
+
+    def test_broken_native_module_is_not_hidden_as_a_skip(self):
+        args = self._args("--nof-replica-num=1")
+        with (
+            patch.object(
+                bench, "load_store_module", side_effect=ImportError("libasio")
+            ),
+            self.assertRaisesRegex(ImportError, "libasio"),
+        ):
+            bench.probe_nof_capabilities(args)
+
+
+class NofCopyTest(unittest.TestCase):
+    class Store:
+        def __init__(self):
+            self.values = {}
+            self.hot = set()
+            self.handoffs = 0
+            self.reads = 0
+            self.materialized = True
+
+        def setup(self, *args, **kwargs):
+            self.targets = json.loads(os.environ["MC_STORE_RS_NOF_TARGETS"])
+            self.replica_count = int(os.environ["MC_STORE_RS_NOF_REPLICA_COUNT"])
+            return 0
+
+        def put(self, key, value, config=None):
+            self.values[key] = value
+            self.hot.add(key)
+            return 0
+
+        def put_batch(self, keys, values, config=None):
+            for key, value in zip(keys, values):
+                self.put(key, value, config)
+            return 0
+
+        def debug_evict_all(self):
+            self.handoffs += 1
+            self.hot.clear()
+            return {
+                "completed": True,
+                "remaining_hot_replicas": 0,
+                "dropped_without_cold": 0,
+            }
+
+        def query_route(self, key):
+            if key not in self.values:
+                return None
+            return {
+                "state": "Active",
+                "replicas": ["DRAM"] if key in self.hot else [],
+                "nof_backing": {
+                    "state": "Materialized" if self.materialized else "PendingOffload",
+                    "replica_count": self.replica_count,
+                },
+            }
+
+        def get(self, key):
+            if key in self.hot:
+                raise AssertionError("read incorrectly served by DRAM")
+            self.reads += 1
+            return self.values.get(key, b"")
+
+        def get_batch(self, keys):
+            return [self.get(key) for key in keys]
+
+        def close(self):
+            pass
+
+    def _args(self, path, *extra):
+        return bench.build_parser().parse_args(
+            [
+                "--scenario=verify_write",
+                "--store-backend=rs",
+                "--memory-replica-num=0",
+                "--nof-replica-num=1",
+                f"--rs-nof-targets={path}",
+                "--nr-objects=4",
+                "--value-size=4096",
+                "--verify",
+                "--pattern=0x1234",
+                *extra,
+            ]
+        )
+
+    def _module(self, store):
+        return SimpleNamespace(
+            NOF_ENABLED=True,
+            MooncakeDistributedStore=lambda: store,
+            ReplicateConfig=store_module.ReplicateConfig,
+        )
+
+    def test_copy_single_and_batch_wait_for_nof_and_verify_payloads(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "targets.json"
+            path.write_text('[{"target_id":"nof0"}]')
+            for batch_size in (1, 4):
+                with self.subTest(batch_size=batch_size):
+                    store = self.Store()
+                    args = self._args(path, f"--batch-size={batch_size}")
+                    with patch.object(
+                        bench, "load_store_module", return_value=self._module(store)
+                    ):
+                        runner = bench.BenchmarkRunner(args)
+                        try:
+                            phases = runner.run()
+                        finally:
+                            runner.close()
+                    self.assertEqual(store.handoffs, 4 // batch_size)
+                    self.assertEqual(store.reads, 4)
+                    self.assertTrue(
+                        all(
+                            phase.failed_kvs == 0 and phase.verify_failures == 0
+                            for phase in phases
+                        )
+                    )
+
+    def test_pending_nof_backing_cannot_be_counted_as_success(self):
+        store = self.Store()
+        store.replica_count = 1
+        store.materialized = False
+        args = self._args("unused.json")
+        session = bench.StoreSession(
+            args,
+            0,
+            bench.PayloadFactory(4096, b"x"),
+            store,
+            store_module.ReplicateConfig(),
+            None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "materialized NoF-only"):
+            session.put_ids([0])
+
+    def test_copy_rejects_unaligned_values_before_setup(self):
+        args = self._args("unused.json", "--value-size=512")
+        with self.assertRaisesRegex(ValueError, "4 KiB-aligned"):
             bench.BenchmarkRunner(args)
+
+    def test_hot_read_is_rejected_even_with_a_materialized_nof_copy(self):
+        store = self.Store()
+        store.replica_count = 1
+        args = self._args("unused.json")
+        session = bench.StoreSession(
+            args,
+            0,
+            bench.PayloadFactory(4096, b"x"),
+            store,
+            store_module.ReplicateConfig(),
+            None,
+        )
+        key = bench.make_key(args.key_prefix, args.key_size, 0)
+        store.put(key, b"x" * 4096)
+        with self.assertRaisesRegex(RuntimeError, "NoF-only"):
+            session.get_ids([0], verify=False)
+        self.assertEqual(store.reads, 0)
+
+    def test_setup_environment_is_restored_on_failure(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "targets.json"
+            path.write_text('[{"target_id":"nof0"}]')
+            args = self._args(path)
+            with patch.dict(
+                os.environ,
+                {
+                    "MC_STORE_RS_NOF_TARGETS": "previous",
+                    "MC_STORE_RS_NOF_REPLICA_COUNT": "2",
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "setup failed"):
+                    with bench.rs_nof_environment(args):
+                        self.assertEqual(
+                            json.loads(os.environ["MC_STORE_RS_NOF_TARGETS"])[0][
+                                "target_id"
+                            ],
+                            "nof0",
+                        )
+                        raise RuntimeError("setup failed")
+                self.assertEqual(os.environ["MC_STORE_RS_NOF_TARGETS"], "previous")
+                self.assertEqual(os.environ["MC_STORE_RS_NOF_REPLICA_COUNT"], "2")
+
+    def test_cpp_copy_rejects_memory_replicas(self):
+        args = self._args("unused.json", "--store-backend=cpp")
+        store = Mock()
+        store.put.return_value = 0
+        store.get_replica_desc.return_value = [
+            SimpleNamespace(is_nof_replica=lambda: False)
+        ]
+        session = bench.StoreSession(
+            args,
+            0,
+            bench.PayloadFactory(4096, b"x"),
+            store,
+            store_module.ReplicateConfig(),
+            None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "NoF-only replicas"):
+            session.put_ids([0])
+        store.get_replica_desc.return_value = [
+            SimpleNamespace(
+                is_nof_replica=lambda: True, status=SimpleNamespace(name="COMPLETE")
+            )
+        ]
+        result = session.put_ids([1])
+        self.assertTrue(result.request_ok)
+
+    def test_cpp_nof_copy_disables_local_payload_cache_during_setup(self):
+        args = self._args("unused.json", "--store-backend=cpp")
+        store = Mock()
+
+        def setup(*args, **kwargs):
+            self.assertNotIn("MC_STORE_LOCAL_HOT_CACHE_SIZE", os.environ)
+            return 0
+
+        store.setup.side_effect = setup
+        with (
+            patch.dict(os.environ, {"MC_STORE_LOCAL_HOT_CACHE_SIZE": "4096"}),
+            patch.object(bench, "load_store_module", return_value=self._module(store)),
+        ):
+            runtime = bench.StoreRuntime(args, 1)
+            try:
+                self.assertEqual(os.environ["MC_STORE_LOCAL_HOT_CACHE_SIZE"], "4096")
+            finally:
+                runtime.close()
 
 
 class ZcopyBufferPoolTest(unittest.TestCase):

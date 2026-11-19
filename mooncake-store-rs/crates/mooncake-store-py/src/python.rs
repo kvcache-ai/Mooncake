@@ -192,6 +192,9 @@ impl PyMooncakeDistributedStore {
         let route_control = parse_route_control_arg(route_control)?;
         let worker_scope = resolve_real_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
         let compat_scope = keyspace.clone().unwrap_or_else(|| "default".to_string());
+        let (nof_targets, nof_replica_count) =
+            run_without_gil(crate::nof::targets_from_env).map_err(store_error_to_py)?;
+        let has_nof_targets = !nof_targets.is_empty();
         let runtime = CompatRuntimeArgs {
             setup: CompatSetupArgs {
                 local_hostname: local_hostname.to_string(),
@@ -226,7 +229,7 @@ impl PyMooncakeDistributedStore {
             initial_state,
             route_control,
         }
-        .build()
+        .build_with_nof_targets(nof_targets, nof_replica_count)
         .map_err(store_error_to_py)?;
         let stable_id = runtime.stable_id.clone();
         let lease_ttl_ms = runtime.lease_ttl_ms;
@@ -241,6 +244,16 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)?;
         finalize_real_dispatcher_setup(&dispatcher, initial_state, lease_ttl_ms)
             .map_err(store_error_to_py)?;
+        if has_nof_targets && initial_state == ClientLifecycleState::Active {
+            let timeout = dispatcher.startup_timeout();
+            let result = run_without_gil(|| {
+                dispatcher.run(move |client| client.wait_for_nof_targets_ready(timeout))
+            });
+            if let Err(error) = result {
+                allow_threads_ungil(move || StoreBackend::Real(dispatcher).close());
+                return Err(store_error_to_py(error));
+            }
+        }
         self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
     }
@@ -1422,6 +1435,24 @@ impl PyMooncakeDistributedStore {
             .collect()
     }
 
+    /// Evict this runtime's hot replicas using the existing diagnostic drain.
+    /// Callers must check completion and dropped_without_cold before treating
+    /// this as a successful cold-tier handoff.
+    fn debug_evict_all(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dispatcher = self.real_dispatcher()?;
+        let result = run_without_gil(move || dispatcher.run(|client| client.debug_evict_all()))
+            .map_err(store_error_to_py)?;
+        let dict = PyDict::new(py);
+        dict.set_item("completed", result.completed)?;
+        dict.set_item("remaining_hot_replicas", result.remaining_hot_replicas)?;
+        dict.set_item("dropped_without_cold", result.dropped_without_cold)?;
+        dict.set_item("timed_out", result.timed_out)?;
+        dict.set_item("stopped_reason", result.stopped_reason)?;
+        dict.set_item("evicted", result.evicted)?;
+        dict.set_item("last_error", result.last_error)?;
+        Ok(dict.into_any().unbind())
+    }
+
     #[pyo3(signature = (key, *, tenant = None))]
     fn query_route(
         &self,
@@ -1553,6 +1584,7 @@ fn metrics_server_address() -> Option<String> {
 
 #[pymodule]
 fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("NOF_ENABLED", cfg!(feature = "nof-spdk"))?;
     module.add_class::<PyMooncakeDistributedStore>()?;
     module.add_class::<PyMooncakeHostMemAllocator>()?;
     module.add_class::<tensor::TensorReadResult>()?;
@@ -1794,6 +1826,14 @@ fn route_to_py(py: Python<'_>, route: &ObjectRoute) -> PyResult<Py<PyAny>> {
         replicas.append(entry)?;
     }
     dict.set_item("replicas", replicas)?;
+    if let Some(backing) = route.nof_backing.as_ref() {
+        let nof = PyDict::new(py);
+        nof.set_item("state", format!("{:?}", backing.state))?;
+        nof.set_item("replica_count", backing.all_targets().count())?;
+        dict.set_item("nof_backing", nof)?;
+    } else {
+        dict.set_item("nof_backing", py.None())?;
+    }
     Ok(dict.into_any().unbind())
 }
 

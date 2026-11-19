@@ -16,23 +16,24 @@ if(NOT CARGO_EXECUTABLE)
   message(FATAL_ERROR "WITH_STORE_RS=ON requires cargo on PATH")
 endif()
 
-find_package(Python3 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(
+  Python3 3.10
+  COMPONENTS Interpreter Development.Module
+  REQUIRED)
 if(NOT Python3_SOABI)
   message(FATAL_ERROR "WITH_STORE_RS=ON requires a CPython SOABI")
 endif()
 
 set(STORE_RS_SHIM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/crates/mooncake-store-rs-transport-sys/src)
-set(STORE_RS_YLT_INCLUDE_DIR
-    ${yalantinglibs_SOURCE_DIR}/include)
+set(STORE_RS_YLT_INCLUDE_DIR ${yalantinglibs_SOURCE_DIR}/include)
 set(STORE_RS_NATIVE_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/native-shims)
 set(STORE_RS_CLI_CARGO_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/cargo-cli)
 set(STORE_RS_PYTHON_CARGO_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/cargo-python)
 set(STORE_RS_TEST_CARGO_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/cargo-tests)
 set(STORE_RS_CLI_RELEASE_DIR ${STORE_RS_CLI_CARGO_TARGET_DIR}/release)
 set(STORE_RS_PYTHON_RELEASE_DIR ${STORE_RS_PYTHON_CARGO_TARGET_DIR}/release)
-set(STORE_RS_EXTENSION_SUFFIX
-    ".${Python3_SOABI}${CMAKE_SHARED_MODULE_SUFFIX}")
+set(STORE_RS_EXTENSION_SUFFIX ".${Python3_SOABI}${CMAKE_SHARED_MODULE_SUFFIX}")
 
 add_library(mooncake_store_rs_classic_shim SHARED
             ${STORE_RS_SHIM_SOURCES}/classic_shim.cc)
@@ -64,11 +65,13 @@ target_include_directories(
 # tent_shim.cc); CANN headers are not exported by tent_shared's interface.
 # Without the Ascend transports the shim compiles without ACL and keeps the
 # entry points as "unavailable" stubs, so a host without CANN still builds it.
-if(USE_ASCEND_DIRECT OR USE_ASCEND OR USE_ASCEND_HETEROGENEOUS)
+if(USE_ASCEND_DIRECT
+   OR USE_ASCEND
+   OR USE_ASCEND_HETEROGENEOUS)
   file(GLOB STORE_RS_ASCEND_TOOLKIT_ROOT
        "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
-  target_include_directories(
-    mooncake_store_rs_tent_shim PRIVATE ${STORE_RS_ASCEND_TOOLKIT_ROOT}/include)
+  target_include_directories(mooncake_store_rs_tent_shim
+                             PRIVATE ${STORE_RS_ASCEND_TOOLKIT_ROOT}/include)
   target_compile_definitions(mooncake_store_rs_tent_shim
                              PRIVATE MOONCAKE_STORE_RS_TENT_ACL)
 endif()
@@ -80,8 +83,8 @@ endif()
 if(TARGET ascend_allocator)
   target_link_libraries(mooncake_store_rs_tent_shim PRIVATE ascend_allocator)
   target_include_directories(
-    mooncake_store_rs_tent_shim PRIVATE
-    ${PROJECT_SOURCE_DIR}/mooncake-transfer-engine/include)
+    mooncake_store_rs_tent_shim
+    PRIVATE ${PROJECT_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_compile_definitions(mooncake_store_rs_tent_shim
                              PRIVATE MOONCAKE_STORE_RS_TENT_ASCEND_ALLOCATOR)
 endif()
@@ -93,8 +96,7 @@ set_target_properties(
              POSITION_INDEPENDENT_CODE ON
              INSTALL_RPATH "$ORIGIN")
 
-set(STORE_RS_CLASSIC_SHIM
-    "$<TARGET_FILE:mooncake_store_rs_classic_shim>")
+set(STORE_RS_CLASSIC_SHIM "$<TARGET_FILE:mooncake_store_rs_classic_shim>")
 set(STORE_RS_TENT_SHIM "$<TARGET_FILE:mooncake_store_rs_tent_shim>")
 set(STORE_RS_PYTHON_EXTENSION
     ${STORE_RS_PYTHON_RELEASE_DIR}/lib_store_rs${CMAKE_SHARED_LIBRARY_SUFFIX})
@@ -103,17 +105,16 @@ set(STORE_RS_CLI_CLIENT ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-rs-client)
 set(STORE_RS_CLI_ADMIN ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-rs-admin)
 set(STORE_RS_CLI_BENCH ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-rs-bench)
 
-add_custom_target(build_store_rs_cli
+add_custom_target(
+  build_store_rs_cli
   COMMAND
-    ${CMAKE_COMMAND} -E env
-    "CARGO_TARGET_DIR=${STORE_RS_CLI_CARGO_TARGET_DIR}"
+    ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${STORE_RS_CLI_CARGO_TARGET_DIR}"
     "MOONCAKE_ROOT_DIR=${PROJECT_SOURCE_DIR}"
     "MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}"
     "MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "MOONCAKE_CLASSIC_SHIM_LIB_PATH=${STORE_RS_CLASSIC_SHIM}"
-    "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}"
-    ${CARGO_EXECUTABLE} build -p mooncake-store-rs-cli -p mooncake-store-rs-admin
-    --bins --release
+    "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}" ${CARGO_EXECUTABLE}
+    build -p mooncake-store-rs-cli -p mooncake-store-rs-admin --bins --release
   BYPRODUCTS ${STORE_RS_CLI_CLIENT} ${STORE_RS_CLI_ADMIN} ${STORE_RS_CLI_BENCH}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building Store-RS CLI tools without Python bindings"
@@ -121,7 +122,13 @@ add_custom_target(build_store_rs_cli
 add_dependencies(build_store_rs_cli transfer_engine tent_shared
                  mooncake_store_rs_classic_shim mooncake_store_rs_tent_shim)
 
-add_custom_target(build_store_rs_python_extension
+set(STORE_RS_PYTHON_FEATURES python-extension)
+if(USE_NOF)
+  string(APPEND STORE_RS_PYTHON_FEATURES ",nof-spdk")
+endif()
+
+add_custom_target(
+  build_store_rs_python_extension
   COMMAND
     ${CMAKE_COMMAND} -E env
     "CARGO_TARGET_DIR=${STORE_RS_PYTHON_CARGO_TARGET_DIR}"
@@ -130,9 +137,9 @@ add_custom_target(build_store_rs_python_extension
     "MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}"
     "MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "MOONCAKE_CLASSIC_SHIM_LIB_PATH=${STORE_RS_CLASSIC_SHIM}"
-    "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}"
-    ${CARGO_EXECUTABLE} build -p mooncake-store-py --lib
-    --features python-extension --release
+    "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}" ${CARGO_EXECUTABLE}
+    build -p mooncake-store-py --lib --features ${STORE_RS_PYTHON_FEATURES}
+    --release
   BYPRODUCTS ${STORE_RS_PYTHON_EXTENSION}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building private mooncake._store_rs extension"
@@ -140,36 +147,35 @@ add_custom_target(build_store_rs_python_extension
 add_dependencies(build_store_rs_python_extension transfer_engine tent_shared
                  mooncake_store_rs_classic_shim mooncake_store_rs_tent_shim)
 
-add_custom_target(build_store_rs ALL
-  DEPENDS build_store_rs_cli build_store_rs_python_extension)
+add_custom_target(build_store_rs ALL DEPENDS build_store_rs_cli
+                                             build_store_rs_python_extension)
 
 # The Python wheel installs the exact native CMake targets used by Cargo.
-install(
-  TARGETS mooncake_store_rs_classic_shim mooncake_store_rs_tent_shim tent_shared
-  LIBRARY DESTINATION mooncake
-  COMPONENT python)
+install(TARGETS mooncake_store_rs_classic_shim mooncake_store_rs_tent_shim
+                tent_shared LIBRARY DESTINATION mooncake COMPONENT python)
 install(
   FILES ${STORE_RS_PYTHON_EXTENSION}
   DESTINATION mooncake
   RENAME _store_rs${STORE_RS_EXTENSION_SUFFIX}
   COMPONENT python)
-install(PROGRAMS ${STORE_RS_CLI_CLIENT} ${STORE_RS_CLI_ADMIN}
-                ${STORE_RS_CLI_BENCH}
-        DESTINATION mooncake COMPONENT python)
+install(
+  PROGRAMS ${STORE_RS_CLI_CLIENT} ${STORE_RS_CLI_ADMIN} ${STORE_RS_CLI_BENCH}
+  DESTINATION mooncake
+  COMPONENT python)
 
 # Unit tests use the default embedded-Python configuration; wheel builds use
 # the extension-module feature above and therefore do not link libpython.
-add_custom_target(build_store_rs_tests
+add_custom_target(
+  build_store_rs_tests
   COMMAND
-    ${CMAKE_COMMAND} -E env
-    "CARGO_TARGET_DIR=${STORE_RS_TEST_CARGO_TARGET_DIR}"
+    ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${STORE_RS_TEST_CARGO_TARGET_DIR}"
     "PYO3_PYTHON=${Python3_EXECUTABLE}"
     "MOONCAKE_ROOT_DIR=${PROJECT_SOURCE_DIR}"
     "MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}"
     "MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "MOONCAKE_CLASSIC_SHIM_LIB_PATH=${STORE_RS_CLASSIC_SHIM}"
-    "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}"
-    ${CARGO_EXECUTABLE} test --workspace --lib --no-run --release
+    "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}" ${CARGO_EXECUTABLE} test
+    --workspace --lib --no-run --release
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building Store-RS Rust tests"
   VERBATIM)
