@@ -771,6 +771,11 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(stored);
     }
 
+    std::optional<BufferHandle> ReservePushStaging(FileStorage& storage,
+                                                   size_t bytes) {
+        return storage.client_buffer_allocator_->allocate(bytes);
+    }
+
     size_t ClientBufferBatchCount(FileStorage& fileStorage) {
         size_t total = 0;
         for (auto& shard : fileStorage.client_buffer_shards_) {
@@ -3676,6 +3681,79 @@ TEST_F(FileStorageTest,
                       values[i].substr(0, partial ? 512 : 8192));
         }
     }
+}
+
+TEST_F(FileStorageTest, SmallOwnerBatchHonorsExactStagingBudget) {
+    for (const size_t extra : {size_t{0}, size_t{1}}) {
+        auto config =
+            SmallConfig(data_path + "/budget-" + std::to_string(extra));
+        fs::create_directories(config.storage_filepath);
+        config.streaming_read.slot_bytes = 4096;
+        config.streaming_read.slots = 2;
+        FileStorage storage(config, nullptr, "owner");
+        const std::vector<std::string> values{std::string(4096, 'a'),
+                                              std::string(4096 + extra, 'b')};
+        SeedPushBatch(storage, values);
+        std::array<std::vector<char>, 2> output{
+            std::vector<char>(values[0].size() + 64, '?'),
+            std::vector<char>(values[1].size() + 64, '?')};
+        auto target = std::make_shared<SmallBatchTarget>();
+        for (size_t i = 0; i < output.size(); ++i)
+            target->views.push_back({output[i].data() + 32, values[i].size()});
+        auto request = SmallRequest(values);
+        auto result = storage.ReadOwnerStreaming(
+            request, target,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        ASSERT_TRUE(result);
+        EXPECT_EQ(target->writes, extra ? 3u : 1u);
+        EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+                  ssd_offload::DestinationError::kOk);
+        for (size_t i = 0; i < output.size(); ++i) {
+            EXPECT_EQ(std::string(output[i].begin() + 32, output[i].end() - 32),
+                      values[i]);
+            EXPECT_EQ(std::string(output[i].begin(), output[i].begin() + 32),
+                      std::string(32, '?'));
+            EXPECT_EQ(std::string(output[i].end() - 32, output[i].end()),
+                      std::string(32, '?'));
+            EXPECT_EQ(result->objects[i].outcome,
+                      ssd_offload::AttemptOutcome::kSucceeded);
+        }
+    }
+}
+
+TEST_F(FileStorageTest, SmallOwnerBatchUsesSlotsWhenArenaIsFragmented) {
+    auto config = SmallConfig(data_path);
+    config.local_buffer_size = 65536;
+    config.streaming_read.slot_bytes = 4096;
+    FileStorage storage(config, nullptr, "owner");
+    const std::vector<std::string> values(4, std::string(4096, 'a'));
+    SeedPushBatch(storage, values);
+    std::vector<std::optional<BufferHandle>> reservations;
+    for (size_t i = 0; i < 8; ++i) {
+        reservations.push_back(ReservePushStaging(storage, 8192));
+        ASSERT_TRUE(reservations.back());
+    }
+    for (size_t i = 1; i < reservations.size(); i += 2) reservations[i].reset();
+    // Four 8 KiB holes can hold the aligned streaming slots, but no one hole
+    // can hold the complete 16 KiB batch.
+    ASSERT_FALSE(ReservePushStaging(storage, 16384));
+    auto request = SmallRequest(values);
+    std::array<std::array<char, 4096>, 4> output{};
+    auto target = std::make_shared<SmallBatchTarget>();
+    for (auto& value : output)
+        target->views.push_back({value.data(), value.size()});
+    auto result = storage.ReadOwnerStreaming(
+        request, target,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(target->writes, 4u);
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_EQ(std::string(output[i].begin(), output[i].end()), values[i]);
+        EXPECT_EQ(result->objects[i].outcome,
+                  ssd_offload::AttemptOutcome::kSucceeded);
+    }
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+              ssd_offload::DestinationError::kOk);
 }
 
 }  // namespace mooncake

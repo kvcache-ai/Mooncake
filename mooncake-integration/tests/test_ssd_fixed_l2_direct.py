@@ -158,7 +158,7 @@ class FixedL2DirectPythonTest(unittest.TestCase):
                             "MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES": "65536",
                             "MOONCAKE_OFFLOAD_STREAM_SLOTS": "2",
                             "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS": "1",
-                            "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT": "1",
+                            "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT": "500",
                             "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS": "1",
                         }
                     )
@@ -240,6 +240,73 @@ class FixedL2DirectPythonTest(unittest.TestCase):
                     self.assertEqual(
                         json.loads(owner.get_ssd_push_peer_info())["read_requests"], 1
                     )
+
+                    # Exercise the bounded whole-value batch path through the
+                    # public API. Four adjacent CPU destinations fit within
+                    # the two-slot staging budget and share one registration.
+                    small_size = 8 * 1024
+                    small_keys = [f"fixed-l2-small-{i}" for i in range(4)]
+                    small_payloads = [
+                        bytes([i + 1]) * small_size for i in range(len(small_keys))
+                    ]
+                    for small_key, small_payload in zip(
+                        small_keys, small_payloads, strict=True
+                    ):
+                        self.assertEqual(owner.put(small_key, small_payload), 0)
+
+                    def small_values_on_disk():
+                        return all(
+                            any(
+                                r.is_local_disk_replica()
+                                for r in owner.batch_get_replica_desc([k]).get(k, [])
+                            )
+                            for k in small_keys
+                        )
+
+                    wait_for(small_values_on_disk)
+                    cleared = set()
+
+                    def clear_small_memory_replicas():
+                        cleared.update(
+                            owner.batch_replica_clear(
+                                small_keys, segment_name=owner.get_hostname()
+                            )
+                        )
+                        return len(cleared) == len(small_keys)
+
+                    wait_for(clear_small_memory_replicas)
+
+                    def small_values_are_disk_only():
+                        return all(
+                            (replicas := owner.batch_get_replica_desc([k]).get(k, []))
+                            and all(r.is_local_disk_replica() for r in replicas)
+                            for k in small_keys
+                        )
+
+                    wait_for(small_values_are_disk_only)
+                    ctypes.memset(pointer, 0xA5, size + 64)
+                    small_ptrs = [pointer + 32 + i * small_size for i in range(4)]
+                    self.assertEqual(
+                        requester.batch_get_into(
+                            small_keys, small_ptrs, [small_size] * len(small_keys)
+                        ),
+                        [small_size] * len(small_keys),
+                    )
+                    for i, small_payload in enumerate(small_payloads):
+                        start = 32 + i * small_size
+                        self.assertEqual(
+                            bytes(pool[start : start + small_size]), small_payload
+                        )
+                    self.assertEqual(bytes(pool)[:32], b"\xa5" * 32)
+                    self.assertEqual(
+                        bytes(pool)[32 + len(small_keys) * small_size :],
+                        b"\xa5" * (size + 32 - len(small_keys) * small_size),
+                    )
+                    self.assertEqual(bytes(pool)[-32:], b"\xa5" * 32)
+                    self.assertEqual(
+                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 2
+                    )
+
                     proxy = LostReplyProxy(peer["control_host"], peer["control_port"])
                     peer["control_host"] = "127.0.0.1"
                     peer["control_port"] = proxy.port
@@ -265,7 +332,7 @@ class FixedL2DirectPythonTest(unittest.TestCase):
                     self.assertEqual(requester.unregister_buffer(pointer), 0)
                     self.assertEqual(requester.close(), 0)
                     self.assertEqual(
-                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 2
+                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 3
                     )
                     self.assertFalse(proxy.errors)
                 finally:

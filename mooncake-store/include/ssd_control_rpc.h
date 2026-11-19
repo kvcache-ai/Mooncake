@@ -40,7 +40,7 @@ class SsdReadIntoRpcEndpoint {
    public:
     explicit SsdReadIntoRpcEndpoint(std::shared_ptr<SsdDirectReadOwner>,
                                     SsdReadProtocolLimits = {},
-                                    size_t worker_threads = 2,
+                                    size_t worker_threads = 4,
                                     size_t max_outstanding = 64);
     ~SsdReadIntoRpcEndpoint();
     void Call(SsdDirectRpcContext, std::string_view);

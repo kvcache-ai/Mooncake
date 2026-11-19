@@ -800,6 +800,9 @@ FileStorage::ReadOwnerStreaming(
         std::vector<std::string> batch_keys;
         std::vector<int64_t> batch_sizes;
         std::unordered_set<std::string> unique_keys;
+        batch_keys.reserve(request.objects.size());
+        batch_sizes.reserve(request.objects.size());
+        unique_keys.reserve(request.objects.size());
         bool whole_batch = !request.objects.empty() && !config.direct_io &&
                            !config.fixed_buffers;
         for (const auto& object : request.objects) {
@@ -835,10 +838,13 @@ FileStorage::ReadOwnerStreaming(
             batch_keys.push_back(tenant.MakeScopedKey(object.key));
             batch_sizes.push_back(static_cast<int64_t>(size));
         }
-        if (whole_batch) {
-            auto handle = client_buffer_allocator_->allocate(batch_bytes);
-            if (!handle)
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        // Fragmentation can prevent a contiguous batch allocation while the
+        // smaller streaming slots still fit. No I/O has been accepted, so
+        // retain the pipeline below when the bulk allocation is unavailable.
+        auto handle = whole_batch
+                          ? client_buffer_allocator_->allocate(batch_bytes)
+                          : std::nullopt;
+        if (handle) {
             // Lay values out by destination registration/offset. Adjacent
             // destinations can then share a wire WRITE after authorization.
             std::vector<size_t> order(request.objects.size());
@@ -852,6 +858,7 @@ FileStorage::ReadOwnerStreaming(
             });
             const auto begin = reinterpret_cast<uintptr_t>(handle->ptr());
             std::unordered_map<std::string, Slice> slices;
+            slices.reserve(request.objects.size());
             size_t cursor = 0;
             for (const auto index : order) {
                 if (config_.use_uring)
@@ -872,6 +879,7 @@ FileStorage::ReadOwnerStreaming(
             }
             ReadChunk chunk{};
             chunk.read_bytes = handle->size();
+            chunk.fragments.reserve(batch_destinations);
             size_t ordinal = 0;
             for (size_t i = 0; i < request.objects.size(); ++i) {
                 size_t offset =

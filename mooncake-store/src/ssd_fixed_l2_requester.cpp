@@ -56,10 +56,12 @@ struct SsdFixedL2Requester::State {
     SsdRequesterCallResult Call(Pending& pending, SsdControlCommand command,
                                 std::chrono::milliseconds timeout) noexcept {
         try {
-            auto message = pending.message;
-            message.command = command;
+            // Read and recovery hold this attempt's mutex across the call.
+            // Only the command changes; retain the owned request for recovery
+            // without copying all keys and destination views on every RPC.
+            pending.message.command = command;
             return call(pending.route.control_host, pending.route.control_port,
-                        message, timeout);
+                        pending.message, timeout);
         } catch (...) {
             return {};
         }
@@ -85,7 +87,7 @@ struct SsdFixedL2Requester::State {
             return fail(call.reply->snapshot->error);
         if (call.reply->snapshot->state != SsdOwnerRequestState::kDrained)
             return fail(DestinationError::kNotDrained);
-        auto result = *call.reply->snapshot->result;
+        auto result = std::move(*call.reply->snapshot->result);
         const auto valid =
             ValidateSsdReadResultV1(*pending->message.request, result, wire);
         if (valid != DestinationError::kOk) return fail(valid);
