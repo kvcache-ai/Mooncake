@@ -1,5 +1,13 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_executable(transfer_sharding_test ${WORKSPACE}/transfer_sharding_test.cpp)
+target_link_libraries(transfer_sharding_test PRIVATE transfer_engine gtest
+                                                     gtest_main pthread)
+if(USE_TENT)
+  target_compile_definitions(transfer_sharding_test PRIVATE USE_TENT)
+endif()
+add_test(NAME transfer_sharding_test COMMAND transfer_sharding_test)
+
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_executable(task_congestion_observation_test
                  ${WORKSPACE}/task_congestion_observation_test.cpp)
@@ -244,13 +252,12 @@ set_tests_properties(rdma_native_notify_test PROPERTIES LABELS "rdma" TIMEOUT
 
 # Real CQ completions through the eventfd. Self-skips without an RDMA device
 # or when MC_SLICE_TIMEOUT disables the notification path.
-add_executable(rdma_completion_fd_test
-               ${WORKSPACE}/rdma_completion_fd_test.cpp)
+add_executable(rdma_completion_fd_test ${WORKSPACE}/rdma_completion_fd_test.cpp)
 target_link_libraries(rdma_completion_fd_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME rdma_completion_fd_test COMMAND rdma_completion_fd_test)
 set_tests_properties(rdma_completion_fd_test PROPERTIES LABELS "rdma" TIMEOUT
-                                                       120)
+                                                        120)
 
 # CtrlChannel RDMA notify correctness. Self-skips without RDMA.
 add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)

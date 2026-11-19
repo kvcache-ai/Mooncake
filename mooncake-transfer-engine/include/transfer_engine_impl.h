@@ -473,6 +473,11 @@ class TransferEngineImpl {
         return local_topology_;
     }
 
+    bool supportsShardedTransfer(Transport::SegmentID peer) const {
+        return multi_transports_ &&
+               multi_transports_->supportsShardedTransfer(peer);
+    }
+
    private:
     struct MemoryRegion {
         void* addr;

@@ -1114,6 +1114,40 @@ int TransferEnginePy::batchTransferSync(
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
+    if (!notify && engine_->shardingExecutor().eligible(batch_size) &&
+        independentTransferDestinations(
+            opcode == TransferOpcode::WRITE ? peer_buffer_addresses : buffers,
+            lengths)) {
+        const int hint = parseTransportHint(transport_hint);
+        auto sharded_result = engine_->tryShardedTransfer(
+            handle, batch_size,
+            [&](size_t begin, size_t end) {
+                std::vector<TransferRequest> requests;
+                requests.reserve(end - begin);
+                for (size_t i = begin; i < end; ++i) {
+                    TransferRequest entry;
+                    entry.opcode = opcode == TransferOpcode::WRITE
+                                       ? TransferRequest::WRITE
+                                       : TransferRequest::READ;
+                    entry.length = lengths[i];
+                    entry.source = reinterpret_cast<void*>(buffers[i]);
+                    entry.target_id = handle;
+                    entry.target_offset = peer_buffer_addresses[i];
+                    entry.transport_hint = hint;
+                    entry.nic_hint = nic_hint_id;
+                    requests.push_back(std::move(entry));
+                }
+                return requests;
+            },
+            std::chrono::nanoseconds(transfer_timeout_nsec_ + total_length),
+            hint);
+        if (sharded_result) {
+            if (!sharded_result->ok())
+                LOG(ERROR) << "Sharded transfer failed: "
+                           << sharded_result->ToString();
+            return sharded_result->ok() ? 0 : -1;
+        }
+    }
     std::vector<TransferRequest> entries;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;

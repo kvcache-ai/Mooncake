@@ -20,6 +20,9 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #include "error.h"
 
 namespace mooncake {
@@ -87,14 +90,17 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover)
-    : impl_(std::make_shared<TransferEngineImpl>(auto_discover)) {}
+    : impl_(std::make_shared<TransferEngineImpl>(auto_discover)),
+      sharding_executor_(std::make_shared<TransferShardingExecutor>()) {}
 
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter)
-    : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
+    : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)),
+      sharding_executor_(std::make_shared<TransferShardingExecutor>()) {}
 
 TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
+      sharding_executor_(std::move(other.sharding_executor_)),
       impl_tent_(std::move(other.impl_tent_)),
       metadata_conn_string_(std::move(other.metadata_conn_string_)),
       use_tent_(other.use_tent_) {
@@ -110,6 +116,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     if (this == &other) return *this;
     freeEngine();
     impl_ = std::move(other.impl_);
+    sharding_executor_ = std::move(other.sharding_executor_);
     impl_tent_ = std::move(other.impl_tent_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
     metadata_conn_string_ = std::move(other.metadata_conn_string_);
@@ -145,6 +152,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    if (sharding_executor_) sharding_executor_->shutdown();
     metadata_conn_string_.clear();
     detachShutdownToken(shutdown_token_);
     if (impl_) {
@@ -558,6 +566,7 @@ TransferEngine::TransferEngine(bool auto_discover) {
     }
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover);
+        sharding_executor_ = std::make_shared<TransferShardingExecutor>();
     }
 }
 
@@ -598,11 +607,13 @@ TransferEngine::TransferEngine(bool auto_discover,
         tent_device_filter_ = filter;
     } else {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
+        sharding_executor_ = std::make_shared<TransferShardingExecutor>();
     }
 }
 
 TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
+      sharding_executor_(std::move(other.sharding_executor_)),
       impl_tent_(std::move(other.impl_tent_)),
       tent_compat_transport_(std::move(other.tent_compat_transport_)),
       shutdown_token_(nullptr),
@@ -621,6 +632,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     if (this == &other) return *this;
     freeEngine();
     impl_ = std::move(other.impl_);
+    sharding_executor_ = std::move(other.sharding_executor_);
     impl_tent_ = std::move(other.impl_tent_);
     tent_compat_transport_ = std::move(other.tent_compat_transport_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
@@ -751,6 +763,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    if (sharding_executor_) sharding_executor_->shutdown();
     metadata_conn_string_.clear();
     detachShutdownToken(shutdown_token_);
     {
@@ -1347,6 +1360,142 @@ std::string TransferEngine::showLinks(bool json) const {
 #endif
 
 namespace mooncake {
+
+TransferShardingExecutor& TransferEngine::shardingExecutor() {
+#ifdef USE_TENT
+    if (use_tent_) return impl_tent_->shardingExecutor();
+#endif
+    return *sharding_executor_;
+}
+
+TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::allocate() {
+    sub_batch_id = engine.allocateBatchID(requests.size());
+    return sub_batch_id == INVALID_BATCH_ID || sub_batch_id == 0
+               ? Executor::Result{-1, "Could not allocate sub-batch"}
+               : Executor::Result::OK();
+}
+
+TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::submit() {
+    auto status = engine.submitTransfer(sub_batch_id, requests);
+    return status.ok() ? Executor::Result::OK()
+                       : Executor::Result{-1, status.ToString()};
+}
+
+SubBatchProgress TransferEngine::TESubBatchAdapter::poll() {
+    TransferStatus status{};
+    auto polled = engine.getBatchTransferStatus(sub_batch_id, status);
+    if (!polled.ok()) throw std::runtime_error(polled.ToString());
+    const bool terminal = status.s != TransferStatusEnum::WAITING &&
+                          status.s != TransferStatusEnum::PENDING;
+    return {terminal, status.s == TransferStatusEnum::COMPLETED, {}};
+}
+
+TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::release() {
+    auto status = engine.freeBatchID(sub_batch_id);
+    sub_batch_id = INVALID_BATCH_ID;
+    return status.ok() || status.IsBatchCleanupDeferred()
+               ? Executor::Result::OK()
+               : Executor::Result{-1, status.ToString()};
+}
+
+bool TransferEngine::supportsShardedTransfer(SegmentID peer) const {
+#ifdef USE_TENT
+    if (use_tent_) {
+        return impl_tent_ && impl_tent_->supportsShardedTransfer(peer);
+    }
+#endif
+    return impl_ && impl_->supportsShardedTransfer(peer);
+}
+
+std::optional<Status> TransferEngine::tryShardedTransfer(
+    SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+    std::chrono::nanoseconds timeout, int transport_hint) {
+    using Executor = TransferShardingExecutor;
+    auto& executor = shardingExecutor();
+    if (!executor.eligible(count)) return std::nullopt;
+#ifdef USE_TENT
+    if (use_tent_) {
+        auto status = impl_tent_->tryShardedTransfer(
+            peer, count,
+            [&](size_t begin, size_t end) {
+                auto entries = builder(begin, end);
+                std::vector<tent::Request> converted;
+                converted.reserve(entries.size());
+                for (const auto& entry : entries) {
+                    if (entry.target_id != peer ||
+                        (entry.opcode != TransferRequest::READ &&
+                         entry.opcode != TransferRequest::WRITE) ||
+                        entry.intent_type < 0 ||
+                        entry.intent_type >
+                            static_cast<int>(
+                                tent::IntentType::STAGING_INTERNAL) ||
+                        entry.transport_hint < 0 ||
+                        entry.transport_hint >= tent::kSupportedTransportTypes)
+                        throw std::invalid_argument(
+                            "Unsupported sharded request");
+                    tent::Request request;
+                    request.opcode =
+                        static_cast<tent::Request::OpCode>(entry.opcode);
+                    request.source = entry.source;
+                    request.target_id = entry.target_id;
+                    request.target_offset = entry.target_offset;
+                    request.length = entry.length;
+                    request.priority = entry.priority;
+                    request.intent_type =
+                        static_cast<tent::IntentType>(entry.intent_type);
+                    request.transport_hint =
+                        static_cast<tent::TransportType>(entry.transport_hint);
+                    converted.push_back(std::move(request));
+                }
+                return converted;
+            },
+            timeout, static_cast<tent::TransportType>(transport_hint));
+        if (!status) return std::nullopt;
+        return status->ok() ? Status::OK()
+                            : Status::Context(status->ToString());
+    }
+#endif
+    const auto deadline = Executor::Clock::now() + timeout;
+    if (!supportsShardedTransfer(peer)) {
+        VLOG(1) << "Synchronous sharding admission declined: peer=" << peer
+                << " descriptors=" << count;
+        return std::nullopt;
+    }
+    VLOG(1) << "Synchronous sharding admitted: peer=" << peer
+            << " descriptors=" << count;
+    int device = -1;
+#ifdef USE_CUDA
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return Status::Context("Could not capture sharding CUDA device");
+#endif
+    // Workers mutate distinct vectors; retain every vector until parent join.
+    std::vector<std::vector<TransferRequest>> request_storage(
+        std::min(executor.config().threads, count));
+    auto result = executor.execute(
+        count, deadline,
+        [&](Executor::Range range, const Executor::Cancellation& cancellation) {
+#ifdef USE_CUDA
+            if (cudaSetDevice(device) != cudaSuccess)
+                return Executor::Result{-1,
+                                        "Could not bind sharding CUDA device"};
+#endif
+            auto& requests = request_storage[range.index];
+            requests = builder(range.begin, range.end);
+            if (requests.size() != range.end - range.begin)
+                return Executor::Result{-1, "Invalid sub-batch request count"};
+            for (const auto& request : requests)
+                if (request.target_id != peer ||
+                    (request.opcode != TransferRequest::READ &&
+                     request.opcode != TransferRequest::WRITE))
+                    return Executor::Result{
+                        -1,
+                        "Sharded batch must contain READ/WRITE to one peer"};
+            TESubBatchAdapter sub_batch{*this, requests};
+            return runSubBatch(sub_batch, cancellation);
+        });
+    return result.ok() ? Status::OK() : Status::Context(result.error);
+}
+
 namespace {
 
 #ifdef USE_TENT

@@ -16,6 +16,10 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/topology.h"
+#include "transfer_sharding.h"
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -37,7 +41,86 @@ TransferEngine::TransferEngine(const std::string config_path) {
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)
     : impl_(std::make_unique<TransferEngineImpl>(conf)) {}
 
-TransferEngine::~TransferEngine() {}
+TransferEngine::~TransferEngine() { sharding_executor_->shutdown(); }
+
+bool TransferEngine::supportsShardedTransfer(SegmentID peer) const {
+    return impl_->supportsShardedTransfer(peer);
+}
+
+TransferShardingExecutor::Result
+TransferEngine::TentSubBatchAdapter::allocate() {
+    sub_batch_id = engine.allocateBatch(requests.size());
+    return sub_batch_id ? Executor::Result::OK()
+                        : Executor::Result{-1, "Could not allocate sub-batch"};
+}
+
+TransferShardingExecutor::Result TransferEngine::TentSubBatchAdapter::submit() {
+    auto status = engine.submitTransfer(sub_batch_id, requests);
+    return status.ok() ? Executor::Result::OK()
+                       : Executor::Result{-1, status.ToString()};
+}
+
+SubBatchProgress TransferEngine::TentSubBatchAdapter::poll() {
+    TransferStatus status{};
+    auto polled = engine.getTransferStatus(sub_batch_id, status);
+    if (!polled.ok()) throw std::runtime_error(polled.ToString());
+    const bool terminal = status.s != PENDING && status.s != INITIAL;
+    return {terminal, status.s == COMPLETED, {}};
+}
+
+TransferShardingExecutor::Result
+TransferEngine::TentSubBatchAdapter::release() {
+    auto status = engine.freeBatch(sub_batch_id);
+    sub_batch_id = 0;
+    return status.ok() ? Executor::Result::OK()
+                       : Executor::Result{-1, status.ToString()};
+}
+
+std::optional<Status> TransferEngine::tryShardedTransfer(
+    SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+    std::chrono::nanoseconds timeout, TransportType hint) {
+    using Executor = ::mooncake::TransferShardingExecutor;
+    auto& executor = *sharding_executor_;
+    if (!executor.eligible(count)) return std::nullopt;
+    const auto deadline = Executor::Clock::now() + timeout;
+    if (!supportsShardedTransfer(peer)) {
+        VLOG(1) << "TENT synchronous sharding admission declined: peer=" << peer
+                << " descriptors=" << count;
+        return std::nullopt;
+    }
+    VLOG(1) << "TENT synchronous sharding admitted: peer=" << peer
+            << " descriptors=" << count;
+    int device = -1;
+#ifdef USE_CUDA
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return Status::InternalError("Could not capture sharding CUDA device");
+#endif
+    std::vector<std::vector<Request>> request_storage(
+        std::min(executor.config().threads, count));
+    auto result = executor.execute(
+        count, deadline,
+        [&](Executor::Range range, const Executor::Cancellation& cancellation) {
+#ifdef USE_CUDA
+            if (cudaSetDevice(device) != cudaSuccess)
+                return Executor::Result{-1,
+                                        "Could not bind sharding CUDA device"};
+#endif
+            auto& requests = request_storage[range.index];
+            requests = builder(range.begin, range.end);
+            if (requests.size() != range.end - range.begin)
+                return Executor::Result{-1, "Invalid sub-batch request count"};
+            for (const auto& request : requests)
+                if (request.target_id != peer ||
+                    request.transport_hint != hint ||
+                    (request.opcode != Request::READ &&
+                     request.opcode != Request::WRITE))
+                    return Executor::Result{
+                        -1, "Sharded transfer request differs from admission"};
+            TentSubBatchAdapter sub_batch{*this, requests};
+            return ::mooncake::runSubBatch(sub_batch, cancellation);
+        });
+    return result.ok() ? Status::OK() : Status::InternalError(result.error);
+}
 
 bool TransferEngine::available() const { return impl_->available(); }
 

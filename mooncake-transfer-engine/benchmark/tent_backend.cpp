@@ -522,6 +522,39 @@ double TENTBenchRunner::runSingleTransfer(
         return -1.0;
     };
 
+    XferBenchTimer parent_timer;
+    auto build = [&](size_t begin, size_t end) {
+        std::vector<Request> requests;
+        for (uint64_t i = begin; i < end; ++i) {
+            Request entry;
+            entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
+            entry.length = block_size;
+            entry.source = (void*)(local_addr + block_size * i);
+            entry.target_id = target_id;
+            entry.target_offset = target_addr + block_size * i;
+            entry.transport_hint = transport_hint_;
+            entry.deadline_ns = deadline_ns;
+            entry.intent_type = intent_type == IntentType::INTENT_UNSPEC
+                                    ? intent_type_
+                                    : intent_type;
+            requests.emplace_back(entry);
+        }
+        return requests;
+    };
+    if (!XferBenchConfig::notifi) {
+        auto sharded_result = engine_->tryShardedTransfer(
+            target_id, batch_size, build, std::chrono::seconds(30),
+            transport_hint_);
+        if (sharded_result) {
+            if (!sharded_result->ok()) {
+                LOG(ERROR) << "Sharded transfer failed: "
+                           << sharded_result->ToString();
+                return abortTransfer("Sharded transfer failed");
+            }
+            return static_cast<double>(parent_timer.lap_ns(false)) /
+                   kNanosecondsPerMicrosecond;
+        }
+    }
     auto batch_id = engine_->allocateBatch(batch_size);
     if (!batch_id) return abortTransfer("Failed to allocate transfer batch");
 
@@ -530,21 +563,7 @@ double TENTBenchRunner::runSingleTransfer(
         return duration;
     };
 
-    std::vector<Request> requests;
-    for (uint64_t i = 0; i < batch_size; ++i) {
-        Request entry;
-        entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
-        entry.length = block_size;
-        entry.source = (void*)(local_addr + block_size * i);
-        entry.target_id = target_id;
-        entry.target_offset = target_addr + block_size * i;
-        entry.transport_hint = transport_hint_;
-        entry.deadline_ns = deadline_ns;
-        entry.intent_type = intent_type == IntentType::INTENT_UNSPEC
-                                ? intent_type_
-                                : intent_type;
-        requests.emplace_back(entry);
-    }
+    auto requests = build(0, batch_size);
     XferBenchTimer timer;
     Status submitted;
     if (XferBenchConfig::notifi) {
@@ -573,8 +592,10 @@ double TENTBenchRunner::runSingleTransfer(
             logSplitXfer({block_size, batch_size, splitWarmup(), submit_ns,
                           total_ns - submit_ns, polls});
         }
-        return finish(static_cast<double>(total_ns) /
-                      kNanosecondsPerMicrosecond);
+        auto duration = finish(0.0);
+        (void)duration;
+        return static_cast<double>(parent_timer.lap_ns(false)) /
+               kNanosecondsPerMicrosecond;
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         return finish(-1.0);  // stopped and abandoned

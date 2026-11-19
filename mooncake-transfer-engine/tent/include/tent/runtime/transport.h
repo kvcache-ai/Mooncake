@@ -193,6 +193,10 @@ class Transport {
         return Status::OK();
     }
 
+    // Worker submission must preserve caller-thread context and execution
+    // dependencies. Ordinary failure/timeout and cleanup semantics still apply.
+    virtual bool supportsShardedTransfer() const { return false; }
+
    protected:
     Capabilities caps;
 };

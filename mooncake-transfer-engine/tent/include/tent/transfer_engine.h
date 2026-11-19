@@ -238,6 +238,9 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <chrono>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -245,6 +248,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "transfer_sharding.h"
 
 namespace mooncake {
 class TransferEngine;
@@ -331,6 +335,13 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    using SubBatchRequestBuilder =
+        std::function<std::vector<Request>(size_t begin, size_t end)>;
+    std::optional<Status> tryShardedTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout, TransportType hint = UNSPEC);
+    TransferShardingExecutor& shardingExecutor() { return *sharding_executor_; }
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
@@ -375,11 +386,27 @@ class TransferEngine {
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
+    bool supportsShardedTransfer(SegmentID peer) const;
+
    private:
+    struct TentSubBatchAdapter {
+        using Executor = TransferShardingExecutor;
+        TransferEngine& engine;
+        const std::vector<Request>& requests;
+        BatchID sub_batch_id = 0;
+
+        Executor::Result allocate();
+        Executor::Result submit();
+        SubBatchProgress poll();
+        Executor::Result release();
+    };
+
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
     std::unique_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<TransferShardingExecutor> sharding_executor_ =
+        std::make_shared<TransferShardingExecutor>();
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };

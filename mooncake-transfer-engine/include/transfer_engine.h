@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "multi_transport.h"
 #include "task_congestion_status.h"
 #include "transfer_metadata.h"
+#include "transfer_sharding.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -187,6 +189,19 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    using SubBatchRequestBuilder =
+        std::function<std::vector<TransferRequest>(size_t begin, size_t end)>;
+
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must preserve every request
+    // field.
+    std::optional<Status> tryShardedTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout, int transport_hint = 0);
+
+    TransferShardingExecutor& shardingExecutor();
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
@@ -375,7 +390,21 @@ class TransferEngine {
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
+    bool supportsShardedTransfer(SegmentID peer) const;
+
    private:
+    struct TESubBatchAdapter {
+        using Executor = TransferShardingExecutor;
+        TransferEngine& engine;
+        const std::vector<TransferRequest>& requests;
+        BatchID sub_batch_id = INVALID_BATCH_ID;
+
+        Executor::Result allocate();
+        Executor::Result submit();
+        SubBatchProgress poll();
+        Executor::Result release();
+    };
+
     Status submitScatterTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest>& entries);
 
@@ -384,6 +413,7 @@ class TransferEngine {
         const std::string& local_server_name) const;
 
     std::shared_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<TransferShardingExecutor> sharding_executor_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::unique_ptr<Transport> tent_compat_transport_;
     std::mutex tent_compat_transport_mutex_;
