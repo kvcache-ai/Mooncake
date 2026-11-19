@@ -52,6 +52,7 @@
 #include "metadata/object_route.h"
 #include "metadata/object_state.h"
 #include "promotion_candidate_tracker.h"
+#include "piece_put_manager.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
@@ -431,6 +432,17 @@ class MasterService {
                   const TenantId& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    // Assemble disjoint contributions into an ordinary MEMORY object.
+    // Payloads use the existing transfer path, outside these metadata calls.
+    auto PiecePutStart(const UUID& client_id,
+                       const PiecePutStartRequest& request,
+                       const TenantId& tenant_id)
+        -> tl::expected<PiecePutStartResponse, ErrorCode>;
+    auto PiecePutFinish(const UUID& client_id,
+                        const PiecePutFinishRequest& request,
+                        const TenantId& tenant_id)
+        -> tl::expected<PiecePutFinishResponse, ErrorCode>;
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
@@ -1465,6 +1477,18 @@ class MasterService {
                             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // Callers already hold this key's write guard. Assembly state does not
+    // own allocations, and central erase never re-enters that guard.
+    void DiscardAndForgetPiecePutLocked(const TenantId& tenant_id,
+                                        const std::string& key,
+                                        ObjectMetadata& metadata,
+                                        route::Generation generation);
+    void SweepExpiredPiecePuts(std::chrono::system_clock::time_point now);
+    bool PiecePutTargetsValid(const ObjectMetadata& metadata,
+                              const PiecePutRound& round) const;
+    void FinishWritePublicationLocked(MetadataAccessorRW& accessor,
+                                      ReplicaType replica_type);
+
     // Helper: allocate replicas, publish the object under the key `accessor`
     // holds, which must hold none, and return descriptor list.  Shared by
     // PutStart and UpsertStart.
@@ -2092,6 +2116,8 @@ class MasterService {
     // master_state_mutex_.
     bool AdmitsBusinessWorkers() const;
 
+    PiecePutManager piece_put_manager_;
+
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
@@ -2110,6 +2136,12 @@ class MasterService {
             MasterMetricManager::instance().inc_put_start_discard_cnt(
                 1, mem_size_);
         }
+
+        // The list node is allocated before taking advertised allocations
+        // out of metadata. PopReplicas reserves before moving any handles.
+        template <typename Pop>
+        DiscardedReplicas(std::chrono::system_clock::time_point ttl, Pop&& pop)
+            : DiscardedReplicas(pop(), ttl) {}
 
         ~DiscardedReplicas() {
             MasterMetricManager::instance().inc_put_start_release_cnt(

@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 
 #include "ascii_string.h"
+#include "piece_put_retry.h"
 #include "allocator.h"
 #include "segment.h"
 #include "nof/nof_runtime.h"
@@ -72,6 +73,7 @@ std::optional<size_t> GetTransportRegistrationLimit(
 
 namespace {
 
+constexpr size_t kPiecePutWindowSize = 64;
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
@@ -5233,6 +5235,208 @@ Client::BatchTransferReadOffloadRanges(
         LOG(ERROR) << "Offload range read failed, entry=" << i
                    << ", error=" << static_cast<int>(entry_errors[i].value());
         results[i] = tl::unexpected(entry_errors[i].value());
+    }
+    return results;
+}
+
+tl::expected<PiecePutItemResult, ErrorCode> Client::PiecePut(
+    const PiecePutItem& item, const ReplicateConfig& config) {
+    return BatchPiecePut(std::span<const PiecePutItem>(&item, 1), config)
+        .front();
+}
+
+std::vector<tl::expected<PiecePutItemResult, ErrorCode>> Client::BatchPiecePut(
+    std::span<const PiecePutItem> items, const ReplicateConfig& config) {
+    std::vector<tl::expected<PiecePutItemResult, ErrorCode>> results(
+        items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (items.empty()) return results;
+    // The native scatter API drains borrowed source buffers on return. The
+    // current TENT Store adapter can force-clean an unfinished batch, so it
+    // cannot provide that contract here. Legacy TCP lacks a remote WRITE ack.
+    const char* tcp_proto = std::getenv("MC_TCP_PROTO");
+    if (object_checksum_enabled_ || !transfer_engine_ ||
+        transfer_engine_->isUsingTent() || protocol_ == "rpc_only" ||
+        protocol_ == "cxl" ||
+        (protocol_ == "tcp" && tcp_proto && std::strcmp(tcp_proto, "1") == 0)) {
+        return std::vector<tl::expected<PiecePutItemResult, ErrorCode>>(
+            items.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
+    if (!config.HasValidKeyHints(items.size()) ||
+        !config.ValidSessionIds(items.size()))
+        return results;
+
+    // Strip per-key vectors before copying the shared configuration per item.
+    ReplicateConfig base_config = config;
+    base_config.group_ids.reset();
+    base_config.session_ids.reset();
+    base_config.per_key_preferred_hca_names.reset();
+    base_config.residency_affinity_ids.reset();
+
+    for (size_t begin = 0; begin < items.size(); begin += kPiecePutWindowSize) {
+        const size_t end = std::min(items.size(), begin + kPiecePutWindowSize);
+        std::vector<PiecePutStartRequest> requests;
+        std::vector<size_t> indices;
+        requests.reserve(end - begin);
+        indices.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index) {
+            const auto& item = items[index];
+            uint64_t length = 0;
+            bool valid = !item.key.empty() && !item.write_id.empty() &&
+                         item.total_size > 0 && !item.slices.empty();
+            for (const auto& slice : item.slices) {
+                if (!slice.ptr || slice.size == 0 ||
+                    slice.size > std::numeric_limits<int64_t>::max() - length) {
+                    valid = false;
+                    break;
+                }
+                length += slice.size;
+            }
+            if (!valid || item.offset > item.total_size ||
+                length > item.total_size - item.offset)
+                continue;
+            const auto op_id =
+                piece_put_next_op_id_.fetch_add(1, std::memory_order_relaxed);
+            if (op_id == 0) {
+                results[index] = tl::unexpected(ErrorCode::INVALID_WRITE);
+                continue;
+            }
+            // RemoveHotKey also invalidates already queued async fills.
+            if (hot_cache_) hot_cache_->RemoveHotKey(item.key);
+            auto key_config = base_config;
+            key_config.SetKeyIds(config, index);
+            key_config = AttachHostId(key_config);
+            AttachHcaAffinity(key_config, item.slices);
+            requests.push_back({item.key, item.total_size, item.offset, length,
+                                item.write_id, op_id, std::move(key_config)});
+            indices.push_back(index);
+        }
+        if (requests.empty()) continue;
+        std::vector<std::chrono::steady_clock::time_point> send_times;
+        auto starts = piece_put_detail::RetryMetadata<PiecePutStartResponse>(
+            requests,
+            [&](const auto& retry) {
+                return master_client_.BatchPiecePutStart(retry);
+            },
+            &send_times);
+        std::vector<std::vector<Replica::Descriptor>> replicas;
+        std::vector<std::vector<Slice>> slices;
+        std::vector<std::vector<uint64_t>> offsets;
+        std::vector<size_t> transfer_indices;
+        std::vector<PiecePutFinishRequest> finishes;
+        std::vector<size_t> finish_indices;
+        std::vector<ErrorCode> data_errors;
+        for (size_t i = 0; i < starts.size(); ++i) {
+            const size_t index = indices[i];
+            if (!starts[i]) {
+                results[index] = tl::unexpected(starts[i].error());
+                continue;
+            }
+            auto& start = *starts[i];
+            if (start.piece_completed) {
+                results[index] = PiecePutItemResult{true, false, std::nullopt};
+                continue;
+            }
+            ErrorCode error = ErrorCode::OK;
+            if (piece_put_detail::GrantExpired(
+                    start, send_times[i], std::chrono::steady_clock::now()))
+                error = ErrorCode::LEASE_EXPIRED;
+            if (start.replicas.empty()) error = ErrorCode::INVALID_REPLICA;
+            for (const auto& replica : start.replicas) {
+                if (!replica.is_memory_replica()) {
+                    error = ErrorCode::INVALID_REPLICA;
+                    break;
+                }
+                const auto& buffer =
+                    replica.get_memory_descriptor().buffer_descriptor;
+                if (buffer.protocol_ == "tcp") {
+                    if (tcp_proto && std::strcmp(tcp_proto, "1") == 0) {
+                        error = ErrorCode::NOT_SUPPORTED;
+                        break;
+                    }
+                    const auto target =
+                        transfer_engine_->getMetadata()->getSegmentDescByName(
+                            buffer.transport_endpoint_);
+                    if (!target || target->tcp_proto_version < 2) {
+                        error = ErrorCode::NOT_SUPPORTED;
+                        break;
+                    }
+                }
+            }
+            finish_indices.push_back(index);
+            finishes.push_back({std::move(start.handle), false});
+            data_errors.push_back(error);
+            if (error != ErrorCode::OK) continue;
+            transfer_indices.push_back(finishes.size() - 1);
+            replicas.push_back(std::move(start.replicas));
+            slices.push_back(items[index].slices);
+            std::vector<uint64_t> entry_offsets;
+            uint64_t offset = items[index].offset;
+            for (const auto& slice : items[index].slices) {
+                entry_offsets.push_back(offset);
+                offset += slice.size;
+            }
+            offsets.push_back(std::move(entry_offsets));
+        }
+        if (!transfer_indices.empty()) {
+            // Exactly one data submission per logical item. All fixed memory
+            // replicas are included by the existing coalesced scatter writer.
+            auto writes = BatchTransferWriteRanges(replicas, slices, offsets);
+            for (size_t i = 0; i < transfer_indices.size(); ++i) {
+                const auto finish_index = transfer_indices[i];
+                const bool applied = writes.size() == transfer_indices.size() &&
+                                     writes[i].has_value();
+                finishes[finish_index].applied = applied;
+                if (!applied)
+                    data_errors[finish_index] =
+                        writes.size() == transfer_indices.size()
+                            ? writes[i].error()
+                            : ErrorCode::TRANSFER_FAIL;
+            }
+        }
+        auto confirmed =
+            piece_put_detail::RetryMetadata<PiecePutFinishResponse>(
+                finishes, [&](const auto& retry) {
+                    return master_client_.BatchPiecePutFinish(retry);
+                });
+        for (size_t i = 0; i < finishes.size(); ++i) {
+            const auto index = finish_indices[i];
+            results[index] = piece_put_detail::MapFinishResult(
+                finishes[i].handle, confirmed[i], data_errors[i]);
+            // The Master may already have published even when Finish's reply
+            // is unknown. Cancel stale local fills again after that boundary.
+            if (hot_cache_ && results[index])
+                hot_cache_->RemoveHotKey(finishes[i].handle.key);
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<PiecePutItemResult, ErrorCode>> Client::CommitPiecePut(
+    std::span<const PiecePutCommitHandle> handles) {
+    std::vector<tl::expected<PiecePutItemResult, ErrorCode>> results(
+        handles.size(), tl::unexpected(ErrorCode::ILLEGAL_CLIENT));
+    for (size_t begin = 0; begin < handles.size();
+         begin += kPiecePutWindowSize) {
+        const size_t end =
+            std::min(handles.size(), begin + kPiecePutWindowSize);
+        std::vector<PiecePutFinishRequest> requests;
+        std::vector<size_t> indices;
+        for (size_t i = begin; i < end; ++i) {
+            if (handles[i].client_id != client_id_) continue;
+            requests.push_back({handles[i], true});
+            indices.push_back(i);
+        }
+        auto confirmed =
+            piece_put_detail::RetryMetadata<PiecePutFinishResponse>(
+                requests, [&](const auto& retry) {
+                    return master_client_.BatchPiecePutFinish(retry);
+                });
+        for (size_t i = 0; i < confirmed.size(); ++i) {
+            results[indices[i]] = piece_put_detail::MapFinishResult(
+                handles[indices[i]], confirmed[i]);
+            if (hot_cache_ && results[indices[i]])
+                hot_cache_->RemoveHotKey(handles[indices[i]].key);
+        }
     }
     return results;
 }

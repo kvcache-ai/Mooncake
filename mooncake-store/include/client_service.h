@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "piece_put.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -336,6 +337,19 @@ class Client {
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager,
         bool group_by_target = false);
+
+    // All producers must use a shared write_id for one computation and disjoint
+    // ranges. A successful piece is hidden until the whole object is published.
+    // Source slices stay registered/alive until the call returns. A pending
+    // commit contains no source pointers and must be retried with
+    // CommitPiecePut.
+    tl::expected<PiecePutItemResult, ErrorCode> PiecePut(
+        const PiecePutItem& item, const ReplicateConfig& config = {});
+    std::vector<tl::expected<PiecePutItemResult, ErrorCode>> BatchPiecePut(
+        std::span<const PiecePutItem> items,
+        const ReplicateConfig& config = {});
+    std::vector<tl::expected<PiecePutItemResult, ErrorCode>> CommitPiecePut(
+        std::span<const PiecePutCommitHandle> handles);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -1186,6 +1200,7 @@ class Client {
 
     // Client identification
     const UUID client_id_;
+    std::atomic<uint64_t> piece_put_next_op_id_{1};
 
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;

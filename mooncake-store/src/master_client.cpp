@@ -91,6 +91,16 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPiecePutStart> {
+    static constexpr const char* value = "BatchPiecePutStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPiecePutFinish> {
+    static constexpr const char* value = "BatchPiecePutFinish";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -828,6 +838,22 @@ MasterClient::BatchGetReplicaListReadOnly(
                                                  object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+MasterClient::BatchPiecePutStart(
+    const std::vector<PiecePutStartRequest>& requests) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchPiecePutStart,
+                            PiecePutStartResponse>(
+        requests.size(), client_id_, requests, tenant_id_.value());
+}
+
+std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+MasterClient::BatchPiecePutFinish(
+    const std::vector<PiecePutFinishRequest>& requests) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchPiecePutFinish,
+                            PiecePutFinishResponse>(
+        requests.size(), client_id_, requests, tenant_id_.value());
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
