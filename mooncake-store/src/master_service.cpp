@@ -6243,21 +6243,28 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                     }
                 }
 
+                const bool has_object_replica =
+                    metadata.HasReplica(&Replica::fn_is_object_storage_replica);
                 const bool has_read_lease = !metadata.IsLeaseExpired(now);
-                if (has_read_lease &&
-                    metadata.HasReplica([](const Replica& replica) {
-                        return !replica.is_memory_replica() &&
-                               !replica.is_object_storage_replica();
-                    })) {
-                    // File-backed reads can resolve storage by key, so they
-                    // cannot retain an old version across replacement.
-                    return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                if (has_read_lease) {
+                    // HA replay cannot reserve the old memory address after
+                    // an object-storage replacement commits.
+                    if (enable_ha_ &&
+                        (has_object_replica || config.os_replica_num) &&
+                        metadata.HasReplica(&Replica::fn_is_memory_replica)) {
+                        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                    }
+                    if (metadata.HasReplica([](const Replica& replica) {
+                            return !replica.is_memory_replica() &&
+                                   !replica.is_object_storage_replica();
+                        })) {
+                        // File-backed reads can resolve storage by key.
+                        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                    }
                 }
 
                 const bool requires_fresh_object_replicas =
-                    config.os_replica_num ||
-                    metadata.HasReplica(
-                        &Replica::fn_is_object_storage_replica) ||
+                    config.os_replica_num || has_object_replica ||
                     (object_uploads_ &&
                      object_uploads_->FirstObjectUploadForKey(
                          object_id.tenant_id.value(), key));

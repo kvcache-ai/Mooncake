@@ -138,6 +138,7 @@ def forward(endpoint, method, path, headers, body):
 class Environment:
     def __init__(self, args):
         self.args = args
+        self.read_lease_seconds = 10 if args.scenario == "gc" else 3
         self.output = args.output
         self.output.mkdir(parents=True, exist_ok=False)
         self.children = []
@@ -248,7 +249,7 @@ class Environment:
                 f"--object_storage_max_pending_records={max_pending_records}",
                 f"--object_storage_cleanup_interval_ms={cleanup_interval_ms}",
                 f"--object_storage_maintenance_batch_size={maintenance_batch_size}",
-                f"--default_kv_lease_ttl={10000 if self.args.scenario == 'gc' else 3000}ms",
+                f"--default_kv_lease_ttl={self.read_lease_seconds * 1000}ms",
                 "--ha_leader_lease_ttl_sec=5",
                 f"--put_start_discard_timeout_sec={2 if self.args.scenario == 'import' else 30}",
                 f"--put_start_release_timeout_sec={5 if self.args.scenario == 'import' else 600}",
@@ -347,6 +348,8 @@ def run_basic(args):
         old_objects = env.names()
         assert len(old_objects) == 1, old_objects
         replacement = value[::-1]
+        if config.replica_num:
+            time.sleep(env.read_lease_seconds)
         assert writer.upsert("value", replacement, config) == 0
         assert reader.get("value") == replacement
         assert len(env.names() - old_objects) == 1
@@ -367,6 +370,8 @@ def run_basic(args):
             assert results[0] != 0 and results[1] == 0, results
             assert reader.get("batch-a") in (None, b"")
             assert reader.get("batch-b") == values[1]
+            if config.replica_num:
+                time.sleep(env.read_lease_seconds)
             assert writer.batch_upsert_from(
                 ["batch-a", "batch-b"], addresses, sizes, config
             ) == [0, 0]
@@ -381,7 +386,8 @@ def run_basic(args):
         wait_for(
             lambda: all(
                 not replica.is_memory_replica()
-                for replica in reader.get_replica_desc("value")
+                for key in ("value", "leased")
+                for replica in reader.get_replica_desc(key)
             ),
             "original owner replicas removed",
         )
@@ -529,6 +535,7 @@ def run_budget(args):
         assert command("revoke") == ["0"]
         assert writer.remove("stable", True) == 0
         env.report("revoke and delete remain available above the pending budget")
+        time.sleep(env.read_lease_seconds)
         assert writer.upsert("budget", new, memory_config) == 0
         deadline = time.monotonic() + 15
         while env.names() and time.monotonic() < deadline:
