@@ -93,6 +93,7 @@ impl StorageOwnerState {
             pending_cold_deletes: parking_lot::Mutex::new(
                 super::super::PendingColdDeleteQueue::default(),
             ),
+            pending_delete_gc_cursors: parking_lot::Mutex::new(BTreeMap::new()),
             pending_delete_next_due_at_ms: AtomicU64::new(u64::MAX),
             pending_publication_authority_retry: parking_lot::Mutex::new(
                 super::super::PendingPublicationAuthorityRetry::default(),

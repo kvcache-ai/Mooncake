@@ -237,6 +237,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         }
         config.set(entry.second, parseBool(normalized));
     }
+    if (const char* mode = std::getenv("MC_MNNVL_SYNC_MODE"))
+        config.set("transports/mnnvl/sync_mode", std::string(mode));
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -328,6 +330,22 @@ Status parseMnnvlConfig(const Config& config, MnnvlConfig& options) {
     };
     CHECK_STATUS(
         read_bool("transports/mnnvl/require_fabric", parsed.require_fabric));
+    const auto mode = config.get("transports/mnnvl/sync_mode", "cpu_block");
+    if ((configured("transports/mnnvl/sync_mode") &&
+         config.get<json>("transports/mnnvl/sync_mode", json()).type() !=
+             json::value_t::string) ||
+        (mode != "cpu_block" && mode != "gpu_wait"))
+        return Status::InvalidArgument(
+            "MNNVL sync_mode must be cpu_block or gpu_wait");
+    parsed.gpu_wait = mode == "gpu_wait";
+    if (parsed.gpu_wait) {
+        bool queue_enabled = false;
+        CHECK_STATUS(read_bool("enable_runtime_queue", queue_enabled));
+        if (queue_enabled)
+            return Status::InvalidArgument(
+                "MNNVL gpu_wait requires direct caller-thread dispatch "
+                "(enable_runtime_queue=false)");
+    }
     parsed.egm_enabled = config.get("transports/mnnvl/egm", false);
     if (parsed.require_fabric) {
         CHECK_STATUS(read_bool("transports/mnnvl/egm", parsed.egm_enabled));

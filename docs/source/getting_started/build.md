@@ -29,6 +29,27 @@ make -j
 sudo make install
 ```
 
+(build-with-hpe-slingshot-cxi)=
+### Build with HPE Slingshot (CXI)
+
+In addition to the common dependencies above, install the site's CXI drivers,
+libcxi, and libfabric with the CXI provider. Check the provider before building:
+
+```bash
+fi_info -p cxi
+cmake -S . -B build-cxi -DUSE_CXI=ON -DUSE_EFA=OFF -DUSE_TENT=OFF
+cmake --build build-cxi -j
+sudo cmake --install build-cxi
+```
+
+If libfabric is outside the default search paths, pass
+`-DLIBFABRIC_INCLUDE_DIR=/path/to/libfabric/include` and
+`-DLIBFABRIC_LIBRARY=/path/to/libfabric/lib/libfabric.so` (or `lib64`), and make
+that library directory available to the runtime linker. For GPU buffers, add
+`-DUSE_CUDA=ON` or `-DUSE_HIP=ON` and use the matching libfabric memory support.
+See {ref}`HPE Slingshot (CXI) <hpe-slingshot-cxi>` for protocol
+selection, device discovery, and current limitations.
+
 ### Build with VRAM Segment
 
 To enable VRAM Segment, install CUDA toolkit and build Mooncake with
@@ -514,6 +535,7 @@ The following options can be passed to `cmake ..`.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/transport/efa_transport.md). |
+| `-DUSE_CXI=ON/OFF` | Disabled unless set | Enable HPE Slingshot Cassini transport via libfabric's CXI provider. See {ref}`Build with HPE Slingshot <build-with-hpe-slingshot-cxi>`. |
 | `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
 | `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
 | `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |

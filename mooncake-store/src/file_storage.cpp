@@ -210,6 +210,23 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 }
 
 FileStorage::~FileStorage() {
+    if (!Shutdown())
+        LOG(ERROR) << "FileStorage shutdown retained a registered arena";
+#ifdef USE_URING
+    // client_buffer_allocator_ frees the staging buffer after this body, so
+    // unpin it here: the source registration and every I/O thread's clone of
+    // it would otherwise keep the freed pages pinned for the process lifetime.
+    // The owner stops issuing I/O through this FileStorage before destroying
+    // it.
+    if (uring_buffer_registered_) UringFile::unregister_global_buffer();
+#endif
+    for (const auto& root : disk_roots_) {
+        if (root.fd >= 0) ::close(root.fd);
+    }
+}
+
+tl::expected<void, ErrorCode> FileStorage::Shutdown() {
+    std::lock_guard lock(shutdown_mutex_);
     LOG(INFO) << "Shutdown FileStorage...";
     heartbeat_running_ = false;
     WakeHeartbeat();
@@ -222,17 +239,24 @@ FileStorage::~FileStorage() {
     }
     // A metadata rescan can still be reading through the storage backend.
     if (rescan_future_.valid()) rescan_future_.wait();
-#ifdef USE_URING
-    // client_buffer_allocator_ frees the staging buffer after this body, so
-    // unpin it here: the source registration and every I/O thread's clone of
-    // it would otherwise keep the freed pages pinned for the process lifetime.
-    // The owner stops issuing I/O through this FileStorage before destroying
-    // it.
-    if (uring_buffer_registered_) UringFile::unregister_global_buffer();
-#endif
-    for (const auto& root : disk_roots_) {
-        if (root.fd >= 0) ::close(root.fd);
+    if (staging_registered_) {
+        auto result = client_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!result && result.error() != ErrorCode::NOT_REGISTERED) {
+            shutdown_error_ = result.error();
+            LOG(ERROR) << "Retaining FileStorage staging arena after "
+                          "unregister failure";
+            (void)new std::shared_ptr<ClientBufferAllocator>(
+                std::move(client_buffer_allocator_));
+        }
+        staging_registered_ = false;
     }
+    // All owned workers have stopped. Release this strong owner while the
+    // staging allocator is still alive, so Client's destructor can drain TE.
+    client_.reset();
+    if (shutdown_error_ != ErrorCode::OK)
+        return tl::unexpected(shutdown_error_);
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -1792,6 +1816,7 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
     }
+    staging_registered_ = true;
     return {};
 }
 
