@@ -33,6 +33,8 @@
 #include "allocator.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
+#include "master_service.h"
+#include "tenant/quota_policy_store.h"
 #include "utils/common.h"
 
 namespace fs = std::filesystem;
@@ -1015,14 +1017,16 @@ TEST_F(BucketRecoveryOwnershipTest, EvictionAndRemovalLeaveNestedFilesIntact) {
     }
 }
 
-TEST_F(StorageBackendTest, BucketKeepsReadableBytesAfterLostCompletionReply) {
+TEST_F(StorageBackendTest,
+       BucketKeepsReadableBytesWhenCompletionMayHavePublished) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketStorageBackend backend(config, BucketBackendConfig{});
     ASSERT_TRUE(backend.Init());
 
     std::string value = "published bytes";
-    for (auto error : {ErrorCode::RPC_TIMEOUT, ErrorCode::RPC_FAIL}) {
+    for (auto error : {ErrorCode::RPC_TIMEOUT, ErrorCode::RPC_FAIL,
+                       ErrorCode::INTERNAL_ERROR}) {
         const auto key = toString(error);
         auto expect_readable = [&] {
             std::string buffer(value.size(), '\0');
@@ -1045,8 +1049,81 @@ TEST_F(StorageBackendTest, BucketKeepsReadableBytesAfterLostCompletionReply) {
     }
     auto metadata = backend.GetStoreMetadata();
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->total_keys, 2);
-    EXPECT_GE(metadata->total_size, 2 * value.size());
+    EXPECT_EQ(metadata->total_keys, 3);
+    EXPECT_GE(metadata->total_size, 3 * value.size());
+}
+
+TEST_F(StorageBackendTest, BucketKeepsBytesAfterPartialMasterPublication) {
+    const TenantId tenant("registered");
+    const auto policy_path = fs::path(data_path) / "tenants.yaml";
+    {
+        std::ofstream policy(policy_path);
+        ASSERT_TRUE(policy);
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas.emplace(tenant.value(), 64 * 1024 * 1024);
+        policy << FormatTenantQuotaPolicyYaml(snapshot);
+    }
+    auto master_config =
+        MasterServiceConfig::builder()
+            .set_enable_multi_tenants(true)
+            .set_enable_offload(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(policy_path.string())
+            .build();
+    MasterService master(master_config);
+    const UUID owner = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "partial_completion_segment";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x100000000000ULL;
+    segment.size = 64 * 1024 * 1024;
+    ASSERT_TRUE(master.MountSegment(segment, owner));
+    ASSERT_TRUE(master.MountLocalDiskSegment(owner, true));
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+    std::string value = "published bytes";
+    const int64_t size = value.size();
+    const auto good_key = tenant.MakeScopedKey("accepted");
+    const TenantId unknown_tenant("unregistered");
+    const auto bad_key = unknown_tenant.MakeScopedKey("rejected");
+    auto result = backend.BatchOffload(
+        {{good_key, {{value.data(), value.size()}}},
+         {bad_key, {{value.data(), value.size()}}}},
+        [&](const auto& keys, auto& metadata) {
+            if (keys.size() != 2 || metadata.size() != 2) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+            if (keys.front() != good_key) {
+                std::swap(metadata[0], metadata[1]);
+            }
+            for (auto& entry : metadata) {
+                entry.transport_endpoint = segment.name;
+            }
+            const auto completed = master.NotifyOffloadSuccess(
+                owner,
+                {{tenant.value(), "accepted", size},
+                 {unknown_tenant.value(), "rejected", size}},
+                metadata);
+            return completed ? ErrorCode::OK : completed.error();
+        });
+    EXPECT_EQ(result, tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED));
+    auto replicas = master.GetReplicaList("accepted", tenant);
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_TRUE(replicas->replicas.front().is_local_disk_replica());
+    EXPECT_FALSE(master.GetReplicaList("rejected", unknown_tenant));
+
+    std::string buffer(value.size(), '\0');
+    std::unordered_map<std::string, Slice> reads{
+        {good_key, {buffer.data(), buffer.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(reads));
+    EXPECT_EQ(std::string_view(static_cast<const char*>(reads.at(good_key).ptr),
+                               value.size()),
+              value);
 }
 
 TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
@@ -1085,12 +1162,12 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
     auto offload_res = storage_backend.BatchOffload(
         batched_slices, [](const std::vector<std::string>& keys,
                            std::vector<StorageObjectMetadata>& metadatas) {
-            return ErrorCode::INTERNAL_ERROR;
+            return ErrorCode::OFFLOAD_NOT_DISPATCHED;
         });
 
     // Assertion 1: Offload returns the handler's error
     EXPECT_FALSE(offload_res.has_value());
-    EXPECT_EQ(offload_res.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(offload_res.error(), ErrorCode::OFFLOAD_NOT_DISPATCHED);
 
     // Assertion 2: All keys removed from object_bucket_map_
     for (const auto& key : test_keys) {
@@ -1123,76 +1200,6 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
     }
     EXPECT_EQ(bucket_file_count, 0)
         << "No bucket data or metadata files should remain after rollback";
-}
-
-TEST_F(StorageBackendTest, AdaptorRejectedWriteReleasesQuota) {
-    FileStorageConfig config;
-    config.storage_filepath = data_path;
-    config.total_size_limit = 3;
-    FilePerKeyConfig per_key_config;
-    per_key_config.fsdir = "objects";
-    per_key_config.enable_eviction = false;
-    StorageBackendAdaptor backend(config, per_key_config);
-    ASSERT_TRUE(backend.Init());
-    ASSERT_TRUE(
-        backend.ScanMeta([](const auto&, auto&) { return ErrorCode::OK; }));
-
-    std::string value = "old";
-    const std::unordered_map<std::string, std::vector<Slice>> batch{
-        {"rejected", {{value.data(), value.size()}}}};
-    for (auto error : {ErrorCode::INVALID_READ,
-                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS}) {
-        auto result = backend.BatchOffload(
-            batch, [error](const auto&, auto&) { return error; });
-        ASSERT_FALSE(result);
-        EXPECT_EQ(result.error(), error);
-        EXPECT_FALSE(backend.IsExist("rejected").value());
-        EXPECT_TRUE(backend.IsEnableOffloading().value());
-    }
-}
-
-TEST_F(StorageBackendTest, OffsetRejectedBatchRestoresOldValueAndQuota) {
-    FileStorageConfig config;
-    config.storage_filepath = data_path;
-    config.total_size_limit = 10 * 1024 * 1024;
-    config.total_keys_limit = 2;
-    OffsetAllocatorBackendConfig offset_config;
-    offset_config.low_watermark_keys = 1;
-    offset_config.high_watermark_keys = 2;
-    offset_config.persist_mode = OffsetPersistMode::kStrict;
-    auto backend =
-        std::make_unique<OffsetAllocatorStorageBackend>(config, offset_config);
-    ASSERT_TRUE(backend->Init());
-
-    std::string old_value = "old";
-    ASSERT_TRUE(backend->BatchOffload(
-        {{"key", {{old_value.data(), old_value.size()}}}}, nullptr));
-    std::string new_value = "new";
-    auto result = backend->BatchOffload(
-        {{"key", {{new_value.data(), new_value.size()}}},
-         {"rejected", {{new_value.data(), new_value.size()}}}},
-        [](const auto& keys, auto&) {
-            EXPECT_EQ(keys.size(), 2u);
-            return ErrorCode::INVALID_READ;
-        });
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_READ);
-    auto expect_rollback = [&](OffsetAllocatorStorageBackend& storage) {
-        EXPECT_FALSE(storage.IsExist("rejected").value());
-        EXPECT_TRUE(storage.IsEnableOffloading().value());
-        std::string loaded(3, '\0');
-        std::unordered_map<std::string, Slice> slices{
-            {"key", {loaded.data(), loaded.size()}}};
-        ASSERT_TRUE(storage.BatchLoad(slices));
-        EXPECT_EQ(loaded, old_value);
-    };
-    expect_rollback(*backend);
-    backend->SetSkipFinalCheckpointForTest();
-    backend.reset();
-
-    OffsetAllocatorStorageBackend recovered(config, offset_config);
-    ASSERT_TRUE(recovered.Init());
-    expect_rollback(recovered);
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
@@ -5636,10 +5643,10 @@ TEST_F(StorageBackendTest,
         auto rollback_res = storage_backend.BatchOffload(
             batch, [](const std::vector<std::string>&,
                       std::vector<StorageObjectMetadata>&) {
-                return ErrorCode::INTERNAL_ERROR;
+                return ErrorCode::OFFLOAD_NOT_DISPATCHED;
             });
         ASSERT_FALSE(rollback_res.has_value());
-        EXPECT_EQ(rollback_res.error(), ErrorCode::INTERNAL_ERROR);
+        EXPECT_EQ(rollback_res.error(), ErrorCode::OFFLOAD_NOT_DISPATCHED);
 
         auto exist_res = storage_backend.IsExist(rollback_key);
         ASSERT_TRUE(exist_res.has_value());
@@ -7010,8 +7017,9 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
             buckets.push_back(*result);
         }
         auto failed = backend.BatchOffload(
-            make_batch(bucket_count * keys_per_bucket),
-            [](const auto&, auto&) { return ErrorCode::INTERNAL_ERROR; });
+            make_batch(bucket_count * keys_per_bucket), [](const auto&, auto&) {
+                return ErrorCode::OFFLOAD_NOT_DISPATCHED;
+            });
         ASSERT_FALSE(failed.has_value());
         EXPECT_EQ(backend.GetStoreMetadata()->total_keys,
                   bucket_count * keys_per_bucket);

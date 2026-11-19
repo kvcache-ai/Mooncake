@@ -903,11 +903,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
-            // This bucket did not persist, so report its keys back to the
-            // master as failed regardless of whether we continue or abort.
-            // Doing it here (rather than only on the soft path) keeps their
-            // offloading tasks and source-replica refcounts from leaking until
-            // the put_start_release_timeout_sec_ TTL reaper fires.
+            // Release any remaining source references even when a completion
+            // error leaves the bucket on disk.
             for (const auto& [key, _] : host_batch_object) {
                 failed_tasks.push_back(task_by_storage_key.at(key));
             }

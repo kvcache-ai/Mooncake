@@ -36,6 +36,7 @@
 
 #include "master_client.h"
 #include "pyclient.h"
+#include "rpc_service.h"
 #include "test_server_helpers.h"
 #include "types.h"
 
@@ -122,6 +123,29 @@ TEST(RpcTimeoutTest, ErrorCodeValueAndString) {
     EXPECT_EQ(toString(ErrorCode::RPC_TIMEOUT), "RPC_TIMEOUT");
     // Distinct from the generic RPC failure code.
     EXPECT_NE(ErrorCode::RPC_TIMEOUT, ErrorCode::RPC_FAIL);
+}
+
+TEST_F(RpcTimeoutEnvTest, MissingOffloadCompletionMethodWasNotDispatched) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+    config.enable_metric_reporting = false;
+    WrappedMasterService master(config);
+    const auto ports = getFreeTcpPorts(1);
+    ASSERT_EQ(ports.size(), 1u);
+    coro_rpc::coro_rpc_server server(1, ports.front(), "127.0.0.1");
+    server.register_handler<&WrappedMasterService::ServiceReady>(&master);
+    auto started = server.async_start();
+    ASSERT_FALSE(started.hasResult());
+
+    const UUID owner = generate_uuid();
+    MasterClient client(owner);
+    ASSERT_EQ(client.Connect("127.0.0.1:" + std::to_string(ports.front())),
+              ErrorCode::OK);
+    EXPECT_EQ(
+        client.NotifyOffloadSuccess(owner, std::vector<OffloadTaskItem>{}, {}),
+        tl::unexpected(ErrorCode::OFFLOAD_NOT_DISPATCHED));
+    EXPECT_EQ(client.ExistKey("absent"), tl::unexpected(ErrorCode::RPC_FAIL));
+    server.stop();
 }
 
 // End-to-end: a small MC_RPC_TIMEOUT_MS must be honored by every RPC and turn

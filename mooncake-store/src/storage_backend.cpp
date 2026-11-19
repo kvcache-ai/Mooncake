@@ -539,7 +539,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     return {};
 }
 
-bool StorageBackend::RemoveFile(const std::string& path) {
+void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
     // StoreObject holds the same striped path lock across file creation, write,
     // and queue insertion. Acquiring it here serializes deletion with those
@@ -548,13 +548,15 @@ bool StorageBackend::RemoveFile(const std::string& path) {
 
     // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
-        std::error_code ec;
-        fs::remove(path, ec);
-        if (ec) {
-            LOG(ERROR) << "Failed to delete file: " << path
-                       << ", error: " << ec.message();
+        if (fs::exists(path)) {
+            std::error_code ec;
+            fs::remove(path, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to delete file: " << path
+                           << ", error: " << ec.message();
+            }
         }
-        return !ec;
+        return;
     }
 
     // Eviction-enabled logic (local mode)
@@ -570,7 +572,7 @@ bool StorageBackend::RemoveFile(const std::string& path) {
             LOG(WARNING) << "File not found in tracking queue, assuming it's "
                             "already removed or untracked: "
                          << path;
-            return false;
+            return;
         }
     }
 
@@ -580,14 +582,13 @@ bool StorageBackend::RemoveFile(const std::string& path) {
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(ERROR) << "Failed to remove file: " << path
                        << ", Error: " << ec.message();
-            return false;
+            return;
         }
     }
 
     RemoveFileFromWriteQueue(path);
 
     ReleaseSpace(file_size);
-    return true;
 }
 
 void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
@@ -1340,22 +1341,12 @@ std::string StorageBackendAdaptor::ConcatSlicesToString(
     return out;
 }
 
-namespace {
-
-bool OffloadCompletionRejectedBeforePublication(ErrorCode error) {
-    return error == ErrorCode::INVALID_READ ||
-           error == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-}
-
-}  // namespace
-
 tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
-    MutexLocker mutation_lock(&mutation_mutex_);
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1366,8 +1357,6 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         return tl::make_unexpected(enable_offloading_res.error());
     }
     std::vector<StorageObjectMetadata> metadatas;
-    std::vector<size_t> written_sizes;
-    written_sizes.reserve(batch_object.size());
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
@@ -1412,7 +1401,6 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         metadatas.emplace_back(
             StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
                                   static_cast<int64_t>(kv.value.size()), ""});
-        written_sizes.push_back(kv_buf.size());
         keys.emplace_back(kv.key);
     }
 
@@ -1420,19 +1408,12 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code;
-            if (OffloadCompletionRejectedBeforePublication(error_code)) {
-                for (size_t i = 0; i < keys.size(); ++i) {
-                    auto path = FileUtil::ResolvePathFromKey(
-                        keys[i], file_storage_config_.storage_filepath,
-                        file_per_key_config_.fsdir);
-                    if (storage_backend_->RemoveFile(path)) {
-                        MutexLocker lock(&mutex_);
-                        --total_keys;
-                        total_size -= written_sizes[i];
-                    }
-                }
-            }
+            LOG(ERROR)
+                << "Complete handler failed: " << error_code << " - "
+                << keys.size()
+                << " keys were successfully written to disk but master was not "
+                   "notified. "
+                << "Master will learn about them via ScanMeta on next restart.";
             return tl::make_unexpected(error_code);
         }
     }
@@ -1444,7 +1425,6 @@ tl::expected<std::vector<std::string>, ErrorCode>
 StorageBackendAdaptor::EvictAboveDiskWatermark(
     double high_watermark_ratio, double low_watermark_ratio,
     EvictionHandler eviction_handler) {
-    MutexLocker mutation_lock(&mutation_mutex_);
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         high_watermark_ratio, low_watermark_ratio, eviction_handler);
     if (!eviction_result) {
@@ -1597,7 +1577,6 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 }
 
 void StorageBackendAdaptor::RemoveAll() {
-    MutexLocker mutation_lock(&mutation_mutex_);
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
@@ -1866,10 +1845,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             LOG(ERROR) << "Complete handler failed: " << error_code
                        << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
-            // A transport error may arrive after the master registered the
-            // replica. Keep its bytes readable in that case.
-            if (error_code != ErrorCode::RPC_TIMEOUT &&
-                error_code != ErrorCode::RPC_FAIL) {
+            // The master can publish earlier entries before rejecting the
+            // rest of the batch, or publish before the reply is lost.
+            if (error_code == ErrorCode::OFFLOAD_NOT_DISPATCHED) {
                 RollbackCommittedBucket(bucket_id, committed_keys, disk_index);
             }
             return tl::make_unexpected(error_code);
@@ -5709,7 +5687,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     // DCHECK_GE guards in EvictToMakeRoom must also be re-evaluated.
     // ================================================================
 
-    MutexLocker mutation_lock(&mutation_mutex_);
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -5759,7 +5736,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
     // Prepared victims are held here until the master accepts their removal.
     // Their allocation handles prevent reuse before notification succeeds.
-    std::unordered_map<std::string, ObjectEntry> replaced_entries;
     PendingEviction pending_eviction;
 
     for (const auto& [key, slices] : batch_object) {
@@ -5977,9 +5953,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             const uint64_t seq = record_seq;
 
             if (!is_new_key) {
-                if (complete_handler) {
-                    replaced_entries.emplace(key, it->second);
-                }
                 size_delta -= static_cast<int64_t>(it->second.total_size);
                 if (eviction_on) fifo_index_.erase(it->second.fifo_seq);
             }
@@ -6104,72 +6077,13 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     // ---- Complete handler ----
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
-        if (OffloadCompletionRejectedBeforePublication(error_code)) {
-            std::vector<ObjectEntry> pinned_rejected_entries;
-            {
-                MutexLocker ev_lock(&eviction_mutex_);
-                for (const auto& key : keys) {
-                    auto& shard = shards_[ShardForKey(key)];
-                    SharedMutexLocker shard_lock(&shard.mutex);
-                    auto entry = shard.map.find(key);
-                    total_size_.fetch_sub(entry->second.total_size,
-                                          std::memory_order_relaxed);
-                    fifo_index_.erase(entry->second.fifo_seq);
-                    auto previous = replaced_entries.find(key);
-                    if (previous != replaced_entries.end()) {
-                        if (persist_enabled &&
-                            entry->second.allocation.use_count() > 1) {
-                            pinned_rejected_entries.push_back(
-                                std::move(entry->second));
-                        }
-                        entry->second = std::move(previous->second);
-                        total_size_.fetch_add(entry->second.total_size,
-                                              std::memory_order_relaxed);
-                        if (eviction_on) {
-                            fifo_index_.emplace(entry->second.fifo_seq, key);
-                        }
-                    } else {
-                        shard.map.erase(entry);
-                        total_keys_.fetch_sub(1, std::memory_order_relaxed);
-                        if (persist_enabled)
-                            all_evicted_this_batch_.insert(key);
-                    }
-                }
-            }
-            metadata_dirty_.store(true, std::memory_order_relaxed);
-            if (persist_enabled) {
-                // The checkpoint includes extents still pinned by readers.
-                // Recovery must skip a rejected replacement in such an extent.
-                std::array<char, RecordHeader::SIZE> invalid_header{};
-                for (const auto& entry : pinned_rejected_entries) {
-                    iovec header{invalid_header.data(), invalid_header.size()};
-                    auto written =
-                        data_file->vector_write(&header, 1, entry.offset);
-                    if (!written || *written != invalid_header.size()) {
-                        LOG(ERROR) << "Failed to invalidate rejected record at "
-                                   << entry.offset;
-                    }
-                }
-                pinned_rejected_entries.clear();
-                auto checkpoint = data_file->datasync();
-                auto saved = checkpoint
-                                 ? SaveMetadata(all_evicted_this_batch_)
-                                 : tl::expected<void, ErrorCode>(
-                                       tl::make_unexpected(checkpoint.error()));
-                if (saved) {
-                    all_evicted_this_batch_.clear();
-                } else {
-                    LOG(ERROR)
-                        << "Rejected offload rollback checkpoint failed: "
-                        << saved.error();
-                }
-            }
-        } else if (!replaced_entries.empty()) {
-            replaced_entries.clear();
-            metadata_dirty_.store(true, std::memory_order_relaxed);
-        }
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code;
+            LOG(ERROR) << "Complete handler failed: " << error_code << " - "
+                       << keys.size()
+                       << " keys were successfully written to disk but "
+                          "master was not notified. "
+                       << "Master will learn about them via ScanMeta on "
+                          "next restart.";
             return tl::make_unexpected(error_code);
         }
     }
@@ -6471,7 +6385,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
 }
 
 void OffsetAllocatorStorageBackend::RemoveAll() {
-    MutexLocker mutation_lock(&mutation_mutex_);
     // Acquire exclusive locks on all shards to safely clear the maps and
     // reset counters. The single-arg SharedMutexLocker constructor takes
     // exclusive mode (see mutex.h), so map.clear() is safe. The shard locks
