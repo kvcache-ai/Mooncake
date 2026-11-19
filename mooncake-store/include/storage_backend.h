@@ -551,7 +551,7 @@ class StorageBackend {
      * @brief Deletes the physical file associated with the given object key
      * @param path Path to the file to remove
      */
-    void RemoveFile(const std::string& path);
+    bool RemoveFile(const std::string& path);
 
     /**
      * @brief Removes objects from the storage backend whose keys match a regex
@@ -794,6 +794,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     std::unique_ptr<StorageBackend> storage_backend_;
 
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
+
+    Mutex mutation_mutex_;
 
     mutable Mutex mutex_;
 
@@ -1741,6 +1743,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // Mutex protecting fifo_index_ and insert_seq_. Must be acquired BEFORE
     // any shard mutex (shards_[i].mutex) when both are held.
+    Mutex mutation_mutex_;
     mutable Mutex eviction_mutex_;
 
     // Global FIFO index: insertion sequence number -> key.
