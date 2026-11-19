@@ -512,11 +512,21 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
     def test_async_batch_arrays_with_nonblocking_check_status(self):
         """Test batch_transfer_async_{write,read}_arrays with transfer_check_status and batch_transfer_check_status."""
         from array import array
+        import time
 
         adaptor = self.adaptor
         base_src_addr = self._ensure_buffer_available()
         base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
         self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        def wait_single(batch_id: int, label: str, timeout_s: float = 30.0) -> int:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                rc = adaptor.transfer_check_status(batch_id)
+                if rc != 0:
+                    return rc
+                time.sleep(0.0005)
+            self.fail(f"Timed out waiting for {label} batch {batch_id}")
 
         # Empty 0-descriptor batch should complete cleanly with status 1.
         empty = array("Q")
@@ -524,11 +534,7 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             self.target_server_name, empty, empty, empty
         )
         self.assertNotEqual(empty_bid, 0)
-        while True:
-            rc = adaptor.transfer_check_status(empty_bid)
-            if rc != 0:
-                self.assertEqual(rc, 1)
-                break
+        self.assertEqual(wait_single(empty_bid, "empty write"), 1)
 
         # Submit two multi-chunk array write batches and poll them together via
         # vectorized batch_transfer_check_status.
@@ -567,7 +573,13 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             write_bids.append(bid)
 
         pending = list(write_bids)
+        write_deadline = time.monotonic() + 30.0
         while pending:
+            self.assertLess(
+                time.monotonic(),
+                write_deadline,
+                f"Timed out waiting for vectorized write batches {pending}",
+            )
             statuses = adaptor.batch_transfer_check_status(pending)
             self.assertEqual(len(statuses), len(pending))
             still_pending = []
@@ -577,6 +589,8 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
                 else:
                     self.assertEqual(st, 1, f"write batch {bid} failed with {st}")
             pending = still_pending
+            if pending:
+                time.sleep(0.0005)
 
         # Read all chunks back in a single array batch and poll with transfer_check_status.
         total_chunks = 2 * chunks_per_batch
@@ -595,11 +609,7 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             self.target_server_name, read_addrs, remote_addrs, read_lengths
         )
         self.assertNotEqual(read_bid, 0)
-        while True:
-            rc = adaptor.transfer_check_status(read_bid)
-            if rc != 0:
-                self.assertEqual(rc, 1)
-                break
+        self.assertEqual(wait_single(read_bid, "array read"), 1)
 
         for i, addr in enumerate(read_addrs):
             self.assertEqual(

@@ -873,7 +873,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 static Status lookupTask(BatchID batch_id, size_t task_id,
                          const Transport::TransferTask*& task) {
     if (!Transport::isValidBatchID(batch_id))
-        return Status::InvalidArgument("Invalid Batch ID");
+        return Status::InvalidArgument("Invalid batch ID");
     const auto& batch_desc = Transport::toBatchDesc(batch_id);
     if (task_id >= batch_desc.task_list.size())
         return Status::InvalidArgument("Task ID out of range");

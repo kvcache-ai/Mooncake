@@ -1312,11 +1312,6 @@ int TransferEnginePy::getBatchTransferStatus(
     if (!engine_) return -1;
     for (auto& batch_id : batch_ids) {
         if (!Transport::isValidBatchID(batch_id)) {
-            for (auto& valid_id : batch_ids) {
-                if (Transport::isValidBatchID(valid_id)) {
-                    engine_->freeBatchID(valid_id);
-                }
-            }
             return -1;
         }
     }
@@ -1443,7 +1438,8 @@ int TransferEnginePy::checkSingleBatchStatus(batch_id_t batch_id) {
     TransferStatus status;
     Status s = engine_->getBatchTransferStatus(batch_id, status);
     if (!s.ok()) {
-        return -1;
+        Status free_s = engine_->freeBatchID(batch_id);
+        return (free_s.ok() || free_s.IsBatchCleanupDeferred()) ? -2 : -1;
     }
     if (status.s == TransferStatusEnum::WAITING ||
         status.s == TransferStatusEnum::PENDING) {
