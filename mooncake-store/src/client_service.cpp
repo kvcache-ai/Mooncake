@@ -1851,7 +1851,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     };
     std::unordered_map<std::string, TargetReadGroup> target_groups;
     std::vector<size_t> object_reads;
-    std::optional<bool> independent_destinations;
     auto destinations_are_disjoint = [&] {
         std::vector<std::pair<uintptr_t, size_t>> ranges;
         for (const auto& key : object_keys) {
@@ -1868,6 +1867,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                                       return b.first - a.first < a.second;
                                   }) == ranges.end();
     };
+    // Decide before submitting any transfer: an earlier memory read may
+    // otherwise still be writing when an overlapping object GET starts.
+    const bool serialize_reads =
+        object_storage_backend_ && object_keys.size() > 1 &&
+        std::any_of(query_results.begin(), query_results.end(),
+                    [](const auto& q) {
+                        return std::any_of(
+                            q.replicas.begin(), q.replicas.end(),
+                            [](const auto& r) {
+                                return r.is_object_storage_replica();
+                            });
+                    }) &&
+        !destinations_are_disjoint();
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<Replica::Descriptor> dfs_read_replicas;
@@ -1917,6 +1929,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
+        if (serialize_reads) {
+            results[i] = Get(key, query_result, slices_it->second);
+            continue;
+        }
+
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
@@ -1926,12 +1943,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         if (replica.is_object_storage_replica()) {
-            if (!independent_destinations.has_value())
-                independent_destinations = destinations_are_disjoint();
-            if (*independent_destinations)
-                object_reads.push_back(i);
-            else
-                results[i] = Get(key, query_result, slices_it->second);
+            object_reads.push_back(i);
             continue;
         }
         // Submit transfer operation asynchronously
@@ -2023,15 +2035,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Submit the other media first. Object GETs may block on a remote call.
-    // Parallelize disjoint host destinations; aliases retain submission order
-    // and staged device reads keep the batch's previous staging requirement.
+    // Only single-slice host reads bypass the shared staging budget.
     bool parallel_reads = object_reads.size() > 1;
     if (parallel_reads) {
         auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
         for (size_t index : object_reads) {
-            for (const auto& slice : slices.at(object_keys[index]))
-                if (slice.size && runtime.FindDeviceForPointer(slice.ptr))
+            bool found_slice = false;
+            for (const auto& slice : slices.at(object_keys[index])) {
+                if (!slice.size) continue;
+                if (found_slice || runtime.FindDeviceForPointer(slice.ptr)) {
                     parallel_reads = false;
+                    break;
+                }
+                found_slice = true;
+            }
             if (!parallel_reads) break;
         }
     }
