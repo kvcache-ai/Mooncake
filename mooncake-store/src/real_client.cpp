@@ -1142,14 +1142,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             device_name, resolved_master_server_addr, transfer_engine,
             {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
         if (!client_opt) {
-            LOG(ERROR) << "Failed to create client";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            LOG(ERROR) << "Failed to create client: "
+                       << toString(client_opt.error());
+            return tl::unexpected(client_opt.error());
         }
         client_ = *client_opt;
     } else {
-        // Auto port binding with retry on metadata registration failure
+        // Auto port binding with retry
         const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
         bool success = false;
+        ErrorCode last_error = ErrorCode::INTERNAL_ERROR;
 
         for (int retry = 0; retry < auto_port_config.max_retries; ++retry) {
             // Create port binder to hold a port
@@ -1180,19 +1182,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 break;
             }
 
-            // Failed to create client (possibly due to metadata registration
-            // conflict), release port and retry with a different port
-            LOG(WARNING) << "Failed to create client on port " << port
-                         << ", retry " << (retry + 1) << "/"
-                         << auto_port_config.max_retries;
+            last_error = client_opt.error();
+            LOG(WARNING) << "Failed to create client on port " << port << ": "
+                         << toString(last_error) << ", retry " << (retry + 1)
+                         << "/" << auto_port_config.max_retries;
             port_binder_.reset();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (!success) {
             LOG(ERROR) << "Failed to create client after "
-                       << auto_port_config.max_retries << " retries";
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                       << auto_port_config.max_retries
+                       << " retries, last error: " << toString(last_error);
+            return tl::unexpected(last_error);
         }
     }
 
