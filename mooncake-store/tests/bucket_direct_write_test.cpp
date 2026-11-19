@@ -294,11 +294,12 @@ TEST_P(BucketDirectWriteTest, LayoutRollbackAndRestartReadback) {
                           std::filesystem::directory_iterator{});
         Values failed{{"must-rollback", std::string(8193, 'z')}};
         auto failed_batch = MakeBatch(failed);
-        auto failure = backend.BatchOffload(
-            failed_batch,
-            [](const auto&, auto&) { return ErrorCode::INTERNAL_ERROR; });
+        auto failure =
+            backend.BatchOffload(failed_batch, [](const auto&, auto&) {
+                return ErrorCode::OFFLOAD_NOT_DISPATCHED;
+            });
         ASSERT_FALSE(failure);
-        EXPECT_EQ(failure.error(), ErrorCode::INTERNAL_ERROR);
+        EXPECT_EQ(failure.error(), ErrorCode::OFFLOAD_NOT_DISPATCHED);
         EXPECT_FALSE(backend.IsExist("must-rollback").value_or(true));
         EXPECT_EQ(std::distance(std::filesystem::directory_iterator(path_),
                                 std::filesystem::directory_iterator{}),
