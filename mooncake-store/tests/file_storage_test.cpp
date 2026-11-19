@@ -3144,87 +3144,58 @@ TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
     const std::string& expected_data = batch_data.at(target_key);
     constexpr int kConcurrency = 8;
 
-    std::vector<uint64_t> batch_ids(kConcurrency, 0);
-    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
-    std::atomic<int> started{0};
-    std::atomic<int> readers{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kConcurrency);
+    // One real cold read produces the shared staging; the remaining readers
+    // join it through the same alias path a singleflight follower takes
+    // (ShareStagingBuffer). This keeps the sharing deterministic — racing
+    // raw threads made it a scheduler lottery, because a local cold read
+    // finishes faster than the wake-up jitter between the "concurrent"
+    // readers.
+    auto leader = fileStorage.BatchGet({target_key}, {target_size});
+    ASSERT_TRUE(leader);
+    ASSERT_EQ(leader->pointers.size(), 1u);
+    ASSERT_NE(leader->pointers[0], 0u);
+    auto staging = ClientBufferBatch(fileStorage, leader->batch_id);
+    ASSERT_NE(staging, nullptr);
+    auto staging_weak = std::weak_ptr(staging);
 
-    // Reader 0 is the survivor: it holds its batch id until every other reader
-    // has released, which is exactly when a shared staging buffer must still
-    // be readable.
-    std::barrier sync_point(kConcurrency + 1);  // +1 for main thread
-
-    for (int i = 0; i < kConcurrency; ++i) {
-        threads.emplace_back([&, i] {
-            started.fetch_add(1);
-            while (started.load() < kConcurrency) {
-                std::this_thread::yield();
-            }
-            auto result = fileStorage.BatchGet({target_key}, {target_size});
-            if (result) {
-                batch_ids[i] = result->batch_id;
-                if (result->pointers.size() == 1) {
-                    staging_ptrs[i] = result->pointers[0];
-                }
-                readers.fetch_add(1);
-            }
-            sync_point.arrive_and_wait();  // phase 1: everyone holds an id
-
-            if (i != 0 && batch_ids[i] != 0) {
-                EXPECT_TRUE(fileStorage.ReleaseBuffer(batch_ids[i]));
-            }
-            sync_point.arrive_and_wait();  // phase 2: the aliases are released
-            sync_point.arrive_and_wait();  // phase 3: the survivor may release
-
-            if (i == 0 && batch_ids[0] != 0) {
-                EXPECT_TRUE(fileStorage.ReleaseBuffer(batch_ids[0]));
-            }
-        });
+    std::vector<uint64_t> batch_ids{leader->batch_id};
+    for (int i = 1; i < kConcurrency; ++i) {
+        auto alias = FileStorageShareStagingBuffer(fileStorage, staging);
+        EXPECT_EQ(alias.pointers, leader->pointers)
+            << "Every reader must observe the same staging address";
+        batch_ids.push_back(alias.batch_id);
     }
-
-    sync_point.arrive_and_wait();  // wait for every reader to hold an id
-    EXPECT_EQ(readers.load(), kConcurrency)
-        << "All concurrent BatchGet calls should succeed";
+    // Drop the test's own strong reference: from here on only the batch
+    // table entries keep the staging alive, so the assertions below
+    // exercise the production lifetime, not the test's hold on it.
+    staging.reset();
 
     std::unordered_set<uint64_t> distinct_ids(batch_ids.begin(),
                                               batch_ids.end());
-    EXPECT_EQ(distinct_ids.size(), static_cast<size_t>(kConcurrency))
-        << "Each reader should own a distinct batch id";
+    EXPECT_EQ(distinct_ids.size(), static_cast<size_t>(kConcurrency));
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage),
+              static_cast<size_t>(kConcurrency));
 
-    int sharers = 0;
-    for (int i = 0; i < kConcurrency; ++i) {
-        if (staging_ptrs[i] == staging_ptrs[0]) {
-            sharers++;
-        }
+    // Releasing an alias must not free memory another reader still uses:
+    // after every alias is gone the survivor still reads the exact bytes.
+    for (int i = 1; i < kConcurrency; ++i) {
+        EXPECT_TRUE(fileStorage.ReleaseBuffer(batch_ids[i]));
     }
-    LOG(INFO) << "Shared staging test: " << sharers << "/" << kConcurrency
-              << " readers share the staging buffer of batch_id "
-              << batch_ids[0];
-    EXPECT_GT(sharers, 1)
-        << "Concurrent same-key readers should share one staging buffer";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 1u);
+    // Hard stop if the staging died early: reading below would copy from
+    // memory the pool already handed back.
+    ASSERT_FALSE(staging_weak.expired());
+    const std::string actual(reinterpret_cast<const char*>(leader->pointers[0]),
+                             target_size);
+    EXPECT_EQ(actual, expected_data)
+        << "Surviving reader must still read the shared staging buffer";
 
-    sync_point.arrive_and_wait();  // release every id but the survivor's
-
-    // Releasing an alias must not free memory another reader is still using.
-    if (staging_ptrs[0] != 0) {
-        std::string actual(reinterpret_cast<const char*>(staging_ptrs[0]),
-                           target_size);
-        EXPECT_EQ(actual, expected_data)
-            << "Shared staging must stay valid until the last reader releases";
-    }
-
-    sync_point.arrive_and_wait();  // the survivor releases its own id
-
-    for (auto& t : threads) {
-        t.join();
-    }
-
+    // The last release returns the staging memory to the pool.
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(batch_ids[0]));
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u);
+    EXPECT_TRUE(staging_weak.expired());
     EXPECT_FALSE(fileStorage.ReleaseBuffer(batch_ids[0]))
-        << "The survivor's reader already released that id";
-    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
-        << "The last release should return the staging buffer to the pool";
+        << "The released id must not be reusable";
 }
 
 TEST_F(FileStorageTest, BatchGetSingleflight_AliasLeasesAreIndependent) {
@@ -3282,8 +3253,7 @@ TEST_F(FileStorageTest,
     // Small pool, so the probe below can exhaust it and drive the eager GC.
     file_storage_config.local_buffer_size = kBufferSize;
     file_storage_config.total_keys_limit = 1000;
-    // Short-ish lease so an abandoned batch becomes reclaimable quickly, but
-    // comfortably longer than the concurrent cold reads below take to run.
+    // Short-ish lease so an abandoned batch becomes reclaimable quickly.
     file_storage_config.client_buffer_gc_ttl_ms = 2000;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
@@ -3294,70 +3264,61 @@ TEST_F(FileStorageTest,
     constexpr int kConcurrency = 8;
 
     // Every reader disappears right after its cold read without releasing,
-    // which is the worst case for a shared staging buffer: only the lease can
-    // still get the memory back.
-    std::atomic<int> started{0};
-    std::atomic<int> readers{0};
-    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
-    std::vector<std::thread> threads;
-    threads.reserve(kConcurrency);
+    // which is the worst case for a shared staging buffer: only the lease
+    // can still get the memory back. The readers join one real cold read
+    // through the singleflight follower alias path (deterministic sharing
+    // — see LastReleaseFreesSharedStaging for why raw racing threads do
+    // not work here).
+    auto leader = fileStorage.BatchGet({target_key}, {target_size});
+    ASSERT_TRUE(leader);
+    ASSERT_EQ(leader->pointers.size(), 1u);
+    ASSERT_NE(leader->pointers[0], 0u);
+    auto staging = ClientBufferBatch(fileStorage, leader->batch_id);
+    ASSERT_NE(staging, nullptr);
+    auto staging_weak = std::weak_ptr(staging);
 
-    for (int i = 0; i < kConcurrency; ++i) {
-        threads.emplace_back([&, i] {
-            started.fetch_add(1);
-            while (started.load() < kConcurrency) {
-                std::this_thread::yield();
-            }
-            auto result = fileStorage.BatchGet({target_key}, {target_size});
-            if (!result) return;
-            if (result->pointers.size() == 1) {
-                staging_ptrs[i] = result->pointers[0];
-            }
-            readers.fetch_add(1);
-            // Deliberately no ReleaseBuffer: the client is gone.
-        });
+    std::vector<uint64_t> batch_ids{leader->batch_id};
+    for (int i = 1; i < kConcurrency; ++i) {
+        auto alias = FileStorageShareStagingBuffer(fileStorage, staging);
+        EXPECT_EQ(alias.pointers, leader->pointers)
+            << "Every reader must observe the same staging address";
+        batch_ids.push_back(alias.batch_id);
     }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-    ASSERT_EQ(readers.load(), kConcurrency);
-
-    int sharers = 0;
-    for (int i = 0; i < kConcurrency; ++i) {
-        if (staging_ptrs[i] == staging_ptrs[0]) {
-            sharers++;
-        }
-    }
-    EXPECT_GT(sharers, 1)
-        << "Expected the concurrent readers to share one staging buffer";
-    EXPECT_EQ(ClientBufferBatchCount(fileStorage),
-              static_cast<size_t>(kConcurrency))
-        << "Every reader should hold its own batch id";
+    staging.reset();
+    std::unordered_set<uint64_t> distinct_ids(batch_ids.begin(),
+                                              batch_ids.end());
+    EXPECT_EQ(distinct_ids.size(), static_cast<size_t>(kConcurrency))
+        << "Every abandoned reader holds its own batch id";
 
     // These tests never call Init(), so the background GC thread is not
     // running; reclamation is driven by the eager GC inside AllocateBatch,
-    // which kicks in when an allocation fails. A whole-pool request cannot be
-    // satisfied while any batch is outstanding, so it always takes that path.
+    // which kicks in when an allocation fails. A whole-pool request cannot
+    // be satisfied while any batch is outstanding, so it always takes that
+    // path.
     const std::vector<std::string> probe_key = {target_key};
     const std::vector<int64_t> probe_size = {kBufferSize};
     auto probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
     ASSERT_FALSE(probe);
     EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
 
-    // The lease is still alive, so the eager GC must leave the abandoned batch
-    // alone: its reader may still be copying out of it.
+    // The lease is still alive, so the eager GC must leave the abandoned
+    // batch alone: its reader may still be copying out of it.
     EXPECT_EQ(ClientBufferBatchCount(fileStorage),
               static_cast<size_t>(kConcurrency))
-        << "An unexpired lease should keep the shared staging buffer reserved";
+        << "An unexpired lease should keep the shared staging buffer "
+           "reserved";
 
-    // Let the lease expire, then drive the eager GC once more.
+    // Let the lease expire, then drive the eager GC once more: the same
+    // whole-pool allocation must now succeed (AllocateBatch retries after
+    // collecting expired entries) and the staging must be gone.
     std::this_thread::sleep_for(std::chrono::milliseconds(
         file_storage_config.client_buffer_gc_ttl_ms + 100));
     probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
+    ASSERT_TRUE(probe);
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
         << "Abandoned shared staging buffers must be reclaimed once their "
            "lease expires, otherwise the memory leaks for good";
+    EXPECT_TRUE(staging_weak.expired());
 }
 
 }  // namespace mooncake
