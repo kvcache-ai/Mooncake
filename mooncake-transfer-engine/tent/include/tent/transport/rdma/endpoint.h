@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <queue>
 #include <unordered_set>
@@ -217,7 +218,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // rejects come back with `failed` set; the caller undoes what it did for
     // them.
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
-                     const std::function<void(RdmaSlice*)>& on_post = {});
+                     const std::function<void(RdmaSlice*)>& on_post = {},
+                     size_t max_slices = std::numeric_limits<size_t>::max());
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 

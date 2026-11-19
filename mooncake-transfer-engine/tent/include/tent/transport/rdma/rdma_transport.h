@@ -43,6 +43,9 @@ class RdmaEndPoint;
 class Workers;
 class EndpointStore;
 class LocalBuffers;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+class TentRdmaCongestionControl;
+#endif
 
 using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 
@@ -161,6 +164,11 @@ class RdmaTransport : public Transport {
     RdmaContextSet context_set_;
     std::unordered_map<std::string, int> context_name_lookup_;
     std::unique_ptr<Workers> workers_;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    // Outlives workers and orphan slices because active permits contain raw
+    // pointers to its shared-core domains.
+    std::unique_ptr<TentRdmaCongestionControl> rdma_congestion_control_;
+#endif
     std::shared_ptr<RdmaParams> params_;
 
     // Local notification queue for receiveNotification()
