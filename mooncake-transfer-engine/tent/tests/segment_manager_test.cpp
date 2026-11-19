@@ -110,6 +110,43 @@ TEST(SegmentManagerTest, UpdateLocalFailureDoesNotPublish) {
     EXPECT_EQ(manager->getLocal()->name, "local_test_segment");
 }
 
+TEST(SegmentManagerTest, MluGenerationAdvancesWhenBufferRemoved) {
+    auto manager = makeManager();
+    ASSERT_TRUE(manager
+                    ->updateLocal([](SegmentDesc& desc) -> Status {
+                        auto& memory = std::get<MemorySegmentDesc>(desc.detail);
+                        memory.transport_attrs.try_emplace(MLU);
+                        memory.buffers.push_back(makeBuffer(0x1000, 0x1000));
+                        return Status::OK();
+                    })
+                    .ok());
+    auto before = manager->getLocal();
+    ASSERT_EQ(before->getMemory().buffers.size(), 1u);
+    const auto* before_text = before->getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(before_text, nullptr);
+    const auto before_generation = std::stoull(*before_text);
+    ASSERT_GT(before_generation, 0u);
+    ASSERT_TRUE(
+        manager
+            ->updateLocal([](SegmentDesc& desc) -> Status {
+                std::get<MemorySegmentDesc>(desc.detail).buffers.clear();
+                return Status::OK();
+            })
+            .ok());
+    auto removed = manager->getLocal();
+    EXPECT_TRUE(removed->getMemory().buffers.empty());
+    const auto* removed_text = removed->getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(removed_text, nullptr);
+    const auto removed_generation = std::stoull(*removed_text);
+    EXPECT_EQ(removed_generation, before_generation + 1);
+
+    auto encoded = json::parse(*manager->getLocalDumpedJson());
+    auto decoded = encoded.get<SegmentDesc>();
+    const auto* decoded_text = decoded.getMemory().getTransportAttrs(MLU);
+    ASSERT_NE(decoded_text, nullptr);
+    EXPECT_EQ(*decoded_text, std::to_string(removed_generation));
+}
+
 TEST(SegmentManagerTest, JsonCacheInvalidatedOnPublication) {
     auto manager = makeManager();
     auto dump1 = manager->getLocalDumpedJson();

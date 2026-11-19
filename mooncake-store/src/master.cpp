@@ -9,6 +9,7 @@
 #include <memory>   // For std::unique_ptr
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -179,6 +180,22 @@ DEFINE_double(tenant_eviction_high_watermark_ratio,
               "quota sits at or below eviction_high_watermark_ratio reaches "
               "its own ceiling before the pool crosses the pool-wide "
               "watermark, so nothing ever reclaims on its behalf");
+DEFINE_uint32(eviction_worker_threads,
+              mooncake::DEFAULT_EVICTION_WORKER_THREADS,
+              "Threads that walk the eviction index in each memory eviction "
+              "pass. 0 picks one per 16M filed keys, clamped to [1, 64]; 1-64 "
+              "sets the count. Passes stay serial when an eviction policy, "
+              "reclaimer or observer cannot run concurrently (e.g. with "
+              "oplog or offload-on-evict)");
+DEFINE_validator(eviction_worker_threads,
+                 [](const char* flagname, uint32_t value) {
+                     if (value > mooncake::MAX_EVICTION_WORKER_THREADS) {
+                         LOG(ERROR) << flagname << " must be between 0 and "
+                                    << mooncake::MAX_EVICTION_WORKER_THREADS;
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -345,6 +362,8 @@ DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
     }
     return true;
 });
+DEFINE_uint32(ha_redis_expected_replicas_per_shard, 0,
+              "Expected replica membership per Redis shard; must be positive");
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
@@ -577,6 +596,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         "tenant_eviction_high_watermark_ratio",
         &master_config.tenant_eviction_high_watermark_ratio,
         FLAGS_tenant_eviction_high_watermark_ratio);
+    default_config.GetUInt32("eviction_worker_threads",
+                             &master_config.eviction_worker_threads,
+                             FLAGS_eviction_worker_threads);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -684,6 +706,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetUInt32(
+        "ha_redis_expected_replicas_per_shard",
+        &master_config.ha_redis_expected_replicas_per_shard,
+        FLAGS_ha_redis_expected_replicas_per_shard);
     default_config.GetInt64("ha_leader_lease_ttl_sec",
                             &master_config.ha_leader_lease_ttl_sec,
                             FLAGS_ha_leader_lease_ttl_sec);
@@ -926,6 +952,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.tenant_eviction_high_watermark_ratio =
             FLAGS_tenant_eviction_high_watermark_ratio;
     }
+    if ((google::GetCommandLineFlagInfo("eviction_worker_threads", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.eviction_worker_threads = FLAGS_eviction_worker_threads;
+    }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1128,6 +1159,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.ha_leader_lease_ttl_sec = FLAGS_ha_leader_lease_ttl_sec;
+    }
+    if (google::GetCommandLineFlagInfo("ha_redis_expected_replicas_per_shard",
+                                       &info) &&
+        !info.is_default) {
+        master_config.ha_redis_expected_replicas_per_shard =
+            FLAGS_ha_redis_expected_replicas_per_shard;
+    }
+    if (master_config.enable_ha && master_config.ha_backend_type == "redis" &&
+        master_config.ha_redis_expected_replicas_per_shard == 0) {
+        LOG(FATAL) << "ha_redis_expected_replicas_per_shard must be positive";
     }
     if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
         master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
@@ -1546,9 +1587,13 @@ int main(int argc, char* argv[]) {
     if (!master_config.ha_backend_connstring.empty() &&
         !master_config.etcd_endpoints.empty() &&
         master_config.ha_backend_connstring != master_config.etcd_endpoints) {
+        const std::string_view ha_backend_connstring_for_log =
+            master_config.ha_backend_type == "redis"
+                ? std::string_view{"<Redis endpoints>"}
+                : std::string_view{master_config.ha_backend_connstring};
         LOG(WARNING) << "Both ha_backend_connstring and etcd_endpoints are "
                      << "set. Using ha_backend_connstring="
-                     << master_config.ha_backend_connstring
+                     << ha_backend_connstring_for_log
                      << " for HA coordinator setup";
     }
     if (master_config.memory_allocator != "cachelib" &&
@@ -1612,6 +1657,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    const std::string_view ha_backend_connstring_for_log =
+        master_config.ha_backend_type == "redis"
+            ? std::string_view{"<Redis endpoints>"}
+            : std::string_view{ha_backend_connstring};
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -1628,6 +1677,7 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", tenant_eviction_high_watermark_ratio="
         << master_config.tenant_eviction_high_watermark_ratio
+        << ", eviction_worker_threads=" << master_config.eviction_worker_threads
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
         << ", weight_management_oplog_capability_confirmed="
@@ -1644,7 +1694,7 @@ int main(int argc, char* argv[]) {
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
-        << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", ha_backend_connstring=" << ha_backend_connstring_for_log
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", etcd_max_send_message_bytes="

@@ -255,6 +255,36 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* max_recv_wr_env = std::getenv("MC_MAX_RECV_WR");
+    if (max_recv_wr_env) {
+        int val = atoi(max_recv_wr_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.max_recv_wr = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_RECV_WR";
+    }
+
+    const char* max_rd_atomic_env = std::getenv("MC_MAX_RD_ATOMIC");
+    if (max_rd_atomic_env) {
+        int val = atoi(max_rd_atomic_env);
+        if (val > 0 && val <= UINT8_MAX)
+            config.max_rd_atomic = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_RD_ATOMIC";
+    }
+
+    const char* max_dest_rd_atomic_env = std::getenv("MC_MAX_DEST_RD_ATOMIC");
+    if (max_dest_rd_atomic_env) {
+        int val = atoi(max_dest_rd_atomic_env);
+        if (val > 0 && val <= UINT8_MAX)
+            config.max_dest_rd_atomic = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_MAX_DEST_RD_ATOMIC";
+    }
+
     const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
     if (signal_interval_env) {
         int val = atoi(signal_interval_env);
@@ -601,6 +631,29 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
+    // Resolved before the clash below, so that next to
+    // MC_ENABLE_HCA_PEER_AFFINITY the option is ignored whatever
+    // MC_ENABLE_DEST_DEVICE_AFFINITY says, and that clash then applies as is.
+    if (const char* value = std::getenv("MC_RDMA_WRITE_PREFER_DEST_NIC")) {
+        parseBoolConfigEnv(value, "MC_RDMA_WRITE_PREFER_DEST_NIC",
+                           config.rdma_write_prefer_dest_nic);
+    }
+    if (config.rdma_write_prefer_dest_nic) {
+        if (config.enable_hca_peer_affinity) {
+            LOG(ERROR) << "MC_RDMA_WRITE_PREFER_DEST_NIC and "
+                          "MC_ENABLE_HCA_PEER_AFFINITY cannot be enabled at "
+                          "the same time; ignoring "
+                          "MC_RDMA_WRITE_PREFER_DEST_NIC.";
+            config.rdma_write_prefer_dest_nic = false;
+        } else {
+            // The sender's NIC then follows the destination, and the peer
+            // must answer on the NIC of the same name. A worker reuses its
+            // last peer pick across slices, so the pairing covers every
+            // operation rather than WRITEs alone.
+            config.enable_dest_device_affinity = true;
+        }
+    }
+
     if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
         LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
                       "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
@@ -920,6 +973,8 @@ void updateGlobalConfig(ibv_device_attr& device_attr) {
         config.num_cq_per_ctx = device_attr.max_cq;
     if (config.max_wr > (size_t)device_attr.max_qp_wr)
         config.max_wr = device_attr.max_qp_wr;
+    if (config.max_recv_wr > (size_t)device_attr.max_qp_wr)
+        config.max_recv_wr = device_attr.max_qp_wr;
     if (config.max_sge > (size_t)device_attr.max_sge)
         config.max_sge = device_attr.max_sge;
     if (config.max_cqe > (size_t)device_attr.max_cqe)
@@ -943,6 +998,17 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "max_recv_wr = "
+              << (config.max_recv_wr ? std::to_string(config.max_recv_wr)
+                                     : std::string("<unset, = max_wr>"));
+    LOG(INFO) << "max_rd_atomic = "
+              << (config.max_rd_atomic
+                      ? std::to_string(config.max_rd_atomic)
+                      : std::string("<unset, device default>"));
+    LOG(INFO) << "max_dest_rd_atomic = "
+              << (config.max_dest_rd_atomic
+                      ? std::to_string(config.max_dest_rd_atomic)
+                      : std::string("<unset, device default>"));
     LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
@@ -975,6 +1041,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "rdma_write_prefer_dest_nic = "
+              << (config.rdma_write_prefer_dest_nic ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

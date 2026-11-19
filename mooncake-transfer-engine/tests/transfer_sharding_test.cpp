@@ -1033,6 +1033,32 @@ TEST_F(TentSharding, FacadePreservesExplicitHintAndIntent) {
         EXPECT_EQ(request.opcode, tt::Request::READ);
     }
 }
+
+TEST_F(TentSharding, FacadeRejectsUnsupportedProducerEvent) {
+    TransferEngine facade(false);
+    TransferEngineImplTestPeer::facade(facade, engine);
+    auto result = facade.tryShardedTransfer(
+        LOCAL_SEGMENT_ID, 1,
+        [&](size_t begin, size_t end) {
+            std::vector<TransferRequest> result;
+            for (const auto& source : requests(begin, end)) {
+                TransferRequest entry{};
+                entry.opcode = TransferRequest::WRITE;
+                entry.source = source.source;
+                entry.target_id = source.target_id;
+                entry.target_offset = source.target_offset;
+                entry.length = source.length;
+                entry.producer_event = reinterpret_cast<void*>(uintptr_t{1});
+                result.push_back(entry);
+            }
+            return result;
+        },
+        10s);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->ok());
+    EXPECT_EQ(transport->submits.load(), 0);
+    EXPECT_TRUE(transport->observed.empty());
+}
 #endif
 }  // namespace
 }  // namespace mooncake

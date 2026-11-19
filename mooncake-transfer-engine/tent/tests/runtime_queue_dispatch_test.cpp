@@ -56,6 +56,11 @@ class TransferEngineImplTestPeer {
     static bool hasActiveRuntimeQueue(tent::TransferEngineImpl& engine) {
         return engine.hasActiveRuntimeQueue();
     }
+    static bool eventHonored(tent::TransferEngineImpl& engine,
+                             const tent::Request& request,
+                             tent::TransportType type, bool staging) {
+        return engine.producerEventHonored(request, type, staging);
+    }
     // What the RDMA transport would install at construction; the tests swap
     // in a fake RDMA transport afterwards, so they install the provider here.
     static void setBandwidthProvider(tent::TransferEngineImpl& engine,
@@ -103,6 +108,7 @@ class FakeTransport : public Transport {
     std::atomic<int> status_calls{0};
     std::atomic<int> cancel_calls{0};
     bool cancellation_supported{true};
+    bool producer_event_supported{false};
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -162,6 +168,17 @@ class FakeTransport : public Transport {
 
     bool supportsCancellation() const override {
         return cancellation_supported;
+    }
+
+    bool supportsProducerEvent() const override {
+        return producer_event_supported;
+    }
+
+    void* lastProducerEvent() const {
+        auto* batch = static_cast<FakeSubBatch*>(last_batch_);
+        return batch && !batch->requests.empty()
+                   ? batch->requests.back().producer_event
+                   : nullptr;
     }
 
     Status cancelTransferTask(SubBatchRef batch, int task_id) override {
@@ -262,6 +279,82 @@ Request makeLocalWrite(uint8_t* ptr, size_t length) {
     request.length = length;
     request.transport_hint = RDMA;
     return request;
+}
+
+TEST(RuntimeQueueDispatch, RejectsUnsupportedProducerEventBeforeSubmission) {
+    for (bool queued : {false, true}) {
+        SCOPED_TRACE(queued);
+        auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+        cfg->set("enable_runtime_queue", queued);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        auto fake = std::make_shared<FakeTransport>(RDMA);
+        installFakeRdma(engine, fake);
+        std::vector<uint8_t> buffer(4096);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        auto batch = engine.allocateBatch(1);
+        ASSERT_NE(batch, (BatchID)0);
+        auto request = makeLocalWrite(buffer.data(), buffer.size());
+        request.producer_event = reinterpret_cast<void*>(uintptr_t{1});
+        auto status = engine.submitTransfer(batch, {request});
+        EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+        EXPECT_EQ(fake->submit_calls.load(), 0);
+        TransferStatus task_status{};
+        EXPECT_TRUE(engine.getTransferStatus(batch, 0, task_status)
+                        .IsInvalidArgument());
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    }
+}
+
+TEST(RuntimeQueueDispatch, PreservesSupportedProducerEventOnSubmission) {
+    for (bool queued : {false, true}) {
+        SCOPED_TRACE(queued);
+        auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+        cfg->set("enable_runtime_queue", queued);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        auto fake = std::make_shared<FakeTransport>(RDMA);
+        fake->producer_event_supported = true;
+        installFakeRdma(engine, fake);
+        std::vector<uint8_t> buffer(4096);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        auto batch = engine.allocateBatch(1);
+        ASSERT_NE(batch, (BatchID)0);
+        auto request = makeLocalWrite(buffer.data(), buffer.size());
+        request.producer_event = reinterpret_cast<void*>(uintptr_t{1});
+        ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+        EXPECT_EQ(fake->submit_calls.load(), 1);
+        EXPECT_EQ(fake->lastProducerEvent(), request.producer_event);
+        TransferStatus task_status{};
+        ASSERT_TRUE(engine.getTransferStatus(batch, 0, task_status).ok());
+        EXPECT_EQ(task_status.s, COMPLETED);
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    }
+}
+
+TEST(RuntimeQueueDispatch, ProducerEventGuardRejectsStagedRoutes) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    fake->producer_event_supported = true;
+    installFakeRdma(engine, fake);
+    Request request{};
+    request.producer_event = reinterpret_cast<void*>(uintptr_t{1});
+    EXPECT_TRUE(
+        TransferEngineImplTestPeer::eventHonored(engine, request, RDMA, false));
+    EXPECT_FALSE(
+        TransferEngineImplTestPeer::eventHonored(engine, request, RDMA, true));
+    EXPECT_FALSE(TransferEngineImplTestPeer::eventHonored(engine, request,
+                                                          UNSPEC, false));
+    EXPECT_FALSE(
+        TransferEngineImplTestPeer::eventHonored(engine, request, TCP, false));
 }
 
 TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
