@@ -35,9 +35,6 @@
 
 #include "common.h"
 #include "transfer_engine.h"
-#ifdef USE_TENT
-#include "tent/transfer_engine.h"
-#endif
 #include "topology.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
@@ -1036,22 +1033,6 @@ ErrorCode Client::InitTransferEngine(
                 << "Configure devices via TENT config file or environment "
                    "variables.";
         }
-#ifdef USE_TENT
-        // TENT picks the data transport itself and its UB transport is off
-        // unless transports/ub/enable is set. Without this check a client
-        // asking for "ub" would come up fine and carry its data over TCP.
-        if (protocol == "ub") {
-            auto tent_engine = transfer_engine_->getTentEngine();
-            if (!tent_engine || !tent_engine->hasTransport(tent::UB)) {
-                LOG(ERROR)
-                    << "protocol=ub was requested in TENT mode, but TENT did "
-                       "not install its UB transport. Set transports/ub/enable "
-                       "to true in the TENT config (MC_TENT_CONF) and check "
-                       "that a UB device and liburma are present.";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        }
-#endif
         return ErrorCode::OK;
     }
 

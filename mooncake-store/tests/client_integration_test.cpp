@@ -838,34 +838,6 @@ TEST_F(ClientIntegrationTest, UbMockCarriesPutAndGet) {
     EXPECT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
 }
-
-// TENT keeps its UB transport off unless transports/ub/enable is set, and it
-// would otherwise come up on TCP. A client that asks for "ub" must then fail
-// to start instead of quietly carrying its data over another transport.
-TEST_F(ClientIntegrationTest, UbRequestedWithoutTentUbTransportFails) {
-    namespace ub_mock = ::mooncake::tent::ub::mock;
-    if (!ub_mock::loopbackRequested() || FLAGS_protocol != "ub") {
-        GTEST_SKIP() << "needs the TENT UB loopback run with --protocol=ub";
-    }
-    const char* saved = std::getenv("MC_TENT_CONF");
-    const std::optional<std::string> saved_conf =
-        saved ? std::optional<std::string>(saved) : std::nullopt;
-    ASSERT_EQ(
-        setenv("MC_TENT_CONF", R"({"transports":{"ub":{"enable":false}}})", 1),
-        0);
-
-    auto client_opt =
-        Client::Create("localhost:17951",  // unique hostname
-                       "P2PHANDSHAKE", "ub", std::nullopt, master_address_);
-
-    if (saved_conf) {
-        setenv("MC_TENT_CONF", saved_conf->c_str(), 1);
-    } else {
-        unsetenv("MC_TENT_CONF");
-    }
-    EXPECT_FALSE(client_opt.has_value())
-        << "client started although TENT has no UB transport";
-}
 #endif
 
 constexpr size_t kReplicaCheckSize = 256 * 1024;

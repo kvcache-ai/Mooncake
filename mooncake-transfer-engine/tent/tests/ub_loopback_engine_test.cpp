@@ -139,22 +139,6 @@ class UbLoopbackEngineTest : public ::testing::Test {
     SegmentID segment_ = 0;
 };
 
-// Store relies on this to refuse protocol=ub when TENT has no UB transport.
-TEST_F(UbLoopbackEngineTest, ReportsInstalledTransports) {
-    EXPECT_TRUE(client_->hasTransport(UB));
-    EXPECT_FALSE(client_->hasTransport(TCP));
-    EXPECT_FALSE(client_->hasTransport(UNSPEC));
-    EXPECT_FALSE(client_->hasTransport(kNumTransportTypes));
-
-    auto config = makeUbOnlyConfig();
-    config->set("transports/ub/enable", false);
-    config->set("transports/tcp/enable", true);
-    TransferEngine tcp_only(config);
-    ASSERT_TRUE(tcp_only.available());
-    EXPECT_FALSE(tcp_only.hasTransport(UB));
-    EXPECT_TRUE(tcp_only.hasTransport(TCP));
-}
-
 TEST_F(UbLoopbackEngineTest, WriteThenReadThroughUb) {
     for (size_t i = 0; i < kBufferLength; ++i) {
         client_buffer_[i] = pattern(i, 1);

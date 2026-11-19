@@ -280,11 +280,6 @@ class TransferEngine {
    public:
     bool available() const;
 
-    // True when a transport of this type was loaded and installed. The set is
-    // fixed once the engine is constructed, so a caller that requires one
-    // transport can check here instead of silently running on another.
-    bool hasTransport(TransportType type) const;
-
     const std::string getSegmentName() const;
 
     const std::string getRpcServerAddress() const;

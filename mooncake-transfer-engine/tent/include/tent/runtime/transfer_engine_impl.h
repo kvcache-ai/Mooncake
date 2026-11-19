@@ -273,13 +273,6 @@ class TransferEngineImpl {
    public:
     bool available() const { return available_; }
 
-    // Slots are filled by construct() and only cleared again by deconstruct().
-    bool hasTransport(TransportType type) const {
-        return available_ && type > UNSPEC &&
-               type < (TransportType)kSupportedTransportTypes &&
-               transport_list_[type] != nullptr;
-    }
-
     const std::string getSegmentName() const;
 
     const std::string getRpcServerAddress() const;
