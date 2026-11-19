@@ -1310,17 +1310,34 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
+    if (!engine_) return -1;
+    for (auto& batch_id : batch_ids) {
+        if (batch_id == 0 || batch_id == INVALID_BATCH_ID ||
+            batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+            for (auto& valid_id : batch_ids) {
+                if (valid_id != 0 && valid_id != INVALID_BATCH_ID &&
+                    valid_id != static_cast<batch_id_t>(ERR_MEMORY)) {
+                    engine_->freeBatchID(valid_id);
+                }
+            }
+            return -1;
+        }
+    }
+    const bool use_tent = engine_->isUsingTent();
+    const auto call_start_ts = getCurrentTimeInNano();
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto& batch_id : batch_ids) {
         int64_t total_length = 0;
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-        const size_t task_count = batch_desc->task_list.size();
+        if (!use_tent) {
+            auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+            const size_t task_count = batch_desc->task_list.size();
 
-        for (size_t task_id = 0; task_id < task_count; task_id++) {
-            auto& task = batch_desc->task_list[task_id];
-            for (auto& slice : task.slice_list) {
-                total_length += slice->length;
+            for (size_t task_id = 0; task_id < task_count; task_id++) {
+                auto& task = batch_desc->task_list[task_id];
+                for (auto& slice : task.slice_list) {
+                    total_length += slice->length;
+                }
             }
         }
 
@@ -1331,10 +1348,15 @@ int TransferEnginePy::getBatchTransferStatus(
     std::unordered_set<batch_id_t> remove_ids{};
     while (!timeout_table.empty() && !failed_or_timeout) {
         for (auto& entry : timeout_table) {
-            auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
-            auto start_timestamp = batch_desc->start_timestamp;
+            const auto start_timestamp =
+                use_tent ? call_start_ts
+                         : reinterpret_cast<BatchDesc*>(entry.first)
+                               ->start_timestamp;
             Status s = engine_->getBatchTransferStatus(entry.first, status);
-            LOG_ASSERT(s.ok());
+            if (!s.ok()) {
+                failed_or_timeout = true;
+                break;
+            }
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(entry.first);
                 LOG(INFO) << "Batch Transfer completed!";
@@ -1343,6 +1365,10 @@ int TransferEnginePy::getBatchTransferStatus(
                 failed_or_timeout = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                failed_or_timeout = true;
+            } else if (status.s != TransferStatusEnum::WAITING &&
+                       status.s != TransferStatusEnum::PENDING) {
+                failed_or_timeout = true;
             }
             auto current_ts = getCurrentTimeInNano();
             if (current_ts - start_timestamp > entry.second) {
@@ -1388,6 +1414,14 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     }
 
     auto batch_id = engine_->allocateBatchID(1);
+    if (batch_id == 0 || batch_id == INVALID_BATCH_ID ||
+        batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+        return 0;
+    }
+    if (!engine_->isUsingTent()) {
+        reinterpret_cast<BatchDesc*>(batch_id)->start_timestamp =
+            getCurrentTimeInNano();
+    }
     TransferRequest entry;
     entry.opcode = TransferRequest::WRITE;
     entry.length = length;
@@ -1406,8 +1440,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     return batch_id;
 }
 
-int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
-    pybind11::gil_scoped_release release;
+int TransferEnginePy::checkSingleBatchStatus(batch_id_t batch_id) {
     if (!engine_ || batch_id == 0 || batch_id == INVALID_BATCH_ID ||
         batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
         return -1;
@@ -1421,14 +1454,56 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
         status.s == TransferStatusEnum::PENDING) {
         return 0;
     }
-    engine_->freeBatchID(batch_id);
     if (status.s == TransferStatusEnum::COMPLETED) {
+        engine_->freeBatchID(batch_id);
         return 1;
     }
     if (status.s == TransferStatusEnum::TIMEOUT) {
+        engine_->freeBatchID(batch_id);
         return -2;
     }
-    return -1;
+
+    // Classic MultiTransport::getBatchTransferStatus folds per-task TIMEOUT
+    // into FAILED and short-circuits on the first failed task while sibling
+    // tasks may still have DMA in flight. Check per-task drainage before
+    // freeing BatchDesc so undrained/timed-out batches return -2 instead of -1.
+    bool all_tasks_drained = true;
+    if (!engine_->isUsingTent()) {
+        auto* batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+        const size_t task_count = batch_desc->task_list.size();
+        for (size_t task_id = 0; task_id < task_count; ++task_id) {
+            auto& task = batch_desc->task_list[task_id];
+            if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE) ||
+                task.slice_count == 0) {
+                continue;
+            }
+            TransferStatus task_status;
+            Status ts =
+                engine_->getTransferStatus(batch_id, task_id, task_status);
+            if (!ts.ok() || (task_status.s != TransferStatusEnum::COMPLETED &&
+                             task_status.s != TransferStatusEnum::FAILED)) {
+                all_tasks_drained = false;
+                break;
+            }
+        }
+    }
+    engine_->freeBatchID(batch_id);
+    return all_tasks_drained ? -1 : -2;
+}
+
+int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
+    pybind11::gil_scoped_release release;
+    return checkSingleBatchStatus(batch_id);
+}
+
+std::vector<int> TransferEnginePy::batchTransferCheckStatus(
+    const std::vector<batch_id_t>& batch_ids) {
+    pybind11::gil_scoped_release release;
+    std::vector<int> statuses(batch_ids.size(), -1);
+    for (size_t i = 0; i < batch_ids.size(); ++i) {
+        statuses[i] = checkSingleBatchStatus(batch_ids[i]);
+    }
+    return statuses;
 }
 
 int TransferEnginePy::batchRegisterMemory(
@@ -2068,6 +2143,8 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("transfer_check_status",
                  &TransferEnginePy::transferCheckStatus)
+            .def("batch_transfer_check_status",
+                 &TransferEnginePy::batchTransferCheckStatus)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
