@@ -5154,14 +5154,14 @@ TEST_F(MasterServiceTest, DrainIntoFullTargetEvictsInsteadOfFailingMoves) {
               "segment_1");
 }
 
-TEST_F(MasterServiceTest, DrainIntoRequestedFullTargetWaitsWithoutEvicting) {
+TEST_F(MasterServiceTest, DrainIntoRequestedFullTargetFailsWithoutEvicting) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
     auto service = std::make_unique<MasterService>(service_config);
     constexpr size_t kTargetSize = 1024 * 1024;
     constexpr size_t kObjectSize = 64 * 1024;
-    PrepareSimpleSegment(*service, "segment_0", 0x300000000,
-                         kDefaultSegmentSize);
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
     PrepareSimpleSegment(*service, "segment_1", 0x400000000, kTargetSize);
     PrepareSimpleSegment(*service, "segment_2", 0x500000000, kTargetSize);
 
@@ -5175,29 +5175,26 @@ TEST_F(MasterServiceTest, DrainIntoRequestedFullTargetWaitsWithoutEvicting) {
     const int64_t eviction_attempts =
         MasterMetricManager::instance().get_mem_eviction_attempts();
 
+    // No deadline: the job must still end and give the source back.
     CreateDrainJobRequest request;
     request.segments = {"segment_0"};
     request.target_segments = {"segment_1"};
-    auto job_id = service->CreateTimedDrainJob(request, 1500);
+    auto job_id = service->CreateDrainJob(request);
     ASSERT_TRUE(job_id.has_value());
-    WaitUntil([&] {
-        auto query = service->QueryDrainJob(job_id.value());
-        return query.has_value() &&
-               query->message ==
-                   "Drain job running; waiting for room on targets";
-    });
     WaitUntil(
         [&] {
             auto query = service->QueryDrainJob(job_id.value());
-            return query.has_value() && query->status == JobStatus::TIMED_OUT;
+            return query.has_value() && query->status == JobStatus::FAILED;
         },
         std::chrono::seconds(8));
     auto query = service->QueryDrainJob(job_id.value());
     ASSERT_TRUE(query.has_value());
-    EXPECT_EQ(query->failed_units, 0u);
+    EXPECT_EQ(query->failed_units, 3u);
     EXPECT_EQ(MasterMetricManager::instance().get_mem_eviction_attempts(),
               eviction_attempts);
     EXPECT_EQ(service->QuerySegments("segment_1")->first, kTargetSize);
+    EXPECT_EQ(service->QuerySegmentStatusById(source.segment_id).value(),
+              SegmentStatus::OK);
     auto replicas = service->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(replicas.has_value());
     ASSERT_EQ(replicas->replicas.size(), 1u);

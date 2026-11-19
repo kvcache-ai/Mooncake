@@ -11233,6 +11233,18 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                             job.terminal_failed_unit_keys.insert(unit_key);
                             continue;
                         }
+                        // Eviction works on the whole pool and would mostly
+                        // free other segments, so with requested targets the
+                        // object fails after the same tries as a failed move.
+                        if (target.error() == DrainTargetMiss::kNoRoom &&
+                            !job.request.target_segments.empty()) {
+                            job.failed_units++;
+                            if (++job.retry_counts[unit_key] >=
+                                kMaxDrainUnitRetries) {
+                                job.terminal_failed_unit_keys.insert(unit_key);
+                            }
+                            continue;
+                        }
                         waits_for_room |=
                             target.error() == DrainTargetMiss::kNoRoom;
                         blocked_unit_keys.insert(unit_key);
@@ -11254,9 +11266,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         return;
     }
     job.blocked_units = blocked_unit_keys.size();
-    // Eviction works on the whole pool, so with requested targets it would
-    // mostly free other segments.
-    if (waits_for_room && job.request.target_segments.empty()) {
+    if (waits_for_room) {
         need_mem_eviction_ = true;
     }
 
