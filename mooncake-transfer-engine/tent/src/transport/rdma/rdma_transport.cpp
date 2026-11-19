@@ -550,29 +550,47 @@ Status RdmaTransport::submitTransferTasks(
     std::vector<RdmaSlice*> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
 
-    auto flush_lane = [&](int lane) {
-        auto& list = slice_lists[lane];
-        if (!list.first) return;
-        rdma_batch->slice_chain.push_back(list.first);
-        auto status = workers_->submit(list, lane);
-        if (status.ok()) {
-            watermarks[lane] = steady_watermark;
-        } else {
-            // Earlier chunks may already be posted. Resolve only this rejected
-            // chunk. Otherwise, a synchronous group failure would resubmit that
-            // prefix.
-            LOG(ERROR) << "Unable to enqueue RDMA slices: "
-                       << status.ToString();
-            for (auto* slice = list.first; slice; slice = slice->next) {
-                const int dev = slice->charged_dev.exchange(-1);
-                if (dev >= 0)
-                    workers_->getDeviceSelector()->release(dev, slice->length,
-                                                           0.0);
-                updateSliceStatus(slice, FAILED);
+    std::vector<RdmaSliceList> ready(num_workers);
+    auto flush_lanes = [&](bool tail_flush) {
+        bool any_ready = false;
+        for (int lane = 0; lane < num_workers; ++lane) {
+            auto& list = slice_lists[lane];
+            if (!list.first ||
+                (!tail_flush &&
+                 static_cast<size_t>(list.num_slices) < watermarks[lane])) {
+                continue;
             }
+            ready[lane] = list;
+            rdma_batch->slice_chain.push_back(list.first);
+            any_ready = true;
         }
-        list = {};
-        slice_tails[lane] = nullptr;
+        if (!any_ready) return;
+
+        const auto status = workers_->admitBatch(ready);
+        if (!status.ok()) {
+            LOG_EVERY_N(ERROR, 1024)
+                << "Unable to enqueue RDMA slices: " << status.ToString();
+        }
+        for (int lane = 0; lane < num_workers; ++lane) {
+            auto& list = ready[lane];
+            if (!list.first) continue;
+            if (status.ok()) {
+                watermarks[lane] = steady_watermark;
+            } else {
+                // Earlier flushes can already be posted. Settle this
+                // unpublished flush only, preserving the caller's status path.
+                for (auto* slice = list.first; slice; slice = slice->next) {
+                    const int dev = slice->charged_dev.exchange(-1);
+                    if (dev >= 0)
+                        workers_->getDeviceSelector()->release(
+                            dev, slice->length, 0.0);
+                    updateSliceStatus(slice, FAILED);
+                }
+            }
+            list = {};
+            slice_lists[lane] = {};
+            slice_tails[lane] = nullptr;
+        }
     };
 
     // Distribute starting worker across threads to avoid contention
@@ -664,16 +682,10 @@ Status RdmaTransport::submitTransferTasks(
         // Flush a chunk to pipeline task slice submission and worker posting
         // Publish only after this task's slice count and references are
         // finalized
-        if (flush_ready) {
-            for (int i = 0; i < num_workers; ++i) {
-                if (static_cast<size_t>(slice_lists[i].num_slices) >=
-                    watermarks[i])
-                    flush_lane(i);
-            }
-        }
+        if (flush_ready) flush_lanes(false);
     }
 
-    for (int i = 0; i < num_workers; ++i) flush_lane(i);
+    flush_lanes(true);
     return Status::OK();
 }
 
