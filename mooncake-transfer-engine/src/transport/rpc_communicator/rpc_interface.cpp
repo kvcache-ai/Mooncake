@@ -1,3 +1,7 @@
+#include <nanobind/stl/function.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/vector.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 #include "transport/rpc_communicator/rpc_communicator.h"
 #include "config.h"
@@ -8,6 +12,8 @@
 #include <glog/logging.h>
 #include "async_simple/coro/SyncAwait.h"
 
+namespace py = nanobind;
+
 namespace mooncake {
 
 static constexpr size_t MAX_TENSOR_DIMS = 4;
@@ -15,19 +21,43 @@ static constexpr size_t MAX_TENSOR_DIMS = 4;
 // (MAX_TENSOR_DIMS * 8 bytes)
 static constexpr size_t TENSOR_METADATA_SIZE = 4 + 4 + MAX_TENSOR_DIMS * 8;
 
+namespace {
+
+using RpcCompletion = std::function<void(int, const std::string&)>;
+
+RpcCompletion ScheduleRpcCompletion(py::object future, py::handle loop,
+                                    py::object request_owner = {}) {
+    // nanobind's std::function caster acquires the GIL for Python calls and
+    // reference release even when the coroutine completes on an I/O thread.
+    return py::cast<RpcCompletion>(py::cpp_function(
+        [future = std::move(future), loop = py::borrow<py::object>(loop),
+         request_owner = std::move(request_owner)](int result,
+                                                   const std::string& error) {
+            auto schedule = loop.attr("call_soon_threadsafe");
+            if (error.empty()) {
+                schedule(future.attr("set_result"), result);
+                return;
+            }
+            auto exc = py::module_::import_("builtins").attr("RuntimeError");
+            schedule(future.attr("set_exception"), exc(error));
+        }));
+}
+
+}  // namespace
+
 // Implementation class
 class __attribute__((visibility("hidden"))) RpcInterface::Impl {
    public:
-    std::unique_ptr<RpcCommunicator> communicator;
-    pybind11::function data_receive_callback;
-    pybind11::function tensor_receive_callback;
+    std::shared_ptr<RpcCommunicator> communicator;
+    py::callable data_receive_callback;
+    py::callable tensor_receive_callback;
 };
 
 // Constructor
 RpcInterface::RpcInterface() : impl_(std::make_unique<Impl>()) {}
 
 // Destructor
-RpcInterface::~RpcInterface() = default;
+RpcInterface::~RpcInterface() { stopServer(); }
 
 // Initialize
 bool RpcInterface::initialize(const std::string& local_address,
@@ -39,7 +69,7 @@ bool RpcInterface::initialize(const std::string& local_address,
     config.timeout_seconds = timeout_seconds;
     config.pool_size = pool_size;
 
-    impl_->communicator = std::make_unique<RpcCommunicator>();
+    impl_->communicator = std::make_shared<RpcCommunicator>();
     return impl_->communicator->initialize(config);
 }
 
@@ -76,134 +106,80 @@ void RpcInterface::stopServer() {
     }
 }
 
-int RpcInterface::sendData(const std::string& target_address,
-                           pybind11::handle data) {
+int RpcInterface::sendData(const std::string& target_address, py::handle data) {
     if (!impl_->communicator) return -1;
 
-    pybind11::gil_scoped_acquire acquire;
+    py::gil_scoped_acquire acquire;
 
-    // Extract data from handle directly
-    std::string data_str;
-    try {
-        // Try to get direct string view from bytes object
-        pybind11::bytes data_bytes =
-            pybind11::reinterpret_borrow<pybind11::bytes>(data);
-        data_str = static_cast<std::string>(data_bytes);
-    } catch (...) {
-        // Fallback: convert to bytes and then get string
-        pybind11::bytes data_bytes = pybind11::cast<pybind11::bytes>(data);
-        data_str = static_cast<std::string>(data_bytes);
-    }
+    const auto data_bytes = py::bytes(data);
+    const std::string data_str(data_bytes.c_str(), data_bytes.size());
 
-    pybind11::gil_scoped_release release;
+    py::gil_scoped_release release;
     return impl_->communicator->sendData(target_address, data_str.data(),
                                          data_str.size());
 }
 
-pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
-                                             pybind11::handle data,
-                                             pybind11::handle loop) {
-    pybind11::gil_scoped_acquire acquire;
+py::object RpcInterface::sendDataAsync(const std::string& target_address,
+                                       py::handle data, py::handle loop) {
+    py::gil_scoped_acquire acquire;
 
-    auto future_module = pybind11::module_::import("asyncio");
+    auto future_module = py::module_::import_("asyncio");
     auto future_obj = future_module.attr("Future")();
 
     if (!impl_->communicator) {
-        auto exc_type =
-            pybind11::module_::import("builtins").attr("RuntimeError");
-        auto exc = exc_type(pybind11::str("Communicator not initialized"));
+        auto exc_type = py::module_::import_("builtins").attr("RuntimeError");
+        auto exc = exc_type(py::str("Communicator not initialized"));
         future_obj.attr("set_exception")(exc);
         return future_obj;
     }
 
-    auto communicator = impl_->communicator.get();
-    std::string target_addr = target_address;
-
-    // Extract data from handle directly without creating intermediate bytes
-    // object
-    std::string_view data_view;
-    std::string data_str;  // Only used if we can't get direct view
-
-    try {
-        // Try to get direct string view from bytes object
-        pybind11::bytes data_bytes =
-            pybind11::reinterpret_borrow<pybind11::bytes>(data);
-        data_view = data_bytes;
-        // Store a copy for lambda capture since string_view might not be valid
-        // after GIL release
-        data_str = std::string(data_view);
-    } catch (...) {
-        // Fallback: convert to bytes and then to string
-        pybind11::bytes data_bytes = pybind11::cast<pybind11::bytes>(data);
-        data_str = data_bytes;
-    }
-
-    // Release GIL before starting coroutine
-    pybind11::gil_scoped_release release;
-
-    auto coro_lambda = [communicator, target_addr, data_str, future_obj,
-                        loop]() -> async_simple::coro::Lazy<void> {
+    const auto data_bytes = py::bytes(data);
+    auto lazy = [](std::shared_ptr<RpcCommunicator> communicator,
+                   std::string target, std::string data, RpcCompletion complete)
+        -> async_simple::coro::Lazy<void> {
+        int result = -1;
+        std::string error;
         try {
-            auto result_struct = co_await communicator->sendDataAsync(
-                target_addr, data_str.data(), data_str.size());
-            int result = result_struct.code;
-
-            auto call_soon_threadsafe = [future_obj, loop, result]() {
-                pybind11::gil_scoped_acquire acquire;
-                if (result >= 0) {
-                    future_obj.attr("set_result")(result);
-                } else {
-                    auto runtime_error = pybind11::module_::import("builtins")
-                                             .attr("RuntimeError");
-                    future_obj.attr("set_exception")(
-                        runtime_error(pybind11::str("Send data failed")));
-                }
-            };
-
-            auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop.attr("call_soon_threadsafe")(callback);
+            auto response = co_await communicator->sendDataAsync(
+                target, data.data(), data.size());
+            result = response.code;
+            if (result < 0) error = "Send data failed";
         } catch (const std::exception& e) {
-            auto call_soon_threadsafe = [future_obj, loop, e]() {
-                pybind11::gil_scoped_acquire acquire;
-                auto runtime_error =
-                    pybind11::module_::import("builtins").attr("RuntimeError");
-                future_obj.attr("set_exception")(runtime_error(pybind11::str(
-                    std::string("Send data error: ") + e.what())));
-            };
-
-            auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop.attr("call_soon_threadsafe")(callback);
+            error = std::string("Send data error: ") + e.what();
         }
-    };
-
-    auto lazy = coro_lambda();
-    lazy.start([](auto&& result) {
-        if (result.hasError()) {
-            LOG(ERROR) << "Coroutine completed with error";
-        }
-    });
+        complete(result, error);
+    }(impl_->communicator, target_address,
+        std::string(data_bytes.c_str(), data_bytes.size()),
+        ScheduleRpcCompletion(future_obj, loop));
+    {
+        py::gil_scoped_release release;
+        lazy.start([](auto&& result) {
+            if (result.hasError()) {
+                LOG(ERROR) << "Data coroutine completed with error";
+            }
+        });
+    }
 
     return future_obj;
 }
 
 int RpcInterface::sendTensor(const std::string& target_address,
-                             pybind11::handle tensor) {
+                             py::handle tensor) {
     if (!impl_->communicator) return -1;
 
     try {
         TensorInfo tensor_info;
         {
-            pybind11::gil_scoped_acquire acquire;
-            pybind11::object tensor_obj =
-                pybind11::reinterpret_borrow<pybind11::object>(tensor);
+            py::gil_scoped_acquire acquire;
+            py::object tensor_obj = py::borrow<py::object>(tensor);
 
             // Validate tensor type using duck typing - check for required
             // attributes
-            if (!pybind11::hasattr(tensor_obj, "data_ptr") ||
-                !pybind11::hasattr(tensor_obj, "numel") ||
-                !pybind11::hasattr(tensor_obj, "element_size") ||
-                !pybind11::hasattr(tensor_obj, "shape") ||
-                !pybind11::hasattr(tensor_obj, "dtype")) {
+            if (!py::hasattr(tensor_obj, "data_ptr") ||
+                !py::hasattr(tensor_obj, "numel") ||
+                !py::hasattr(tensor_obj, "element_size") ||
+                !py::hasattr(tensor_obj, "shape") ||
+                !py::hasattr(tensor_obj, "dtype")) {
                 LOG(ERROR) << "Input is not a valid tensor object (missing "
                               "required attributes)";
                 return -1;
@@ -212,24 +188,24 @@ int RpcInterface::sendTensor(const std::string& target_address,
             // Extract tensor properties - zero copy, just get pointers and
             // metadata
             uintptr_t data_ptr =
-                tensor_obj.attr("data_ptr")().cast<uintptr_t>();
-            size_t numel = tensor_obj.attr("numel")().cast<size_t>();
+                py::cast<uintptr_t>(tensor_obj.attr("data_ptr")());
+            size_t numel = py::cast<size_t>(tensor_obj.attr("numel")());
             size_t element_size =
-                tensor_obj.attr("element_size")().cast<size_t>();
+                py::cast<size_t>(tensor_obj.attr("element_size")());
             size_t tensor_size = numel * element_size;
 
             // Get tensor shape
-            pybind11::object shape_obj = tensor_obj.attr("shape");
-            pybind11::tuple shape_tuple =
-                pybind11::cast<pybind11::tuple>(shape_obj);
+            py::object shape_obj = tensor_obj.attr("shape");
+            py::tuple shape_tuple = py::cast<py::tuple>(shape_obj);
             std::vector<size_t> shape;
             for (size_t i = 0; i < shape_tuple.size(); i++) {
-                shape.push_back(shape_tuple[i].cast<size_t>());
+                shape.push_back(py::cast<size_t>(shape_tuple[i]));
             }
 
             // Get tensor dtype string
-            pybind11::object dtype_obj = tensor_obj.attr("dtype");
-            std::string dtype = dtype_obj.attr("__str__")().cast<std::string>();
+            py::object dtype_obj = tensor_obj.attr("dtype");
+            std::string dtype =
+                py::cast<std::string>(dtype_obj.attr("__str__")());
 
             // Fill TensorInfo structure (no data copying, just metadata)
             tensor_info.data_ptr = reinterpret_cast<void*>(data_ptr);
@@ -251,7 +227,7 @@ int RpcInterface::sendTensor(const std::string& target_address,
         }
 
         // Use the async version which supports zero-copy via attachments
-        pybind11::gil_scoped_release release;
+        py::gil_scoped_release release;
         auto result = async_simple::coro::syncAwait(
             impl_->communicator->sendTensorAsync(target_address, tensor_info));
         return result;
@@ -262,43 +238,37 @@ int RpcInterface::sendTensor(const std::string& target_address,
     }
 }
 
-pybind11::object RpcInterface::sendTensorAsync(
-    const std::string& target_address, pybind11::handle tensor,
-    pybind11::handle loop) {
-    pybind11::gil_scoped_acquire acquire;
+py::object RpcInterface::sendTensorAsync(const std::string& target_address,
+                                         py::handle tensor, py::handle loop) {
+    py::gil_scoped_acquire acquire;
 
-    auto future_module = pybind11::module_::import("asyncio");
+    auto future_module = py::module_::import_("asyncio");
     auto future_obj = future_module.attr("Future")();
 
     if (!impl_->communicator) {
-        auto exc_type =
-            pybind11::module_::import("builtins").attr("RuntimeError");
-        auto exc = exc_type(pybind11::str("Communicator not initialized"));
+        auto exc_type = py::module_::import_("builtins").attr("RuntimeError");
+        auto exc = exc_type(py::str("Communicator not initialized"));
         future_obj.attr("set_exception")(exc);
         return future_obj;
     }
 
-    auto communicator = impl_->communicator.get();
-    std::string target_addr = target_address;
-
     // Extract tensor info
-    pybind11::object tensor_obj =
-        pybind11::reinterpret_borrow<pybind11::object>(tensor);
-    uintptr_t data_ptr = tensor_obj.attr("data_ptr")().cast<uintptr_t>();
-    size_t numel = tensor_obj.attr("numel")().cast<size_t>();
-    size_t element_size = tensor_obj.attr("element_size")().cast<size_t>();
+    py::object tensor_obj = py::borrow<py::object>(tensor);
+    uintptr_t data_ptr = py::cast<uintptr_t>(tensor_obj.attr("data_ptr")());
+    size_t numel = py::cast<size_t>(tensor_obj.attr("numel")());
+    size_t element_size = py::cast<size_t>(tensor_obj.attr("element_size")());
     size_t tensor_size = numel * element_size;
 
     // Get tensor shape and dtype
-    pybind11::object shape_obj = tensor_obj.attr("shape");
-    pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
+    py::object shape_obj = tensor_obj.attr("shape");
+    py::tuple shape_tuple = py::cast<py::tuple>(shape_obj);
     std::vector<size_t> shape;
     for (size_t i = 0; i < shape_tuple.size(); i++) {
-        shape.push_back(shape_tuple[i].cast<size_t>());
+        shape.push_back(py::cast<size_t>(shape_tuple[i]));
     }
 
-    pybind11::object dtype_obj = tensor_obj.attr("dtype");
-    std::string dtype = dtype_obj.attr("__str__")().cast<std::string>();
+    py::object dtype_obj = tensor_obj.attr("dtype");
+    std::string dtype = py::cast<std::string>(dtype_obj.attr("__str__")());
 
     // Create TensorInfo on stack (no need for shared_ptr)
     TensorInfo tensor_info;
@@ -307,63 +277,35 @@ pybind11::object RpcInterface::sendTensorAsync(
     tensor_info.shape = std::move(shape);
     tensor_info.dtype = std::move(dtype);
 
-    // Keep a reference to the tensor object to avoid it being garbage collected
-    pybind11::object py_tensor_obj = tensor_obj;
-
-    pybind11::gil_scoped_release release;
-
-    auto coro_lambda = [communicator, target_addr, tensor_info, future_obj,
-                        loop,
-                        py_tensor_obj]() -> async_simple::coro::Lazy<void> {
+    auto lazy = [](std::shared_ptr<RpcCommunicator> communicator,
+                   std::string target, TensorInfo tensor,
+                   RpcCompletion complete)
+        -> async_simple::coro::Lazy<void> {
+        int result = -1;
+        std::string error;
         try {
-            auto result = co_await communicator->sendTensorAsync(target_addr,
-                                                                 tensor_info);
-
-            auto call_soon_threadsafe = [future_obj, loop, result]() {
-                pybind11::gil_scoped_acquire acquire;
-                if (result >= 0) {
-                    future_obj.attr("set_result")(result);
-                } else {
-                    auto runtime_error = pybind11::module_::import("builtins")
-                                             .attr("RuntimeError");
-                    future_obj.attr("set_exception")(
-                        runtime_error(pybind11::str("Send tensor failed")));
-                }
-            };
-
-            auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop.attr("call_soon_threadsafe")(callback);
+            result = co_await communicator->sendTensorAsync(target, tensor);
+            if (result < 0) error = "Send tensor failed";
         } catch (const std::exception& e) {
-            auto call_soon_threadsafe = [future_obj, loop, e]() {
-                pybind11::gil_scoped_acquire acquire;
-                auto runtime_error =
-                    pybind11::module_::import("builtins").attr("RuntimeError");
-                future_obj.attr("set_exception")(runtime_error(pybind11::str(
-                    std::string("Send tensor error: ") + e.what())));
-            };
-
-            auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop.attr("call_soon_threadsafe")(callback);
+            error = std::string("Send tensor error: ") + e.what();
         }
-    };
-
-    // Start the coroutine in a detached manner (fire and forget)
-    auto lazy = coro_lambda();
-    lazy.start([](auto&& result) {
-        // This callback will be called when the coroutine completes
-        // We don't need to do anything here since the result is handled in
-        // the coroutine itself
-        if (result.hasError()) {
-            // Log error if needed
-            LOG(ERROR) << "Tensor coroutine completed with error";
-        }
-    });
+        complete(result, error);
+    }(impl_->communicator, target_address, std::move(tensor_info),
+        ScheduleRpcCompletion(future_obj, loop, std::move(tensor_obj)));
+    {
+        py::gil_scoped_release release;
+        lazy.start([](auto&& result) {
+            if (result.hasError()) {
+                LOG(ERROR) << "Tensor coroutine completed with error";
+            }
+        });
+    }
 
     return future_obj;
 }
 
-void RpcInterface::setDataReceiveCallback(pybind11::function callback) {
-    pybind11::gil_scoped_acquire acquire;
+void RpcInterface::setDataReceiveCallback(py::callable callback) {
+    py::gil_scoped_acquire acquire;
     impl_->data_receive_callback = callback;
     if (impl_->communicator) {
         // Capture this pointer - safe because RpcInterface is managed by Python
@@ -376,8 +318,8 @@ void RpcInterface::setDataReceiveCallback(pybind11::function callback) {
     }
 }
 
-void RpcInterface::setTensorReceiveCallback(pybind11::function callback) {
-    pybind11::gil_scoped_acquire acquire;
+void RpcInterface::setTensorReceiveCallback(py::callable callback) {
+    py::gil_scoped_acquire acquire;
     impl_->tensor_receive_callback = callback;
 
     // Note: Tensor data is received through the regular data callback
@@ -469,12 +411,11 @@ void RpcInterface::handleIncomingData(std::string_view source,
     if (!impl_->data_receive_callback) return;
 
     try {
-        pybind11::gil_scoped_acquire acquire;
-        pybind11::dict received;
+        py::gil_scoped_acquire acquire;
+        py::dict received;
         received["source"] =
             std::string(source);  // Convert to string for Python
-        received["data"] = pybind11::bytes(
-            std::string(data));  // Convert to string for pybind11::bytes
+        received["data"] = py::bytes(data.data(), data.size());
 
         impl_->data_receive_callback(received);
     } catch (const std::exception& e) {
@@ -498,7 +439,7 @@ void RpcInterface::handleIncomingTensor(std::string_view source,
     LOG(INFO) << "Calling Python tensor receive callback...";
 
     try {
-        pybind11::gil_scoped_acquire acquire;
+        py::gil_scoped_acquire acquire;
 
         ReceivedTensor received;
         received.source_address = std::string(source);
@@ -530,25 +471,22 @@ std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank,
 }
 
 // Python binding implementation
-void bind_rpc_interface(pybind11::module_& m) {
-    namespace py = pybind11;
+void bind_rpc_interface(py::module_& m) {
     using namespace mooncake;
 
     // Bind RpcInterface::ReceivedData
     py::class_<RpcInterface::ReceivedData>(m, "ReceivedData")
-        .def_readonly("source_address",
-                      &RpcInterface::ReceivedData::source_address)
-        .def_readonly("data_size", &RpcInterface::ReceivedData::data_size)
+        .def_ro("source_address", &RpcInterface::ReceivedData::source_address)
+        .def_ro("data_size", &RpcInterface::ReceivedData::data_size)
         .def("get_bytes", &RpcInterface::ReceivedData::getBytes)
         .def("get_memory_view", &RpcInterface::ReceivedData::getMemoryView);
 
     // Bind RpcInterface::ReceivedTensor
     py::class_<RpcInterface::ReceivedTensor>(m, "ReceivedTensor")
-        .def_readonly("source_address",
-                      &RpcInterface::ReceivedTensor::source_address)
-        .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
-        .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
-        .def_readonly("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
+        .def_ro("source_address", &RpcInterface::ReceivedTensor::source_address)
+        .def_ro("shape", &RpcInterface::ReceivedTensor::shape)
+        .def_ro("dtype", &RpcInterface::ReceivedTensor::dtype)
+        .def_ro("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
         .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
         .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
         .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);

@@ -14,7 +14,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 #include <sys/time.h>
 
 #include <cstdlib>
@@ -30,6 +30,8 @@
 #include "transfer_engine_c.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/transport.h"
+
+namespace py = nanobind;
 
 using namespace mooncake;
 
@@ -150,28 +152,30 @@ class TransferEnginePy {
     // contiguous 1-D array of 8-byte integers (a NumPy uint64/int64 array,
     // an array.array('Q'), ...). Large batches skip building three Python
     // lists of ints and converting them one element at a time.
-    int batchTransferSyncWriteArrays(
-        const char *target_hostname, const pybind11::buffer &buffers,
-        const pybind11::buffer &peer_buffer_addresses,
-        const pybind11::buffer &lengths, const std::string &transport_hint = "",
-        const std::string &nic_hint = "");
+    int batchTransferSyncWriteArrays(const char *target_hostname,
+                                     py::handle buffers,
+                                     py::handle peer_buffer_addresses,
+                                     py::handle lengths,
+                                     const std::string &transport_hint = "",
+                                     const std::string &nic_hint = "");
 
-    int batchTransferSyncReadArrays(
-        const char *target_hostname, const pybind11::buffer &buffers,
-        const pybind11::buffer &peer_buffer_addresses,
-        const pybind11::buffer &lengths, const std::string &transport_hint = "",
-        const std::string &nic_hint = "");
+    int batchTransferSyncReadArrays(const char *target_hostname,
+                                    py::handle buffers,
+                                    py::handle peer_buffer_addresses,
+                                    py::handle lengths,
+                                    const std::string &transport_hint = "",
+                                    const std::string &nic_hint = "");
 
     batch_id_t batchTransferAsyncWriteArrays(
-        const char *target_hostname, const pybind11::buffer &buffers,
-        const pybind11::buffer &peer_buffer_addresses,
-        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const char *target_hostname, py::handle buffers,
+        py::handle peer_buffer_addresses, py::handle lengths,
+        const std::string &transport_hint = "",
         const std::string &nic_hint = "");
 
     batch_id_t batchTransferAsyncReadArrays(
-        const char *target_hostname, const pybind11::buffer &buffers,
-        const pybind11::buffer &peer_buffer_addresses,
-        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const char *target_hostname, py::handle buffers,
+        py::handle peer_buffer_addresses, py::handle lengths,
+        const std::string &transport_hint = "",
         const std::string &nic_hint = "");
 
     // Page-gathered batch transfer: `fields` is a C-contiguous [F, 5] array
@@ -183,26 +187,22 @@ class TransferEnginePy {
     // submitted in batches of at most `max_batch_size` (0: one batch).
     // Returns 0, or the first batch's nonzero status.
     int batchTransferSyncWritePages(const char *target_hostname,
-                                    const pybind11::buffer &src_pages,
-                                    const pybind11::buffer &dst_pages,
-                                    const pybind11::buffer &fields,
+                                    py::handle src_pages, py::handle dst_pages,
+                                    py::handle fields,
                                     size_t max_batch_size = 0,
                                     const std::string &transport_hint = "",
                                     const std::string &nic_hint = "");
 
     int batchTransferSyncReadPages(const char *target_hostname,
-                                   const pybind11::buffer &src_pages,
-                                   const pybind11::buffer &dst_pages,
-                                   const pybind11::buffer &fields,
-                                   size_t max_batch_size = 0,
+                                   py::handle src_pages, py::handle dst_pages,
+                                   py::handle fields, size_t max_batch_size = 0,
                                    const std::string &transport_hint = "",
                                    const std::string &nic_hint = "");
 
     int batchTransferSyncPages(const char *target_hostname,
-                               const pybind11::buffer &src_pages,
-                               const pybind11::buffer &dst_pages,
-                               const pybind11::buffer &fields,
-                               size_t max_batch_size, TransferOpcode opcode,
+                               py::handle src_pages, py::handle dst_pages,
+                               py::handle fields, size_t max_batch_size,
+                               TransferOpcode opcode,
                                const std::string &transport_hint,
                                const std::string &nic_hint);
 
@@ -275,15 +275,14 @@ class TransferEnginePy {
     // No-op on non-EFA builds or when the EFA transport is not installed.
     int warmupEfaSegment(const std::string &segment_name);
 
-    int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
+    int writeBytesToBuffer(uintptr_t dest_address, const char *src_ptr,
                            size_t length) {
         memcpy((void *)dest_address, (void *)src_ptr, length);
         return 0;
     }
 
-    pybind11::bytes readBytesFromBuffer(uintptr_t source_address,
-                                        size_t length) {
-        return pybind11::bytes(
+    py::bytes readBytesFromBuffer(uintptr_t source_address, size_t length) {
+        return py::bytes(
             static_cast<const char *>(reinterpret_cast<void *>(source_address)),
             length);
     }

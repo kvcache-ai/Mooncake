@@ -302,7 +302,7 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     assert 'OUTPUT_NAME "_store"' in integration_cmake
     assert "../python/mooncake/store/" in integration_cmake
     binding = (REPOSITORY_ROOT / "mooncake-integration/store/store_py.cpp").read_text()
-    assert "PYBIND11_MODULE(_store, m)" in binding
+    assert "NB_MODULE(_store, m)" in binding
 
     store_rs = REPOSITORY_ROOT / "mooncake-store-rs"
     assert not (store_rs / "pyproject.toml").exists()
