@@ -475,6 +475,22 @@ TEST_F(SsdDestinationTcp, AdjacentMRSNeverBypassSingleTcpBufferPreflight) {
                   destination.size(), DestinationMemory::kHost}});
     EXPECT_EQ(made.error, DestinationError::kInvalidArgument);
     EXPECT_FALSE(made.target);
+    // Both halves are individually authorized. A coalescer must retain two
+    // frames because TCP validates each frame against one registered buffer.
+    staging.fill(std::byte{0x47});
+    made = PrepareSsdTcpWriteTarget(
+        source, {{peer->getLocalIpAndPort(),
+                  reinterpret_cast<uint64_t>(destination.data()), 32,
+                  DestinationMemory::kHost},
+                 {peer->getLocalIpAndPort(),
+                  reinterpret_cast<uint64_t>(destination.data() + 32), 32,
+                  DestinationMemory::kHost}});
+    ASSERT_EQ(made.error, DestinationError::kOk);
+    ReadChunk chunk{0, 0, 64, 0, 64, {{32, {2, 1, 0, 32}}, {0, {1, 1, 0, 32}}}};
+    ASSERT_EQ(
+        made.target->WriteAndDrain(chunk, {staging.data(), staging.size()}),
+        Error::kOk);
+    EXPECT_EQ(destination, staging);
     made.target.reset();
     EXPECT_EQ(peer->unregisterLocalMemory(destination.data() + 32, true), 0);
     EXPECT_EQ(peer->unregisterLocalMemory(destination.data(), true), 0);

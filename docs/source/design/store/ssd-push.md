@@ -47,7 +47,13 @@ responses return their connection to the cache. A broken or partially consumed
 stream is discarded; a submitted request is never replayed by the cache.
 
 The Owner combines fragments for one target into one scatter submission, keeping
-the authorization check for every destination. With liburing, ordinary READ
+the authorization check for every destination. Whole-value requests that fit
+the configured slot budget use one bounded bulk read and scatter push; larger
+requests keep the streaming pipeline. Exactly adjacent source and destination
+fragments share a wire WRITE only when the transport registration covers the
+combined range. Partial reads and explicit direct/fixed-buffer policies retain
+the pipeline. Control sockets first attempt nonblocking I/O and poll only when
+it would block, with the same absolute deadline. With liburing, ordinary READ
 workers retain their rings across requests. File and slot references remain
 owned through real completions; shutdown drains accepted work before release.
 
@@ -63,6 +69,6 @@ owned through real completions; shutdown drains accepted work before release.
 | `MOONCAKE_OFFLOAD_READ_CONCURRENCY` | 1 | Concurrent Owner groups per batch, capped at 8 |
 
 The portable `pread` driver remains available when streaming io_uring is disabled.
-Small-object batches can have more scheduling overhead than the existing bulk
-restore. Measure the application's object sizes and batch layout before enabling
-push; do not infer cross-host RDMA throughput from loopback TCP results.
+Some small single-value and batch shapes still have more overhead than the
+existing restore path. Measure the application's object sizes and batch layout
+before enabling push; do not infer cross-host RDMA throughput from loopback TCP results.

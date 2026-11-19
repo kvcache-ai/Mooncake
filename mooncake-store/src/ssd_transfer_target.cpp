@@ -48,14 +48,17 @@ bool RegistrationCovers(const TransferMetadata::SegmentDesc& desc,
 }
 class ClassicWriteTarget final : public SourceDrainedWriteTarget {
    public:
-    ClassicWriteTarget(std::shared_ptr<TransferEngine> engine,
-                       std::vector<ResolvedDestination> views, size_t limit,
-                       bool local_destination, bool rdma = false)
+    ClassicWriteTarget(
+        std::shared_ptr<TransferEngine> engine,
+        std::vector<ResolvedDestination> views, size_t limit,
+        bool local_destination, bool rdma = false,
+        std::shared_ptr<TransferMetadata::SegmentDesc> remote = {})
         : engine_(std::move(engine)),
           views_(std::move(views)),
           limit_(limit),
           local_destination_(local_destination),
-          rdma_(rdma) {}
+          rdma_(rdma),
+          remote_(std::move(remote)) {}
     Error WriteAndDrain(const ReadChunk& chunk,
                         SlotBuffer slot) noexcept override {
         try {
@@ -104,12 +107,42 @@ class ClassicWriteTarget final : public SourceDrainedWriteTarget {
                 remote_end =
                     std::max(remote_end, begin + fragment.destination.length);
             }
-            for (const auto& fragment : chunk.fragments) {
-                const auto& view = views_[fragment.destination.region_id - 1];
-                local_offsets.push_back(fragment.buffer_offset);
-                remote_offsets.push_back(
-                    view.address + fragment.destination.offset - remote_begin);
-                lengths.push_back(fragment.destination.length);
+            std::vector<const WriteFragment*> ordered;
+            // Streaming chunks commonly have just one destination. Keep that
+            // path free of a sorting allocation.
+            if (chunk.fragments.size() > 1) {
+                ordered.reserve(chunk.fragments.size());
+                for (const auto& fragment : chunk.fragments)
+                    ordered.push_back(&fragment);
+                std::sort(ordered.begin(), ordered.end(),
+                          [](const auto* a, const auto* b) {
+                              return a->buffer_offset < b->buffer_offset;
+                          });
+            }
+            for (size_t i = 0; i < chunk.fragments.size(); ++i) {
+                const auto* fragment = chunk.fragments.size() == 1
+                                           ? &chunk.fragments.front()
+                                           : ordered[i];
+                const auto& view = views_[fragment->destination.region_id - 1];
+                const auto remote =
+                    view.address + fragment->destination.offset - remote_begin;
+                // Every original view was checked above. Merge only exact
+                // adjacency at both ends; gaps never gain write authority.
+                if (!lengths.empty() &&
+                    local_offsets.back() + lengths.back() ==
+                        fragment->buffer_offset &&
+                    remote_offsets.back() + lengths.back() == remote &&
+                    (rdma_ ||
+                     (remote_ &&
+                      RegistrationCovers(
+                          *remote_, remote_begin + remote_offsets.back(),
+                          lengths.back() + fragment->destination.length)))) {
+                    lengths.back() += fragment->destination.length;
+                } else {
+                    local_offsets.push_back(fragment->buffer_offset);
+                    remote_offsets.push_back(remote);
+                    lengths.push_back(fragment->destination.length);
+                }
             }
             std::vector<TransferEngine::ScatterTransferRange> ranges;
             if (!chunk.fragments.empty()) {
@@ -157,6 +190,7 @@ class ClassicWriteTarget final : public SourceDrainedWriteTarget {
     size_t limit_;
     bool local_destination_;
     bool rdma_;
+    std::shared_ptr<TransferMetadata::SegmentDesc> remote_;
     std::atomic<bool> destinations_drained_{true};
 };
 }  // namespace
@@ -193,6 +227,7 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
         if (intervals[i].first < intervals[i - 1].second)
             return {DestinationError::kOverlap, {}};
     bool local_destination = false;
+    std::shared_ptr<TransferMetadata::SegmentDesc> remote;
     if (!views.empty()) {
         const auto segment = engine->openSegment(endpoint);
         struct SegmentCloser {
@@ -216,6 +251,7 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
         if (!desc || desc->protocol != "tcp" || desc->tcp_proto_version < 2)
             return {DestinationError::kNotSupported, {}};
         if (!covered()) return {DestinationError::kInvalidArgument, {}};
+        remote = desc;
         const auto local =
             engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
         local_destination = local &&
@@ -224,7 +260,8 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
     }
     return {DestinationError::kOk,
             std::make_shared<ClassicWriteTarget>(
-                std::move(engine), std::move(views), limit, local_destination)};
+                std::move(engine), std::move(views), limit, local_destination,
+                false, std::move(remote))};
 }
 SsdTransferTargetPreparation PrepareSsdRdmaWriteTarget(
     std::shared_ptr<TransferEngine> engine,

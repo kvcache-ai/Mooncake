@@ -791,6 +791,121 @@ FileStorage::ReadOwnerStreaming(
                 active.fetch_sub(count, std::memory_order_relaxed);
             }
         } credits{active_streaming_sources_, request.objects.size()};
+        // Small complete values fit in the same bounded staging budget as
+        // the streaming slots. Read them as a batch, then push all fragments
+        // with one scatter operation instead of one WRITE per small value.
+        // Explicit direct/fixed-buffer policies retain their native pipeline.
+        const size_t batch_budget = config.slot_bytes * config.slots;
+        size_t batch_bytes = 0, batch_destinations = 0;
+        std::vector<std::string> batch_keys;
+        std::vector<int64_t> batch_sizes;
+        std::unordered_set<std::string> unique_keys;
+        bool whole_batch = !request.objects.empty() && !config.direct_io &&
+                           !config.fixed_buffers;
+        for (const auto& object : request.objects) {
+            if (!whole_batch) break;
+            const uint64_t size = object.expected_object_size;
+            if (object.ranges.size() != 1 ||
+                object.ranges.front().source_offset != 0 || !size ||
+                size > batch_budget || !unique_keys.insert(object.key).second) {
+                whole_batch = false;
+                break;
+            }
+            size_t bytes = 0;
+            for (const auto& destination : object.ranges.front().destinations) {
+                if (destination.length > size - bytes ||
+                    batch_destinations == config.max_fragments) {
+                    whole_batch = false;
+                    break;
+                }
+                bytes += destination.length;
+                ++batch_destinations;
+            }
+            // Legacy io_uring may read aligned prefix/suffix bytes and shift
+            // each returned pointer. Account for that allocation up front.
+            const size_t reserved =
+                config_.use_uring ? align_up(size, size_t{4096}) + 2 * 4096
+                                  : size;
+            if (!whole_batch || bytes != size ||
+                reserved > batch_budget - batch_bytes) {
+                whole_batch = false;
+                break;
+            }
+            batch_bytes += reserved;
+            batch_keys.push_back(tenant.MakeScopedKey(object.key));
+            batch_sizes.push_back(static_cast<int64_t>(size));
+        }
+        if (whole_batch) {
+            auto handle = client_buffer_allocator_->allocate(batch_bytes);
+            if (!handle)
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            // Lay values out by destination registration/offset. Adjacent
+            // destinations can then share a wire WRITE after authorization.
+            std::vector<size_t> order(request.objects.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                const auto& left = request.objects[a].ranges[0].destinations[0];
+                const auto& right =
+                    request.objects[b].ranges[0].destinations[0];
+                return std::pair(left.region.region_id, left.offset) <
+                       std::pair(right.region.region_id, right.offset);
+            });
+            const auto begin = reinterpret_cast<uintptr_t>(handle->ptr());
+            std::unordered_map<std::string, Slice> slices;
+            size_t cursor = 0;
+            for (const auto index : order) {
+                if (config_.use_uring)
+                    cursor = align_up(begin + cursor, size_t{4096}) - begin;
+                slices.emplace(batch_keys[index],
+                               Slice{reinterpret_cast<void*>(begin + cursor),
+                                     static_cast<size_t>(batch_sizes[index])});
+                cursor +=
+                    config_.use_uring
+                        ? align_up(batch_sizes[index], size_t{4096}) + 4096
+                        : batch_sizes[index];
+            }
+            auto loaded = BatchLoad(slices);
+            if (!loaded) return tl::make_unexpected(loaded.error());
+            if (expired()) {
+                cancel_remaining(0);
+                return result;
+            }
+            ReadChunk chunk{};
+            chunk.read_bytes = handle->size();
+            size_t ordinal = 0;
+            for (size_t i = 0; i < request.objects.size(); ++i) {
+                size_t offset =
+                    reinterpret_cast<uintptr_t>(slices.at(batch_keys[i]).ptr) -
+                    begin;
+                for (const auto& destination :
+                     request.objects[i].ranges.front().destinations) {
+                    chunk.fragments.push_back(
+                        {offset, {++ordinal, 1, 0, destination.length}});
+                    offset += destination.length;
+                    chunk.payload_bytes += destination.length;
+                }
+            }
+            if (expired()) {
+                cancel_remaining(0);
+                return result;
+            }
+            // Keep the batch allocation alive until the write is physically
+            // drained, including on failure. Gaps in the address envelope are
+            // never included in the authorized scatter fragments.
+            const auto written = target->WriteAndDrain(
+                chunk, {reinterpret_cast<std::byte*>(begin), chunk.read_bytes});
+            const bool late = expired();
+            for (size_t i = 0; i < result.objects.size(); ++i) {
+                auto& object = result.objects[i];
+                object.outcome = late ? AttemptOutcome::kCancelled
+                                 : written == Error::kOk
+                                     ? AttemptOutcome::kSucceeded
+                                     : AttemptOutcome::kFailed;
+                if (written == Error::kOk) object.valid_bytes = batch_sizes[i];
+            }
+            result.dma_drained = target->DestinationsDrained();
+            return result;
+        }
         struct PreparedRead {
             std::shared_ptr<ReadSource> source;
             ReadPlan plan;

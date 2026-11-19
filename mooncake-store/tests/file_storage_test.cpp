@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -754,6 +755,20 @@ class FileStorageTest : public ::testing::Test {
                              const std::vector<int64_t>& sizes) {
         return fileStorage.AllocateBatch(keys, sizes,
                                          *fileStorage.client_buffer_allocator_);
+    }
+
+    void SeedPushBatch(FileStorage& storage,
+                       const std::vector<std::string>& values) {
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        std::unordered_map<std::string, std::vector<Slice>> objects;
+        for (size_t i = 0; i < values.size(); ++i)
+            objects.emplace(
+                TenantId::Default().MakeScopedKey("small-" + std::to_string(i)),
+                std::vector<Slice>{
+                    {const_cast<char*>(values[i].data()), values[i].size()}});
+        auto stored = storage.storage_backend_->BatchOffload(
+            objects, [](const auto&, auto&) { return ErrorCode::OK; });
+        ASSERT_TRUE(stored);
     }
 
     size_t ClientBufferBatchCount(FileStorage& fileStorage) {
@@ -3450,6 +3465,217 @@ TEST_F(FileStorageTest,
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
         << "Abandoned shared staging buffers must be reclaimed once their "
            "lease expires, otherwise the memory leaks for good";
+}
+
+namespace {
+class SmallBatchTarget final : public ssd_offload::SourceDrainedWriteTarget {
+   public:
+    std::vector<Slice> views;
+    std::atomic<size_t> writes{0};
+    std::promise<void>* entered{nullptr};
+    std::shared_future<void> release;
+    bool drained{true}, fail{false};
+    ssd_offload::Error WriteAndDrain(
+        const ssd_offload::ReadChunk& chunk,
+        ssd_offload::SlotBuffer buffer) noexcept override {
+        if (writes.fetch_add(1) == 0 && entered) entered->set_value();
+        if (release.valid()) release.wait();
+        if (fail) return ssd_offload::Error::kTransferError;
+        for (const auto& fragment : chunk.fragments) {
+            const auto& destination = fragment.destination;
+            if (!destination.region_id ||
+                destination.region_id > views.size() ||
+                destination.offset > views[destination.region_id - 1].size ||
+                destination.length > views[destination.region_id - 1].size -
+                                         destination.offset ||
+                fragment.buffer_offset > buffer.capacity ||
+                destination.length > buffer.capacity - fragment.buffer_offset)
+                return ssd_offload::Error::kInvalidArgument;
+            std::memcpy(
+                static_cast<char*>(views[destination.region_id - 1].ptr) +
+                    destination.offset,
+                buffer.data + fragment.buffer_offset, destination.length);
+        }
+        return ssd_offload::Error::kOk;
+    }
+    bool DestinationsDrained() const noexcept override { return drained; }
+};
+ssd_offload::SsdReadRequestV1 SmallRequest(
+    const std::vector<std::string>& values, bool split = false) {
+    using namespace ssd_offload;
+    const PeerIdentity requester{1, 2, 3}, owner{4, 5, 6};
+    SsdReadRequestV1 request{1, requester, {owner, 1, 1}, "default", 60000,
+                             0, {}};
+    for (size_t i = 0; i < values.size(); ++i) {
+        const DestinationRegion region{requester, i + 1, 1, {7, 8}};
+        SsdReadRangeV1 range{0, {{region, 0, values[i].size()}}};
+        if (split) {
+            const size_t half = values[i].size() / 2;
+            range.destinations = {{region, 0, half},
+                                  {region, half, values[i].size() - half}};
+        }
+        request.objects.push_back(
+            {"small-" + std::to_string(i), values[i].size(), {}, {range}});
+    }
+    return request;
+}
+FileStorageConfig SmallConfig(const std::string& path) {
+    FileStorageConfig config;
+    config.storage_filepath = path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.push_enabled = true;
+    config.streaming_read.slot_bytes = 65536;
+    config.streaming_read.slots = 4;
+    return config;
+}
+}  // namespace
+
+TEST_F(FileStorageTest,
+       SmallOwnerBatchPushesNestedValuesOnceAndHonorsAdjustedPointers) {
+    for (const bool legacy_uring : {false, true}) {
+        auto config = SmallConfig(
+            data_path + (legacy_uring ? "/bulk-uring" : "/bulk-pread"));
+        fs::create_directories(config.storage_filepath);
+        config.use_uring = legacy_uring;
+        FileStorage storage(config, nullptr, "owner");
+        const std::vector<std::string> values{std::string(4093, 'a'),
+                                              std::string(65537, 'b'),
+                                              std::string(107, 'c')};
+        SeedPushBatch(storage, values);
+        auto request = SmallRequest(values, true);
+        std::vector<std::vector<char>> output;
+        auto target = std::make_shared<SmallBatchTarget>();
+        for (const auto& value : values)
+            output.emplace_back(value.size() + 64, '?');
+        for (auto& value : output) {
+            const size_t half = (value.size() - 64) / 2;
+            target->views.push_back({value.data() + 32, half});
+            target->views.push_back(
+                {value.data() + 32 + half, value.size() - 64 - half});
+        }
+        auto result = storage.ReadOwnerStreaming(
+            request, target,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        ASSERT_TRUE(result);
+        EXPECT_EQ(target->writes, 1u);
+        EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+                  ssd_offload::DestinationError::kOk);
+        for (size_t i = 0; i < values.size(); ++i) {
+            EXPECT_EQ(result->objects[i].outcome,
+                      ssd_offload::AttemptOutcome::kSucceeded);
+            EXPECT_EQ(std::string(output[i].begin() + 32, output[i].end() - 32),
+                      values[i]);
+            EXPECT_TRUE(std::all_of(output[i].begin(), output[i].begin() + 32,
+                                    [](char c) { return c == '?'; }));
+            EXPECT_TRUE(std::all_of(output[i].end() - 32, output[i].end(),
+                                    [](char c) { return c == '?'; }));
+        }
+        EXPECT_EQ(ClientBufferBatchCount(storage), 0u);
+    }
+}
+
+TEST_F(FileStorageTest, SmallOwnerBatchPreflightsEveryValueBeforeWriting) {
+    auto config = SmallConfig(data_path);
+    FileStorage storage(config, nullptr, "owner");
+    const std::vector<std::string> values{std::string(8192, 'a'),
+                                          std::string(8192, 'b')};
+    SeedPushBatch(storage, values);
+    for (int fault = 0; fault < 3; ++fault) {
+        auto request = SmallRequest(values);
+        if (fault == 0) request.objects[1].key = "missing";
+        if (fault == 1) {
+            ++request.objects[1].expected_object_size;
+            ++request.objects[1].ranges[0].destinations[0].length;
+        }
+        if (fault == 2) request.objects[1].expected_object_checksum = 123;
+        auto target = std::make_shared<SmallBatchTarget>();
+        auto result = storage.ReadOwnerStreaming(
+            request, target,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        EXPECT_FALSE(result);
+        EXPECT_EQ(target->writes, 0u);
+        EXPECT_EQ(ClientBufferBatchCount(storage), 0u);
+        EXPECT_TRUE(FileStorageAllocateBatch(storage, {"probe"},
+                                             {config.local_buffer_size}));
+    }
+}
+
+TEST_F(FileStorageTest,
+       SmallOwnerBatchRetainsStagingThroughLateWriteAndFailure) {
+    auto config = SmallConfig(data_path);
+    FileStorage storage(config, nullptr, "owner");
+    const std::vector<std::string> values{std::string(8192, 'a'),
+                                          std::string(8192, 'b')};
+    SeedPushBatch(storage, values);
+    auto request = SmallRequest(values);
+    auto target = std::make_shared<SmallBatchTarget>();
+    std::promise<void> entered, release;
+    target->entered = &entered;
+    target->release = release.get_future().share();
+    target->fail = true;
+    target->drained = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto read = std::async(std::launch::async, [&] {
+        return storage.ReadOwnerStreaming(request, target, deadline);
+    });
+    const auto started = entered.get_future().wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(started, std::future_status::ready);
+    EXPECT_FALSE(FileStorageAllocateBatch(storage, {"probe"},
+                                          {config.local_buffer_size}));
+    std::this_thread::sleep_until(deadline + std::chrono::milliseconds(20));
+    EXPECT_EQ(read.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    release.set_value();
+    auto result = read.get();
+    ASSERT_TRUE(result);
+    EXPECT_FALSE(result->dma_drained);
+    for (const auto& item : result->objects) {
+        EXPECT_EQ(item.outcome, ssd_offload::AttemptOutcome::kCancelled);
+        EXPECT_EQ(item.valid_bytes, 0u);
+    }
+    EXPECT_TRUE(FileStorageAllocateBatch(storage, {"probe"},
+                                         {config.local_buffer_size}));
+}
+
+TEST_F(FileStorageTest,
+       SmallOwnerBatchKeepsPartialAndOverBudgetReadsPipelined) {
+    const std::vector<std::string> values{std::string(8192, 'a'),
+                                          std::string(8192, 'b')};
+    for (int mode = 0; mode < 3; ++mode) {
+        auto config =
+            SmallConfig(data_path + "/pipeline-" + std::to_string(mode));
+        fs::create_directories(config.storage_filepath);
+        config.streaming_read.slot_bytes = mode == 2 ? 65536 : 4096;
+        config.streaming_read.slots = 2;
+        config.streaming_read.fixed_buffers = mode == 2;
+        FileStorage storage(config, nullptr, "owner");
+        SeedPushBatch(storage, values);
+        const bool partial = mode == 1;
+        auto request = SmallRequest(values);
+        std::array<std::vector<char>, 2> output{std::vector<char>(8192, '?'),
+                                                std::vector<char>(8192, '?')};
+        auto target = std::make_shared<SmallBatchTarget>();
+        for (size_t i = 0; i < 2; ++i) {
+            if (partial) {
+                request.objects[i].ranges[0].source_offset = 10;
+                request.objects[i].ranges[0].destinations[0].length = 512;
+            }
+            target->views.push_back({output[i].data(), output[i].size()});
+        }
+        auto result = storage.ReadOwnerStreaming(
+            request, target,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        ASSERT_TRUE(result);
+        EXPECT_EQ(target->writes, mode == 0 ? 4u : 2u);
+        for (size_t i = 0; i < 2; ++i) {
+            EXPECT_EQ(result->objects[i].outcome,
+                      ssd_offload::AttemptOutcome::kSucceeded);
+            EXPECT_EQ(std::string(output[i].begin(),
+                                  output[i].begin() + (partial ? 512 : 8192)),
+                      values[i].substr(0, partial ? 512 : 8192));
+        }
+    }
 }
 
 }  // namespace mooncake

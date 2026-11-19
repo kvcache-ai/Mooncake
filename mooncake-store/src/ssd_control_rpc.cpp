@@ -326,8 +326,8 @@ std::error_code Transfer(int fd, char* buffer, size_t size, bool write,
                          Clock::time_point deadline) {
     size_t position = 0;
     while (position < size) {
-        auto error = Wait(fd, write ? POLLOUT : POLLIN, deadline);
-        if (error) return error;
+        if (Clock::now() >= deadline)
+            return std::make_error_code(std::errc::timed_out);
         const ssize_t count =
             write ? send(fd, buffer + position, size - position,
 #ifdef MSG_NOSIGNAL
@@ -341,7 +341,10 @@ std::error_code Transfer(int fd, char* buffer, size_t size, bool write,
             position += size_t(count);
         else if (count == 0)
             return std::make_error_code(std::errc::connection_reset);
-        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+        else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            auto error = Wait(fd, write ? POLLOUT : POLLIN, deadline);
+            if (error) return error;
+        } else if (errno != EINTR)
             return {errno, std::generic_category()};
     }
     return {};
@@ -444,11 +447,10 @@ SsdControlRpcCall CallOnSocket(Socket& socket, const std::string& host,
     auto head =
         struct_pack::serialize<struct_pack::sp_config::DISABLE_ALL_META_INFO,
                                std::string>(request);
+    // One frame avoids a second short send on the nonblocking control stream.
+    head.append(body);
     call.transport_error =
         Transfer(socket.fd, head.data(), head.size(), true, deadline);
-    if (!call.transport_error)
-        call.transport_error =
-            Transfer(socket.fd, body.data(), body.size(), true, deadline);
     std::array<char, Protocol::RESP_HEAD_LEN> response_head{};
     if (!call.transport_error)
         call.transport_error = Transfer(socket.fd, response_head.data(),
