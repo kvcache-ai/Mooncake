@@ -954,8 +954,9 @@ void Client::EnsureStorageControlPlaneStarted() {
 
 ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol,
-    const std::optional<std::string>& device_names) {
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    bool& retryable_on_new_endpoint) {
+    retryable_on_new_endpoint = false;
     // TEs created through the Store entry (Client::Create ->
     // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
     // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
@@ -1016,6 +1017,7 @@ ErrorCode Client::InitTransferEngine(
                                     hostname, port);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+        retryable_on_new_endpoint = rc == ERR_RPC_META_CONFLICT;
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -1348,11 +1350,14 @@ Client::CreateWithError(const std::string& local_hostname,
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
+        bool retryable_on_new_endpoint = false;
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         protocol, device_names,
+                                         retryable_on_new_endpoint);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
-            return tl::make_unexpected(CreateFailure{err});
+            return tl::make_unexpected(
+                CreateFailure{err, retryable_on_new_endpoint});
         }
     } else {
         client->transfer_engine_ = transfer_engine;

@@ -494,6 +494,11 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     }
 
     bool set(const std::string &key, const Json::Value &value) override {
+        return setWithStatus(key, value) == MetadataSetResult::kSuccess;
+    }
+
+    MetadataSetResult setWithStatus(const std::string &key,
+                                    const Json::Value &value) override {
         CURL *h = tl_easy();
         curl_easy_reset(h);
 
@@ -528,17 +533,24 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         if (rc != CURLE_OK) {
             LOG(ERROR) << "PUT " << url << " curl: " << curl_easy_strerror(rc)
                        << " err: " << errbuf;
-            return false;
+            return MetadataSetResult::kFailure;
         }
 
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
         if (!is_200(code)) {
+            if (code == 400 && key.find("rpc_meta") != std::string::npos &&
+                readBody == "Duplicate rpc_meta key not allowed") {
+                LOG(WARNING) << "PUT " << url
+                             << " rejected because the rpc_meta key already "
+                                "contains a different value";
+                return MetadataSetResult::kRpcMetaConflict;
+            }
             LOG(ERROR) << "PUT " << url << " http=" << code
                        << " body: " << readBody;
-            return false;
+            return MetadataSetResult::kFailure;
         }
-        return true;
+        return MetadataSetResult::kSuccess;
     }
 
     // ---- DELETE ----

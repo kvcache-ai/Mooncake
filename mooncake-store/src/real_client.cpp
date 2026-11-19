@@ -1152,9 +1152,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         client_ = std::move(client_result.value());
     } else {
-        // Retry only when no local port can be reserved. A client setup error
-        // such as a metadata backend write failure cannot be fixed by a new
-        // Store endpoint.
+        // Retry when no local port can be reserved or the metadata service
+        // rejects a duplicate rpc_meta key. Other setup errors are not fixed
+        // by selecting another Store endpoint.
         const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
         bool success = false;
         ErrorCode last_error = ErrorCode::INTERNAL_ERROR;
@@ -1190,12 +1190,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             const auto failure = client_result.error();
             last_error = failure.code;
-            LOG(ERROR) << "Client setup failed on port " << port
-                       << ": error=" << toString(failure.code)
-                       << "; a different endpoint cannot recover this "
-                          "failure";
+            if (!failure.retryable_on_new_endpoint) {
+                LOG(ERROR) << "Client setup failed on port " << port
+                           << ": error=" << toString(failure.code)
+                           << "; a different endpoint cannot recover this "
+                              "failure";
+                port_binder_.reset();
+                return tl::unexpected(failure.code);
+            }
+
+            LOG(WARNING) << "RPC metadata key conflict on port " << port
+                         << ", retry " << (retry + 1) << "/"
+                         << auto_port_config.max_retries
+                         << " with a new Store endpoint";
             port_binder_.reset();
-            return tl::unexpected(failure.code);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (!success) {

@@ -27,10 +27,16 @@ bool IsHostCharacter(char character) {
 
 bool ParseEtcdEndpoint(std::string_view endpoint) {
     endpoint = TrimEndpoint(endpoint);
+    bool is_http_url = false;
     if (endpoint.starts_with("http://")) {
+        is_http_url = true;
         endpoint.remove_prefix(std::string_view("http://").size());
     } else if (endpoint.starts_with("https://")) {
+        is_http_url = true;
         endpoint.remove_prefix(std::string_view("https://").size());
+    }
+    if (is_http_url && !endpoint.empty() && endpoint.back() == '/') {
+        endpoint.remove_suffix(1);
     }
     if (endpoint.empty() ||
         endpoint.find_first_of("/?#") != std::string_view::npos) {

@@ -67,6 +67,8 @@ TEST(HABackendAvailabilityTest, ExplicitEtcdSchemeNormalizesEndpoints) {
 
     expect_etcd("etcd://127.0.0.1:2379", "127.0.0.1:2379");
     expect_etcd("etcd://https://127.0.0.1:2379", "https://127.0.0.1:2379");
+    expect_etcd("etcd://http://127.0.0.1:2379/", "http://127.0.0.1:2379/");
+    expect_etcd("etcd://https://127.0.0.1:2379/", "https://127.0.0.1:2379/");
 
 #else
     auto spec = ParseHABackendSpec("etcd://127.0.0.1:2379");
