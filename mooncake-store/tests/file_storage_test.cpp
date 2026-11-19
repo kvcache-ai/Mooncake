@@ -1811,6 +1811,105 @@ TEST_F(FileStorageTest, StagingAllocWaitExpiresToBufferOverflow) {
         << "the wait must stay bounded";
 }
 
+TEST_F(FileStorageTest, StagingAllocRejectsOversizedBatchBeforeWaiting) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    // A budget long enough that a batch that waited it out would be obvious.
+    file_storage_config.client_buffer_alloc_wait_ms = 5000;
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    auto start = std::chrono::steady_clock::now();
+    // Whole-batch footprint is 4 MiB (2 MiB + 2 MiB) against a 3 MiB arena, so
+    // it can never fit. Admit the batch as a unit: reject before any bounded
+    // wait instead of holding the first slice, parking for the full budget, and
+    // only then failing.
+    auto waiter_result = TryAllocate(fileStorage, {"a", "b"},
+                                     {2 * 1024 * 1024, 2 * 1024 * 1024});
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_EQ(waiter_result.error, ErrorCode::BUFFER_OVERFLOW);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(500))
+        << "an oversized batch must be rejected without waiting out the budget";
+}
+
+TEST_F(FileStorageTest, StagingAllocRollsBackPartialBeforeWaiting) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 2500;
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // A registered 1 MiB holder leaves 2 MiB free, less than the waiter's 3 MiB
+    // whole batch, so the waiter must roll back and wait rather than sit on a
+    // partial slice that another reader needs.
+    auto holder =
+        FileStorageAllocateBatch(fileStorage, {"holder"}, {1 * 1024 * 1024});
+    ASSERT_TRUE(holder);
+    const uint64_t holder_id = holder.value()->batch_id;
+    RegisterHolderBatch(fileStorage, std::move(holder.value()));
+
+    AllocOutcome waiter_result{ErrorCode::INTERNAL_ERROR, 0};
+    std::thread waiter([&] {
+        waiter_result =
+            TryAllocate(fileStorage, {"w0", "w1"},
+                        {static_cast<int64_t>(3 * 1024 * 1024 / 2),
+                         static_cast<int64_t>(3 * 1024 * 1024 / 2)});
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    // While the waiter is parked it must hold no arena memory at all: the full
+    // 2 MiB still nominally free has to be allocatable right now. A waiter that
+    // kept its first slice would have consumed this space.
+    auto probe =
+        FileStorageAllocateBatch(fileStorage, {"probe"}, {2 * 1024 * 1024});
+    ASSERT_TRUE(probe) << "a waiting reader must not hold partial arena slices";
+    probe.value().reset();
+
+    ASSERT_TRUE(fileStorage.ReleaseBuffer(holder_id));
+    waiter.join();
+
+    ASSERT_EQ(waiter_result.error, ErrorCode::OK)
+        << "the waiter should succeed once the whole batch fits";
+    EXPECT_EQ(waiter_result.total_size, 3 * 1024 * 1024);
+}
+
+TEST_F(FileStorageTest, StagingAllocRaReleaseWakesWaiter) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 3000;
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // Held only by its RAII handles: no ReleaseBuffer, so the only way the
+    // space returns is the handle destructor signalling the release.
+    auto raii_holder =
+        FileStorageAllocateBatch(fileStorage, {"raii"}, {2 * 1024 * 1024});
+    ASSERT_TRUE(raii_holder);
+    ASSERT_EQ(ClientBufferBatchCount(fileStorage), 0u)
+        << "the holder must not be registered in the lease table";
+
+    AllocOutcome waiter_result{ErrorCode::INTERNAL_ERROR, 0};
+    std::thread waiter([&] {
+        waiter_result = TryAllocate(fileStorage, {"waiter"}, {2 * 1024 * 1024});
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto start = std::chrono::steady_clock::now();
+    raii_holder.value().reset();  // RAII release: no ReleaseBuffer call.
+    waiter.join();
+    auto wake = std::chrono::steady_clock::now() - start;
+
+    ASSERT_EQ(waiter_result.error, ErrorCode::OK);
+    EXPECT_LT(wake, std::chrono::milliseconds(1000))
+        << "an RAII release must wake the waiter promptly, not after the "
+           "budget";
+    EXPECT_EQ(waiter_result.total_size, 2 * 1024 * 1024);
+}
+
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     std::unordered_map<std::string, int64_t> offloading_objects;
     for (size_t i = 0; i < 35; i++) {

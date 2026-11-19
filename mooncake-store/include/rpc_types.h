@@ -350,6 +350,16 @@ struct BatchGetOffloadObjectResponse {
     std::vector<uint64_t> pointers;
     std::string transfer_engine_addr;
     uint64_t gc_ttl_ms;
+    // Conservative lower bound, measured by the owner, on how long elapsed
+    // from the offload RPC handler entry to the moment the owner started the
+    // batch lease. That stretch already ran on the owner's clock before this
+    // response reached the reader, so the reader subtracts it from its own
+    // lease window instead of banking the full gc_ttl_ms on top of it; the
+    // lease is the reader's only guard against the owner reclaiming the
+    // staging buffer mid-read, so over-counting it is the unsafe direction.
+    // compatible<,1> so an owner that predates the field is read as 0 and the
+    // reader falls back to its old unadjusted window.
+    struct_pack::compatible<std::uint64_t, 1> pre_grant_ms;
 
     BatchGetOffloadObjectResponse() : batch_id(0), gc_ttl_ms(0) {}
     BatchGetOffloadObjectResponse(uint64_t batch_id_param,
@@ -362,7 +372,7 @@ struct BatchGetOffloadObjectResponse {
           gc_ttl_ms(gc_ttl_ms_param) {}
 };
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
-         transfer_engine_addr, gc_ttl_ms);
+         transfer_engine_addr, gc_ttl_ms, pre_grant_ms);
 
 // Verify request on the offload RPC server. Offload files are written under
 // the object's recorded tenant, which is not necessarily the owning client's
