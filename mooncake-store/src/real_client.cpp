@@ -3104,7 +3104,8 @@ std::vector<int> RealClient::batchIsExist(
 
 std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
                                           const ExistOptions &options) {
-    auto internal_results = batchIsExist_internal(keys);
+    auto internal_results =
+        batchIsExist_internal(keys, options.chunked_parallel);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -7303,7 +7304,7 @@ RealClient::batch_get_into_internal(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string> &keys, bool parallel) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
@@ -7316,7 +7317,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     }
 
     // Call client BatchIsExist and return the vector<expected> directly
-    return client_->BatchIsExist(keys);
+    return client_->BatchIsExist(keys, parallel);
 }
 
 tl::expected<bool, ErrorCode> RealClient::probeKey_internal(

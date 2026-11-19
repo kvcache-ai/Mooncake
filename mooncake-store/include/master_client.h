@@ -154,7 +154,7 @@ class MasterClient {
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& object_keys);
+        const std::vector<std::string>& object_keys, bool parallel = false);
 
     /**
      * @brief Probe multiple objects, optionally leasing the last complete

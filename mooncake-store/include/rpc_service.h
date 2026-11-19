@@ -66,6 +66,13 @@ class WrappedMasterService {
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
+    // Additive parallel variant: keeps BatchExistKey's wire signature intact
+    // so mixed-version peers keep working (see RegisterRpcService's
+    // "purely additive for old peers" note).
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyParallel(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
@@ -447,6 +454,9 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        bool parallel);
     MasterService master_service_;
 };
 

@@ -4332,8 +4332,8 @@ tl::expected<bool, ErrorCode> Client::ProbeKey(const std::string& key) {
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchExistKey(keys);
+    const std::vector<std::string>& keys, bool parallel) {
+    auto response = master_client_.BatchExistKey(keys, parallel);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {

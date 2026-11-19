@@ -557,7 +557,7 @@ class Client {
      * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys, bool parallel = false);
 
     WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);

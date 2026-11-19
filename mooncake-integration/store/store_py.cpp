@@ -2350,6 +2350,9 @@ PYBIND11_MODULE(_store, m) {
     py::class_<ExistOptions>(m, "ExistOptions")
         .def(py::init<>())
         .def_readwrite("prefetch_to_memory", &ExistOptions::prefetch_to_memory)
+        .def_readwrite("chunked_parallel", &ExistOptions::chunked_parallel,
+                       "When true, query the key set in parallel chunks on "
+                       "the master (off by default).")
         .def("__str__", [](const ExistOptions &options) {
             std::ostringstream oss;
             oss << options;
@@ -2824,7 +2827,9 @@ PYBIND11_MODULE(_store, m) {
             "Check if multiple objects exist. When options.prefetch_to_memory "
             "is true (and enable_ssd_prefetch is configured), triggers "
             "best-effort SSD-to-DRAM promotion for keys that only have "
-            "LOCAL_DISK replicas. Returns list of results: 1 if "
+            "LOCAL_DISK replicas. When options.chunked_parallel is true, the "
+            "key set is queried in parallel chunks on the master, which can "
+            "speed up large batches. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def(
             "probe_key",

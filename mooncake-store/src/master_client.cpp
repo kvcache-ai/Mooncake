@@ -46,6 +46,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchExistKeyParallel> {
+    static constexpr const char* value = "BatchExistKeyParallel";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchProbeKey> {
     static constexpr const char* value = "BatchProbeKey";
 };
@@ -672,12 +677,20 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
-    const std::vector<std::string>& object_keys) {
+    const std::vector<std::string>& object_keys, bool parallel) {
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
-    timer.LogRequest("keys_count=", object_keys.size());
+    timer.LogRequest("keys_count=", object_keys.size(),
+                     ", parallel=", parallel);
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
-        object_keys.size(), object_keys, tenant_id_.value());
+    std::vector<tl::expected<bool, ErrorCode>> result;
+    if (parallel) {
+        result = invoke_batch_rpc<&WrappedMasterService::BatchExistKeyParallel,
+                                  bool>(object_keys.size(), object_keys,
+                                        tenant_id_.value());
+    } else {
+        result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+            object_keys.size(), object_keys, tenant_id_.value());
+    }
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
