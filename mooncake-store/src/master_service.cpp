@@ -5330,7 +5330,8 @@ auto MasterService::PrepareWriteStart(
 }
 
 auto MasterService::CleanupStaleBeforeWrite(const char* why,
-                                            MetadataAccessorRW& accessor)
+                                            MetadataAccessorRW& accessor,
+                                            const ReplicateConfig& config)
     -> tl::expected<void, ErrorCode> {
     if (accessor.IsPublished() &&
         accessor.GetState().object_storage_commit_pending)
@@ -5352,7 +5353,11 @@ auto MasterService::CleanupStaleBeforeWrite(const char* why,
         return tl::make_unexpected(persist_result.error());
     }
     if (enable_oplog_) {
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        // An object-aware client treats ALREADY_EXISTS as a successful put.
+        // Retry admission once the queued cleanup is durable.
+        return tl::make_unexpected(config.os_replica_num
+                                       ? ErrorCode::REPLICA_IS_NOT_READY
+                                       : ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     if (CleanupStaleHandles(key, tenant_id, accessor.Get(),
                             accessor.GetState())) {
@@ -5422,8 +5427,8 @@ auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
         if (auto admitted = accessor.Grow(0); !admitted) {
             return tl::make_unexpected(admitted.error());
         }
-        if (auto cleaned =
-                CleanupStaleBeforeWrite("PutStart(stale cleanup)", accessor);
+        if (auto cleaned = CleanupStaleBeforeWrite("PutStart(stale cleanup)",
+                                                   accessor, config);
             !cleaned) {
             return tl::make_unexpected(cleaned.error());
         }
@@ -6077,7 +6082,7 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
             }
             // --- Step 0: stale handle cleanup ---
             if (auto cleaned = CleanupStaleBeforeWrite(
-                    "UpsertStart(stale cleanup)", accessor);
+                    "UpsertStart(stale cleanup)", accessor, config);
                 !cleaned) {
                 return tl::make_unexpected(cleaned.error());
             }
@@ -6372,8 +6377,9 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                 if (!old_replicas.empty()) {
                     FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
-                    discarded_replicas_.emplace_back(std::move(old_replicas),
-                                                     release_at);
+                    discarded_replicas_.emplace_back(
+                        std::move(old_replicas),
+                        std::max(release_at, metadata.EvictionDeadline()));
                 }
                 // The replacement is published under this same lock, so no
                 // reader or writer finds the key between the two objects.

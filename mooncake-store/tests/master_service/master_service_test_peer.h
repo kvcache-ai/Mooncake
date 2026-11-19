@@ -47,6 +47,11 @@ class MasterServiceTestPeer {
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
+    // Exercise object commit and recovery with the in-memory HA log. Remote
+    // I/O and the cleanup worker are deliberately not started by this fixture.
+    StandbyMetadataStore& EnableObjectRecordsForTesting(
+        const ObjectStorageConfig& config);
+
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
 

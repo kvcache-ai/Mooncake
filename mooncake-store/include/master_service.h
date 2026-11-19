@@ -1540,8 +1540,9 @@ class MasterService {
     // A write's first step under the key: drops the held object's stale
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
-    // with OBJECT_ALREADY_EXISTS.
-    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
+    // until it is durable.
+    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor,
+                                 const ReplicateConfig& config)
         -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission

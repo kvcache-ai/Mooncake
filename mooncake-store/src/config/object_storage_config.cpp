@@ -11,7 +11,9 @@ bool ObjectStorageConfig::Validate() const {
             maintenance_batch_size && cleanup_interval_ms);
 }
 std::string ObjectStorageConfig::NamespaceId() const {
-    auto bytes = struct_pack::serialize(target);
+    auto bytes =
+        struct_pack::serialize<struct_pack::sp_config::DISABLE_TYPE_INFO>(
+            target);
     return {bytes.begin(), bytes.end()};
 }
 }  // namespace mooncake

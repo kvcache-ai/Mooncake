@@ -1,9 +1,21 @@
 #include "master_config.h"
 
 #include <gtest/gtest.h>
+#include <ylt/struct_pack.hpp>
 
 namespace mooncake::test {
 namespace {
+
+TEST(ObjectStorageConfigTest,
+     NamespaceMatchesTheReleaseWireFormatInEveryBuild) {
+    ObjectStorageConfig config;
+    config.target = {"s3",     "https://objects.example.com",
+                     "bucket", "region",
+                     "prefix", true};
+    const auto wire =
+        struct_pack::serialize<struct_pack::DISABLE_TYPE_INFO>(config.target);
+    EXPECT_EQ(config.NamespaceId(), std::string(wire.begin(), wire.end()));
+}
 
 TEST(ObjectStorageConfigTest, RegionIsRequiredOnlyWhenEnabled) {
     ObjectStorageConfig config;

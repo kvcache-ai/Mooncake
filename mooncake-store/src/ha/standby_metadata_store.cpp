@@ -94,6 +94,9 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
             previous.writer != record.writer ||
             previous.replica_id != record.replica_id ||
             previous.object.object_size != record.object.object_size ||
+            (previous.read_lease_ttl_ms.has_value() &&
+             (!record.read_lease_ttl_ms.has_value() ||
+              *record.read_lease_ttl_ms < *previous.read_lease_ttl_ms)) ||
             record.phase < previous.phase ||
             (previous.upload_finished && !record.upload_finished) ||
             record.not_before_ms < previous.not_before_ms) {

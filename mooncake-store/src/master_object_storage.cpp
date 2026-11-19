@@ -14,6 +14,14 @@ uint64_t ObjectNowMs() {
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
+uint64_t ObjectLeaseTtl(const ObjectUploadRecord& record, uint64_t current) {
+    return std::max(current, record.read_lease_ttl_ms.value_or(0));
+}
+void RetireObject(ObjectUploadRecord& record, uint64_t ttl, uint64_t now) {
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms =
+        std::max(record.not_before_ms, now + ObjectLeaseTtl(record, ttl));
+}
 std::string EncodeObjectMutation(const ObjectReplicaMutation& mutation) {
     auto bytes = struct_pack::serialize(mutation);
     return {bytes.begin(), bytes.end()};
@@ -124,10 +132,7 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
         for (auto record : previous) {
             if (!retained.contains(record.object.object_key) &&
                 record.phase != ObjectUploadPhase::RETIRED) {
-                record.phase = ObjectUploadPhase::RETIRED;
-                record.not_before_ms =
-                    std::max(record.not_before_ms,
-                             ObjectNowMs() + default_kv_lease_ttl_);
+                RetireObject(record, default_kv_lease_ttl_, ObjectNowMs());
             }
             mutation.records.push_back(std::move(record));
         }
@@ -153,10 +158,7 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
             if (changed.contains(record.object.object_key)) continue;
             if (!retained.contains(record.object.object_key) &&
                 record.phase != ObjectUploadPhase::RETIRED) {
-                record.phase = ObjectUploadPhase::RETIRED;
-                record.not_before_ms =
-                    std::max(record.not_before_ms,
-                             ObjectNowMs() + default_kv_lease_ttl_);
+                RetireObject(record, default_kv_lease_ttl_, ObjectNowMs());
             }
             mutation.records.push_back(std::move(record));
         }
@@ -273,6 +275,7 @@ tl::expected<void, ErrorCode> MasterService::AuthorizeObjectStorage(
     }
     ObjectUploadRecord record;
     record.target = object_storage_config_.target;
+    record.read_lease_ttl_ms = default_kv_lease_ttl_;
     record.tenant_id = tenant.value();
     record.key = key;
     record.writer = writer;
@@ -351,10 +354,7 @@ tl::expected<void, ErrorCode> MasterService::FinishObjectStorageUpload(
             record->upload_finished = true;
         } else if (!record->upload_finished) {
             if (record->phase != ObjectUploadPhase::RETIRED) {
-                record->phase = ObjectUploadPhase::RETIRED;
-                record->not_before_ms =
-                    std::max(record->not_before_ms,
-                             ObjectNowMs() + default_kv_lease_ttl_);
+                RetireObject(*record, default_kv_lease_ttl_, ObjectNowMs());
             }
             record->upload_finished =
                 outcome == ObjectUploadOutcome::NOT_STARTED;
@@ -521,10 +521,7 @@ tl::expected<void, ErrorCode> MasterService::RevokeObjectStorageWrite(
                 replica->get_object_storage_descriptor().object_key);
             if (!record) return tl::make_unexpected(ErrorCode::INVALID_WRITE);
             if (record->phase != ObjectUploadPhase::RETIRED) {
-                record->phase = ObjectUploadPhase::RETIRED;
-                record->not_before_ms =
-                    std::max(record->not_before_ms,
-                             ObjectNowMs() + default_kv_lease_ttl_);
+                RetireObject(*record, default_kv_lease_ttl_, ObjectNowMs());
             }
             ObjectReplicaMutation mutation;
             mutation.target = record->target;
@@ -637,10 +634,8 @@ void MasterService::MaintainObjectStorage() {
                 }
                 if (record->phase != ObjectUploadPhase::RETIRED) {
                     if (!live) {
-                        record->phase = ObjectUploadPhase::RETIRED;
-                        record->not_before_ms =
-                            std::max(record->not_before_ms,
-                                     ObjectNowMs() + default_kv_lease_ttl_);
+                        RetireObject(*record, default_kv_lease_ttl_,
+                                     ObjectNowMs());
                         ObjectReplicaMutation mutation;
                         mutation.target = record->target;
                         mutation.records.push_back(*record);
@@ -736,6 +731,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
                 auto record =
                     object_uploads_->FindObjectUpload(descriptor.object_key);
                 const auto& attempt = metadata.object_storage_write_attempt;
+                if (record && !record->read_lease_ttl_ms.has_value()) {
+                    LOG(ERROR) << "Cannot restore a live object without its "
+                                  "prior read lease TTL";
+                    valid = false;
+                }
                 if (!record || record->tenant_id != tenant.value() ||
                     record->key != object.key() ||
                     record->writer != metadata.client_id ||
@@ -757,7 +757,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
         object_work_.clear();
     }
     if (!snapshot.target) return {};
-    const auto deadline = ObjectNowMs() + default_kv_lease_ttl_;
+    const auto now = ObjectNowMs();
     uint64_t pending_sequence = 0;
     size_t pending_count = 0;
     for (auto record : snapshot.records) {
@@ -772,8 +772,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
             accessor.Exists() ? accessor.Get().GetReplicaByID(record.replica_id)
                               : nullptr;
         if (replica && replica->is_completed()) {
-            accessor.Get().GrantReadLease(
-                std::chrono::milliseconds(default_kv_lease_ttl_));
             if (!replica->is_object_storage_replica() ||
                 record.phase != ObjectUploadPhase::UPLOADED ||
                 replica->get_object_storage_descriptor().object_key !=
@@ -781,6 +779,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
                 replica->get_object_storage_descriptor().object_size !=
                     record.object.object_size)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            accessor.Get().GrantReadLease(std::chrono::milliseconds(
+                ObjectLeaseTtl(record, default_kv_lease_ttl_)));
             auto encoded = SerializeMetadataForOpLog(accessor.Get());
             MetadataPayload payload;
             if (struct_pack::deserialize_to(payload, encoded) !=
@@ -788,10 +788,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
                 !object_uploads_->PutMetadata(record.tenant_id, record.key,
                                               payload.ToStandbyMetadata()))
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
+            if (*record.read_lease_ttl_ms >= default_kv_lease_ttl_) continue;
+            // Persist the larger ceiling before this leader can grant it.
+            record.read_lease_ttl_ms = default_kv_lease_ttl_;
+        } else if (record.phase != ObjectUploadPhase::RETIRED) {
+            RetireObject(record, default_kv_lease_ttl_, now);
         }
-        record.phase = ObjectUploadPhase::RETIRED;
-        record.not_before_ms = std::max(record.not_before_ms, deadline);
         ObjectReplicaMutation mutation;
         mutation.target = record.target;
         mutation.records.push_back(record);
