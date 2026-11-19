@@ -44,7 +44,12 @@ class PrefetchTeardownTest : public ::testing::Test {
         client_ = RealClient::create();
         ASSERT_TRUE(client_->setup_internal(config).has_value());
     }
-    void TearDown() override { master_.Stop(); }
+    void TearDown() override {
+        // Release the client's segments before the master goes away, or its
+        // destructor unmounts against a stopped master (RPC_FAIL noise).
+        client_.reset();
+        master_.Stop();
+    }
 
     // TEST_F bodies run in generated subclasses, which do NOT inherit this
     // fixture's friendship with RealClient — every touch of a private member
