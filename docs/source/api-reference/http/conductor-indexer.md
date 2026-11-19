@@ -77,10 +77,11 @@ The HTTP server listens on `http_server_port` (default `13333`).
 
 ### Encoding
 
-All request and response bodies are MessagePack. Requests must set a
-`Content-Type` containing `application/msgpack`, and responses use
+Control API request and response bodies are MessagePack. These requests must
+set a `Content-Type` containing `application/msgpack`, and their responses use
 `Content-Type: application/msgpack`. The examples below show MessagePack maps
-in JSON notation.
+in JSON notation. The `/metrics` endpoint described below returns Prometheus
+text instead.
 
 Request maps are strict: unknown fields are rejected, and every field has a
 fixed type.
@@ -361,3 +362,135 @@ The master's memory replicas feed the `cpu_share` tier and its disk-class
 replicas feed `disk`. Its `group_id` must be empty or `0`. A `cleared` event
 removes every object indexed for that `backend_id` and `tenant_id`. The master
 has no replay endpoint, so any sequence gap marks the stream stale.
+
+## Prometheus metrics
+
+### `GET /metrics`
+
+The existing HTTP server exposes Prometheus text format 0.0.4 on `/metrics`.
+No separate port or metrics flag is required. Unlike the control APIs, this
+endpoint returns `text/plain; version=0.0.4; charset=utf-8` and needs no
+MessagePack decoding:
+
+```bash
+curl -fsS http://127.0.0.1:13333/metrics
+```
+
+For example, a fresh process with no subscriptions returns the following
+capability sample, along with the metric family HELP and TYPE declarations:
+
+```text
+# HELP mooncake_conductor_metrics_info Conductor event metrics schema version.
+# TYPE mooncake_conductor_metrics_info gauge
+mooncake_conductor_metrics_info{schema="2"} 1
+```
+
+Configure Prometheus to scrape the Conductor HTTP listener:
+
+```yaml
+scrape_configs:
+  - job_name: mooncake-conductor
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["127.0.0.1:13333"]
+```
+
+Use an address reachable from Prometheus in `targets`. The metrics endpoint
+has the same network access boundary as the other Conductor HTTP endpoints.
+
+### Metric families and labels
+
+Except for `mooncake_conductor_metrics_info`, each sample has these labels:
+
+- `tenant_id`: the subscription's tenant.
+- `cache_domain`: the registered `modelname` value.
+- `instance_id`: the registered inference instance or storage publisher.
+- `dp_rank`: the registered data-parallel rank.
+- `publisher_kind`: `vLLM`, `SGLang`, or `Mooncake`.
+
+Replicas on the same host remain separate subscriptions. No request IDs,
+block hashes, tokens, or error strings are used as labels.
+
+| Metric | Type | Meaning / additional labels |
+|---|---|---|
+| `mooncake_conductor_metrics_info` | Gauge | Value `1`, with `schema="2"`. Present even without subscriptions. |
+| `mooncake_conductor_events_supported` | Gauge | `1` for vLLM/SGLang engine event counters, `0` for Mooncake storage publishers. |
+| `mooncake_conductor_events_total` | Counter | Engine event handling attempts by `event_type`, `result`, and `origin`, including redeliveries. |
+| `mooncake_conductor_event_block_references_total` | Counter | Block hashes carried by successfully applied stored/removed events; `event_type` and `origin`. |
+| `mooncake_conductor_last_applied_event_timestamp_seconds` | Gauge | Conductor receive time of the last successfully applied engine event, in Unix seconds. Absent until an event is applied. |
+| `mooncake_conductor_event_batch_redeliveries_total` | Counter | Engine batches delivered to the handler with a non-increasing nonnegative transport sequence; label `origin`. Includes retries and duplicate deliveries. |
+| `mooncake_conductor_source_stale` | Gauge | `1` when an unrecoverable gap or dispatch failure invalidates the source; otherwise `0`. This is not an idle-time detector. |
+| `mooncake_conductor_batch_failures_total` | Counter | Malformed multipart frames, invalid envelopes, or failed batch dispatches. |
+| `mooncake_conductor_sequence_gaps_total` | Counter | Gaps observed in the live transport sequence. |
+| `mooncake_conductor_sequence_missing_messages_total` | Counter | Messages missing from those live gaps, including messages subsequently recovered by replay. |
+| `mooncake_conductor_replay_requests_total` | Counter | Replay attempts with `result="success"` or `result="failed"`; failed retries are included. A successful empty replay also counts. |
+
+Engine `event_type` is `stored`, `removed`, `cleared`, or `unknown` for an
+undecodable individual event. `result` is `applied`, `ignored`, or `rejected`;
+unknown events only have a rejected series. Ignored events include vLLM media
+that the indexer does not track and empty removals. Whole-batch rejection is
+counted by `batch_failures_total`, rather than inventing individual events.
+vLLM CPU events and SGLang engine-local CPU/DISK events are included when the
+indexer accepts them.
+
+`origin` is `live` or `replay`. Event and block-reference counters describe
+**handling attempts**, not unique events or final cache contents. If a rejected
+event is corrected and delivered again with the same sequence, both the rejected
+attempt and the later applied attempt are counted. In a partially successful
+batch, already successful events that are processed again also count again.
+Repeated successes and repeated failures are observable; counters never decrease.
+
+`event_batch_redeliveries_total` separately counts batches whose nonnegative
+sequence is at or below the highest sequence previously delivered to that
+subscription's handler. It does not distinguish a corrected retry from an
+identical duplicate. Calls without a transport sequence count their events but
+do not affect this batch counter. Metrics do not suppress processing or change
+transport recovery: messages discarded by transport deduplication never reach
+the handler and therefore do not add handling attempts. For overlapping buffered
+live/replay messages, the first buffered copy determines the origin.
+
+Schema `2` replaces the earlier schema `1` sequence-deduplicated event counts
+with these handling-attempt semantics and adds the redelivery counter. Each
+metric family's HELP/TYPE declarations and all its subscriptions' samples are
+emitted together for compatibility with Prometheus text parsers.
+
+Engine event counters start at zero for each subscription. Mooncake storage
+publishers expose transport metrics and `events_supported=0`; they do not
+expose misleading zero engine-event counts. All per-source series disappear
+on unregister and restart at zero on re-registration. A process restart resets
+counters and the in-memory index. These metrics do not add startup replay or
+index persistence.
+
+### Event and block-reference rates
+
+Use separate panels or units for event counts and the block references they
+carry. For example, one applied stored event containing three block hashes
+adds **one event** and **three block references**. These are event activity
+counts, not inference request counts, cache-hit counts, or resident cache size.
+
+Applied live events per minute, grouped by replica and event type:
+
+```promql
+sum by (tenant_id, cache_domain, instance_id, event_type) (
+  rate(mooncake_conductor_events_total{
+    origin="live", result="applied", event_type=~"stored|removed"
+  }[5m])
+) * 60
+```
+
+Block references in those events per minute:
+
+```promql
+sum by (tenant_id, cache_domain, instance_id, event_type) (
+  rate(mooncake_conductor_event_block_references_total{
+    origin="live", event_type=~"stored|removed"
+  }[5m])
+) * 60
+```
+
+When the subscription's effective block size is known, multiply block references
+by that size to estimate tokens involved in events. For a 16-token block, three
+references correspond to 48 tokens; repeated references remain included. There
+is no native token counter. Do not multiply aggregates spanning different block
+sizes by one shared factor. Prometheus needs multiple successful scrapes before
+`rate` produces values; missing history must not be interpreted as zero.

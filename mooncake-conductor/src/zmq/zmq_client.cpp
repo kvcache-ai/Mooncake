@@ -267,6 +267,7 @@ std::string ZMQClient::ProcessMessage() {
     }
 
     if (frames.size() != 3) {
+        ++batch_failures_;
         return "invalid multipart frame count: expected 3, got " +
                std::to_string(frames.size());
     }
@@ -276,11 +277,13 @@ std::string ZMQClient::ProcessMessage() {
     auto& payload_msg = frames[2];
 
     if (seq_msg.size() != 8) {
+        ++batch_failures_;
         return "invalid sequence length";
     }
     const uint64_t raw_seq =
         BigEndianToU64(static_cast<const unsigned char*>(seq_msg.data()));
     if (raw_seq > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        ++batch_failures_;
         return "sequence exceeds int64 range";
     }
     const int64_t seq = static_cast<int64_t>(raw_seq);
@@ -383,12 +386,13 @@ std::string ZMQClient::ProcessMessage() {
 
 std::string ZMQClient::DispatchMessage(const std::string& topic,
                                        int64_t sequence, const char* payload,
-                                       size_t payload_size) {
+                                       size_t payload_size, bool from_replay) {
     const MessageMetadata metadata{
         .publisher_kind = config_.publisher_kind,
         .endpoint = config_.endpoint,
         .topic = topic,
         .sequence = sequence,
+        .from_replay = from_replay,
     };
 
     DecodedBatch batch;
@@ -416,6 +420,7 @@ std::string ZMQClient::DispatchMessage(const std::string& topic,
         }
     }
     if (!decode_error.empty()) {
+        ++batch_failures_;
         LOG(WARNING) << "Rejected KV event envelope endpoint="
                      << metadata.endpoint << " topic=" << metadata.topic
                      << " seq=" << metadata.sequence << " publisher_kind="
@@ -424,9 +429,11 @@ std::string ZMQClient::DispatchMessage(const std::string& topic,
         return "";
     }
     if (event_handler_ == nullptr) {
+        ++batch_failures_;
         return "event handler is nil";
     }
     if (auto err = event_handler_->HandleBatch(batch, metadata); !err.empty()) {
+        ++batch_failures_;
         return "event handler failed: " + err;
     }
 
@@ -495,9 +502,9 @@ std::string ZMQClient::DrainBufferedMessages(bool allow_initial_baseline) {
             buffered_messages_.erase(next);
         }
 
-        if (auto err =
-                DispatchMessage(message.topic, message.sequence,
-                                message.payload.data(), message.payload.size());
+        if (auto err = DispatchMessage(
+                message.topic, message.sequence, message.payload.data(),
+                message.payload.size(), message.from_replay);
             !err.empty()) {
             MarkStale("failed to dispatch buffered sequence " +
                       std::to_string(message.sequence) + ": " + err);
@@ -648,11 +655,13 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
         socket = replay_socket_.get();
     }
     if (socket == nullptr) {
+        ++replay_failures_;
         return {.error = "replay socket is nil",
                 .failure = ReplayFailure::kRetryable};
     }
 
     auto fail = [this](std::string error, ReplayFailure failure) {
+        ++replay_failures_;
         if (auto reset_error = ResetReplaySocket(); !reset_error.empty()) {
             error += "; failed to reset replay socket: " + reset_error;
         }
@@ -738,6 +747,7 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
                 LOG(INFO) << "Replay completed service="
                           << config_.cache_pool_key << " from=" << from_seq
                           << " replayed=" << messages.size();
+                ++replay_successes_;
                 return {.messages = std::move(messages)};
             }
             if (raw_seq >
@@ -789,7 +799,8 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
                  .sequence = replay_seq,
                  .payload =
                      std::string(static_cast<const char*>(payload_msg.data()),
-                                 payload_size)});
+                                 payload_size),
+                 .from_replay = true});
         }
     } catch (const detail::Error& e) {
         return fail(std::string("replay request failed: ") + e.what(),
