@@ -143,10 +143,15 @@ impl HotPathBlockedMetadataBackend {
     }
 }
 
+type BeforeRouteReadHook = (ObjectKey, Box<dyn FnOnce() + Send>);
+
 struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
     fail_live_client_list: AtomicBool,
+    before_route_read: Mutex<Option<BeforeRouteReadHook>>,
+    fail_next_quota_abort: AtomicBool,
+    quota_abort_calls: AtomicUsize,
     get_object_route_calls: AtomicUsize,
     upsert_client_lease_calls: AtomicUsize,
     update_client_state_calls: AtomicUsize,
@@ -507,6 +512,9 @@ impl CountingMetadataBackend {
             inner,
             list_live_clients_calls: AtomicUsize::new(0),
             fail_live_client_list: AtomicBool::new(false),
+            before_route_read: Mutex::new(None),
+            fail_next_quota_abort: AtomicBool::new(false),
+            quota_abort_calls: AtomicUsize::new(0),
             get_object_route_calls: AtomicUsize::new(0),
             upsert_client_lease_calls: AtomicUsize::new(0),
             update_client_state_calls: AtomicUsize::new(0),
@@ -1852,6 +1860,17 @@ impl MetadataBackend for CountingMetadataBackend {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
         self.get_object_route_calls.fetch_add(1, Ordering::Relaxed);
+        let hook = {
+            let mut pending = self.before_route_read.lock();
+            if pending.as_ref().is_some_and(|(target, _)| target == key) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, hook)) = hook {
+            hook();
+        }
         self.inner.get_object_route(key)
     }
 
@@ -1988,6 +2007,10 @@ impl MetadataBackend for CountingMetadataBackend {
         &self,
         reservation_id: &str,
     ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.quota_abort_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_next_quota_abort.swap(false, Ordering::Relaxed) {
+            return Err(StoreError::Metadata("injected quota abort failure".into()));
+        }
         self.inner.abort_tenant_quota(reservation_id)
     }
 
@@ -18379,6 +18402,245 @@ impl MembershipReadFixture {
 }
 
 #[test]
+fn ranged_read_preserves_routes_published_after_membership_refresh() {
+    let mut fixture = MembershipReadFixture::new();
+    fixture.keys.truncate(2);
+    let mut published = fixture
+        .reader
+        .query_route(&fixture.keys[1])
+        .unwrap()
+        .unwrap();
+    assert!(
+        fixture
+            .metadata
+            .compare_and_swap_object_route(&published.key, Some(published.version), None)
+            .unwrap()
+            .applied
+    );
+    published.version = published.version.next();
+    fixture
+        .metadata
+        .update_client_state(
+            fixture.stores[0].runtime_id(),
+            ClientLifecycleState::Standby,
+        )
+        .unwrap();
+    fixture.reader.live_clients_snapshot(true).unwrap();
+    let before = fixture.metadata.list_live_clients_calls();
+    let metadata = fixture.metadata.clone();
+    let new_route = published.clone();
+    *fixture.metadata.before_route_read.lock() = Some((
+        published.key.clone(),
+        Box::new(move || {
+            // A has already refreshed membership; B becomes visible afterward.
+            assert_eq!(metadata.list_live_clients_calls() - before, 1);
+            metadata
+                .update_client_state(&new_route.replicas[0].owner, ClientLifecycleState::Active)
+                .unwrap();
+            assert!(
+                metadata
+                    .compare_and_swap_object_route(&new_route.key, None, Some(&new_route))
+                    .unwrap()
+                    .applied
+            );
+        }),
+    ));
+
+    fixture.read(MembershipReadPath::Ranges);
+
+    assert!(fixture.metadata.before_route_read.lock().is_none());
+    assert_eq!(fixture.metadata.list_live_clients_calls() - before, 1);
+    assert_eq!(
+        fixture
+            .reader
+            .query_route(&fixture.keys[1])
+            .unwrap()
+            .unwrap(),
+        published,
+        "the shared snapshot predates B and must not remove its healthy primary"
+    );
+    assert_eq!(
+        fixture
+            .reader
+            .query_route(&fixture.keys[0])
+            .unwrap()
+            .unwrap()
+            .replicas
+            .len(),
+        1,
+        "A can still be pruned using its later membership refresh"
+    );
+}
+
+#[test]
+fn read_failure_refresh_preserves_replicas_published_during_route_lookup() {
+    let fixture = MembershipReadFixture::new();
+    let key = &fixture.keys[0];
+    let (mut resolved, _) = fixture
+        .reader
+        .resolve_objects(&[ObjectRef::new(key)])
+        .unwrap();
+    let entry = &mut resolved[0];
+    let mut published = entry.route.clone();
+    published.version = published.version.next();
+    fixture
+        .metadata
+        .update_client_state(
+            fixture.stores[0].runtime_id(),
+            ClientLifecycleState::Standby,
+        )
+        .unwrap();
+    let metadata = fixture.metadata.clone();
+    let new_route = published.clone();
+    let expected = entry.route.version;
+    *fixture.metadata.before_route_read.lock() = Some((
+        published.key.clone(),
+        Box::new(move || {
+            metadata
+                .update_client_state(&new_route.replicas[0].owner, ClientLifecycleState::Active)
+                .unwrap();
+            assert!(
+                metadata
+                    .compare_and_swap_object_route(&new_route.key, Some(expected), Some(&new_route))
+                    .unwrap()
+                    .applied
+            );
+        }),
+    ));
+    let before = fixture.metadata.list_live_clients_calls();
+
+    assert!(fixture
+        .reader
+        .refresh_resolved_route_after_read_failure(entry)
+        .unwrap());
+
+    assert!(fixture.metadata.before_route_read.lock().is_none());
+    assert_eq!(fixture.metadata.list_live_clients_calls() - before, 1);
+    assert_eq!(entry.route, published);
+    assert_eq!(fixture.reader.query_route(key).unwrap().unwrap(), published);
+}
+
+#[test]
+fn put_reservation_retry_stops_when_quota_abort_fails_before_applying() {
+    let fixture = MembershipReadFixture::new();
+    let scope = TenantPolicyScope::new("default", None::<String>, None::<String>);
+    let quota = TenantQuotaPolicy {
+        max_bytes: Some(1024),
+        max_objects: Some(16),
+    };
+    let policy = fixture
+        .metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: scope.clone(),
+                spec: TenantPolicySpec {
+                    quota: Some(quota.clone()),
+                    ..Default::default()
+                },
+                version: 1,
+                updated_at_ms: now_ms(),
+                updated_by: "test".into(),
+            },
+            None,
+        )
+        .unwrap();
+    fixture
+        .reader
+        .live_client_cache
+        .lock()
+        .store_tenant_quota_policy(
+            "default".into(),
+            Some(policy.version),
+            Some(quota),
+            now_ms(),
+        );
+    fixture
+        .metadata
+        .update_client_state(
+            fixture.stores[0].runtime_id(),
+            ClientLifecycleState::Standby,
+        )
+        .unwrap();
+    fixture.reader.live_clients_snapshot(true).unwrap();
+    // A refresh would discover enough owners to retry successfully.
+    fixture
+        .metadata
+        .update_client_state(fixture.stores[0].runtime_id(), ClientLifecycleState::Active)
+        .unwrap();
+    fixture
+        .metadata
+        .fail_next_quota_abort
+        .store(true, Ordering::Relaxed);
+    let before = fixture.metadata.list_live_clients_calls();
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .prefer_local(false);
+    let value = b"single-put-refresh-payload";
+    let key = "quota-abort-before-retry";
+
+    let error = fixture
+        .reader
+        .put_with_policy(key, value, &policy)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, StoreError::InvalidState(ref message)
+        if message.contains("injected quota abort failure")),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.metadata.quota_abort_calls.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(fixture.metadata.list_live_clients_calls() - before, 0);
+    assert!(fixture.reader.query_route(key).unwrap().is_none());
+    let object_key = fixture.reader.scoped_object_key_for_tenant("default", key);
+    assert!(fixture
+        .metadata
+        .get_tenant_object_accounting(&object_key)
+        .unwrap()
+        .is_none());
+    let reservations = fixture
+        .metadata
+        .list_tenant_quota_reservations(&scope)
+        .unwrap();
+    assert_eq!(
+        reservations.len(),
+        1,
+        "the failed abort must not create a second reservation"
+    );
+    let state = fixture
+        .metadata
+        .get_tenant_quota_state(&scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!((state.used_bytes, state.used_objects), (0, 0));
+    assert_eq!(state.pending_reserved_bytes, value.len() as u64);
+    assert_eq!(state.pending_reserved_objects, 1);
+
+    // Clean up the original reservation, then prove refresh/retry would otherwise succeed.
+    fixture
+        .metadata
+        .abort_tenant_quota(&reservations[0].reservation_id)
+        .unwrap();
+    fixture.reader.put_with_policy(key, value, &policy).unwrap();
+    assert_eq!(fixture.reader.get(key).unwrap(), value);
+    let state = fixture
+        .metadata
+        .get_tenant_quota_state(&scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (state.used_bytes, state.used_objects),
+        (value.len() as u64, 1)
+    );
+    assert_eq!(
+        (state.pending_reserved_bytes, state.pending_reserved_objects),
+        (0, 0)
+    );
+}
+
+#[test]
 fn healthy_replicated_reads_do_not_refresh_membership() {
     let fixture = MembershipReadFixture::new();
     for path in [
@@ -18421,7 +18683,15 @@ fn batch_read_pruning_refreshes_membership_once() {
             1,
             "{path:?}"
         );
-        fixture.assert_replicas(1);
+        if matches!(path, MembershipReadPath::Ranges) {
+            // Later routes were loaded after the shared snapshot and retain their replicas.
+            for (index, key) in fixture.keys.iter().enumerate() {
+                let route = fixture.reader.query_route(key).unwrap().unwrap();
+                assert_eq!(route.replicas.len(), if index == 0 { 1 } else { 2 });
+            }
+        } else {
+            fixture.assert_replicas(1);
+        }
     }
 }
 

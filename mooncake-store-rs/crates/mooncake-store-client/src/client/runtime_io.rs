@@ -2415,13 +2415,14 @@ impl StoreClient {
         entry: &mut ResolvedObject,
     ) -> Result<bool> {
         let local_segments = self.local_storage_segments();
-        let readable_runtimes = self.readable_runtime_set(true)?;
         let Some(route) = self.query_route_in_tenant(&entry.tenant, &entry.key)? else {
             return Ok(false);
         };
         if route.state != RouteState::Active {
             return Ok(false);
         }
+        // Membership used for pruning must be fetched after the route it validates.
+        let readable_runtimes = self.readable_runtime_set(true)?;
         let Some(replica) = Self::select_readable_replica(
             &route,
             &self.lease.runtime,
@@ -2490,9 +2491,11 @@ impl StoreClient {
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
         refresh: &ReadableRuntimeRefresh,
     ) -> Result<ResolvedObject> {
-        let route = route.ok_or_else(|| {
-            StoreError::NotFound(format!("tenant={tenant} key={logical_key}"))
-        })?;
+        // Ranged reads load routes lazily. Only a refresh initiated after this
+        // route was loaded can authorize pruning its replicas.
+        let can_prune = refresh.get().is_none();
+        let route = route
+            .ok_or_else(|| StoreError::NotFound(format!("tenant={tenant} key={logical_key}")))?;
         if route.state != RouteState::Active {
             return Err(StoreError::NotFound(format!(
                 "tenant={tenant} key={logical_key} is not readable"
@@ -2534,11 +2537,12 @@ impl StoreClient {
                 }
             }
         };
-        if route
-            .replicas
-            .iter()
-            .min_by_key(|candidate| candidate.priority)
-            .is_some_and(|primary| primary.owner != replica.owner)
+        if can_prune
+            && route
+                .replicas
+                .iter()
+                .min_by_key(|candidate| candidate.priority)
+                .is_some_and(|primary| primary.owner != replica.owner)
         {
             self.prune_unreadable_replicas_best_effort(&route, readable_for_route, refresh);
         }
