@@ -18,26 +18,36 @@ bool IsValidSpec(const RegionResourceSpec& spec) {
 class NativeAllocationCandidate final : public AllocationCandidate {
    public:
     explicit NativeAllocationCandidate(
-        std::shared_ptr<BufferAllocatorBase> allocator)
-        : AllocationCandidate(std::move(allocator)) {}
+        std::shared_ptr<BufferAllocatorBase> allocator,
+        ClientSessionSharedPtr owner_session = nullptr)
+        : AllocationCandidate(std::move(allocator), std::move(owner_session)) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
-        return allocator().allocate(size);
-    }
+    using AllocationCandidate::BindBuffer;
 
     AllocationCandidateKind Kind() const noexcept override {
         return AllocationCandidateKind::NATIVE;
+    }
+
+   protected:
+    std::unique_ptr<AllocatedBuffer> DoAllocate(size_t size) const override {
+        return allocator().allocate(size);
     }
 };
 
 class CxlAllocationCandidate final : public AllocationCandidate {
    public:
     CxlAllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator,
-                           std::string binding_name)
-        : AllocationCandidate(std::move(allocator)),
+                           std::string binding_name,
+                           ClientSessionSharedPtr owner_session = nullptr)
+        : AllocationCandidate(std::move(allocator), std::move(owner_session)),
           cxl_binding_name_(std::move(binding_name)) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
+    AllocationCandidateKind Kind() const noexcept override {
+        return AllocationCandidateKind::CXL;
+    }
+
+   protected:
+    std::unique_ptr<AllocatedBuffer> DoAllocate(size_t size) const override {
         auto buffer = allocator().allocate(size);
         if (buffer) {
             buffer->change_to_cxl(cxl_binding_name_);
@@ -45,18 +55,21 @@ class CxlAllocationCandidate final : public AllocationCandidate {
         return buffer;
     }
 
-    AllocationCandidateKind Kind() const noexcept override {
-        return AllocationCandidateKind::CXL;
-    }
-
    private:
     std::string cxl_binding_name_;
 };
 
 std::unique_ptr<RegionResource> MakeNativeResource(
-    std::shared_ptr<BufferAllocatorBase> allocator) {
-    auto candidate =
-        std::make_unique<NativeAllocationCandidate>(std::move(allocator));
+    std::shared_ptr<BufferAllocatorBase> allocator,
+    ClientSessionSharedPtr owner_session,
+    std::span<const std::unique_ptr<AllocatedBuffer>> imported_buffers = {}) {
+    auto candidate = std::make_unique<NativeAllocationCandidate>(
+        std::move(allocator), std::move(owner_session));
+    for (const auto& buffer : imported_buffers) {
+        if (buffer) {
+            candidate->BindBuffer(*buffer);
+        }
+    }
     return std::make_unique<RegionResource>(std::move(candidate));
 }
 
@@ -64,7 +77,7 @@ std::unique_ptr<RegionResource> MakeCxlResource(
     const RegionResourceSpec& spec,
     std::shared_ptr<BufferAllocatorBase> allocator) {
     auto candidate = std::make_unique<CxlAllocationCandidate>(
-        std::move(allocator), spec.name);
+        std::move(allocator), spec.name, spec.owner_session);
     return std::make_unique<RegionResource>(std::move(candidate));
 }
 
@@ -86,6 +99,11 @@ class CxlRegionDriver final : public RegionDriver {
     explicit CxlRegionDriver(
         std::shared_ptr<BufferAllocatorBase> global_allocator);
     ~CxlRegionDriver() override;
+
+    std::shared_ptr<BufferAllocatorBase> GetSharedAllocator()
+        const noexcept override {
+        return global_allocator_;
+    }
 
     tl::expected<PreparedRegionResource, ErrorCode> PrepareOpen(
         const RegionResourceSpec& spec,
@@ -221,7 +239,8 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
         if (!allocator) {
             return tl::make_unexpected(allocator.error());
         }
-        return Stage(spec.id, MakeNativeResource(std::move(*allocator)));
+        return Stage(spec.id, MakeNativeResource(std::move(*allocator),
+                                                 spec.owner_session));
     }
 
     if (*allocator_type() == BufferAllocatorType::CACHELIB) {
@@ -231,7 +250,9 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
         if (!restored) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        auto resource = MakeNativeResource(std::move(restored->allocator));
+        auto resource =
+            MakeNativeResource(std::move(restored->allocator),
+                               spec.owner_session, restored->buffers);
         return Stage(spec.id, std::move(resource),
                      std::move(restored->buffers));
     }
@@ -242,7 +263,9 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
         if (!restored) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        auto resource = MakeNativeResource(std::move(restored->allocator));
+        auto resource =
+            MakeNativeResource(std::move(restored->allocator),
+                               spec.owner_session, restored->buffers);
         return Stage(spec.id, std::move(resource),
                      std::move(restored->buffers));
     }
@@ -260,7 +283,8 @@ MemoryRegionDriver::PrepareAdopt(
         allocator->base() != spec.base || allocator->capacity() != spec.size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return Stage(spec.id, MakeNativeResource(std::move(allocator)));
+    return Stage(spec.id,
+                 MakeNativeResource(std::move(allocator), spec.owner_session));
 }
 
 CxlRegionDriver::CxlRegionDriver(

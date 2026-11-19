@@ -218,5 +218,36 @@ TEST(RegionDriverTest, InvalidCxlConfigIsReturnedExplicitly) {
     EXPECT_EQ(drivers.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(RegionDriverTest, CxlDriverExposesSharedAllocatorAndMemoryDriverDoesNot) {
+    auto mem_driver = CreateTestDriver(RegionKind::HOST_MEMORY);
+    auto cxl_driver = CreateTestDriver(RegionKind::CXL);
+    ASSERT_NE(mem_driver, nullptr);
+    ASSERT_NE(cxl_driver, nullptr);
+    EXPECT_EQ(mem_driver->GetSharedAllocator(), nullptr);
+    ASSERT_NE(cxl_driver->GetSharedAllocator(), nullptr);
+    EXPECT_EQ(cxl_driver->GetSharedAllocator()->capacity(), kRegionSize);
+}
+
+TEST(RegionDriverTest,
+     ImportedBuffersBindSessionAndInvalidateOnUncommittedDrop) {
+    auto driver = CreateTestDriver(RegionKind::HOST_MEMORY);
+    ASSERT_NE(driver, nullptr);
+    auto spec = MakeSpec(0x500000000ULL);
+    auto session = std::make_shared<ClientLivenessRecord>(
+        generate_uuid(), ClientLivenessRecord::Clock::now());
+    spec.owner_session = session;
+
+    std::vector<std::unique_ptr<AllocatedBuffer>> abandoned;
+    {
+        auto prepared = driver->PrepareOpen(spec, {{0, 4096}});
+        ASSERT_TRUE(prepared.has_value());
+        abandoned = prepared->TakeImportedBuffers();
+        ASSERT_EQ(abandoned.size(), 1U);
+        EXPECT_EQ(abandoned[0]->getClientSession(), session);
+        EXPECT_TRUE(abandoned[0]->isAllocatorValid());
+    }
+    EXPECT_FALSE(abandoned[0]->isAllocatorValid());
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -22,8 +22,7 @@ class SegmentPool final {
     class WriteAccess;
     class ReadAccess;
 
-    explicit SegmentPool(RegionDriverRegistry region_drivers)
-        : region_drivers_(std::move(region_drivers)) {}
+    explicit SegmentPool(RegionDriverRegistry region_drivers);
     ~SegmentPool();
 
     WriteAccess AcquireWriteAccess();

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "client_liveness.h"
 #include "local_ssd/manager.h"
 #include "placement/index.h"
 #include "test_buffer_allocator.h"
@@ -21,22 +22,24 @@ constexpr size_t kCapacity = 1U << 20;
 class TestAllocationCandidate final : public AllocationCandidate {
    public:
     TestAllocationCandidate(std::shared_ptr<TestBufferAllocator> allocator,
-                            bool is_cxl, std::string cxl_binding)
-        : AllocationCandidate(std::move(allocator)),
+                            bool is_cxl, std::string cxl_binding,
+                            ClientSessionSharedPtr owner_session = nullptr)
+        : AllocationCandidate(std::move(allocator), std::move(owner_session)),
           is_cxl_(is_cxl),
           cxl_binding_(std::move(cxl_binding)) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
+    AllocationCandidateKind Kind() const noexcept override {
+        return is_cxl_ ? AllocationCandidateKind::CXL
+                       : AllocationCandidateKind::NATIVE;
+    }
+
+   protected:
+    std::unique_ptr<AllocatedBuffer> DoAllocate(size_t size) const override {
         auto buffer = allocator().allocate(size);
         if (buffer && is_cxl_) {
             buffer->change_to_cxl(cxl_binding_);
         }
         return buffer;
-    }
-
-    AllocationCandidateKind Kind() const noexcept override {
-        return is_cxl_ ? AllocationCandidateKind::CXL
-                       : AllocationCandidateKind::NATIVE;
     }
 
    private:
@@ -46,17 +49,22 @@ class TestAllocationCandidate final : public AllocationCandidate {
 
 class PlacementState {
    public:
-    TestBufferAllocator* Add(std::string name, std::string endpoint,
-                             size_t used = 0, bool is_cxl = false,
-                             std::string cxl_binding = {},
-                             std::string host = {}) {
+    TestBufferAllocator* Add(
+        std::string name, std::string endpoint, size_t used = 0,
+        bool is_cxl = false, std::string cxl_binding = {},
+        std::string host = {}, ClientSessionSharedPtr owner_session = nullptr,
+        std::optional<SegmentLocality> locality = std::nullopt) {
         auto allocator = std::make_shared<TestBufferAllocator>(
             name, std::move(endpoint), kCapacity,
             is_cxl ? DEFAULT_CXL_BASE : next_base_);
         next_base_ += kCapacity + 4096;
         allocator->SetUsed(used);
+        if (locality) {
+            allocator->SetLocality(std::move(locality));
+        }
         auto candidate = std::make_unique<TestAllocationCandidate>(
-            allocator, is_cxl, std::move(cxl_binding));
+            allocator, is_cxl, std::move(cxl_binding),
+            std::move(owner_session));
         EXPECT_TRUE(index.AddCandidate(name, *candidate, host));
         auto* result = allocator.get();
         allocators.push_back(std::move(allocator));
@@ -510,6 +518,138 @@ TEST(ReplicaAllocatorTest, HostOrderingWrapsAndDeduplicatesCatalogRecords) {
     ASSERT_TRUE(
         state.index.RemoveCandidate("a", *state.candidates[4], "host-d"));
     EXPECT_EQ(names("host-c"), (std::vector<std::string>{"c", "b"}));
+}
+
+TEST(ReplicaAllocatorTest,
+     SuspectedSessionSkipsAllocationAndReportsDiagnostics) {
+    PlacementState state;
+    const auto now = ClientLivenessRecord::Clock::now();
+    auto session_a =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), now);
+    auto session_b =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), now);
+    auto* alloc_a =
+        state.Add("seg-a", "ep-a", 0, false, {}, "host-a", session_a);
+    state.Add("seg-b", "ep-b", 0, false, {}, "host-b", session_b);
+
+    ASSERT_EQ(
+        session_a->Evaluate(now + std::chrono::seconds(10),
+                            std::chrono::seconds(5), std::chrono::seconds(20)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+
+    auto access = state.Access();
+    PlacementDiagnostics diag;
+    auto request = Request(2);
+    auto result = ReplicaAllocator(FreeRatioFirstPlacementPolicy{})
+                      .Allocate(access, request, &diag);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1U);
+    EXPECT_EQ(ReplicaEndpoint(result->front()), "ep-b");
+    EXPECT_EQ(alloc_a->allocation_calls(), 0U);
+    EXPECT_FALSE(diag.has_sufficient_active_entry_count);
+
+    // PreferredOnly and AllocateFrom also reject non-serving sessions.
+    auto named = ReplicaAllocator(RandomPlacementPolicy{})
+                     .AllocateFrom(access, 4096, "seg-a");
+    ASSERT_FALSE(named.has_value());
+    EXPECT_EQ(named.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Recovering session_a resumes serving and restores diagnostics.
+    ASSERT_EQ(session_a->Observe(now + std::chrono::seconds(11)),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    auto recovered = ReplicaAllocator(FreeRatioFirstPlacementPolicy{})
+                         .Allocate(access, request, &diag);
+    ASSERT_TRUE(recovered.has_value());
+    ASSERT_EQ(recovered->size(), 2U);
+    EXPECT_TRUE(diag.has_sufficient_active_entry_count);
+}
+
+TEST(ReplicaAllocatorTest, NonServingEntriesDoNotBurnSampleOrRetryBudget) {
+    PlacementState state;
+    const auto now = ClientLivenessRecord::Clock::now();
+    auto suspected =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), now);
+    ASSERT_EQ(
+        suspected->Evaluate(now + std::chrono::seconds(10),
+                            std::chrono::seconds(5), std::chrono::seconds(20)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+    for (size_t i = 0; i < 120; ++i) {
+        state.Add("suspected-" + std::to_string(i),
+                  "suspected-ep-" + std::to_string(i), 0, false, {}, {},
+                  suspected);
+    }
+    auto active = std::make_shared<ClientLivenessRecord>(generate_uuid(), now);
+    state.Add("active", "active-ep", 0, false, {}, {}, active);
+
+    auto access = state.Access();
+    for (size_t i = 0; i < 32; ++i) {
+        auto r1 = ReplicaAllocator(RandomPlacementPolicy{})
+                      .Allocate(access, Request(1));
+        ASSERT_TRUE(r1.has_value());
+        EXPECT_EQ(ReplicaEndpoint(r1->front()), "active-ep");
+
+        auto r2 = ReplicaAllocator(FreeRatioFirstPlacementPolicy{})
+                      .Allocate(access, Request(1));
+        ASSERT_TRUE(r2.has_value());
+        EXPECT_EQ(ReplicaEndpoint(r2->front()), "active-ep");
+    }
+}
+
+TEST(ReplicaAllocatorTest, HcaAffinityPrefersMatchThenUnknownThenMismatch) {
+    PlacementState state;
+    auto* match = state.Add("shared", "match-ep", 0, false, {}, {}, nullptr,
+                            SegmentLocality{0, {"mlx5_0", "mlx5_1"}});
+    auto* unknown = state.Add("shared", "unknown-ep");
+    auto* mismatch = state.Add("shared", "mismatch-ep", 0, false, {}, {},
+                               nullptr, SegmentLocality{1, {"mlx5_2"}});
+
+    std::vector<std::string> preferred_hcas{"mlx5_0"};
+    auto request = Request(1);
+    request.placement.preferred_segment_name = "shared";
+    request.placement.preferred_hca_names = preferred_hcas;
+
+    auto access = state.Access();
+    for (size_t i = 0; i < 16; ++i) {
+        auto res =
+            ReplicaAllocator(RandomPlacementPolicy{}).Allocate(access, request);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(ReplicaEndpoint(res->front()), "match-ep");
+    }
+
+    match->SetAlwaysFail(true);
+    for (size_t i = 0; i < 16; ++i) {
+        auto res =
+            ReplicaAllocator(RandomPlacementPolicy{}).Allocate(access, request);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(ReplicaEndpoint(res->front()), "unknown-ep");
+    }
+
+    unknown->SetAlwaysFail(true);
+    auto res =
+        ReplicaAllocator(RandomPlacementPolicy{}).Allocate(access, request);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(ReplicaEndpoint(res->front()), "mismatch-ep");
+    EXPECT_GT(mismatch->allocation_calls(), 0U);
+}
+
+TEST(ReplicaAllocatorTest, HostAffinityAppliesAcrossAllRankerPolicies) {
+    PlacementState state;
+    state.Add("local", "local-ep", kCapacity - 8192, false, {}, "writer-host");
+    state.Add("remote", "remote-ep", 0, false, {}, "remote-host");
+
+    auto request = Request(1);
+    request.host_affinity = {"writer-host", "key"};
+    auto access = state.Access();
+
+    auto free_ratio = ReplicaAllocator(FreeRatioFirstPlacementPolicy{})
+                          .Allocate(access, request);
+    ASSERT_TRUE(free_ratio.has_value());
+    EXPECT_EQ(ReplicaEndpoint(free_ratio->front()), "local-ep");
+
+    auto random =
+        ReplicaAllocator(RandomPlacementPolicy{}).Allocate(access, request);
+    ASSERT_TRUE(random.has_value());
+    EXPECT_EQ(ReplicaEndpoint(random->front()), "local-ep");
 }
 
 }  // namespace mooncake::test

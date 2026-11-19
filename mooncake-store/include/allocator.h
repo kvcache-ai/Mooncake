@@ -43,6 +43,7 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
 // Forward declarations
+class AllocationCandidate;
 class BufferAllocatorBase;
 class Replica;
 class SegmentAllocatorRegistration;
@@ -66,6 +67,7 @@ class SegmentLifetime {
 
    private:
     friend class AllocatedBuffer;
+    friend class AllocationCandidate;
     friend class SegmentAllocatorRegistration;
     struct State;
     [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
