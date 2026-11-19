@@ -1510,10 +1510,10 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
     EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
     EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
-    EXPECT_EQ(
-        HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
-            HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
-        1);
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, first.key));
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, second.key));
 }
 
 TEST_F(MasterServiceHATest,

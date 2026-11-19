@@ -348,7 +348,7 @@ curl "http://localhost:9003/batch_query_keys?keys=key1,key2,key3"
 }
 ```
 
-The `values` field is always present (empty array when no memory replica exists). The `disk_values`, `local_disk_values`, and `nof_values` fields are optional and only appear when the corresponding replica type is present for the key.
+The `values` field is always present (empty array when no memory replica exists). The `object_storage_values` field lists the object key and byte size of each object-storage replica. The `disk_values`, `local_disk_values`, `nof_values`, and `object_storage_values` fields are optional and only appear when the corresponding replica type is present for the key.
 
 **Error Response** (missing keys parameter, HTTP 400):
 ```json

@@ -1142,16 +1142,24 @@ struct HttpLocalDiskReplicaInfo {
              transport_endpoint);
 };
 
+struct HttpObjectStorageReplicaInfo {
+    std::string object_key;
+    uint64_t object_size;
+    YLT_REFL(HttpObjectStorageReplicaInfo, object_key, object_size);
+};
+
 struct HttpBatchQueryKeyResult {
     bool ok{false};
     std::optional<std::string> error;
     std::optional<std::vector<AllocatedBuffer::Descriptor>> values;
+    std::optional<std::vector<HttpObjectStorageReplicaInfo>>
+        object_storage_values;
     std::optional<std::vector<HttpDiskReplicaInfo>> disk_values;
     std::optional<std::vector<HttpLocalDiskReplicaInfo>> local_disk_values;
     std::optional<std::vector<AllocatedBuffer::Descriptor>> nof_values;
 };
 YLT_REFL(HttpBatchQueryKeyResult, ok, error, values, disk_values,
-         local_disk_values, nof_values);
+         local_disk_values, nof_values, object_storage_values);
 
 struct HttpBatchQueryKeysResponse {
     bool success{false};
@@ -1218,6 +1226,13 @@ void MasterAdminServer::HandleBatchQueryKeys(
                         HttpLocalDiskReplicaInfo{UuidToString(d.client_id),
                                                  d.object_size,
                                                  d.transport_endpoint});
+                } else if (replica.is_object_storage_replica()) {
+                    if (!item.object_storage_values)
+                        item.object_storage_values.emplace();
+                    const auto& object =
+                        replica.get_object_storage_descriptor();
+                    item.object_storage_values->push_back(
+                        {object.object_key, object.object_size});
                 } else if (replica.is_nof_replica()) {
                     if (!item.nof_values.has_value()) {
                         item.nof_values =

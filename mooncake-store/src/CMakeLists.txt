@@ -592,6 +592,10 @@ target_link_libraries(
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
+if(CURL_FOUND AND OpenSSL_FOUND)
+  target_link_libraries(mooncake_store_shared_objects PRIVATE CURL::libcurl
+                                                              OpenSSL::Crypto)
+endif()
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_compile_definitions(mooncake_store_shared_objects
                              PRIVATE MOONCAKE_HAVE_KVCS_SDK=1)

@@ -25,10 +25,14 @@ ErrorCode Client::InitObjectStorage() {
 }
 ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
                                             const std::vector<Slice>& slices) {
-    if (!object_storage_backend_) return ErrorCode::NOT_SUPPORTED;
     const auto& object = replica.get_object_storage_descriptor();
-    if (object.namespace_id != object_storage_namespace_)
-        return ErrorCode::INVALID_PARAMS;
+    if (!object_storage_backend_ ||
+        object.namespace_id != object_storage_namespace_) {
+        ReportObjectStorageUpload(object.object_key,
+                                  ObjectUploadOutcome::NOT_STARTED);
+        return object_storage_backend_ ? ErrorCode::INVALID_PARAMS
+                                       : ErrorCode::NOT_SUPPORTED;
+    }
     auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
     bool started = false;
     auto start = std::chrono::steady_clock::now();
@@ -82,8 +86,11 @@ ErrorCode Client::ReadObjectStorageReplica(const Replica::Descriptor& replica,
 void Client::ReportObjectStorageUpload(const std::string& name,
                                        ObjectUploadOutcome outcome) {
     if (!master_client_.FinishObjectStorageUpload(name, outcome)) {
-        std::lock_guard lock(object_storage_completions_mutex_);
-        object_storage_completions_.insert_or_assign(name, outcome);
+        {
+            std::lock_guard lock(object_storage_completions_mutex_);
+            object_storage_completions_.insert_or_assign(name, outcome);
+        }
+        EnsureStorageControlPlaneStarted();
     }
 }
 void Client::AcknowledgeObjectStorageWrite(
@@ -96,7 +103,6 @@ void Client::AcknowledgeObjectStorageWrite(
                 replica.get_object_storage_descriptor().object_key);
 }
 void Client::PollObjectStorage() {
-    if (!object_storage_backend_) return;
     std::vector<std::pair<std::string, ObjectUploadOutcome>> pending;
     {
         std::lock_guard lock(object_storage_completions_mutex_);

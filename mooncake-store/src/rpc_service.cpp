@@ -614,38 +614,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (!resolved_tenant_id) {
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
-    } else if (config.prefer_alloc_in_same_node) {
-        ReplicateConfig new_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            new_config.SetKeyIds(config, i);
-            auto result = master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], new_config);
-            results.emplace_back(result);
-            if ((i == 0) && result.has_value()) {
-                std::string preferred_segment;
-                for (const auto& replica : result.value()) {
-                    if (replica.is_memory_replica()) {
-                        auto handles =
-                            replica.get_memory_descriptor().buffer_descriptor;
-                        if (!handles.transport_endpoint_.empty()) {
-                            preferred_segment = handles.transport_endpoint_;
-                        }
-                    }
-                }
-                if (!preferred_segment.empty()) {
-                    new_config.preferred_segment = preferred_segment;
-                }
-            }
-        }
     } else {
-        ReplicateConfig key_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            key_config.SetKeyIds(config, i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        results = master_service_.BatchPutStart(
+            client_id, keys, *resolved_tenant_id, slice_lengths, config);
     }
 
     size_t failure_count = 0;
@@ -2106,9 +2077,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const ObjectReplicaSnapshot& object_storage) {
     return master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments, weight_metadata);
+        objects, initial_oplog_sequence_id, segments, weight_metadata,
+        object_storage);
 }
 
 tl::expected<void, ErrorCode>

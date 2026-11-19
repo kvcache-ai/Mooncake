@@ -1850,6 +1850,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::vector<bool> cache_used;
     };
     std::unordered_map<std::string, TargetReadGroup> target_groups;
+    std::vector<size_t> object_reads;
+    std::optional<bool> independent_destinations;
+    auto destinations_are_disjoint = [&] {
+        std::vector<std::pair<uintptr_t, size_t>> ranges;
+        for (const auto& key : object_keys) {
+            auto it = slices.find(key);
+            if (it == slices.end()) continue;
+            for (const auto& slice : it->second)
+                if (slice.size)
+                    ranges.emplace_back(reinterpret_cast<uintptr_t>(slice.ptr),
+                                        slice.size);
+        }
+        std::sort(ranges.begin(), ranges.end());
+        return std::adjacent_find(ranges.begin(), ranges.end(),
+                                  [](const auto& a, const auto& b) {
+                                      return b.first - a.first < a.second;
+                                  }) == ranges.end();
+    };
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<Replica::Descriptor> dfs_read_replicas;
@@ -1908,7 +1926,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         if (replica.is_object_storage_replica()) {
-            results[i] = Get(key, query_result, slices_it->second);
+            if (!independent_destinations.has_value())
+                independent_destinations = destinations_are_disjoint();
+            if (*independent_destinations)
+                object_reads.push_back(i);
+            else
+                results[i] = Get(key, query_result, slices_it->second);
             continue;
         }
         // Submit transfer operation asynchronously
@@ -1999,6 +2022,32 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << " keys from " << endpoint;
     }
 
+    // Submit the other media first. Object GETs may block on a remote call.
+    // Parallelize disjoint host destinations; aliases retain submission order
+    // and staged device reads keep the batch's previous staging requirement.
+    bool parallel_reads = object_reads.size() > 1;
+    if (parallel_reads) {
+        auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+        for (size_t index : object_reads) {
+            for (const auto& slice : slices.at(object_keys[index]))
+                if (slice.size && runtime.FindDeviceForPointer(slice.ptr))
+                    parallel_reads = false;
+            if (!parallel_reads) break;
+        }
+    }
+    auto read_objects = [&](size_t first, size_t stride) {
+        for (size_t i = first; i < object_reads.size(); i += stride) {
+            const auto index = object_reads[i];
+            const auto& key = object_keys[index];
+            results[index] = Get(key, query_results[index], slices.at(key));
+        }
+    };
+    std::future<void> object_worker;
+    if (parallel_reads) {
+        object_worker = std::async(std::launch::async | std::launch::deferred,
+                                   read_objects, 1, 2);
+    }
+
     if (!dfs_read_requests.empty()) {
         auto* dfs_metric = GetDfsMetricPtr();
         const auto dfs_read_start = std::chrono::steady_clock::now();
@@ -2072,6 +2121,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << ", latency_us=" << dfs_read_latency_us;
     }
 
+    read_objects(0, parallel_reads ? 2 : 1);
+
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
@@ -2113,6 +2164,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
     }
+
+    if (object_worker.valid()) object_worker.get();
 
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
@@ -2285,13 +2338,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
-    auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - t0_put)
-                      .count();
-    if (metrics_) {
-        metrics_->transfer_metric.put_latency_us.observe(us_put);
-    }
-
     for (const auto& replica : start_result.value()) {
         if (!replica.is_object_storage_replica()) continue;
         if (!NonDfsTransfersSucceeded(transfer_summary) ||
@@ -2307,6 +2353,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         else
             transfer_summary.RecordFailure(ReplicaType::OBJECT_STORAGE, error);
     }
+    auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_put)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us_put);
+    }
+
     const auto finalize_decision =
         DetermineFinalizeDecision(client_cfg, transfer_summary);
 
@@ -2511,13 +2564,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-    if (metrics_) {
-        metrics_->transfer_metric.put_latency_us.observe(us);
-    }
-
     for (const auto& replica : start_result.value()) {
         if (!replica.is_object_storage_replica()) continue;
         if (!NonDfsTransfersSucceeded(transfer_summary) ||
@@ -2533,6 +2579,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         else
             transfer_summary.RecordFailure(ReplicaType::OBJECT_STORAGE, error);
     }
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us);
+    }
+
     const auto finalize_decision =
         DetermineFinalizeDecision(client_cfg, transfer_summary);
     if (finalize_decision.end_type.has_value()) {

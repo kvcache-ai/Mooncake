@@ -24,10 +24,6 @@ class WrappedMasterService {
    public:
     store::GatherReadDirectory gather_directory;
     tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
-    tl::expected<void, ErrorCode> RestoreObjectStorage(
-        const ObjectReplicaSnapshot& snapshot) {
-        return master_service_.RestoreObjectStorage(snapshot);
-    }
 
     tl::expected<void, ErrorCode> FinishObjectStorageUpload(
         const UUID&, const std::string&, ObjectUploadOutcome,
@@ -362,7 +358,8 @@ class WrappedMasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const ObjectReplicaSnapshot& object_storage = {});
     // Copies objects out of the handoff; the caller keeps ownership.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const BatchOpLogPromotionHandoff& handoff,

@@ -3159,12 +3159,20 @@ struct MasterService::LegacyRestoreContext {
         pending_ranges;
     std::unordered_map<size_t, std::unordered_set<size_t>> discarded_replicas;
     std::vector<PreparedObject> prepared;
+    std::vector<const StandbyObjectEntry*> rejected_object_entries;
 };
 
 void MasterService::NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
                                                const StandbyObjectEntry& entry,
                                                const char* reason) {
     ++ctx.rejected_count;
+    for (const auto& replica : entry.metadata.replicas) {
+        if (replica.is_object_storage_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            ctx.rejected_object_entries.push_back(&entry);
+            break;
+        }
+    }
     LOG(WARNING) << "RestoreFromStandbySnapshot: skipping object, key="
                  << entry.key << ", reason=" << reason;
     MasterMetricManager::instance().inc_standby_restore_rejected_objects(
@@ -3550,10 +3558,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const ObjectReplicaSnapshot& object_storage) {
     return RestoreFromStandbyState(&objects, nullptr, initial_oplog_sequence_id,
                                    segments, objects.size(), std::nullopt,
-                                   &weight_metadata);
+                                   &weight_metadata, &object_storage);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
@@ -3574,9 +3583,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
         ((applied_cursor.batch_id == 0) != (applied_cursor.last_seq == 0))) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return RestoreFromStandbyState(nullptr, &metadata_store,
-                                   applied_cursor.last_seq, segments,
-                                   chunk_object_count, max_replica_id, nullptr);
+    return RestoreFromStandbyState(
+        nullptr, &metadata_store, applied_cursor.last_seq, segments,
+        chunk_object_count, max_replica_id, nullptr, nullptr);
 }
 
 // Restore lifecycle (RFC #4700, slice 1). Defined next to the restore
@@ -3608,7 +3617,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
-    const WeightMetadataSnapshot* legacy_weight_metadata) {
+    const WeightMetadataSnapshot* legacy_weight_metadata,
+    const ObjectReplicaSnapshot* legacy_object_storage) {
     // Lifecycle bookkeeping around the restore (RFC #4700, slice 1). The
     // restore itself keeps its existing retry semantics: a replacement
     // restore from Ready or Failed is still allowed and is exercised by
@@ -3648,9 +3658,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
     auto result = RestoreFromStandbyStateCore(
         legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
-        chunk_object_count, expected_max_replica_id, legacy_weight_metadata);
-    if (result && metadata_store)
-        result = RestoreObjectStorage(metadata_store->SnapshotObjectReplicas());
+        chunk_object_count, expected_max_replica_id, legacy_weight_metadata,
+        legacy_object_storage);
 
     lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
                                               : RestoreLifecycleState::kFailed,
@@ -3715,7 +3724,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
-    const WeightMetadataSnapshot* legacy_weight_metadata) {
+    const WeightMetadataSnapshot* legacy_weight_metadata,
+    const ObjectReplicaSnapshot* legacy_object_storage) {
     if (enable_dfs_ && !use_kvcs_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
                       "restoration is not supported";
@@ -3747,6 +3757,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     } else {
+        for (const auto& record : legacy_object_storage->records) {
+            if (record.replica_id == std::numeric_limits<ReplicaID>::max())
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            max_live_id = std::max(max_live_id, record.replica_id);
+        }
         for (const auto& entry : *legacy_objects) {
             auto [tenant_id, user_key] = resolve_standby_object(entry);
             std::unordered_set<ReplicaID> object_replica_ids;
@@ -3848,6 +3863,16 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // The publications this call installed, so a failed restore can roll its
     // own state back before reporting the error.
     std::vector<std::pair<TenantId, route::ObjectRef>> installed;
+
+    const auto remove_installed = [&]() {
+        for (const auto& [tenant, ref] : installed) {
+            MetadataAccessorRW accessor(this, tenant, ref);
+            if (accessor.IsPublished()) {
+                accessor.GetState().announced_kv_media = 0;
+                accessor.Erase();
+            }
+        }
+    };
 
     const auto restore_chunk =
         [&](const std::vector<StandbyObjectEntry>& objects)
@@ -4069,7 +4094,37 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
         auto installed = InstallLegacyStandbyObjects(legacy_ctx);
         if (!installed) {
+            remove_installed();
             return tl::make_unexpected(installed.error());
+        }
+        // Tolerant restore may skip duplicates or objects with invalid peers.
+        // A skipped live object descriptor must still be reachable before we
+        // can classify unreferenced uploads as orphans and retire them.
+        for (const auto* entry : legacy_ctx.rejected_object_entries) {
+            const auto [tenant, key] = ResolveStandbyObject(*entry);
+            bool reachable = tenant.IsValid();
+            if (reachable) {
+                MetadataAccessorRO current(this, {tenant, key});
+                for (const auto& desc : entry->metadata.replicas) {
+                    if (!desc.is_object_storage_replica() ||
+                        desc.status != ReplicaStatus::COMPLETE)
+                        continue;
+                    if (!current.IsPublished() ||
+                        !current.Get().HasReplica([&](const Replica& r) {
+                            return r.id() == desc.id && r.is_completed() &&
+                                   r.is_object_storage_replica() &&
+                                   r.get_object_storage_descriptor()
+                                           .object_key ==
+                                       desc.get_object_storage_descriptor()
+                                           .object_key;
+                        }))
+                        reachable = false;
+                }
+            }
+            if (!reachable) {
+                remove_installed();
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
         }
         restored_object_count += *installed;
     } else {
@@ -4081,6 +4136,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         for (;;) {
             if (!metadata_store->CopyNextSnapshotChunk(chunk_object_count,
                                                        cursor, objects)) {
+                remove_installed();
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
             if (objects.empty()) {
@@ -4088,6 +4144,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             }
             auto restored = restore_chunk(objects);
             if (!restored) {
+                remove_installed();
                 return restored;
             }
         }
@@ -4106,13 +4163,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // swapped in once the restore can no longer fail, so rollback never has to
     // undo a published metric delta.
     const auto rollback_restored_state = [&]() {
-        for (const auto& [tenant, ref] : installed) {
-            MetadataAccessorRW accessor(this, tenant, ref);
-            if (accessor.IsPublished()) {
-                accessor.GetState().announced_kv_media = 0;
-                accessor.Erase();
-            }
-        }
+        remove_installed();
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
         standby_memory_segments_ = prev_standby_memory_segments;
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
@@ -4136,15 +4187,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     }
 
     NotifyPolicyRestored();
-
-    auto restored_weight_metadata =
-        weight_manager_.RestoreSnapshot(weight_metadata);
-    if (!restored_weight_metadata) {
-        // Same fail-closed contract as the repair paths below: leave nothing
-        // behind; uncommitted owner sessions in `restore` drop on return.
-        rollback_restored_state();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
 
     // Durable repair for conflict-derived discards: a later promotion must
     // not replay what this one dropped. The whole repair set goes out as one
@@ -4243,6 +4285,23 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
         LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
                   << total;
+    }
+
+    auto object_result =
+        metadata_store ? RestoreObjectStorageLocked(
+                             metadata_store->SnapshotObjectReplicas())
+                       : RestoreObjectStorageLocked(*legacy_object_storage);
+    if (!object_result) {
+        rollback_restored_state();
+        return object_result;
+    }
+    auto restored_weight_metadata =
+        weight_manager_.RestoreSnapshot(weight_metadata);
+    if (!restored_weight_metadata) {
+        // Same fail-closed contract as the repair paths below: leave nothing
+        // behind; uncommitted owner sessions in `restore` drop on return.
+        rollback_restored_state();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Publish the accounting swap only after nothing can fail anymore: the
@@ -5879,10 +5938,35 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
-    for (const auto& object_meta : object_metas) {
-        results.emplace_back(
-            PutEnd(client_id, object_meta, tenant_id, replica_type));
+    std::vector<std::pair<size_t, std::future<ErrorCode>>> pending;
+    std::unordered_set<std::string_view> pending_keys;
+    auto finish_pending = [&] {
+        for (auto& [index, completion] : pending) {
+            auto error = completion.get();
+            if (error != ErrorCode::OK)
+                results[index] = tl::make_unexpected(error);
+        }
+        pending.clear();
+        pending_keys.clear();
+    };
+    for (const auto& meta : object_metas) {
+        if (!pending.empty() && (pending_keys.contains(meta.key) ||
+                                 pending.size() >= oplog_batch_max_entries_))
+            finish_pending();
+        if (!meta.object_storage_target) {
+            results.emplace_back(
+                PutEnd(client_id, meta, tenant_id, replica_type));
+            continue;
+        }
+        std::future<ErrorCode> completion;
+        results.emplace_back(CommitObjectStorage(client_id, meta, tenant_id,
+                                                 replica_type, &completion));
+        if (completion.valid()) {
+            pending.emplace_back(results.size() - 1, std::move(completion));
+            pending_keys.insert(meta.key);
+        }
     }
+    finish_pending();
     return results;
 }
 
@@ -6363,6 +6447,26 @@ MasterService::BatchUpsertStart(const UUID& client_id,
                                 const TenantId& tenant_id,
                                 const std::vector<uint64_t>& slice_lengths,
                                 const ReplicateConfig& config) {
+    return BatchWriteStart(client_id, keys, tenant_id, slice_lengths, config,
+                           true);
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterService::BatchPutStart(const UUID& client_id,
+                             const std::vector<std::string>& keys,
+                             const TenantId& tenant_id,
+                             const std::vector<uint64_t>& slice_lengths,
+                             const ReplicateConfig& config) {
+    return BatchWriteStart(client_id, keys, tenant_id, slice_lengths, config,
+                           false);
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterService::BatchWriteStart(const UUID& client_id,
+                               const std::vector<std::string>& keys,
+                               const TenantId& tenant_id,
+                               const std::vector<uint64_t>& slice_lengths,
+                               const ReplicateConfig& config, bool upsert) {
     assert(tenant_id.IsValid());
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
@@ -6385,10 +6489,31 @@ MasterService::BatchUpsertStart(const UUID& client_id,
         results;
     results.reserve(keys.size());
     ReplicateConfig key_config = config;
+    size_t first_pending = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         key_config.SetKeyIds(config, i);
-        results.emplace_back(UpsertStart(client_id, keys[i], tenant_id,
-                                         slice_lengths[i], key_config));
+        auto result = upsert ? UpsertStartImpl(client_id, keys[i], tenant_id,
+                                               slice_lengths[i], key_config)
+                             : PutStartImpl(client_id, keys[i], tenant_id,
+                                            slice_lengths[i], key_config);
+        if (!upsert && i == 0 && config.prefer_alloc_in_same_node && result) {
+            for (const auto& replica : *result) {
+                if (!replica.is_memory_replica()) continue;
+                const auto& endpoint =
+                    replica.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
+                if (!endpoint.empty()) key_config.preferred_segment = endpoint;
+            }
+        }
+        results.emplace_back(std::move(result));
+        if (config.os_replica_num &&
+            (i + 1 == keys.size() ||
+             i + 1 - first_pending >= oplog_batch_max_entries_)) {
+            for (; first_pending <= i; ++first_pending) {
+                auto& pending = results[first_pending];
+                pending = AwaitObjectAuthorization(std::move(pending));
+            }
+        }
     }
     return results;
 }

@@ -381,7 +381,7 @@ auto MasterService::PutEnd(const UUID& writer, const ObjectMeta& meta,
 
 tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
     const UUID& writer, const ObjectMeta& meta, const TenantId& tenant,
-    ReplicaType type) {
+    ReplicaType type, std::future<ErrorCode>* deferred) {
     if (!object_uploads_) return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     TestFailPoint::Wait("object_before_commit_append");
     auto completion = std::make_shared<ObjectCompletion>();
@@ -483,6 +483,10 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
             [completion](ErrorCode error) {
                 if (error != ErrorCode::OK) completion->Finish(error);
             });
+    if (deferred) {
+        *deferred = std::move(result);
+        return {};
+    }
     auto error = result.get();
     if (error != ErrorCode::OK) return tl::make_unexpected(error);
     return {};
@@ -707,7 +711,7 @@ void MasterService::MaintainObjectStorage() {
     ScheduleObjectWorkLocked();
 }
 
-tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
+tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
     const ObjectReplicaSnapshot& snapshot) {
     if (!object_uploads_) {
         // The log retains the target identity even after the last forget.
@@ -718,6 +722,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
     }
     if (snapshot.target && *snapshot.target != object_storage_config_.target)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    object_uploads_->Clear();
     if (!object_uploads_->RestoreObjectReplicas(snapshot))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     bool valid = true;
@@ -761,7 +766,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
             if (!durable) return durable;
             pending_count = 0;
         }
-        std::shared_lock lock(master_state_mutex_);
         MetadataAccessorRW accessor(this,
                                     {TenantId(record.tenant_id), record.key});
         const auto* replica =

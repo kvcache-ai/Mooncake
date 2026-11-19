@@ -6876,6 +6876,7 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
     "dfs_replica_num",
+    "os_replica_num",
     "group_ids",
     "session_ids",
     "preferred_hca_names",

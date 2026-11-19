@@ -128,8 +128,6 @@ class MasterService {
     tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
         const UUID&, const std::string&, const ObjectWriteAttempt&,
         const TenantId&);
-    tl::expected<void, ErrorCode> RestoreObjectStorage(
-        const ObjectReplicaSnapshot&);
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -536,6 +534,11 @@ class MasterService {
                      const TenantId& tenant_id,
                      const std::vector<uint64_t>& slice_lengths,
                      const ReplicateConfig& config);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const TenantId& tenant_id,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
@@ -958,7 +961,8 @@ class MasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const ObjectReplicaSnapshot& object_storage = {});
     // Copies objects out of the handoff. The caller keeps ownership so a
     // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
@@ -1114,7 +1118,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const ObjectReplicaSnapshot* legacy_object_storage);
 
     // The restore implementation itself; entered only through
     // RestoreFromStandbyState above.
@@ -1125,7 +1130,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const ObjectReplicaSnapshot* legacy_object_storage);
 
     // Tolerant legacy snapshot restore (#3760), one phase per method so each
     // stays single-purpose.
@@ -2339,6 +2345,8 @@ class MasterService {
     void ScheduleObjectWorkLocked();
     void InitObjectStorage(const MasterServiceConfig&);
     void MaintainObjectStorage();
+    tl::expected<void, ErrorCode> RestoreObjectStorageLocked(
+        const ObjectReplicaSnapshot&);
     tl::expected<void, ErrorCode> AuthorizeObjectStorage(const UUID&,
                                                          const TenantId&,
                                                          const std::string&,
@@ -2347,15 +2355,18 @@ class MasterService {
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
         AwaitObjectAuthorization(
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>);
-    tl::expected<void, ErrorCode> CommitObjectStorage(const UUID&,
-                                                      const ObjectMeta&,
-                                                      const TenantId&,
-                                                      ReplicaType);
+    tl::expected<void, ErrorCode> CommitObjectStorage(
+        const UUID&, const ObjectMeta&, const TenantId&, ReplicaType,
+        std::future<ErrorCode>* deferred = nullptr);
     tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t);
     tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
     CommitObjectAware(OrderedOpLogWriter::Reservation&&, OpLogEntry,
                       DurableFinalizeCallback,
                       uint64_t* object_sequence = nullptr);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchWriteStart(const UUID&, const std::vector<std::string>&,
+                    const TenantId&, const std::vector<uint64_t>&,
+                    const ReplicateConfig&, bool upsert);
     auto PutStartImpl(const UUID&, const std::string&, const TenantId&,
                       uint64_t, const ReplicateConfig&)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
