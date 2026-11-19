@@ -628,7 +628,8 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     return {};
 }
 
-void StorageBackend::RemoveFile(const std::string& path) {
+tl::expected<void, ErrorCode> StorageBackend::RemoveFile(
+    const std::string& path) {
     namespace fs = std::filesystem;
     // StoreObject holds the same striped path lock across file creation, write,
     // and queue insertion. Acquiring it here serializes deletion with those
@@ -637,15 +638,14 @@ void StorageBackend::RemoveFile(const std::string& path) {
 
     // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
-        if (fs::exists(path)) {
-            std::error_code ec;
-            fs::remove(path, ec);
-            if (ec) {
-                LOG(ERROR) << "Failed to delete file: " << path
-                           << ", error: " << ec.message();
-            }
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "Failed to delete file: " << path
+                       << ", error: " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        return;
+        return {};
     }
 
     // Eviction-enabled logic (local mode)
@@ -661,7 +661,9 @@ void StorageBackend::RemoveFile(const std::string& path) {
             LOG(WARNING) << "File not found in tracking queue, assuming it's "
                             "already removed or untracked: "
                          << path;
-            return;
+            if (fs::exists(path, ec) || ec)
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            return {};
         }
     }
 
@@ -671,13 +673,14 @@ void StorageBackend::RemoveFile(const std::string& path) {
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(ERROR) << "Failed to remove file: " << path
                        << ", Error: " << ec.message();
-            return;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
     }
 
     RemoveFileFromWriteQueue(path);
 
     ReleaseSpace(file_size);
+    return {};
 }
 
 void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
@@ -1550,7 +1553,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffloadImpl(
                         file_per_key_config_.fsdir);
                     std::error_code ec;
                     auto bytes = std::filesystem::file_size(path, ec);
-                    storage_backend_->RemoveFile(path);
+                    auto removed = storage_backend_->RemoveFile(path);
+                    if (!removed) continue;
                     MutexLocker lock(&mutex_);
                     --total_keys;
                     if (!ec) total_size -= bytes;

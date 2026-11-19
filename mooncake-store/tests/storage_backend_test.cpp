@@ -6940,6 +6940,61 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
 }
 
+TEST_F(StorageBackendTest, StreamRollbackKeepsAccountingWhenUnlinkFails) {
+    auto root = fs::path(data_path) / "rollback-permissions";
+    fs::create_directory(root);
+    fs::permissions(root, fs::perms::all);
+    ASSERT_EXIT(
+        ([&] {
+            // Drop root privileges so directory permissions cause real EACCES.
+            if (geteuid() == 0 && seteuid(65534) != 0) _exit(2);
+            for (bool key_limit : {false, true}) {
+                FileStorageConfig config;
+                config.storage_filepath = root.string();
+                config.total_keys_limit = key_limit ? 0 : 100;
+                config.total_size_limit = key_limit ? 1024 * 1024 : 1;
+                FilePerKeyConfig file_config;
+                file_config.fsdir = key_limit ? "key-limit" : "byte-limit";
+                file_config.enable_eviction = false;
+                StorageBackendAdaptor backend(config, file_config);
+                if (!backend.Init() || !backend.ScanMeta(NoopCompleteHandler()))
+                    _exit(3);
+                const std::string key = "rejected-stream";
+                const std::string payload(4096, 'r');
+                auto path = FileUtil::ResolvePathFromKey(
+                    key, config.storage_filepath, file_config.fsdir);
+                auto result = backend.OffloadStream(
+                    key, payload.size(),
+                    [&](int fd, uint64_t offset,
+                        uint64_t) -> tl::expected<void, ErrorCode> {
+                        if (pwrite(fd, payload.data(), payload.size(),
+                                   offset) !=
+                            static_cast<ssize_t>(payload.size()))
+                            return tl::make_unexpected(
+                                ErrorCode::FILE_WRITE_FAIL);
+                        return {};
+                    },
+                    [&](const auto&, auto&) {
+                        fs::permissions(
+                            fs::path(path).parent_path(),
+                            fs::perms::owner_read | fs::perms::owner_exec);
+                        return ErrorCode::INVALID_PARAMS;
+                    });
+                fs::permissions(fs::path(path).parent_path(),
+                                fs::perms::owner_all);
+                if (result || result.error() != ErrorCode::INVALID_PARAMS ||
+                    !backend.IsExist(key).value_or(false) ||
+                    backend.IsEnableOffloading().value_or(true)) {
+                    fprintf(stderr, "rollback lost %s accounting\n",
+                            key_limit ? "object count" : "byte count");
+                    _exit(4);
+                }
+            }
+            _exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
 TEST_F(StorageBackendTest, StreamFailureCheckpointsCommittedEvictions) {
     auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
     OffsetAllocatorBackendConfig backend_config;

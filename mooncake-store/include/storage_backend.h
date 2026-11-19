@@ -568,8 +568,9 @@ class StorageBackend {
     /**
      * @brief Deletes the physical file associated with the given object key
      * @param path Path to the file to remove
+     * @return Success if the file is gone, or an error if removal failed
      */
-    void RemoveFile(const std::string& path);
+    tl::expected<void, ErrorCode> RemoveFile(const std::string& path);
 
     /**
      * @brief Removes objects from the storage backend whose keys match a regex
