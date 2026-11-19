@@ -442,7 +442,7 @@ The soft-pin lifetime starts when the first replica becomes readable. When its d
 
 Soft pin is runtime-only eviction-priority state. It is not persisted in snapshots or the HA OpLog, so recovery and Standby promotion downgrade restored objects to ordinary cache. Existing snapshot fields are retained only for format compatibility and ignored during recovery.
 
-An explicitly started drain job can move a soft-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its soft pin  and TTL throughout the move.
+An explicitly started drain job can move a soft-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its soft pin and TTL throughout the move.
 
 There are three startup parameters in `master_service` related to the soft pin mechanism:
 
