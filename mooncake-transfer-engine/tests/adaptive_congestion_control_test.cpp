@@ -262,6 +262,153 @@ TEST(AdaptiveCongestionControlTest, BacklogWithoutSuccessPreservesWindow) {
     }
 }
 
+TEST(AdaptiveCongestionControlTest, RepeatedSuccessGrowsOncePerNonemptyEpoch) {
+    for (Mode mode : {Mode::kEnforce, Mode::kObserve}) {
+        DomainState device(testConfig(mode)), route(testConfig(mode));
+        Signals successes;
+        successes.successful_completions = std::numeric_limits<uint64_t>::max();
+        for (uint64_t epoch = 1; epoch <= 4; ++epoch) {
+            for (int i = 0; i < 32; ++i) {
+                Permit permit;
+                ASSERT_EQ(tryAcquire(pathFor(device, route), 8, permit),
+                          Decision::kAllow);
+                ASSERT_TRUE(complete(permit, OutcomeClass::kSuccess,
+                                     FailureScope::kOperation));
+                EXPECT_FALSE(complete(permit, OutcomeClass::kSuccess,
+                                      FailureScope::kOperation));
+                recordCurrent(device, successes);
+                recordCurrent(route, successes);
+            }
+            controlTick(device, epoch);
+            controlTick(route, epoch);
+            EXPECT_EQ(snapshot(device).window_bytes, 64u + epoch * 16);
+            EXPECT_EQ(snapshot(route).window_bytes, 64u + epoch * 16);
+            EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+            EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+            controlTick(device, epoch);
+            controlTick(route, epoch);
+            EXPECT_EQ(snapshot(device).window_bytes, 64u + epoch * 16);
+            EXPECT_EQ(snapshot(route).window_bytes, 64u + epoch * 16);
+        }
+    }
+}
+
+TEST(AdaptiveCongestionControlTest, PureSuccessTracksEpochAndFullGeneration) {
+    DomainState device(testConfig(), 0), route(testConfig(), 0);
+    ASSERT_EQ(generation(device), 1u);
+    ASSERT_EQ(generation(route), 1u);
+    for (uint64_t epoch = 1; epoch <= 4; ++epoch) {
+        for (int i = 0; i < 32; ++i) {
+            Permit permit;
+            ASSERT_EQ(tryAcquire(pathFor(device, route), 8, permit),
+                      Decision::kAllow);
+            ASSERT_TRUE(complete(permit, OutcomeClass::kSuccess,
+                                 FailureScope::kOperation));
+        }
+        controlTick(device, epoch);
+        controlTick(route, epoch);
+        EXPECT_EQ(snapshot(device).window_bytes, 64u + epoch * 16);
+        EXPECT_EQ(snapshot(route).window_bytes, 64u + epoch * 16);
+        controlTick(device, epoch);
+        controlTick(route, epoch);
+        EXPECT_EQ(snapshot(device).window_bytes, 64u + epoch * 16);
+        EXPECT_EQ(snapshot(route).window_bytes, 64u + epoch * 16);
+    }
+    Permit stale;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 8, stale), Decision::kAllow);
+    for (uint32_t next : {0x80000001u, 0xffffffffu, 0u}) {
+        resetGeneration(device, next);
+        resetGeneration(route, next);
+        if (stale.active()) {
+            ASSERT_TRUE(complete(stale, OutcomeClass::kSuccess,
+                                 FailureScope::kOperation));
+        }
+        controlTick(device, 5);
+        controlTick(route, 5);
+        EXPECT_EQ(snapshot(device).window_bytes, 64u);
+        EXPECT_EQ(snapshot(route).window_bytes, 64u);
+        Permit fresh;
+        ASSERT_EQ(tryAcquire(pathFor(device, route), 8, fresh),
+                  Decision::kAllow);
+        ASSERT_TRUE(
+            complete(fresh, OutcomeClass::kSuccess, FailureScope::kOperation));
+        controlTick(device, 6);
+        controlTick(route, 6);
+        EXPECT_EQ(snapshot(device).window_bytes, 80u);
+        EXPECT_EQ(snapshot(route).window_bytes, 80u);
+        EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+        EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    }
+}
+
+TEST(AdaptiveCongestionControlTest,
+     RepeatedSuccessPreservesMixedSignalPriority) {
+    DomainState domain(testConfig());
+    Signals success;
+    success.successful_completions = 100;
+    for (uint64_t epoch = 1; epoch <= 8; ++epoch) {
+        recordCurrent(domain, success);
+        controlTick(domain, epoch);
+    }
+    ASSERT_EQ(snapshot(domain).window_bytes, 192u);
+    for (int i = 0; i < 32; ++i) recordCurrent(domain, success);
+    Signals mixed = success;
+    mixed.receiver_pressure = 3;
+    mixed.hard_errors = 1;
+    recordCurrent(domain, mixed);
+    controlTick(domain, 9);
+    EXPECT_EQ(snapshot(domain).window_bytes, 96u);
+    EXPECT_EQ(snapshot(domain).state, PathState::kCongested);
+
+    mixed.receiver_pressure = 0;
+    for (int i = 0; i < 32; ++i) recordCurrent(domain, mixed);
+    controlTick(domain, 10);
+    EXPECT_EQ(snapshot(domain).window_bytes, 96u);
+    recordCurrent(domain, success);
+    controlTick(domain, 11);
+    EXPECT_EQ(snapshot(domain).window_bytes, 112u);
+}
+
+TEST(AdaptiveCongestionControlTest,
+     ConcurrentSuccessSurvivesTickAndResetEpochs) {
+    Config config = testConfig();
+    config.max_window_bytes = 4096;
+    DomainState domain(config);
+    Signals successes;
+    successes.successful_completions = 16;
+    for (uint32_t round = 1; round <= 32; ++round) {
+        std::vector<std::thread> writers;
+        const uint32_t current = generation(domain);
+        for (int writer = 0; writer < 4; ++writer) {
+            writers.emplace_back([&] {
+                for (int i = 0; i < 128; ++i)
+                    recordSignals(domain, current, successes);
+            });
+        }
+        for (auto& writer : writers) writer.join();
+        controlTick(domain, round);
+        EXPECT_EQ(snapshot(domain).window_bytes, 64u + round * 16);
+    }
+    const uint32_t old_generation = generation(domain);
+    std::atomic<bool> start{false};
+    std::thread late([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int i = 0; i < 4096; ++i)
+            recordSignals(domain, old_generation, successes);
+    });
+    start.store(true, std::memory_order_release);
+    resetGeneration(domain, old_generation + 1);
+    late.join();
+    controlTick(domain, 33);
+    EXPECT_EQ(snapshot(domain).window_bytes, 64u);
+    recordCurrent(domain, successes);
+    controlTick(domain, 34);
+    EXPECT_EQ(snapshot(domain).window_bytes, 80u);
+    controlTick(domain, 35);
+    EXPECT_EQ(snapshot(domain).window_bytes, 80u);
+}
+
 TEST(AdaptiveCongestionControlTest, ReceiverPressureHalvesOnceBeforeErrorVeto) {
     DomainState domain(testConfig());
     Signals signals;
@@ -646,6 +793,296 @@ TEST(AdaptiveCongestionControlTest, ConcurrentPermitsBalanceExactly) {
     EXPECT_EQ(completion_failures.load(), 0u);
     EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
     EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+}
+
+TEST(AdaptiveCongestionControlSuccessBatchTest,
+     DuplicateOnlyRefundsFirstWinner) {
+    std::atomic<uint32_t> adapter_generation{1};
+    DomainState device(testConfig()), route(testConfig());
+    Permit first, second;
+    const auto path = pathFor(device, route);
+    ASSERT_EQ(tryAcquire(path, 8, first), Decision::kAllow);
+    ASSERT_EQ(tryAcquire(path, 12, second), Decision::kAllow);
+    Permit* permits[] = {&first, &second, &first};
+    uint64_t mask = UINT64_MAX;
+    ASSERT_TRUE(completeSuccessBatch(permits, 3, mask, adapter_generation, 1));
+    EXPECT_EQ(mask, 3u);
+    EXPECT_FALSE(first.active());
+    EXPECT_FALSE(second.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    EXPECT_FALSE(
+        complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_FALSE(
+        complete(second, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_FALSE(completeSuccessBatch(permits, 3, mask, adapter_generation, 1));
+    EXPECT_EQ(mask, 0u);
+}
+
+TEST(AdaptiveCongestionControlSuccessBatchTest,
+     PreflightPreservesScalarClaims) {
+    std::atomic<uint32_t> adapter_generation{1};
+    for (int scenario = 0; scenario < 7; ++scenario) {
+        SCOPED_TRACE(scenario);
+        DomainState device(testConfig()), route(testConfig()),
+            other(testConfig());
+        Permit first, second;
+        auto first_path = pathFor(device, route);
+        auto second_path = first_path;
+        if (scenario == 0) second_path = pathFor(device, other);
+        if (scenario == 1) first_path = second_path = pathFor(device, device);
+        if (scenario == 2)
+            first_path =
+                second_path = {&device, nullptr, generation(device), 0};
+        ASSERT_EQ(tryAcquire(first_path, 8, first), Decision::kAllow);
+        ASSERT_EQ(tryAcquire(second_path, 12, second), Decision::kAllow);
+        if (scenario == 3) resetGeneration(route, generation(route) + 1);
+        const auto device_bytes = snapshot(device).inflight_bytes;
+        const auto route_bytes = snapshot(route).inflight_bytes;
+        const auto other_bytes = snapshot(other).inflight_bytes;
+        Permit* permits[] = {&first, &second};
+        if (scenario == 4) permits[1] = nullptr;
+        uint64_t mask = UINT64_MAX;
+        const size_t count = scenario == 5 ? 1 : scenario == 6 ? 0 : 2;
+        EXPECT_FALSE(
+            completeSuccessBatch(permits, count, mask, adapter_generation, 1));
+        EXPECT_EQ(mask, 0u);
+        EXPECT_TRUE(first.active());
+        EXPECT_TRUE(second.active());
+        EXPECT_EQ(snapshot(device).inflight_bytes, device_bytes);
+        EXPECT_EQ(snapshot(route).inflight_bytes, route_bytes);
+        EXPECT_EQ(snapshot(other).inflight_bytes, other_bytes);
+        EXPECT_TRUE(
+            complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+        EXPECT_TRUE(
+            complete(second, OutcomeClass::kSuccess, FailureScope::kOperation));
+        EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+        EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+        EXPECT_EQ(snapshot(other).inflight_bytes, 0u);
+    }
+}
+
+TEST(AdaptiveCongestionControlSuccessBatchTest,
+     OtherModesPreserveScalarClaims) {
+    std::atomic<uint32_t> adapter_generation{1};
+    for (Mode mode : {Mode::kOff, Mode::kObserve}) {
+        DomainState device(testConfig(mode)), route(testConfig(mode));
+        Permit first, second;
+        const auto path = pathFor(device, route);
+        ASSERT_EQ(tryAcquire(path, UINT64_MAX, first), Decision::kAllow);
+        ASSERT_EQ(tryAcquire(path, 1, second), Decision::kAllow);
+        const auto bytes = snapshot(device).inflight_bytes;
+        Permit* permits[] = {&first, &second};
+        uint64_t mask = UINT64_MAX;
+        EXPECT_FALSE(
+            completeSuccessBatch(permits, 2, mask, adapter_generation, 1));
+        EXPECT_EQ(mask, 0u);
+        EXPECT_TRUE(first.active());
+        EXPECT_TRUE(second.active());
+        EXPECT_EQ(snapshot(device).inflight_bytes, bytes);
+        EXPECT_EQ(snapshot(route).inflight_bytes, bytes);
+        EXPECT_TRUE(
+            complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+        EXPECT_TRUE(
+            complete(second, OutcomeClass::kSuccess, FailureScope::kOperation));
+        EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+        EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    }
+}
+
+TEST(AdaptiveCongestionControlSuccessBatchTest, OverflowDoesNotClaimPermit) {
+    std::atomic<uint32_t> adapter_generation{1};
+    DomainState device(testConfig()), route(testConfig());
+    Permit permit;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), UINT64_MAX, permit),
+              Decision::kAllow);
+    Permit* permits[] = {&permit, &permit};
+    uint64_t mask = UINT64_MAX;
+    EXPECT_FALSE(completeSuccessBatch(permits, 2, mask, adapter_generation, 1));
+    EXPECT_EQ(mask, 0u);
+    EXPECT_TRUE(permit.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, UINT64_MAX);
+    EXPECT_EQ(snapshot(route).inflight_bytes, UINT64_MAX);
+    EXPECT_TRUE(
+        complete(permit, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+}
+
+TEST(AdaptiveCongestionControlSuccessBatchTest,
+     ChangedAdapterRefundsWithoutSuccessFeedback) {
+    DomainState device(testConfig()), route(testConfig());
+    Permit first, second;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 8, first), Decision::kAllow);
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 12, second), Decision::kAllow);
+    Permit* permits[] = {&first, &second};
+    std::atomic<uint32_t> adapter_generation{2};
+    uint64_t mask = 0;
+    ASSERT_TRUE(completeSuccessBatch(permits, 2, mask, adapter_generation, 1));
+    EXPECT_EQ(mask, 3u);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    controlTick(device, 1);
+    controlTick(route, 1);
+    EXPECT_EQ(snapshot(device).window_bytes, 64u);
+    EXPECT_EQ(snapshot(route).window_bytes, 64u);
+}
+
+TEST(AdaptiveCongestionControlBatchTest, FullFitKeepsPerPermitCompletion) {
+    DomainState device(testConfig()), route(testConfig());
+    Permit first, second;
+    BatchItem items[] = {{&first, 8}, {&second, 12}};
+    ASSERT_TRUE(tryAcquireBatch(pathFor(device, route), items, 2));
+    EXPECT_TRUE(first.active());
+    EXPECT_TRUE(second.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, 20u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 20u);
+    EXPECT_TRUE(
+        complete(second, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(device).inflight_bytes, 8u);
+    EXPECT_FALSE(
+        complete(second, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_TRUE(
+        complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+}
+
+TEST(AdaptiveCongestionControlBatchTest, ConflictingClaimPreservesOldPermit) {
+    DomainState device(testConfig()), route(testConfig());
+    Permit fresh, occupied;
+    const auto path = pathFor(device, route);
+    ASSERT_EQ(tryAcquire(path, 8, occupied), Decision::kAllow);
+    BatchItem items[] = {{&fresh, 12}, {&occupied, 16}};
+    EXPECT_FALSE(tryAcquireBatch(path, items, 2));
+    EXPECT_FALSE(fresh.active());
+    EXPECT_TRUE(occupied.active());
+    EXPECT_TRUE(isCurrentGeneration(occupied));
+    EXPECT_EQ(snapshot(device).inflight_bytes, 8u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 8u);
+    EXPECT_TRUE(complete(occupied, OutcomeClass::kDerivedFlush,
+                         FailureScope::kOperation));
+    EXPECT_FALSE(
+        complete(fresh, OutcomeClass::kDerivedFlush, FailureScope::kOperation));
+    BatchItem duplicate[] = {{&fresh, 8}, {&fresh, 8}};
+    EXPECT_FALSE(tryAcquireBatch(path, duplicate, 2));
+    EXPECT_FALSE(fresh.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+}
+
+TEST(AdaptiveCongestionControlBatchTest, RouteFailureRollsBackWithoutEvidence) {
+    auto small = testConfig();
+    small.min_window_bytes = 16;
+    small.max_window_bytes = 16;
+    DomainState device(testConfig()), route(small);
+    Permit first, second;
+    BatchItem items[] = {{&first, 8}, {&second, 12}};
+    const auto path = pathFor(device, route);
+    EXPECT_FALSE(tryAcquireBatch(path, items, 2));
+    EXPECT_FALSE(first.active());
+    EXPECT_FALSE(second.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(device).deferred_bytes, 0u);
+    EXPECT_EQ(snapshot(route).deferred_bytes, 0u);
+    ASSERT_EQ(tryAcquire(path, 8, first), Decision::kAllow);
+    AdmissionEvidence evidence;
+    EXPECT_EQ(tryAcquire(path, 12, second, &evidence), Decision::kDefer);
+    EXPECT_EQ(evidence.domain, AdmissionDomain::kRoute);
+    EXPECT_EQ(evidence.reason, AdmissionReason::kWindow);
+    EXPECT_EQ(snapshot(route).deferred_bytes, 12u);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 8u);
+    EXPECT_TRUE(
+        complete(first, OutcomeClass::kDerivedFlush, FailureScope::kOperation));
+}
+
+TEST(AdaptiveCongestionControlBatchTest, OversizedAndOtherModesUseScalar) {
+    for (Mode mode : {Mode::kOff, Mode::kObserve, Mode::kEnforce}) {
+        auto config = testConfig(mode);
+        config.min_window_bytes = 16;
+        config.max_window_bytes = 16;
+        DomainState device(config), route(config);
+        Permit first, second;
+        BatchItem items[] = {{&first, 32}, {&second, 1}};
+        const auto path = pathFor(device, route);
+        EXPECT_FALSE(tryAcquireBatch(path, items, 2));
+        EXPECT_FALSE(first.active());
+        EXPECT_FALSE(second.active());
+        EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+        EXPECT_EQ(snapshot(route).deferred_bytes, 0u);
+        ASSERT_EQ(tryAcquire(path, 32, first), Decision::kAllow);
+        EXPECT_TRUE(complete(first, OutcomeClass::kDerivedFlush,
+                             FailureScope::kOperation));
+    }
+    DomainState device(testConfig()), route(testConfig());
+    Permit first, second;
+    BatchItem overflow[] = {{&first, std::numeric_limits<uint64_t>::max()},
+                            {&second, 1}};
+    EXPECT_FALSE(tryAcquireBatch(pathFor(device, route), overflow, 2));
+    EXPECT_FALSE(first.active());
+    EXPECT_FALSE(second.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+}
+
+TEST(AdaptiveCongestionControlBatchTest, StaleRouteReturnsDeviceReservation) {
+    DomainState device(testConfig()), route(testConfig());
+    const auto path = pathFor(device, route);
+    resetGeneration(route, path.route_generation + 1);
+    Permit first, second;
+    BatchItem items[] = {{&first, 8}, {&second, 8}};
+    EXPECT_FALSE(tryAcquireBatch(path, items, 2));
+    EXPECT_FALSE(first.active());
+    EXPECT_FALSE(second.active());
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(device).deferred_bytes, 0u);
+    EXPECT_EQ(snapshot(route).deferred_bytes, 0u);
+}
+
+TEST(AdaptiveCongestionControlBatchTest,
+     ConcurrentResetAndReservationsBalance) {
+    auto config = testConfig();
+    config.min_window_bytes = 256;
+    DomainState device(config), route(config);
+    std::atomic<bool> start{false};
+    std::atomic<int> completed{0};
+    std::vector<std::thread> threads;
+    for (int lane = 0; lane < 6; ++lane)
+        threads.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            for (int iteration = 0; iteration < 500; ++iteration) {
+                Permit permits[6];
+                BatchItem items[6];
+                for (int i = 0; i < 6; ++i) items[i] = {&permits[i], 4};
+                bool acquired = false;
+                for (int attempt = 0; attempt < 10000 && !acquired; ++attempt)
+                    acquired =
+                        tryAcquireBatch(pathFor(device, route), items, 6);
+                if (!acquired) continue;
+                for (int i = 5; i >= 0; --i)
+                    if (complete(permits[i], OutcomeClass::kDerivedFlush,
+                                 FailureScope::kOperation))
+                        completed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    std::thread reset([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (uint32_t gen = 2; gen < 1000; ++gen) {
+            resetGeneration(device, gen);
+            resetGeneration(route, gen);
+        }
+    });
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) thread.join();
+    reset.join();
+    EXPECT_GT(completed.load(), 0);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(device).deferred_bytes, 0u);
+    EXPECT_EQ(snapshot(route).deferred_bytes, 0u);
 }
 
 }  // namespace

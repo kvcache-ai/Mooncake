@@ -21,6 +21,13 @@
 namespace mooncake::adaptive_congestion_control {
 namespace {
 
+constexpr uint64_t kSuccessPaused = 1;
+constexpr uint64_t kSuccessSeen = 2;
+
+uint64_t successFeedback(uint32_t generation) {
+    return uint64_t{generation} << 32;
+}
+
 Config normalize(Config config) {
     config.min_window_bytes = std::max<uint64_t>(config.min_window_bytes, 1);
     config.max_window_bytes =
@@ -73,7 +80,7 @@ struct CoreAccess {
     }
 
     static AcquireResult acquireOne(DomainState* state, uint32_t generation,
-                                    uint64_t bytes) {
+                                    uint64_t bytes, bool speculative = false) {
         if (state == nullptr || state->config_.mode == Mode::kOff) {
             return {Decision::kAllow, false, AdmissionReason::kNone};
         }
@@ -90,8 +97,9 @@ struct CoreAccess {
             state->inflight_bytes_.load(std::memory_order_relaxed);
         while (true) {
             // An empty domain admits one indivisible oversized slice.
-            if (current != 0 && (bytes > limit || current > limit - bytes)) {
-                addSaturating(state->deferred_bytes_, bytes);
+            if ((speculative || current != 0) &&
+                (bytes > limit || current > limit - bytes)) {
+                if (!speculative) addSaturating(state->deferred_bytes_, bytes);
                 return {Decision::kDefer, false, AdmissionReason::kWindow};
             }
             if (state->inflight_bytes_.compare_exchange_weak(
@@ -136,6 +144,28 @@ struct CoreAccess {
         state.feedback_writers_.fetch_sub(1, std::memory_order_release);
     }
 
+    static void recordSuccess(DomainState& state, uint32_t generation) {
+        uint64_t current =
+            state.success_feedback_.load(std::memory_order_acquire);
+        while (generation != 0) {
+            if (current & kSuccessPaused) {
+                if (state.generation_.load(std::memory_order_acquire) !=
+                    generation)
+                    return;
+                std::this_thread::yield();
+                current =
+                    state.success_feedback_.load(std::memory_order_acquire);
+                continue;
+            }
+            if ((current >> 32) != generation) return;
+            // Even an already-seen success needs a CAS to join this epoch.
+            if (state.success_feedback_.compare_exchange_weak(
+                    current, current | kSuccessSeen, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+                return;
+        }
+    }
+
     static void recordOutcome(DomainState* state, uint32_t generation,
                               OutcomeClass outcome, FailureScope scope,
                               bool route) {
@@ -144,8 +174,8 @@ struct CoreAccess {
         Signals signals;
         switch (outcome) {
             case OutcomeClass::kSuccess:
-                signals.successful_completions = 1;
-                break;
+                recordSuccess(*state, generation);
+                return;
             case OutcomeClass::kCongestion:
                 signals.receiver_pressure = 1;
                 break;
@@ -180,6 +210,8 @@ struct CoreAccess {
     }
 
     static void clearSignals(DomainState& state) {
+        state.success_feedback_.fetch_and(~kSuccessSeen,
+                                          std::memory_order_relaxed);
         state.successful_completions_.store(0, std::memory_order_relaxed);
         state.receiver_pressure_.store(0, std::memory_order_relaxed);
         state.epoch_error_.store(false, std::memory_order_relaxed);
@@ -191,6 +223,8 @@ struct CoreAccess {
             if (state.feedback_generation_.compare_exchange_weak(
                     expected, 0, std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
+                state.success_feedback_.fetch_or(kSuccessPaused,
+                                                 std::memory_order_acq_rel);
                 while (state.feedback_writers_.load(
                            std::memory_order_acquire) != 0) {
                     std::this_thread::yield();
@@ -208,6 +242,10 @@ struct CoreAccess {
     }
 
     static void resumeFeedback(DomainState& state, uint32_t generation) {
+        // Open pure-success feedback first; nothing may clear its seen bit
+        // after this publication, including before the generic gate opens.
+        state.success_feedback_.store(successFeedback(generation),
+                                      std::memory_order_release);
         state.feedback_generation_.store(generation, std::memory_order_release);
     }
 };
@@ -231,7 +269,8 @@ DomainState::DomainState(Config config, uint32_t generation)
     : config_(normalize(config)),
       window_bytes_(config_.min_window_bytes),
       generation_(generation == 0 ? 1 : generation),
-      feedback_generation_(generation == 0 ? 1 : generation) {}
+      feedback_generation_(generation == 0 ? 1 : generation),
+      success_feedback_(successFeedback(generation == 0 ? 1 : generation)) {}
 
 Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                     AdmissionEvidence* evidence) {
@@ -299,6 +338,76 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
     return Decision::kAllow;
 }
 
+bool tryAcquireBatch(const PathHandle& path, const BatchItem* items,
+                     size_t count) {
+    if (!items || count < 2 || !path.device || !path.route ||
+        path.device == path.route ||
+        path.device->config_.mode != Mode::kEnforce ||
+        path.route->config_.mode != Mode::kEnforce)
+        return false;
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!items[i].permit || items[i].bytes == 0 ||
+            items[i].bytes > std::numeric_limits<uint64_t>::max() - total)
+            return false;
+        total += items[i].bytes;
+    }
+
+    size_t claimed = 0;
+    const auto undo_claims = [&] {
+        while (claimed != 0)
+            items[--claimed].permit->active_.store(false,
+                                                   std::memory_order_release);
+    };
+    for (; claimed < count; ++claimed) {
+        bool expected = false;
+        if (!items[claimed].permit->active_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            undo_claims();
+            return false;
+        }
+    }
+
+    const auto device = CoreAccess::acquireOne(
+        path.device, path.device_generation, total, true);
+    if (!device.reserved) {
+        undo_claims();
+        return false;
+    }
+    const auto route =
+        CoreAccess::acquireOne(path.route, path.route_generation, total, true);
+    if (!route.reserved) {
+        CoreAccess::releaseBytes(*path.device, total);
+        undo_claims();
+        return false;
+    }
+    const auto current = [&](const DomainState& state, uint32_t expected) {
+        const auto limit = state.window_bytes_.load(std::memory_order_relaxed);
+        return state.generation_.load(std::memory_order_acquire) == expected &&
+               total <= limit &&
+               state.inflight_bytes_.load(std::memory_order_relaxed) <= limit;
+    };
+    if (!current(*path.device, path.device_generation) ||
+        !current(*path.route, path.route_generation)) {
+        CoreAccess::releaseBytes(*path.device, total);
+        CoreAccess::releaseBytes(*path.route, total);
+        undo_claims();
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        auto& permit = *items[i].permit;
+        permit.device_ = path.device;
+        permit.route_ = path.route;
+        permit.bytes_ = items[i].bytes;
+        permit.device_generation_ = path.device_generation;
+        permit.route_generation_ = path.route_generation;
+        permit.device_reserved_ = true;
+        permit.route_reserved_ = true;
+    }
+    return true;
+}
+
 bool isCurrentGeneration(const Permit& permit) {
     if (!permit.active_.load(std::memory_order_acquire)) return false;
     if (permit.device_ == nullptr && permit.route_ == nullptr) return false;
@@ -324,6 +433,68 @@ bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope) {
         CoreAccess::releaseBytes(*permit.device_, permit.bytes_);
     if (permit.route_reserved_)
         CoreAccess::releaseBytes(*permit.route_, permit.bytes_);
+    return true;
+}
+
+bool completeSuccessBatch(Permit* const* permits, size_t count,
+                          uint64_t& completed_mask,
+                          const std::atomic<uint32_t>& adapter_generation,
+                          uint32_t expected_adapter_generation) {
+    completed_mask = 0;
+    if (!permits || count < 2 || count > 64 || !permits[0] ||
+        !permits[0]->active())
+        return false;
+    auto* device = permits[0]->device_;
+    auto* route = permits[0]->route_;
+    if (!device || !route || device == route ||
+        device->config_.mode != Mode::kEnforce ||
+        route->config_.mode != Mode::kEnforce)
+        return false;
+    const auto device_generation = permits[0]->device_generation_;
+    const auto route_generation = permits[0]->route_generation_;
+    if (device_generation != generation(*device) ||
+        route_generation != generation(*route))
+        return false;
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const auto* permit = permits[i];
+        if (!permit || !permit->active() || permit->device_ != device ||
+            permit->route_ != route ||
+            permit->device_generation_ != device_generation ||
+            permit->route_generation_ != route_generation ||
+            !permit->device_reserved_ || !permit->route_reserved_ ||
+            permit->bytes_ == 0 ||
+            permit->bytes_ > std::numeric_limits<uint64_t>::max() - total)
+            return false;
+        total += permit->bytes_;
+    }
+
+    // Once a claim wins, its reservation must be refunded here, never retried.
+    total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        auto& permit = *permits[i];
+        // Match the adapter's per-attempt check before each irreversible claim.
+        const auto outcome =
+            adapter_generation.load(std::memory_order_acquire) ==
+                    expected_adapter_generation
+                ? OutcomeClass::kSuccess
+                : OutcomeClass::kDerivedFlush;
+        bool expected = true;
+        if (!permit.active_.compare_exchange_strong(expected, false,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed))
+            continue;
+        CoreAccess::recordOutcome(device, permit.device_generation_, outcome,
+                                  FailureScope::kOperation, false);
+        CoreAccess::recordOutcome(route, permit.route_generation_, outcome,
+                                  FailureScope::kOperation, true);
+        total += permit.bytes_;
+        completed_mask |= uint64_t{1} << i;
+    }
+    if (total != 0) {
+        CoreAccess::releaseBytes(*device, total);
+        CoreAccess::releaseBytes(*route, total);
+    }
     return true;
 }
 
@@ -368,6 +539,9 @@ void controlTick(DomainState& state, uint64_t) {
     if (!CoreAccess::pauseFeedback(state, generation)) return;
     FeedbackResumeGuard feedback_guard(state, generation);
 
+    const bool pure_success =
+        (state.success_feedback_.load(std::memory_order_acquire) &
+         kSuccessSeen) != 0;
     const uint64_t successes =
         state.successful_completions_.exchange(0, std::memory_order_relaxed);
     const uint64_t receiver_pressure =
@@ -386,7 +560,7 @@ void controlTick(DomainState& state, uint64_t) {
 
     if (epoch_error) return;
 
-    if (successes != 0) {
+    if (pure_success || successes != 0) {
         const uint64_t current =
             state.window_bytes_.load(std::memory_order_relaxed);
         const uint64_t increment =
