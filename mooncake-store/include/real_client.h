@@ -1374,6 +1374,8 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    RpcDrainGuard dummy_read_drain_;
+    friend class RealClientDummyReadTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
     struct SessionRangeReadRequest {
