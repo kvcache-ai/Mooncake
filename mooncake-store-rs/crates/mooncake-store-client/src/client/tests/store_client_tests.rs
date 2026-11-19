@@ -18,14 +18,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, CompatibilityDescriptor, MetadataBackend,
-    ObjectKey, ObjectRoute, RouteDirectory, RouteState, RouteVersion, StoreError,
+    CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+    CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
+    RouteCasRequest, RouteDirectory, RouteState, RouteVersion, SegmentName, StoreError,
 };
+use mooncake_store_route::LocalRouteAuthority;
 use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::transport::{FaultyTransport, TestTransport};
 
 use crate::{
-    MooncakeCompatibilityFacade, ObjectRef, PutRequest, ReplicationPolicy, StoreClientBuilder,
+    metrics_test_lock, snapshot_metrics, MooncakeCompatibilityFacade, ObjectRef, PutRequest,
+    ReplicationPolicy, StoreClientBuilder,
 };
 
 use super::{
@@ -86,6 +89,126 @@ fn put_get_remove_lifecycle() {
     // get after remove — NotFound
     let err = client.get("hello").expect_err("get after remove must fail");
     assert!(matches!(err, StoreError::NotFound(_)));
+}
+
+#[test]
+fn route_gauges_follow_authority_updates() {
+    const TENANT: &str = "route-gauges-fixture";
+    const OWNER: &str = "route-gauges-fixture-owner";
+
+    let _guard = metrics_test_lock().lock();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let namespace = metadata.for_tenant("default").unwrap().route_namespace();
+    let _client = StoreClientBuilder::new(metadata, "route-gauges-fixture")
+        .state(ClientLifecycleState::Active)
+        .build(test_future_expiry_ms())
+        .unwrap();
+    let authority =
+        LocalRouteAuthority::new(namespace, ClientStableId::new("route-gauges-fixture"));
+    let key = ObjectKey::new(format!("{TENANT}::object"));
+    let old_runtime = ClientRuntimeId::new(OWNER, ClientEpoch(1));
+    let new_runtime = ClientRuntimeId::new(OWNER, ClientEpoch(2));
+    let replica = ReplicaRoute {
+        owner: old_runtime.clone(),
+        segment_name: SegmentName::new("old-segment"),
+        allocation_id: None,
+        segment_offset: 0,
+        length: 16,
+        checksum: None,
+        offset: Some(0),
+        tier: ReplicaTier::Dram,
+        priority: 0,
+    };
+    let old = ObjectRoute {
+        key: key.clone(),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
+        version: RouteVersion(1),
+        state: RouteState::Active,
+        compatibility: Default::default(),
+        replicas: vec![
+            replica.clone(),
+            ReplicaRoute {
+                segment_name: SegmentName::new("other-segment"),
+                ..replica.clone()
+            },
+        ],
+        cold_backing: None,
+        nof_backing: None,
+    };
+    let next = ObjectRoute {
+        version: RouteVersion(2),
+        replicas: vec![ReplicaRoute {
+            owner: new_runtime.clone(),
+            tier: ReplicaTier::Nvme,
+            ..replica
+        }],
+        ..old.clone()
+    };
+    let stale_delete = RouteCasRequest {
+        key: key.clone(),
+        expected: Some(old.version),
+        next: None,
+    };
+    let assert_gauges = |objects: Option<f64>, replicas: &[(&str, &str, f64)]| {
+        let snapshot = snapshot_metrics();
+        let actual_objects = snapshot
+            .object_routes
+            .iter()
+            .filter(|sample| sample.key.tenant == TENANT)
+            .map(|sample| sample.value)
+            .collect::<Vec<_>>();
+        let actual_replicas = snapshot
+            .replica_distribution
+            .iter()
+            .filter(|sample| sample.key.runtime.starts_with(OWNER))
+            .map(|sample| (sample.key.runtime.as_str(), sample.key.tier, sample.value))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_objects, objects.into_iter().collect::<Vec<_>>());
+        assert_eq!(actual_replicas, replicas);
+    };
+
+    assert!(
+        authority
+            .compare_and_swap_route(&key, None, Some(&old))
+            .unwrap()
+            .applied
+    );
+    assert_gauges(Some(1.0), &[(&old_runtime.to_string(), "dram", 2.0)]);
+
+    assert!(
+        authority
+            .compare_and_swap_route(&key, Some(old.version), Some(&next))
+            .unwrap()
+            .applied
+    );
+    assert_gauges(Some(1.0), &[(&new_runtime.to_string(), "nvme", 1.0)]);
+
+    authority.replace_route(&key, Some(&old)).unwrap();
+    authority
+        .replace_routes(std::slice::from_ref(&stale_delete))
+        .unwrap();
+    assert_eq!(
+        authority.get_route(&key).unwrap().unwrap().version,
+        next.version
+    );
+    assert_gauges(Some(1.0), &[(&new_runtime.to_string(), "nvme", 1.0)]);
+
+    let tombstone = ObjectRoute {
+        version: RouteVersion(3),
+        state: RouteState::Tombstone,
+        replicas: Vec::new(),
+        ..next
+    };
+    authority.replace_route(&key, Some(&tombstone)).unwrap();
+    assert_gauges(None, &[]);
+    authority.replace_route(&key, Some(&old)).unwrap();
+    authority.replace_routes(&[stale_delete]).unwrap();
+    assert!(authority.get_route(&key).unwrap().is_none());
+    assert_gauges(None, &[]);
 }
 
 #[test]
