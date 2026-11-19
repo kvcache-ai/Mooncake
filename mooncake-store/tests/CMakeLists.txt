@@ -67,6 +67,14 @@ if(USE_MLU)
     add_test(NAME ${mlu_test} COMMAND ${mlu_test})
   endforeach()
 endif()
+add_store_test(real_client_shutdown_test real_client_shutdown_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(real_client_shutdown_test
+                             PRIVATE MOONCAKE_TEST_WRAP_UNREGISTER)
+  target_link_options(
+    real_client_shutdown_test PRIVATE
+    "-Wl,--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(read_singleflight_test read_singleflight_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
