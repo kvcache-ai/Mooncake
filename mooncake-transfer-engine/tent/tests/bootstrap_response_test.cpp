@@ -62,6 +62,41 @@ TEST(BootstrapResponseTest, InvalidJsonIsMalformed) {
     EXPECT_TRUE(status.IsMalformedJson());
 }
 
+// Peers that predate path_mtu do not send it.
+TEST(BootstrapResponseTest, PathMtuIsOptional) {
+    BootstrapDesc parsed;
+    parsed.path_mtu = 4096;
+    auto status = ControlClient::decodeBootstrapResponse(
+        R"({"local_nic_path":"a:1@mlx5_1","peer_nic_path":"b:1@mlx5_1",)"
+        R"("qp_num":[1],"local_lid":0,"local_gid":"fe80::1",)"
+        R"("reply_msg":"","notify_qp_num":7})",
+        parsed);
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(parsed.path_mtu, 0u);
+
+    BootstrapDesc desc;
+    desc.local_gid = "fe80::1";
+    desc.qp_num = {1};
+    desc.path_mtu = 1024;
+    status = ControlClient::decodeBootstrapResponse(json(desc).dump(), parsed);
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(parsed.path_mtu, 1024u);
+}
+
+TEST(BootstrapResponseTest, OtherFieldsAreStillRequired) {
+    BootstrapDesc desc;
+    desc.local_gid = "fe80::1";
+    desc.qp_num = {1};
+    for (const char* key : {"local_gid", "qp_num"}) {
+        json wire = desc;
+        wire.erase(key);
+        BootstrapDesc parsed;
+        auto status =
+            ControlClient::decodeBootstrapResponse(wire.dump(), parsed);
+        EXPECT_TRUE(status.IsMalformedJson()) << key;
+    }
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
