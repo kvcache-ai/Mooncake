@@ -1222,6 +1222,7 @@ TEST(RdAtomicResolveTest, RequestMayExceedHistoricalCapUpToDeviceLimit) {
     EXPECT_EQ(resolveRdAtomicDepth(255, 255), 255);
 }
 
+#if defined(USE_CUDA)
 TEST(GlobalConfigTest, RdmaHostOnlyIsReadFromEnvironment) {
     unsetenv("MOONCAKE_RDMA_HOST_ONLY");
     GlobalConfig defaults;
@@ -1234,6 +1235,15 @@ TEST(GlobalConfigTest, RdmaHostOnlyIsReadFromEnvironment) {
     unsetenv("MOONCAKE_RDMA_HOST_ONLY");
     EXPECT_TRUE(enabled.rdma_host_only);
 }
+#else
+TEST(GlobalConfigTest, RdmaHostOnlyIsIgnoredWithoutCuda) {
+    setenv("MOONCAKE_RDMA_HOST_ONLY", "1", 1);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    unsetenv("MOONCAKE_RDMA_HOST_ONLY");
+    EXPECT_FALSE(config.rdma_host_only);
+}
+#endif
 
 }  // namespace
 }  // namespace mooncake

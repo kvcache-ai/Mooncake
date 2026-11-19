@@ -239,6 +239,7 @@ TEST(ExportDmabuf, GpuWholeAllocationWithUnalignedSize) {
 
 // ── MOONCAKE_RDMA_HOST_ONLY (host-staged RDMA) ───────────────────────────────
 
+#if defined(USE_CUDA)
 namespace {
 
 // Enables rdma_host_only for one test and restores the previous value.
@@ -264,7 +265,6 @@ TEST(ExportDmabuf, HostOnlyKeepsHostMemoryOnHostReg) {
     EXPECT_EQ(exp.fd, -1);
 }
 
-#if defined(USE_CUDA)
 TEST(ExportDmabuf, HostOnlyRejectsGpuMemory) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -281,4 +281,5 @@ TEST(ExportDmabuf, HostOnlyRejectsGpuMemory) {
     }
     cudaFree(dev);
 }
-#endif
+
+#endif  // USE_CUDA

@@ -795,7 +795,6 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     for (const auto& [env_name, field] :
          {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
-          std::pair{"MOONCAKE_RDMA_HOST_ONLY", &config.rdma_host_only},
           std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct},
           std::pair{"MC_RDMA_DATA_DIRECT_PAIRING",
                     &config.rdma_data_direct_pairing}}) {
@@ -812,6 +811,24 @@ void loadGlobalConfig(GlobalConfig& config) {
                          << ", keeping default " << *field;
         }
     }
+
+#ifdef USE_CUDA
+    if (const char* value = std::getenv("MOONCAKE_RDMA_HOST_ONLY")) {
+        const auto parsed = TryParseBool(value);
+        if (parsed.has_value()) {
+            config.rdma_host_only = *parsed;
+        } else {
+            LOG(WARNING)
+                << "Invalid MOONCAKE_RDMA_HOST_ONLY environment value: "
+                << value << ", keeping default " << config.rdma_host_only;
+        }
+    }
+#else
+    if (std::getenv("MOONCAKE_RDMA_HOST_ONLY") != nullptr) {
+        LOG(WARNING) << "MOONCAKE_RDMA_HOST_ONLY is only supported in CUDA "
+                        "builds; ignoring the environment value";
+    }
+#endif
 
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {

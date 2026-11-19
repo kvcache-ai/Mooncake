@@ -578,6 +578,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
+#ifdef USE_CUDA
     if (globalConfig().rdma_host_only && result == CUDA_SUCCESS &&
         memType != CU_MEMORYTYPE_HOST) {
         LOG(ERROR) << "RDMA host-only mode requires host memory; GPU "
@@ -585,6 +586,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                       "registration";
         return ERR_INVALID_ARGUMENT;
     }
+#endif
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
@@ -1565,11 +1567,14 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
+#if defined(USE_CUDA)
         if (globalConfig().rdma_host_only) {
             LOG(INFO) << "RDMA host-only mode enabled; skipping GPU DMA-BUF "
                          "affinity validation for RNIC "
                       << device_name;
-        } else if (!globalConfig().with_nvidia_peermem) {
+        } else
+#endif
+            if (!globalConfig().with_nvidia_peermem) {
             std::vector<int> mapped_gpu_devices;
             if (engine_.local_topology_) {
                 const auto topology_matrix =

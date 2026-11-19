@@ -195,7 +195,8 @@ struct GlobalConfig {
     // Host-staged RDMA: only host (pinned CPU) memory may be registered. GPU
     // buffers are rejected, and the GPU DMA-BUF capability checks are skipped.
     // Callers copy GPU data into pinned host buffers first. Set via
-    // MOONCAKE_RDMA_HOST_ONLY.
+    // MOONCAKE_RDMA_HOST_ONLY. Supported only in CUDA builds; other builds
+    // ignore the environment variable.
     bool rdma_host_only = false;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
