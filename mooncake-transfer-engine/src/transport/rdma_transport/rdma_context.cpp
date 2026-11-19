@@ -580,7 +580,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
-#if defined(USE_CUDA) || defined(USE_SUPA)
+#if defined(USE_CUDA) || defined(USE_SUPA) || defined(USE_MACA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
@@ -901,11 +901,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
+        // Capture errno before PLOG touches it: the transport needs to tell
+        // the HugeTLB sub-view EINVAL apart from every other failure so it can
+        // retry with a widened range (see
+        // RdmaTransport::registerLocalMemoryInternal).
+        const int saved_errno = errno;
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
                     << globalConfig().rdma_data_direct;
-        return ERR_CONTEXT;
+        return saved_errno == EINVAL ? ERR_CONTEXT_EINVAL : ERR_CONTEXT;
     }
     return 0;
 }
@@ -1000,6 +1005,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     // safe and does not affect the subsequent dereg.
     closeDmabufExport(exp);
     if (ret != 0) {
+        // Propagates ERR_CONTEXT_EINVAL unchanged: the fault-in attempt runs
+        // before any MR is recorded, so the transport can retry it widened.
         return ret;
     }
     if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC
@@ -1647,23 +1654,45 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 
         updateGlobalConfig(device_attr);
         supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
-        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
-        max_qp_init_rd_atom_ =
-            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        {
+            // Scoped so the gotos to cleanup_context_and_devices below do not
+            // jump past this initialization.
+            const auto &config = globalConfig();
+            max_qp_rd_atom_ = resolveRdAtomicDepth(config.max_dest_rd_atomic,
+                                                   device_attr.max_qp_rd_atom);
+            max_qp_init_rd_atom_ = resolveRdAtomicDepth(
+                config.max_rd_atomic, device_attr.max_qp_init_rd_atom);
+            if (config.max_rd_atomic > 0 || config.max_dest_rd_atomic > 0) {
+                LOG(INFO) << "Device " << device_name
+                          << " RD-atomic depth: max_rd_atomic="
+                          << max_qp_init_rd_atom_
+                          << " (MC_MAX_RD_ATOMIC=" << config.max_rd_atomic
+                          << ", device max_qp_init_rd_atom="
+                          << device_attr.max_qp_init_rd_atom
+                          << "), max_dest_rd_atomic=" << max_qp_rd_atom_
+                          << " (MC_MAX_DEST_RD_ATOMIC="
+                          << config.max_dest_rd_atomic
+                          << ", device max_qp_rd_atom="
+                          << device_attr.max_qp_rd_atom << ")";
+            }
+        }
         if (!supports_rdma_atomic_) {
             LOG(INFO) << "RNIC " << device_name
                       << " reports no RDMA atomic; data QPs will not request "
                          "IBV_ACCESS_REMOTE_ATOMIC";
         }
-        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
-            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+        if (clampRdAtomicDepth(device_attr.max_qp_rd_atom) <
+                kIdealRdAtomicDepth ||
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom) <
+                kIdealRdAtomicDepth) {
             LOG(WARNING)
                 << "Device " << device_name
                 << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
-                << max_qp_rd_atom_
-                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
-                << "; QPs on this NIC will use those "
-                << "values instead of the default " << kIdealRdAtomicDepth;
+                << device_attr.max_qp_rd_atom
+                << ", max_qp_init_rd_atom=" << device_attr.max_qp_init_rd_atom
+                << "; QPs on this NIC will use max_dest_rd_atomic="
+                << max_qp_rd_atom_ << ", max_rd_atomic=" << max_qp_init_rd_atom_
+                << " instead of the default " << kIdealRdAtomicDepth;
         }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;

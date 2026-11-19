@@ -285,11 +285,26 @@ TEST(RailMonitorCrossNumaTest, CrossNumaPrefersSameNameDevice) {
     // remote mlx5_x is at idx1. Must map there, not positionally to idx0.
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/1), 1);
 
+    // direct_rails_ pairs by name across all remote NICs, ignoring NUMA.
+    EXPECT_EQ(rail.directRemoteDevice(/*local_nic=*/0), 1);
+    EXPECT_EQ(rail.directRemoteDevice(/*local_nic=*/1), 0);
+
     // With unknown target NUMA (wildcard memory location), the explicit
     // same-name direct rail remains the best peer across all remote NUMA
     // domains.
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/-1),
               1);
+}
+
+TEST(RailMonitorCrossNumaTest, DirectRemoteRejectsDifferentName) {
+    auto local = makeNamedNumaTopology("mlx5_x", 0, "mlx5_y", 1);
+    auto remote = makeNamedNumaTopology("mlx5_a", 0, "mlx5_b", 1);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote).ok());
+
+    // A recorded pair with unequal names is not an affinity match.
+    EXPECT_EQ(rail.directRemoteDevice(/*local_nic=*/0), -1);
+    EXPECT_EQ(rail.directRemoteDevice(/*local_nic=*/1), -1);
 }
 
 TEST(RailMonitorCrossNumaTest, UnknownRemoteNumaPrefersDirectPeer) {
