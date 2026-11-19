@@ -27,7 +27,7 @@
 #include "p2p/common/p2p_rpc_types.h"
 #include "p2p/client/p2p_client_config_builder.h"
 #include "mutex.h"
-#include "inflight_tracker.h"
+#include "p2p/common/inflight_tracker.h"
 #include "p2p/client/runtime_config_store.h"
 #include "transfer_engine.h"
 #include <ylt/coro_http/coro_http_server.hpp>

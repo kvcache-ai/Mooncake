@@ -78,6 +78,8 @@ target_link_libraries(stress_workload_test_p2p PUBLIC
 )
 
 # client side
+add_p2p_store_test(inflight_tracker_test inflight_tracker_test.cpp)
+set_tests_properties(inflight_tracker_test PROPERTIES TIMEOUT 60)
 if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "p2p")
     add_p2p_store_executable(p2p_real_client_test p2p_real_client_test.cpp)
     add_test(NAME p2p_real_client_test COMMAND p2p_real_client_test

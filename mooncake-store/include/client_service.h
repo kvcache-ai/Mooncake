@@ -18,7 +18,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include "client_buffer.h"
 #include "client_resources.h"
-#include "inflight_tracker.h"
+#include "p2p/common/inflight_tracker.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"

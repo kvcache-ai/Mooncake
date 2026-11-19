@@ -8,7 +8,7 @@
 #include <ylt/util/tl/expected.hpp>
 #include "p2p/client/client_rpc_types.h"
 #include "p2p/client/data_manager.h"
-#include "inflight_tracker.h"
+#include "p2p/common/inflight_tracker.h"
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/common/p2p_types.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
