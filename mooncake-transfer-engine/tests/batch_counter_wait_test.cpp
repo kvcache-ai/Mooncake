@@ -1064,6 +1064,10 @@ TEST_F(BatchCounterWait, RejectsInvalidBatchHandles) {
                         .IsInvalidArgument());
         EXPECT_TRUE(
             multi.getBatchTransferStatus(bad, status).IsInvalidArgument());
+        bool drained = true;
+        EXPECT_TRUE(
+            multi.getBatchDrainStatus(bad, drained).IsInvalidArgument());
+        EXPECT_FALSE(drained);
         EXPECT_TRUE(multi.freeBatchID(bad).IsInvalidArgument());
     }
 }

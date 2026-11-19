@@ -5,11 +5,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -18,15 +23,77 @@
 
 #include "types.h"
 #include "pinned_buffer_pool.h"
+#include "transfer_engine_impl.h"
+#ifdef USE_TENT
+#include "tent/transfer_engine.h"
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/transport.h"
+#endif
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
 
 namespace mooncake {
 
+class TransferEngineImplTestPeer {
+   public:
+#ifdef USE_TENT
+    static void InstallNativeTransport(
+        TransferEngine& engine, std::shared_ptr<tent::Transport> transport) {
+        engine.getTentEngine()->impl_->swapTransportForTest(
+            tent::TCP, std::move(transport));
+    }
+#endif
+    static void InstallCpuFaultTransport(TransferEngine& engine,
+                                         std::shared_ptr<Transport> transport) {
+        engine.impl_->multi_transports_->transport_map_.clear();
+        engine.impl_->multi_transports_->transport_map_.emplace(
+            "tcp", std::move(transport));
+        auto metadata = engine.impl_->getMetadata();
+        auto self = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (!self) {
+            self = std::make_shared<TransferMetadata::SegmentDesc>();
+            self->name = engine.getLocalIpAndPort();
+            auto held = self;
+            metadata->addLocalSegment(LOCAL_SEGMENT_ID, self->name,
+                                      std::move(held));
+        }
+        self->protocol = "tcp";
+    }
+};
+
+namespace {
+
+class ScopedTransferTimeoutEnv {
+   public:
+    explicit ScopedTransferTimeoutEnv(const char* value) {
+        const char* current = std::getenv("MC_TRANSFER_TIMEOUT_SEC");
+        if (current != nullptr) previous_ = current;
+
+        if (value != nullptr) {
+            ::setenv("MC_TRANSFER_TIMEOUT_SEC", value, 1);
+        } else {
+            ::unsetenv("MC_TRANSFER_TIMEOUT_SEC");
+        }
+    }
+
+    ~ScopedTransferTimeoutEnv() {
+        if (previous_.has_value()) {
+            ::setenv("MC_TRANSFER_TIMEOUT_SEC", previous_->c_str(), 1);
+        } else {
+            ::unsetenv("MC_TRANSFER_TIMEOUT_SEC");
+        }
+    }
+
+   private:
+    std::optional<std::string> previous_;
+};
+
+}  // namespace
+
 // Test fixture for TransferTask tests
-// TODO: Currently, this test does not cover TransferSubmitter and
-// TransferEngine integration. Will add more tests in the future.
+// Device completion faults are injected below; status publication, batch
+// ownership, and caller-memory drain use the production transfer code.
 class ScopedEnvVar {
    public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
@@ -118,6 +185,659 @@ TEST_F(TransferTaskTest, MemcpyOperationState) {
     EXPECT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
 }
+
+TEST_F(TransferTaskTest, TransferFutureTimeoutDrainsDelayedMemcpyBeforeReturn) {
+    auto state = std::make_shared<MemcpyOperationState>();
+    TransferFuture future(state);
+    std::string destination(64, '?');
+    const std::string source(64, 'M');
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::memcpy(destination.data(), source.data(), source.size());
+        state->set_completed(ErrorCode::OK);
+    });
+    auto waiter =
+        std::async(std::launch::async, [&] { return future.get(10); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(waiter.get(), ErrorCode::TRANSFER_FAIL);
+    writer.join();
+    EXPECT_EQ(destination, source);
+    EXPECT_TRUE(future.isReady());
+    EXPECT_EQ(future.get(), ErrorCode::OK);
+}
+
+namespace {
+
+// A CPU fault source with a real caller-memory write, held before the transport
+// completion. These tasks use the production TE status and Slice completion
+// path; only the device/CQE timing is injected.
+class DelayedCpuBatch {
+   private:
+    // The fault source models classic BatchDesc/CQE completion, including in
+    // binaries that also compile TENT support.
+    ScopedEnvVar classic_tent_{"MC_USE_TENT", nullptr};
+    ScopedEnvVar classic_tev1_{"MC_USE_TEV1", nullptr};
+
+   public:
+    explicit DelayedCpuBatch(size_t tasks) : engine(false) {
+        EXPECT_EQ(engine.init("P2PHANDSHAKE", "localhost:17941"), 0);
+        id = engine.allocateBatchID(tasks);
+        auto& batch = Transport::toBatchDesc(id);
+        batch.task_list.resize(tasks);
+        for (auto& task : batch.task_list) {
+            task.batch_id = id;
+            task.slice_count = 1;
+            task.total_bytes = 64;
+            auto* slice = new Transport::Slice{};
+            slice->task = &task;
+            slice->length = 64;
+            slice->status = Transport::Slice::PENDING;
+            task.slice_list.push_back(slice);
+        }
+    }
+
+    Transport::Slice* slice(size_t index) {
+        return Transport::toBatchDesc(id).task_list[index].slice_list[0];
+    }
+
+    TransferEngine engine;
+    BatchID id;
+};
+
+class ThrowOnceMemcpyState final : public OperationState {
+   public:
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+    void wait_for_completion() override {
+        if (!thrown_.exchange(true)) throw std::runtime_error("injected wait");
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return result_.has_value(); });
+    }
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::LOCAL_MEMCPY;
+    }
+    void Finish() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            result_ = ErrorCode::OK;
+        }
+        cv_.notify_all();
+    }
+
+   private:
+    std::atomic<bool> thrown_{false};
+};
+
+class TransientQueryFailureTransport : public Transport {
+   public:
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::NotImplemented("completion injection only");
+    }
+    Status getTransferStatus(BatchID id, size_t index,
+                             TransferStatus& status) override {
+        if (!failed_.exchange(true)) return Status::Context("injected query");
+        auto& task = toBatchDesc(id).task_list[index];
+        if (__atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE) == 1) {
+            status.s = TransferStatusEnum::COMPLETED;
+            task.is_finished = true;
+        } else {
+            status.s = TransferStatusEnum::WAITING;
+        }
+        status.transferred_bytes = 0;
+        return Status::OK();
+    }
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+    const char* getName() const override { return "cpu-fault"; }
+
+   private:
+    std::atomic<bool> failed_{false};
+};
+
+// A CQE can arrive after a task status was sampled but before the subsequent
+// physical-drain query. Keep that interleaving deterministic without hardware.
+class CompletionAfterSnapshotTransport final
+    : public TransientQueryFailureTransport {
+   public:
+    explicit CompletionAfterSnapshotTransport(bool success)
+        : success_(success) {}
+
+    Status getTransferStatus(BatchID id, size_t index,
+                             TransferStatus& status) override {
+        auto& task = toBatchDesc(id).task_list[index];
+        if (!completed_) {
+            status.s = TransferStatusEnum::WAITING;
+            status.transferred_bytes = 0;
+            if (success_)
+                task.slice_list[0]->markSuccess();
+            else
+                task.slice_list[0]->markFailed();
+            completed_ = true;
+        } else {
+            status.s = success_ ? TransferStatusEnum::COMPLETED
+                                : TransferStatusEnum::FAILED;
+            status.transferred_bytes = success_ ? task.total_bytes : 0;
+            task.is_finished = true;
+        }
+        return Status::OK();
+    }
+
+    Status getTaskDrainStatus(BatchID id, size_t index,
+                              bool& drained) override {
+        const auto& task = toBatchDesc(id).task_list[index];
+        // This CPU fixture has no accepted I/O after the injected completion,
+        // including the failure case. Default Transport only proves success.
+        drained =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE) +
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) ==
+            task.slice_count;
+        return Status::OK();
+    }
+
+   private:
+    const bool success_;
+    bool completed_ = false;
+};
+
+class DelayedCpuTransport final : public Transport {
+   public:
+    explicit DelayedCpuTransport(bool throws, bool success = false)
+        : throws_(throws), success_(success), release_(release.get_future()) {}
+    ~DelayedCpuTransport() override {
+        if (worker_.joinable()) worker_.join();
+    }
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::NotImplemented("task submission only");
+    }
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        auto* task = tasks.at(0);
+        task->slice_count = 1;
+        auto* slice = new Slice{};
+        slice->task = task;
+        slice->length = task->request->length;
+        slice->status = Slice::PENDING;
+        task->slice_list.push_back(slice);
+        // Keep the test's injected WR self-contained, so the RED baseline can
+        // complete after its early return without dereferencing a stale vector.
+        const auto request = *task->request;
+        const auto* borrowed = task->request;
+        worker_ = std::thread([this, request, borrowed, slice] {
+            release_.wait();
+            // The success case also checks production descriptor ownership,
+            // after the submitting method's local vector has left scope.
+            const auto& active = success_ ? *borrowed : request;
+            std::memcpy(active.source,
+                        reinterpret_cast<const void*>(active.target_offset),
+                        active.length);
+            slice->markSuccess();
+        });
+        accepted.set_value();
+        if (success_) return Status::OK();
+        if (throws_) throw std::bad_alloc();
+        return Status::Context("injected failure after accepting a WR");
+    }
+    Status getTransferStatus(BatchID id, size_t index,
+                             TransferStatus& status) override {
+        auto& task = toBatchDesc(id).task_list[index];
+        const auto completed =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        status.s = completed == 1 ? TransferStatusEnum::COMPLETED
+                                  : TransferStatusEnum::WAITING;
+        if (completed == 1) task.is_finished = true;
+        status.transferred_bytes = completed ? task.total_bytes : 0;
+        return Status::OK();
+    }
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+    const char* getName() const override { return "tcp"; }
+    void Join() {
+        if (worker_.joinable()) worker_.join();
+    }
+    std::promise<void> accepted, release;
+
+   private:
+    bool throws_;
+    bool success_;
+    std::future<void> release_;
+    std::thread worker_;
+};
+
+class SlowReadyMemcpyState final : public OperationState {
+   public:
+    SlowReadyMemcpyState(std::string& destination, bool false_first,
+                         int delay_ms = 60)
+        : destination_(destination),
+          false_first_(false_first),
+          delay_ms_(delay_ms) {}
+    bool is_completed() override {
+        if (ready_) return true;
+        if (false_first_ && queries_++ == 0) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
+        std::fill(destination_.begin(), destination_.end(), 'D');
+        std::lock_guard lock(mutex_);
+        result_ = ErrorCode::OK;
+        ready_ = true;
+        return true;
+    }
+    void wait_for_completion() override { (void)is_completed(); }
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::LOCAL_MEMCPY;
+    }
+    void HoldResultLock(std::promise<void>& entered) {
+        std::lock_guard lock(mutex_);
+        entered.set_value();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+
+   private:
+    std::string& destination_;
+    bool false_first_, ready_{false};
+    int delay_ms_;
+    size_t queries_{0};
+};
+
+class SlowSuccessQueryTransport final : public Transport {
+   public:
+    SlowSuccessQueryTransport(std::string& destination, int delay_ms)
+        : destination_(destination), delay_ms_(delay_ms) {}
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::NotImplemented("CPU completion injection");
+    }
+    Status getTransferStatus(BatchID id, size_t index,
+                             TransferStatus& status) override {
+        auto& task = toBatchDesc(id).task_list[index];
+        if (!completed_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
+            std::fill(destination_.begin(), destination_.end(), 'D');
+            task.slice_list[0]->markSuccess();
+            completed_ = true;
+        }
+        status.s = TransferStatusEnum::COMPLETED;
+        status.transferred_bytes = task.total_bytes;
+        return Status::OK();
+    }
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+    const char* getName() const override { return "cpu-slow-success"; }
+
+   private:
+    std::string& destination_;
+    int delay_ms_;
+    bool completed_{false};
+};
+
+}  // namespace
+
+TEST_F(TransferTaskTest,
+       ExplicitDeadlineChecksSlowReadyAndResultCollectionBeforeSuccess) {
+    for (bool false_first : {false, true}) {
+        std::string destination(64, '?');
+        auto state =
+            std::make_shared<SlowReadyMemcpyState>(destination, false_first);
+        TransferFuture future(state);
+        EXPECT_EQ(future.get(5), ErrorCode::TRANSFER_FAIL)
+            << "false_first=" << false_first;
+        EXPECT_EQ(destination, std::string(64, 'D'));
+        EXPECT_TRUE(future.isReady());
+        // A per-call logical timeout does not poison a later physical result.
+        EXPECT_EQ(future.get(), ErrorCode::OK);
+    }
+    std::string destination(64, '?');
+    auto state = std::make_shared<SlowReadyMemcpyState>(destination, false, 0);
+    TransferFuture future(state);
+    ASSERT_TRUE(future.isReady());
+    std::promise<void> entered;
+    auto is_entered = entered.get_future();
+    std::thread holder([&] { state->HoldResultLock(entered); });
+    is_entered.wait();
+    // Readiness is already cached, but collecting get_result still consumes
+    // this call's budget while another observer holds its metadata mutex.
+    EXPECT_EQ(future.get(5), ErrorCode::TRANSFER_FAIL);
+    holder.join();
+    EXPECT_EQ(destination, std::string(64, 'D'));
+    EXPECT_EQ(future.get(), ErrorCode::OK);
+}
+
+TEST_F(TransferTaskTest,
+       DefaultDeadlineChecksFirstReadyAndPreservesExplicitOverrideAndCache) {
+    ScopedTransferTimeoutEnv env("1");
+    struct Case {
+        const char* name;
+        int query_delay_ms;
+        bool cached_before_deadline;
+        int64_t explicit_timeout_ms;
+        ErrorCode expected;
+    };
+    for (const auto& scenario :
+         {Case{"first slow default query", 1100, false, 0,
+               ErrorCode::TRANSFER_FAIL},
+          Case{"cached before default expiry", 10, true, 0, ErrorCode::OK},
+          Case{"explicit budget overrides default", 1100, false, 2000,
+               ErrorCode::OK}}) {
+        SCOPED_TRACE(scenario.name);
+        std::string destination(64, '?');
+        DelayedCpuBatch batch(1);
+        SlowSuccessQueryTransport transport(destination,
+                                            scenario.query_delay_ms);
+        Transport::toBatchDesc(batch.id).task_list[0].transport_ = &transport;
+        auto state = std::make_shared<TransferEngineOperationState>(
+            batch.engine, batch.id, 1);
+        TransferFuture future(state);
+        if (scenario.cached_before_deadline) {
+            ASSERT_TRUE(future.isReady());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        }
+        EXPECT_EQ(future.get(scenario.explicit_timeout_ms), scenario.expected);
+        EXPECT_EQ(destination, std::string(64, 'D'));
+        bool drained = false;
+        EXPECT_TRUE(batch.engine.getBatchDrainStatus(batch.id, drained).ok());
+        EXPECT_TRUE(drained);
+    }
+}
+
+TEST_F(TransferTaskTest, TransferFutureWaitExceptionStillDrainsCallerMemory) {
+    auto state = std::make_shared<ThrowOnceMemcpyState>();
+    TransferFuture future(state);
+    std::string destination(64, '?');
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'E');
+        state->Finish();
+    });
+    auto waiter = std::async(std::launch::async, [&] { return future.get(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_NO_THROW(EXPECT_EQ(waiter.get(), ErrorCode::TRANSFER_FAIL));
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'E'));
+}
+
+TEST_F(TransferTaskTest, AbandonedTransferFutureDrainsDelayedMemcpy) {
+    auto state = std::make_shared<MemcpyOperationState>();
+    std::string destination(64, '?');
+    std::promise<void> release, abandoning;
+    auto released = release.get_future();
+    auto is_abandoning = abandoning.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'A');
+        state->set_completed(ErrorCode::OK);
+    });
+    auto owner = std::async(std::launch::async, [&] {
+        TransferFuture future(state);
+        abandoning.set_value();
+    });
+    is_abandoning.wait();
+    EXPECT_EQ(owner.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    owner.get();
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'A'));
+}
+
+TEST_F(TransferTaskTest, TransferFutureMoveAssignmentDrainsReplacedOperation) {
+    auto old_state = std::make_shared<MemcpyOperationState>();
+    auto new_state = std::make_shared<MemcpyOperationState>();
+    new_state->set_completed(ErrorCode::OK);
+    std::string destination(64, '?');
+    std::promise<void> release, replacing;
+    auto released = release.get_future();
+    auto is_replacing = replacing.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'V');
+        old_state->set_completed(ErrorCode::OK);
+    });
+    auto owner = std::async(std::launch::async, [&] {
+        TransferFuture future(old_state);
+        TransferFuture replacement(new_state);
+        replacing.set_value();
+        future = std::move(replacement);
+        return future.get();
+    });
+    is_replacing.wait();
+    EXPECT_EQ(owner.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(owner.get(), ErrorCode::OK);
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'V'));
+}
+
+TEST_F(TransferTaskTest,
+       TransferFutureTimeoutDrainsRemainingTasksAfterFailure) {
+    DelayedCpuBatch batch(2);
+    batch.slice(0)->markFailed();
+    auto* delayed = batch.slice(1);
+    auto state = std::make_shared<TransferEngineOperationState>(batch.engine,
+                                                                batch.id, 2);
+    TransferFuture future(state);
+    std::string destination(64, '?');
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'T');
+        delayed->markSuccess();
+    });
+    auto waiter =
+        std::async(std::launch::async, [&] { return future.get(10); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(waiter.get(), ErrorCode::TRANSFER_FAIL);
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'T'));
+    EXPECT_TRUE(future.isReady());
+}
+
+TEST_F(TransferTaskTest,
+       TransferEngineConfiguredTimeoutStillDrainsDelayedTask) {
+    ScopedTransferTimeoutEnv env("1");
+    DelayedCpuBatch batch(1);
+    auto* delayed = batch.slice(0);
+    auto state = std::make_shared<TransferEngineOperationState>(batch.engine,
+                                                                batch.id, 1);
+    TransferFuture future(state);
+    std::string destination(64, '?');
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'C');
+        delayed->markSuccess();
+    });
+    auto waiter = std::async(std::launch::async, [&] { return future.get(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(1150)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(waiter.get(), ErrorCode::TRANSFER_FAIL);
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'C'));
+    EXPECT_TRUE(future.isReady());
+}
+
+TEST_F(TransferTaskTest, TransferEngineQueryFailureStillDrainsDelayedTask) {
+    DelayedCpuBatch batch(1);
+    TransientQueryFailureTransport fault;
+    Transport::toBatchDesc(batch.id).task_list[0].transport_ = &fault;
+    auto* delayed = batch.slice(0);
+    auto state = std::make_shared<TransferEngineOperationState>(batch.engine,
+                                                                batch.id, 1);
+    TransferFuture future(state);
+    std::string destination(64, '?');
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread writer([&] {
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'Q');
+        delayed->markSuccess();
+    });
+    auto waiter = std::async(std::launch::async, [&] { return future.get(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(waiter.get(), ErrorCode::TRANSFER_FAIL);
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'Q'));
+}
+
+TEST_F(TransferTaskTest, CompletionAfterTaskSnapshotKeepsFinalOutcome) {
+    for (bool success : {true, false}) {
+        DelayedCpuBatch batch(1);
+        CompletionAfterSnapshotTransport transport(success);
+        Transport::toBatchDesc(batch.id).task_list[0].transport_ = &transport;
+        auto state = std::make_shared<TransferEngineOperationState>(
+            batch.engine, batch.id, 1);
+        TransferFuture future(state);
+        EXPECT_EQ(future.get(),
+                  success ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL);
+        bool drained = false;
+        EXPECT_TRUE(batch.engine.getBatchDrainStatus(batch.id, drained).ok());
+        EXPECT_TRUE(drained);
+    }
+}
+
+TEST_F(TransferTaskTest, FailedOrThrowingSubmissionDrainsAlreadyAcceptedWrite) {
+    ScopedEnvVar classic_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_tev1("MC_USE_TEV1", nullptr);
+    ScopedEnvVar memcpy_disabled("MC_STORE_MEMCPY", "0");
+    for (bool throws : {false, true}) {
+        TransferEngine engine(false);
+        ASSERT_EQ(engine.init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
+        auto transport = std::make_shared<DelayedCpuTransport>(throws);
+        auto accepted = transport->accepted.get_future();
+        TransferEngineImplTestPeer::InstallCpuFaultTransport(engine, transport);
+        std::shared_ptr<StorageBackend> backend;
+        TransferSubmitter submitter(engine, backend,
+                                    engine.getLocalIpAndPort());
+        const std::string source(64, 'S');
+        std::string destination(64, '?');
+        auto caller = std::async(std::launch::async, [&] {
+            try {
+                auto future = submitter.submit_batch_get_offload_object(
+                    engine.getLocalIpAndPort(), {"key"},
+                    {reinterpret_cast<uintptr_t>(source.data())},
+                    {{"key", {{destination.data(), destination.size()}}}},
+                    OffloadBufferAccess::kTransferEngine);
+                return future.has_value();
+            } catch (const std::bad_alloc&) {
+                return false;
+            }
+        });
+        accepted.wait();
+        EXPECT_EQ(caller.wait_for(std::chrono::milliseconds(60)),
+                  std::future_status::timeout)
+            << "submit throws=" << throws;
+        transport->release.set_value();
+        EXPECT_FALSE(caller.get());
+        transport->Join();
+        EXPECT_EQ(destination, source);
+    }
+}
+
+TEST_F(TransferTaskTest, SubmittedRequestDescriptorsSurviveSubmittingMethod) {
+    ScopedEnvVar classic_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_tev1("MC_USE_TEV1", nullptr);
+    ScopedEnvVar memcpy_disabled("MC_STORE_MEMCPY", "0");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<DelayedCpuTransport>(false, true);
+    TransferEngineImplTestPeer::InstallCpuFaultTransport(engine, transport);
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    const std::string source(64, 'R');
+    std::string destination(64, '?');
+    auto future = submitter.submit_batch_get_offload_object(
+        engine.getLocalIpAndPort(), {"key"},
+        {reinterpret_cast<uintptr_t>(source.data())},
+        {{"key", {{destination.data(), destination.size()}}}},
+        OffloadBufferAccess::kTransferEngine);
+    ASSERT_TRUE(future);
+    transport->release.set_value();
+    EXPECT_EQ(future->get(), ErrorCode::OK);
+    transport->Join();
+    EXPECT_EQ(destination, source);
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransferTaskTest,
+       TransferEngineWaitsForCallbackQuiescenceAfterPublishedCompletion) {
+    DelayedCpuBatch batch(1);
+    auto& desc = Transport::toBatchDesc(batch.id);
+    auto* delayed = batch.slice(0);
+    auto state = std::make_shared<TransferEngineOperationState>(batch.engine,
+                                                                batch.id, 1);
+    TransferFuture future(state);
+    std::string destination(64, '?');
+    std::promise<void> published, release;
+    auto is_published = published.get_future();
+    auto released = release.get_future();
+    std::thread writer([&] {
+        desc.active_completion_callbacks.fetch_add(1,
+                                                   std::memory_order_acq_rel);
+        delayed->markSuccess();
+        published.set_value();
+        released.wait();
+        std::fill(destination.begin(), destination.end(), 'K');
+        desc.active_completion_callbacks.fetch_sub(1,
+                                                   std::memory_order_acq_rel);
+    });
+    is_published.wait();
+    EXPECT_FALSE(future.isReady());
+    auto waiter = std::async(std::launch::async, [&] { return future.get(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(60)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(waiter.get(), ErrorCode::OK);
+    writer.join();
+    EXPECT_EQ(destination, std::string(64, 'K'));
+}
+#endif
 
 // Test MemcpyWorkerPool basic functionality
 TEST_F(TransferTaskTest, MemcpyWorkerPoolBasic) {
@@ -301,6 +1021,321 @@ TEST_F(TransferTaskTest, NativeScatterPreservesSharedRemoteSegment) {
     EXPECT_EQ(server.unregisterLocalMemory(source.data()), 0);
 }
 
+namespace {
+// Ordinary CPU transport: a terminal logical result is deliberately published
+// before its destination access ends. No allocator fault hooks are involved.
+class NativeDrainTransport final : public tent::Transport {
+   public:
+    struct AcceptedBatch final : SubBatch {
+        std::vector<tent::Request> requests;
+        size_t size() const override { return requests.size(); }
+    };
+    NativeDrainTransport() { caps.dram_to_dram = true; }
+    tent::Status install(std::string&, std::shared_ptr<tent::ControlService>,
+                         std::shared_ptr<tent::Topology>,
+                         std::shared_ptr<tent::Config>) override {
+        return tent::Status::OK();
+    }
+    tent::Status allocateSubBatch(SubBatchRef& batch,
+                                  size_t capacity) override {
+        auto owner = std::make_unique<AcceptedBatch>();
+        owner->requests.reserve(capacity);
+        batch = owner.release();
+        return tent::Status::OK();
+    }
+    tent::Status freeSubBatch(SubBatchRef& batch) override {
+        delete static_cast<AcceptedBatch*>(batch);
+        batch = nullptr;
+        ++freed;
+        return tent::Status::OK();
+    }
+    tent::Status submitTransferTasks(
+        SubBatchRef batch,
+        const std::vector<tent::Request>& requests) override {
+        auto* accepted = static_cast<AcceptedBatch*>(batch);
+        accepted->requests = requests;
+        live_batch = accepted;
+        if (!notified.exchange(true)) submitted.set_value();
+        if (throw_after_submit)
+            throw std::runtime_error("accepted CPU transfer");
+        return tent::Status::OK();
+    }
+    tent::Status getTransferStatus(SubBatchRef batch, int task,
+                                   tent::TransferStatus& status) override {
+        if (slow_status.exchange(false))
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        if (query_error.load())
+            return tent::Status::InvalidArgument("transient CPU query failure");
+        const auto* accepted = static_cast<AcceptedBatch*>(batch);
+        if (task < 0 || static_cast<size_t>(task) >= accepted->size())
+            return tent::Status::InvalidArgument("unpublished CPU request");
+        status = {(logical_failure || task == failed_task) ? tent::FAILED
+                                                           : tent::COMPLETED,
+                  accepted->requests[task].length};
+        return tent::Status::OK();
+    }
+    tent::Status getSubBatchDrainStatus(SubBatchRef, bool& drained) override {
+        if (slow_drain.exchange(false))
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        drained = released.load(std::memory_order_acquire);
+        return tent::Status::OK();
+    }
+    tent::Status addMemoryBuffer(tent::BufferDesc& buffer,
+                                 const tent::MemoryOptions&) override {
+        buffer.transports.push_back(tent::TCP);
+        return tent::Status::OK();
+    }
+    tent::Status removeMemoryBuffer(tent::BufferDesc&) override {
+        return tent::Status::OK();
+    }
+    const char* getName() const override { return "native-cpu-drain"; }
+
+    void Release() {
+        // The last destination write occurs before the physical drain flag.
+        if (live_batch)
+            for (const auto& request : live_batch->requests)
+                std::memcpy(
+                    request.source,
+                    reinterpret_cast<const void*>(request.target_offset),
+                    request.length);
+        query_error.store(false);
+        released.store(true, std::memory_order_release);
+    }
+    std::promise<void> submitted;
+    std::atomic<bool> released{false}, query_error{false}, slow_status{false},
+        slow_drain{false};
+    std::atomic<int> freed{0};
+    std::atomic<bool> notified{false};
+    bool throw_after_submit = false, logical_failure = false;
+    int failed_task = -1;
+
+   private:
+    AcceptedBatch* live_batch = nullptr;
+};
+
+class NativeStoreDrainTest : public TransferTaskTest {
+   protected:
+    void SetUp() override {
+        TransferTaskTest::SetUp();
+        engine = std::make_unique<TransferEngine>(false);
+        ASSERT_TRUE(engine->isUsingTent());
+        ASSERT_EQ(engine->init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
+        transport = std::make_shared<NativeDrainTransport>();
+        TransferEngineImplTestPeer::InstallNativeTransport(*engine, transport);
+        source.assign(32, 'N');
+        destination.assign(34, '?');
+        ASSERT_EQ(
+            engine->registerLocalMemory(source.data(), source.size(), "cpu:0"),
+            0);
+        ASSERT_EQ(engine->registerLocalMemory(destination.data(),
+                                              destination.size(), "cpu:0"),
+                  0);
+        submitter = std::make_unique<TransferSubmitter>(
+            *engine, backend, engine->getLocalIpAndPort());
+    }
+    void TearDown() override {
+        submitter.reset();
+        if (engine) {
+            EXPECT_EQ(engine->unregisterLocalMemory(source.data()), 0);
+            EXPECT_EQ(engine->unregisterLocalMemory(destination.data()), 0);
+        }
+        engine.reset();
+        TransferTaskTest::TearDown();
+    }
+    TransferEngine::ScatterTransferRange Range(std::atomic<int>& callbacks,
+                                               std::atomic<bool>& success) {
+        return {.opcode = TransferRequest::READ,
+                .remote_segment = engine->getLocalIpAndPort(),
+                .remote_base_offset = reinterpret_cast<uint64_t>(source.data()),
+                .remote_size = source.size(),
+                .local_buffer = destination.data(),
+                .local_capacity = destination.size(),
+                .local_offsets = local_offsets,
+                .remote_offsets = remote_offsets,
+                .lengths = lengths,
+                .on_fragment_complete = [&](size_t, const Status& status) {
+                    success.store(status.ok());
+                    ++callbacks;
+                }};
+    }
+    std::optional<TransferFuture> Future() {
+        return submitter->submit_batch_get_offload_object(
+            engine->getLocalIpAndPort(), {"native"},
+            {reinterpret_cast<uint64_t>(source.data())},
+            {{"native", {{destination.data() + 1, source.size()}}}},
+            OffloadBufferAccess::kTransferEngine,
+            TransferIntent::kForegroundGet);
+    }
+    void CheckBytes() {
+        EXPECT_EQ(destination.front(), '?');
+        EXPECT_EQ(destination.back(), '?');
+        EXPECT_EQ(destination.substr(1, source.size()), source);
+        EXPECT_EQ(transport->freed.load(), 1);
+    }
+    ScopedEnvVar native_enabled{"MC_USE_TENT", "1"};
+    ScopedEnvVar loopback{"MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"};
+    ScopedEnvVar config{
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":false},"shm":{"enable":false}},"metrics":{"enabled":false},"merge_requests":false,"enable_progress_worker":false})"};
+    std::unique_ptr<TransferEngine> engine;
+    std::shared_ptr<NativeDrainTransport> transport;
+    std::shared_ptr<StorageBackend> backend;
+    std::unique_ptr<TransferSubmitter> submitter;
+    std::string source, destination;
+    std::vector<size_t> local_offsets{1}, remote_offsets{0}, lengths{32};
+};
+
+TEST_F(NativeStoreDrainTest, FutureTimeoutRetainsDestinationUntilDrain) {
+    auto future = Future();
+    ASSERT_TRUE(future);
+    auto waiter =
+        std::async(std::launch::async, [&] { return future->get(1); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_EQ(transport->freed.load(), 0);
+    transport->Release();
+    EXPECT_EQ(waiter.get(), ErrorCode::TRANSFER_FAIL);
+    future.reset();
+    CheckBytes();
+}
+
+TEST_F(NativeStoreDrainTest, AbandonedFutureDrainsAcceptedWrite) {
+    auto future = Future();
+    ASSERT_TRUE(future);
+    auto waiter = std::async(std::launch::async, [&] { future.reset(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    transport->Release();
+    waiter.get();
+    CheckBytes();
+}
+
+TEST_F(NativeStoreDrainTest, SubmissionExceptionDrainsAcceptedPrefix) {
+    transport->throw_after_submit = true;
+    auto accepted = transport->submitted.get_future();
+    auto waiter = std::async(std::launch::async, [&] {
+        try {
+            (void)Future();
+            return false;
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+    });
+    EXPECT_EQ(accepted.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    transport->Release();
+    EXPECT_TRUE(waiter.get());
+    CheckBytes();
+}
+
+TEST_F(NativeStoreDrainTest, ScatterFailureDefersCallbacksUntilPhysicalDrain) {
+    transport->logical_failure = true;
+    std::atomic<int> callbacks{0};
+    std::atomic<bool> success{true};
+    auto operation = submitter->submitNativeScatter(
+        {Range(callbacks, success)}, TransferIntent::kForegroundGet);
+    EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(1)).ok());
+    EXPECT_EQ(callbacks.load(), 0);
+    auto waiter =
+        std::async(std::launch::async, [&] { return operation.wait(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    transport->Release();
+    EXPECT_FALSE(waiter.get().ok());
+    EXPECT_EQ(callbacks.load(), 1);
+    EXPECT_FALSE(success.load());
+    CheckBytes();
+}
+
+TEST_F(NativeStoreDrainTest, ScatterPreservesSuccessfulFragmentsAfterDrain) {
+    transport->failed_task = 1;
+    local_offsets = {1, 17};
+    remote_offsets = {0, 16};
+    lengths = {16, 16};
+    std::atomic<int> callbacks{0};
+    std::atomic<bool> success{true};
+    std::array<bool, 2> fragment_ok{false, true};
+    auto range = Range(callbacks, success);
+    range.on_fragment_complete = [&](size_t index, const Status& status) {
+        fragment_ok[index] = status.ok();
+        ++callbacks;
+    };
+    auto operation =
+        submitter->submitNativeScatter({range}, TransferIntent::kForegroundGet);
+    auto waiter =
+        std::async(std::launch::async, [&] { return operation.wait(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_EQ(callbacks.load(), 0);
+    transport->Release();
+    EXPECT_FALSE(waiter.get().ok());
+    EXPECT_EQ(callbacks.load(), 2);
+    EXPECT_TRUE(fragment_ok[0]);
+    EXPECT_FALSE(fragment_ok[1]);
+    CheckBytes();
+}
+
+TEST_F(NativeStoreDrainTest,
+       ScatterQueryErrorDefersCallbacksUntilPhysicalDrain) {
+    transport->query_error.store(true);
+    std::atomic<int> callbacks{0};
+    std::atomic<bool> success{true};
+    auto operation = submitter->submitNativeScatter(
+        {Range(callbacks, success)}, TransferIntent::kForegroundGet);
+    EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(1)).ok());
+    EXPECT_EQ(callbacks.load(), 0);
+    transport->Release();
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(callbacks.load(), 1);
+    EXPECT_FALSE(success.load());
+    CheckBytes();
+}
+
+TEST_F(NativeStoreDrainTest,
+       ScatterDeadlineIncludesFinalStatusAndDrainQueries) {
+    for (bool slow_drain : {false, true}) {
+        transport->released.store(false);
+        std::atomic<int> callbacks{0};
+        std::atomic<bool> success{true};
+        auto operation = submitter->submitNativeScatter(
+            {Range(callbacks, success)}, TransferIntent::kForegroundGet);
+        transport->Release();
+        transport->slow_drain.store(slow_drain);
+        transport->slow_status.store(!slow_drain);
+        EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(1)).ok());
+        EXPECT_EQ(callbacks.load(), 1);
+        EXPECT_FALSE(success.load());
+        EXPECT_FALSE(operation.wait().ok());
+        EXPECT_EQ(callbacks.load(), 1);
+    }
+    EXPECT_EQ(transport->freed.load(), 2);
+}
+
+TEST_F(NativeStoreDrainTest, ScatterDestructorWaitsForPhysicalDrain) {
+    std::atomic<int> callbacks{0};
+    std::atomic<bool> success{false};
+    auto operation = submitter->submitNativeScatter(
+        {Range(callbacks, success)}, TransferIntent::kForegroundGet);
+    auto waiter = std::async(std::launch::async,
+                             [operation = std::move(operation)]() mutable {
+                                 auto local = std::move(operation);
+                                 // local's destructor drains before return.
+                             });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_EQ(callbacks.load(), 0);
+    transport->Release();
+    waiter.get();
+    EXPECT_EQ(callbacks.load(), 1);
+    EXPECT_TRUE(success.load());
+    CheckBytes();
+}
+}  // namespace
+#endif
+
+#ifdef USE_TENT
 TEST_F(TransferTaskTest, TransferSubmitterScatterUsesTentDataPath) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17934"), 0);

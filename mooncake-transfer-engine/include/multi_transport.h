@@ -62,6 +62,9 @@ class MultiTransport {
     struct ScatterSubmission {
         BatchID batch_id = static_cast<BatchID>(-1);
         std::vector<size_t> task_sizes;
+        // Set only after complete task metadata preparation, before the first
+        // transport call. Exceptions afterwards may leave accepted I/O alive.
+        bool dispatch_started = false;
     };
 
     BatchID allocateBatchID(size_t batch_size);
@@ -108,6 +111,8 @@ class MultiTransport {
     // See TransferEngine::drainCompletions().
     Status drainCompletions(std::vector<BatchCompletion> &out);
 
+    Status getBatchDrainStatus(BatchID batch_id, bool &drained);
+
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
 
@@ -132,7 +137,8 @@ class MultiTransport {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
-                          std::vector<size_t> *task_sizes);
+                          std::vector<size_t> *task_sizes,
+                          bool *dispatch_started = nullptr);
 
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);

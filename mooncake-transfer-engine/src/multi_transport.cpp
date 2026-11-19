@@ -201,6 +201,60 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
         "BatchID is invalid because cleanup has been deferred");
 }
 
+Status MultiTransport::getBatchDrainStatus(BatchID batch_id, bool& drained) {
+    drained = false;
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
+    // Serialize descriptor deletion; a caller must not query a handle after
+    // freeBatchID has transferred its ownership to deferred cleanup.
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+    if (deferred_cleanup_batches_.count(batch_id) != 0) {
+        return Status::InvalidArgument(
+            "Batch cleanup has already been deferred");
+    }
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
+        auto& task = batch.task_list[task_id];
+        const auto slices =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        if (slices == 0) continue;  // Preparation rejected before dispatch.
+        if ((__atomic_load_n(&task.completion_state, __ATOMIC_ACQUIRE) &
+             Transport::Slice::kCompletionSealBit) == 0) {
+            return Status::OK();
+        }
+        if (task.transport_) {
+            bool task_drained = false;
+            auto query = task.transport_->getTaskDrainStatus(batch_id, task_id,
+                                                             task_drained);
+            if (!query.ok()) return query;
+            if (!task_drained) return Status::OK();
+            continue;
+        }
+        // Legacy tasks without a transport pointer use the Slice completion
+        // counters directly; no transport-specific logical failure is cached.
+        TransferStatus status;
+        auto query = getTransferStatus(batch_id, task_id, status);
+        const auto success =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        const auto failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (success + failed != slices) {
+            return query.ok() ? Status::OK() : query;
+        }
+    }
+    if (batch.active_completion_callbacks.load(std::memory_order_acquire) !=
+        0) {
+        return Status::OK();
+    }
+    // A permanent logical query error must not strand already-drained batch
+    // metadata. The existing free path may now skip querying these tasks.
+    for (auto& task : batch.task_list)
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+    drained = true;
+    return Status::OK();
+}
+
 Status MultiTransport::tryFreeBatchID(
     BatchID batch_id, const std::function<void()>& before_delete) {
     if (!Transport::isValidBatchID(batch_id)) {
@@ -585,7 +639,7 @@ Status MultiTransport::submitTransfer(
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
-    std::vector<size_t>* task_sizes) {
+    std::vector<size_t>* task_sizes, bool* dispatch_started) {
     if (!Transport::isValidBatchID(batch_id)) {
         return Status::InvalidArgument("Invalid batch ID");
     }
@@ -672,6 +726,21 @@ Status MultiTransport::submitTransfer(
                                  std::memory_order_release);
     }
     Status overall_status = Status::OK();
+    struct SealOnExit {
+        decltype(submit_tasks)& groups;
+        ~SealOnExit() {
+            // A throwing transport stops this dispatch loop. Seal both its
+            // accepted prefix and groups that were never reached so completion
+            // publication cannot wait for nonexistent later submissions.
+            for (auto& group : groups)
+                for (auto* task : group.second)
+                    if ((__atomic_load_n(&task->completion_state,
+                                         __ATOMIC_ACQUIRE) &
+                         Transport::Slice::kCompletionSealBit) == 0)
+                        Transport::Slice::sealTaskSubmission(task);
+        }
+    } seal_on_exit{submit_tasks};
+    if (dispatch_started) *dispatch_started = true;
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         for (auto* task : entry.second) {
@@ -712,7 +781,8 @@ Status MultiTransport::submitScatter(
     if (!Transport::isValidBatchID(submission.batch_id))
         return Status::InvalidArgument(
             "failed to allocate scatter transfer batch");
-    return submitTransfer(submission.batch_id, entries, &submission.task_sizes);
+    return submitTransfer(submission.batch_id, entries, &submission.task_sizes,
+                          &submission.dispatch_started);
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL

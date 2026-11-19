@@ -46,6 +46,7 @@ class HighPerformanceTcpTransport final : public Transport {
                                const std::vector<Request>& requests) override;
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override;
+    Status getSubBatchDrainStatus(SubBatchRef batch, bool& drained) override;
     Status retryTransferTask(SubBatchRef batch, int task_id,
                              const Request& request) override;
 

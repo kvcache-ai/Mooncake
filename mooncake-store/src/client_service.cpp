@@ -72,6 +72,59 @@ std::optional<size_t> GetTransportRegistrationLimit(
 }
 
 namespace {
+using ReadDeadline = std::chrono::steady_clock::time_point;
+
+ReadDeadline MakeReadDeadline(ReadDeadline start, int64_t timeout_ms) {
+    if (timeout_ms <= 0) return ReadDeadline::max();
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            ReadDeadline::max() - start);
+    return std::chrono::milliseconds(timeout_ms) >= remaining
+               ? ReadDeadline::max()
+               : start + std::chrono::milliseconds(timeout_ms);
+}
+
+ErrorCode FinishBatchRead(TransferFuture& future, ReadDeadline deadline) {
+    if (deadline == ReadDeadline::max()) return future.get();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        // Logical expiry does not revoke a posted transfer's buffer access.
+        (void)future.get();
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    const auto remaining_ms =
+        std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+    const auto result = future.get(remaining_ms);
+    return std::chrono::steady_clock::now() >= deadline
+               ? ErrorCode::TRANSFER_FAIL
+               : result;
+}
+
+class ScopedHotCacheRead {
+   public:
+    ScopedHotCacheRead() = default;
+    ScopedHotCacheRead(const ScopedHotCacheRead&) = delete;
+    ScopedHotCacheRead& operator=(const ScopedHotCacheRead&) = delete;
+    ~ScopedHotCacheRead() { Release(); }
+
+    void Acquire(LocalHotCache* cache, const std::string& key) {
+        cache_ = cache;
+        key_ = &key;
+    }
+
+    void Release() {
+        if (cache_) {
+            cache_->ReleaseHotKey(*key_);
+            cache_ = nullptr;
+        }
+    }
+
+    void Disarm() { cache_ = nullptr; }
+
+   private:
+    LocalHotCache* cache_ = nullptr;
+    const std::string* key_ = nullptr;
+};
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
@@ -1782,7 +1835,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool group_by_target) {
+    bool group_by_target, int64_t timeout_ms) {
+    const auto t0_batch_get = std::chrono::steady_clock::now();
+    const auto deadline = MakeReadDeadline(t0_batch_get, timeout_ms);
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1807,8 +1862,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Collect all transfer operations for parallel execution
-    // Tuple: (index, key, future, replica, cache_used)
-    std::vector<std::tuple<size_t, std::string, TransferFuture,
+    // Source leases outlive all submitted futures even on exceptions.
+    std::vector<ScopedHotCacheRead> cache_reads(object_keys.size());
+    // Tuple: (index, future, replica, cache_used). Construct the descriptor
+    // and reserve storage before submission, so accepted work cannot be lost
+    // to a subsequent vector/string allocation failure.
+    std::vector<std::tuple<size_t, std::optional<TransferFuture>,
                            Replica::Descriptor, bool>>
         pending_transfers;
     struct TargetReadGroup {
@@ -1818,12 +1877,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::vector<bool> cache_used;
     };
     std::unordered_map<std::string, TargetReadGroup> target_groups;
+    pending_transfers.reserve(object_keys.size());
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<Replica::Descriptor> dfs_read_replicas;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
-    // Record batch get transfer latency (Submit + Wait)
-    auto t0_batch_get = std::chrono::steady_clock::now();
+    dfs_read_requests.reserve(object_keys.size());
+    dfs_read_indices.reserve(object_keys.size());
 
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
@@ -1833,6 +1893,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            continue;
+        }
 
         auto slices_it = slices.find(key);
         if (slices_it == slices.end()) {
@@ -1871,12 +1936,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
             if (cache_used) {
+                cache_reads[i].Acquire(hot_cache_.get(), key);
                 total_cache_hits++;
             }
         }
 
         // Submit transfer operation asynchronously
-        std::optional<TransferFuture> future;
         if (replica.is_dfs_replica()) {
             if (!dfs_storage_backend_) {
                 LOG(ERROR) << "DFS backend is not initialized";
@@ -1896,11 +1961,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             dfs_read_indices.push_back(i);
             dfs_read_replicas.push_back(replica);
             continue;
-        } else if (replica.is_nof_replica()) {
+        }
+        pending_transfers.emplace_back(i, std::nullopt, replica, cache_used);
+        auto& future = std::get<1>(pending_transfers.back());
+        if (std::chrono::steady_clock::now() >= deadline) {
+            cache_reads[i].Release();
+            pending_transfers.pop_back();
+            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            continue;
+        }
+        if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                pending_transfers.pop_back();
                 continue;
             }
             future = transfer_submitter_->submit(
@@ -1915,6 +1990,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             group.replicas.push_back(replica);
             group.slices.push_back(slices_it->second);
             group.cache_used.push_back(cache_used);
+            pending_transfers.pop_back();
             continue;
         } else {
             future = transfer_submitter_->submit(
@@ -1924,8 +2000,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
-                hot_cache_->ReleaseHotKey(key);
+                cache_reads[i].Release();
             }
+            pending_transfers.pop_back();
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
             results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
@@ -1934,39 +2011,62 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         VLOG(1) << "Submitted transfer for key " << key
                 << " using strategy: " << static_cast<int>(future->strategy());
-
-        pending_transfers.emplace_back(i, key, std::move(*future), replica,
-                                       cache_used);
     }
 
     for (auto& [endpoint, group] : target_groups) {
-        auto future = transfer_submitter_->submit_batch(
-            group.replicas, group.slices, TransferRequest::READ,
-            TransferIntent::kForegroundGet);
+        std::optional<TransferFuture> future;
+        if (std::chrono::steady_clock::now() < deadline)
+            future = transfer_submitter_->submit_batch(
+                group.replicas, group.slices, TransferRequest::READ,
+                TransferIntent::kForegroundGet);
         for (size_t j = 0; j < group.indexes.size(); ++j) {
             const size_t index = group.indexes[j];
             const auto& key = object_keys[index];
             if (!future) {
                 if (hot_cache_ && group.cache_used[j]) {
-                    hot_cache_->ReleaseHotKey(key);
+                    cache_reads[index].Release();
                 }
                 LOG(ERROR) << "Failed to submit batch transfer to " << endpoint
                            << " for key: " << key;
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 continue;
             }
-            pending_transfers.emplace_back(index, key, future->share(),
-                                           group.replicas[j],
-                                           group.cache_used[j]);
+            pending_transfers.emplace_back(
+                index, future->share(), group.replicas[j], group.cache_used[j]);
         }
         VLOG(1) << "Submitted batch read of " << group.indexes.size()
                 << " keys from " << endpoint;
     }
 
-    if (!dfs_read_requests.empty()) {
+    if (!dfs_read_requests.empty() &&
+        std::chrono::steady_clock::now() >= deadline) {
+        for (size_t index : dfs_read_indices) {
+            results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+    } else if (!dfs_read_requests.empty()) {
         auto* dfs_metric = GetDfsMetricPtr();
         const auto dfs_read_start = std::chrono::steady_clock::now();
-        auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        std::vector<tl::expected<void, ErrorCode>> dfs_results;
+        if (deadline == ReadDeadline::max()) {
+            dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        } else {
+            // The DFS adapter performs synchronous per-key I/O. Keep its
+            // accepted read alive until ReadAt returns, then check the common
+            // deadline before starting another key.
+            dfs_results.assign(dfs_read_requests.size(),
+                               tl::unexpected(ErrorCode::TRANSFER_FAIL));
+            for (size_t i = 0; i < dfs_read_requests.size(); ++i) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                const std::vector<DfsReadRequest> request{dfs_read_requests[i]};
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                auto result = dfs_storage_backend_->BatchRead(request);
+                dfs_results[i] =
+                    result.size() == 1
+                        ? std::move(result[0])
+                        : tl::expected<void, ErrorCode>{
+                              tl::unexpected(ErrorCode::INTERNAL_ERROR)};
+            }
+        }
         const auto dfs_read_latency_us = elapsed_us_since(dfs_read_start);
         int64_t dfs_success_keys = 0;
         uint64_t dfs_success_bytes = 0;
@@ -2004,6 +2104,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     }
                     continue;
                 }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                    continue;
+                }
                 // The I/O itself delivered these bytes, so they count even if
                 // the checksum below rejects the payload; a checksum mismatch
                 // is additionally recorded as an error so the two are
@@ -2037,13 +2141,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Wait for all transfers to complete
-    for (auto& [index, key, future, stored_replica, cache_used] :
+    for (auto& [index, future, stored_replica, cache_used] :
          pending_transfers) {
-        ErrorCode result = future.get();
+        const auto& key = object_keys[index];
+        ErrorCode result = FinishBatchRead(*future, deadline);
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
-            hot_cache_->ReleaseHotKey(key);
+            cache_reads[index].Release();
         }
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
@@ -4504,7 +4609,10 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
-    OffloadBufferAccess buffer_access, TransferIntent intent) {
+    OffloadBufferAccess buffer_access, TransferIntent intent,
+    int64_t timeout_ms) {
+    const auto deadline =
+        MakeReadDeadline(std::chrono::steady_clock::now(), timeout_ms);
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices, buffer_access,
         intent);
@@ -4513,7 +4621,7 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
     VLOG(1) << "Using transfer strategy: " << future->strategy();
-    auto result = future->get();
+    auto result = FinishBatchRead(*future, deadline);
     if (result != ErrorCode::OK) {
         LOG(ERROR) << "Transfer failed, error code is " << result;
         return tl::make_unexpected(result);

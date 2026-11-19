@@ -27,6 +27,40 @@
 
 namespace mooncake {
 
+int64_t GetTransferTimeoutMilliseconds() {
+    constexpr int64_t kDefaultTimeoutMilliseconds = 60 * 1000;
+    constexpr int64_t kMillisecondsPerSecond = 1000;
+    // condition_variable::wait_for converts the relative timeout to the
+    // steady-clock duration (nanoseconds on supported Linux platforms). Keep
+    // well below that signed duration's limit so both conversion and
+    // steady_clock::now() + timeout remain representable.
+    constexpr int64_t kMaxTimeoutSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::nanoseconds::max() / 2)
+            .count();
+
+    const char* raw_value = std::getenv("MC_TRANSFER_TIMEOUT_SEC");
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+        return kDefaultTimeoutMilliseconds;
+    }
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    const long long seconds = std::strtoll(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value || end_ptr == nullptr ||
+        *end_ptr != '\0' || seconds <= 0 ||
+        seconds >
+            std::numeric_limits<int64_t>::max() / kMillisecondsPerSecond ||
+        seconds > kMaxTimeoutSeconds) {
+        LOG(WARNING) << "Invalid MC_TRANSFER_TIMEOUT_SEC='" << raw_value
+                     << "', using default " << kDefaultTimeoutMilliseconds
+                     << " milliseconds";
+        return kDefaultTimeoutMilliseconds;
+    }
+
+    return static_cast<int64_t>(seconds) * kMillisecondsPerSecond;
+}
+
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -824,6 +858,8 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 TransferEngineOperationState::~TransferEngineOperationState() {
+    if (batch_id_ == 0 || batch_id_ == INVALID_BATCH_ID) return;
+    wait_for_completion();
 #ifdef USE_TENT
     if (tent_engine_)
         tent_engine_->freeBatch(batch_id_);
@@ -843,51 +879,37 @@ bool TransferEngineOperationState::is_completed() {
 }
 
 void TransferEngineOperationState::check_task_status() {
-    // Check all transfers in the batch.
-    // Wait for ALL tasks to reach a terminal state before setting the result,
-    // even if some have already failed. This prevents the caller from seeing
-    // "completed" while background transfers are still in progress, which
-    // could cause issues when freeBatchID is called in the destructor.
+    // Task status decides the logical outcome. Only the TE physical barrier
+    // decides whether returning ownership of caller memory is safe.
     bool all_terminated = true;
-    std::vector<size_t> failed_task_ids;
+    bool task_failed = false;
 
-    for (size_t i = 0; i < batch_size_; ++i) {
+    for (size_t i = 0; !submission_failed_ && i < batch_size_; ++i) {
         TransferStatus status;
-        Status s;
+        Status query;
 #ifdef USE_TENT
         if (tent_engine_) {
-            tent::TransferStatus tent_status;
-            auto tent_s =
-                tent_engine_->getTransferStatus(batch_id_, i, tent_status);
-            if (!tent_s.ok()) {
-                LOG(ERROR) << "Failed to get transfer status for batch "
-                           << batch_id_ << " task " << i << " with error "
-                           << tent_s.message();
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
-                return;
+            tent::TransferStatus native_status;
+            const auto result =
+                tent_engine_->getTransferStatus(batch_id_, i, native_status);
+            const auto state = result.ok()
+                                   ? ToClassicTransferStatus(native_status.s)
+                                   : std::nullopt;
+            if (state) {
+                status.s = *state;
+                status.transferred_bytes = native_status.transferred_bytes;
+            } else {
+                query = Status::Context("native transfer status query failed");
             }
-            auto classic_status = ToClassicTransferStatus(tent_status.s);
-            if (!classic_status) {
-                LOG(ERROR) << "Unknown TENT transfer status for batch "
-                           << batch_id_ << " task " << i << " with status "
-                           << static_cast<int>(tent_status.s);
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
-                return;
-            }
-            status.s = *classic_status;
-            status.transferred_bytes = tent_status.transferred_bytes;
-            s = Status::OK();
         } else
 #endif
         {
-            s = engine_.getTransferStatus(batch_id_, i, status);
-            if (!s.ok()) {
-                LOG(ERROR) << "Failed to get transfer status for batch "
-                           << batch_id_ << " task " << i << " with error "
-                           << s.message();
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
-                return;
-            }
+            query = engine_.getTransferStatus(batch_id_, i, status);
+        }
+        if (!query.ok()) {
+            status_query_failed_ = true;
+            all_terminated = false;
+            continue;
         }
 
         switch (status.s) {
@@ -901,7 +923,7 @@ void TransferEngineOperationState::check_task_status() {
                 VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
                         << i << " with status " << static_cast<int>(status.s);
 #endif
-                failed_task_ids.push_back(i);
+                task_failed = true;
                 break;
             default:
                 // Transfer is still in progress (WAITING, PENDING, etc.)
@@ -910,27 +932,37 @@ void TransferEngineOperationState::check_task_status() {
         }
     }
 
-    if (!all_terminated) {
-        // Some tasks are still in progress; wait for next poll iteration.
-        // Do NOT set result yet, even if some tasks have already failed.
+    bool drained = false;
+    Status drain_status;
+#ifdef USE_TENT
+    if (tent_engine_) {
+        const auto result =
+            tent_engine_->getBatchDrainStatus(batch_id_, drained);
+        if (!result.ok()) drain_status = Status::Context(result.ToString());
+    } else
+#endif
+    {
+        drain_status = engine_.getBatchDrainStatus(batch_id_, drained);
+    }
+    if (!drain_status.ok()) {
+        if (!status_query_failed_) {
+            LOG(ERROR) << "Failed to query physical drain for batch "
+                       << batch_id_ << ": " << drain_status.message();
+        }
+        status_query_failed_ = true;
         return;
     }
-
-    // All tasks have reached a terminal state.
-    ErrorCode ec = ErrorCode::OK;
-    if (!failed_task_ids.empty()) {
-        std::ostringstream oss;
-        for (size_t j = 0; j < failed_task_ids.size(); ++j) {
-            if (j > 0) oss << ", ";
-            oss << failed_task_ids[j];
-        }
-        LOG(ERROR) << "Batch " << batch_id_
-                   << " completed with task failures: task_ids=[" << oss.str()
-                   << "]";
-        ec = ErrorCode::TRANSFER_FAIL;
-    }
-
-    set_result_internal(ec);
+    if (!drained) return;
+    // A CQE may complete after the per-task snapshot but before the drain
+    // query. Keep ownership and sample again; a stale PENDING state is neither
+    // a terminal error nor proof that the completed transfer succeeded.
+    if (!all_terminated && !submission_failed_ && !status_query_failed_ &&
+        !deadline_exceeded_)
+        return;
+    set_result_internal(submission_failed_ || task_failed || !all_terminated ||
+                                deadline_exceeded_ || status_query_failed_
+                            ? ErrorCode::TRANSFER_FAIL
+                            : ErrorCode::OK);
 }
 
 void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
@@ -949,102 +981,50 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 }
 
 void TransferEngineOperationState::wait_for_completion() {
-    if (is_completed()) {
-        return;
-    }
-
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
-
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-    // TENT batches do not use the classic transport BatchDesc layout.
-    if (!engine_.isUsingTent()) {
-        VLOG(1) << "Waiting for transfer engine completion for batch "
-                << batch_id_;
-        // Wait directly on BatchDesc's condition variable.
-        auto& batch_desc = Transport::toBatchDesc(batch_id_);
-        bool completed;
-        bool failed = false;
-
-        // Fast path: if already finished, avoid taking the mutex and waiting.
-        // Use acquire here to pair with the writer's release-store, because
-        // this path may skip taking the mutex. It ensures all prior updates are
-        // visible.
-        completed = batch_desc.is_finished.load(std::memory_order_acquire);
-        if (!completed) {
-            // Use the same mutex as the notifier when updating the predicate to
-            // avoid missed notifications. The predicate is re-checked under the
-            // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-            // orders prior writes.
-            std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-            const int64_t elapsed_milliseconds =
-                getCurrentTimeInMilli() - start_ts_;
-            if (elapsed_milliseconds < timeout_milliseconds) {
-                completed = batch_desc.completion_cv.wait_for(
-                    lock,
-                    std::chrono::milliseconds(timeout_milliseconds -
-                                              elapsed_milliseconds),
-                    [&batch_desc] {
-                        return batch_desc.is_finished.load(
-                            std::memory_order_relaxed);
-                    });
-            }
-        }  // Explicitly release completion_mutex before acquiring mutex_
-
-        // Once completion is observed, read failure flag.
-        if (completed) {
-            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+    const int64_t timeout_milliseconds = GetTransferTimeoutMilliseconds();
+    auto check_deadline = [&] {
+        if (getCurrentTimeInMilli() - start_ts_ >= timeout_milliseconds &&
+            !deadline_exceeded_) {
+            LOG(ERROR) << "Transfer deadline exceeded after "
+                       << timeout_milliseconds << " milliseconds for batch "
+                       << batch_id_
+                       << "; draining accepted I/O before returning";
+            deadline_exceeded_ = true;
         }
-        ErrorCode error_code =
-            completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                      : ErrorCode::TRANSFER_FAIL;
+    };
+    for (;;) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            set_result_internal(error_code);
+            // A completion observed earlier (including under an explicit
+            // budget) is already cached. Do not retroactively time it out.
+            if (result_.has_value()) return;
+            check_deadline();
+            check_task_status();
+            // A status/drain query can itself span the remaining budget.
+            // Finalize its logical outcome under this same mutex before any
+            // observer can consume a newly discovered successful result.
+            check_deadline();
+            if (deadline_exceeded_ && result_ == ErrorCode::OK)
+                result_ = ErrorCode::TRANSFER_FAIL;
+            if (result_.has_value()) return;
         }
-        if (completed) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(error_code);
-        } else {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-        }
-        return;
-    }
-#endif
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
-
-    while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            {
-                // result_ is shared with concurrent completion paths
-                // (is_completed()/check_task_status() hold mutex_ when they
-                // set it, and the event-driven branch below wraps its
-                // set_result_internal() in the same lock). Lock this path
-                // too, or a late completion racing the timeout is a data
-                // race on result_.
-                std::lock_guard<std::mutex> lock(mutex_);
-                set_result_internal(ErrorCode::TRANSFER_FAIL);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        if (!engine_.isUsingTent() && !submission_failed_) {
+            auto& batch = Transport::toBatchDesc(batch_id_);
+            std::unique_lock<std::mutex> lock(batch.completion_mutex);
+            if (!batch.is_finished.load(std::memory_order_acquire)) {
+                batch.completion_cv.wait_for(
+                    lock, std::chrono::microseconds(100), [&] {
+                        return batch.is_finished.load(
+                            std::memory_order_acquire);
+                    });
+                continue;
             }
-            return;
         }
-
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
-        }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+#endif
+        // Both the deadline and result are updated while mutex_ is held above;
+        // accepted transfers still drain before returning.
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
 
@@ -1060,16 +1040,84 @@ TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
     }
 }
 
+TransferFuture::~TransferFuture() {
+    if (state_) (void)wait();
+}
+
+TransferFuture& TransferFuture::operator=(TransferFuture&& other) noexcept {
+    if (this != &other) {
+        if (state_) (void)wait();
+        state_ = std::move(other.state_);
+    }
+    return *this;
+}
+
 bool TransferFuture::isReady() const { return state_->is_completed(); }
 
 ErrorCode TransferFuture::wait() {
-    if (!isReady()) {
-        state_->wait_for_completion();
+    bool wait_failed = false;
+    const bool default_engine_wait =
+        dynamic_cast<TransferEngineOperationState*>(state_.get()) != nullptr;
+    for (;;) {
+        try {
+            // Default TE waits must apply their budget before the first ready
+            // query. Positive get(timeout) keeps its own polling deadline;
+            // generic ready states retain their existing no-wait fast path.
+            if (default_engine_wait) state_->wait_for_completion();
+            if (state_->is_completed()) {
+                return wait_failed ? ErrorCode::TRANSFER_FAIL
+                                   : state_->get_result();
+            }
+            state_->wait_for_completion();
+        } catch (...) {
+            // A wait or polling exception is not evidence that accepted I/O
+            // stopped accessing the caller's memory. Keep the operation alive
+            // and wait for its completion before returning a failure.
+            if (!wait_failed) {
+                LOG(ERROR) << "Transfer wait failed; draining accepted I/O "
+                              "before returning";
+            }
+            wait_failed = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
-    return state_->get_result();
 }
 
 ErrorCode TransferFuture::get() { return wait(); }
+
+ErrorCode TransferFuture::get(int64_t timeout_ms) {
+    if (timeout_ms <= 0) return get();
+    const auto now = std::chrono::steady_clock::now();
+    const auto until_max =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now);
+    const auto deadline = std::chrono::milliseconds(timeout_ms) >= until_max
+                              ? std::chrono::steady_clock::time_point::max()
+                              : now + std::chrono::milliseconds(timeout_ms);
+    try {
+        while (!isReady()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG(ERROR) << "L3-scoped transfer deadline exceeded after "
+                           << timeout_ms
+                           << " ms; draining accepted I/O before returning";
+                (void)wait();
+                return ErrorCode::TRANSFER_FAIL;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const auto result = state_->get_result();
+        // Both the final ready query and collecting its result (mutex wait)
+        // consume this call's budget. Physical completion is already proven.
+        return std::chrono::steady_clock::now() >= deadline
+                   ? ErrorCode::TRANSFER_FAIL
+                   : result;
+    } catch (...) {
+        LOG(ERROR) << "Transfer completion query failed; draining accepted I/O "
+                      "before returning";
+        (void)wait();
+        return ErrorCode::TRANSFER_FAIL;
+    }
+}
 
 TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
@@ -1266,10 +1314,12 @@ class StoreScatterTransferOperation::Impl {
         : aggregate_status_(std::move(status)), completed_(true) {}
 
 #ifdef USE_TENT
-    Impl(std::shared_ptr<tent::TransferEngine> engine,
-         const std::vector<TransferEngine::ScatterTransferRange>& ranges,
-         TransferIntent intent)
-        : tent_engine_(std::move(engine)) {
+    explicit Impl(std::shared_ptr<tent::TransferEngine> engine)
+        : tent_engine_(std::move(engine)) {}
+
+    void initialize(
+        const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+        TransferIntent intent) {
         build(ranges, intent);
     }
 #endif
@@ -1279,42 +1329,44 @@ class StoreScatterTransferOperation::Impl {
             return;
         }
 #ifdef USE_TENT
-        if (completed_) return;
-        // Destructor path: use a shorter timeout than wait() to avoid
-        // blocking too long when the caller didn't explicitly wait.
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
-                                  "MC_TENT_DESTRUCTOR_TIMEOUT_S", 5));
-        while (!completed_ && std::chrono::steady_clock::now() < deadline) {
-            poll();
-            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+        if (completed_) {
+            return;
         }
-        if (!completed_) forceCleanup();
+        // A deadline is a logical failure, never proof that caller memory
+        // is no longer accessed. Retain the native batch until physical drain.
+        if (batch_id_ == 0) {
+            finish();
+            return;
+        }
+        (void)wait();
 #endif
     }
 
     Status wait() {
         if (classic_operation_) return classic_operation_->wait();
 #ifdef USE_TENT
+        const auto budget =
+            std::getenv("MC_TENT_TRANSFER_TIMEOUT_S")
+                ? static_cast<int64_t>(GetTentPositiveEnvOrDefault(
+                      "MC_TENT_TRANSFER_TIMEOUT_S", 60)) *
+                      1000
+                : GetTransferTimeoutMilliseconds();
         const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
-                                  "MC_TENT_TRANSFER_TIMEOUT_S", 60));
+                              std::chrono::milliseconds(budget);
         while (!completed_) {
-            poll();
-            if (!completed_) std::this_thread::sleep_for(kPollInterval);
-            if (!completed_ && std::chrono::steady_clock::now() >= deadline) {
-                requestAbort(Status::Socket("TENT scatter transfer timed out"));
-                const auto cleanup_deadline =
-                    std::chrono::steady_clock::now() +
-                    std::chrono::seconds(GetTentPositiveEnvOrDefault(
-                        "MC_TENT_CANCEL_GRACE_S", 1));
-                while (!completed_ &&
-                       std::chrono::steady_clock::now() < cleanup_deadline) {
-                    poll();
-                    if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            try {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    wait_timed_out_ = true;
+                    requestAbort(
+                        Status::Clock("TENT scatter transfer timed out"));
                 }
-                if (!completed_) forceCleanup();
+                poll(deadline);
+            } catch (...) {
+                // Query/submission exceptions leave the batch owner alive.
+                // A later successful barrier is still required before return.
+                query_failed_ = true;
             }
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
         }
 #endif
         return aggregate_status_;
@@ -1323,13 +1375,28 @@ class StoreScatterTransferOperation::Impl {
     Status waitFor(std::chrono::nanoseconds timeout) {
         if (classic_operation_) return classic_operation_->waitFor(timeout);
 #ifdef USE_TENT
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining =
+            std::chrono::steady_clock::time_point::max() - now;
+        const auto max_timeout =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(remaining);
+        const auto deadline = timeout <= std::chrono::nanoseconds::zero() ? now
+                              : timeout >= max_timeout
+                                  ? std::chrono::steady_clock::time_point::max()
+                                  : now + timeout;
         while (!completed_) {
-            poll();
+            try {
+                poll(deadline);
+            } catch (...) {
+                query_failed_ = true;
+            }
             if (completed_) break;
             if (std::chrono::steady_clock::now() >= deadline) {
-                requestAbort(Status::Clock("scatter transfer wait timed out"));
-                return aggregate_status_;
+                const auto status =
+                    Status::Clock("scatter transfer wait timed out");
+                wait_timed_out_ = true;
+                requestAbort(status);
+                return status;
             }
             std::this_thread::sleep_for(kPollInterval);
         }
@@ -1371,9 +1438,6 @@ class StoreScatterTransferOperation::Impl {
         remember(status);
         if (abort_requested_ || batch_id_ == 0) return;
         abort_requested_ = true;
-        abort_deadline_ = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(GetTentPositiveEnvOrDefault(
-                              "MC_TENT_CANCEL_GRACE_S", 1));
         for (size_t task = 0; task < tent_requests_.size(); ++task) {
             const size_t index = native_indexes_[task];
             if (done_[index]) continue;
@@ -1383,15 +1447,22 @@ class StoreScatterTransferOperation::Impl {
         }
     }
 
-    void forceCleanup() {
-        failPending(Status::Socket("TENT scatter transfer cleanup timed out"));
-        if (batch_id_ != 0) tent_engine_->freeBatch(batch_id_);
-        batch_id_ = 0;
-        finish();
-    }
-
     void build(const std::vector<TransferEngine::ScatterTransferRange>& ranges,
                TransferIntent intent) {
+        size_t fragments = 0;
+        for (const auto& range : ranges) {
+            if (range.local_offsets.size() >
+                std::numeric_limits<size_t>::max() - fragments)
+                throw std::length_error("scatter fragment count overflow");
+            fragments += range.local_offsets.size();
+        }
+        callbacks_.reserve(ranges.size());
+        tent_requests_.reserve(fragments);
+        native_indexes_.reserve(fragments);
+        request_fragments_.reserve(fragments);
+        done_.reserve(fragments);
+        task_statuses_.reserve(fragments);
+        query_failures_.reserve(fragments);
         auto default_intent = ToTentIntent(intent);
         if (!default_intent) {
             aggregate_status_ =
@@ -1509,53 +1580,81 @@ class StoreScatterTransferOperation::Impl {
             finish();
             return;
         }
-        auto status = tent_engine_->submitTransfer(batch_id_, tent_requests_);
-        if (!status.ok()) {
-            failPending(Status::Context(status.ToString()));
-            tent_engine_->freeBatch(batch_id_);
-            batch_id_ = 0;
-            finish();
-            return;
-        }
+        task_statuses_.resize(tent_requests_.size(),
+                              TransferStatusEnum::PENDING);
+        query_failures_.assign(tent_requests_.size(), false);
         remaining_ = tent_requests_.size();
+        try {
+            auto status =
+                tent_engine_->submitTransfer(batch_id_, tent_requests_);
+            if (!status.ok()) {
+                submission_failed_ = true;
+                remember(Status::Context(status.ToString()));
+            }
+        } catch (...) {
+            submission_failed_ = true;
+            // Publish a logical failure without freeing a partially accepted
+            // batch. The owning Impl drains it during unwinding.
+            aggregate_status_ = Status::Context({});
+            throw;
+        }
     }
 
-    void poll() {
-        for (size_t task = 0; task < tent_requests_.size(); ++task) {
-            const size_t index = native_indexes_[task];
-            if (done_[index]) continue;
+    void poll(std::chrono::steady_clock::time_point deadline) {
+        for (size_t task = 0;
+             !submission_failed_ && task < tent_requests_.size(); ++task) {
             tent::TransferStatus transfer_status;
-            auto status = tent_engine_->getTransferStatus(batch_id_, task,
-                                                          transfer_status);
+            const auto status = tent_engine_->getTransferStatus(
+                batch_id_, task, transfer_status);
             if (!status.ok()) {
+                query_failures_[task] = true;
                 requestAbort(Status::Context(status.ToString()));
-                if (!abort_requested_ ||
-                    std::chrono::steady_clock::now() >= abort_deadline_) {
-                    complete(index, Status::Context(status.ToString()));
-                    assert(remaining_ > 0);
-                    --remaining_;
-                }
                 continue;
-            } else {
-                auto state = ToClassicTransferStatus(transfer_status.s);
-                if (!state) {
-                    complete(
-                        index,
-                        Status::Socket("unknown TENT scatter transfer status"));
-                    --remaining_;
-                    continue;
-                }
-                if (*state == TransferStatusEnum::WAITING) continue;
-                complete(index, *state == TransferStatusEnum::COMPLETED
-                                    ? Status::OK()
-                                    : Status::Socket(
-                                          "scatter transfer fragment failed"));
             }
-            assert(remaining_ > 0);
-            --remaining_;
+            const auto state = ToClassicTransferStatus(transfer_status.s);
+            if (!state) {
+                query_failures_[task] = true;
+                requestAbort(Status::Context("unknown native scatter status"));
+                continue;
+            }
+            task_statuses_[task] = *state;
+            if (*state != TransferStatusEnum::WAITING &&
+                *state != TransferStatusEnum::PENDING &&
+                *state != TransferStatusEnum::COMPLETED)
+                requestAbort(
+                    Status::Socket("scatter transfer fragment failed"));
         }
-        if (remaining_ != 0) return;
-        auto status = tent_engine_->freeBatch(batch_id_);
+        bool drained = false;
+        const auto barrier =
+            tent_engine_->getBatchDrainStatus(batch_id_, drained);
+        if (!barrier.ok()) {
+            query_failed_ = true;
+            requestAbort(Status::Context(barrier.ToString()));
+            return;
+        }
+        if (!drained) return;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            remember(
+                Status::Clock("native scatter transfer deadline exceeded"));
+            // No cancellation call after proving drain: it can query logical
+            // status again. Only record the sticky logical failure here.
+            abort_requested_ = true;
+            wait_timed_out_ = true;
+        }
+        // Polling after this barrier could create failover work. Use only
+        // results cached before physical completion was proven.
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const bool success =
+                !submission_failed_ && !query_failed_ &&
+                !query_failures_[task] && !wait_timed_out_ &&
+                task_statuses_[task] == TransferStatusEnum::COMPLETED;
+            complete(native_indexes_[task],
+                     success
+                         ? Status::OK()
+                         : Status::Socket("native scatter transfer failed"));
+        }
+        remaining_ = 0;
+        const auto status = tent_engine_->freeBatch(batch_id_);
         remember(status.ok() ? Status::OK()
                              : Status::Context(status.ToString()));
         batch_id_ = 0;
@@ -1576,8 +1675,11 @@ class StoreScatterTransferOperation::Impl {
     BatchID batch_id_ = 0;
     size_t remaining_ = 0;
     bool abort_requested_ = false;
-    std::chrono::steady_clock::time_point abort_deadline_ =
-        std::chrono::steady_clock::time_point::max();
+    std::vector<TransferStatusEnum> task_statuses_;
+    bool submission_failed_ = false;
+    bool query_failed_ = false;
+    bool wait_timed_out_ = false;
+    std::vector<uint8_t> query_failures_;
 #endif
 };
 
@@ -1616,9 +1718,10 @@ StoreScatterTransferOperation TransferSubmitter::submitNativeScatter(
     TransferIntent intent) {
 #ifdef USE_TENT
     if (tent_engine_) {
-        return StoreScatterTransferOperation(
-            std::make_unique<StoreScatterTransferOperation::Impl>(
-                engine_.getTentEngine(), transfers, intent));
+        auto operation = std::make_unique<StoreScatterTransferOperation::Impl>(
+            engine_.getTentEngine());
+        operation->initialize(transfers, intent);
+        return StoreScatterTransferOperation(std::move(operation));
     }
 #else
     (void)intent;
@@ -1749,83 +1852,70 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
     const size_t operation_count = operations.size();
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
+    TransferFuture future(state);
 
     VLOG(1) << "Memcpy transfer submitted to worker pool with "
             << operation_count << " operations";
 
-    return TransferFuture(state);
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests, TransferIntent intent) {
-    const size_t batch_size = requests.size();
-
-    BatchID batch_id = INVALID_BATCH_ID;
-    Status s;
-
+    auto state = std::make_shared<TransferEngineOperationState>(
+        engine_, INVALID_BATCH_ID, requests.size(), std::move(requests));
 #ifdef USE_TENT
+    std::vector<tent::Request> native_requests;
     if (tent_engine_) {
-        batch_id = tent_engine_->allocateBatch(batch_size);
-        if (batch_id == 0) {
-            LOG(ERROR) << "Failed to allocate batch ID";
-            return std::nullopt;
+        const auto native_intent = ToTentIntent(intent);
+        if (!native_intent) return std::nullopt;
+        native_requests.reserve(state->requests_.size());
+        for (const auto& request : state->requests_) {
+            const auto opcode = ToTentOpCode(request.opcode);
+            if (!opcode) return std::nullopt;
+            tent::Request native;
+            native.opcode = *opcode;
+            native.source = request.source;
+            native.target_id = request.target_id;
+            native.target_offset = request.target_offset;
+            native.length = request.length;
+            native.transport_hint =
+                tent::c_to_transport_hint(request.transport_hint);
+            native.intent_type = *native_intent;
+            native_requests.push_back(native);
         }
-        std::vector<tent::Request> tent_reqs;
-        tent_reqs.reserve(requests.size());
-        auto tent_intent = ToTentIntent(intent);
-        if (!tent_intent) {
-            LOG(ERROR) << "Invalid TENT transfer intent: "
-                       << static_cast<int>(intent);
-            tent_engine_->freeBatch(batch_id);
-            return std::nullopt;
-        }
-        for (auto& r : requests) {
-            auto tent_opcode = ToTentOpCode(r.opcode);
-            if (!tent_opcode) {
-                LOG(ERROR) << "Invalid TENT transfer opcode: "
-                           << static_cast<int>(r.opcode);
-                tent_engine_->freeBatch(batch_id);
-                return std::nullopt;
-            }
-            tent::Request tr;
-            tr.opcode = *tent_opcode;
-            tr.source = r.source;
-            tr.target_id = r.target_id;
-            tr.target_offset = r.target_offset;
-            tr.length = r.length;
-            tr.transport_hint =
-                mooncake::tent::c_to_transport_hint(r.transport_hint);
-            tr.intent_type = *tent_intent;
-            tent_reqs.push_back(tr);
-        }
-        auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
-        if (!tent_status.ok()) {
-            LOG(ERROR) << "Failed to submit all transfers, error: "
-                       << tent_status.ToString();
-            tent_engine_->freeBatch(batch_id);
-            return std::nullopt;
-        }
+        state->batch_id_ = tent_engine_->allocateBatch(state->batch_size_);
     } else
 #endif
     {
-        batch_id = engine_.allocateBatchID(batch_size);
-        if (batch_id == INVALID_BATCH_ID) {
-            LOG(ERROR) << "Failed to allocate batch ID";
-            return std::nullopt;
-        }
-        s = engine_.submitTransfer(batch_id, requests);
-        if (!s.ok()) {
-            LOG(ERROR) << "Failed to submit all transfers, error code is "
-                       << s.code();
-            engine_.freeBatchID(batch_id);
-            return std::nullopt;
-        }
+        state->batch_id_ = engine_.allocateBatchID(state->batch_size_);
     }
-
-    auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
-
-    return TransferFuture(state);
+    if (state->batch_id_ == 0 || state->batch_id_ == INVALID_BATCH_ID)
+        return std::nullopt;
+    TransferFuture future(state);
+    Status status;
+    try {
+#ifdef USE_TENT
+        if (tent_engine_) {
+            const auto result =
+                tent_engine_->submitTransfer(state->batch_id_, native_requests);
+            if (!result.ok()) status = Status::Context(result.ToString());
+        } else
+#endif
+        {
+            status = engine_.submitTransfer(state->batch_id_, state->requests_);
+        }
+    } catch (...) {
+        state->submission_failed_ = true;
+        (void)future.get();
+        throw;
+    }
+    if (!status.ok()) {
+        state->submission_failed_ = true;
+        (void)future.get();
+        return std::nullopt;
+    }
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
@@ -2056,10 +2146,11 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     // Submit memcpy operations to worker pool for async execution
     FilereadTask task(file_path, file_length, slices, state);
     fileread_pool_->submitTask(std::move(task));
+    TransferFuture future(state);
 
     VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;
 
-    return TransferFuture(state);
+    return future;
 }
 
 TransferStrategy TransferSubmitter::selectStrategy(

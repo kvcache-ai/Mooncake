@@ -299,6 +299,17 @@ endif()
 if(WITH_STORE)
   install(TARGETS store LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                                 COMPONENT python)
+  if(BUILD_UNIT_TESTS AND TARGET Mooncake::liburing)
+    add_test(
+      NAME ssd_fixed_l2_python_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env PYTHONPATH=$<TARGET_FILE_DIR:store>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}
+        MOONCAKE_TEST_MASTER=$<TARGET_FILE:mooncake_master>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ssd_fixed_l2_direct.py)
+    set_tests_properties(ssd_fixed_l2_python_test PROPERTIES TIMEOUT 90)
+  endif()
 endif()
 
 if(WITH_TE OR WITH_CONDUCTOR)

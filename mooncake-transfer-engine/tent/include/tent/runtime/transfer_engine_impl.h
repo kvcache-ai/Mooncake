@@ -362,6 +362,8 @@ class TransferEngineImpl {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    Status getBatchDrainStatus(BatchID batch_id, bool& drained);
+
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
@@ -478,6 +480,11 @@ class TransferEngineImpl {
     Status retainBatch(BatchID batch_id, Batch*& batch);
 
     Status releaseBatch(Batch* batch);
+
+    // Proxy cleanup owns a retained child, so its own runtime ref is excluded
+    // while checking device/transport drain. Public callers require refs=0.
+    Status getBatchDrainStatusInternal(BatchID batch_id, bool& drained,
+                                       bool check_runtime_refs);
 
     // Called by ProxyManager when its shutdown drain deadline expires: takes
     // ownership of the batches (and the local stage buffers they target) that

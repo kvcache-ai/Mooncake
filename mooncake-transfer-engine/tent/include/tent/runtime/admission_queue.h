@@ -164,6 +164,11 @@ class LocalTransferAdmissionQueue {
     // their selected transport instead.
     Status cancel(QueueOwnerId owner_id);
 
+    // Exception cleanup only: the runtime must prove that no transport
+    // accepted this owner. Unlike normal cancellation, this also releases an
+    // owner selected for dispatch before its transport call began.
+    void abortUnsubmitted(QueueOwnerId owner_id) noexcept;
+
     Status retireBatch(uint64_t batch_token);
 
     Status resolveOwner(uint64_t batch_token, size_t public_task_id,

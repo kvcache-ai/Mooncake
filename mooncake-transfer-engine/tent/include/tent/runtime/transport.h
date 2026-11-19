@@ -118,6 +118,27 @@ class Transport {
             "getTransferStatus not implemented" LOC_MARK);
     }
 
+    // Poll every physical task, including attempts no longer selected by the
+    // engine after failover. Async transports with a logical timeout or a
+    // completion callback tail must override this with their ownership proof.
+    virtual Status getSubBatchDrainStatus(SubBatchRef batch, bool& drained) {
+        drained = false;
+        if (!batch)
+            return Status::InvalidArgument("Invalid sub-batch" LOC_MARK);
+        for (size_t task_id = 0; task_id < batch->size(); ++task_id) {
+            TransferStatus physical_status{PENDING, 0};
+            CHECK_STATUS(getTransferStatus(batch, task_id, physical_status));
+            // Existing async backends may publish FAILED/CANCELED for a
+            // whole route while an accepted device operation still runs.
+            // Only explicit backend ownership checks may prove failure drain.
+            if (physical_status.s != COMPLETED) {
+                return Status::OK();
+            }
+        }
+        drained = true;
+        return Status::OK();
+    }
+
     virtual Status retryTransferTask(SubBatchRef batch, int task_id,
                                      const Request& request) {
         return Status::NotImplemented(

@@ -31,6 +31,9 @@
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/rdma/rdma_transport.h"
+#include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
 namespace mooncake {
 
@@ -75,6 +78,15 @@ class TransferEngineImplTestPeer {
         deferred.batches = std::move(batches);
         engine.adoptDeferredStageTeardown(std::move(deferred));
     }
+    static tent::Batch* retain(tent::TransferEngineImpl& engine,
+                               tent::BatchID id) {
+        tent::Batch* batch = nullptr;
+        EXPECT_TRUE(engine.retainBatch(id, batch).ok());
+        return batch;
+    }
+    static void release(tent::TransferEngineImpl& engine, tent::Batch* batch) {
+        EXPECT_TRUE(engine.releaseBatch(batch).ok());
+    }
 };
 
 namespace tent {
@@ -107,6 +119,7 @@ class FakeTransport : public Transport {
     std::atomic<int> submit_calls{0};
     std::atomic<int> status_calls{0};
     std::atomic<int> cancel_calls{0};
+    std::atomic<bool> physical_tail_active{false};
     bool cancellation_supported{true};
     bool producer_event_supported{false};
 
@@ -191,6 +204,21 @@ class FakeTransport : public Transport {
         }
         ++cancel_calls;
         fake->statuses[task_id] = {TransferStatusEnum::CANCELED, 0};
+        return Status::OK();
+    }
+
+    Status getSubBatchDrainStatus(SubBatchRef batch, bool& drained) override {
+        drained = false;
+        if (physical_tail_active.load(std::memory_order_acquire))
+            return Status::OK();
+        for (size_t id = 0; id < batch->size(); ++id) {
+            TransferStatus status{PENDING, 0};
+            auto result = getTransferStatus(batch, id, status);
+            if (!result.ok()) return result;
+            if (status.s == PENDING || status.s == INITIAL) return Status::OK();
+        }
+        // This CPU fixture has no device work after a terminal poll result.
+        drained = true;
         return Status::OK();
     }
 
@@ -355,6 +383,180 @@ TEST(RuntimeQueueDispatch, ProducerEventGuardRejectsStagedRoutes) {
                                                           UNSPEC, false));
     EXPECT_FALSE(
         TransferEngineImplTestPeer::eventHonored(engine, request, TCP, false));
+}
+
+TEST(RuntimeQueueDispatch, DrainStatusWaitsForQueuedAndPhysicalOwners) {
+    std::atomic<bool> finish{false};
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<FakeTransport>(RDMA, [&](const Request&, int) {
+        return TransferStatus{finish.load() ? COMPLETED : PENDING, 0};
+    });
+    installFakeRdma(engine, fake);
+    std::vector<uint8_t> buffer(8192, 0x12);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    auto batch = engine.allocateBatch(2);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch, {makeLocalWrite(buffer.data(), 4096),
+                                    makeLocalWrite(buffer.data() + 4096, 4096)})
+            .ok());
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch, drained).ok());
+    EXPECT_FALSE(drained);
+    finish.store(true);
+    TransferStatus status;
+    for (int i = 0; i < 4; ++i)
+        ASSERT_TRUE(engine.getTransferStatus(batch, status).ok());
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, DrainStatusIncludesPriorFailoverSubBatch) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    cfg->set("max_failover_attempts", 1);
+    cfg->set("enable_auto_failover_on_poll", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<FakeTransport>(
+        RDMA, [](const Request&, int) { return TransferStatus{FAILED, 0}; });
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    rdma->physical_tail_active.store(true);
+    installFakeRdma(engine, rdma);
+    std::string segment = engine.getSegmentName();
+    ASSERT_TRUE(tcp->install(segment, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> buffer(4096, 0x12);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    auto batch = engine.allocateBatch(1);
+    auto request = makeLocalWrite(buffer.data(), buffer.size());
+    request.transport_hint = UNSPEC;
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    TransferStatus terminal;
+    for (int attempt = 0; attempt < 4; ++attempt)
+        ASSERT_TRUE(engine.getTransferStatus(batch, terminal).ok());
+    ASSERT_EQ(terminal.s, COMPLETED);
+    EXPECT_EQ(rdma->submit_calls.load(), 1);
+    EXPECT_EQ(tcp->submit_calls.load(), 1);
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch, drained).ok());
+    EXPECT_FALSE(drained);
+    rdma->physical_tail_active.store(false);
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, DrainStatusWaitsForRuntimeReferenceTail) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+    std::vector<uint8_t> buffer(4096, 0x12);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    auto batch = engine.allocateBatch(1);
+    ASSERT_TRUE(engine
+                    .submitTransfer(
+                        batch, {makeLocalWrite(buffer.data(), buffer.size())})
+                    .ok());
+    TransferStatus terminal;
+    ASSERT_TRUE(engine.getTransferStatus(batch, terminal).ok());
+    ASSERT_EQ(terminal.s, COMPLETED);
+    auto* held = ::mooncake::TransferEngineImplTestPeer::retain(engine, batch);
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch, drained).ok());
+    EXPECT_FALSE(drained);
+    ::mooncake::TransferEngineImplTestPeer::release(engine, held);
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch,
+     RdmaDrainStatusRejectsTerminalTaskWithOwedCompletion) {
+    RdmaTransport transport;
+    Transport::SubBatchRef sub_batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(sub_batch, 1).ok());
+    auto* batch = static_cast<RdmaSubBatch*>(sub_batch);
+    auto* task = RdmaTaskStorage::Get().allocate();
+    task->status_word = TIMEOUT;
+    task->num_slices = 1;
+    task->ref();
+    batch->task_list.push_back(task);
+    auto* slice = RdmaSliceStorage::Get().allocate();
+    slice->task = task;
+    slice->word = TIMEOUT;
+    slice->completions_owed.store(1);
+    batch->slice_chain.push_back(slice);
+    bool drained = true;
+    ASSERT_TRUE(transport.getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_FALSE(drained);
+    // The count is paid only after the CQ callback is fully done.
+    slice->completions_owed.store(0);
+    ASSERT_TRUE(transport.getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(transport.freeSubBatch(sub_batch).ok());
+}
+
+TEST(RuntimeQueueDispatch, GenericDrainStatusRejectsUnknownAsyncFailure) {
+    FakeTransport transport(
+        RDMA, [](const Request&, int) { return TransferStatus{FAILED, 0}; });
+    Transport::SubBatchRef sub_batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(sub_batch, 1).ok());
+    uint8_t byte = 0;
+    ASSERT_TRUE(
+        transport.submitTransferTasks(sub_batch, {makeLocalWrite(&byte, 1)})
+            .ok());
+    bool drained = true;
+    ASSERT_TRUE(
+        transport.Transport::getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_FALSE(drained);
+    EXPECT_TRUE(transport.freeSubBatch(sub_batch).ok());
+}
+
+TEST(RuntimeQueueDispatch, TcpDrainStatusUsesLocalCompletionForUnknownWrite) {
+    TcpTransport transport;
+    Transport::SubBatchRef sub_batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(sub_batch, 1).ok());
+    auto* batch = static_cast<TcpSubBatch*>(sub_batch);
+    auto& task = batch->task_list.emplace_back();
+    bool drained = true;
+    ASSERT_TRUE(transport.getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_FALSE(drained);
+    task.non_replayable_failure = true;
+    task.status_word.store(FAILED, std::memory_order_release);
+    ASSERT_TRUE(transport.getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(transport.freeSubBatch(sub_batch).ok());
+}
+
+TEST(RuntimeQueueDispatch, HpTcpDrainStatusUsesLocalCompletionForUnknownWrite) {
+    HighPerformanceTcpTransport transport(HighPerformanceTcpParams{});
+    Transport::SubBatchRef sub_batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(sub_batch, 1).ok());
+    auto* batch = static_cast<HighPerformanceTcpSubBatch*>(sub_batch);
+    auto task = std::make_shared<HighPerformanceTcpTaskState>(
+        0, 0, [](BatchID) {}, HighPerformanceTcpBufferRegistry::Lease{});
+    batch->tasks.push_back(task);
+    bool drained = true;
+    ASSERT_TRUE(transport.getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_FALSE(drained);
+    ASSERT_TRUE(task->completeOnce(FAILED, 0,
+                                   HighPerformanceTcpStatus::kInternalError));
+    ASSERT_TRUE(transport.getSubBatchDrainStatus(sub_batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(transport.freeSubBatch(sub_batch).ok());
 }
 
 TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
@@ -876,23 +1078,16 @@ TEST(RuntimeQueueDispatch, CancelsDispatchedRdmaTaskIdempotently) {
 }
 
 TEST(RuntimeQueueDispatch, RejectsCancellationForUnsupportedTransport) {
+    std::atomic<bool> finish{false};
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    // Keep the task in flight until the cancellation has been judged. The
-    // runtime queue enables the ProgressWorker, which may poll the transport
-    // before this test calls cancelTransfer(); a fake that completes on
-    // submit would then let cancelTransfer() return OK for an already
-    // terminal task instead of reaching the transport capability check.
-    std::atomic<bool> complete{false};
-    auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, [&complete](const Request& request, int) {
-            if (!complete.load()) {
-                return TransferStatus{TransferStatusEnum::PENDING, 0};
-            }
-            return TransferStatus{TransferStatusEnum::COMPLETED,
-                                  request.length};
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [&](const Request& request, int) {
+            return TransferStatus{
+                finish.load(std::memory_order_acquire) ? COMPLETED : PENDING,
+                request.length};
         });
     fake_rdma->cancellation_supported = false;
     installFakeRdma(engine, fake_rdma);
@@ -908,8 +1103,8 @@ TEST(RuntimeQueueDispatch, RejectsCancellationForUnsupportedTransport) {
 
     EXPECT_TRUE(engine.cancelTransfer(batch, 0).IsNotImplemented());
     EXPECT_EQ(fake_rdma->cancel_calls.load(), 0);
+    finish.store(true, std::memory_order_release);
 
-    complete.store(true);
     TransferStatus status{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);

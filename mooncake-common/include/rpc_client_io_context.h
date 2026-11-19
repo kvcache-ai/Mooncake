@@ -55,8 +55,8 @@ std::shared_ptr<coro_io::io_context_pool> CreateRpcClientIoContextPool(
 class RpcDrainGuard {
    private:
     struct State {
-        std::atomic<bool> stopping{false};
-        std::atomic<int> inflight{0};
+        bool stopping{false};
+        int inflight{0};
         std::mutex mutex;
         std::condition_variable cv;
     };
@@ -75,21 +75,18 @@ class RpcDrainGuard {
 
        private:
         static bool try_enter(State& state) {
-            if (state.stopping.load(std::memory_order_acquire)) return false;
-            state.inflight.fetch_add(1, std::memory_order_acq_rel);
-            // a drain that started between the two reads still sees this call
-            if (state.stopping.load(std::memory_order_acquire)) {
-                leave(state);
-                return false;
-            }
+            // Admission and the stop/count snapshot need one ordering. Two
+            // independent acquire/release atomics could both observe the old
+            // values and let drain return while a new call is being admitted.
+            std::lock_guard lock(state.mutex);
+            if (state.stopping) return false;
+            ++state.inflight;
             return true;
         }
 
         static void leave(State& state) {
-            if (state.inflight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                std::lock_guard lk(state.mutex);
-                state.cv.notify_all();
-            }
+            std::lock_guard lock(state.mutex);
+            if (--state.inflight == 0) state.cv.notify_all();
         }
 
         std::shared_ptr<State> state_;
@@ -101,11 +98,10 @@ class RpcDrainGuard {
     // regardless (the registry already does), and the state itself stays
     // valid until the last ScopedCall lets go of it.
     bool drain_for(std::chrono::milliseconds timeout) {
-        state_->stopping.store(true, std::memory_order_release);
         std::unique_lock lk(state_->mutex);
-        return state_->cv.wait_for(lk, timeout, [&] {
-            return state_->inflight.load(std::memory_order_acquire) == 0;
-        });
+        state_->stopping = true;
+        return state_->cv.wait_for(lk, timeout,
+                                   [&] { return state_->inflight == 0; });
     }
 
    private:

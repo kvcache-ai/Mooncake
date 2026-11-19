@@ -29,6 +29,7 @@
 namespace mooncake {
 namespace tent {
 class TransferEngineImpl;
+class Batch;
 class TaskInfo;
 struct StageBufferCache;
 namespace internal {
@@ -38,6 +39,7 @@ class RemoteStageOperation;
 struct StagingTask {
     TaskInfo* native{nullptr};
     BatchID batch{0};
+    Batch* parent{nullptr};
     std::vector<std::string> params;
 };
 
@@ -110,6 +112,7 @@ class ProxyManager {
 
    private:
     struct PendingBufferCleanup {
+        Batch* parent{nullptr};
         std::vector<uint64_t> local_addrs;
         std::vector<std::pair<std::string, uint64_t>> remote_addrs;
         std::vector<BatchID> batches;

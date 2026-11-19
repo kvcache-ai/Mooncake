@@ -288,6 +288,10 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     return impl_->allocateBatchID(batch_size);
 }
 
+Status TransferEngine::getBatchDrainStatus(BatchID batch_id, bool& drained) {
+    return impl_->getBatchDrainStatus(batch_id, drained);
+}
+
 Status TransferEngine::freeBatchID(BatchID batch_id) {
     return impl_->freeBatchID(batch_id);
 }
@@ -972,6 +976,15 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     }
 }
 
+Status TransferEngine::getBatchDrainStatus(BatchID batch_id, bool& drained) {
+    drained = false;
+    if (use_tent_) {
+        auto status = impl_tent_->getBatchDrainStatus(batch_id, drained);
+        return status.ok() ? Status::OK() : Status::Context(status.ToString());
+    }
+    return impl_->getBatchDrainStatus(batch_id, drained);
+}
+
 Status TransferEngine::freeBatchID(BatchID batch_id) {
     if (use_tent_) {
         auto status = impl_tent_->freeBatch(batch_id);
@@ -1454,6 +1467,16 @@ int TransferEngine::getSegmentBuffers(SegmentHandle handle,
     return 0;
 }
 
+void TransferEngine::retainLocalMemory(std::shared_ptr<void> backing) {
+#ifdef USE_TENT
+    if (use_tent_) {
+        impl_tent_->retainLocalMemory(std::move(backing));
+        return;
+    }
+#endif
+    impl_->retainLocalMemory(std::move(backing));
+}
+
 class TransferEngine::ScatterTransferOperation::Impl {
    public:
     struct Backend {
@@ -1463,8 +1486,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
     };
 
-    Impl(TransferEngine& engine, Backend backend,
-         const std::vector<ScatterTransferRange>& ranges)
+    Impl(Backend backend, const std::vector<ScatterTransferRange>& ranges)
         : backend_(std::move(backend)) {
         callbacks_.reserve(ranges.size());
         size_t fragment_count = 0;
@@ -1474,10 +1496,21 @@ class TransferEngine::ScatterTransferOperation::Impl {
         }
         requests_.reserve(fragment_count);
         request_fragments_.reserve(fragment_count);
+        task_statuses_.reserve(fragment_count);
+        query_results_.reserve(fragment_count);
+    }
+
+    void initialize(TransferEngine& engine,
+                    const std::vector<ScatterTransferRange>& ranges) {
         build(engine, ranges);
     }
 
-    ~Impl() { wait(); }
+    ~Impl() {
+        // Pre-submission exceptions may have opened segments, but accepted no
+        // I/O. Initialization runs only after this Impl has an owning pointer.
+        if (batch_id_ == INVALID_BATCH_ID && !completed_) finish();
+        wait();
+    }
 
     Status wait() {
         while (!completed_) {
@@ -1502,8 +1535,15 @@ class TransferEngine::ScatterTransferOperation::Impl {
         while (!completed_) {
             poll();
             if (completed_) break;
-            if (std::chrono::steady_clock::now() >= deadline)
-                return Status::Clock("scatter transfer wait timed out");
+            if (std::chrono::steady_clock::now() >= deadline) {
+                if (!wait_timed_out_) {
+                    wait_timeout_status_ =
+                        Status::Clock("scatter transfer wait timed out");
+                    wait_timed_out_ = true;
+                }
+                requestAbort(wait_timeout_status_);
+                return wait_timeout_status_;
+            }
             std::this_thread::sleep_for(kPollInterval);
         }
         return aggregate_status_;
@@ -1555,8 +1595,24 @@ class TransferEngine::ScatterTransferOperation::Impl {
         return backend_.legacy->freeBatchID(batch_id);
     }
 
+    Status getDrainStatus(BatchID batch_id, bool& drained) {
+#ifdef USE_TENT
+        if (backend_.tent) {
+            auto result = backend_.tent->getBatchDrainStatus(batch_id, drained);
+            return result.ok() ? Status::OK()
+                               : Status::Context(result.ToString());
+        }
+#endif
+        return backend_.legacy->getBatchDrainStatus(batch_id, drained);
+    }
+
     void remember(const Status& status) {
         if (aggregate_status_.ok() && !status.ok()) aggregate_status_ = status;
+    }
+
+    void remember(Status&& status) {
+        if (aggregate_status_.ok() && !status.ok())
+            aggregate_status_ = std::move(status);
     }
 
     Status closeSegments(Status status) {
@@ -1583,6 +1639,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
         request_fragments_.clear();
         done_.clear();
         task_sizes_.clear();
+        task_statuses_.clear();
+        query_results_.clear();
         backend_ = {};
     }
 
@@ -1603,7 +1661,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
         const auto [range_index, fragment_index] =
             request_fragments_[request_index];
         done_[request_index] = true;
-        complete(range_index, fragment_index, status);
+        complete(range_index, fragment_index,
+                 wait_timed_out_ ? wait_timeout_status_ : status);
     }
 
     void failPending(const Status& status) {
@@ -1630,78 +1689,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
     }
 
-    bool legacyBatchPhysicallyDrained() {
-        if (useTent() || batch_id_ == INVALID_BATCH_ID) return false;
-        auto& batch = Transport::toBatchDesc(batch_id_);
-        for (auto& task : batch.task_list) {
-            if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) continue;
-            const auto slice_count =
-                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
-            const auto success_count =
-                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
-            const auto failure_count =
-                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
-            if (legacy_submit_failed_ && slice_count == 0) {
-                __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
-                continue;
-            }
-            if (slice_count == 0 || success_count > slice_count ||
-                failure_count > slice_count - success_count)
-                return false;
-            if (success_count + failure_count != slice_count) return false;
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-            // The completion thread publishes is_finished only after its final
-            // access to the batch. Slice counters can become complete earlier.
-            return false;
-#endif
-        }
-#ifndef USE_EVENT_DRIVEN_COMPLETION
-        for (auto& task : batch.task_list)
-            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
-#endif
-        return true;
-    }
-
-    bool finishDrainedLegacyFailure(const Status& status) {
-        if (!legacyBatchPhysicallyDrained()) return false;
-        remember(status);
-        size_t request_index = 0;
-        for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
-            const size_t request_start = request_index;
-            request_index += task_sizes_[task_id];
-            if (done_[request_start]) continue;
-
-            std::vector<TransferStatusEnum> request_statuses;
-            auto detail_status = backend_.legacy->getScatterRequestStatuses(
-                batch_id_, task_id, request_statuses);
-            if (!detail_status.ok() ||
-                request_statuses.size() != task_sizes_[task_id]) {
-                remember(detail_status.ok()
-                             ? Status::Context(
-                                   "invalid grouped scatter status count")
-                             : detail_status);
-                continue;
-            }
-            for (size_t i = request_start; i < request_index; ++i) {
-                const auto fragment_status =
-                    request_statuses[i - request_start] ==
-                            TransferStatusEnum::COMPLETED
-                        ? Status::OK()
-                        : Status::Socket("scatter transfer fragment failed");
-                completeRequest(i, fragment_status);
-            }
-        }
-        // Fragment callbacks may inspect state associated with the live batch.
-        // Resolve every callback before releasing that batch.
-        failPending(status);
-        auto free_status = freeBatch(batch_id_);
-        if (!free_status.ok() && !free_status.IsBatchCleanupDeferred()) {
-            remember(free_status);
-            return false;
-        }
-        batch_id_ = INVALID_BATCH_ID;
-        finish();
-        return true;
+    void requestAbort(Status&& status) {
+        remember(std::move(status));
+        requestAbort(aggregate_status_);
     }
 
     void build(TransferEngine& engine,
@@ -1797,6 +1787,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
                     .task_group_id = 1,
+                    .require_tcp_write_ack = range.require_tcp_write_ack,
                 };
                 req.intent_type = range.intent_type;
                 requests_.push_back(req);
@@ -1832,10 +1823,19 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 submit_status = Status::InvalidArgument(
                     "failed to allocate TENT scatter transfer batch");
             } else {
-                auto status =
-                    backend_.tent
-                        ->submitTransferRequiringPostSubmitCancellation(
-                            batch_id_, tent_requests_);
+                tent::Status status;
+                try {
+                    status =
+                        backend_.tent
+                            ->submitTransferRequiringPostSubmitCancellation(
+                                batch_id_, tent_requests_);
+                } catch (...) {
+                    submission_threw_ = true;
+                    if (aggregate_status_.ok())
+                        aggregate_status_ = Status::Context({});
+                    status = tent::Status::InvalidArgument(
+                        "scatter submission threw");
+                }
                 if (!status.ok()) {
                     if (status.IsNotImplemented())
                         submit_status =
@@ -1847,10 +1847,39 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
         } else {
             MultiTransport::ScatterSubmission submission;
-            submit_status =
-                backend_.legacy->submitScatter(requests_, submission);
+            bool threw = false;
+            try {
+                submit_status =
+                    backend_.legacy->submitScatter(requests_, submission);
+            } catch (...) {
+                threw = true;
+            }
+            // Capture published state before constructing error messages.
+            // Even an exception here must unwind through an owning Impl that
+            // drains its tasks while their request/source references are live.
             batch_id_ = submission.batch_id;
             task_sizes_ = std::move(submission.task_sizes);
+            remaining_ = task_sizes_.size();
+            if (threw && !submission.dispatch_started) {
+                // No transport was called. A partial task_sizes vector is
+                // preparation metadata, not partially accepted I/O.
+                if (batch_id_ != INVALID_BATCH_ID) {
+                    remember(freeBatch(batch_id_));
+                    batch_id_ = INVALID_BATCH_ID;
+                }
+                failPending(Status::Context("scatter preparation threw"));
+                finish();
+                return;
+            }
+            if (threw) {
+                submission_threw_ = true;
+                // No message allocation: exceptional unwinding must never
+                // deliver an OK fragment callback if the next allocation fails.
+                if (aggregate_status_.ok())
+                    aggregate_status_ = Status::Context({});
+            }
+            if (threw)
+                submit_status = Status::Context("scatter submission threw");
         }
         remaining_ = task_sizes_.size();
         if (batch_id_ == INVALID_BATCH_ID) {
@@ -1866,21 +1895,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
 #ifdef USE_TENT
         if (backend_.tent) {
-            // TENT prepare failures publish no task slots, while committed
-            // submissions publish all slots and report transport failures in
-            // task status. On a live batch, task 0 being out of range thus
-            // identifies the unpublished case.
-            mooncake::tent::TransferStatus status;
-            auto probe = backend_.tent->getTransferStatus(batch_id_, 0, status);
-            if (probe.ok() || !probe.IsInvalidArgument()) {
-                requestAbort(submit_status);
-                return;
-            }
-            remember(submit_status);
-            remember(freeBatch(batch_id_));
-            batch_id_ = INVALID_BATCH_ID;
-            failPending(submit_status);
-            finish();
+            // Even an unpublished batch has a definitive native drain barrier.
+            // A status query error alone cannot establish that no I/O exists.
+            requestAbort(submit_status);
             return;
         }
 #endif
@@ -1897,21 +1914,60 @@ class TransferEngine::ScatterTransferOperation::Impl {
     }
 
     void poll() {
+        // Status polling advances queued TENT work and detects logical errors,
+        // but neither failure nor timeout proves that accepted I/O has stopped.
+        // Preserve requests and caller buffers through physical completion and
+        // the completion callback tail before publishing fragment callbacks.
+        // Capacities were reserved before dispatch; caching query failures must
+        // not allocate another copy of their error message while I/O is live.
+        task_statuses_.resize(task_sizes_.size());
+        query_results_.resize(task_sizes_.size());
+        size_t request_start = 0;
+        for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
+            const bool task_done = done_[request_start];
+            request_start += task_sizes_[task_id];
+            if (task_done) continue;
+            task_statuses_[task_id] = TransferStatusEnum::PENDING;
+            TransferStatus status;
+            auto result = getStatus(batch_id_, task_id, status);
+            if (!result.ok()) {
+                if (query_results_[task_id].ok())
+                    query_results_[task_id] = Status(result.code(), {});
+                requestAbort(std::move(result));
+                continue;
+            }
+            task_statuses_[task_id] = status.s;
+            if (status.s == TransferStatusEnum::TIMEOUT) {
+                requestAbort(
+                    Status::Socket("scatter transfer fragment timed out"));
+            } else if (status.s != TransferStatusEnum::WAITING &&
+                       status.s != TransferStatusEnum::PENDING &&
+                       status.s != TransferStatusEnum::COMPLETED) {
+                requestAbort(
+                    Status::Socket("scatter transfer fragment failed"));
+            }
+        }
+
+        bool drained = false;
+        auto drain_status = getDrainStatus(batch_id_, drained);
+        if (!drain_status.ok()) {
+            requestAbort(std::move(drain_status));
+            return;
+        }
+        if (!drained) return;
+
         size_t request_index = 0;
         for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
             const size_t request_start = request_index;
             request_index += task_sizes_[task_id];
             if (done_[request_start]) continue;
-            TransferStatus status;
-            auto result = getStatus(batch_id_, task_id, status);
-            if (!result.ok()) {
-                requestAbort(result);
-                if (finishDrainedLegacyFailure(result)) return;
-                continue;
-            }
-
-            if (!useTent() && status.s == TransferStatusEnum::FAILED &&
-                task_sizes_[task_id] > 1) {
+            // Detailed classic statuses only inspect the now-drained slice
+            // list. Preserve successful fragments even when the logical query
+            // failed, without polling again and potentially starting failover.
+            const auto status = task_statuses_[task_id];
+            if (!submission_threw_ && !useTent() &&
+                (status != TransferStatusEnum::COMPLETED ||
+                 !query_results_[task_id].ok())) {
                 std::vector<TransferStatusEnum> request_statuses;
                 auto detail_status = backend_.legacy->getScatterRequestStatuses(
                     batch_id_, task_id, request_statuses);
@@ -1937,27 +1993,31 @@ class TransferEngine::ScatterTransferOperation::Impl {
                              : detail_status);
             }
 
-            Status fragment_status;
-            if (status.s == TransferStatusEnum::COMPLETED) {
-                fragment_status = Status::OK();
-            } else if (status.s == TransferStatusEnum::WAITING ||
-                       status.s == TransferStatusEnum::PENDING) {
+            if (!query_results_[task_id].ok()) {
+                for (size_t i = request_start; i < request_index; ++i)
+                    completeRequest(i, aggregate_status_);
+                --remaining_;
                 continue;
-            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+            }
+
+            Status fragment_status;
+            if (status == TransferStatusEnum::COMPLETED) {
+                fragment_status = Status::OK();
+            } else if (status == TransferStatusEnum::WAITING ||
+                       status == TransferStatusEnum::PENDING) {
+                continue;
+            } else if (status == TransferStatusEnum::TIMEOUT) {
                 fragment_status =
                     Status::Socket("scatter transfer fragment timed out");
                 requestAbort(fragment_status);
-                if (!useTent()) {
-                    if (finishDrainedLegacyFailure(fragment_status)) return;
-                    continue;
-                }
             } else {
                 fragment_status =
                     Status::Socket("scatter transfer fragment failed");
             }
             if (!fragment_status.ok()) requestAbort(fragment_status);
             for (size_t i = request_start; i < request_index; ++i)
-                completeRequest(i, fragment_status);
+                completeRequest(
+                    i, submission_threw_ ? aggregate_status_ : fragment_status);
             --remaining_;
         }
         assert(request_index == requests_.size());
@@ -1980,14 +2040,19 @@ class TransferEngine::ScatterTransferOperation::Impl {
     std::unordered_map<std::string, SegmentHandle> segment_handles_;
     std::vector<uint8_t> done_;
     std::vector<size_t> task_sizes_;
+    std::vector<TransferStatusEnum> task_statuses_;
+    std::vector<Status> query_results_;
     BatchID batch_id_ = INVALID_BATCH_ID;
     size_t remaining_ = 0;
     Status aggregate_status_;
+    Status wait_timeout_status_;
     bool abort_requested_ = false;
     // A failed submit with zero slices is unpublished because the Transport
     // contract forbids publishing slices after submitTransferTask() returns.
     bool legacy_submit_failed_ = false;
     bool completed_ = false;
+    bool submission_threw_ = false;
+    bool wait_timed_out_ = false;
 };
 
 TransferEngine::ScatterTransferOperation::ScatterTransferOperation(
@@ -2024,9 +2089,10 @@ TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
     backend.tent = impl_tent_;
 #endif
 
-    return ScatterTransferOperation(
-        std::make_unique<ScatterTransferOperation::Impl>(
-            *this, std::move(backend), ranges));
+    auto operation = std::make_unique<ScatterTransferOperation::Impl>(
+        std::move(backend), ranges);
+    operation->initialize(*this, ranges);
+    return ScatterTransferOperation(std::move(operation));
 }
 
 Status TransferEngine::transferScatter(

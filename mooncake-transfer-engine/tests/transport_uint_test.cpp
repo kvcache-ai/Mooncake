@@ -79,6 +79,12 @@ class ScopedEnvVar {
 
 class TransferEngineImplTestPeer {
    public:
+    static std::shared_ptr<void> holdActualBackend(TransferEngine& engine) {
+#ifdef USE_TENT
+        if (engine.use_tent_) return engine.impl_tent_;
+#endif
+        return engine.impl_;
+    }
     static void replaceTransports(TransferEngineImpl& engine,
                                   std::shared_ptr<Transport> transport) {
         engine.multi_transports_->transport_map_.clear();
@@ -836,6 +842,13 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
         return Status::OK();
     }
 
+    Status getTaskDrainStatus(BatchID, size_t, bool& drained) override {
+        // submitTransferTask finishes every synthetic write synchronously;
+        // these failure results have a physical completion barrier.
+        drained = true;
+        return Status::OK();
+    }
+
     bool supportsGroupedScatter() const override { return true; }
 
     void addExtraSlice() { extra_slice_ = true; }
@@ -845,6 +858,136 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
    private:
     bool extra_slice_ = false;
 };
+
+// Reproduces an exception after transport publication. Pending tasks retain
+// pointers to ScatterTransferOperation's owned request vector until Finish.
+class ThrowingSubmissionTransport : public BatchResultTransport {
+   public:
+    explicit ThrowingSubmissionTransport(size_t published = SIZE_MAX)
+        : published_(published) {}
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        for (auto* task : tasks_) {
+            for (size_t i = 0; i < std::min(task->request_count, published_);
+                 ++i) {
+                auto* slice = new Slice{};
+                slice->task = task;
+                slice->length = task->request[i].length;
+                slice->status = Slice::PENDING;
+                task->slice_list.push_back(slice);
+                __sync_fetch_and_add(&task->slice_count, 1);
+            }
+        }
+        throw std::runtime_error("submission threw after publishing tasks");
+    }
+    bool supportsGroupedScatter() const override { return true; }
+    Status getTransferStatus(BatchID, size_t task_id,
+                             TransferStatus& status) override {
+        status.s = tasks_[task_id]->is_finished ? TransferStatusEnum::COMPLETED
+                                                : TransferStatusEnum::WAITING;
+        return Status::OK();
+    }
+    void Finish(bool read_requests) {
+        for (auto* task : tasks_) {
+            for (size_t i = 0; i < task->slice_list.size(); ++i) {
+                if (read_requests) {
+                    const auto& request = task->request[i];
+                    std::memcpy(reinterpret_cast<void*>(request.target_offset),
+                                request.source, request.length);
+                }
+                task->slice_list[i]->markSuccess();
+            }
+            task->is_finished = true;
+        }
+    }
+    BatchID batch() const { return tasks_.front()->batch_id; }
+
+   private:
+    std::vector<TransferTask*> tasks_;
+    size_t published_;
+};
+
+// A reported terminal status can precede the last access to the caller's
+// buffers. Model that independently of task metadata so RED cleanup remains
+// safe even if Scatter releases a logically failed batch too early.
+class DelayedScatterDrainTransport : public BatchResultTransport {
+   public:
+    explicit DelayedScatterDrainTransport(TransferStatusEnum status,
+                                          bool query_error = false)
+        : status_(status), query_error_(query_error) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) {
+            task->slice_count = 1;
+            for (size_t i = 0; i < task->request_count; ++i)
+                writes_.push_back(task->request[i]);
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = status_.load(std::memory_order_acquire);
+        if (query_error_.load(std::memory_order_acquire))
+            return Status::Context("synthetic status query failure");
+        return Status::OK();
+    }
+
+    Status getTaskDrainStatus(BatchID, size_t, bool& drained) override {
+        drained = drained_.load(std::memory_order_acquire);
+        return Status::OK();
+    }
+
+    void finishWrites(TransferStatusEnum status) {
+        for (const auto& request : writes_)
+            std::memcpy(reinterpret_cast<void*>(request.target_offset),
+                        request.source, request.length);
+        status_.store(status, std::memory_order_release);
+        drained_.store(true, std::memory_order_release);
+    }
+
+    void clearQueryError() {
+        query_error_.store(false, std::memory_order_release);
+    }
+
+   private:
+    std::atomic<TransferStatusEnum> status_;
+    std::atomic<bool> query_error_;
+    std::atomic<bool> drained_{false};
+    std::vector<TransferRequest> writes_;
+};
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+class ScatterCallbackTailTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) {
+            task->slice_count = 1;
+            task->success_slice_count = 1;
+            task->is_finished = true;
+            batch_id_ = task->batch_id;
+        }
+        toBatchDesc(batch_id_).active_completion_callbacks.store(
+            1, std::memory_order_release);
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+
+    void finishCallbackTail() {
+        toBatchDesc(batch_id_).active_completion_callbacks.store(
+            0, std::memory_order_release);
+    }
+
+   private:
+    BatchID batch_id_ = INVALID_BATCH_ID;
+};
+#endif
 
 class TerminalFailureTransport : public BatchResultTransport {
    public:
@@ -946,6 +1089,11 @@ class ScatterDrainProbeTransport : public BatchResultTransport {
         return Status::OK();
     }
 
+    Status getTaskDrainStatus(BatchID, size_t, bool& drained) override {
+        drained = physical_completion_.load(std::memory_order_acquire);
+        return Status::OK();
+    }
+
     bool waitForFirstPoll() {
         std::unique_lock<std::mutex> lock(mutex_);
         return cv_.wait_for(lock, std::chrono::seconds(1),
@@ -954,7 +1102,6 @@ class ScatterDrainProbeTransport : public BatchResultTransport {
 
     void finishPhysicalTransfer(bool success = false) {
         std::lock_guard<std::mutex> lock(mutex_);
-        physical_completion_.store(true);
         for (auto* task : tasks_) {
             if (success) {
                 __atomic_store_n(&task->success_slice_count, task->slice_count,
@@ -969,6 +1116,7 @@ class ScatterDrainProbeTransport : public BatchResultTransport {
             }
             __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
         }
+        physical_completion_.store(true, std::memory_order_release);
     }
 
     void allowTerminalStatus() {
@@ -1001,6 +1149,11 @@ class DeferredEventPublicationTransport : public BatchResultTransport {
         const std::vector<TransferTask*>& tasks) override {
         tasks_ = tasks;
         for (auto* task : tasks_) {
+            // Model a completion callback that already published counters but
+            // still owns BatchDesc access until publishCompletion returns.
+            toBatchDesc(task->batch_id)
+                .active_completion_callbacks.fetch_add(
+                    1, std::memory_order_acq_rel);
             task->slice_count = 1;
             task->success_slice_count = 1;
             auto* slice = new Slice{};
@@ -1017,8 +1170,12 @@ class DeferredEventPublicationTransport : public BatchResultTransport {
     }
 
     void publishCompletion() {
-        for (auto* task : tasks_)
+        for (auto* task : tasks_) {
+            auto& batch = toBatchDesc(task->batch_id);
             __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
+            batch.active_completion_callbacks.fetch_sub(
+                1, std::memory_order_release);  // Last BatchDesc access.
+        }
     }
 
    private:
@@ -1073,6 +1230,17 @@ class GroupedDrainResultTransport : public BatchResultTransport {
 
     Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
         return Status::Context("synthetic grouped status failure");
+    }
+
+    Status getTaskDrainStatus(BatchID batch_id, size_t task_id,
+                              bool& drained) override {
+        const auto& task = toBatchDesc(batch_id).task_list.at(task_id);
+        // This synchronous CPU fixture has no I/O after marking its slices.
+        drained =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE) +
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) ==
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        return Status::OK();
     }
 
     bool supportsGroupedScatter() const override { return true; }
@@ -1241,6 +1409,206 @@ TEST_F(TransportTest, parseHostNameWithPortTest) {
     ASSERT_EQ(res.second, 12001);
 }
 
+TEST_F(TransportTest, DrainStatusRejectsExpiredSliceUntilPhysicalCompletion) {
+    ScopedSliceTimeout timeout(/*timeout_sec=*/1);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto& task = batch.task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    auto* slice = new Transport::Slice();
+    slice->length = 1;
+    slice->status = Transport::Slice::PENDING;
+    slice->task = &task;
+    slice->ts = getCurrentTimeInNano() - 2'000'000'000LL;
+    task.slice_list.push_back(slice);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::TIMEOUT);
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_FALSE(drained);
+    // A logical completion cache must not override the physical counters.
+    task.is_finished = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_FALSE(drained);
+
+    slice->markFailed();
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST_F(TransportTest, DrainStatusRejectsUnknownAsyncFailureCounters) {
+    TimeoutThenFailureTransport async_transport;
+    async_transport.fail();
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto& task = batch.task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    task.failed_slice_count = 1;
+    task.is_finished = true;
+    task.transport_ = &async_transport;
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_FALSE(drained);
+    // The injected transport owns no actual asynchronous writes in this CPU
+    // fixture, so freeing after the assertion is safe for the test itself.
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST_F(TransportTest, DrainStatusWaitsForEveryTaskAfterPartialFailure) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto batch_id = engine.allocateBatchID(2);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (size_t id = 0; id < 2; ++id) {
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        auto* slice = new Transport::Slice();
+        slice->length = 1;
+        slice->task = &task;
+        slice->status = Transport::Slice::PENDING;
+        slice->ts = 0;
+        task.slice_list.push_back(slice);
+    }
+    batch.task_list[0].slice_list[0]->markFailed();
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_FALSE(drained);
+    batch.task_list[1].slice_list[0]->markSuccess();
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST_F(TransportTest, DrainedBatchFreesDespitePermanentLogicalQueryError) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    DelayedScatterDrainTransport transport(TransferStatusEnum::COMPLETED, true);
+    auto batch_id = engine.allocateBatchID(1);
+    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    std::array<char, 1> source{'s'}, destination{};
+    TransferRequest request{
+        .opcode = TransferRequest::WRITE,
+        .source = source.data(),
+        .target_id = 0,
+        .target_offset = reinterpret_cast<uint64_t>(destination.data()),
+        .length = source.size()};
+    task.batch_id = batch_id;
+    task.transport_ = &transport;
+    task.request = &request;
+    ASSERT_TRUE(transport.submitTransferTask({&task}).ok());
+    transport.finishWrites(TransferStatusEnum::COMPLETED);
+    bool drained = false;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    ASSERT_TRUE(drained);
+    auto freed = engine.freeBatchID(batch_id);
+    EXPECT_TRUE(freed.ok());
+    if (!freed.ok()) {
+        // The baseline fails the logical query after physical completion.
+        task.is_finished = true;
+        EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+    }
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, DrainStatusAllowsUnsubmittedUnsealedGroup) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto batch_id = engine.allocateBatchID(1);
+    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    Transport::Slice::unsealTaskSubmission(&task);
+    task.request_count = 2;
+    bool drained = false;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+#endif
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, SliceOwnsCallbackBeforePublishingTerminalCounters) {
+    // Hold the final publication mutex so the callback cannot finish between
+    // the terminal counter observation and the ownership assertion.
+    for (int attempt = 0; attempt < 2048; ++attempt) {
+        Transport::BatchDesc batch;
+        batch.id = reinterpret_cast<BatchID>(&batch);
+        batch.batch_size = 1;
+        batch.task_list.reserve(1);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch.id;
+        task.slice_count = 1;
+        Transport::Slice slice;
+        slice.task = &task;
+        slice.length = 1;
+        std::unique_lock<std::mutex> publication_lock(batch.completion_mutex);
+        std::thread complete([&] { slice.markSuccess(); });
+        while (__atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE) ==
+               0) {
+        }
+        EXPECT_NE(
+            batch.active_completion_callbacks.load(std::memory_order_acquire),
+            0u);
+        publication_lock.unlock();
+        complete.join();
+        EXPECT_EQ(
+            batch.active_completion_callbacks.load(std::memory_order_acquire),
+            0u);
+    }
+}
+
+#endif
+
+TEST_F(TransportTest, DrainStatusWaitsForCompletionCallbackTail) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto& task = batch.task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    task.success_slice_count = 1;
+    task.is_finished = true;
+    batch.active_completion_callbacks.store(1, std::memory_order_release);
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_FALSE(drained);
+    batch.active_completion_callbacks.store(0, std::memory_order_release);
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST_F(TransportTest, DrainStatusRequiresPackedSubmissionSeal) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    const auto batch_id = engine.allocateBatchID(1);
+    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    Transport::Slice::unsealTaskSubmission(&task);
+    Transport::Slice slice;
+    slice.task = &task;
+    slice.length = 1;
+    slice.markSuccess();
+    bool drained = true;
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_FALSE(drained);
+    Transport::Slice::sealTaskSubmission(&task);
+    ASSERT_TRUE(engine.getBatchDrainStatus(batch_id, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
 TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
     ScopedSliceTimeout timeout(/*timeout_sec=*/1);
     std::string server_name = "unit-test-server:1234";
@@ -1333,6 +1701,20 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     }
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
+}
+
+TEST_F(TransportTest, RetainedMemoryOutlivesFacadeAndDiesWithActualBackend) {
+    auto engine = std::make_unique<TransferEngine>(false);
+    ASSERT_EQ(engine->init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+    auto backing = std::make_shared<std::array<char, 4096>>();
+    std::weak_ptr<std::array<char, 4096>> weak = backing;
+    engine->retainLocalMemory(backing);
+    auto backend = TransferEngineImplTestPeer::holdActualBackend(*engine);
+    backing.reset();
+    engine.reset();
+    EXPECT_FALSE(weak.expired());
+    backend.reset();
+    EXPECT_TRUE(weak.expired());
 }
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
@@ -1973,6 +2355,296 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     transport->addExtraSlice();
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
 }
+
+TEST_F(TransportTest,
+       ScatterSubmissionExceptionRetainsPublishedRequestsUntilDrain) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<ThrowingSubmissionTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"throwing", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "throwing";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 32> source, destination{};
+    source.fill('s');
+    std::array<size_t, 2> offsets{0, 16}, lengths{16, 16};
+    size_t callbacks = 0;
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        [&](size_t, const Status&) { ++callbacks; }};
+    std::optional<TransferEngine::ScatterTransferOperation> operation;
+    bool threw = false;
+    try {
+        operation.emplace(engine.submitScatter({range}));
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    EXPECT_FALSE(threw)
+        << "A committed submission must retain an owned operation";
+    if (!operation) {
+        // The RED implementation dropped its request vector. Do not dereference
+        // the dangling request pointers during test cleanup.
+        transport->Finish(false);
+        EXPECT_TRUE(engine.freeBatchID(transport->batch()).ok());
+        return;
+    }
+    EXPECT_TRUE(operation->waitFor(std::chrono::milliseconds(5)).IsClock());
+    EXPECT_EQ(callbacks, 0u);
+    EXPECT_EQ(destination[0], 0);
+    transport->Finish(true);
+    EXPECT_FALSE(operation->wait().ok());
+    EXPECT_EQ(callbacks, 2u);
+    EXPECT_EQ(source, destination);
+}
+
+TEST_F(TransportTest,
+       ScatterSubmissionExceptionNeverPublishesUnsubmittedFragments) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<ThrowingSubmissionTransport>(1);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"throwing", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "throwing";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 32> source, destination{};
+    source.fill('s');
+    std::array<size_t, 2> offsets{0, 16}, lengths{16, 16};
+    std::vector<bool> published;
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        [&](size_t, const Status& status) {
+            published.push_back(status.ok());
+        }};
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(5)).IsClock());
+    transport->Finish(true);
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(published, (std::vector<bool>{false, false}));
+    EXPECT_EQ(destination[0], 's');
+    EXPECT_EQ(destination[16], 0);
+}
+
+TEST_F(TransportTest, ScatterFailureWaitsUntilCallerBufferWritesDrain) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<DelayedScatterDrainTransport>(
+        TransferStatusEnum::FAILED);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"delayed", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "delayed";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 32> source, destination{};
+    source.fill('s');
+    std::array<size_t, 1> offsets{0}, lengths{source.size()};
+    std::vector<bool> published;
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        [&](size_t, const Status& status) {
+            published.push_back(status.ok());
+        }};
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(5)).IsClock());
+    EXPECT_TRUE(published.empty());
+    EXPECT_EQ(destination[0], 0);
+    auto waiter =
+        std::async(std::launch::async, [&] { return operation.wait(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(5)),
+              std::future_status::timeout);
+    transport->finishWrites(TransferStatusEnum::FAILED);
+    EXPECT_FALSE(waiter.get().ok());
+    EXPECT_EQ(published, (std::vector<bool>{false}));
+    EXPECT_EQ(source, destination);
+    destination.fill('r');
+    EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(5)).ok());
+    EXPECT_EQ(destination[0], 'r');
+}
+
+TEST_F(TransportTest, ScatterWaitDeadlineRemainsFailureAfterPhysicalSuccess) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<DelayedScatterDrainTransport>(
+        TransferStatusEnum::WAITING);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"delayed", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "delayed";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 32> source, destination{};
+    source.fill('s');
+    std::array<size_t, 1> offsets{0}, lengths{source.size()};
+    std::vector<bool> callback_timeouts;
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        [&](size_t, const Status& status) {
+            callback_timeouts.push_back(status.IsClock());
+        }};
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(5)).IsClock());
+    EXPECT_TRUE(callback_timeouts.empty());
+    transport->finishWrites(TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(operation.wait().IsClock());
+    EXPECT_EQ(callback_timeouts, (std::vector<bool>{true}));
+    EXPECT_EQ(source, destination);
+}
+
+TEST_F(TransportTest, ScatterStatusQueryFailureReturnsAfterPhysicalDrain) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<DelayedScatterDrainTransport>(
+        TransferStatusEnum::WAITING, /*query_error=*/true);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"delayed", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "delayed";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 32> source, destination{};
+    source.fill('s');
+    std::array<size_t, 1> offsets{0}, lengths{source.size()};
+    std::vector<bool> published;
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        [&](size_t, const Status& status) {
+            published.push_back(status.ok());
+        }};
+    auto operation = engine.submitScatter({range});
+    auto waiter =
+        std::async(std::launch::async, [&] { return operation.wait(); });
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(5)),
+              std::future_status::timeout);
+    transport->finishWrites(TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::ready);
+    // Let the RED implementation leave its permanent status-query loop too.
+    transport->clearQueryError();
+    EXPECT_FALSE(waiter.get().ok());
+    EXPECT_EQ(published, (std::vector<bool>{false}));
+    EXPECT_EQ(source, destination);
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, ScatterWaitRetainsRequestsThroughCompletionCallbackTail) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<ScatterCallbackTailTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"callback-tail", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "callback-tail";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 1> source{}, destination{};
+    std::array<size_t, 1> offsets{0}, lengths{1};
+    size_t callbacks = 0;
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        [&](size_t, const Status&) { ++callbacks; }};
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(5)).IsClock());
+    EXPECT_EQ(callbacks, 0u);
+    transport->finishCallbackTail();
+    EXPECT_TRUE(operation.wait().IsClock());
+    EXPECT_EQ(callbacks, 1u);
+}
+
+TEST_F(TransportTest, ScatterSubmissionExceptionSealsPublishedGroup) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto transport = std::make_shared<ThrowingSubmissionTransport>(1);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"throwing", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "throwing";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+    std::array<char, 2> source{'s', 's'}, destination{};
+    std::array<size_t, 2> offsets{0, 1}, lengths{1, 1};
+    TransferEngine::ScatterTransferRange range{
+        TransferRequest::WRITE,
+        "remote",
+        reinterpret_cast<uint64_t>(destination.data()),
+        destination.size(),
+        source.data(),
+        source.size(),
+        offsets,
+        offsets,
+        lengths,
+        {}};
+    auto operation = engine.submitScatter({range});
+    auto& task = Transport::toBatchDesc(transport->batch()).task_list.front();
+    EXPECT_TRUE((__atomic_load_n(&task.completion_state, __ATOMIC_ACQUIRE) &
+                 Transport::Slice::kCompletionSealBit) != 0);
+    // Baseline leaves the accepted prefix unsealed. End RED safely after
+    // observing it, rather than leaving the operation's destructor waiting.
+    if (!(__atomic_load_n(&task.completion_state, __ATOMIC_ACQUIRE) &
+          Transport::Slice::kCompletionSealBit) != 0)
+        Transport::Slice::sealTaskSubmission(&task);
+    transport->Finish(true);
+    EXPECT_FALSE(operation.wait().ok());
+}
+#endif
 
 // Model the state left by completion events explicitly so these regressions
 // also run in default builds without USE_EVENT_DRIVEN_COMPLETION.

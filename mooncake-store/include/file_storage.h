@@ -13,9 +13,14 @@
 #include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
+#include "ssd_pipeline_io.h"
+#include "ssd_read_protocol.h"
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
+namespace ssd_offload {
+class UringReadExecutor;
+}
 
 struct SsdMetric;
 
@@ -105,6 +110,33 @@ class FileStorage {
         const std::vector<int64_t>& offsets,
         const std::vector<int64_t>& lengths,
         const std::vector<int64_t>& object_sizes);
+
+    struct LocalReadRequest {
+        std::string storage_key;
+        // Size of the complete persisted object, before range selection.
+        uint64_t expected_size{0};
+        uint64_t source_offset{0};
+        std::vector<Slice> destinations;
+    };
+    bool SupportsLocalStreamingRead() const;
+    // Destinations are writable CPU memory, held exclusively through return.
+    // Their sizes select a continuous source range in destination order.
+    // Destinations across the whole batch must not overlap. An I/O error can
+    // partially modify them; publish only after whole-batch success. Every
+    // return drains accepted I/O before releasing staging or source leases.
+    tl::expected<void, ErrorCode> ReadLocalStreaming(
+        const std::vector<LocalReadRequest>& requests);
+
+    bool SupportsOwnerStreamingRead() const;
+    // Trusted owner worker only, after requester grant resolution. The target
+    // maps one-based flat destination ordinals (object/range/destination order)
+    // to authoritative resolved views; planner offsets are relative to a view.
+    // Keep FileStorage alive through return. Preflight errors accept no writes.
+    // A result with dma_drained=false must leave the owner ledger quarantined.
+    tl::expected<ssd_offload::SsdReadResultV1, ErrorCode> ReadOwnerStreaming(
+        const ssd_offload::SsdReadRequestV1& request,
+        std::shared_ptr<ssd_offload::SourceDrainedWriteTarget> target,
+        std::chrono::steady_clock::time_point deadline);
 
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
@@ -396,6 +428,10 @@ class FileStorage {
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
+    std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
+    std::atomic<size_t> active_streaming_sources_{0};
     // A singleflight burst gives every waiter of one batch its own batch id at
     // the same instant, and all of them then register and release that id
     // here. Striping the table by id keeps the resulting convoy off a single

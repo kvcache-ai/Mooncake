@@ -173,43 +173,67 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     }
 
     admitted_owner_ids.reserve(submit.owners.size());
-    for (const auto& owner_input : submit.owners) {
-        const QueueOwnerId owner_id = next_owner_id_++;
-        QueueOwner owner;
-        owner.batch_token = submit.batch_token;
-        owner.request = owner_input.request;
-        owner.kind = owner_input.kind;
-        owner.transport = owner_input.transport;
-        owner.degradation_eligible = owner_input.degradation_eligible;
-        owners_.emplace(owner_id, owner);
+    const auto first_new_owner_id = next_owner_id_;
+    try {
+        for (const auto& owner_input : submit.owners) {
+            const QueueOwnerId owner_id = next_owner_id_++;
+            QueueOwner owner;
+            owner.batch_token = submit.batch_token;
+            owner.request = owner_input.request;
+            owner.kind = owner_input.kind;
+            owner.transport = owner_input.transport;
+            owner.degradation_eligible = owner_input.degradation_eligible;
+            owners_.emplace(owner_id, owner);
 
-        public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
-            owner_id;
-        for (const auto derived_task_id : owner_input.derived_task_ids) {
-            public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
+            public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
+                owner_id;
+            for (const auto derived_task_id : owner_input.derived_task_ids) {
+                public_to_owner_[{submit.batch_token, derived_task_id}] =
+                    owner_id;
+            }
+            // RFC #2519 step 2: keep fifo_ ordered on admission so
+            // pickForDispatch never has to re-sort. Default (deadline_aware ==
+            // false) appends in strict FIFO. When deadline-aware, insert at the
+            // earliest-deadline- first position; upper_bound places a new owner
+            // *after* existing owners with the same deadline, preserving FIFO
+            // order among ties.
+            if (limits_.deadline_aware) {
+                const uint64_t key = deadlineKey(owner.request.deadline_ns);
+                auto pos = std::upper_bound(
+                    fifo_.begin(), fifo_.end(), key,
+                    [this](uint64_t k, QueueOwnerId id) {
+                        auto it = owners_.find(id);
+                        uint64_t d =
+                            (it == owners_.end())
+                                ? std::numeric_limits<uint64_t>::max()
+                                : deadlineKey(it->second.request.deadline_ns);
+                        return k < d;
+                    });
+                fifo_.insert(pos, owner_id);
+            } else {
+                fifo_.push_back(owner_id);
+            }
+            admitted_owner_ids.push_back(owner_id);
         }
-        // RFC #2519 step 2: keep fifo_ ordered on admission so pickForDispatch
-        // never has to re-sort. Default (deadline_aware == false) appends in
-        // strict FIFO. When deadline-aware, insert at the earliest-deadline-
-        // first position; upper_bound places a new owner *after* existing
-        // owners with the same deadline, preserving FIFO order among ties.
-        if (limits_.deadline_aware) {
-            const uint64_t key = deadlineKey(owner.request.deadline_ns);
-            auto pos = std::upper_bound(
-                fifo_.begin(), fifo_.end(), key,
-                [this](uint64_t k, QueueOwnerId id) {
-                    auto it = owners_.find(id);
-                    uint64_t d =
-                        (it == owners_.end())
-                            ? std::numeric_limits<uint64_t>::max()
-                            : deadlineKey(it->second.request.deadline_ns);
-                    return k < d;
-                });
-            fifo_.insert(pos, owner_id);
-        } else {
-            fifo_.push_back(owner_id);
+    } catch (...) {
+        // Accounting is published only below. Remove every partial insertion
+        // without allocating, including an owner whose public aliases or FIFO
+        // insertion threw before it reached admitted_owner_ids.
+        owners_.erase(owners_.lower_bound(first_new_owner_id), owners_.end());
+        for (auto it = public_to_owner_.begin();
+             it != public_to_owner_.end();) {
+            if (it->second >= first_new_owner_id)
+                it = public_to_owner_.erase(it);
+            else
+                ++it;
         }
-        admitted_owner_ids.push_back(owner_id);
+        fifo_.erase(std::remove_if(fifo_.begin(), fifo_.end(),
+                                   [first_new_owner_id](QueueOwnerId id) {
+                                       return id >= first_new_owner_id;
+                                   }),
+                    fifo_.end());
+        admitted_owner_ids.clear();
+        throw;
     }
 
     outstanding_owners_ = next_outstanding_owners;
@@ -243,6 +267,11 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     if (dropped_owner_ids) dropped_owner_ids->clear();
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
+    // After selection starts, each recorded ID owns queue accounting. Reserve
+    // before changing states so allocation failure cannot strand dispatching
+    // owners that the runtime never received.
+    picked.reserve(std::min(max_owners, fifo_.size()));
+    if (dropped_owner_ids) dropped_owner_ids->reserve(fifo_.size());
 
     // RFC #2519 step 2 (opt-in): earliest-deadline-first dispatch. When
     // deadline_aware, fifo_ is kept EDF-ordered at admission time (see
@@ -442,6 +471,23 @@ Status LocalTransferAdmissionQueue::cancel(QueueOwnerId owner_id) {
         outstanding_user_bytes_ -= owner.request.length;
     }
     return Status::OK();
+}
+
+void LocalTransferAdmissionQueue::abortUnsubmitted(
+    QueueOwnerId owner_id) noexcept {
+    auto it = owners_.find(owner_id);
+    if (it == owners_.end() || it->second.state == QueueState::Terminal) return;
+    auto& owner = it->second;
+    if (owner.state == QueueState::Dispatching && owner.degradation_eligible)
+        dispatching_bytes_ -= owner.request.length;
+    owner.state = QueueState::Terminal;
+    owner.terminal_status = FAILED;
+    --outstanding_owners_;
+    outstanding_bytes_ -= owner.request.length;
+    if (owner.kind == QueueOwnerKind::User) {
+        --outstanding_user_owners_;
+        outstanding_user_bytes_ -= owner.request.length;
+    }
 }
 
 Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {

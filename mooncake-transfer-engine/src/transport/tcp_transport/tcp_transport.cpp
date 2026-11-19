@@ -528,6 +528,24 @@ int TcpTransport::unregisterLocalMemoryBatch(
     return first_error ? first_error : metadata_ret;
 }
 
+Status TcpTransport::getTaskDrainStatus(BatchID batch_id, size_t task_id,
+                                        bool& drained) {
+    drained = false;
+    auto& batch = toBatchDesc(batch_id);
+    if (task_id >= batch.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+    TransferStatus status;
+    auto query = getTransferStatus(batch_id, task_id, status);
+    auto& task = batch.task_list[task_id];
+    const auto success =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    const auto failed =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    drained = success + failed ==
+              __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+    return drained ? Status::OK() : query;
+}
+
 Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                        TransferStatus& status) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
@@ -633,6 +651,7 @@ Transport::Slice* TcpTransport::prepareTransfer(
     slice->length = request.length;
     slice->opcode = request.opcode;
     slice->tcp.dest_addr = request.target_offset;
+    slice->tcp.require_write_ack = request.require_tcp_write_ack;
     slice->task = task;
     slice->target_id = request.target_id;
     slice->status = Slice::PENDING;
@@ -778,6 +797,11 @@ void TcpTransport::startTransfer(Slice* slice,
     const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+    if (slice->opcode == TransferRequest::WRITE &&
+        slice->tcp.require_write_ack && !use_v2) {
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
     TcpWorkItem work(slice, use_v2, std::move(continuation));
 
     // Scatter task groups request reuse even when the general pool setting is

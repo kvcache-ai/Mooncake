@@ -2869,9 +2869,11 @@ PYBIND11_MODULE(_store, m) {
             "close",
             [](MooncakeStorePyWrapper &self) {
                 int rc = self.store_ ? self.store_->tearDownAll() : 0;
-                self.store_.reset();
-                self.real_client_.reset();
-                self.use_dummy_client_ = false;
+                if (rc == 0) {
+                    self.store_.reset();
+                    self.real_client_.reset();
+                    self.use_dummy_client_ = false;
+                }
                 return rc;
             },
             "Close the store and clear the native client, including on "
@@ -3196,6 +3198,32 @@ PYBIND11_MODULE(_store, m) {
             "wait for in-flight RDMA/NoF operations, and freeing or remapping "
             "the buffer while a transfer is active is unsafe")
         .def(
+            "get_ssd_push_peer_info",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.store_) return std::string("{}");
+                py::gil_scoped_release release;
+                return self.store_->get_ssd_push_peer_info();
+            },
+            "Get trusted bootstrap metadata for fixed-L2 SSD reads")
+        .def(
+            "configure_ssd_push_peers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &peers) {
+                if (!self.store_) return -1;
+                py::gil_scoped_release release;
+                return self.store_->configure_ssd_push_peers(peers);
+            },
+            py::arg("peer_info_json"),
+            "Configure trusted fixed-L2 SSD peers once during setup")
+        .def(
+            "recover_ssd_push",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.store_) return -1;
+                py::gil_scoped_release release;
+                return self.store_->recover_ssd_push();
+            },
+            "Recover uncertain SSD reads without resubmitting them")
+        .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size) {
@@ -3290,16 +3318,18 @@ PYBIND11_MODULE(_store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes) {
+               const std::vector<size_t> &sizes, int64_t timeout_ms) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes);
+                return self.store_->batch_get_into(keys, buffers, sizes,
+                                                   timeout_ms);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("timeout_ms") = 0,
             "Get object data directly into pre-allocated buffers for "
             "multiple "
             "keys")
@@ -3454,14 +3484,15 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               bool prefer_alloc_in_same_node = false) {
+               bool prefer_alloc_in_same_node = false, int64_t timeout_ms = 0) {
                 py::gil_scoped_release release;
                 return self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
-                    prefer_alloc_in_same_node);
+                    prefer_alloc_in_same_node, timeout_ms);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("prefer_alloc_in_same_node") = false,
+            py::arg("timeout_ms") = 0,
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")

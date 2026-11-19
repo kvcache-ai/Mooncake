@@ -61,7 +61,10 @@ void ProxyManager::flushPendingCleanups(bool unpin_remote_buffers) {
                     ++batch_it;
                     continue;
                 }
-                if (status.s == PENDING) {
+                bool drained = false;
+                auto drain_status = impl_->getBatchDrainStatusInternal(
+                    *batch_it, drained, false);
+                if (!drain_status.ok() || !drained) {
                     ++batch_it;
                     continue;
                 }
@@ -83,6 +86,11 @@ void ProxyManager::flushPendingCleanups(bool unpin_remote_buffers) {
                 }
             }
 
+            if (it->batches.empty() && it->remote_operations.empty() &&
+                it->parent) {
+                batches_to_release.push_back(it->parent);
+                it->parent = nullptr;
+            }
             if (it->local_addrs.empty() && it->remote_addrs.empty() &&
                 it->batches.empty() && it->remote_operations.empty()) {
                 it = pending_cleanups_.erase(it);
@@ -114,6 +122,17 @@ Status ProxyManager::deconstruct() {
             shards_[i].cv.notify_all();
         }
         if (shards_[i].thread.joinable()) shards_[i].thread.join();
+    }
+
+    for (auto& shard : shards_) {
+        while (!shard.queue.empty()) {
+            auto task = shard.queue.front();
+            shard.queue.pop();
+            if (task.native)
+                task.native->staging_status.store(FAILED,
+                                                  std::memory_order_release);
+            if (task.parent) impl_->releaseBatch(task.parent);
+        }
     }
 
     auto has_pending_batches = [this]() {
@@ -148,7 +167,7 @@ Status ProxyManager::deconstruct() {
         has_pending_cleanups_.store(false, std::memory_order_relaxed);
     }
     for (auto& pending : remaining) {
-        if (!pending.batches.empty()) {
+        if (!pending.batches.empty() || pending.parent) {
             // The drain deadline above makes non-terminal batches reachable
             // here. A transport worker may still complete these batches and
             // their slices target the local stage buffers pinned in
@@ -165,6 +184,9 @@ Status ProxyManager::deconstruct() {
             deferred_batches.insert(deferred_batches.end(),
                                     pending.batches.begin(),
                                     pending.batches.end());
+            if (pending.parent)
+                deferred_batches.push_back(
+                    reinterpret_cast<BatchID>(pending.parent));
             deferred_local_addrs.insert(deferred_local_addrs.end(),
                                         pending.local_addrs.begin(),
                                         pending.local_addrs.end());
@@ -332,19 +354,50 @@ Status ProxyManager::waitCrossStage(const Request& request,
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
                             const std::vector<std::string>& params) {
-    StagingTask staging_task;
-    staging_task.native = task;
-    staging_task.batch = batch;
-    staging_task.params = params;
-    task->staging_status.store(PENDING, std::memory_order_relaxed);
-    static std::atomic<size_t> next_queue_index(0);
-    thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
-    {
-        std::lock_guard<std::mutex> lk(shards_[id].mu);
-        shards_[id].queue.push(staging_task);
+    if (!task) return Status::InvalidArgument("Invalid staging task" LOC_MARK);
+    if (!running_.load(std::memory_order_acquire)) {
+        task->staging_status.store(FAILED, std::memory_order_release);
+        return Status::InternalError("Proxy manager is shutting down" LOC_MARK);
     }
-    shards_[id].cv.notify_one();
-    return Status::OK();
+    auto release_parent = [this](Batch* parent) {
+        if (parent) impl_->releaseBatch(parent);
+    };
+    std::unique_ptr<Batch, decltype(release_parent)> parent(nullptr,
+                                                            release_parent);
+    try {
+        StagingTask staging_task;
+        staging_task.native = task;
+        staging_task.batch = batch;
+        staging_task.params = params;
+        if (batch != 0) {
+            auto retained = impl_->retainBatch(batch, staging_task.parent);
+            if (!retained.ok()) {
+                task->staging_status.store(FAILED, std::memory_order_release);
+                return retained;
+            }
+            parent.reset(staging_task.parent);
+        }
+        task->staging_status.store(PENDING, std::memory_order_relaxed);
+        static std::atomic<size_t> next_queue_index(0);
+        thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
+        {
+            std::lock_guard<std::mutex> lock(shards_[id].mu);
+            if (!running_.load(std::memory_order_acquire)) {
+                task->staging_status.store(FAILED, std::memory_order_release);
+                return Status::InternalError(
+                    "Proxy manager is shutting down" LOC_MARK);
+            }
+            shards_[id].queue.push(std::move(staging_task));
+            parent.release();
+        }
+        shards_[id].cv.notify_one();
+        return Status::OK();
+    } catch (...) {
+        // Nothing was published to a worker. Signal a true no-I/O failure
+        // before releasing the parent reference during stack unwinding.
+        task->staging_status.store(FAILED, std::memory_order_release);
+        throw;
+    }
 }
 
 Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
@@ -419,12 +472,17 @@ void ProxyManager::runner(size_t id) {
         {
             std::unique_lock<std::mutex> lk(shard.mu);
             if (shard.queue.empty()) {
-                shard.cv.wait(
-                    lk, [&] { return !running_ || !shard.queue.empty(); });
+                shard.cv.wait_for(lk, std::chrono::milliseconds(20), [&] {
+                    return !running_ || !shard.queue.empty();
+                });
             }
 
             if (!running_) break;
-            if (shard.queue.empty()) continue;
+            if (shard.queue.empty()) {
+                lk.unlock();
+                flushPendingCleanups();
+                continue;
+            }
 
             task = shard.queue.front();
             shard.queue.pop();
@@ -466,12 +524,22 @@ void ProxyManager::runner(size_t id) {
                                       undrained_remote_operations.empty();
             if (!buffers_safe_to_release) waitBeforeNextPoll(drain_polls++);
         }
+        // A pending cleanup can complete on another worker as soon as it is
+        // published. Finish the native TaskInfo access before handing it the
+        // parent's final runtime reference.
+        const bool published_before_handoff =
+            !buffers_safe_to_release && task.parent;
+        if (published_before_handoff)
+            task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
+                                              std::memory_order_release);
         if (buffers_safe_to_release) {
             cache.reset();
         } else {
             LOG(WARNING) << "Staging cleanup could not drain all in-flight "
                             "operations; deferring stage buffer cleanup";
             PendingBufferCleanup pending;
+            pending.parent = task.parent;
+            task.parent = nullptr;
             for (auto& entry : cache.local_stage_buffers) {
                 pending.local_addrs.push_back(entry.second);
             }
@@ -489,11 +557,11 @@ void ProxyManager::runner(size_t id) {
                 has_pending_cleanups_.store(true, std::memory_order_relaxed);
             }
         }
-        if (buffers_safe_to_release) {
+        if (!published_before_handoff)
             task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
                                               std::memory_order_release);
-            impl_->notifyBatchMaybeReady(task.batch);
-        }
+        impl_->notifyBatchMaybeReady(task.batch);
+        if (task.parent) impl_->releaseBatch(task.parent);
     }
 }
 
@@ -575,17 +643,17 @@ Status ProxyManager::transferEventLoop(
     auto drain_batch = [&](BatchID batch) {
         TransferStatus xfer_status;
         auto status = impl_->progressBatch(batch, xfer_status);
+        bool drained = false;
+        if (status.ok())
+            status = impl_->getBatchDrainStatusInternal(batch, drained, false);
         if (!status.ok()) {
-            LOG(ERROR) << "Failed to poll in-flight staging batch: " << status;
-            impl_->freeBatch(batch);
-            return false;
+            LOG(ERROR) << "Failed to drain in-flight staging batch: " << status;
         }
         auto free_status = impl_->freeBatch(batch);
         if (!free_status.ok()) {
-            LOG(WARNING) << "Failed to free drained staging batch: "
-                         << free_status;
+            LOG(WARNING) << "Failed to free staging batch: " << free_status;
         }
-        return xfer_status.s != PENDING;
+        return status.ok() && drained;
     };
     auto cleanup_inflight = [&]() {
         bool all_drained = true;
@@ -600,9 +668,10 @@ Status ProxyManager::transferEventLoop(
                 chunk.batch = 0;
             } else {
                 all_drained = false;
-                if (retain_status.ok() && bptr) {
-                    undrained_batches.push_back(chunk.batch);
-                }
+                // If retaining failed, preserve the unknown ID as well. The
+                // internal proof rejects missing/unowned handles and keeps
+                // the parent pinned instead of guessing that I/O stopped.
+                undrained_batches.push_back(chunk.batch);
             }
         }
         if (!internal::pollRemoteOperations(remote_operations)) {
@@ -751,6 +820,13 @@ Status ProxyManager::transferEventLoop(
                     return status;
                 }
                 if (xfer_status.s == PENDING) {
+                    event_queue.push(id);
+                    break;
+                }
+                bool drained = false;
+                auto drain_status =
+                    impl_->getBatchDrainStatus(chunk.batch, drained);
+                if (!drain_status.ok() || !drained) {
                     event_queue.push(id);
                     break;
                 }

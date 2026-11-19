@@ -146,6 +146,25 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     shm_helper.cpp
     config/shm_spdk_registration_config.cpp
     file_storage.cpp
+    ssd_read_pipeline.cpp
+    ssd_read_source.cpp
+    ssd_pipeline_io.cpp
+    ssd_uring_pipeline.cpp
+    ssd_destination_registry.cpp
+    ssd_destination_registration.cpp
+    ssd_transfer_registration.cpp
+    ssd_transfer_target.cpp
+    ssd_read_protocol.cpp
+    ssd_read_control.cpp
+    ssd_direct_read.cpp
+    ssd_fixed_l2_requester.cpp
+    ssd_direct_runtime.cpp
+    ssd_peer_directory.cpp
+    ssd_control_wire.cpp
+    ssd_control_rpc.cpp
+    ssd_owner_read_worker.cpp
+    ssd_push_requester.cpp
+    ssd_file_storage_owner_reader.cpp
     config/client_host_identity_config.cpp
     ssd_prefetcher.cpp
     config/client_metric_config.cpp

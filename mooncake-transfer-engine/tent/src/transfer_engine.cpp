@@ -185,6 +185,10 @@ Status TransferEngine::getTransferStatus(
     return impl_->getTransferStatus(batch_id, status_list);
 }
 
+Status TransferEngine::getBatchDrainStatus(BatchID batch_id, bool& drained) {
+    return impl_->getBatchDrainStatus(batch_id, drained);
+}
+
 Status TransferEngine::getTransferStatus(BatchID batch_id,
                                          TransferStatus& overall_status) {
     return impl_->getTransferStatus(batch_id, overall_status);

@@ -47,6 +47,9 @@ struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
+namespace ssd_offload {
+class SsdDirectRuntime;
+}
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -125,8 +128,13 @@ class RealClient : public PyClient {
             const ReplicateConfig &config = ReplicateConfig{});
 
     int register_buffer(void *buffer, size_t size);
+    int register_buffers(const std::vector<void *> &buffers,
+                         const std::vector<size_t> &sizes);
 
     int unregister_buffer(void *buffer);
+    std::string get_ssd_push_peer_info() const override;
+    int configure_ssd_push_peers(const std::vector<std::string> &) override;
+    int recover_ssd_push() override;
 
     struct WritableBufferRegion {
         void *base{nullptr};
@@ -177,7 +185,8 @@ class RealClient : public PyClient {
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
-                                        const std::vector<size_t> &sizes);
+                                        const std::vector<size_t> &sizes,
+                                        int64_t timeout_ms = 0);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -199,7 +208,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_alloc_in_same_node);
+        bool prefer_alloc_in_same_node, int64_t timeout_ms = 0);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -719,6 +728,8 @@ class RealClient : public PyClient {
         const std::string &protocol, const std::string &device_name,
         size_t mount_segment_size = 1024 * 1024 * 16);
 
+    tl::expected<void, ErrorCode> register_buffers_internal(
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
     tl::expected<void, ErrorCode> unregister_buffer_internal(void *buffer);
 
     tl::expected<void, ErrorCode> put_internal(
@@ -769,7 +780,8 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        int64_t timeout_ms = 0);
 
     using LocalDiskOffloadObjects =
         std::unordered_map<std::string, std::vector<Slice>>;
@@ -782,14 +794,16 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-        const LocalDiskOffloadReader &local_disk_reader);
+        const LocalDiskOffloadReader &local_disk_reader, int64_t timeout_ms = 0,
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max());
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_alloc_in_same_node);
+        bool prefer_alloc_in_same_node, int64_t timeout_ms = 0);
 
     // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
     // fires one promotion attempt for those keys (best-effort, non-blocking,
@@ -1002,7 +1016,7 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
-        const OffloadReadRange *read_range = nullptr);
+        const OffloadReadRange *read_range = nullptr, int64_t timeout_ms = 0);
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential
@@ -1018,7 +1032,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
-        bool allow_pinned = true,
+        bool allow_pinned = true, bool count_read = true,
         const std::vector<int64_t> *value_offsets = nullptr,
         const std::vector<int64_t> *object_sizes = nullptr);
 
@@ -1189,6 +1203,8 @@ class RealClient : public PyClient {
     std::string local_hostname;
     std::string local_rpc_addr;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
+    std::shared_ptr<ssd_offload::SsdDirectRuntime> ssd_direct_;
+    RpcDrainGuard offload_rpc_drain_;
     int offload_rpc_port_ = 0;
 
     // SSD prefetch (best-effort SSD->DRAM promotion on exist probes). Off
@@ -1257,6 +1273,7 @@ class RealClient : public PyClient {
     // stay mapped until the cleanup retry succeeds (or process exit).
     std::unordered_map<void *, BufferRegistrationRecord>
         registered_buffer_sizes_;
+    std::unordered_set<void *> incomplete_buffer_registrations_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).

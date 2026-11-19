@@ -24,6 +24,9 @@
 
 namespace mooncake {
 
+// Invalid/non-positive MC_TRANSFER_TIMEOUT_SEC values keep the 60s default.
+int64_t GetTransferTimeoutMilliseconds();
+
 /**
  * @brief Transfer strategy enumeration
  */
@@ -248,12 +251,14 @@ class FilereadOperationState : public OperationState {
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+                                 size_t batch_size,
+                                 std::vector<TransferRequest> requests = {})
         : engine_(engine),
           tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
-          start_ts_(getCurrentTimeInMilli()) {}
+          start_ts_(getCurrentTimeInMilli()),
+          requests_(std::move(requests)) {}
 
     ~TransferEngineOperationState();
 
@@ -266,6 +271,7 @@ class TransferEngineOperationState : public OperationState {
     }
 
    private:
+    friend class TransferSubmitter;
     /**
      * @brief Check the current completion status of the task, make sure to lock
      * the mutex before calling this function.
@@ -280,6 +286,12 @@ class TransferEngineOperationState : public OperationState {
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    // Logical outcome only. Deadlines and query failures do not prove drain.
+    bool deadline_exceeded_ = false;
+    bool status_query_failed_ = false;
+    bool submission_failed_ = false;
+    // Classic task descriptors retain request pointers through completion.
+    std::vector<TransferRequest> requests_;
 };
 
 /**
@@ -292,12 +304,14 @@ class TransferEngineOperationState : public OperationState {
 class TransferFuture {
    public:
     explicit TransferFuture(std::shared_ptr<OperationState> state);
+    // Abandoning a handle must not let accepted I/O outlive caller memory.
+    ~TransferFuture();
 
     // Non-copyable but movable
     TransferFuture(const TransferFuture&) = delete;
     TransferFuture& operator=(const TransferFuture&) = delete;
     TransferFuture(TransferFuture&&) = default;
-    TransferFuture& operator=(TransferFuture&&) = default;
+    TransferFuture& operator=(TransferFuture&& other) noexcept;
 
     /**
      * @brief Check if the operation has completed (non-blocking)
@@ -316,6 +330,14 @@ class TransferFuture {
      * @return ErrorCode indicating success or failure
      */
     ErrorCode get();
+
+    /**
+     * Apply a logical deadline and report failure when it expires. Before
+     * returning, drain all work that may still access the caller's buffers;
+     * this may outlast timeout_ms. A non-positive value keeps the default
+     * transfer deadline.
+     */
+    ErrorCode get(int64_t timeout_ms);
 
     /**
      * @brief Get the transfer strategy used by this operation

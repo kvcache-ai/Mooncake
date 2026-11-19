@@ -32,6 +32,8 @@
 #include "embedded_master.h"
 #include "environ.h"
 #include "environment_variables.h"
+#include "ssd_direct_runtime.h"
+#include "offload_read_executor_config.h"
 #include "common/client_buffer_allocation.h"
 #include "common/mmap_aligned.h"
 #include "registered_pinned_memory.h"
@@ -91,7 +93,170 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+// One logical budget covers metadata lookup, every storage tier and all owner
+// groups. It never replaces the physical drain performed by the read itself.
+class ReadDeadline {
+   public:
+    explicit ReadDeadline(int64_t timeout_ms,
+                          std::chrono::steady_clock::time_point inherited =
+                              std::chrono::steady_clock::time_point::max())
+        : deadline_(inherited) {
+        if (inherited != std::chrono::steady_clock::time_point::max() ||
+            timeout_ms <= 0)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto maximum =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::time_point::max() - now)
+                .count();
+        deadline_ =
+            now + std::chrono::milliseconds(std::min(timeout_ms, maximum));
+    }
+    bool Expired() const {
+        return std::chrono::steady_clock::now() >= deadline_;
+    }
+    int64_t RemainingMilliseconds() const {
+        if (deadline_ == std::chrono::steady_clock::time_point::max())
+            return 0;  // Existing default transfer timeout.
+        return std::max<int64_t>(
+            1, std::chrono::duration_cast<std::chrono::milliseconds>(
+                   deadline_ - std::chrono::steady_clock::now())
+                   .count());
+    }
+    auto deadline() const { return deadline_; }
+
+   private:
+    std::chrono::steady_clock::time_point deadline_;
+};
+
+template <class T>
+void RejectLateReadSuccesses(std::vector<tl::expected<T, ErrorCode>> &results,
+                             const ReadDeadline &deadline) {
+    if (deadline.Expired())
+        for (auto &result : results)
+            if (result) result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+}
+
+std::vector<tl::expected<void, ErrorCode>> BatchGetWithinDeadline(
+    Client &client, const std::vector<std::string> &keys,
+    const std::vector<QueryResult> &queries,
+    std::unordered_map<std::string, std::vector<Slice>> &slices,
+    bool prefer_same_node, const ReadDeadline &deadline) {
+    if (deadline.Expired())
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::TRANSFER_FAIL));
+    auto results = client.BatchGet(keys, queries, slices, prefer_same_node,
+                                   deadline.RemainingMilliseconds());
+    RejectLateReadSuccesses(results, deadline);
+    return results;
+}
+
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+bool CanUseLocalStreamingRestore(
+    const FileStorage *storage, const std::string &local_rpc_addr,
+    const std::string &target_rpc_addr,
+    const RealClient::LocalDiskOffloadObjects &objects) {
+    if (!storage || target_rpc_addr != local_rpc_addr ||
+        !storage->SupportsLocalStreamingRead())
+        return false;
+    auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (const auto &[key, slices] : objects)
+        for (const auto &slice : slices)
+            if (slice.size && accelerators.FindDeviceForPointer(slice.ptr))
+                return false;
+    return true;
+}
+
+// SSD restores are blocking and can arrive from every model rank at once.
+// Keep them off the process-wide blocking executor using a dedicated pool
+// with 64 threads by default. An explicit setting can tune the pool within
+// [1, 128]; the pool is created lazily on the first SSD restore.
+coro_io::ExecutorWrapper<> *GetOffloadReadExecutor() {
+    static const std::shared_ptr<coro_io::io_context_pool> pool = [] {
+        const char *value = std::getenv("MOONCAKE_OFFLOAD_READ_IO_THREADS");
+        const auto parsed = detail::ParseOffloadReadIoThreads(value);
+        const auto thread_count =
+            parsed.value_or(detail::kDefaultOffloadReadIoThreads);
+        if (!parsed) {
+            LOG(WARNING) << "Invalid MOONCAKE_OFFLOAD_READ_IO_THREADS='"
+                         << value << "'; using " << thread_count << " threads";
+        }
+        LOG(INFO) << "Using dedicated SSD restore executor with "
+                  << thread_count << " thread(s)";
+        return CreateRpcClientIoContextPool(thread_count);
+    }();
+    // get_executor() performs round-robin selection.  Select on every request
+    // instead of pinning all restores to the first io_context in the pool.
+    return pool->get_executor();
+}
+
+size_t GetOffloadReadConcurrency(size_t endpoint_count) {
+    if (endpoint_count <= 1) return endpoint_count;
+
+    constexpr size_t kDefaultConcurrency = 1;
+    constexpr size_t kMaxConcurrency = 8;
+    const char *raw = std::getenv("MOONCAKE_OFFLOAD_READ_CONCURRENCY");
+    if (!raw) return std::min(endpoint_count, kDefaultConcurrency);
+
+    auto parsed = TryParseInteger<size_t>(raw, {.trim_ascii_whitespace = true});
+    if (!parsed || *parsed == 0) {
+        LOG(WARNING) << "Ignoring invalid MOONCAKE_OFFLOAD_READ_CONCURRENCY='"
+                     << raw << "'; expected an integer in [1, "
+                     << kMaxConcurrency << "]";
+        return std::min(endpoint_count, kDefaultConcurrency);
+    }
+    return std::min({endpoint_count, *parsed, kMaxConcurrency});
+}
+
+template <typename EndpointGroups, typename Reader>
+std::vector<tl::expected<void, ErrorCode>> ReadOffloadEndpoints(
+    EndpointGroups &groups, Reader &&reader) {
+    using Group = typename EndpointGroups::value_type;
+    std::vector<Group *> work;
+    work.reserve(groups.size());
+    for (auto &group : groups) {
+        if (!group.second.empty()) work.push_back(&group);
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(work.size());
+    const size_t concurrency = GetOffloadReadConcurrency(work.size());
+    if (concurrency <= 1) {
+        for (size_t i = 0; i < work.size(); ++i) {
+            results[i] = reader(work[i]->first, work[i]->second);
+        }
+        return results;
+    }
+
+    std::atomic_size_t next{0};
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(concurrency);
+        for (size_t worker = 0; worker < concurrency; ++worker) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const size_t i =
+                        next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= work.size()) break;
+                    try {
+                        results[i] = reader(work[i]->first, work[i]->second);
+                    } catch (const std::exception &error) {
+                        LOG(ERROR) << "SSD endpoint read threw an exception: "
+                                   << error.what();
+                        results[i] =
+                            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    } catch (...) {
+                        LOG(ERROR)
+                            << "SSD endpoint read threw an unknown exception";
+                        results[i] =
+                            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
+                }
+            });
+        }
+    }
+    return results;
+}
 
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -941,6 +1106,25 @@ RealClient::RealClient() : prefetcher_(std::make_unique<SsdPrefetcher>()) {
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
 }
+std::string RealClient::get_ssd_push_peer_info() const {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return "{}";
+    const auto runtime = ssd_direct_;
+    return runtime ? runtime->PeerInfo() : "{}";
+}
+int RealClient::configure_ssd_push_peers(
+    const std::vector<std::string> &peers) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return -1;
+    const auto runtime = ssd_direct_;
+    return runtime ? runtime->ConfigurePeers(peers) : -1;
+}
+int RealClient::recover_ssd_push() {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return -1;
+    const auto runtime = ssd_direct_;
+    return runtime ? runtime->Recover() : -1;
+}
 
 RealClient::~RealClient() {
     // All close paths share the same ordered teardown owner.
@@ -1665,6 +1849,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             });
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (ssd_offload::SsdDirectRuntime::Enabled(client_)) {
+        try {
+            ssd_direct_ = std::make_shared<ssd_offload::SsdDirectRuntime>(
+                client_, file_storage_, local_rpc_addr,
+                getHostNameWithoutPort(local_hostname));
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "SSD direct setup failed: " << error.what();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
     if (enable_ssd_prefetch_) {
         // Prefetch needs the master-facing client for metadata and task
         // registration; local promotion additionally needs file_storage_.
@@ -1947,10 +2141,28 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         prefetcher_->Shutdown();
     }
 
+    {
+        // Registration bookkeeping and runtime import must finish together
+        // before close removes their MRs. Admission keeps client_ alive until
+        // an accepted registration/rollback leaves this critical section.
+        std::unique_lock buffer_lock(registered_buffer_mutex_);
+        if (!incomplete_buffer_registrations_.empty() ||
+            (ssd_direct_ && ssd_direct_->Close() != 0)) {
+            closed_.store(false, std::memory_order_release);
+            return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+        }
+    }
+
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
 
+    // SSD handlers suspend on a separate read executor. Keep their RPC I/O
+    // threads and Client alive until accepted handlers have returned; stopping
+    // only the server does not drain work on that external executor.
+    while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(WARNING) << "Waiting for accepted SSD offload RPCs before teardown";
+    }
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
         offload_rpc_server_.reset();
@@ -4763,7 +4975,8 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
 
 tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     void *buffer, size_t size) {
-    if (!client_) {
+    std::unique_lock buffer_lock(registered_buffer_mutex_);
+    if (closed_.load(std::memory_order_acquire) || !client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -4791,49 +5004,116 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
-    // Gather reads are owner-initiated WRITEs. Publish Store output buffers
-    // on supported classic transports; TE's registration defaults stay intact.
-    auto result = client_->RegisterLocalMemory(
-        buffer, registration_size, kWildcardLocation,
-        client_->SupportsGatherRead(), true);
-    if (!result) {
-        return result;
-    }
-    // #3131: SPDK's RDMA transport keeps its own translation table, which TE
-    // registration does not cover. Register the same (possibly widened) range
-    // as TE; failure is non-fatal (same policy as the shm paths).
-    if (nof_runtime_.initiator) {
-        auto rc =
-            nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
-        if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
-            // The failed page is terminally quarantined (never unregistered,
-            // never munmapped): the buffer must not be freed or remapped.
-            LOG(ERROR) << "NoF memory registration left unconfirmed "
-                          "translation state for buffer "
-                       << buffer << ", size " << registration_size
-                       << "; the affected NoF page is quarantined. Do not "
-                          "free or remap this buffer.";
-        } else if (rc != ErrorCode::OK) {
-            LOG(WARNING) << "NoF memory registration failed for buffer "
-                         << buffer << ", size " << registration_size << ": "
-                         << toString(rc)
-                         << "; buffer stays registered with the transfer "
-                            "engine, but NoF I/O to it will fail. Use "
-                            "hugepage-backed memory for NoF, or set "
-                            "MC_NOF_BACKEND=none if NoF is not intended.";
+    bool fixed_l2 = false;
+    // Allocate both bookkeeping nodes before any MR can become visible. There
+    // must be no throwing map insertion after a successful runtime import.
+    bool bookkeeping = false;
+    bool registration_started = false;
+    bool registered = false;
+    auto rollback = [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+        if (registered) {
+            try {
+                // Only this call's confirmed successful registration may be
+                // removed. A failed import never permits releasing an active
+                // attempt or a registration belonging to another caller.
+                if ((fixed_l2 && ssd_direct_->RevokeFixedPool(buffer) != 0) ||
+                    !client_->unregisterLocalMemory(buffer, true)) {
+                    return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                }
+            } catch (...) {
+                return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            }
         }
+        incomplete_buffer_registrations_.erase(buffer);
+        registered_buffer_sizes_.erase(buffer);
+        return tl::unexpected(error);
+    };
+    try {
+        fixed_l2 = ssd_direct_ && !device::GetAcceleratorRegistry()
+                                       .RuntimeAccelerators()
+                                       .FindDeviceForPointer(buffer);
+        const auto [entry, inserted] = registered_buffer_sizes_.try_emplace(
+            buffer, BufferRegistrationRecord{size});
+        if (!inserted) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        bookkeeping = true;
+        incomplete_buffer_registrations_.insert(buffer);
+        registration_started = true;
+        auto result = client_->RegisterLocalMemory(
+            buffer, registration_size, kWildcardLocation,
+            fixed_l2 || client_->SupportsGatherRead(), true);
+        if (!result) return rollback(result.error());
+        registered = true;
+        if (fixed_l2 && ssd_direct_->ImportFixedPool(buffer, size) != 0)
+            return rollback(ErrorCode::INVALID_PARAMS);
+        // #3131: SPDK's RDMA transport keeps its own translation table, which
+        // TE registration does not cover. Register the same (possibly widened)
+        // range as TE; failure is non-fatal (same policy as the shm paths).
+        if (nof_runtime_.initiator) {
+            auto rc = nof_runtime_.initiator->RegisterMemory(buffer,
+                                                             registration_size);
+            if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // The failed page is terminally quarantined (never
+                // unregistered, never munmapped): the buffer must not be freed
+                // or remapped.
+                LOG(ERROR) << "NoF memory registration left unconfirmed "
+                              "translation state for buffer "
+                           << buffer << ", size " << registration_size
+                           << "; the affected NoF page is quarantined. Do not "
+                              "free or remap this buffer.";
+            } else if (rc != ErrorCode::OK) {
+                LOG(WARNING)
+                    << "NoF memory registration failed for buffer " << buffer
+                    << ", size " << registration_size << ": " << toString(rc)
+                    << "; buffer stays registered with the transfer "
+                       "engine, but NoF I/O to it will fail. Use "
+                       "hugepage-backed memory for NoF, or set "
+                       "MC_NOF_BACKEND=none if NoF is not intended.";
+            }
+        }
+        incomplete_buffer_registrations_.erase(buffer);
+        return {};
+    } catch (...) {
+        if (!bookkeeping) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        if (registration_started && !registered) {
+            // A throwing transport did not confirm whether registration
+            // committed. Retain bookkeeping for explicit unregister/retry;
+            // neither free the pool nor delete a potentially unrelated MR.
+            return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+        }
+        return rollback(ErrorCode::INTERNAL_ERROR);
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        // The record keeps the logical size: writable-region resolution must
-        // not expose the physical segment beyond what the caller registered.
-        registered_buffer_sizes_[buffer] = {size};
-    }
-    return result;
 }
 
 int RealClient::register_buffer(void *buffer, size_t size) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return static_cast<int>(ErrorCode::INVALID_PARAMS);
     return to_py_ret(register_buffer_internal(buffer, size));
+}
+
+tl::expected<void, ErrorCode> RealClient::register_buffers_internal(
+    const std::vector<void *> &buffers, const std::vector<size_t> &sizes) {
+    if (buffers.empty() || buffers.size() != sizes.size())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        const auto result = register_buffer_internal(buffers[i], sizes[i]);
+        if (!result) {
+            bool rollback_failed = false;
+            for (size_t j = 0; j < i; ++j)
+                if (!unregister_buffer_internal(buffers[j]))
+                    rollback_failed = true;
+            if (rollback_failed)
+                return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            return result;
+        }
+    }
+    return {};
+}
+
+int RealClient::register_buffers(const std::vector<void *> &buffers,
+                                 const std::vector<size_t> &sizes) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(register_buffers_internal(buffers, sizes));
 }
 
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
@@ -4842,6 +5122,9 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    if (ssd_direct_ && ssd_direct_->RevokeFixedPool(buffer) != 0)
+        return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
     auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
         auto &hook = TeUnregisterHookForTestingSlot();
         if (hook) {
@@ -4852,7 +5135,6 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
 
     // Record check, NoF cleanup and record erase stay in one critical
     // section (teardown's unregister walk takes the same lock).
-    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
         // Fall through to the NoF cleanup only when TE reports the buffer as
@@ -4889,10 +5171,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     if (rec_it != registered_buffer_sizes_.end()) {
         registered_buffer_sizes_.erase(rec_it);
     }
+    incomplete_buffer_registrations_.erase(buffer);
     return {};
 }
 
 int RealClient::unregister_buffer(void *buffer) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return static_cast<int>(ErrorCode::INVALID_PARAMS);
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
@@ -5021,6 +5306,15 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    const auto address = reinterpret_cast<uintptr_t>(buffer);
+    if (dst_offset > UINTPTR_MAX - address ||
+        size > UINTPTR_MAX - address - dst_offset ||
+        (ssd_direct_ &&
+         ssd_direct_->HasPending(reinterpret_cast<void *>(address + dst_offset),
+                                 size))) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     if (src_offset == 0 && size == total_size) {
         // LOCAL_DISK full-object read: destination buffer is passed
         // directly to SSD RPC (same pattern as single-buffer batch_get_into;
@@ -5032,8 +5326,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             objects.emplace(
                 key, std::vector<Slice>{
                          {static_cast<char *>(buffer) + dst_offset, size}});
-            auto result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            auto result = batch_get_into_offload_object_internal(
+                endpoint, objects, nullptr, 0);
             if (!result) return tl::unexpected(result.error());
             if (verify_checksum) {
                 auto checksum_result = client_->VerifyObjectChecksum(
@@ -5187,9 +5481,16 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         void *dst = static_cast<char *>(buffer) + dst_offset;
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
-        if (can_use_pinned_restore_arena(endpoint, objects)) {
+        if (ssd_direct_ || can_use_pinned_restore_arena(endpoint, objects) ||
+            CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
+                                        endpoint, objects)) {
+            if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const OffloadReadRange read_range{src_offset,
+                                              static_cast<int64_t>(total_size)};
             auto result = batch_get_into_offload_object_internal(
-                endpoint, objects, &read_range);
+                endpoint, objects, &read_range, 0);
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
@@ -5200,7 +5501,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 objects.emplace(key, std::vector<Slice>{
                                          {static_cast<char *>(tmp_buf), size}});
                 return batch_get_into_offload_object_internal(endpoint, objects,
-                                                              &read_range);
+                                                              &read_range, 0);
             },
             size);
     }
@@ -5445,6 +5746,12 @@ RealClient::get_into_ranges_internal(
                                     static_cast<size_t>(metadata.total_size))) {
                                 continue;
                             }
+                            if (ssd_direct_ &&
+                                ssd_direct_->HasPending(
+                                    static_cast<char *>(buffers[i]) +
+                                        dst_offsets[k],
+                                    sizes[k]))
+                                continue;
                             if (metadata.query_result.IsLeaseExpired()) {
                                 range_results[k] =
                                     tl::unexpected(ErrorCode::LEASE_EXPIRED);
@@ -5519,6 +5826,33 @@ RealClient::get_into_ranges_internal(
                 if (inserted)
                     lease_it->second.expires_at =
                         metadata.query_result.lease_timeout;
+                struct Fragments {
+                    std::vector<size_t> offsets, sources, lengths, indices;
+                };
+                std::shared_ptr<Fragments> selected_fragments;
+                if (ssd_direct_) {
+                    selected_fragments = std::make_shared<Fragments>();
+                    for (size_t k = 0; k < sizes.size(); ++k) {
+                        if (dst_offsets[k] > capacities[i] ||
+                            sizes[k] > capacities[i] - dst_offsets[k])
+                            continue;
+                        const auto address =
+                            reinterpret_cast<uintptr_t>(buffers[i]);
+                        if (dst_offsets[k] > UINTPTR_MAX - address ||
+                            sizes[k] > UINTPTR_MAX - address - dst_offsets[k])
+                            continue;
+                        if (ssd_direct_->HasPending(
+                                reinterpret_cast<void *>(address +
+                                                         dst_offsets[k]),
+                                sizes[k]))
+                            continue;
+                        selected_fragments->offsets.push_back(dst_offsets[k]);
+                        selected_fragments->sources.push_back(src_offsets[k]);
+                        selected_fragments->lengths.push_back(sizes[k]);
+                        selected_fragments->indices.push_back(k);
+                    }
+                    if (selected_fragments->indices.empty()) continue;
+                }
                 auto transfer = TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
@@ -5526,13 +5860,26 @@ RealClient::get_into_ranges_internal(
                     .remote_size = handle.size_,
                     .local_buffer = buffers[i],
                     .local_capacity = capacities[i],
-                    .local_offsets = dst_offsets,
-                    .remote_offsets = src_offsets,
-                    .lengths = sizes,
+                    .local_offsets = selected_fragments
+                                         ? std::span<const size_t>(
+                                               selected_fragments->offsets)
+                                         : dst_offsets,
+                    .remote_offsets = selected_fragments
+                                          ? std::span<const size_t>(
+                                                selected_fragments->sources)
+                                          : src_offsets,
+                    .lengths = selected_fragments
+                                   ? std::span<const size_t>(
+                                         selected_fragments->lengths)
+                                   : sizes,
                     .on_fragment_complete =
                         [results = &range_results, sizes = &sizes,
-                         lease = &lease_it->second](size_t k,
-                                                    const Status &status) {
+                         selected_fragments, lease = &lease_it->second](
+                            size_t fragment, const Status &status) {
+                            const auto k =
+                                selected_fragments
+                                    ? selected_fragments->indices[fragment]
+                                    : fragment;
                             const bool expired =
                                 std::chrono::steady_clock::now() >=
                                 lease->expires_at;
@@ -6462,10 +6809,13 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes) {
+    const std::vector<size_t> &sizes, int64_t timeout_ms) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
-            [&]() { return batch_get_into_internal(keys, buffers, sizes); },
+            [&]() {
+                return batch_get_into_internal(keys, buffers, sizes,
+                                               timeout_ms);
+            },
             [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
@@ -6896,7 +7246,9 @@ RealClient::get_into_ranges_shm_helper_impl(
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes) {
+                                    const std::vector<size_t> &sizes,
+                                    int64_t timeout_ms) {
+    const ReadDeadline deadline(timeout_ms);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
@@ -6916,9 +7268,15 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     const auto query_results = client_->BatchQuery(keys);
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
-        });
+        [this, deadline](
+            const std::string &endpoint,
+            LocalDiskOffloadObjects &objects) -> tl::expected<void, ErrorCode> {
+            if (deadline.Expired())
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            return batch_get_into_offload_object_internal(
+                endpoint, objects, nullptr, deadline.RemainingMilliseconds());
+        },
+        timeout_ms, deadline.deadline());
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -6926,7 +7284,9 @@ RealClient::batch_get_into_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes,
     const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-    const LocalDiskOffloadReader &local_disk_reader) {
+    const LocalDiskOffloadReader &local_disk_reader, int64_t timeout_ms,
+    std::chrono::steady_clock::time_point inherited_deadline) {
+    const ReadDeadline deadline(timeout_ms, inherited_deadline);
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -6945,6 +7305,12 @@ RealClient::batch_get_into_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
+    if (ssd_direct_) {
+        for (size_t i = 0; i < buffers.size(); ++i)
+            if (ssd_direct_->HasPending(buffers[i], sizes[i]))
+                return std::vector<tl::expected<int64_t, ErrorCode>>(
+                    keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results(num_keys);
 
@@ -7126,7 +7492,8 @@ RealClient::batch_get_into_internal(
     if (!valid_operations.empty()) {
         // Execute batch transfer
         const auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+            BatchGetWithinDeadline(*client_, batch_keys, batch_query_results,
+                                   batch_slices, false, deadline);
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -7200,8 +7567,9 @@ RealClient::batch_get_into_internal(
         }
 
         if (!disk_batch_keys.empty()) {
-            auto disk_results = client_->BatchGet(
-                disk_batch_keys, disk_batch_qrs, disk_batch_slices);
+            auto disk_results = BatchGetWithinDeadline(
+                *client_, disk_batch_keys, disk_batch_qrs, disk_batch_slices,
+                false, deadline);
 
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
@@ -7271,10 +7639,24 @@ RealClient::batch_get_into_internal(
     [[maybe_unused]] size_t offload_object_count = 0;
     [[maybe_unused]] auto start_read_store_time =
         std::chrono::steady_clock::now();
-    for (auto &offload_objects_it : offload_objects) {
+    for (const auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = local_disk_reader(
-            offload_objects_it.first, offload_objects_it.second);
+    }
+    auto offload_results = ReadOffloadEndpoints(
+        offload_objects,
+        [&](const std::string &endpoint,
+            auto &objects) -> tl::expected<void, ErrorCode> {
+            if (deadline.Expired())
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            auto result = local_disk_reader(endpoint, objects);
+            if (result && deadline.Expired())
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            return result;
+        });
+    size_t endpoint_index = 0;
+    for (auto &offload_objects_it : offload_objects) {
+        const auto &batch_get_offload_result =
+            offload_results[endpoint_index++];
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
@@ -7321,6 +7703,9 @@ RealClient::batch_get_into_internal(
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    // Check after checksum, scatter and duplicate/device copies as well as
+    // the transfer wait. All synchronous copies have drained at this point.
+    RejectLateReadSuccesses(results, deadline);
     return results;
 }
 
@@ -7957,9 +8342,10 @@ void RealClient::execute_session_local_disk_range_reads(
             continue;
         }
 
-        auto restored = restore_offload_objects(
-            endpoint, restore_keys, restore_sizes, {},
-            /*allow_pinned=*/false, &restore_offsets, &object_sizes);
+        auto restored =
+            restore_offload_objects(endpoint, restore_keys, restore_sizes, {},
+                                    /*allow_pinned=*/false, /*count_read=*/true,
+                                    &restore_offsets, &object_sizes);
         if (!restored) {
             for (const auto &key : restore_keys) {
                 for (const auto *request : keys.at(key).key_requests) {
@@ -8688,12 +9074,13 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, int64_t timeout_ms) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
                 return batch_get_into_multi_buffers_internal(
-                    keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
+                    keys, all_buffers, all_sizes, prefer_alloc_in_same_node,
+                    timeout_ms);
             },
             [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -8750,7 +9137,8 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, int64_t timeout_ms) {
+    const ReadDeadline deadline(timeout_ms);
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -9010,10 +9398,23 @@ RealClient::batch_get_into_multi_buffers_internal(
                     .emplace(key, std::move(user_slices));
             }
 
+            auto read_results = ReadOffloadEndpoints(
+                offload_objects,
+                [this, deadline](const std::string &endpoint, auto &objects)
+                    -> tl::expected<void, ErrorCode> {
+                    if (deadline.Expired())
+                        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                    auto result = batch_get_into_offload_object_internal(
+                        endpoint, objects, nullptr,
+                        deadline.RemainingMilliseconds());
+                    if (result && deadline.Expired())
+                        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                    return result;
+                });
+            size_t endpoint_index = 0;
             for (auto &[endpoint, objects] : offload_objects) {
                 if (objects.empty()) continue;
-                auto read_result =
-                    batch_get_into_offload_object_internal(endpoint, objects);
+                const auto &read_result = read_results[endpoint_index++];
                 // On success: results[original_index] was already pre-filled
                 // with total_size when valid_local_disk_ops was built; nothing
                 // to update. Only overwrite on failure.
@@ -9198,6 +9599,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    RejectLateReadSuccesses(results, deadline);
     return results;
 }
 
@@ -9576,7 +9978,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     if (!inflight.ok()) {
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
+    if (!file_storage_ || !client_)
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -9584,6 +9987,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         std::vector<std::string> keys;
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
+        std::chrono::steady_clock::time_point queued_at =
+            std::chrono::steady_clock::now();
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
@@ -9591,7 +9996,31 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->file_storage = file_storage_;
     auto *s = state.get();
     auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+        [s]() {
+            const auto io_started_at = std::chrono::steady_clock::now();
+            const auto queue_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    io_started_at - s->queued_at)
+                    .count();
+            auto result = s->file_storage->BatchGet(s->keys, s->sizes);
+            const auto io_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - io_started_at)
+                    .count();
+            if (queue_us >= 500 || io_us >= 5000) {
+                LOG(INFO) << "action=offload_batch_get_timing keys="
+                          << s->keys.size() << " queue_us=" << queue_us
+                          << " io_us=" << io_us;
+            }
+            return result;
+        },
+        GetOffloadReadExecutor()->get_asio_executor());
+    // post() resumes on the SSD worker. Return to the RPC executor before
+    // dropping the drain guard so server.stop() also drains serialization and
+    // response dispatch after this handler returns.
+    if (co_await async_simple::CurrentExecutor{}) {
+        co_await async_simple::coro::Yield{};
+    }
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -9649,7 +10078,6 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     if (!inflight.ok()) {
         return false;
     }
-
     if (!file_storage_) {
         LOG(WARNING)
             << "release_offload_buffer called but file_storage_ is null";
@@ -9858,7 +10286,8 @@ RealClient::restore_offload_objects(
     const std::vector<std::string> &keys,
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
-    bool allow_pinned, const std::vector<int64_t> *value_offsets,
+    bool allow_pinned, bool count_read,
+    const std::vector<int64_t> *value_offsets,
     const std::vector<int64_t> *object_sizes) {
     if (keys.size() != restore_sizes.size() ||
         (value_offsets != nullptr && value_offsets->size() != keys.size()) ||
@@ -9866,7 +10295,8 @@ RealClient::restore_offload_objects(
         ((value_offsets == nullptr) != (object_sizes == nullptr))) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
+    if (count_read)
+        offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     const auto start_time = std::chrono::steady_clock::now();
     const bool local_batch =
         allow_pinned &&
@@ -9927,14 +10357,25 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
-    const OffloadReadRange *read_range) {
+    const OffloadReadRange *read_range, int64_t timeout_ms) {
+    const ReadDeadline deadline(timeout_ms);
+    if (deadline.Expired()) return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
+    const TenantId tenant_id(client_->tenant_id());
     std::vector<std::string> keys;
+    std::vector<std::string> storage_keys;
+    std::vector<std::string> physical_keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
+        physical_keys.emplace_back(object_it.first);
+        storage_keys.emplace_back(
+            tenant_id.MakeScopedKey(physical_keys.back()));
         uint64_t total = 0;
         for (const auto &slice : object_it.second) {
             if (slice.size > std::numeric_limits<uint64_t>::max() - total) {
@@ -9961,6 +10402,53 @@ RealClient::batch_get_into_offload_object_internal(
         sizes.emplace_back(storage_size);
     }
 
+    if (ssd_direct_ && tenant_id.value() == client_->tenant_id()) {
+        std::vector<ssd_offload::SsdRuntimeObject> direct_objects;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            for (const auto &slice : objects.at(keys[i]))
+                if (ssd_direct_->HasPending(slice.ptr, slice.size))
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            direct_objects.push_back(
+                {physical_keys[i],
+                 read_range ? uint64_t(read_range->object_size)
+                            : uint64_t(sizes[i]),
+                 read_range ? read_range->source_offset : 0,
+                 objects.at(keys[i])});
+        }
+        if (deadline.Expired()) return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        const auto remaining = deadline.RemainingMilliseconds();
+        auto direct = ssd_direct_->Read(
+            target_rpc_service_addr, direct_objects,
+            remaining > 0 ? std::chrono::milliseconds(remaining)
+                          : std::chrono::seconds(60));
+        if (direct) {
+            if (*direct && deadline.Expired())
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            return *direct;
+        }
+    }
+    if (deadline.Expired()) return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+    if (CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
+                                    target_rpc_service_addr, objects)) {
+        std::vector<FileStorage::LocalReadRequest> requests;
+        requests.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i)
+            requests.push_back({storage_keys[i],
+                                read_range ? uint64_t(read_range->object_size)
+                                           : uint64_t(sizes[i]),
+                                read_range ? read_range->source_offset : 0,
+                                objects.at(keys[i])});
+        auto streamed = file_storage_->ReadLocalStreaming(requests);
+        if (streamed && deadline.Expired())
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        if (streamed || streamed.error() != ErrorCode::NO_AVAILABLE_HANDLE)
+            return streamed;
+        // Source/arena admission failed before any destination was
+        // modified. Preserve legacy fallback under resource contention.
+    }
+
+    if (deadline.Expired()) return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+
     std::vector<int64_t> value_offsets;
     std::vector<int64_t> object_sizes;
     const std::vector<int64_t> *offsets_arg = nullptr;
@@ -9972,18 +10460,22 @@ RealClient::batch_get_into_offload_object_internal(
         offsets_arg = &value_offsets;
         object_sizes_arg = &object_sizes;
     }
-    auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
-                                true, offsets_arg, object_sizes_arg);
+    auto restored = restore_offload_objects(
+        target_rpc_service_addr, physical_keys, sizes, objects, true, false,
+        offsets_arg, object_sizes_arg);
     if (!restored) {
         return tl::unexpected(restored.error());
     }
     auto &lease = **restored;
+    if (deadline.Expired()) return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     auto result = client_->BatchGetOffloadObject(
         lease.response().transfer_engine_addr, keys, lease.response().pointers,
         objects,
         lease.local_batch() ? OffloadBufferAccess::kLocalAddress
-                            : OffloadBufferAccess::kTransferEngine);
+                            : OffloadBufferAccess::kTransferEngine,
+        TransferIntent::kForegroundGet, deadline.RemainingMilliseconds());
+    if (result && deadline.Expired())
+        result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
     const auto elapsed_time = lease.ElapsedMs();
     LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
               << elapsed_time

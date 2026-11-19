@@ -217,6 +217,7 @@ class TransferEngine {
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
         int intent_type = 0;
+        bool require_tcp_write_ack = false;
     };
 
     class ScatterTransferOperation {
@@ -236,8 +237,10 @@ class TransferEngine {
         // fragment completion callback.
         Status wait();
 
-        // A wait timeout does not cancel the transfer. Keep this operation and
-        // its CPU/GPU buffers alive until a later wait reaches completion.
+        // A wait timeout records failure and requests cancellation where
+        // supported. Accepted I/O may still run: keep this operation and its
+        // CPU/GPU buffers alive until wait() or destruction physically drains
+        // every task. Pending fragment callbacks then report the timeout.
         Status waitFor(std::chrono::nanoseconds timeout);
 
        private:
@@ -338,6 +341,10 @@ class TransferEngine {
     // split one wake. CompletionNotificationUnsupported when
     // completionFd() is -1.
     Status drainCompletions(std::vector<BatchCompletion>& out);
+    // Nonblocking physical completion check. A logical timeout/failure is not
+    // drain proof. The caller must keep batch_id valid and stop submitting to
+    // it while using this check as a buffer-lifetime barrier.
+    Status getBatchDrainStatus(BatchID batch_id, bool& drained);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
@@ -370,6 +377,12 @@ class TransferEngine {
     int syncSegmentCache(const std::string& segment_name = "");
 
     std::shared_ptr<TransferMetadata> getMetadata();
+
+    // Pin an allocation until the actual transport backend is destroyed,
+    // including operations that outlive this facade. Call before registering
+    // memory whose owner may close while remote accesses are still possible.
+    // The backing must not itself own this engine (that would form a cycle).
+    void retainLocalMemory(std::shared_ptr<void> backing);
 
     bool checkOverlap(void* addr, uint64_t length);
 

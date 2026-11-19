@@ -85,7 +85,8 @@ class DummyClient : public PyClient {
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
-                                        const std::vector<size_t> &sizes);
+                                        const std::vector<size_t> &sizes,
+                                        int64_t timeout_ms = 0);
 
     std::vector<int64_t> batch_get_into_cuda_ipc(
         const std::vector<CudaIpcReadRequest> &requests);
@@ -94,7 +95,7 @@ class DummyClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_alloc_in_same_node);
+        bool prefer_alloc_in_same_node, int64_t timeout_ms = 0);
 
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});

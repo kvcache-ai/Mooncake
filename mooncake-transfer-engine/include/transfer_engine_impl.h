@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -224,6 +225,10 @@ class TransferEngineImpl {
         return multi_transports_->allocateBatchID(batch_size);
     }
 
+    Status getBatchDrainStatus(BatchID batch_id, bool& drained) {
+        return multi_transports_->getBatchDrainStatus(batch_id, drained);
+    }
+
     Status freeBatchID(BatchID batch_id) {
         return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
             // BatchID is pointer-derived. Remove side-table state before the
@@ -420,6 +425,11 @@ class TransferEngineImpl {
 
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
+    void retainLocalMemory(std::shared_ptr<void> backing) {
+        std::lock_guard lock(retained_memory_mutex_);
+        retained_memory_.push_back(std::move(backing));
+    }
+
     bool checkOverlap(void* addr, uint64_t length);
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -500,6 +510,10 @@ class TransferEngineImpl {
 
     void clearSkipRegistrationLocked(void* addr);
 
+    // Declaration order matters: transports and their in-flight operations
+    // must be destroyed before releasing their registered memory backing.
+    std::vector<std::shared_ptr<void>> retained_memory_;
+    std::mutex retained_memory_mutex_;
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;

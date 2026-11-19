@@ -2811,8 +2811,19 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             // Transport::submitTransferTasks() calls, which are counted where
             // they recurse through the non-staging path below. Only stamp the
             // logical request's first post time for stage decomposition here.
-            auto status = staging_proxy_->submit(&task, (BatchID)batch,
-                                                 owner.staging_params);
+            Status status;
+            try {
+                status = staging_proxy_->submit(&task, (BatchID)batch,
+                                                owner.staging_params);
+            } catch (...) {
+                // ProxyManager publishes the queue entry only after all
+                // throwing preparation completes. A throwing submit did not
+                // accept the task or retain its parent batch.
+                task.staging = false;
+                task.status = FAILED;
+                task.staging_status.store(FAILED, std::memory_order_release);
+                throw;
+            }
             if (!status.ok()) {
                 task.staging = false;
                 task.type = UNSPEC;
@@ -3015,14 +3026,12 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         submit.owners.push_back(std::move(input));
     }
 
-    std::vector<QueueOwnerId> admitted_owner_ids;
-    CHECK_STATUS(runtime_queue_->tryAdmit(submit, admitted_owner_ids));
-    batch->queue_token = batch_token;
-
-    batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
-                            TaskInfo{});
+    // Complete all throwing task/alias preparation before admission can
+    // become visible to the dispatcher.
+    const size_t start_task_id = batch->task_list.size();
+    std::vector<TaskInfo> tasks(prepared.tasks.size());
     for (const auto& task_plan : prepared.tasks) {
-        auto& task = batch->task_list[task_plan.task_id];
+        auto& task = tasks[task_plan.task_id - start_task_id];
         const auto& owner = prepared.owners[task_plan.merged_task_index];
         task.failover_count = 0;
         task.xport_priority = 0;
@@ -3039,24 +3048,49 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.derived = task_plan.task_id != owner.owner_task_id;
     }
 
-    if (owner_kind == QueueOwnerKind::User) {
-        for (const auto& owner : prepared.owners) {
-            startLogicalRequestObservability(
-                batch->task_list[owner.owner_task_id]);
-        }
-    }
-
-    for (size_t i = 0; i < admitted_owner_ids.size(); ++i) {
+    std::vector<QueuedOwnerState> queued_states;
+    queued_states.reserve(prepared.owners.size());
+    for (const auto& owner : prepared.owners) {
         QueuedOwnerState queued;
         queued.batch = batch;
-        queued.owner_task_id = prepared.owners[i].owner_task_id;
-        queued.byte_charge = prepared.owners[i].request.length;
-        queued.public_task_ids.push_back(prepared.owners[i].owner_task_id);
-        queued.public_task_ids.insert(
-            queued.public_task_ids.end(),
-            prepared.owners[i].derived_task_ids.begin(),
-            prepared.owners[i].derived_task_ids.end());
-        queued_owners_.emplace(admitted_owner_ids[i], queued);
+        queued.owner_task_id = owner.owner_task_id;
+        queued.byte_charge = owner.request.length;
+        queued.public_task_ids.push_back(owner.owner_task_id);
+        queued.public_task_ids.insert(queued.public_task_ids.end(),
+                                      owner.derived_task_ids.begin(),
+                                      owner.derived_task_ids.end());
+        queued_states.push_back(std::move(queued));
+    }
+
+    std::vector<QueueOwnerId> admitted_owner_ids;
+    CHECK_STATUS(runtime_queue_->tryAdmit(submit, admitted_owner_ids));
+    batch->queue_token = batch_token;
+    try {
+        // allocateBatch reserved max_size slots; TaskInfo moves do not throw.
+        batch->task_list.insert(batch->task_list.end(),
+                                std::make_move_iterator(tasks.begin()),
+                                std::make_move_iterator(tasks.end()));
+        for (size_t i = 0; i < admitted_owner_ids.size(); ++i) {
+            queued_owners_.emplace(admitted_owner_ids[i],
+                                   std::move(queued_states[i]));
+        }
+    } catch (...) {
+        // progress_mutex_ still excludes every dispatcher. None of these
+        // owners reached a transport, including partially inserted metadata.
+        for (const auto owner_id : admitted_owner_ids) {
+            runtime_queue_->abortUnsubmitted(owner_id);
+            queued_owners_.erase(owner_id);
+        }
+        for (size_t id = start_task_id; id < batch->task_list.size(); ++id) {
+            batch->task_list[id].status = FAILED;
+            batch->task_list[id].suppress_failover = true;
+        }
+        throw;
+    }
+    if (owner_kind == QueueOwnerKind::User) {
+        for (const auto& owner : prepared.owners)
+            startLogicalRequestObservability(
+                batch->task_list[owner.owner_task_id]);
     }
     return Status::OK();
 }
@@ -3232,8 +3266,15 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             // Orchestration only; the real transport submissions issued by
             // ProxyManager are counted where they recurse through the
             // non-staging path below.
-            auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
+            Status status;
+            try {
+                status = staging_proxy_->submit(&task, (BatchID)batch,
+                                                staging_params);
+            } catch (...) {
+                task.staging = false;
+                task.staging_status.store(FAILED, std::memory_order_release);
+                throw;
+            }
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
             task.post_time = std::chrono::steady_clock::now();
             return markQueuedOwnerSubmitted(owner_id);
@@ -3303,8 +3344,49 @@ Status TransferEngineImpl::refillDispatchWindow() {
                        << " could not be settled: " << status.ToString();
         }
     }
-    for (const auto owner_id : picked) {
-        CHECK_STATUS(dispatchQueuedOwner(owner_id));
+    for (size_t index = 0; index < picked.size(); ++index) {
+        try {
+            CHECK_STATUS(dispatchQueuedOwner(picked[index]));
+        } catch (...) {
+            // The current transport may have accepted work before throwing.
+            // Later selected owners have not been dispatched at all. Settle
+            // each case without allocations or further transport submissions.
+            for (size_t failed_index = index; failed_index < picked.size();
+                 ++failed_index) {
+                const auto owner_id = picked[failed_index];
+                auto it = queued_owners_.find(owner_id);
+                if (it == queued_owners_.end()) continue;
+                auto& queued = it->second;
+                auto* batch = queued.batch;
+                auto& task = batch->task_list[queued.owner_task_id];
+                task.suppress_failover = true;
+                auto* physical = batch->sub_batch[task.type];
+                const bool accepted =
+                    failed_index == index &&
+                    (task.staging || (physical && task.sub_task_id >= 0 &&
+                                      static_cast<size_t>(task.sub_task_id) <
+                                          physical->size()));
+                if (accepted) {
+                    if (!queued.in_dispatch_window) {
+                        queued.in_dispatch_window = true;
+                        ++dispatch_inflight_owners_;
+                        dispatch_inflight_bytes_ += queued.byte_charge;
+                    }
+                    continue;
+                }
+                runtime_queue_->abortUnsubmitted(owner_id);
+                for (const auto task_id : queued.public_task_ids) {
+                    auto& unpublished = batch->task_list[task_id];
+                    unpublished.status = FAILED;
+                    unpublished.type = UNSPEC;
+                    unpublished.sub_task_id = -1;
+                    unpublished.staging = false;
+                    unpublished.suppress_failover = true;
+                }
+                queued_owners_.erase(it);
+            }
+            throw;
+        }
     }
     return Status::OK();
 }
@@ -3380,28 +3462,83 @@ Status TransferEngineImpl::submitTransfer(
         // Queue mode uses the global progress lock; direct mode uses its shard.
         std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
         const size_t start_task_id = batch_ref.get()->task_list.size();
-        PreparedSubmit prepared;
-        CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
-                                   require_post_submit_cancellation));
+        bool queued_submit = false;
+        try {
+            PreparedSubmit prepared;
+            CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
+                                       require_post_submit_cancellation));
 
-        if (shouldQueueSubmit(prepared, owner_kind)) {
-            CHECK_STATUS(
-                enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
-            auto dispatch_status = refillDispatchWindow();
-            if (!dispatch_status.ok()) {
-                LOG(WARNING)
-                    << "runtime queue dispatch failed after admission: "
-                    << dispatch_status.ToString();
+            queued_submit = shouldQueueSubmit(prepared, owner_kind);
+            if (queued_submit) {
+                CHECK_STATUS(enqueuePreparedSubmit(batch_ref.get(), prepared,
+                                                   owner_kind));
+                auto dispatch_status = refillDispatchWindow();
+                if (!dispatch_status.ok()) {
+                    LOG(WARNING)
+                        << "runtime queue dispatch failed after admission: "
+                        << dispatch_status.ToString();
+                }
+                notifyRuntimeQueueReady();
+            } else {
+                CHECK_STATUS(commitPreparedSubmit(batch_ref.get(), prepared,
+                                                  owner_kind));
             }
-            notifyRuntimeQueueReady();
-        } else {
-            CHECK_STATUS(
-                commitPreparedSubmit(batch_ref.get(), prepared, owner_kind));
-        }
 
-        if (notifi) {
-            addSubmitHook(batch_ref.get(), start_task_id, request_list,
-                          *notifi);
+            if (notifi) {
+                addSubmitHook(batch_ref.get(), start_task_id, request_list,
+                              *notifi);
+            }
+        } catch (...) {
+            std::lock_guard<std::recursive_mutex> lock(
+                progressLockFor(batch_id));
+            if (queued_submit) {
+                for (auto it = queued_owners_.begin();
+                     it != queued_owners_.end();) {
+                    auto& queued = it->second;
+                    if (queued.batch != batch ||
+                        queued.owner_task_id < start_task_id) {
+                        ++it;
+                        continue;
+                    }
+                    auto& task = batch->task_list[queued.owner_task_id];
+                    task.suppress_failover = true;
+                    auto* physical = batch->sub_batch[task.type];
+                    if (task.staging || (physical && task.sub_task_id >= 0 &&
+                                         static_cast<size_t>(task.sub_task_id) <
+                                             physical->size())) {
+                        ++it;
+                        continue;
+                    }
+                    // This owner is still queued or was selected without
+                    // reaching its transport. Prevent every later dispatcher
+                    // from posting it.
+                    runtime_queue_->abortUnsubmitted(it->first);
+                    for (const auto task_id : queued.public_task_ids) {
+                        batch->task_list[task_id].status = FAILED;
+                    }
+                    it = queued_owners_.erase(it);
+                }
+            }
+            for (size_t task_id = start_task_id;
+                 task_id < batch->task_list.size(); ++task_id) {
+                auto& task = batch->task_list[task_id];
+                task.suppress_failover = true;
+                if (task.staging) continue;
+                const auto* physical = batch->sub_batch[task.type];
+                if (physical && task.sub_task_id >= 0 &&
+                    static_cast<size_t>(task.sub_task_id) < physical->size()) {
+                    // A transport may throw after accepting a prefix. Keep that
+                    // prefix pollable and its physical sub-batch retained.
+                    continue;
+                }
+                // No physical slot exists for this newly appended task. It
+                // cannot write the caller's buffer, and must not remain
+                // PENDING.
+                task.status = FAILED;
+                task.type = UNSPEC;
+                task.sub_task_id = -1;
+            }
+            throw;
         }
     }
     // releaseBatch may sweep deferred frees under progress_mutex_. Drop the
@@ -3716,9 +3853,9 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (!transport || !sub_batch) {
         return Status::InvalidArgument("Transport not available" LOC_MARK);
     }
-    // HP TCP classifies transport errors using the terminal output. Other
-    // transports retain their existing error-output contract.
-    if (task.type == HP_TCP) task_status = {PENDING, 0};
+    // TCP error classification inspects terminal output even after a query
+    // fails. A backend may return an error without writing that output.
+    if (task.type == TCP || task.type == HP_TCP) task_status = {PENDING, 0};
     Status result =
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
     if (task.type == TCP && task_status.s == FAILED &&
@@ -3734,8 +3871,8 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
 
     if (result.IsNeedsRefreshCache()) {
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-        if (task.metadata_refresh_retry_count >=
-            kMaxHpTcpMetadataRefreshRetries) {
+        if (task.suppress_failover || task.metadata_refresh_retry_count >=
+                                          kMaxHpTcpMetadataRefreshRetries) {
             task.suppress_failover = true;
             return Status::OK();
         }
@@ -4060,6 +4197,88 @@ Status TransferEngineImpl::getTransferStatus(
         CHECK_STATUS(getTransferStatus(batch_id, task_id, task_status));
         status_list.push_back(task_status);
     }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::getBatchDrainStatus(BatchID batch_id,
+                                               bool& drained) {
+    return getBatchDrainStatusInternal(batch_id, drained, true);
+}
+
+Status TransferEngineImpl::getBatchDrainStatusInternal(
+    BatchID batch_id, bool& drained, bool check_runtime_refs) {
+    drained = false;
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lock(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    auto* batch = reinterpret_cast<Batch*>(batch_id);
+    if (check_runtime_refs) {
+        if (batch->free_requested)
+            return Status::InvalidArgument("Batch is being freed" LOC_MARK);
+        if (batch->runtime_refs != 0) return Status::OK();
+    } else if (batch->runtime_refs == 0) {
+        return Status::InvalidArgument(
+            "Internal drain requires retained batch" LOC_MARK);
+    } else if (batch->runtime_refs != 1) {
+        // Ignore only the cleanup's own retained reference. Another runtime
+        // owner can still be unwinding its task/callback state.
+        return Status::OK();
+    }
+    for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
+        auto& task = batch->task_list[task_id];
+        if (task.derived) continue;
+        if (task.staging) {
+            // The parent reference is held until every staged child drains.
+            // A submit exception can leave the normal status cache untouched.
+            task.status = task.staging_status.load(std::memory_order_acquire);
+        } else if ((task.status == INITIAL || task.status == PENDING) &&
+                   task.suppress_failover) {
+            // Submit threw after accepting a prefix. Poll only that physical
+            // attempt: no admission, metadata retry, failover, or hook RPC.
+            auto& transport = transport_list_[task.type];
+            auto* physical = batch->sub_batch[task.type];
+            if (!transport || !physical || task.sub_task_id < 0)
+                return Status::InvalidArgument(
+                    "Unresolved physical task" LOC_MARK);
+            TransferStatus physical_status{PENDING, 0};
+            auto queried = transport->getTransferStatus(
+                physical, task.sub_task_id, physical_status);
+            if (!queried.ok()) {
+                bool stopped = false;
+                auto proof =
+                    transport->getSubBatchDrainStatus(physical, stopped);
+                if (!proof.ok()) return proof;
+                if (!stopped) return queried;
+                physical_status.s = FAILED;
+            }
+            task.status = physical_status.s;
+        }
+        if (task.status == INITIAL || task.status == PENDING)
+            return Status::OK();
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            QueueOwnerId owner_id = 0;
+            auto resolved = runtime_queue_->resolveOwner(batch->queue_token,
+                                                         task_id, owner_id);
+            if (resolved.ok() && queued_owners_.count(owner_id) != 0)
+                CHECK_STATUS(finishQueuedOwner(owner_id, task.status));
+        }
+    }
+    // A failover changes task.type/sub_task_id but leaves the earlier physical
+    // attempt in its original sub-batch. Inspect all of them, not just the
+    // logical task's current selection.
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto* sub_batch = batch->sub_batch[type];
+        if (!sub_batch) continue;
+        auto& transport = transport_list_[type];
+        if (!transport)
+            return Status::InvalidArgument("Transport not available" LOC_MARK);
+        bool physical_drained = false;
+        CHECK_STATUS(
+            transport->getSubBatchDrainStatus(sub_batch, physical_drained));
+        if (!physical_drained) return Status::OK();
+    }
+    drained = true;
     return Status::OK();
 }
 

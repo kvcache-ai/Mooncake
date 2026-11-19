@@ -765,6 +765,19 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
+# Fault injection is isolated so its operator new cannot affect other suites.
+foreach(test_name IN ITEMS submit_exception_drain proxy_submission_lifetime)
+  add_executable(tent_${test_name}_test ${test_name}_test.cpp)
+  target_link_libraries(tent_${test_name}_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_${test_name}_test PRIVATE asio_shared)
+  endif()
+  target_include_directories(tent_${test_name}_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_${test_name}_test COMMAND tent_${test_name}_test)
+endforeach()
+
 add_executable(tent_local_memory_lifecycle_test local_memory_lifecycle_test.cpp)
 target_link_libraries(tent_local_memory_lifecycle_test PRIVATE gtest gtest_main
                                                                tent_link_group)

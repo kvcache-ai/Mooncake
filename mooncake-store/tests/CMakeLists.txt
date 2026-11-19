@@ -260,7 +260,7 @@ endif()
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
 find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+if(USE_CUDA AND CUDAToolkit_FOUND)
   target_compile_definitions(transfer_task_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(transfer_task_test PRIVATE CUDA::cudart)
 endif()
@@ -372,12 +372,15 @@ if(USE_TENT AND USE_UB_MOCK)
   target_link_libraries(store_tent_ub_mock_test PRIVATE tent)
   target_include_directories(
     store_tent_ub_mock_test
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/tent/tests/ub_mock)
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/tent/tests/ub_mock
+  )
   set(STORE_UB_MOCK_ENV
       "MC_USE_TENT=1;MC_TENT_UB_MOCK=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"rdma\":{\"enable\":false},\"hp_tcp\":{\"enable\":false},\"shm\":{\"enable\":false},\"io_uring\":{\"enable\":false},\"ub\":{\"enable\":true}}}"
   )
-  set_tests_properties(store_tent_ub_mock_test
-                       PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}" TIMEOUT 300)
+  set_tests_properties(
+    store_tent_ub_mock_test PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}"
+                                       TIMEOUT 300)
 endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
@@ -691,3 +694,27 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+# Owner-push transport regressions, independent of Master/HA protocol changes.
+add_store_test(ssd_control_rpc_test ssd_control_rpc_test.cpp)
+add_store_test(ssd_control_wire_test ssd_control_wire_test.cpp)
+add_store_test(ssd_destination_registry_test ssd_destination_registry_test.cpp)
+add_store_test(ssd_destination_registration_test
+               ssd_destination_registration_test.cpp)
+add_store_test(ssd_destination_tcp_test ssd_destination_tcp_test.cpp)
+add_store_test(ssd_destination_rdma_test ssd_destination_rdma_test.cpp)
+add_store_test(ssd_direct_read_test ssd_direct_read_test.cpp)
+add_store_test(ssd_fixed_l2_requester_test ssd_fixed_l2_requester_test.cpp)
+add_store_test(ssd_read_control_test ssd_read_control_test.cpp)
+add_store_test(ssd_read_protocol_test ssd_read_protocol_test.cpp)
+add_store_test(ssd_owner_read_worker_test ssd_owner_read_worker_test.cpp)
+add_store_test(ssd_push_requester_test ssd_push_requester_test.cpp)
+add_store_test(ssd_pipeline_io_test ssd_pipeline_io_test.cpp)
+add_store_test(ssd_read_pipeline_test ssd_read_pipeline_test.cpp)
+add_store_test(ssd_read_source_test ssd_read_source_test.cpp)
+add_store_test(ssd_uring_pipeline_test ssd_uring_pipeline_test.cpp)
+add_store_test(ssd_uring_shutdown_test ssd_uring_shutdown_test.cpp)
+add_store_test(ssd_streaming_config_test ssd_streaming_config_test.cpp)
+add_store_test(offload_read_executor_config_test
+               offload_read_executor_config_test.cpp)
+add_store_test(secure_random_test secure_random_test.cpp)

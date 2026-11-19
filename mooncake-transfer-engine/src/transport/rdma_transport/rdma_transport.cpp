@@ -2173,6 +2173,24 @@ Status RdmaTransport::submitTransferTask(
     return Status::OK();
 }
 
+Status RdmaTransport::getTaskDrainStatus(BatchID batch_id, size_t task_id,
+                                         bool &drained) {
+    drained = false;
+    auto &batch = toBatchDesc(batch_id);
+    if (task_id >= batch.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+    TransferStatus status;
+    auto query = getTransferStatus(batch_id, task_id, status);
+    auto &task = batch.task_list[task_id];
+    const auto success =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    const auto failed =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    drained = success + failed ==
+              __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+    return drained ? Status::OK() : query;
+}
+
 Status RdmaTransport::getTransferStatus(BatchID batch_id,
                                         std::vector<TransferStatus> &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));

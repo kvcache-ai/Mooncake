@@ -92,6 +92,8 @@ class Transport {
         // refers to Topology::getHcaList(); -1 keeps normal topology-based
         // selection. The hint is advisory and only affects initial submission.
         int nic_hint = -1;
+        // Classic TCP WRITE must use acknowledged v2 framing when requested.
+        bool require_tcp_write_ack = false;
     };
 
     enum TransferStatusEnum {
@@ -270,6 +272,7 @@ class Transport {
             } nccl;
             struct {
                 uint64_t dest_addr;
+                bool require_write_ack;
             } tcp;
             struct {
                 uint64_t offset;
@@ -744,6 +747,24 @@ class Transport {
 
     /// @brief Create a batch with specified maximum outstanding transfers.
     virtual BatchID allocateBatchID(size_t batch_size);
+
+    // A failure counter may be a logical device error rather than a stopped
+    // DMA operation. Backends with a proven failure barrier override this.
+    virtual Status getTaskDrainStatus(BatchID batch_id, size_t task_id,
+                                      bool &drained) {
+        drained = false;
+        auto &batch = toBatchDesc(batch_id);
+        if (task_id >= batch.task_list.size())
+            return Status::InvalidArgument("Task ID out of range");
+        auto &task = batch.task_list[task_id];
+        TransferStatus status;
+        auto query = getTransferStatus(batch_id, task_id, status);
+        const auto slices =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        drained = __atomic_load_n(&task.success_slice_count,
+                                  __ATOMIC_ACQUIRE) == slices;
+        return drained ? Status::OK() : query;
+    }
 
     /// @brief Free an allocated batch.
     /// May return BatchBusy while completion callbacks are still unwinding;

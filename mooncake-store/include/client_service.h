@@ -303,7 +303,7 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool group_by_target = false);
+        bool group_by_target = false, int64_t timeout_ms = 0);
 
     /**
      * @brief Stores data with replication
@@ -774,7 +774,8 @@ class Client {
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
         OffloadBufferAccess buffer_access,
-        TransferIntent intent = TransferIntent::kForegroundGet);
+        TransferIntent intent = TransferIntent::kForegroundGet,
+        int64_t timeout_ms = 0);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -854,6 +855,12 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    void RetainTransferBacking(std::shared_ptr<void> backing) {
+        transfer_engine_->retainLocalMemory(std::move(backing));
+    }
+    std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return transfer_engine_;
+    }
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {

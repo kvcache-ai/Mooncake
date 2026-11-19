@@ -144,6 +144,9 @@ class RdmaTransport : public Transport {
 
     bool supportsGroupedScatter() const override { return true; }
 
+    Status getTaskDrainStatus(BatchID batch_id, size_t task_id,
+                              bool &drained) override;
+
     Status getTransferStatus(BatchID batch_id,
                              std::vector<TransferStatus> &status);
 

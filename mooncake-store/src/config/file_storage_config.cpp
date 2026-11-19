@@ -165,6 +165,37 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
+    auto& stream = config.streaming_read;
+    stream.enabled = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ, stream.enabled);
+    stream.push_enabled = Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_SSD_PUSH,
+                                          stream.push_enabled);
+    stream.use_uring =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_USE_URING,
+#ifdef USE_URING
+                        stream.push_enabled);
+#else
+                        false);
+#endif
+    stream.direct_io = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_DIRECT_IO, stream.direct_io);
+    stream.fixed_buffers = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS, stream.fixed_buffers);
+    stream.slot_bytes =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES,
+                        uint64_t(stream.slot_bytes));
+    stream.slots = Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_SLOTS,
+                                   uint32_t(stream.slots));
+    stream.read_workers =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_READ_THREADS,
+                        uint32_t(stream.read_workers));
+    stream.write_workers =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS,
+                        uint32_t(stream.write_workers));
+    stream.max_outstanding =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING,
+                        uint32_t(stream.DefaultMaxOutstanding()));
+
     return config;
 }
 
@@ -230,6 +261,14 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
+    if ((streaming_read.enabled || streaming_read.push_enabled) &&
+        (local_buffer_size <= 0 ||
+         !streaming_read.Validate(static_cast<uint64_t>(local_buffer_size)))) {
+        LOG(ERROR)
+            << "FileStorageConfig: invalid streaming read limits or arena size";
+        return false;
+    }
+
     // storage_filepath may be a comma-separated multi-disk list. ValidatePath
     // stats a single path and would reject the raw list string (stat of
     // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed

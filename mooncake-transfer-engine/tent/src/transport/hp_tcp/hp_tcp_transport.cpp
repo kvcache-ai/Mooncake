@@ -796,6 +796,24 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
     return Status::OK();
 }
 
+Status HighPerformanceTcpTransport::getSubBatchDrainStatus(SubBatchRef batch,
+                                                           bool& drained) {
+    drained = false;
+    auto* tcp_batch = dynamic_cast<HighPerformanceTcpSubBatch*>(batch);
+    if (!tcp_batch)
+        return Status::InvalidArgument("Invalid HP TCP sub-batch" LOC_MARK);
+    for (const auto& task : tcp_batch->tasks) {
+        auto status = task->snapshot().s;
+        if (status != COMPLETED && status != FAILED && status != CANCELED &&
+            status != TIMEOUT)
+            return Status::OK();
+    }
+    // completeOnce retires the local lease and every socket buffer callback
+    // before its terminal publication, including unknown remote WRITE results.
+    drained = true;
+    return Status::OK();
+}
+
 Status HighPerformanceTcpTransport::getTransferStatus(SubBatchRef batch,
                                                       int task_id,
                                                       TransferStatus& status) {

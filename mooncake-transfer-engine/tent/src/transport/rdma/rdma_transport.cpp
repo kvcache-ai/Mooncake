@@ -742,6 +742,34 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+Status RdmaTransport::getSubBatchDrainStatus(SubBatchRef batch, bool& drained) {
+    drained = false;
+    auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+    if (!rdma_batch)
+        return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
+    for (auto* task : rdma_batch->task_list) {
+        const auto status =
+            __atomic_load_n(&task->status_word, __ATOMIC_ACQUIRE);
+        if ((status != COMPLETED && status != FAILED && status != CANCELED &&
+             status != TIMEOUT) ||
+            task->ref_count.load(std::memory_order_acquire) != 1) {
+            return Status::OK();
+        }
+    }
+    for (auto* chain : rdma_batch->slice_chain) {
+        for (auto* slice = chain; slice; slice = slice->next) {
+            // A timeout can resolve the logical task before the accepted WR
+            // reaches its CQ. The count is paid at the handler's final exit.
+            // Endpoint expiry is deliberately not used as a fencing proof.
+            if (slice->completions_owed.load(std::memory_order_acquire) != 0) {
+                return Status::OK();
+            }
+        }
+    }
+    drained = true;
+    return Status::OK();
+}
+
 Status RdmaTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
     auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch) {

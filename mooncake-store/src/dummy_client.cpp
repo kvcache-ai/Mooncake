@@ -1789,7 +1789,12 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
-    const std::vector<size_t>& sizes) {
+    const std::vector<size_t>& sizes, int64_t timeout_ms) {
+    // Explicit read budgets are supported by RealClient. IPC retains its
+    // existing protocol and rejects an unsupported budget before submission.
+    if (timeout_ms > 0)
+        return std::vector<int64_t>(keys.size(),
+                                    toInt(ErrorCode::INVALID_PARAMS));
     if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
         return std::vector<int64_t>(keys.size(),
                                     toInt(ErrorCode::INVALID_PARAMS));
@@ -1989,7 +1994,11 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, int64_t timeout_ms) {
+    // Explicit read budgets are supported by RealClient. IPC retains its
+    // existing protocol and rejects an unsupported budget before submission.
+    if (timeout_ms > 0)
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     if (keys.size() != all_buffer_ptrs.size() ||
         keys.size() != all_sizes.size()) {
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
