@@ -2,8 +2,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <csignal>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <set>
 #include <string>
@@ -464,6 +466,121 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
     std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
                           test_data.size());
     ASSERT_EQ(read_data, test_data) << "Data mismatch after move";
+}
+
+TEST_F(TaskExecutorIntegrationTest, GracefulUnmountsLeaveTaskWorkersFree) {
+    // A timer that held a worker for grace + 10 s would outlast the 5 s wait
+    // for the move below.
+    constexpr uint64_t kGracePeriodMs = 2000;
+    constexpr auto kLeaseHold =
+        std::chrono::milliseconds(DEFAULT_DEFAULT_KV_LEASE_TTL);
+    constexpr size_t kExtraSegmentSize = 16 * 1024 * 1024;
+    std::vector<void*> extra_segments;
+    auto released = std::make_shared<std::atomic<int>>(0);
+    const auto unmount_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 4; ++i) {
+        void* ptr = allocate_buffer_allocator_memory(kExtraSegmentSize);
+        ASSERT_NE(ptr, nullptr);
+        extra_segments.push_back(ptr);
+        auto id = client1_->MountSegmentAndGetId(ptr, kExtraSegmentSize);
+        ASSERT_TRUE(id.has_value());
+        ASSERT_TRUE(
+            client1_
+                ->UnmountSegmentById(*id, kGracePeriodMs,
+                                     [released](const UUID&) { ++*released; })
+                .has_value());
+    }
+
+    const std::string key = "graceful_workers_key";
+    std::string data(1024, 'w');
+    std::vector<Slice> slices{{data.data(), data.size()}};
+    ReplicateConfig config;
+    config.preferred_segment = kClient1Endpoint;
+    ASSERT_TRUE(client1_->Put(key, slices, config).has_value());
+
+    auto task_id =
+        master_client_->CreateMoveTask(key, kClient1Endpoint, kClient2Endpoint);
+    ASSERT_TRUE(task_id.has_value());
+    EXPECT_TRUE(WaitForTaskCompletion(*task_id, std::chrono::seconds(5)));
+    ExpectReplicaEndpoints(key, {kClient2Endpoint});
+
+    // The master removes each segment when its grace period ends; the client
+    // releases it one lease hold later. Waiting also keeps them from later
+    // tests on this suite-wide master.
+    const auto deadline = unmount_start +
+                          std::chrono::milliseconds(kGracePeriodMs) +
+                          kLeaseHold + std::chrono::seconds(5);
+    while (*released < 4 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(released->load(), 4);
+    EXPECT_GE(std::chrono::steady_clock::now() - unmount_start,
+              std::chrono::milliseconds(kGracePeriodMs) + kLeaseHold);
+
+    client1_.reset();
+    for (void* ptr : extra_segments) free(ptr);
+    free(client1_segment_ptr_);
+    client1_segment_ptr_ = nullptr;
+}
+
+TEST_F(TaskExecutorIntegrationTest,
+       GracefulUnmountAllServesMovesAndReturnsOnRemoval) {
+    // Remount client1's segment to learn its id.
+    constexpr size_t kSegmentSize = 256 * 1024 * 1024;
+    ASSERT_TRUE(client1_->UnmountSegment(client1_segment_ptr_, kSegmentSize)
+                    .has_value());
+    auto segment_id =
+        client1_->MountSegmentAndGetId(client1_segment_ptr_, kSegmentSize);
+    ASSERT_TRUE(segment_id.has_value());
+
+    const std::string key = "graceful_all_key";
+    std::string data(1024, 'g');
+    std::vector<Slice> slices{{data.data(), data.size()}};
+    ReplicateConfig config;
+    config.preferred_segment = kClient1Endpoint;
+    ASSERT_TRUE(client1_->Put(key, slices, config).has_value());
+
+    constexpr uint64_t kGracePeriodMs = 5000;
+    const auto start = std::chrono::steady_clock::now();
+    // A slow cleanup callback: the wait must not return before it finishes.
+    auto callback_done = std::make_shared<std::atomic<bool>>(false);
+    auto released = std::async(std::launch::async, [this, callback_done] {
+        return client1_->GracefulUnmountAllAndWait(
+            kGracePeriodMs, [callback_done](const UUID&) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                *callback_done = true;
+            });
+    });
+
+    // Create the move only once its source is gracefully unmounting.
+    auto status = master_client_->QuerySegmentStatusById(*segment_id);
+    while (status && *status == SegmentStatus::OK &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        status = master_client_->QuerySegmentStatusById(*segment_id);
+    }
+    ASSERT_TRUE(status.has_value());
+    ASSERT_EQ(*status, SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    auto task_id =
+        master_client_->CreateMoveTask(key, kClient1Endpoint, kClient2Endpoint);
+    ASSERT_TRUE(task_id.has_value());
+    EXPECT_TRUE(WaitForTaskCompletion(*task_id, std::chrono::seconds(5)));
+
+    // Released one lease hold after the master removes it at grace end.
+    EXPECT_TRUE(released.get());
+    EXPECT_TRUE(callback_done->load());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto lease_hold =
+        std::chrono::milliseconds(DEFAULT_DEFAULT_KV_LEASE_TTL);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(kGracePeriodMs) + lease_hold);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(kGracePeriodMs) + lease_hold +
+                           std::chrono::seconds(5));
+
+    std::vector<char> buffer(data.size());
+    std::vector<Slice> read_slices{{buffer.data(), buffer.size()}};
+    ASSERT_TRUE(client2_->Get(key, read_slices).has_value());
+    EXPECT_EQ(std::string(buffer.data(), buffer.size()), data);
 }
 
 // Test complete drain job flow

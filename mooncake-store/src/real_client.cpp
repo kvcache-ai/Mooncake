@@ -1565,8 +1565,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             auto pinned_region =
                 TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
-            auto mount_result =
-                client_->MountSegment(ptr, mount_size, protocol, seg_location);
+            auto mount_result = client_->MountSegmentAndGetId(
+                ptr, mount_size, protocol, seg_location);
             if (!mount_result.has_value()) {
                 if (!ReleasePinnedRegionForFree(pinned_region,
                                                 "Store setup segment")) {
@@ -1581,6 +1581,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     std::move(pinned_region));
             }
             if (egm_config.enabled) {
+                egm_segment_ids_.emplace(ptr, *mount_result);
                 egm_node_sizes[egm_node_index] -= segment_size;
                 if (egm_node_sizes[egm_node_index] == 0) ++egm_node_index;
             }
@@ -1790,6 +1791,23 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
     }
     return *parsed_value;
 }
+
+// Ids that Client cleanup callbacks report from its timer thread.
+class SegmentIdSet {
+   public:
+    void Insert(const UUID &id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ids_.insert(id);
+    }
+    bool Contains(const UUID &id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ids_.contains(id);
+    }
+
+   private:
+    std::mutex mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> ids_;
+};
 }  // namespace
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1951,6 +1969,19 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         LOG(WARNING) << "Waiting for in-flight offload RPCs during teardown";
     }
 
+    // Runs while Client is still up, so it keeps heartbeating, serving remote
+    // reads and running the drain tasks the master sends it.
+    // Used once, so a later setup and teardown start without it.
+    const uint64_t grace_period_ms = shutdown_grace_period_ms_.exchange(0);
+    // Shared because a callback can also run later, from ~Client.
+    auto removed_segment_ids = std::make_shared<SegmentIdSet>();
+    if (client_ && grace_period_ms > 0) {
+        client_->GracefulUnmountAllAndWait(
+            grace_period_ms, [removed_segment_ids](const UUID &id) {
+                removed_segment_ids->Insert(id);
+            });
+    }
+
     // Drain the prefetch pool before any resource release below. Pool jobs
     // capture shared_ptrs locked at submission, so a job blocked on its
     // metadata RPC keeps Client alive past client_.reset(); segment memory
@@ -1981,6 +2012,14 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                  it != egm_segment_ptrs_.rend(); ++it) {
                 auto &owner = *it;
                 if (!owner) continue;
+                // Removed by the master and released by Client already.
+                // Until client_.reset() below, only a confirmed removal runs
+                // the callback; ~Client runs the rest unconfirmed.
+                auto id = egm_segment_ids_.find(owner->base());
+                if (id != egm_segment_ids_.end() &&
+                    removed_segment_ids->Contains(id->second)) {
+                    continue;
+                }
                 auto result =
                     client_->UnmountSegment(owner->base(), owner->length());
                 if (!result) {
@@ -2045,6 +2084,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
     }
     egm_segment_ptrs_.clear();
+    egm_segment_ids_.clear();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -2204,6 +2244,10 @@ ErrorCode RealClient::RetryQuarantinedShmsLocked() {
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
+
+void RealClient::set_shutdown_grace_period(uint64_t seconds) {
+    shutdown_grace_period_ms_.store(seconds * 1000);
+}
 
 int RealClient::mountSegment(const std::string &path, size_t offset,
                              size_t size, const std::string &protocol,

@@ -523,11 +523,7 @@ Client::~Client() {
         leader_monitor_thread_.join();
     }
 
-    {
-        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
-        graceful_unmount_timer_stopping_ = true;
-    }
-    graceful_unmount_timer_cv_.notify_all();
+    graceful_unmount_scheduler_.Stop();
 
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
@@ -4230,95 +4226,118 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     return {};
 }
 
-bool Client::WaitForGracefulUnmountDelay(std::chrono::milliseconds delay) {
-    std::unique_lock<std::mutex> lock(graceful_unmount_timer_mutex_);
-    return graceful_unmount_timer_cv_.wait_for(
-        lock, delay, [this]() { return graceful_unmount_timer_stopping_; });
+bool Client::GracefulUnmountAllAndWait(
+    uint64_t grace_period_ms,
+    std::function<void(const UUID&)> cleanup_callback) {
+    std::vector<UUID> segment_ids;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (const auto& [id, segment] : mounted_segments_) {
+            segment_ids.push_back(id);
+        }
+    }
+    // A segment that fails here stays mounted and is unmounted at teardown.
+    for (const auto& id : segment_ids) {
+        auto result = UnmountSegmentById(id, grace_period_ms, cleanup_callback);
+        if (!result) {
+            LOG(WARNING) << "Graceful unmount failed for segment "
+                         << UuidToString(id) << ": "
+                         << toString(result.error());
+        }
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(grace_period_ms) +
+                          kGracefulUnmountLeaseHold + kGracefulUnmountWaitSlack;
+    std::unique_lock<std::mutex> lock(mounted_segments_mutex_);
+    if (graceful_unmount_released_cv_.wait_until(lock, deadline, [this] {
+            return gracefully_unmounting_segments_.empty();
+        })) {
+        return true;
+    }
+    for (const auto& [id, segment] : gracefully_unmounting_segments_) {
+        LOG(WARNING) << "Segment " << UuidToString(id)
+                     << " is still gracefully unmounting at close";
+    }
+    return false;
 }
 
 void Client::StartGracefulUnmountTimer(const UUID& segment_id,
                                        uint64_t grace_period_ms) {
-    auto delay =
-        std::chrono::milliseconds(grace_period_ms) + std::chrono::seconds(10);
-    task_thread_pool_.enqueue([this, segment_id, delay]() {
-        if (this->WaitForGracefulUnmountDelay(delay)) {
-            return;
-        }
-        this->OnGracefulUnmountTimer(segment_id, /*retry_left=*/3);
-    });
+    const auto now = std::chrono::steady_clock::now();
+    graceful_unmount_scheduler_.Schedule(
+        GracefulUnmountCheck{segment_id,
+                             now + std::chrono::milliseconds(grace_period_ms) +
+                                 kGracefulUnmountGiveUpDelay},
+        now + kGracefulUnmountPollInterval);
 }
 
-void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
-    // Query master to confirm the segment has been removed
+void Client::OnGracefulUnmountTimer(const GracefulUnmountCheck& check) {
+    if (check.removed_by_master) {
+        ReleaseGracefulUnmount(check.segment_id);
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (MasterRemovedSegment(check.segment_id)) {
+        GracefulUnmountCheck release = check;
+        release.removed_by_master = true;
+        graceful_unmount_scheduler_.Schedule(release,
+                                             now + kGracefulUnmountLeaseHold);
+    } else if (now < check.give_up_at) {
+        graceful_unmount_scheduler_.Schedule(
+            check, now + kGracefulUnmountPollInterval);
+    } else {
+        LOG(WARNING) << "Graceful unmount cleanup timeout for segment "
+                     << UuidToString(check.segment_id);
+    }
+}
+
+bool Client::MasterRemovedSegment(const UUID& segment_id) {
+    auto status = master_client_.QuerySegmentStatusById(segment_id);
+    if (status) {
+        return status.value() == SegmentStatus::UNDEFINED;
+    }
+    if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+        return true;
+    }
+    LOG(WARNING) << "Failed to query graceful unmount segment status: "
+                 << toString(status.error());
+    return false;
+}
+
+void Client::ReleaseGracefulUnmount(const UUID& segment_id) {
+    std::function<void(const UUID&)> cleanup_callback;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         auto it = gracefully_unmounting_segments_.find(segment_id);
         if (it == gracefully_unmounting_segments_.end()) {
-            // Already cleaned up (e.g. by destructor)
             return;
         }
-    }
-
-    auto status = master_client_.QuerySegmentStatusById(segment_id);
-    bool removed = false;
-    if (!status) {
-        if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
-            removed = true;
-        } else {
-            LOG(WARNING) << "Failed to query graceful unmount segment status: "
-                         << toString(status.error());
+        if (gather_service_)
+            gather_service_->removeSource(
+                reinterpret_cast<void*>(it->second.base));
+        int rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(it->second.base));
+        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+            LOG(ERROR) << "Failed to unregister TE MR for graceful unmount: "
+                       << rc;
         }
-    } else if (status.value() == SegmentStatus::UNDEFINED) {
-        removed = true;
-    }
-
-    if (removed) {
-        std::function<void(const UUID&)> cleanup_callback;
-        {
-            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-            auto it = gracefully_unmounting_segments_.find(segment_id);
-            if (it != gracefully_unmounting_segments_.end()) {
-                if (gather_service_)
-                    gather_service_->removeSource(
-                        reinterpret_cast<void*>(it->second.base));
-                int rc = transfer_engine_->unregisterLocalMemory(
-                    reinterpret_cast<void*>(it->second.base));
-                if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
-                    LOG(ERROR)
-                        << "Failed to unregister TE MR for graceful unmount: "
-                        << rc;
-                }
-                gracefully_unmounting_segments_.erase(it);
-            }
-            auto callback_it =
-                graceful_unmount_cleanup_callbacks_.find(segment_id);
-            if (callback_it != graceful_unmount_cleanup_callbacks_.end()) {
-                cleanup_callback = std::move(callback_it->second);
-                graceful_unmount_cleanup_callbacks_.erase(callback_it);
-            }
+        auto callback_it = graceful_unmount_cleanup_callbacks_.find(segment_id);
+        if (callback_it != graceful_unmount_cleanup_callbacks_.end()) {
+            cleanup_callback = std::move(callback_it->second);
+            graceful_unmount_cleanup_callbacks_.erase(callback_it);
         }
-        if (cleanup_callback) {
-            cleanup_callback(segment_id);
-        }
-        return;
     }
-
-    if (retry_left > 0) {
-        try {
-            task_thread_pool_.enqueue([this, segment_id, retry_left]() {
-                if (this->WaitForGracefulUnmountDelay(
-                        std::chrono::seconds(10))) {
-                    return;
-                }
-                this->OnGracefulUnmountTimer(segment_id, retry_left - 1);
-            });
-        } catch (const std::runtime_error& e) {
-            VLOG(1) << "Skip graceful unmount retry enqueue: " << e.what();
-        }
-    } else {
-        LOG(WARNING) << "Graceful unmount cleanup timeout for segment "
-                     << UuidToString(segment_id);
+    if (cleanup_callback) {
+        cleanup_callback(segment_id);
     }
+    // Erase only after the callback, so a waiter that sees the segment gone
+    // also sees what its callback did.
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        gracefully_unmounting_segments_.erase(segment_id);
+    }
+    graceful_unmount_released_cv_.notify_all();
 }
 
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
