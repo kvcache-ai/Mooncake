@@ -26,6 +26,7 @@
 #include <memory>
 #include <unordered_map>
 
+#include "cuda_memcpy_batch_compat.h"
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
@@ -130,8 +131,11 @@ Status NVLinkTransport::install(std::string& local_segment_name,
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
+    // Copies below this size run as a blocking cudaMemcpy instead of the
+    // async stream + completion-event pipeline (see startTransfer). KiB
+    // units; 0 disables the sync fast path.
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 2048) * 1024;
     host_register_ = conf_->get("transports/nvlink/host_register", false);
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
@@ -143,11 +147,16 @@ Status NVLinkTransport::uninstall() {
     if (installed_) {
         metadata_.reset();
         for (auto& relocate_map : relocate_map_) {
-            for (auto& entry : relocate_map.second) {
-                CHECK_CUDA(cudaIpcCloseMemHandle(entry.second.shm_addr));
+            for (auto& by_addr : relocate_map.second) {
+                for (auto& by_dev : by_addr.second) {
+                    CHECK_CUDA(cudaIpcCloseMemHandle(by_dev.second.shm_addr));
+                }
             }
         }
         relocate_map_.clear();
+        // Invalidate thread-local relocate caches that still alias the
+        // mappings closed above (see relocateSharedMemoryAddress).
+        relocate_generation_.fetch_add(1, std::memory_order_release);
         installed_ = false;
     }
     return Status::OK();
@@ -241,8 +250,12 @@ Status NVLinkTransport::submitTransferTasks(
 
         uint64_t target_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
+            // Open the peer IPC mapping on the source buffer's device so the
+            // copy stays a direct source->target NVLink transfer instead of
+            // being routed through whatever device the calling thread happens
+            // to be on (issue #4986).
             auto status = relocateSharedMemoryAddress(
-                target_addr, request.length, request.target_id);
+                target_addr, request.length, request.target_id, device_id);
             if (!status.ok()) {
                 rollback_tasks();
                 return status;
@@ -283,6 +296,59 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                                     NVLinkSubBatch* batch) {
     if (tasks.empty()) return;
 
+    // A single small copy completes faster with a blocking cudaMemcpy than
+    // with the async stream + completion-event pipeline: the sync call
+    // returns already-completed and saves the fixed event record/poll
+    // notification latency, while the copy itself runs at the same speed.
+    // Only single-task batches take this path: batched submissions amortize
+    // the per-copy submit cost across tasks, and blocking copies serialize
+    // inside the driver under concurrency, so multi-task batches and sizes
+    // at/above async_memcpy_threshold_ keep the async pipeline.
+    if (async_memcpy_threshold_ > 0 && tasks.size() == 1 &&
+        tasks[0]->request.length < async_memcpy_threshold_) {
+        NVLinkTask* task = tasks[0];
+        void* src = nullptr;
+        void* dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;
+            src = (void*)task->target_addr;
+        } else {
+            src = task->request.source;
+            dst = (void*)task->target_addr;
+        }
+        // Match the async path's device discipline (fix for #2722): run the
+        // copy on the stream's device, then restore the caller's device.
+        int saved_device = -1;
+        if (batch->stream_device_id >= 0) {
+            auto dev_err = cudaGetDevice(&saved_device);
+            if (dev_err == cudaSuccess &&
+                saved_device != batch->stream_device_id) {
+                dev_err = cudaSetDevice(batch->stream_device_id);
+            }
+            if (dev_err != cudaSuccess) {
+                LOG(ERROR) << "NVLinkTransport: cudaGetDevice/cudaSetDevice "
+                              "failed for sync copy: "
+                           << cudaGetErrorString(dev_err);
+                task->status_word = TransferStatusEnum::FAILED;
+                return;
+            }
+        }
+        auto err =
+            cudaMemcpy(dst, src, task->request.length, cudaMemcpyDefault);
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
+        if (err == cudaSuccess) {
+            task->transferred_bytes = task->request.length;
+            task->status_word = TransferStatusEnum::COMPLETED;
+        } else {
+            LOG(ERROR) << "NVLinkTransport: synchronous cudaMemcpy failed: "
+                       << cudaGetErrorString(err);
+            task->status_word = TransferStatusEnum::FAILED;
+        }
+        return;
+    }
+
     std::vector<void*> srcs;
     std::vector<void*> dsts;
     std::vector<size_t> sizes;
@@ -315,9 +381,9 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     size_t attrs_idx = 0;
     size_t fail_idx = tasks.size();
-    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
-                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
-                               batch->async_stream.get());
+    err = cudaMemcpyBatchAsyncCompat(dsts.data(), srcs.data(), sizes.data(),
+                                     srcs.size(), &attr, &attrs_idx, 1,
+                                     &fail_idx, batch->async_stream.get());
     if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver &&
         fail_idx < tasks.size()) {
         LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
@@ -566,19 +632,53 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
 
 Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                                     uint64_t length,
-                                                    uint64_t target_id) {
-    thread_local HashMap tl_relocate_map;
-    if (tl_relocate_map.empty()) {
+                                                    uint64_t target_id,
+                                                    int src_device) {
+    // The thread-local cache is only valid for the transport instance and
+    // generation that produced it: it must not be reused across instances or
+    // across uninstall() (mappings are closed there). A fresh thread starts
+    // with instance_id == 0, which no instance ever uses.
+    struct TlRelocateCache {
+        uint64_t instance_id = 0;
+        uint64_t generation = 0;
+        HashMap map;
+    };
+    thread_local TlRelocateCache tl_relocate_cache;
+    HashMap& tl_relocate_map = tl_relocate_cache.map;
+    const uint64_t current_generation =
+        relocate_generation_.load(std::memory_order_acquire);
+    if (tl_relocate_cache.instance_id != instance_id_ ||
+        tl_relocate_cache.generation != current_generation ||
+        tl_relocate_map.empty()) {
         RWSpinlock::ReadGuard guard(relocate_lock_);
         tl_relocate_map = relocate_map_;
+        tl_relocate_cache.instance_id = instance_id_;
+        tl_relocate_cache.generation =
+            relocate_generation_.load(std::memory_order_acquire);
     }
 
-    for (auto& entry : tl_relocate_map[target_id]) {
-        if (entry.first <= dest_addr &&
-            dest_addr + length <= entry.first + entry.second.length) {
-            auto shm_addr = entry.second.shm_addr;
-            dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
-            return Status::OK();
+    // Fast path: a mapping cached for this address on src_device. The mapping
+    // is only valid on the device it was opened on, so cuda_id must match.
+    auto it_target = tl_relocate_map.find(target_id);
+    if (it_target != tl_relocate_map.end()) {
+        auto& by_addr = it_target->second;
+        for (auto& entry : by_addr) {
+            // entry.second maps opening-device -> OpenedShmEntry. The covered
+            // length is the same for every device (same peer buffer), so read
+            // it from any entry; the mapping is only usable when src_device
+            // itself has an opened mapping.
+            auto& by_dev = entry.second;
+            if (by_dev.empty()) continue;
+            uint64_t buf_len = by_dev.begin()->second.length;
+            if (entry.first <= dest_addr &&
+                dest_addr + length <= entry.first + buf_len) {
+                auto it_dev = by_dev.find(src_device);
+                if (it_dev != by_dev.end()) {
+                    auto shm_addr = it_dev->second.shm_addr;
+                    dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
+                    return Status::OK();
+                }
+            }
         }
     }
 
@@ -614,8 +714,21 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
             return Status::OK();
         }));
 
-    if (!relocate_map_[target_id].count(buffer->addr)) {
-        void* shm_addr = nullptr;
+    // The opening device must be the local source buffer's device, not the
+    // peer's buffer->location ordinal (that is relative to the peer's
+    // CUDA_VISIBLE_DEVICES and may be invalid or denote a different physical
+    // GPU here), and not the calling thread's current device either. Opening
+    // on src_device makes cudaIpcMemLazyEnablePeerAccess establish P2P
+    // directly between src_device and the allocation's device, so the copy
+    // submitted on src_device's stream is a single NVLink hop instead of being
+    // routed through whatever device the thread defaulted to (issue #4986).
+    if (src_device < 0) {
+        cudaGetDevice(&src_device);
+    }
+
+    auto& by_addr = relocate_map_[target_id][buffer->addr];
+    auto it_dev = by_addr.find(src_device);
+    if (it_dev == by_addr.end()) {
         LocationParser location(buffer->location);
         if (location.type() != "cuda") {
             LOG_EVERY_N(WARNING, 1000)
@@ -628,29 +741,28 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         deserializeBinaryData(buffer->shm_path, output_buffer);
         cudaIpcMemHandle_t handle;
         memcpy(&handle, output_buffer.data(), sizeof(handle));
-        // Open the IPC handle on the CALLER's current device. Never switch to
-        // buffer->location's device index: that ordinal is the PEER's device
-        // index, relative to the peer's CUDA_VISIBLE_DEVICES. In the local
-        // process it may be an invalid ordinal (when the peer process sees
-        // more devices than we do), and even when numerically valid it may
-        // denote a different physical GPU. cudaIpcOpenMemHandle with
-        // cudaIpcMemLazyEnablePeerAccess is valid on the current device: the
-        // lazy flag enables peer access between the current device and the
-        // allocation's source device as needed, and subsequent copies already
-        // run cross-device via P2P (see startTransfer).
-        int cuda_dev = 0;
-        CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
-                                        cudaIpcMemLazyEnablePeerAccess));
+        void* shm_addr = nullptr;
+        int saved_dev = -1;
+        CHECK_CUDA(cudaGetDevice(&saved_dev));
+        if (saved_dev != src_device) {
+            CHECK_CUDA(cudaSetDevice(src_device));
+        }
+        auto open_err = cudaIpcOpenMemHandle(&shm_addr, handle,
+                                             cudaIpcMemLazyEnablePeerAccess);
+        if (saved_dev != src_device) {
+            cudaSetDevice(saved_dev);
+        }
+        CHECK_CUDA(open_err);
         OpenedShmEntry shm_entry;
         shm_entry.shm_addr = shm_addr;
         shm_entry.length = buffer->length;
-        shm_entry.cuda_id = cuda_dev;
-        relocate_map_[target_id][buffer->addr] = shm_entry;
+        shm_entry.cuda_id = src_device;
+        by_addr[src_device] = shm_entry;
         tl_relocate_map = relocate_map_;
+        it_dev = by_addr.find(src_device);
     }
 
-    auto shm_addr = relocate_map_[target_id][buffer->addr].shm_addr;
+    auto shm_addr = it_dev->second.shm_addr;
     dest_addr = dest_addr - buffer->addr + ((uint64_t)shm_addr);
     return Status::OK();
 }

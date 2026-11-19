@@ -15,6 +15,8 @@
 #ifndef XFER_UTILS_H
 #define XFER_UTILS_H
 
+#include "split_output.h"
+
 #include <string>
 #include <unordered_map>
 #include <cmath>
@@ -59,6 +61,9 @@ namespace mooncake {
 namespace tent {
 struct XferBenchConfig {
     static void loadFromFlags();
+    static bool validateLocalNuma(std::string& error);
+    static bool resolveDramNumaRange(int& start_idx, int& num_buffers,
+                                     std::string& error);
 
     static std::string seg_name;
     static std::string seg_type;
@@ -79,6 +84,8 @@ struct XferBenchConfig {
     static int start_num_threads;
     static size_t target_offset;
     static size_t target_range_size;
+    static std::string target_access;
+    static size_t target_window_size;
     static std::string qos_classes;
     static std::string qos_classes_json;
     static std::string workload_classes_json;
@@ -104,6 +111,8 @@ struct XferBenchConfig {
     static std::string tent_intent_type;
 
     static int local_gpu_id;
+    // TENT DRAM allocation: -1 retains all configured nodes, >=0 selects one.
+    static int local_numa_id;
     static int target_gpu_id;
 };
 
@@ -125,13 +134,15 @@ struct XferMetricStats {
         return sum / samples.size();
     }
 
-    double p90() { return percentile(90.0); }
+    double p90() const { return percentile(90.0); }
 
-    double p95() { return percentile(95.0); }
+    double p95() const { return percentile(95.0); }
 
-    double p99() { return percentile(99.0); }
+    double p99() const { return percentile(99.0); }
 
-    double p999() { return percentile(99.9); }
+    double p999() const { return percentile(99.9); }
+
+    double percentile(double p) const;
 
     double fractionAtOrBelow(double threshold) const {
         if (samples.empty()) return 0.0;
@@ -141,21 +152,34 @@ struct XferMetricStats {
         return static_cast<double>(count) / samples.size();
     }
 
-    void add(double value) { samples.push_back(value); }
+    void add(double value) {
+        samples.push_back(value);
+        sorted_valid = false;
+    }
 
     void add(const std::vector<double>& values) {
         samples.insert(samples.end(), values.begin(), values.end());
+        sorted_valid = false;
     }
 
-    void clear() { samples.clear(); }
+    void clear() {
+        samples.clear();
+        sorted_samples.clear();
+        sorted_valid = false;
+    }
 
-    size_t count() { return samples.size(); }
+    size_t count() const { return samples.size(); }
 
    private:
-    double percentile(double p);
+    const std::vector<double>& sortedSamples() const;
 
    private:
     std::vector<double> samples;
+    // Sorted copy of samples, built on the first percentile() call and
+    // invalidated by every mutator. Not synchronized: stats are filled under
+    // the caller's mutex and only read from a single thread afterwards.
+    mutable std::vector<double> sorted_samples;
+    mutable bool sorted_valid = false;
 };
 
 struct XferBenchStats {
@@ -170,11 +194,15 @@ class XferBenchTimer {
 
     void reset() { start_ts_ = getCurrentTimeNs(); }
 
-    uint64_t lap_us(bool reset = true) {
+    uint64_t lap_ns(bool reset = true) {
         auto now_ts = getCurrentTimeNs();
         auto duration = now_ts - start_ts_;
         if (reset) start_ts_ = now_ts;
-        return duration / 1000;
+        return duration;
+    }
+
+    uint64_t lap_us(bool reset = true) {
+        return lap_ns(reset) / kNanosecondsPerMicrosecond;
     }
 
    private:
@@ -189,11 +217,11 @@ class XferBenchTimer {
 
 void printStatsHeader();
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
-                int num_threads);
+void printStats(size_t block_size, size_t batch_size,
+                const XferBenchStats& stats, int num_threads);
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
-                             size_t batch_size, XferBenchStats& stats,
+                             size_t batch_size, const XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us);
 
 std::vector<std::string> splitCommaSeparated(const std::string& value);
@@ -226,6 +254,14 @@ static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
     auto ret = cudaPointerGetAttributes(&attr, ptr);
     return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
+}
+
+// cudaMemset/cudaMemcpy on another GPU's memory fail with "invalid argument"
+// unless that GPU is current, and bench threads may touch any GPU.
+static inline void useCudaDeviceOf(void* ptr) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess)
+        cudaSetDevice(attr.device);
 }
 #endif
 
@@ -296,6 +332,7 @@ static inline void fillData(void* addr, size_t length, uint8_t seed) {
 #endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
+        useCudaDeviceOf(addr);
         auto err = cudaMemset(addr, seed, length);
         LOG_ASSERT(err == cudaSuccess)
             << "cudaMemset failed: " << cudaGetErrorString(err);
@@ -362,8 +399,11 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
+        useCudaDeviceOf(addr);
         std::vector<uint8_t> act_data(length);
-        cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        auto err = cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }
@@ -385,7 +425,9 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #ifdef USE_HIP
     if (isHipMemory(addr)) {
         std::vector<uint8_t> act_data(length);
-        hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);
+        auto err = hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);
+        LOG_ASSERT(err == hipSuccess)
+            << "hipMemcpy failed: " << hipGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

@@ -17,6 +17,8 @@
 #include <cassert>
 #include <filesystem>
 #include <set>
+#include <unordered_map>
+#include <utility>
 
 #include "tent/common/status.h"
 #include "tent/runtime/platform.h"
@@ -42,6 +44,13 @@ bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
     }
     return false;
 }
+
+struct BufferRangeHash {
+    size_t operator()(const std::pair<uint64_t, size_t>& range) const noexcept {
+        return std::hash<uint64_t>()(range.first) ^
+               (std::hash<size_t>()(range.second) << 1);
+    }
+};
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
@@ -69,6 +78,8 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     new_desc.addr = base;
     new_desc.length = length;
     auto entries = Platform::getLoader().getLocation((void*)base, length);
+    if (entries.empty())
+        return Status::InternalError("Unable to determine buffer location");
     if (entries.size() == 1)
         new_desc.location = entries[0].location;
     else {
@@ -93,6 +104,19 @@ Status SegmentTracker::addInBatch(
     std::function<Status(BufferDesc&)> on_removed) {
     std::lock_guard<std::recursive_mutex> guard(mutex_);
     std::vector<BufferDesc> new_desc_list;
+    new_desc_list.reserve(desc_list.size());
+    std::unordered_map<std::pair<uint64_t, size_t>, size_t, BufferRangeHash>
+        new_desc_indices;
+    new_desc_indices.reserve(desc_list.size());
+    auto appendNewDescriptor = [&](BufferDesc& entry) {
+        auto [it, inserted] = new_desc_indices.emplace(
+            std::make_pair(entry.addr, entry.length), new_desc_list.size());
+        if (!inserted) {
+            new_desc_list[it->second].ref_count++;
+            return;
+        }
+        new_desc_list.push_back(std::move(entry));
+    };
     // Read-only pre-scan (see add()): skip the ref-count publication when no
     // entry duplicates an already-registered range.
     bool any_dup = false;
@@ -124,13 +148,13 @@ Status SegmentTracker::addInBatch(
                 if (found) {
                     bumped.emplace_back(entry.addr, entry.length);
                 } else {
-                    new_desc_list.push_back(std::move(entry));
+                    appendNewDescriptor(entry);
                 }
             }
             return Status::OK();
         }));
     } else {
-        new_desc_list = std::move(desc_list);
+        for (auto& entry : desc_list) appendNewDescriptor(entry);
     }
     auto status = callback(new_desc_list);
     if (!status.ok()) {

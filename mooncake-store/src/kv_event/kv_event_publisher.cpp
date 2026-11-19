@@ -297,9 +297,13 @@ void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
     if (events.empty()) {
         return;
     }
+    bool notify = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        const size_t previous_size = queue_.size();
+        notify = previous_size == 0;
         for (auto& event : events) {
+            notify = notify || event.kind != EventKind::kRemoved;
             if (config_.queue_capacity > 0 &&
                 queue_.size() >= config_.queue_capacity) {
                 queue_.pop_front();
@@ -309,8 +313,12 @@ void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
             }
             queue_.push_back(std::move(event));
         }
+        notify = notify || (previous_size < kMaxBatchSize &&
+                            queue_.size() >= kMaxBatchSize);
     }
-    queue_cv_.notify_one();
+    if (notify) {
+        queue_cv_.notify_one();
+    }
 }
 
 void KvEventPublisher::DrainRemainingQueue(std::vector<PendingEvent>& batch) {
@@ -338,6 +346,25 @@ void KvEventPublisher::WorkerLoop() {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cv_.wait(lock,
                            [this] { return stop_.load() || !queue_.empty(); });
+            if (!queue_.empty() && queue_.front().kind == EventKind::kRemoved &&
+                config_.removal_batch_timeout_us > 0) {
+                // Keep one FIFO for all mutations: delaying removals outside
+                // this queue could retract a later same-key Stored event.
+                // The deadline is fixed for this batch, not reset on arrivals.
+                const auto deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(config_.removal_batch_timeout_us);
+                queue_cv_.wait_until(lock, deadline, [this] {
+                    // The scan is bounded by kMaxBatchSize. Control events
+                    // bypass the delay even when followed by more removals.
+                    return stop_.load() || queue_.size() >= kMaxBatchSize ||
+                           std::any_of(queue_.begin(), queue_.end(),
+                                       [](const PendingEvent& event) {
+                                           return event.kind !=
+                                                  EventKind::kRemoved;
+                                       });
+                });
+            }
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();

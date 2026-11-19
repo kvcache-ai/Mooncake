@@ -4,7 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// Not in the SYCL device pass (icpx -fsycl, USE_XPU): it rejects the x86
+// builtins below. The host pass still gets SSE4.2.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && \
+    !defined(__SYCL_DEVICE_ONLY__)
 #include <nmmintrin.h>
 #define MOONCAKE_CRC32C_HAVE_SSE42 1
 #endif

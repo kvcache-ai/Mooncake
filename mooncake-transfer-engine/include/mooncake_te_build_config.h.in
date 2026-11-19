@@ -1,0 +1,22 @@
+// Copyright 2026 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef MOONCAKE_TE_BUILD_CONFIG_H_
+#define MOONCAKE_TE_BUILD_CONFIG_H_
+
+// Public layouts must follow the library, not consumer compile definitions.
+#undef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#cmakedefine MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL 1
+
+#endif  // MOONCAKE_TE_BUILD_CONFIG_H_

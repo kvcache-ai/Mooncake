@@ -1955,10 +1955,14 @@ ObjectsSpec<> Objects(std::initializer_list<std::string> keys);
 
 struct ReadableObjectCountSpec {
     ObjectsSpecData objects;
-    size_t expected;
+    size_t min_expected;
+    size_t max_expected;
 };
 
 ReadableObjectCountSpec ReadableCount(ObjectsSpec<> objects, size_t expected);
+ReadableObjectCountSpec ReadableCountBetween(ObjectsSpec<> objects,
+                                             size_t min_expected,
+                                             size_t max_expected);
 
 struct KeyExistsSpec {
     std::string key;
@@ -1991,14 +1995,23 @@ struct BatchExistenceSpec {
 BatchExistenceSpec BatchExistence(std::initializer_list<std::string> keys);
 
 // Lease-free twin of BatchExistence: BatchProbeKey reports the same hits
-// without granting or extending read leases.
+// without granting or extending read leases. LastHitOnly keeps those
+// per-key results and leases the last candidate of candidate_size
+// consecutive keys whose results are all true.
 struct BatchProbeSpec {
     std::vector<std::string> keys;
     std::string tenant{TenantId::Default().value()};
+    GrantLeasePolicy policy{};
     std::vector<bool> expected;
 
     BatchProbeSpec& ForTenant(std::string value) {
         tenant = std::move(value);
+        return *this;
+    }
+
+    BatchProbeSpec& LastHitOnly(uint64_t candidate_size) {
+        policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+        policy.candidate_size = candidate_size;
         return *this;
     }
 

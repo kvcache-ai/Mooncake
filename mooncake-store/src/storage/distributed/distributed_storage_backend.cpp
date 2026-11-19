@@ -1,11 +1,14 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
+#include <boost/functional/hash.hpp>
 
 #include "types.h"
 
@@ -135,6 +138,72 @@ tl::expected<void, ErrorCode> TransferAll(FileSystemAdapter& adapter, int fd,
     }
 }
 
+tl::expected<uint64_t, ErrorCode> CalculateSliceBytes(
+    std::span<const Slice> slices) {
+    uint64_t total = 0;
+    for (const auto& slice : slices) {
+        if ((slice.ptr == nullptr && slice.size != 0) ||
+            slice.size > std::numeric_limits<uint64_t>::max() - total) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total += slice.size;
+    }
+    return total;
+}
+
+std::vector<bool> ShareableReadDestinations(
+    const std::vector<DfsReadRequest>& requests,
+    const std::vector<bool>& valid) {
+    std::vector<bool> shareable(requests.size(), false);
+    size_t range_count = 0;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!valid[i]) continue;
+        shareable[i] = requests[i].source_replica_id != 0;
+        range_count += requests[i].slices.size();
+    }
+    if (std::none_of(shareable.begin(), shareable.end(),
+                     [](bool value) { return value; }))
+        return shareable;
+    struct Range {
+        uintptr_t begin;
+        uintptr_t end;
+        size_t owner;
+    };
+    std::vector<Range> ranges;
+    ranges.reserve(range_count);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!valid[i]) continue;
+        for (const auto& slice : requests[i].slices) {
+            const auto begin = reinterpret_cast<uintptr_t>(slice.ptr);
+            if (slice.size > std::numeric_limits<uintptr_t>::max() - begin) {
+                shareable[i] = false;
+                continue;
+            }
+            ranges.push_back({begin, begin + slice.size, i});
+        }
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const Range& a, const Range& b) { return a.begin < b.begin; });
+    // Every member of a connected overlapping group has an alias. Include
+    // unshared requests too: a later raw read could overwrite a leader before
+    // its bytes are retained for other consumers.
+    size_t first = 0;
+    while (first < ranges.size()) {
+        size_t next = first + 1;
+        uintptr_t end = ranges[first].end;
+        while (next < ranges.size() && ranges[next].begin < end) {
+            end = std::max(end, ranges[next].end);
+            ++next;
+        }
+        if (next - first > 1) {
+            for (size_t i = first; i < next; ++i)
+                shareable[ranges[i].owner] = false;
+        }
+        first = next;
+    }
+    return shareable;
+}
+
 }  // namespace
 
 DistributedStorageBackend::DistributedStorageBackend(
@@ -169,6 +238,11 @@ DistributedStorageBackend::~DistributedStorageBackend() {
         }
     }
     if (fs_adapter_) fs_adapter_->Shutdown();
+}
+
+bool DistributedStorageBackend::SupportsArbitraryHostReadBuffers() const {
+    return !UsesObjectStorage() && fs_adapter_ &&
+           fs_adapter_->SupportsArbitraryHostReadBuffers();
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
@@ -356,6 +430,54 @@ tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
     return fs_adapter_->OpenExistingFile(file_path);
 }
 
+bool DistributedStorageBackend::ReadIdentity::operator==(
+    const ReadIdentity& other) const {
+    return key == other.key && source.file_path == other.source.file_path &&
+           source.offset == other.source.offset &&
+           source.object_size == other.source.object_size &&
+           source.aligned_size == other.source.aligned_size &&
+           source.shard_idx == other.source.shard_idx &&
+           window_offset == other.window_offset &&
+           window_size == other.window_size && replica_id == other.replica_id;
+}
+
+size_t DistributedStorageBackend::ReadIdentityHash::operator()(
+    const ReadIdentity& identity) const {
+    size_t hash = 0;
+    boost::hash_combine(hash, identity.key);
+    boost::hash_combine(hash, identity.source.file_path);
+    boost::hash_combine(hash, identity.source.offset);
+    boost::hash_combine(hash, identity.source.object_size);
+    boost::hash_combine(hash, identity.source.aligned_size);
+    boost::hash_combine(hash, identity.source.shard_idx);
+    boost::hash_combine(hash, identity.window_offset);
+    boost::hash_combine(hash, identity.window_size);
+    boost::hash_combine(hash, identity.replica_id);
+    return hash;
+}
+
+// Retire reads both before a mutation and on every exit, including exceptions.
+// Existing readers retain their result, while later reads cannot join them.
+struct DistributedStorageBackend::ReadInvalidation {
+    ReadFlights& flights;
+    std::unordered_set<std::string> keys;
+
+    ReadInvalidation(DistributedStorageBackend& backend,
+                     std::vector<std::string> logical_keys)
+        : flights(backend.read_flights_),
+          keys(logical_keys.begin(), logical_keys.end()) {
+        Invalidate();
+    }
+    ~ReadInvalidation() { Invalidate(); }
+    void Invalidate() {
+        if (!keys.empty()) {
+            flights.InvalidateIf([this](const ReadIdentity& read) {
+                return keys.contains(read.key);
+            });
+        }
+    }
+};
+
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -375,6 +497,9 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                "eviction_handler ignored";
     }
 
+    std::vector<std::string> mutation_keys;
+    for (const auto& [key, _] : batch_object) mutation_keys.push_back(key);
+    ReadInvalidation mutation(*this, std::move(mutation_keys));
     std::vector<std::string> success_keys;
     std::vector<StorageObjectMetadata> success_metas;
     std::vector<ObjectPutRequest> requests;
@@ -449,6 +574,7 @@ struct DistributedStorageBackend::DfsIoOp {
     const DistributedFSDescriptor& descriptor;
     std::vector<iovec> iovs;
     uint64_t size;
+    int64_t file_offset = 0;
 };
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
@@ -457,8 +583,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
         auto fd = OpenBucket(op.descriptor);
         if (!fd) return tl::make_unexpected(fd.error());
         auto result = TransferAll(*fs_adapter_, *fd, std::move(op.iovs),
-                                  static_cast<int64_t>(op.descriptor.offset),
-                                  op.size, 0, write);
+                                  op.file_offset, op.size, 0, write);
         auto close_result = fs_adapter_->CloseFile(*fd);
         if (!result) return result;
         return close_result;
@@ -472,7 +597,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
     }
     std::lock_guard lock((*shard)->mutex);
     const auto count = static_cast<int>(op.iovs.size());
-    const auto offset = static_cast<int64_t>(op.descriptor.offset);
+    const auto offset = op.file_offset;
     auto result =
         write
             ? fs_adapter_->WriteAt((*shard)->fd, op.iovs.data(), count, offset)
@@ -531,7 +656,7 @@ void DistributedStorageBackend::ExecuteShardBatchIo(
         }
         io_requests.push_back({(*shard)->fd, op.iovs.data(),
                                static_cast<int>(op.iovs.size()),
-                               static_cast<int64_t>(op.descriptor.offset)});
+                               op.file_offset});
         io_ops.push_back(&op);
     }
     // Shard I/O fails short transfers.
@@ -568,9 +693,9 @@ void DistributedStorageBackend::ExecuteBucketBatchIo(
             }
             opened.emplace_back(*fd, &bucket_ops);
             for (auto* op : bucket_ops) {
-                io_requests.push_back(
-                    {*fd, op->iovs.data(), static_cast<int>(op->iovs.size()),
-                     static_cast<int64_t>(op->descriptor.offset)});
+                io_requests.push_back({*fd, op->iovs.data(),
+                                       static_cast<int>(op->iovs.size()),
+                                       op->file_offset});
                 io_ops.push_back(op);
             }
         }
@@ -635,15 +760,55 @@ DistributedStorageBackend::BatchWrite(
     const std::vector<DfsWriteRequest>& requests) {
     std::vector<tl::expected<void, ErrorCode>> results(requests.size());
 
-    if (UsesObjectStorage()) {
-        results.assign(requests.size(),
-                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
-        return results;
-    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+
+    std::vector<std::string> mutation_keys;
+    for (const auto& request : requests) mutation_keys.push_back(request.key);
+    ReadInvalidation mutation(*this, std::move(mutation_keys));
+
+    if (UsesObjectStorage()) {
+        std::vector<ObjectPutRequest> object_requests;
+        std::vector<std::vector<iovec>> iov_storage;
+        std::vector<size_t> request_indices;
+        object_requests.reserve(requests.size());
+        iov_storage.reserve(requests.size());
+        request_indices.reserve(requests.size());
+        for (size_t index = 0; index < requests.size(); ++index) {
+            const auto& request = requests[index];
+            const auto& desc = request.descriptor;
+            auto total_size = CalculateSliceBytes(request.slices);
+            if (request.slices.empty() || !total_size ||
+                request.slices.size() >
+                    static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                desc.object_size == 0 || *total_size != desc.object_size) {
+                results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            auto& iovs = iov_storage.emplace_back();
+            iovs.reserve(request.slices.size());
+            for (const auto& slice : request.slices)
+                iovs.push_back({slice.ptr, slice.size});
+            object_requests.push_back(
+                {request.key, iovs.data(), static_cast<int>(iovs.size())});
+            request_indices.push_back(index);
+        }
+
+        auto object_results =
+            object_storage_adapter_->PutBatch(object_requests);
+        if (object_results.size() != object_requests.size()) {
+            for (size_t index : request_indices) {
+                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return results;
+        }
+        for (size_t index = 0; index < object_results.size(); ++index) {
+            results[request_indices[index]] = std::move(object_results[index]);
+        }
         return results;
     }
 
@@ -702,7 +867,9 @@ DistributedStorageBackend::BatchWrite(
             results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-        DfsIoOp op{i, request.key, desc, std::move(iovs), total_size};
+        DfsIoOp op{i,          request.key,
+                   desc,       std::move(iovs),
+                   total_size, static_cast<int64_t>(desc.offset)};
         if (batch_io) {
             ops.push_back(std::move(op));
         } else {
@@ -719,97 +886,250 @@ DistributedStorageBackend::BatchWrite(
     return results;
 }
 
+tl::expected<DfsReadRequest, ErrorCode>
+DistributedStorageBackend::ValidateReadRequest(
+    const DfsReadRequest& request) const {
+    const auto& desc = request.descriptor;
+    if (desc.object_size == 0 ||
+        desc.object_size > std::numeric_limits<size_t>::max()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    uint64_t value_offset = 0;
+    uint64_t io_bytes = desc.object_size;
+    if (UsesObjectStorage()) {
+        auto capacity = CalculateSliceBytes(request.slices);
+        if (request.slices.empty() || !capacity || *capacity < io_bytes)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    } else {
+        const bool range_valid =
+            UsesBucketAllocator()
+                ? IsBucketDescriptorRangeValid(desc, distributed_config_)
+                : IsDfsDescriptorRangeValid(desc, distributed_config_);
+        if (!range_valid ||
+            request.slices.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max()))
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        if (request.range_read) {
+            value_offset = request.value_offset;
+            auto capacity = CalculateSliceBytes(request.slices);
+            if (!capacity || value_offset > desc.object_size ||
+                *capacity > desc.object_size - value_offset)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            io_bytes = *capacity;
+        }
+    }
+    if (!UsesObjectStorage() &&
+        (desc.offset > std::numeric_limits<uint64_t>::max() - value_offset ||
+         desc.offset + value_offset >
+             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+    DfsReadRequest validated = request;
+    validated.value_offset = value_offset;
+    validated.slices.clear();
+    uint64_t remaining = io_bytes;
+    for (const auto& slice : request.slices) {
+        if (!slice.ptr && slice.size != 0)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        const size_t size =
+            static_cast<size_t>(std::min<uint64_t>(slice.size, remaining));
+        if (size != 0) validated.slices.push_back({slice.ptr, size});
+        remaining -= size;
+    }
+    if (remaining != 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (!UsesObjectStorage() && request.range_read) {
+        // Validate each consumer against a truncated value before sharing its
+        // window, without fetching the tail of the value.
+        auto file_size = fs_adapter_->GetFileSize(desc.file_path);
+        if (!file_size) return tl::make_unexpected(file_size.error());
+        if (static_cast<uint64_t>(*file_size) < desc.offset + desc.object_size)
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return validated;
+}
+
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
     std::vector<tl::expected<void, ErrorCode>> results(requests.size());
-
-    if (UsesObjectStorage()) {
-        results.assign(requests.size(),
-                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
-        return results;
-    }
     if (!initialized_) {
-        LOG(ERROR) << "DistributedStorageBackend is not initialized";
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
         return results;
     }
+    std::vector<DfsReadRequest> validated(requests.size());
+    std::vector<bool> valid(requests.size(), false);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto request = ValidateReadRequest(requests[i]);
+        if (!request) {
+            results[i] = tl::make_unexpected(request.error());
+            continue;
+        }
+        validated[i] = std::move(*request);
+        valid[i] = true;
+    }
+    const auto shareable = ShareableReadDestinations(validated, valid);
+    std::vector<std::optional<ReadFlights::Ticket>> tickets(requests.size());
+    std::vector<DfsReadRequest> leaders;
+    std::vector<size_t> leader_indices;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!valid[i]) continue;
+        if (shareable[i]) {
+            auto bytes = CalculateSliceBytes(validated[i].slices);
+            const ReadIdentity identity{validated[i].key,
+                                        validated[i].descriptor,
+                                        validated[i].value_offset, *bytes,
+                                        validated[i].source_replica_id};
+            tickets[i].emplace(read_flights_.Acquire(identity));
+            if (!tickets[i]->IsLeader()) continue;
+        }
+        leaders.push_back(std::move(validated[i]));
+        leader_indices.push_back(i);
+    }
 
-    // Storage layout: bucket I/O uses temporary fds and completes short reads;
-    // shard I/O reuses cached fds and fails short reads.
-    const bool bucket_mode = UsesBucketAllocator();
-    // Execution mode: adapters that opt in (currently 3FS) collect validated
-    // reads for submission after the loop. Other adapters (including POSIX)
-    // execute each read in the loop, preserving per-request bucket handles
-    // and shard I/O locking.
+    // Submit every new source before waiting for joined work. This preserves
+    // native batching and avoids cycles between partially overlapping batches.
+    auto reads = BatchReadOnce(leaders);
+    if (reads.size() != leaders.size())
+        reads.assign(leaders.size(),
+                     tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+    for (size_t j = 0; j < leaders.size(); ++j) {
+        const size_t i = leader_indices[j];
+        results[i] = reads[j];
+        if (!tickets[i]) continue;
+        const bool joined = tickets[i]->Retire();
+        SharedRead shared = std::shared_ptr<const std::vector<char>>{};
+        if (!reads[j]) {
+            shared = tl::make_unexpected(reads[j].error());
+        } else if (joined) {
+            try {
+                auto bytes = CalculateSliceBytes(leaders[j].slices);
+                auto snapshot = std::make_shared<std::vector<char>>(
+                    static_cast<size_t>(*bytes));
+                size_t offset = 0;
+                for (const auto& slice : leaders[j].slices) {
+                    std::memcpy(snapshot->data() + offset, slice.ptr,
+                                slice.size);
+                    offset += slice.size;
+                }
+                shared = std::move(snapshot);
+            } catch (...) {
+                // The producer's direct read remains successful if retaining
+                // bytes for other consumers fails.
+                shared = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+        tickets[i]->Publish(std::move(shared));
+        tickets[i].reset();
+    }
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!tickets[i]) continue;
+        try {
+            const auto& shared = tickets[i]->Result().get();
+            if (!shared) {
+                results[i] = tl::make_unexpected(shared.error());
+            } else if (!*shared) {
+                results[i] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            } else {
+                size_t offset = 0;
+                for (const auto& slice : validated[i].slices) {
+                    std::memcpy(slice.ptr, (*shared)->data() + offset,
+                                slice.size);
+                    offset += slice.size;
+                }
+            }
+        } catch (const std::future_error&) {
+            results[i] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchReadOnce(
+    const std::vector<DfsReadRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(requests.size());
+    if (requests.empty()) return results;
+    if (UsesObjectStorage()) {
+        std::vector<ObjectGetRequest> object_requests;
+        std::vector<std::vector<char>> staging_buffers(requests.size());
+        object_requests.reserve(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto& request = requests[i];
+            void* buffer =
+                request.slices.empty() ? nullptr : request.slices.front().ptr;
+            if (request.slices.size() > 1) {
+                staging_buffers[i].resize(
+                    static_cast<size_t>(request.descriptor.object_size));
+                buffer = staging_buffers[i].data();
+            }
+            object_requests.push_back(
+                {request.key, buffer,
+                 static_cast<size_t>(request.descriptor.object_size)});
+        }
+        auto object_results =
+            object_storage_adapter_->GetBatch(object_requests);
+        if (object_results.size() != requests.size())
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(),
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        for (size_t i = 0; i < object_results.size(); ++i) {
+            if (!object_results[i]) {
+                results[i] = tl::make_unexpected(object_results[i].error());
+            } else if (*object_results[i] != object_requests[i].size) {
+                results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            } else if (!staging_buffers[i].empty()) {
+                size_t offset = 0;
+                for (const auto& slice : requests[i].slices) {
+                    std::memcpy(slice.ptr, staging_buffers[i].data() + offset,
+                                slice.size);
+                    offset += slice.size;
+                }
+            }
+        }
+        return results;
+    }
     const bool batch_io = fs_adapter_->SupportsBatchIo();
     std::vector<DfsIoOp> ops;
     if (batch_io) ops.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        const auto& desc = request.descriptor;
-        const bool range_valid =
-            bucket_mode
-                ? IsBucketDescriptorRangeValid(desc, distributed_config_)
-                : IsDfsDescriptorRangeValid(desc, distributed_config_);
-        if (!range_valid) {
-            LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
-                       << ", offset=" << desc.offset
-                       << ", object_size=" << desc.object_size
-                       << ", aligned_size=" << desc.aligned_size
-                       << ", capacity="
-                       << (bucket_mode ? distributed_config_.bucket_capacity
-                                       : distributed_config_.shard_capacity);
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        if (desc.object_size > std::numeric_limits<size_t>::max() ||
-            request.slices.size() >
-                static_cast<size_t>(std::numeric_limits<int>::max())) {
-            LOG(ERROR) << "DFS read request exceeds platform limits for key "
-                       << request.key << ", object_size=" << desc.object_size
-                       << ", slice_count=" << request.slices.size();
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-
         std::vector<iovec> iovs;
         iovs.reserve(request.slices.size());
-        size_t remaining = static_cast<size_t>(desc.object_size);
-        bool invalid = false;
-        for (const auto& slice : request.slices) {
-            if (!slice.ptr && slice.size > 0) {
-                invalid = true;
-                break;
-            }
-            if (remaining == 0 || slice.size == 0) {
-                continue;
-            }
-            const size_t read_size = std::min(slice.size, remaining);
-            iovs.push_back({slice.ptr, read_size});
-            remaining -= read_size;
-        }
-        if (invalid || remaining != 0) {
-            LOG(WARNING) << "Invalid DFS read request for key " << request.key
-                         << ", expected capacity at least=" << desc.object_size;
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        DfsIoOp op{i, request.key, desc, std::move(iovs), desc.object_size};
-        if (batch_io) {
+        for (const auto& slice : request.slices)
+            iovs.push_back({slice.ptr, slice.size});
+        const auto bytes = CalculateSliceBytes(request.slices);
+        DfsIoOp op{i,
+                   request.key,
+                   request.descriptor,
+                   std::move(iovs),
+                   *bytes,
+                   static_cast<int64_t>(request.descriptor.offset +
+                                        request.value_offset)};
+        if (batch_io)
             ops.push_back(std::move(op));
-        } else {
+        else
             results[i] = ExecuteSingleIo(op, false);
-        }
     }
-
-    if (!batch_io) return results;
-    if (bucket_mode) {
-        ExecuteBucketBatchIo(ops, results, false);
-    } else {
-        ExecuteShardBatchIo(ops, results, false);
+    if (batch_io) {
+        if (UsesBucketAllocator())
+            ExecuteBucketBatchIo(ops, results, false);
+        else
+            ExecuteShardBatchIo(ops, results, false);
     }
     return results;
+}
+
+ObjectStorageIoResults DistributedStorageBackend::BatchDeleteObjects(
+    std::span<const std::string> logical_keys) {
+    if (!initialized_ || !UsesObjectStorage() || !object_storage_adapter_) {
+        return ObjectStorageIoResults(
+            logical_keys.size(),
+            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+    }
+    ReadInvalidation mutation(
+        *this,
+        std::vector<std::string>(logical_keys.begin(), logical_keys.end()));
+    return object_storage_adapter_->DeleteBatch(logical_keys);
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(

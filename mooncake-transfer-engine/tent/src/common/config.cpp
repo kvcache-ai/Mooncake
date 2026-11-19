@@ -164,10 +164,23 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
 
 void ConfigHelper::forceTcp(Config& config) {
     config.set("transports/force_tcp", true);
+    config.set("transports/force_fabric", false);
     config.set("transports/tcp/enable", true);
     config.set("transports/rdma/enable", false);
     config.set("transports/hp_tcp/enable", false);
     config.set("transports/fabric/enable", false);
+}
+
+void ConfigHelper::forceFabric(Config& config, const std::string& provider) {
+    // Memory routing is pinned separately; leave file/platform paths available.
+    config.set("transports/force_tcp", false);
+    config.set("transports/force_fabric", true);
+    config.set("transports/tcp/enable", false);
+    config.set("transports/rdma/enable", false);
+    config.set("transports/hp_tcp/enable", false);
+    config.set("transports/shm/enable", false);
+    config.set("transports/fabric/enable", true);
+    config.set("transports/fabric/provider", provider);
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
@@ -208,6 +221,22 @@ Status ConfigHelper::loadFromEnv(Config& config) {
             << "MC_FORCE_TCP is set, forcing TENT memory transfers to use TCP";
     }
     setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
+    // Fail closed on malformed new controls instead of silently disabling them.
+    for (const auto& entry : {std::pair{"MC_MNNVL_REQUIRE_FABRIC",
+                                        "transports/mnnvl/require_fabric"}}) {
+        const char* value = std::getenv(entry.first);
+        if (!value) continue;
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (normalized != "true" && normalized != "false" &&
+            normalized != "1" && normalized != "0" && normalized != "yes" &&
+            normalized != "no" && normalized != "on" && normalized != "off") {
+            return Status::InvalidArgument(std::string("Invalid boolean: ") +
+                                           entry.first);
+        }
+        config.set(entry.second, parseBool(normalized));
+    }
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -223,6 +252,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/endpoint/qp_mul_factor");
     setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
     setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_TENT_RDMA_SIGNAL_INTERVAL",
+              "transports/rdma/endpoint/signal_interval");
     setConfig(config, "MC_MAX_INLINE",
               "transports/rdma/endpoint/max_inline_bytes");
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
@@ -236,12 +267,15 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
     setConfig(config, "MC_RETRY_CNT",
               "transports/rdma/workers/max_retry_count");
-    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
-              "transports/rdma/disable_gpu_direct_rdma");
-    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
-              "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+                  "transports/rdma/disable_gpu_direct_rdma");
+    setBoolConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+                  "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
                   "transports/rdma/strict_local_numa");
+    // Same-name remote NIC affinity. Workers read this key when selecting.
+    setBoolConfig(config, "MC_ENABLE_DEST_DEVICE_AFFINITY",
+                  "transports/rdma/dest_device_affinity");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works
@@ -270,6 +304,46 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_IOURING_STAGING_SLOTS",
               "transports/io_uring/staging_slots");
     return status;
+}
+
+Status parseMnnvlConfig(const Config& config, MnnvlConfig& options) {
+    MnnvlConfig parsed;
+    const auto paths = config.paths();
+    auto configured = [&](const char* key) {
+        return std::binary_search(paths.begin(), paths.end(), std::string(key));
+    };
+    auto read_bool = [&](const char* key, bool& value) -> Status {
+        std::string text;
+        if (!config.dumpSubtree(key, &text)) {
+            if (configured(key))
+                return Status::InvalidArgument(std::string(key) +
+                                               " must be boolean");
+            return Status::OK();
+        }
+        if (text != "true" && text != "false")
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be boolean");
+        value = text == "true";
+        return Status::OK();
+    };
+    CHECK_STATUS(
+        read_bool("transports/mnnvl/require_fabric", parsed.require_fabric));
+    parsed.egm_enabled = config.get("transports/mnnvl/egm", false);
+    if (parsed.require_fabric) {
+        CHECK_STATUS(read_bool("transports/mnnvl/egm", parsed.egm_enabled));
+        bool enabled = true, force_tcp = false;
+        CHECK_STATUS(read_bool("transports/mnnvl/enable", enabled));
+        CHECK_STATUS(read_bool("transports/force_tcp", force_tcp));
+        if (!enabled || force_tcp ||
+            (configured("transports/nvlink/handle_type") &&
+             config.get<json>("transports/nvlink/handle_type", json()) !=
+                 json("fabric")))
+            return Status::InvalidArgument(
+                "Strict MNNVL requires enabled MNNVL and FABRIC handles "
+                "without force_tcp");
+    }
+    options = parsed;
+    return Status::OK();
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {

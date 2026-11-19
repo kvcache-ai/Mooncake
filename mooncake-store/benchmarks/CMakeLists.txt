@@ -69,3 +69,8 @@ target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
 # Add group index write path benchmark executable
 add_executable(group_index_contention_bench group_index_contention_bench.cpp)
 target_link_libraries(group_index_contention_bench PRIVATE mooncake_store)
+
+add_executable(exists_evict_bench exists_evict_bench.cpp)
+target_link_libraries(
+  exists_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
+                             gflags::gflags glog::glog pthread)

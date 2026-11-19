@@ -22,13 +22,15 @@ struct DistributedStorageConfig {
     double eviction_low_watermark = 0.7;
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
+    std::string object_storage_config_path;
+
+    bool UsesObjectStorage() const {
+        return fs_adapter_type == "oss" || fs_adapter_type == "s3" ||
+               fs_adapter_type == "kvcs-lowlevel";
+    }
+    bool UsesKvcs() const { return fs_adapter_type == "kvcs-lowlevel"; }
 
     bool Validate() const;
-    // True for adapters backed by an object store ("oss", "s3") rather
-    // than a filesystem.
-    bool UsesObjectStorage() const {
-        return fs_adapter_type == "oss" || fs_adapter_type == "s3";
-    }
     bool ValidateForAllocator() const;
     static DistributedStorageConfig FromEnvironment();
     std::string FormatStr() const;

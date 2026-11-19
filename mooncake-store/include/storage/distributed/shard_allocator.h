@@ -9,6 +9,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -134,7 +135,12 @@ class ShardAllocator final : public DfsAllocatorInterface {
 
         std::mutex lru_mutex;
         std::list<std::pair<std::string, uint64_t>> lru_list;
-        std::unordered_map<std::string, decltype(lru_list)::iterator> lru_index;
+        // Keys view the key stored in their lru_list node, so each tracked
+        // key is stored once. Insert only with that node's key (never
+        // operator[] with a caller's string), and erase an index entry
+        // before its list node.
+        std::unordered_map<std::string_view, decltype(lru_list)::iterator>
+            lru_index;
         // Once the high watermark is crossed, keep selecting candidates until
         // effective usage falls below the low watermark. Protected candidates
         // may make that span multiple prepare/resolve rounds.

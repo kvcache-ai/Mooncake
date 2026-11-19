@@ -3,10 +3,12 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "common/read_singleflight.h"
 #include "config/distributed_storage_config.h"
 #include "fs_adapter.h"
 #include "replica.h"
@@ -32,6 +34,13 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // When range_read is set, slices are a window of the value starting at
+    // value_offset. Otherwise slices must cover the whole object.
+    uint64_t value_offset = 0;
+    bool range_read = false;
+    // Existing replica identity distinguishes allocations at a reused source.
+    // Zero means no published source identity, so the read cannot be shared.
+    ReplicaID source_replica_id = 0;
 };
 
 /**
@@ -62,6 +71,14 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
 
+    bool UsesKvcs() const {
+        return UsesObjectStorage() && distributed_config_.UsesKvcs();
+    }
+
+    // True when reads go through a filesystem adapter that can read straight
+    // into arbitrary host memory without an intermediate buffer.
+    bool SupportsArbitraryHostReadBuffers() const;
+
     tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -76,6 +93,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
+
+    ObjectStorageIoResults BatchDeleteObjects(
+        std::span<const std::string> logical_keys);
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
@@ -101,6 +121,26 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::mutex mutex;
     };
     struct DfsIoOp;
+    struct ReadIdentity {
+        std::string key;
+        DistributedFSDescriptor source;
+        uint64_t window_offset;
+        uint64_t window_size;
+        ReplicaID replica_id;
+        bool operator==(const ReadIdentity& other) const;
+    };
+    struct ReadIdentityHash {
+        size_t operator()(const ReadIdentity& identity) const;
+    };
+    using SharedRead =
+        tl::expected<std::shared_ptr<const std::vector<char>>, ErrorCode>;
+    using ReadFlights =
+        ReadSingleFlight<ReadIdentity, SharedRead, ReadIdentityHash>;
+    struct ReadInvalidation;
+    tl::expected<DfsReadRequest, ErrorCode> ValidateReadRequest(
+        const DfsReadRequest& request) const;
+    std::vector<tl::expected<void, ErrorCode>> BatchReadOnce(
+        const std::vector<DfsReadRequest>& requests);
 
     tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
         const DistributedFSDescriptor& descriptor);
@@ -137,6 +177,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
                        std::vector<tl::expected<void, ErrorCode>>& results,
                        bool write, bool complete_short_io);
 
+    ReadFlights read_flights_;
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;

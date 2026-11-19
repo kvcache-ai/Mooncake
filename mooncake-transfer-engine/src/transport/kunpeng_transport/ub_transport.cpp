@@ -31,7 +31,10 @@ UbTransport::~UbTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    // Contexts hold URMA resources and need the module alive; release them
+    // before pairing the urma_init() done in init().
     context_list_.clear();
+    uninit(this);
 }
 
 int UbTransport::install(std::string& local_server_name,
@@ -502,6 +505,7 @@ int UbTransport::init(UbTransport* transport) {
             LOG(ERROR) << "UrmaContext init failed";
             return -1;
         }
+        transport->urma_initialized_ = true;
     } else if (transport->endpoint_type_ == OBMM_ENDPOINT) {
         LOG(ERROR) << "ObmmContext not support now.";
         return -1;
@@ -514,6 +518,10 @@ int UbTransport::init(UbTransport* transport) {
 
 void UbTransport::uninit(UbTransport* transport) {
     if (transport->endpoint_type_ == URMA_ENDPOINT) {
+        // Idempotent: install() failure paths and the destructor both land
+        // here, while urma_init() happens exactly once per transport.
+        if (!transport->urma_initialized_) return;
+        transport->urma_initialized_ = false;
         if (!UrmaContext::uninit()) {
             LOG(ERROR) << "UrmaContext uninit failed";
         }

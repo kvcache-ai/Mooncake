@@ -43,6 +43,8 @@ class TestMooncakeBackend(CustomTestCase):
                     ib_devices,
                     "--mem-fraction-static",
                     "0.8",
+                    "--cuda-graph-max-bs-prefill",
+                    "2048",
                 ],
             )
 

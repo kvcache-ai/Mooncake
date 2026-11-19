@@ -31,8 +31,11 @@ bool shouldLogOccurrence(uint64_t occurrence) {
 void cancelTimerNoThrow(
     const std::shared_ptr<asio::steady_timer>& timer) noexcept {
     if (!timer) return;
-    asio::error_code ec;
-    timer->cancel(ec);
+    // Asio 1.36 cancel() throws on failure; this helper stays non-throwing.
+    try {
+        timer->cancel();
+    } catch (const std::exception&) {
+    }
 }
 
 // Tracks only whether executor-posted cancellation actions ran. It is not an
@@ -1562,10 +1565,7 @@ void TcpTransport::shutdownConnectionLanes() {
                     asio::dispatch(
                         group->executor,
                         [retry_timer, admission_timer, cancellation_posts] {
-                            if (retry_timer) {
-                                asio::error_code timer_ec;
-                                retry_timer->cancel(timer_ec);
-                            }
+                            if (retry_timer) cancelTimerNoThrow(retry_timer);
                             cancelTimerNoThrow(admission_timer);
                             cancellation_posts->done();
                         });
