@@ -11271,8 +11271,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         !enable_ha_ &&
                         metadata.AllReplicas(&Replica::fn_is_memory_replica);
                     const auto& state = accessor.GetState();
-                    if (metadata.IsHardPinned() ||
-                        (!can_move_with_read_lease &&
+                    if ((!can_move_with_read_lease &&
                          !metadata.IsLeaseExpired()) ||
                         !metadata.AllReplicas(&Replica::fn_is_completed) ||
                         state.is_processing || state.replication_task ||

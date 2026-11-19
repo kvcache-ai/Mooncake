@@ -748,7 +748,7 @@ therefore become ordinary cache after recovery or Standby promotion.
 #### with_hard_pin
 **Type:** `bool`
 **Default:** `False`
-**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects.
+**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects. An explicit drain job can move its replicas to other segments while preserving the hard pin.
 
 ```python
 config = ReplicateConfig()

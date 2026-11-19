@@ -573,9 +573,10 @@ curl -X PUT http://localhost:9003/api/v1/dfs/shard_count \
 
 ### Drain Job Endpoints
 
-Drain jobs migrate all objects away from one or more segments so they can be
-unmounted safely. Job states follow `CREATED -> PLANNING -> RUNNING ->
-SUCCEEDED | FAILED | CANCELED`.
+Drain jobs move replicas, including those of hard-pinned or soft-pinned objects, off one or
+more segments so the segments can be unmounted safely. Hard-pinned and soft-pinned objects
+retain their eviction protection and TTL after the move. Job states follow
+`CREATED -> PLANNING -> RUNNING -> SUCCEEDED | FAILED | CANCELED`.
 
 #### `POST /api/v1/drain_jobs`
 Create a drain job for the given segments.
