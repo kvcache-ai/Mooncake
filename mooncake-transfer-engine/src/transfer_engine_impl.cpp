@@ -436,14 +436,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
         const bool hint_intra_nvlink =
 #ifdef USE_INTRA_NVLINK
-            !force_hca && auto_discover_config_.protocol == "nvlink_intra";
+            !force_hca && !force_gpu_p2p &&
+            auto_discover_config_.protocol == "nvlink_intra";
 #else
             false;
 #endif
         const bool hint_gpu_p2p =
             !force_hca && auto_discover_config_.protocol == gpu_p2p_protocol;
-        // Explicit env var overrides take priority over HCA auto-detection
-        if (intra_env || (!force_gpu_p2p && hint_intra_nvlink)) {
+        // Env overrides (MC_INTRANODE_NVLINK > MC_FORCE_MNNVL/MC_FORCE_MUSA >
+        // MC_FORCE_HCA) take priority over protocol hints and HCA detection.
+        if (intra_env || hint_intra_nvlink) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
