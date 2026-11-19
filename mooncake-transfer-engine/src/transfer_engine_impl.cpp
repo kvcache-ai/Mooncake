@@ -452,7 +452,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
                 return -1;
             }
-            LOG(INFO) << "Using Intra-Node NVLink transport";
+            LOG(INFO) << "Using Intra-Node NVLink transport ("
+                      << (intra_env ? "MC_INTRANODE_NVLINK set"
+                                    : "protocol hint")
+                      << ")";
         } else if (kGpuP2PCompiled &&
                    (force_gpu_p2p || hint_gpu_p2p || (no_hca && !force_hca))) {
             // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
@@ -464,7 +467,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                            << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using " << gpu_p2p_name << " transport";
+            LOG(INFO) << "Using " << gpu_p2p_name << " transport ("
+                      << (force_gpu_p2p  ? "forced"
+                          : hint_gpu_p2p ? "protocol hint"
+                                         : "no HCA detected")
+                      << ")";
         } else if (!no_hca || force_hca) {
             const char* rdma_protocol =
                 globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
