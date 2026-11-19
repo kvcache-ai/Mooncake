@@ -1,4 +1,7 @@
 #include "client_service.h"
+
+#include <limits>
+
 #include "device/accelerator_registry.h"
 #include "storage/distributed/object_replica_io.h"
 
@@ -11,8 +14,11 @@ ErrorCode Client::InitObjectStorage() {
     if (!adapter) return adapter.error();
     object_storage_namespace_ = config->NamespaceId();
     object_storage_backend_ = std::make_shared<ObjectStorageBackend>(
-        ObjectStorageBackendConfig{config->max_object_bytes,
-                                   config->max_staging_bytes},
+        // A published descriptor may predate a lower write admission limit.
+        ObjectStorageBackendConfig{
+            .max_object_bytes = config->max_object_bytes,
+            .max_staging_bytes = config->max_staging_bytes,
+            .max_read_object_bytes = std::numeric_limits<uint64_t>::max()},
         *adapter);
     EnsureStorageControlPlaneStarted();
     return ErrorCode::OK;

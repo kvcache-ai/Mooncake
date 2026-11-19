@@ -228,7 +228,9 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
                                      const std::vector<Slice>& slices,
                                      uint64_t offset, const Copy& from_host) {
     const auto total_bytes = ValidateReadSlices(
-        object_size, config_.max_object_bytes, slices, offset);
+        object_size,
+        config_.max_read_object_bytes.value_or(config_.max_object_bytes),
+        slices, offset);
     if (!total_bytes) {
         return total_bytes.error();
     }
@@ -307,7 +309,9 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
         return Read(object_key, object_size, slices, offset, from_host);
     }
     const auto total_bytes = ValidateReadSlices(
-        object_size, config_.max_object_bytes, slices, offset);
+        object_size,
+        config_.max_read_object_bytes.value_or(config_.max_object_bytes),
+        slices, offset);
     if (!total_bytes) {
         return total_bytes.error();
     }

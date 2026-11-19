@@ -709,11 +709,13 @@ void MasterService::MaintainObjectStorage() {
 
 tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
     const ObjectReplicaSnapshot& snapshot) {
-    if (!object_uploads_)
-        return snapshot.target
-                   ? tl::expected<void, ErrorCode>(
-                         tl::make_unexpected(ErrorCode::NOT_SUPPORTED))
-                   : tl::expected<void, ErrorCode>{};
+    if (!object_uploads_) {
+        // The log retains the target identity even after the last forget.
+        // Live object descriptors are rejected during metadata restoration.
+        if (!snapshot.records.empty())
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        return {};
+    }
     if (snapshot.target && *snapshot.target != object_storage_config_.target)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     if (!object_uploads_->RestoreObjectReplicas(snapshot))

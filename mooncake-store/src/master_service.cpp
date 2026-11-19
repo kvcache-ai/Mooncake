@@ -5666,6 +5666,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
     if (!accessor.IsPublished()) {
+        if (object_uploads_ && object_uploads_->FirstObjectUploadForKey(
+                                   normalized_tenant.value(), key))
+            return false;
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
             replica.get_descriptor().get_local_disk_descriptor().object_size,
