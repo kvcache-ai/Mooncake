@@ -490,6 +490,7 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
     plans.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         auto &request = requests[i];
+        request.retained_on_failure = 0;
         request.result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         auto bytes = SliceBytes(request.slices);
         if (!bytes || *bytes > UINT32_MAX || request.key.logical_key.empty()) {
@@ -535,9 +536,7 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
                 const auto &context = contexts[request_index];
                 auto &item = prepared[context.plan_index];
                 if (requests[request_index].result) {
-                    item.written_chunk_keys.push_back(
-                        item.write_plan->chunk_values[context.chunk_index]
-                            .first);
+                    item.written_chunks.push_back(context.chunk_index);
                 } else {
                     item.error = requests[request_index].result.error();
                 }
@@ -816,11 +815,16 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
                 continue;
             }
             item.root_written = false;
-            item.written_chunk_keys.clear();
+            item.written_chunks.clear();
             results[plan_index] = PutResult{
                 .stored = true,
                 .inserted = true,
-                .added_payload_bytes = plans[plan_index].payload_size};
+                .new_chunk_bytes = item.write_plan->store_inline
+                                       ? 0u
+                                       : item.write_plan->payload_size,
+                .inline_bytes = item.write_plan->store_inline
+                                    ? item.write_plan->payload_size
+                                    : 0u};
             if (!item.write_plan->store_inline) {
                 CacheManifestAfterWrite(
                     plans[plan_index].key, plans[plan_index].payload_size,
@@ -837,7 +841,7 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
                 *connector_, plans[index].key, item.payload, item);
             if (results[index] && results[index]->stored) {
                 item.root_written = false;
-                item.written_chunk_keys.clear();
+                item.written_chunks.clear();
             }
         });
     } catch (const std::exception &error) {
@@ -860,7 +864,13 @@ tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
             !results[i]->stored) {
             results[i] = tl::make_unexpected(worker_error);
         }
-        requests[plans[i].request_index].result = std::move(results[i]);
+        auto &request = requests[plans[i].request_index];
+        if (results[i] && results[i]->stored) {
+            results[i]->new_chunk_bytes += prepared[i].retained_chunk_bytes;
+        } else {
+            request.retained_on_failure = prepared[i].retained_chunk_bytes;
+        }
+        request.result = std::move(results[i]);
     }
     if (worker_error != ErrorCode::OK) {
         return tl::make_unexpected(worker_error);

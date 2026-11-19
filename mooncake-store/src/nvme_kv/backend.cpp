@@ -82,10 +82,13 @@ class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
             return;
         }
 
-        const auto delete_key = [&](const NvmeKvPhysicalKey &key) {
+        const auto delete_key = [&](size_t index) {
+            const auto &chunk = attempt.write_plan->manifest_records[index];
             try {
-                auto result = connector.Delete(key);
-                if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                auto result = connector.Delete(chunk.physical_key);
+                if (result || result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    attempt.retained_chunk_bytes -= chunk.payload_size;
+                } else {
                     LOG(WARNING) << "NVMe KV failed to clean local value for "
                                  << attempt.write_plan->identity.logical_key
                                  << " error=" << toString(result.error());
@@ -97,7 +100,11 @@ class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
                 LOG(WARNING) << "NVMe KV abort cleanup failed";
             }
         };
-        auto chunks = std::exchange(attempt.written_chunk_keys, {});
+        auto chunks = std::exchange(attempt.written_chunks, {});
+        for (size_t i : chunks) {
+            attempt.retained_chunk_bytes +=
+                attempt.write_plan->manifest_records[i].payload_size;
+        }
         const bool published = std::exchange(attempt.root_written, false);
         if (published || chunks.empty()) return;
         // A failed completion can follow a successful root insert. It may
@@ -120,7 +127,7 @@ class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
             LOG(WARNING) << "NVMe KV could not confirm chunk ownership";
             return;
         }
-        for (const auto &key : chunks) delete_key(key);
+        for (size_t i : chunks) delete_key(i);
     }
 
    private:
@@ -210,8 +217,6 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::Init() {
         initialized_.store(false, std::memory_order_release);
         return init_res;
     }
-    total_size_.store(0, std::memory_order_relaxed);
-    total_keys_.store(0, std::memory_order_relaxed);
     return {};
 }
 
@@ -236,7 +241,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     };
     std::vector<OffloadPlan> plans;
     plans.reserve(batch_object.size());
-    int64_t batch_total_size = 0;
     for (const auto &[key, slices] : batch_object) {
         if (slices.empty()) {
             continue;
@@ -250,12 +254,9 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             payload_size += slice.size;
         }
         if (payload_size >
-                static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
-            batch_total_size > std::numeric_limits<int64_t>::max() -
-                                   static_cast<int64_t>(payload_size)) {
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        batch_total_size += static_cast<int64_t>(payload_size);
         plans.push_back(OffloadPlan{key, &slices, payload_size});
     }
 
@@ -263,20 +264,27 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         return 0;
     }
 
-    if (total_keys_.load(std::memory_order_relaxed) +
-            static_cast<int64_t>(plans.size()) >
-        file_storage_config_.total_keys_limit) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    std::unique_lock quota_lock(quota_mutex_);
+    // An ambiguous publish can retain both the old inline root and new chunks.
+    // Allow a shrink to recover space even when that put exhausted the quota.
+    int64_t available_bytes = std::max<int64_t>(
+        0, file_storage_config_.total_size_limit - total_size_);
+    int64_t new_keys = 0;
+    for (const auto &plan : plans) {
+        const auto it = charged_inline_bytes_.find(plan.key);
+        const bool is_new = it == charged_inline_bytes_.end();
+        if (is_new) ++new_keys;
+        // Another key's growth cannot depend on a shrink that may fail.
+        const auto required =
+            std::max<int64_t>(0, static_cast<int64_t>(plan.payload_size) -
+                                     (is_new ? 0 : it->second));
+        if (required > available_bytes) {
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        }
+        available_bytes -= required;
     }
-    if (total_size_.load(std::memory_order_relaxed) + batch_total_size >
-        file_storage_config_.total_size_limit) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    }
-    auto enable_offloading_res = IsEnableOffloading();
-    if (!enable_offloading_res) {
-        return tl::make_unexpected(enable_offloading_res.error());
-    }
-    if (!enable_offloading_res.value()) {
+    if (new_keys > file_storage_config_.total_keys_limit -
+                       static_cast<int64_t>(charged_inline_bytes_.size())) {
         return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
 
@@ -291,11 +299,10 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     std::vector<StorageObjectMetadata> metadatas;
     keys.reserve(plans.size());
     metadatas.reserve(plans.size());
-    int64_t inserted_keys = 0;
-    int64_t inserted_size = 0;
     ErrorCode first_error =
         worker_result ? ErrorCode::OK : worker_result.error();
     for (size_t i = 0; i < plans.size(); ++i) {
+        total_size_ += requests[i].retained_on_failure;
         if (!requests[i].result) {
             if (first_error == ErrorCode::OK) {
                 first_error = requests[i].result.error();
@@ -305,11 +312,10 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         if (!requests[i].result.value().stored) {
             continue;
         }
-        if (requests[i].result.value().inserted) {
-            ++inserted_keys;
-        }
-        inserted_size +=
-            static_cast<int64_t>(requests[i].result->added_payload_bytes);
+        const auto &result = *requests[i].result;
+        auto &previous = charged_inline_bytes_[plans[i].key];
+        total_size_ += result.new_chunk_bytes + result.inline_bytes - previous;
+        previous = result.inline_bytes;
         keys.push_back(plans[i].key);
         metadatas.emplace_back(StorageObjectMetadata{
             .bucket_id = 0,
@@ -320,8 +326,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         });
     }
 
-    total_keys_.fetch_add(inserted_keys, std::memory_order_relaxed);
-    total_size_.fetch_add(inserted_size, std::memory_order_relaxed);
+    quota_lock.unlock();
     if (complete_handler != nullptr && !keys.empty()) {
         const auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
@@ -401,7 +406,8 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
         const auto &root_blob = write_plan.root_blob;
         const auto &chunk_store_values = write_plan.chunk_values;
         if (store_inline && current && current->root.blob == root_blob)
-            return NvmeKvPutResult{.stored = true, .inserted = false};
+            return NvmeKvPutResult{.stored = true,
+                                   .inline_bytes = write_plan.payload_size};
         const auto publish_root = [&]() -> tl::expected<void, ErrorCode> {
             // A root originally inserted by the batch path may be the only
             // proof that its chunks were published. Keep it before replacing
@@ -413,9 +419,9 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             return connector->Store(physical_key, root_blob, mode);
         };
 
-        auto &written_chunk_keys = attempt.written_chunk_keys;
+        auto &written_chunks = attempt.written_chunks;
         auto &root_written = attempt.root_written;
-        size_t added_payload_bytes = 0;
+        uint32_t new_chunk_bytes = 0;
         bool write_success = true;
         bool slot_collision = false;
         ErrorCode &write_error = attempt.error;
@@ -427,15 +433,6 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                 write_error = store_res.error();
             } else {
                 root_written = !current;
-                if (current) {
-                    const auto previous =
-                        current->root.header.object_type ==
-                                static_cast<uint32_t>(NvmeKvObjectType::kInline)
-                            ? current->root.header.payload_size
-                            : 0u;
-                    if (payload_size > previous)
-                        added_payload_bytes = payload_size - previous;
-                }
             }
         } else {
             std::optional<bool> recorded_manifest;
@@ -479,10 +476,9 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             for (size_t chunk_index = 0; chunk_index < chunk_requests.size();
                  ++chunk_index) {
                 if (chunk_requests[chunk_index].result) {
-                    written_chunk_keys.push_back(
-                        chunk_store_values[chunk_index].first);
-                    added_payload_bytes +=
-                        chunk_store_values[chunk_index].second.size();
+                    written_chunks.push_back(chunk_index);
+                    new_chunk_bytes +=
+                        write_plan.manifest_records[chunk_index].payload_size;
                 }
             }
 
@@ -503,9 +499,8 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             }
             if (write_success) {
                 if (current && current->root.blob == root_blob) {
-                    return NvmeKvPutResult{
-                        .stored = true,
-                        .added_payload_bytes = added_payload_bytes};
+                    return NvmeKvPutResult{.stored = true,
+                                           .new_chunk_bytes = new_chunk_bytes};
                 }
                 // Once the record can be observed, another writer may publish
                 // these chunks even if our own completion is lost.
@@ -517,7 +512,9 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
                             return tl::make_unexpected(saved.error());
                         }
                     }
-                    written_chunk_keys.clear();
+                    attempt.retained_chunk_bytes += new_chunk_bytes;
+                    new_chunk_bytes = 0;
+                    written_chunks.clear();
                 }
                 auto store_res = publish_root();
                 if (!store_res) {
@@ -534,7 +531,11 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             auto existing =
                 StoredValueMatches(*connector, physical_key, root_blob);
             if (existing && *existing)
-                return NvmeKvPutResult{.stored = true, .inserted = false};
+                return NvmeKvPutResult{
+                    .stored = true,
+                    .new_chunk_bytes = new_chunk_bytes,
+                    .inline_bytes =
+                        store_inline ? write_plan.payload_size : 0u};
             if (existing)
                 slot_collision = true;
             else
@@ -549,11 +550,11 @@ tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
             return tl::make_unexpected(write_error);
         }
 
-        return NvmeKvPutResult{.stored = true,
-                               .inserted = !current,
-                               .added_payload_bytes = current
-                                                          ? added_payload_bytes
-                                                          : payload_size};
+        return NvmeKvPutResult{
+            .stored = true,
+            .inserted = !current,
+            .new_chunk_bytes = new_chunk_bytes,
+            .inline_bytes = store_inline ? write_plan.payload_size : 0u};
     }
     return NvmeKvPutResult{};
 }
@@ -597,10 +598,10 @@ tl::expected<bool, ErrorCode> NvmeKvStorageBackend::IsEnableOffloading() {
     if (object_store_ == nullptr) {
         return false;
     }
-    return total_keys_.load(std::memory_order_relaxed) <
+    std::lock_guard lock(quota_mutex_);
+    return static_cast<int64_t>(charged_inline_bytes_.size()) <
                file_storage_config_.total_keys_limit &&
-           total_size_.load(std::memory_order_relaxed) <
-               file_storage_config_.total_size_limit;
+           total_size_ < file_storage_config_.total_size_limit;
 }
 
 tl::expected<void, ErrorCode> NvmeKvStorageBackend::ScanMeta(

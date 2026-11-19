@@ -213,17 +213,19 @@ TEST_P(NvmeKvObjectStoreTest, LostRootUpdateCompletionKeepsPublishedChunks) {
 TEST_P(NvmeKvObjectStoreTest, RewritesAccountForNewPayloadStorage) {
     auto result = Put("key", "a");
     ASSERT_TRUE(result && result->stored && result->inserted);
-    EXPECT_EQ(result->added_payload_bytes, 1u);
+    EXPECT_EQ(result->inline_bytes, 1u);
+    EXPECT_EQ(result->new_chunk_bytes, 0u);
     result = Put("key", "longer");
     ASSERT_TRUE(result && result->stored && !result->inserted);
-    EXPECT_EQ(result->added_payload_bytes, 5u);
+    EXPECT_EQ(result->inline_bytes, 6u);
     const std::string value(9000, 'x');
     result = Put("key", value);
     ASSERT_TRUE(result && result->stored && !result->inserted);
-    EXPECT_EQ(result->added_payload_bytes, value.size());
+    EXPECT_EQ(result->inline_bytes, 0u);
+    EXPECT_EQ(result->new_chunk_bytes, value.size());
     result = Put("key", value);
     ASSERT_TRUE(result && result->stored && !result->inserted);
-    EXPECT_EQ(result->added_payload_bytes, 0u);
+    EXPECT_EQ(result->new_chunk_bytes, 0u);
 }
 
 TEST_P(NvmeKvObjectStoreTest, ConcurrentRewritesPublishOneCompleteValue) {
@@ -297,7 +299,11 @@ TEST_P(NvmeKvObjectStoreTest, FailedManifestRetentionCanBeRetried) {
         } else {
             device->fail_store = record;
         }
-        ASSERT_FALSE(Put(key, value));
+        Slice slice{const_cast<char*>(value.data()), value.size()};
+        NvmeKvObjectStore::PutRequest request{{key}, {&slice, 1}};
+        store->PutBatch(std::span(&request, 1));
+        ASSERT_FALSE(request.result);
+        EXPECT_EQ(request.retained_on_failure, applied ? value.size() : 0u);
         std::string old(3, '?');
         ASSERT_TRUE(Get(key, old));
         EXPECT_EQ(old, "old");
@@ -308,7 +314,7 @@ TEST_P(NvmeKvObjectStoreTest, FailedManifestRetentionCanBeRetried) {
         NewStore();
         auto retry = Put(key, value);
         ASSERT_TRUE(retry && retry->stored);
-        EXPECT_EQ(retry->added_payload_bytes, applied ? 0u : value.size());
+        EXPECT_EQ(retry->new_chunk_bytes, applied ? 0u : value.size());
         NewStore();
         std::string output(value.size(), '?');
         ASSERT_TRUE(Get(key, output));
@@ -325,7 +331,7 @@ TEST_P(NvmeKvObjectStoreTest, ReopenedWriterReusesRetiredChunkSets) {
         NewStore();
         auto restored = Put(key, value);
         ASSERT_TRUE(restored && restored->stored);
-        EXPECT_EQ(restored->added_payload_bytes, 0u);
+        EXPECT_EQ(restored->new_chunk_bytes, 0u);
         std::string output(value.size(), '?');
         ASSERT_TRUE(Get(key, output));
         EXPECT_EQ(output, value);
