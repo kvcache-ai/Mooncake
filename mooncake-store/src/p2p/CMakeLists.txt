@@ -40,6 +40,8 @@ set(MOONCAKE_STORE_P2P_CLIENT_SOURCES
     client/p2p_client_config_builder.cpp
     client/p2p_client_service.cpp
     client/p2p_real_client.cpp
+    client/p2p_real_client_runtime.cpp
+    client/p2p_dummy_client.cpp
     client/p2p_client_metric.cpp
     client/peer_client.cpp
     client/client_rpc_service.cpp

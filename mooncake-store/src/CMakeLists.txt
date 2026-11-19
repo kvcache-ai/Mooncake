@@ -19,8 +19,6 @@ set(MOONCAKE_STORE_COMMON_CLIENT_SOURCES
     config/client_auto_port_config.cpp
     posix_file.cpp
     client_buffer.cpp
-    real_client.cpp
-    dummy_client.cpp
     shm_helper.cpp
 )
 
@@ -265,6 +263,8 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
     set(MOONCAKE_STORE_CENTRALIZED_CLIENT_SOURCES
         client_service.cpp
         centralized_real_client.cpp
+        real_client.cpp
+        dummy_client.cpp
         client_metric.cpp
         config/client_metric_config.cpp
         master_client.cpp

@@ -1,9 +1,12 @@
-#include "real_client.h"
+#include "p2p/client/p2p_real_client.h"
 
 #include "p2p/client/p2p_client_config_builder.h"
 
 namespace mooncake {
 
+// TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
+// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/p2p/client/p2p_real_client.cpp:7.
+// Register the typed RPC handlers for the five P2P Dummy CPU/SHM entries.
 void RealClient::register_dummy_rpc_handlers() {
     auto& server = *dummy_rpc_server_;
     server.register_handler<&RealClient::put_dummy_helper>(this);

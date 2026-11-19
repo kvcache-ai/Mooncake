@@ -2,7 +2,7 @@
 #include <gflags/gflags.h>
 
 #include "p2p/client/p2p_client_config_builder.h"
-#include "real_client.h"
+#include "p2p/client/p2p_real_client.h"
 
 using namespace mooncake;
 

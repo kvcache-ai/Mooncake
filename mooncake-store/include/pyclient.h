@@ -9,16 +9,11 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "common_types.h"
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-#include "p2p/common/p2p_types.h"
-#else
 #include "rpc_types.h"
-#endif
 #include "client_buffer.h"
 
 namespace mooncake {
 
-#define MOONCAKE_SHM_NAME "mooncake_shm"
 // Protocol structure for IPC registration
 struct ShmRegisterRequest {
     uint64_t client_id_first;
@@ -28,15 +23,9 @@ struct ShmRegisterRequest {
     bool is_local_buffer;
 };
 
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-using WriteConfig = P2PWriteRouteConfig;
-using ReadConfig = P2PReadRouteConfig;
-using ObjectDescriptor = P2PRouteDescriptor;
-#else
 using WriteConfig = ReplicateConfig;
 using ReadConfig = CentralizedReadConfig;
 using ObjectDescriptor = Replica::Descriptor;
-#endif
 
 enum class WriteOperation { Put, Publish };
 
@@ -146,7 +135,6 @@ class PyClient {
 
     virtual int tearDownAll() = 0;
 
-#if !defined(MOONCAKE_STORE_CLIENT_P2P)
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string& key, const std::vector<std::string>& targets) = 0;
 
@@ -156,7 +144,6 @@ class PyClient {
 
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID& task_id) = 0;
-#endif
 
     virtual bool is_initialized() const = 0;
 };

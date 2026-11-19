@@ -11,7 +11,6 @@
 #include <glog/logging.h>
 
 #include "common/client_buffer_allocation.h"
-#include "pyclient.h"
 
 namespace mooncake {
 
