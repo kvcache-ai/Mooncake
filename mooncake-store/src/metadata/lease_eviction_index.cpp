@@ -917,8 +917,11 @@ uint16_t LeaseEvictionIndex::ShardForGroupLease(const Lease* group_lease) {
                                  (64 - kShardBits));
 }
 
+// By EvictionOrder(), which differs from the deadline only for an object
+// restored from a standby and not read or written since; a read or write
+// only moves it later.
 Rank LeaseEvictionIndex::RankOf(const ObjectMetadata& metadata) {
-    return BucketOf(metadata.EvictionDeadline());
+    return BucketOf(metadata.EvictionOrder());
 }
 
 Rank LeaseEvictionIndex::BucketOf(Clock::time_point deadline) {
