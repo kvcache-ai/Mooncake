@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "ascii_string.h"
+#include "common/sharded_map.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -953,9 +954,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
      * @param deferred_keys Optional output: keys moved to the internal
-     * ungrouped pool this call (the tail partial bucket, deferred so the next
-     * call can write them as part of a full bucket). These keys are NOT in
-     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * ungrouped pool this call (the tail partial bucket). These keys are NOT
+     * in buckets_keys now. FileStorage replays carried keys on the next pass,
+     * which may emit a partial bucket; empty backend input does not flush. The
      * caller must keep their offload tasks alive across the deferral — a key
      * re-emitted from the pool arrives without a task otherwise
      * (neuralwatt: the silent deferred-tail loss, upstream #3006).
@@ -1343,7 +1344,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Round-robin cursor for SelectDiskForWrite: the disk to try first on the
     // next write.
     int rr_cursor_ GUARDED_BY(mutex_) = 0;
-    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+    ShardedMap<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     // Reserved key sets stay global: key uniqueness is a property of the whole
     // backend, not of one disk.

@@ -35,6 +35,16 @@ keyspace = f"mc/store-rs/py-compat/{stamp}"
 redis_url = os.environ["MC_STORE_RS_REDIS_URL"]
 
 
+def operation_count(metrics, operation):
+    return sum(
+        int(line.rsplit(" ", 1)[1])
+        for line in metrics.splitlines()
+        if line.startswith("mooncake_store_operation_total{")
+        and f'operation="{operation}"' in line
+        and 'status="ok"' in line
+    )
+
+
 def wait_for_embedded_wrh_replication(writer, reader) -> None:
     config = ReplicateConfig(replica_num=2)
     key = "__wrh-ready__"
@@ -86,7 +96,15 @@ assert store_peer.setup(
 
 wait_for_embedded_wrh_replication(store, store_peer)
 
+before_put = metrics_text()
 assert store.put("py-key", b"hello-python") == 0
+after_put = metrics_text()
+put_counts = (operation_count(before_put, "put"), operation_count(after_put, "put"))
+batch_put_counts = (
+    operation_count(before_put, "batch_put"), operation_count(after_put, "batch_put")
+)
+assert put_counts[1] == put_counts[0] + 1, put_counts
+assert batch_put_counts[1] == batch_put_counts[0], batch_put_counts
 assert store.get("py-key") == b"hello-python"
 assert store_peer.get("py-key") == b"hello-python"
 route = store.query_route("py-key")
@@ -123,6 +141,29 @@ preferred_config = ReplicateConfig(
     replica_num=1,
     preferred_segment=preferred_segment,
 )
+scoped_store = MooncakeDistributedStore()
+assert scoped_store.setup(
+    "127.0.0.1", redis_url, 4 * 1024 * 1024, 1 * 1024 * 1024,
+    "tcp", "", redis_url,
+    stable_id=f"py-compat-scoped-{stamp}",
+    keyspace=keyspace,
+    tenant="put-tenant",
+    domain="put-domain",
+    object_set="put-set",
+    labels={"pool": "pool-a", "storage": "true"},
+) == 0
+scoped_segment = scoped_store.list_segments()[0]["segment_name"]
+scoped_config = ReplicateConfig(replica_num=1, preferred_segment=scoped_segment)
+assert scoped_store.put(
+    "py-key", b"scoped-python", tenant="put-tenant", config=scoped_config,
+) == 0
+assert scoped_store.get("py-key", tenant="put-tenant") == b"scoped-python"
+scoped_route = scoped_store.query_route("py-key", tenant="put-tenant")
+assert scoped_route is not None
+assert scoped_route["key"] == "put-tenant::ns/put-domain/put-set/py-key"
+assert len(scoped_route["replicas"]) == 1
+assert scoped_route["replicas"][0]["segment_name"] == scoped_segment
+assert store.get("py-key") == b"hello-python"
 assert store.batch_put(
     [("policy-batch-a", b"left"), ("policy-batch-b", b"right")],
     config=preferred_config,
@@ -242,13 +283,8 @@ assert store.batch_is_exist(["put-batch-a", "put-batch-b"]) == [0, 0]
 
 metrics = metrics_text()
 assert "mooncake_store_operation_total" in metrics
-assert any(
-    operation in metrics
-    for operation in (
-        'operation="put",status="ok"',
-        'operation="batch_put",status="ok"',
-    )
-)
+assert 'operation="put",status="ok"' in metrics
+assert 'operation="batch_put",status="ok"' in metrics
 assert 'operation="batch_get",status="ok"' in metrics
 
 metrics_addr = store.start_metrics_server()
@@ -261,6 +297,7 @@ store.stop_metrics_server()
 assert metrics_server_address() is None
 stop_metrics_server()
 
+scoped_store.close()
 store_peer.close()
 store.close()
 print("python compat ok")

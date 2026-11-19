@@ -375,7 +375,11 @@ class TransferEngineImpl {
 
     Status waitTransferCompletion(BatchID batch_id);
 
-    Status transferSync(const std::vector<Request>& request_list);
+    Status waitTransfer(BatchID batch_id,
+                        std::vector<TransferStatus>* status_list = nullptr,
+                        uint64_t timeout_ms = 0);
+
+    Status submitAndWaitTransfer(const std::vector<Request>& request_list);
 
     uint64_t lockStageBuffer(const std::string& location);
 
@@ -550,6 +554,13 @@ class TransferEngineImpl {
 
     Status cancelQueuedOwner(QueueOwnerId owner_id);
 
+    // Cancels the batch's owners that are still waiting in the admission queue
+    // and does not refill the dispatch window per owner: a refill in the middle
+    // of this loop could start another owner of the same batch. Owners that are
+    // already in the dispatch window are left for the caller to cancel in
+    // flight.
+    Status cancelQueuedOwners(BatchID batch_id);
+
     Status retireQueueForBatch(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
@@ -568,6 +579,11 @@ class TransferEngineImpl {
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
 
+    // False when req carries a producer_event that the route (a concrete
+    // transport, or a staged route) would not order the copy after.
+    bool producerEventHonored(const Request& req, TransportType type,
+                              bool staging) const;
+
     Status loadTransports();
 
     // Control-plane delivery used by sendNotification() once every loaded
@@ -576,8 +592,8 @@ class TransferEngineImpl {
     Status sendNotificationViaRpc(SegmentID target_id,
                                   const Notification& notifi);
 
-    void findStagingPolicy(const Request& req,
-                           std::vector<std::string>& policy);
+    void findStagingPolicy(const Request& req, std::vector<std::string>& policy,
+                           bool allow_device_direct = true);
 
     // True when a request touching XPU or MLU memory can go over RDMA without
     // host staging: the RDMA transport advertises the device capability the
@@ -662,6 +678,7 @@ class TransferEngineImpl {
    private:
     std::shared_ptr<Config> conf_;
     HpTcpTransportConfig hp_tcp_transport_config_;
+    MnnvlConfig mnnvl_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;

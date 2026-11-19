@@ -3962,6 +3962,17 @@ TEST_F(RealClientTest, UnregisterBufferRetryReachesNofCleanup) {
     EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
     EXPECT_EQ(initiator->unregister_calls_, 2);
 
+    // TENT can report success for an already-unregistered address. Store's
+    // missing record must still prevent another NoF cleanup in that case.
+    {
+        TeUnregisterHookGuard hook_guard;
+        RealClient::SetTeUnregisterHookForTesting(
+            [](void*) -> tl::expected<void, ErrorCode> { return {}; });
+        EXPECT_EQ(py_client_->unregister_buffer(buffer.data()),
+                  toInt(ErrorCode::NOT_REGISTERED));
+        EXPECT_EQ(initiator->unregister_calls_, 2);
+    }
+
     ASSERT_EQ(py_client_->tearDownAll(), 0);
 }
 
