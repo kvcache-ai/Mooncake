@@ -28,10 +28,14 @@
 #include <numeric>
 
 #include "context.h"
+#include "mooncake_te_build_config.h"
 #include "rail_monitor.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/concurrent/bounded_mpsc_queue.h"
 #include "tent/common/types.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -50,6 +54,18 @@ inline constexpr int kIbvEventDeviceSpeedChange = 20;  // after WQ_FATAL (19)
 // A build against a header that names it pins the value above.
 static_assert(kIbvEventDeviceSpeedChange == IBV_EVENT_DEVICE_SPEED_CHANGE,
               "verbs async-event values are append-only; update the fallback");
+#endif
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+adaptive_congestion_control::Decision acquireTentCongestionControlAttempt(
+    RdmaSlice& slice, TentRdmaCongestionControlRoute* route,
+    const adaptive_congestion_control::PathHandle& path, uint64_t bytes,
+    uint32_t endpoint_generation);
+bool completeTentCongestionControlAttempt(
+    RdmaSlice& slice, adaptive_congestion_control::OutcomeClass outcome,
+    adaptive_congestion_control::FailureScope scope);
+void tickTentCongestionControlRoute(TentRdmaCongestionControlRoute& route,
+                                    uint64_t now_ns);
 #endif
 
 class Workers {
@@ -91,6 +107,7 @@ class Workers {
    private:
     using Task = std::function<void()>;
     struct WorkerContext;
+    struct PostPath;
 
     void workerThread(int thread_id);
 
@@ -104,11 +121,11 @@ class Workers {
     // `last_in_pass` is true for the final work completion of a poll pass:
     // the meter is only offered a sample there, so an interval never ends
     // partway through a group of completions that share one timestamp.
-    void handleCompletion(WorkerContext& worker, RdmaContext& context,
-                          const ibv_wc& wc, uint64_t poll_ts,
-                          bool last_in_pass = true,
-                          bool queue_already_drained = false,
-                          bool completion_owed = true);
+    void handleCompletion(
+        WorkerContext& worker, RdmaContext& context, const ibv_wc& wc,
+        uint64_t poll_ts, bool last_in_pass = true,
+        bool queue_already_drained = false, bool completion_owed = true,
+        const std::shared_ptr<RdmaEndPoint>* borrowed_ep = nullptr);
 
     // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
     // when it cannot be resolved (no lane recorded, or the worker array is
@@ -184,6 +201,16 @@ class Workers {
     // DeviceSelector::release.
     void releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
                            double latency = 0.0);
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    adaptive_congestion_control::Decision acquireCongestionPermit(
+        RdmaSlice* slice, const PostPath& path,
+        const std::shared_ptr<RdmaEndPoint>& endpoint);
+    void completeCongestionPermit(
+        RdmaSlice* slice, adaptive_congestion_control::OutcomeClass outcome,
+        adaptive_congestion_control::FailureScope scope);
+    void updateCongestionSignals(uint64_t now_ns);
+#endif
 
     // Record that `slice` has reached its source device's hardware. Its
     // submit_ts opens the device's busy stretch when nothing else was
@@ -310,6 +337,9 @@ class Workers {
     };
 
     std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    TentRdmaCongestionControlRoute* getCongestionRoute(const PostPath& path);
+#endif
 
     void disableEndpoint(RdmaSlice* slice);
 
@@ -398,6 +428,14 @@ class Workers {
         // Shared ownership keeps the monitor alive while a slice is retained
         // by an endpoint through delayed teardown.
         std::unordered_map<std::string, std::shared_ptr<RailMonitor>> rails;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        // Pointers remain valid until Workers teardown.
+        std::unordered_map<PostPath, TentRdmaCongestionControlRoute*,
+                           PostPathHash>
+            congestion_control_routes;
+        uint64_t congestion_control_last_poll_ns = 0;
+        bool congestion_control_poller_stalled = false;
+#endif
         PerfMetricSummary perf;
         uint64_t padding[15];
     };
@@ -436,6 +474,15 @@ class Workers {
     // Opt-in deadline-aware bandwidth arbitration within a priority tier
     // (RFC #2792). Default false = original FIFO order (equal bandwidth split).
     bool deadline_bw_arbitration_ = false;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    adaptive_congestion_control::Config congestion_control_config_;
+    std::vector<std::shared_ptr<adaptive_congestion_control::DomainState>>
+        congestion_control_devices_;
+    std::mutex congestion_control_routes_mutex_;
+    std::unordered_map<
+        PostPath, std::shared_ptr<TentRdmaCongestionControlRoute>, PostPathHash>
+        congestion_control_routes_;
+#endif
 };
 }  // namespace tent
 }  // namespace mooncake

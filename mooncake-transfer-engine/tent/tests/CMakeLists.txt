@@ -1110,3 +1110,16 @@ add_executable(tent_c_status_test c_status_test.cpp status_c_api_smoke.c)
 target_link_libraries(tent_c_status_test PRIVATE tent_shared tent_interface
                                                  gtest gtest_main)
 add_test(NAME tent_c_status_test COMMAND tent_c_status_test)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL AND TARGET tent_xport_rdma)
+  target_link_libraries(rdma_cancel_test
+                        PRIVATE adaptive_congestion_control_core)
+  add_executable(tent_adaptive_congestion_control_test
+                 adaptive_congestion_control_test.cpp)
+  target_link_libraries(
+    tent_adaptive_congestion_control_test
+    PRIVATE gtest gtest_main tent_link_group adaptive_congestion_control_core)
+  target_include_directories(tent_adaptive_congestion_control_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_adaptive_congestion_control_test
+           COMMAND tent_adaptive_congestion_control_test)
+endif()

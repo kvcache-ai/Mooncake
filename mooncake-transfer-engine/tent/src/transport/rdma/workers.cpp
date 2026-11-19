@@ -35,10 +35,61 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control_config.h"
+#include "rdma_error_classifier.h"
+#endif
 
 namespace mooncake {
 namespace tent {
 thread_local int tl_wid = -1;
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+namespace {
+void publishTentCongestionControlAttempt(RdmaSlice& slice,
+                                         TentRdmaCongestionControlRoute* route,
+                                         uint32_t endpoint_generation) {
+    slice.congestion_control_route = route;
+    slice.congestion_control_endpoint_generation = endpoint_generation;
+    route->endpoint_generation.store(endpoint_generation,
+                                     std::memory_order_release);
+}
+}  // namespace
+
+adaptive_congestion_control::Decision acquireTentCongestionControlAttempt(
+    RdmaSlice& slice, TentRdmaCongestionControlRoute* route,
+    const adaptive_congestion_control::PathHandle& path, uint64_t bytes,
+    uint32_t endpoint_generation) {
+    const auto decision = adaptive_congestion_control::tryAcquire(
+        path, bytes, slice.congestion_control_permit);
+    if (decision == adaptive_congestion_control::Decision::kAllow) {
+        publishTentCongestionControlAttempt(slice, route, endpoint_generation);
+    }
+    return decision;
+}
+
+bool completeTentCongestionControlAttempt(
+    RdmaSlice& slice, adaptive_congestion_control::OutcomeClass outcome,
+    adaptive_congestion_control::FailureScope scope) {
+    if (!slice.congestion_control_permit.active()) return false;
+    auto* route = slice.congestion_control_route;
+    const bool current_endpoint =
+        route && route->endpoint_generation.load(std::memory_order_acquire) ==
+                     slice.congestion_control_endpoint_generation;
+    if (!current_endpoint) {
+        outcome = adaptive_congestion_control::OutcomeClass::kDerivedFlush;
+        scope = adaptive_congestion_control::FailureScope::kOperation;
+    }
+    const bool completed = adaptive_congestion_control::complete(
+        slice.congestion_control_permit, outcome, scope);
+    if (completed) slice.congestion_control_route = nullptr;
+    return completed;
+}
+void tickTentCongestionControlRoute(TentRdmaCongestionControlRoute& route,
+                                    uint64_t now_ns) {
+    adaptive_congestion_control::controlTick(route.domain, now_ns);
+}
+#endif
 
 namespace {
 // Look up (or create) the RailMonitor for `machine_id` on this worker's map.
@@ -83,6 +134,30 @@ Workers::Workers(RdmaTransport* transport)
     device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
     GdrReachability::instance().configure(conf.get());
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    auto loaded_congestion_control =
+        adaptive_congestion_control::loadConfigFromEnvironment();
+    if (loaded_congestion_control.valid) {
+        congestion_control_config_ = loaded_congestion_control.config;
+    } else {
+        static std::once_flag warning_once;
+        std::call_once(warning_once, [&] {
+            LOG(ERROR) << "Invalid adaptive congestion-control setting: "
+                       << loaded_congestion_control.error
+                       << "; TENT RDMA enforcement disabled";
+        });
+    }
+    if (congestion_control_config_.mode !=
+        adaptive_congestion_control::Mode::kOff) {
+        congestion_control_devices_.reserve(transport_->context_set_.size());
+        for (size_t i = 0; i < transport_->context_set_.size(); ++i) {
+            congestion_control_devices_.push_back(
+                std::make_shared<adaptive_congestion_control::DomainState>(
+                    congestion_control_config_, 1));
+        }
+    }
+#endif
 
     // RailMonitor consumes JSON text, while the public configuration is a file
     // path. Load it once here instead of reopening the file for every worker
@@ -548,6 +623,85 @@ void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
         device_selector_->release(charged, slice->length, latency);
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TentRdmaCongestionControlRoute* Workers::getCongestionRoute(
+    const PostPath& path) {
+    auto& local_routes = worker_context_[tl_wid].congestion_control_routes;
+    auto local = local_routes.find(path);
+    if (local != local_routes.end()) return local->second;
+    std::lock_guard<std::mutex> lock(congestion_control_routes_mutex_);
+    auto [it, inserted] = congestion_control_routes_.try_emplace(path, nullptr);
+    if (inserted)
+        it->second = std::make_shared<TentRdmaCongestionControlRoute>(
+            congestion_control_config_);
+    if (inserted && path.local_device_id >= 0 &&
+        static_cast<size_t>(path.local_device_id) <
+            congestion_control_devices_.size())
+        it->second->device_owner =
+            congestion_control_devices_[path.local_device_id];
+    local_routes[path] = it->second.get();
+    return it->second.get();
+}
+
+adaptive_congestion_control::Decision Workers::acquireCongestionPermit(
+    RdmaSlice* slice, const PostPath& path,
+    const std::shared_ptr<RdmaEndPoint>& endpoint) {
+    if (congestion_control_config_.mode ==
+            adaptive_congestion_control::Mode::kOff ||
+        !slice || !endpoint)
+        return adaptive_congestion_control::Decision::kAllow;
+    const int dev_id = slice->source_dev_id;
+    if (dev_id < 0 ||
+        static_cast<size_t>(dev_id) >= congestion_control_devices_.size())
+        return adaptive_congestion_control::Decision::kAllow;
+    auto* route = endpoint->congestionRoute();
+    if (!route) {
+        route = slice->congestion_control_route;
+        if (!route) route = getCongestionRoute(path);
+        route = endpoint->bindCongestionRoute(route);
+    }
+    slice->congestion_control_route = route;
+    if (slice->congestion_control_route_owner.get() != route)
+        slice->congestion_control_route_owner = route->shared_from_this();
+    const uint32_t device_generation = adaptive_congestion_control::generation(
+        *congestion_control_devices_[dev_id]);
+    const uint32_t route_generation =
+        adaptive_congestion_control::generation(route->domain);
+    adaptive_congestion_control::PathHandle handle{
+        congestion_control_devices_[dev_id].get(), &route->domain,
+        device_generation, route_generation};
+    return acquireTentCongestionControlAttempt(
+        *slice, route, handle, slice->length, endpoint->generation());
+}
+
+void Workers::completeCongestionPermit(
+    RdmaSlice* slice, adaptive_congestion_control::OutcomeClass outcome,
+    adaptive_congestion_control::FailureScope scope) {
+    if (congestion_control_config_.mode ==
+            adaptive_congestion_control::Mode::kOff ||
+        !slice)
+        return;
+    completeTentCongestionControlAttempt(*slice, outcome, scope);
+}
+
+void Workers::updateCongestionSignals(uint64_t now_ns) {
+    if (congestion_control_config_.mode ==
+        adaptive_congestion_control::Mode::kOff)
+        return;
+    for (const auto& device : congestion_control_devices_)
+        adaptive_congestion_control::controlTick(*device, now_ns);
+    std::vector<std::shared_ptr<TentRdmaCongestionControlRoute>> routes;
+    {
+        std::lock_guard<std::mutex> lock(congestion_control_routes_mutex_);
+        routes.reserve(congestion_control_routes_.size());
+        for (const auto& [_, route] : congestion_control_routes_)
+            routes.push_back(route);
+    }
+    for (const auto& route : routes)
+        tickTentCongestionControlRoute(*route, now_ns);
+}
+#endif
+
 Workers::WorkerContext* Workers::ownerContext(const RdmaSlice* slice) {
     if (!worker_context_ || !slice) return nullptr;
     const int lane = slice->owner_worker.load(std::memory_order_relaxed);
@@ -580,6 +734,13 @@ void Workers::retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
                                std::vector<RdmaSlice*>* deferred,
                                bool bytes_moved) {
     if (!slice) return;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    completeCongestionPermit(
+        slice,
+        bytes_moved ? adaptive_congestion_control::OutcomeClass::kSuccess
+                    : adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation);
+#endif
     const int posted_dev = slice->posted_dev.load(std::memory_order_relaxed);
     releaseSliceQuota(slice, now_ns);
     // A slice swept off with FAILED or TIMEOUT leaves the hardware without
@@ -867,15 +1028,81 @@ void Workers::asyncPostSend() {
                             getCurrentTimeInNano());
         }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        size_t allowed = slices.size();
+        const auto acquire_batch = [&] {
+            using namespace adaptive_congestion_control;
+            constexpr size_t kBatchCapacity = 64;
+            if (congestion_control_config_.mode != Mode::kEnforce ||
+                slices.size() < 2 || slices.size() > kBatchCapacity ||
+                path.local_device_id < 0 ||
+                static_cast<size_t>(path.local_device_id) >=
+                    congestion_control_devices_.size())
+                return false;
+            auto* route = endpoint->congestionRoute();
+            if (!route) return false;
+            BatchItem items[kBatchCapacity];
+            for (size_t i = 0; i < slices.size(); ++i) {
+                auto* slice = slices[i];
+                if (!slice || slice->source_dev_id != path.local_device_id ||
+                    slice->congestion_control_route != route ||
+                    slice->congestion_control_route_owner.get() != route)
+                    return false;
+                items[i] = {&slice->congestion_control_permit, slice->length};
+            }
+            auto* device =
+                congestion_control_devices_[path.local_device_id].get();
+            const auto endpoint_generation = endpoint->generation();
+            PathHandle handle{device, &route->domain, generation(*device),
+                              generation(route->domain)};
+            if (!tryAcquireBatch(handle, items, slices.size())) return false;
+            if (endpoint->congestionRoute() != route ||
+                endpoint->generation() != endpoint_generation ||
+                generation(*device) != handle.device_generation ||
+                generation(route->domain) != handle.route_generation) {
+                for (auto* slice : slices)
+                    complete(slice->congestion_control_permit,
+                             OutcomeClass::kDerivedFlush,
+                             FailureScope::kOperation);
+                return false;
+            }
+            for (auto* slice : slices)
+                publishTentCongestionControlAttempt(*slice, route,
+                                                    endpoint_generation);
+            return true;
+        };
+        if (congestion_control_config_.mode !=
+                adaptive_congestion_control::Mode::kOff &&
+            !acquire_batch()) {
+            allowed = 0;
+            while (allowed < slices.size()) {
+                const auto decision =
+                    acquireCongestionPermit(slices[allowed], path, endpoint);
+                if (decision == adaptive_congestion_control::Decision::kAllow) {
+                    ++allowed;
+                    continue;
+                }
+                break;
+            }
+        }
+        if (allowed == 0) continue;
+#endif
         // Everything a completion's poller must find is written before the
         // work request can reach the wire: with a shared queue pair another
         // lane may poll the completion before submitSlices returns, and a
         // poller that finds no posted device on the slice would leave the
         // device's backlog holding these bytes for good.
         const uint64_t post_ts = getCurrentTimeInNano();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        int num_submitted = endpoint->submitSlicesLimited(
+            slices, tl_wid,
+            [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); },
+            allowed);
+#else
         int num_submitted = endpoint->submitSlices(
             slices, tl_wid,
             [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
+#endif
         int first_failed = num_submitted;
         for (int id = 0; id < num_submitted; ++id) {
             if (slices[id]->failed) {
@@ -903,6 +1130,12 @@ void Workers::asyncPostSend() {
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
             releaseSliceQuota(slice, post_ts);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            completeCongestionPermit(
+                slice,
+                adaptive_congestion_control::OutcomeClass::kLocalConfiguration,
+                adaptive_congestion_control::FailureScope::kOperation);
+#endif
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 // Canceled after admit() armed a probe/trial and HW rejected
                 // the post: roll back the admission.
@@ -929,6 +1162,17 @@ void Workers::asyncPostSend() {
             }
         }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (congestion_control_config_.mode !=
+            adaptive_congestion_control::Mode::kOff) {
+            for (size_t id = static_cast<size_t>(num_submitted); id < allowed;
+                 ++id)
+                completeCongestionPermit(
+                    slices[id],
+                    adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                    adaptive_congestion_control::FailureScope::kOperation);
+        }
+#endif
         if (num_submitted) {
             slices.erase(slices.begin(), slices.begin() + num_submitted);
         }
@@ -1030,6 +1274,14 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            completeCongestionPermit(
+                slice,
+                worker.congestion_control_poller_stalled
+                    ? adaptive_congestion_control::OutcomeClass::kDerivedFlush
+                    : adaptive_congestion_control::OutcomeClass::kRouteTimeout,
+                adaptive_congestion_control::FailureScope::kRoute);
+#endif
             // Resolve the task and return its selector charge now, but keep
             // WR/CQ reservations until polling drains them. The QP's ERR
             // transition can produce flush CQEs on a CQ shared by endpoints.
@@ -1070,10 +1322,10 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
     for (auto& slice : slice_to_remove) worker.inflight_slice_set.erase(slice);
 }
 
-void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
-                               const ibv_wc& wc, uint64_t poll_ts,
-                               bool last_in_pass, bool queue_already_drained,
-                               bool completion_owed) {
+void Workers::handleCompletion(
+    WorkerContext& worker, RdmaContext& context, const ibv_wc& wc,
+    uint64_t poll_ts, bool last_in_pass, bool queue_already_drained,
+    bool completion_owed, const std::shared_ptr<RdmaEndPoint>* borrowed_ep) {
     auto slice = (RdmaSlice*)wc.wr_id;
     // The completion this post owed, paid back only once this handler is
     // done with the slice. Paying it on entry is not enough: acknowledge()
@@ -1090,6 +1342,16 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                 slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
         }
     } completion_paid{slice, completion_owed};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (congestion_control_config_.mode !=
+        adaptive_congestion_control::Mode::kOff) {
+        const auto classification =
+            adaptive_congestion_control::classifyCompletion(wc.status,
+                                                            wc.vendor_err);
+        completeCongestionPermit(slice, classification.outcome,
+                                 classification.scope);
+    }
+#endif
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1101,7 +1363,10 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     // The lane that enqueued this slice owns its set entry; with a
     // shared queue pair that is not necessarily this one.
     if (routeSetRemoval(worker, slice)) worker.inflight_slice_set.erase(slice);
-    auto ep = slice->ep_weak_ptr.lock();
+    std::shared_ptr<RdmaEndPoint> owned_ep;
+    if (!borrowed_ep) owned_ep = slice->ep_weak_ptr.lock();
+    const std::shared_ptr<RdmaEndPoint>& ep =
+        borrowed_ep ? *borrowed_ep : owned_ep;
     double enqueue_lat = (slice->submit_ts - slice->enqueue_ts) / 1000.0;
     double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
     // The selection EWMA learns only from a successful transfer, and only
@@ -1291,10 +1556,62 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
 void Workers::asyncPollCq() {
     auto& worker = worker_context_[tl_wid];
     const static size_t kPollCount = 64;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto complete_success_group =
+        [&](RdmaSlice* const* slices, size_t count,
+            const std::shared_ptr<RdmaEndPoint>& ep) {
+            using namespace adaptive_congestion_control;
+            if (congestion_control_config_.mode != Mode::kEnforce ||
+                count < 2 || count > kPollCount || !slices[0] || !ep)
+                return false;
+            auto* route = slices[0]->congestion_control_route;
+            if (!route) return false;
+            const auto endpoint_generation = ep->generation();
+            if (route->endpoint_generation.load(std::memory_order_acquire) !=
+                endpoint_generation)
+                return false;
+            Permit* permits[kPollCount];
+            for (size_t i = 0; i < count; ++i) {
+                auto* slice = slices[i];
+                // Production assigns ep_weak_ptr from the endpoint's own self.
+                // Retain it and every owed credit until all refunds have
+                // finished.
+                if (!slice || slice->word != PENDING ||
+                    slice->completions_owed.load(std::memory_order_acquire) <=
+                        0 ||
+                    slice->ep_weak_ptr.owner_before(ep) ||
+                    ep.owner_before(slice->ep_weak_ptr) ||
+                    slice->congestion_control_route != route ||
+                    slice->congestion_control_route_owner.get() != route ||
+                    slice->congestion_control_endpoint_generation !=
+                        endpoint_generation)
+                    return false;
+                permits[i] = &slice->congestion_control_permit;
+            }
+            uint64_t completed_mask;
+            if (!completeSuccessBatch(permits, count, completed_mask,
+                                      route->endpoint_generation,
+                                      endpoint_generation))
+                return false;
+            for (size_t i = 0; i < count; ++i)
+                if (completed_mask & (uint64_t{1} << i))
+                    slices[i]->congestion_control_route = nullptr;
+            return true;
+        };
+#endif
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
 
-    expireTimedOutSlices(worker, getCurrentTimeInNano());
+    const uint64_t now_ns = getCurrentTimeInNano();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    constexpr uint64_t kPollerStallNs = 5ULL * 1000 * 1000 * 1000;
+    worker.congestion_control_poller_stalled =
+        worker.congestion_control_last_poll_ns != 0 &&
+        now_ns > worker.congestion_control_last_poll_ns &&
+        now_ns - worker.congestion_control_last_poll_ns >= kPollerStallNs;
+    worker.congestion_control_last_poll_ns = now_ns;
+#endif
+    expireTimedOutSlices(worker, now_ns);
 
     for (int index = 0; index < num_contexts; index++) {
         auto& context = transport_->context_set_[index];
@@ -1311,6 +1628,29 @@ void Workers::asyncPollCq() {
         for (int i = 0; i < nr_poll; ++i) {
             const auto& raw = wc[i];
             if (transport_->params_->endpoint.signal_interval <= 1) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                if (raw.status == IBV_WC_SUCCESS && i + 1 < nr_poll &&
+                    congestion_control_config_.mode ==
+                        adaptive_congestion_control::Mode::kEnforce) {
+                    RdmaSlice* slices[kPollCount];
+                    int end = i;
+                    while (end < nr_poll && wc[end].status == IBV_WC_SUCCESS) {
+                        slices[end - i] =
+                            reinterpret_cast<RdmaSlice*>(wc[end].wr_id);
+                        ++end;
+                    }
+                    const auto group_ep =
+                        slices[0] ? slices[0]->ep_weak_ptr.lock() : nullptr;
+                    const bool group_completed =
+                        complete_success_group(slices, end - i, group_ep);
+                    for (; i < end; ++i)
+                        handleCompletion(worker, *context, wc[i], poll_ts,
+                                         i + 1 == nr_poll, false, true,
+                                         group_completed ? &group_ep : nullptr);
+                    --i;
+                    continue;
+                }
+#endif
                 handleCompletion(worker, *context, raw, poll_ts,
                                  i + 1 == nr_poll);
                 continue;
@@ -1323,6 +1663,12 @@ void Workers::asyncPollCq() {
                                  i + 1 == nr_poll);
                 continue;
             }
+            bool group_completed = false;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            if (raw.status == IBV_WC_SUCCESS)
+                group_completed = complete_success_group(
+                    completion_prefix.data(), completion_prefix.size(), ep);
+#endif
             for (size_t index = 0; index < completion_prefix.size(); ++index) {
                 auto logical = raw;
                 logical.wr_id =
@@ -1337,7 +1683,7 @@ void Workers::asyncPollCq() {
                 handleCompletion(
                     worker, *context, logical, poll_ts,
                     i + 1 == nr_poll && index + 1 == completion_prefix.size(),
-                    true, true);
+                    true, true, group_completed ? &ep : nullptr);
             }
         }
     }
@@ -1546,6 +1892,17 @@ bool Workers::activateContext(int dev_id, RdmaContext& context) {
     // The link may have renegotiated while down: re-seed before the device
     // becomes selectable so no worker scores it on the old rate.
     refreshLinkSpeed(dev_id, context);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (congestion_control_config_.mode !=
+            adaptive_congestion_control::Mode::kOff &&
+        dev_id >= 0 &&
+        static_cast<size_t>(dev_id) < congestion_control_devices_.size()) {
+        const uint32_t generation = adaptive_congestion_control::generation(
+            *congestion_control_devices_[dev_id]);
+        adaptive_congestion_control::resetGeneration(
+            *congestion_control_devices_[dev_id], generation + 1);
+    }
+#endif
     if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
     return true;
 }
@@ -1616,6 +1973,9 @@ void Workers::monitorThread() {
             transport_->reapOrphanSlices(/*on_tick=*/true);
             // Safety net for a recovery event that never reached us.
             resumePausedContexts();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            updateCongestionSignals(getCurrentTimeInNano());
+#endif
             last_reclaim_time = current_time;
         }
 
@@ -2086,6 +2446,14 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (congestion_control_config_.mode !=
+        adaptive_congestion_control::Mode::kOff) {
+        PostPath path{slice->source_dev_id, slice->task->request.target_id,
+                      slice->target_dev_id};
+        slice->congestion_control_route = getCongestionRoute(path);
+    }
+#endif
     // Copy identifiers for GPUDirect reachability learning in asyncPollCq.
     // RouteHint pins the metadata snapshot only through this call; completion
     // handling may happen after the segment publishes a replacement snapshot.
