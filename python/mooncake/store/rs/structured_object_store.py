@@ -433,9 +433,13 @@ class _BundleManifestStore:
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
         manifest = self.resolve_manifest(ref)
+        manifest_key = self._manifest_key(ref, manifest)
         keys = self._payload_keys(manifest)
-        keys.append(self._manifest_key(ref, manifest))
-        _cleanup_keys(self._store, keys, strict=True)
+        keys.append(manifest_key)
+        # The manifest is the only record of the payload keys, so it has to
+        # outlive them: a caller holding just manifest_key can then finish
+        # cleanup after a transient failure.
+        _cleanup_keys(self._store, keys, strict=True, last_keys=(manifest_key,))
 
     def resolve_manifest(
         self, ref: RemoteBundleRef | Mapping[str, Any]
@@ -1269,48 +1273,68 @@ def _is_duplicate_buffer_registration(status: Any) -> bool:
     return status == -600
 
 
-def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None:
-    errors = []
-    pending_keys = list(dict.fromkeys(keys))
+def _remove_one(store: BundleStore, key: str, strict: bool) -> bool:
+    """Remove one key, returning whether it is gone (or was already missing)."""
+    try:
+        status = store.remove(key, force=True)
+    except KeyError:
+        return True
+    except Exception:
+        if strict:
+            raise
+        return False
+    return status in (None, 0, MISSING_OBJECT_ERROR)
+
+
+def _cleanup_keys(
+    store: BundleStore,
+    keys: Sequence[str],
+    strict: bool,
+    last_keys: Sequence[str] = (),
+) -> None:
+    """Remove keys, dropping last_keys only once every other key is gone.
+
+    A bundle manifest is the only record of its payload keys, so it is passed
+    as last_keys: a failed payload removal must leave it behind for a retry.
+    """
+    last_set = set(last_keys)
+    ordered = list(dict.fromkeys(keys))
+    payload_keys = [key for key in ordered if key not in last_set]
+    deferred = [key for key in ordered if key in last_set]
+    # A deferred key is the retry record for the others, so it cannot share a
+    # batch with them: a partially successful batch would drop it while a
+    # payload is still present.
     batch_remove = getattr(store, "batch_remove", None)
-    if callable(batch_remove) and pending_keys:
+    pending_keys = list(payload_keys)
+    if callable(batch_remove) and payload_keys:
         try:
             try:
-                results = batch_remove(pending_keys, force=True)
+                results = batch_remove(payload_keys, force=True)
             except TypeError:
-                results = batch_remove(pending_keys)
-            if len(results) != len(pending_keys):
+                results = batch_remove(payload_keys)
+            if len(results) != len(payload_keys):
                 raise RuntimeError(
-                    f"batch_remove returned {len(results)} results for {len(pending_keys)} keys"
+                    f"batch_remove returned {len(results)} results for "
+                    f"{len(payload_keys)} keys"
                 )
-            failed_results = [
-                (key, status)
-                for key, status in zip(pending_keys, results)
+            pending_keys = [
+                key
+                for key, status in zip(payload_keys, results)
                 if status not in (None, 0, MISSING_OBJECT_ERROR)
             ]
-            if not failed_results:
-                return
-            errors.extend(failed_results)
-            pending_keys = [key for key, _status in failed_results]
         except Exception:
             if strict:
                 raise
 
-    retry_errors = []
-    for key in pending_keys:
-        try:
-            status = store.remove(key, force=True)
-        except KeyError:
-            continue
-        except Exception:
-            if strict:
-                raise
-            continue
-        if status not in (None, 0, MISSING_OBJECT_ERROR):
-            retry_errors.append((key, status))
-    if retry_errors:
-        errors = retry_errors
-    if errors and strict:
-        raise RuntimeError(
-            f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}"
-        )
+    # The single-key pass is authoritative for every key it retries, so a
+    # success there supersedes the batch status for that key.
+    failed_keys = [key for key in pending_keys if not _remove_one(store, key, strict)]
+    if failed_keys:
+        if strict:
+            raise RuntimeError(
+                f"failed to remove {len(failed_keys)} Mooncake keys: {failed_keys[:3]}"
+            )
+        return
+    for key in deferred:
+        if not _remove_one(store, key, strict) and strict:
+            raise RuntimeError(f"failed to remove Mooncake key: {key}")

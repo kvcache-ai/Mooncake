@@ -226,6 +226,25 @@ class FailingRemoveStore(FailingPutStore):
     batch_remove = None
 
 
+class FlakyRemoveStore(InMemoryStore):
+    """Fail one key until the injected transient error is cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_key = ""
+        self.single_remove_calls: list[str] = []
+
+    def remove(self, key: str, force: bool = False) -> int:
+        self.single_remove_calls.append(key)
+        if key == self.fail_key:
+            return -1
+        return super().remove(key, force)
+
+    def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
+        self.batch_remove_calls += 1
+        return [self.remove(key, force) for key in keys]
+
+
 class ForceTrackingStore(InMemoryStore):
     def __init__(self) -> None:
         super().__init__()
@@ -572,6 +591,48 @@ def test_bundle_remove_deletes_payload_and_manifest() -> None:
 
     assert store.objects == {}
     assert store.batch_remove_calls == 1
+
+
+def test_bundle_remove_keeps_manifest_until_payloads_are_gone() -> None:
+    store = FlakyRemoveStore()
+    store, transfer = make_transfer(store)
+
+    ref = transfer.put_bundle(b"meta", {"payload": b"data"}, chunk_bytes=2)
+    payload_key = ref.manifest["buffers"]["payload"]["chunks"][0]["key"]
+    store.fail_key = payload_key
+    manifest_only = {"manifest_key": ref.manifest_key}
+
+    with pytest.raises(RuntimeError, match="failed to remove"):
+        transfer.remove_bundle(manifest_only)
+
+    assert payload_key in store.objects
+    assert ref.manifest_key in store.objects
+
+    store.fail_key = ""
+    transfer.remove_bundle(manifest_only)
+
+    assert store.objects == {}
+
+
+def test_bundle_remove_retry_success_clears_batch_error() -> None:
+    store = FlakyRemoveStore()
+    store, transfer = make_transfer(store)
+
+    ref = transfer.put_bundle(b"meta", {"payload": b"data"}, chunk_bytes=2)
+    payload_key = ref.manifest["buffers"]["payload"]["chunks"][0]["key"]
+    store.fail_key = payload_key
+    original_remove = store.remove
+
+    def fail_only_in_batch(key: str, force: bool = False) -> int:
+        if store.batch_remove_calls and key == store.fail_key:
+            store.fail_key = ""
+            return -1
+        return original_remove(key, force)
+
+    store.remove = fail_only_in_batch
+    transfer.remove_bundle(ref)
+
+    assert store.objects == {}
 
 
 def test_bundle_partial_put_failure_cleans_payloads() -> None:
