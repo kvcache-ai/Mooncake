@@ -70,6 +70,9 @@ class KvcsDriver {
     // workers, not a separate configuration; zero retains disabled SDK reads.
     virtual size_t MaxBatchKeys() const { return 0; }
     virtual size_t ReadConcurrency() const { return 1; }
+    // Absolute steady-clock nanoseconds, captured before adapter queueing.
+    // Drivers without a read timeout retain the existing BatchGet contract.
+    virtual int64_t ReadDeadlineNs() const { return INT64_MAX; }
 
     virtual tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() {
@@ -78,6 +81,10 @@ class KvcsDriver {
 
     virtual KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) = 0;
     virtual KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) = 0;
+    virtual KvcsIoResults BatchGetUntil(std::span<const KvcsIoRequest> requests,
+                                        int64_t deadline_ns) {
+        return BatchGet(requests);
+    }
     virtual KvcsIoResults BatchDelete(
         std::span<const ObjectKey> logical_keys) = 0;
 };

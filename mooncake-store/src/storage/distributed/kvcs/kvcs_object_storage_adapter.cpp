@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <future>
 #include <limits>
@@ -90,9 +91,13 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
     if (driver_->MaxValueSize() == 0 || driver_->MaxKeySize() == 0 ||
         driver_->MaxKeySize() > kKvcsMaxKeySize)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    if (driver_->ReadConcurrency() > 1)
-        read_workers_ =
-            std::make_unique<ThreadPool>(driver_->ReadConcurrency());
+    try {
+        if (driver_->ReadConcurrency() > 1)
+            read_workers_ =
+                std::make_unique<ThreadPool>(driver_->ReadConcurrency());
+    } catch (...) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
     initialized_ = true;
     LOG(INFO) << "KVCS Low Level mountpoint_id=" << mountpoint_id
               << ", mountpoint_index=" << mountpoint_index;
@@ -207,6 +212,7 @@ KvcsObjectStorageAdapter::GetBatchWithCompletion(
         for (size_t i = 0; i < requests.size(); ++i) notify(i);
         return results;
     }
+    const int64_t deadline_ns = driver_->ReadDeadlineNs();
     std::vector<KvcsIoRequest> gets;
     std::vector<size_t> indices;
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
@@ -246,8 +252,14 @@ KvcsObjectStorageAdapter::GetBatchWithCompletion(
     auto fetch = [&](size_t begin) {
         const size_t count = std::min(limit, gets.size() - begin);
         try {
-            auto read = driver_->BatchGet(
-                std::span<const KvcsIoRequest>(gets).subspan(begin, count));
+            const auto now =
+                std::chrono::steady_clock::now().time_since_epoch();
+            if (std::chrono::duration_cast<std::chrono::nanoseconds>(now)
+                    .count() >= deadline_ns)
+                return Errors<void>(count, ErrorCode::RPC_TIMEOUT);
+            auto read = driver_->BatchGetUntil(
+                std::span<const KvcsIoRequest>(gets).subspan(begin, count),
+                deadline_ns);
             if (read.size() == count) return read;
         } catch (...) {
         }
@@ -326,8 +338,8 @@ KvcsObjectStorageAdapter::GetBatchWithCompletion(
         // task's future to cover that gap and finish all borrowed-buffer use.
         auto chunk = slots[i].future.get();
         --active;
-        finish(chunk.begin, chunk.results);
         if (next < gets.size()) submit(slots[i]);
+        finish(chunk.begin, chunk.results);
     }
     return results;
 }

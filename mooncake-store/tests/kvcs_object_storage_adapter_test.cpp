@@ -23,6 +23,44 @@
 
 #include <gtest/gtest.h>
 
+#ifdef __linux__
+#include <cerrno>
+#include <dlfcn.h>
+#include <pthread.h>
+
+namespace {
+// Inject a real partial std::thread construction failure without adding a
+// thread factory to the production pool. Tests arm this only around Init().
+std::atomic<int> threads_before_failure{-1};
+std::atomic<size_t> created_threads{0}, joined_threads{0};
+}  // namespace
+
+extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
+                              void* (*start)(void*), void* arg) noexcept {
+    static const auto create = reinterpret_cast<decltype(&pthread_create)>(
+        dlsym(RTLD_NEXT, "pthread_create"));
+    int remaining = threads_before_failure.load();
+    while (remaining >= 0) {
+        if (threads_before_failure.compare_exchange_weak(
+                remaining, remaining == 0 ? -1 : remaining - 1)) {
+            if (remaining == 0) return EAGAIN;
+            break;
+        }
+    }
+    const int result = create(thread, attr, start, arg);
+    if (result == 0) ++created_threads;
+    return result;
+}
+
+extern "C" int pthread_join(pthread_t thread, void** result) {
+    static const auto join = reinterpret_cast<decltype(&pthread_join)>(
+        dlsym(RTLD_NEXT, "pthread_join"));
+    const int status = join(thread, result);
+    if (status == 0) ++joined_threads;
+    return status;
+}
+#endif
+
 namespace mooncake {
 namespace {
 
@@ -108,12 +146,40 @@ class MemoryDriver final : public KvcsDriver {
 // ordering or provider read counts.
 class GatedReadDriver final : public KvcsDriver {
    public:
-    explicit GatedReadDriver(size_t max_batch_keys = 64)
-        : max_batch_keys_(max_batch_keys) {}
+    explicit GatedReadDriver(size_t max_batch_keys = 64, size_t workers = 2)
+        : max_batch_keys_(max_batch_keys), workers_(workers) {}
     tl::expected<void, ErrorCode> Init() override { return {}; }
     uint64_t MaxValueSize() const override { return 1024; }
     size_t MaxBatchKeys() const override { return max_batch_keys_; }
-    size_t ReadConcurrency() const override { return 2; }
+    size_t ReadConcurrency() const override { return workers_; }
+    int64_t ReadDeadlineNs() const override {
+        std::lock_guard lock(mutex_);
+        ++deadline_calls_;
+        changed_.notify_all();
+        return deadline_ns_;
+    }
+    void SetDeadline(int64_t deadline_ns) {
+        std::lock_guard lock(mutex_);
+        deadline_ns_ = deadline_ns;
+    }
+    bool WaitForDeadlines(size_t count) {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return deadline_calls_ >= count; });
+    }
+    int64_t DeadlineFor(const std::string& key) {
+        std::lock_guard lock(mutex_);
+        return deadlines_.at(EncodeKvcsKey(key));
+    }
+    KvcsIoResults BatchGetUntil(std::span<const KvcsIoRequest> requests,
+                                int64_t deadline_ns) override {
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& request : requests)
+                deadlines_[request.logical_key] = deadline_ns;
+        }
+        return BatchGet(requests);
+    }
     KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
         return KvcsIoResults(requests.size());
     }
@@ -202,11 +268,14 @@ class GatedReadDriver final : public KvcsDriver {
         size_t reads = 0;
         bool copied = false;
     };
-    std::mutex mutex_;
-    std::condition_variable changed_;
+    mutable std::mutex mutex_;
+    mutable std::condition_variable changed_;
     std::map<ObjectKey, Entry> entries_;
+    std::map<ObjectKey, int64_t> deadlines_;
+    int64_t deadline_ns_ = INT64_MAX;
+    mutable size_t deadline_calls_ = 0;
     size_t active_ = 0, max_active_ = 0;
-    const size_t max_batch_keys_;
+    const size_t max_batch_keys_, workers_;
 };
 
 struct ReleaseGatedReads {
@@ -270,6 +339,239 @@ TEST(KvcsObjectStorageAdapterTest, SmallBatchCompletesBeforeUnrelatedSlowKey) {
     EXPECT_EQ(source->Reads("slow"), 1u);
     EXPECT_LE(source->MaxActive(), 2u);
 }
+
+TEST(KvcsObjectStorageAdapterTest, QueuedSingleKeyExpiresWithoutDriverRead) {
+    auto driver = std::make_unique<GatedReadDriver>(1);
+    auto* source = driver.get();
+    for (const auto* key : {"first", "second", "queued"})
+        source->Add(key, "data");
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 4> first{}, second{}, queued{'x', 'x', 'x', 'x'};
+    ReadCompletions completed;
+    std::future<void> active, pending;
+    ReleaseGatedReads release{source};
+    active = std::async(std::launch::async, [&] {
+        adapter.GetBatch(
+            {{"first", first.data(), 4}, {"second", second.data(), 4}});
+    });
+    ASSERT_TRUE(source->Wait("first"));
+    ASSERT_TRUE(source->Wait("second"));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    source->SetDeadline(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            deadline.time_since_epoch())
+                            .count());
+    pending = std::async(std::launch::async, [&] {
+        adapter.GetBatchWithCompletion({{"queued", queued.data(), 4}},
+                                       [&](size_t i, const auto& result) {
+                                           completed.Complete(i, result);
+                                       });
+    });
+    ASSERT_TRUE(source->WaitForDeadlines(2));
+    std::this_thread::sleep_until(deadline);
+    source->ReleaseAll();
+    active.get();
+    pending.get();
+    const auto result = completed.Result(0);
+    EXPECT_FALSE(result);
+    if (!result) {
+        EXPECT_EQ(result.error(), ErrorCode::RPC_TIMEOUT);
+    }
+    EXPECT_EQ(source->Reads("queued"), 0u);
+    EXPECT_EQ(std::string(queued.data(), 4), "xxxx");
+}
+
+TEST(KvcsObjectStorageAdapterTest, QueuedReadKeepsOriginalDeadline) {
+    auto driver = std::make_unique<GatedReadDriver>(1);
+    auto* source = driver.get();
+    for (const auto* key : {"first", "second", "queued"})
+        source->Add(key, "data");
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 4> first{}, second{}, queued{};
+    std::future<void> active, pending;
+    ReleaseGatedReads release{source};
+    active = std::async(std::launch::async, [&] {
+        adapter.GetBatch(
+            {{"first", first.data(), 4}, {"second", second.data(), 4}});
+    });
+    ASSERT_TRUE(source->Wait("first"));
+    ASSERT_TRUE(source->Wait("second"));
+    const int64_t deadline =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (std::chrono::steady_clock::now() + std::chrono::seconds(30))
+                .time_since_epoch())
+            .count();
+    source->SetDeadline(deadline);
+    pending = std::async(std::launch::async, [&] {
+        EXPECT_TRUE(adapter.Get("queued", queued.data(), 4));
+    });
+    ASSERT_TRUE(source->WaitForDeadlines(2));
+    source->ReleaseAll();
+    active.get();
+    pending.get();
+    EXPECT_EQ(source->DeadlineFor("queued"), deadline);
+    EXPECT_EQ(source->Reads("queued"), 1u);
+    EXPECT_EQ(std::string(queued.data(), 4), "data");
+}
+
+TEST(KvcsObjectStorageAdapterTest, RefillsBeforeBlockedCompletionCallback) {
+    auto driver = std::make_unique<GatedReadDriver>(1);
+    auto* source = driver.get();
+    for (const auto* key : {"fast", "slow", "next"}) source->Add(key, "data");
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    ASSERT_TRUE(adapter.Init());
+    std::array<std::array<char, 4>, 3> output{};
+    std::promise<void> callback_entered, release_callback;
+    auto callback_gate = release_callback.get_future();
+    std::future<void> read;
+    ReleaseGatedReads release{source};
+    read = std::async(std::launch::async, [&] {
+        adapter.GetBatchWithCompletion({{"fast", output[0].data(), 4},
+                                        {"slow", output[1].data(), 4},
+                                        {"next", output[2].data(), 4}},
+                                       [&](size_t i, const auto&) {
+                                           if (i == 0) {
+                                               callback_entered.set_value();
+                                               callback_gate.wait();
+                                           }
+                                       });
+    });
+    // Release the callback before any assertion can unwind the read future.
+    const bool started = source->Wait("fast") && source->Wait("slow");
+    source->Release("fast");
+    const bool entered =
+        callback_entered.get_future().wait_for(std::chrono::seconds(5)) ==
+        std::future_status::ready;
+    const bool refilled = source->Wait("next");
+    release_callback.set_value();
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(entered);
+    EXPECT_TRUE(refilled);
+    source->ReleaseAll();
+    read.get();
+}
+
+TEST(KvcsObjectStorageAdapterTest, RefilledChunkUsesOriginalBatchDeadline) {
+    auto driver = std::make_unique<GatedReadDriver>(1);
+    auto* source = driver.get();
+    for (const auto* key : {"fast", "slow", "next"}) source->Add(key, "data");
+    const int64_t deadline =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (std::chrono::steady_clock::now() + std::chrono::seconds(30))
+                .time_since_epoch())
+            .count();
+    source->SetDeadline(deadline);
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    ASSERT_TRUE(adapter.Init());
+    std::array<std::array<char, 4>, 3> output{};
+    std::future<void> read;
+    ReleaseGatedReads release{source};
+    read = std::async(std::launch::async, [&] {
+        adapter.GetBatch({{"fast", output[0].data(), 4},
+                          {"slow", output[1].data(), 4},
+                          {"next", output[2].data(), 4}});
+    });
+    ASSERT_TRUE(source->Wait("fast"));
+    ASSERT_TRUE(source->Wait("slow"));
+    source->SetDeadline(0);
+    source->Release("fast");
+    ASSERT_TRUE(source->Wait("next"));
+    for (const auto* key : {"fast", "slow", "next"})
+        EXPECT_EQ(source->DeadlineFor(key), deadline);
+    source->ReleaseAll();
+    read.get();
+}
+
+TEST(KvcsObjectStorageAdapterTest, RefilledChunkExpiresWithBatchDeadline) {
+    auto driver = std::make_unique<GatedReadDriver>(1);
+    auto* source = driver.get();
+    for (const auto* key : {"fast", "slow", "next"}) source->Add(key, "data");
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    ASSERT_TRUE(adapter.Init());
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    source->SetDeadline(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            deadline.time_since_epoch())
+                            .count());
+    std::array<std::array<char, 4>, 3> output{};
+    ReadCompletions completed;
+    std::future<void> read;
+    ReleaseGatedReads release{source};
+    read = std::async(std::launch::async, [&] {
+        adapter.GetBatchWithCompletion({{"fast", output[0].data(), 4},
+                                        {"slow", output[1].data(), 4},
+                                        {"next", output[2].data(), 4}},
+                                       [&](size_t i, const auto& result) {
+                                           completed.Complete(i, result);
+                                       });
+    });
+    ASSERT_TRUE(source->Wait("fast"));
+    ASSERT_TRUE(source->Wait("slow"));
+    std::this_thread::sleep_until(deadline);
+    source->Release("fast");
+    ASSERT_TRUE(completed.Wait(2));
+    ASSERT_FALSE(completed.Result(2));
+    EXPECT_EQ(completed.Result(2).error(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(source->Reads("next"), 0u);
+    EXPECT_EQ(output[2], (std::array<char, 4>{}));
+    EXPECT_EQ(read.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    source->ReleaseAll();
+    read.get();
+    EXPECT_TRUE(completed.Result(0));
+    EXPECT_TRUE(completed.Result(1));
+}
+
+TEST(KvcsObjectStorageAdapterTest, CallbackExceptionDrainsRefilledRead) {
+    auto driver = std::make_unique<GatedReadDriver>(1);
+    auto* source = driver.get();
+    for (const auto* key : {"fast", "slow", "next"}) source->Add(key, "data");
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    ASSERT_TRUE(adapter.Init());
+    std::array<std::array<char, 4>, 3> output{};
+    std::future<void> read;
+    ReleaseGatedReads release{source};
+    read = std::async(std::launch::async, [&] {
+        adapter.GetBatchWithCompletion(
+            {{"fast", output[0].data(), 4},
+             {"slow", output[1].data(), 4},
+             {"next", output[2].data(), 4}},
+            [&](size_t i, const auto&) {
+                if (i == 0) throw std::runtime_error("consumer failure");
+            });
+    });
+    ASSERT_TRUE(source->Wait("fast"));
+    ASSERT_TRUE(source->Wait("slow"));
+    source->Release("fast");
+    ASSERT_TRUE(source->Wait("next"));
+    source->Release("slow");
+    EXPECT_EQ(read.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    source->Release("next");
+    EXPECT_THROW(read.get(), std::runtime_error);
+    EXPECT_EQ(std::string(output[2].data(), 4), "data");
+}
+
+#ifdef __linux__
+TEST(KvcsObjectStorageAdapterTest,
+     PartialWorkerCreationFailureReturnsErrorAndRetries) {
+    auto driver = std::make_unique<GatedReadDriver>(1, 4);
+    KvcsObjectStorageAdapter adapter(std::move(driver));
+    const auto created = created_threads.load(), joined = joined_threads.load();
+    struct Reset {
+        ~Reset() { threads_before_failure = -1; }
+    } reset;
+    threads_before_failure = 2;
+    auto result = adapter.Init();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(created_threads.load() - created, 2u);
+    EXPECT_EQ(joined_threads.load() - joined, 2u);
+    ASSERT_TRUE(adapter.Init());
+}
+#endif
 
 TEST(KvcsObjectStorageAdapterTest, CompletedWindowSlotRefillsAndErrorsDrain) {
     auto driver = std::make_unique<GatedReadDriver>(1);

@@ -86,8 +86,13 @@ Completed sub-batches release matching in-flight DFS readers without waiting
 for unrelated sub-batches. Each consumer is validated and scatter destinations
 are filled before completion is published. A request that needs a slow object
 still waits for that object; this is not a completed-value cache. Overlapping
-destination buffers retain ordinary batch I/O. SDK timeouts are unchanged and
-apply to each SDK call, not to an entire multi-call batch.
+destination buffers retain ordinary batch I/O. A read batch captures one
+absolute `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` deadline before dispatch; queueing
+and subsequent SDK sub-batches consume the same budget. Reads that expire
+before reaching the SDK return `RPC_TIMEOUT` without accessing their output
+buffers. Already accepted SDK reads are drained before returning, including
+when a completion callback throws, so the deadline does not bypass buffer
+lifetime requirements.
 
 ## Capacity source
 
