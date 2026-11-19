@@ -4073,6 +4073,57 @@ TEST_F(RealClientTest, UnregisterBufferRecoversAfterTePartialFailure) {
     ASSERT_EQ(py_client_->tearDownAll(), 0);
 }
 
+TEST_F(RealClientTest, SameSizeUpsertRepublishesLocalDiskReplica) {
+    ScopedEnvVar backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                         "file_per_key_storage_backend");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar hot_cache("MC_STORE_LOCAL_HOT_CACHE_SIZE", "0");
+    char path[] = "/tmp/mooncake_upsert_disk_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(0)
+                                  .build()));
+    constexpr char address[] = "localhost:17813";
+    ASSERT_EQ(py_client_->setup_real(address, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                                     16 * 1024 * 1024, "tcp", "",
+                                     master_.master_address(), nullptr, "",
+                                     true, ssd_path_),
+              0);
+
+    const std::string key = "same_size_upsert_disk";
+    auto wait_for_disk = [&]() -> std::optional<ReplicaID> {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        do {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) return replica.id;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return std::nullopt;
+    };
+    const std::string first(4096, 'A'), second(first.size(), 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(first)), 0);
+    const auto disk_id = wait_for_disk();
+    ASSERT_TRUE(disk_id.has_value());
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(second)), 0);
+    ASSERT_EQ(wait_for_disk(), disk_id);
+
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, address).size(), 1u);
+    const auto remaining = py_client_->get_replica_desc(key);
+    ASSERT_EQ(remaining.size(), 1u);
+    ASSERT_TRUE(remaining.front().is_local_disk_replica());
+    auto value = py_client_->get_buffer(key);
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(
+        std::string_view(static_cast<const char*>(value->ptr()), value->size()),
+        second);
+}
+
 // Regression for the read-side half of the dangling-replica problem: a
 // COMPLETE LOCAL_DISK replica whose backing file physically disappeared
 // used to make every read return empty bytes forever while the master kept

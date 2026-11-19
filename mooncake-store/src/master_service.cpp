@@ -8316,10 +8316,8 @@ auto MasterService::NotifyOffloadSuccess(
                     } else {
                         obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
+                                return rep.get_local_disk_client_id() ==
+                                       client_id;
                             },
                             [&replica](Replica& rep) {
                                 rep.get_descriptor()
@@ -8334,7 +8332,18 @@ auto MasterService::NotifyOffloadSuccess(
                                     replica.get_descriptor()
                                         .get_local_disk_descriptor()
                                         .object_size;
+                                // In-place Upsert leaves the disk replica
+                                // pending until its owner confirms the write.
+                                if (rep.is_processing()) {
+                                    rep.mark_complete();
+                                }
                             });
+                        SyncCacheTotalAccounting(obj_metadata);
+                        if (accessor.InProcessing() &&
+                            obj_metadata.AllReplicas(
+                                &Replica::fn_is_completed)) {
+                            accessor.EraseFromProcessing();
+                        }
                     }
                     handled_existing_object = true;
                 }
