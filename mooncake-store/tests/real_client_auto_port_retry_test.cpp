@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -17,9 +18,16 @@
 #include <thread>
 
 #include "test_server_helpers.h"
+#include "error.h"
+#ifdef STORE_USE_ETCD
+#include "ha/leadership/leader_coordinator_factory.h"
+#endif
 
 namespace mooncake::testing {
 namespace {
+
+static_assert(ERR_RPC_META_CONFLICT != ERR_CONTEXT_EINVAL,
+              "RPC metadata conflicts must not alias RDMA context failures");
 
 class FailingHttpMetadataServer {
    public:
@@ -113,6 +121,10 @@ class FailingHttpMetadataServer {
 
 class RpcMetaConflictHttpMetadataServer {
    public:
+    explicit RpcMetaConflictHttpMetadataServer(
+        std::chrono::milliseconds conflict_delay = std::chrono::milliseconds{0})
+        : conflict_delay_(conflict_delay) {}
+
     ~RpcMetaConflictHttpMetadataServer() {
         stopping_.store(true);
         if (worker_.joinable()) worker_.join();
@@ -244,6 +256,9 @@ class RpcMetaConflictHttpMetadataServer {
             }
 
             if (header_end != std::string::npos) {
+                if (status == 400) {
+                    std::this_thread::sleep_for(conflict_delay_);
+                }
                 const std::string response =
                     "HTTP/1.1 " + std::to_string(status) + " " + status_text +
                     "\r\nContent-Length: " + std::to_string(body.size()) +
@@ -265,6 +280,7 @@ class RpcMetaConflictHttpMetadataServer {
     bool stale_entry_exists_ = true;
     std::set<std::string> rpc_meta_put_targets_;
     std::thread worker_;
+    std::chrono::milliseconds conflict_delay_;
 };
 
 class ScopedEnvVar {
@@ -332,6 +348,63 @@ TEST(RealClientAutoPortRetryTest,
     EXPECT_GE(metadata_server.DistinctRpcMetaPutTargets(), 2);
     EXPECT_EQ(metadata_server.DeleteRequests(), 0);
 }
+
+#ifdef STORE_USE_ETCD
+TEST(RealClientAutoPortRetryTest,
+     EtcdHaConflictRetryDoesNotWaitForLeaderWatchTimeout) {
+    const char* endpoints = std::getenv("MOONCAKE_TEST_ETCD_ENDPOINTS");
+    if (!endpoints || !*endpoints) {
+        GTEST_SKIP() << "Set MOONCAKE_TEST_ETCD_ENDPOINTS to an isolated etcd";
+    }
+    const std::string cluster = "auto-port-retry-" + std::to_string(getpid());
+    ScopedEnvVar cluster_id("MC_STORE_CLUSTER_ID", cluster.c_str());
+    ScopedEnvVar retries("MC_STORE_CLIENT_SETUP_RETRIES", "20");
+
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    auto coordinator =
+        ha::CreateLeaderCoordinator({.type = ha::HABackendType::ETCD,
+                                     .connstring = endpoints,
+                                     .cluster_namespace = cluster,
+                                     .leader_lease_ttl_sec = 120});
+    ASSERT_TRUE(coordinator.has_value());
+    auto acquired =
+        coordinator.value()->TryAcquireLeadership(master.master_address());
+    ASSERT_TRUE(acquired.has_value());
+    ASSERT_EQ(acquired->status, ha::AcquireLeadershipStatus::ACQUIRED);
+    ASSERT_TRUE(acquired->session.has_value());
+    const auto session = *acquired->session;
+    ASSERT_EQ(coordinator.value()->PublishServiceReady(session), ErrorCode::OK);
+
+    // Hold the first failed write long enough for the old eager monitor to
+    // enter its 30-second watch. The retry must not wait for that watch.
+    RpcMetaConflictHttpMetadataServer metadata_server(
+        std::chrono::milliseconds{300});
+    ASSERT_TRUE(metadata_server.Start());
+    auto client = RealClient::create();
+    const auto start = std::chrono::steady_clock::now();
+    const int result =
+        client->setup_real("127.0.0.1", metadata_server.Url(), 0, 0, "tcp", "",
+                           "etcd://" + std::string(endpoints));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_EQ(result, 0);
+    EXPECT_GE(metadata_server.ConflictPutRequests(), 1);
+    EXPECT_GE(metadata_server.DistinctRpcMetaPutTargets(), 2);
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+        10000);
+
+    // Releasing leadership wakes the successful client's watch on teardown.
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        EXPECT_EQ(coordinator.value()->ReleaseLeadership(session),
+                  ErrorCode::OK);
+    });
+    client.reset();
+    release.join();
+}
+#endif
 
 }  // namespace
 }  // namespace mooncake::testing

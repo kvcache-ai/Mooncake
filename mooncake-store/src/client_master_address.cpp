@@ -121,7 +121,9 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     const auto delimiter_pos = entry.find("://");
     if (delimiter_pos != std::string_view::npos) {
         const auto backend_name = entry.substr(0, delimiter_pos);
-        auto backend_type = ha::ParseHABackendType(backend_name);
+        const bool redis_cluster = backend_name == "redis+cluster";
+        auto backend_type =
+            ha::ParseHABackendType(redis_cluster ? "redis" : backend_name);
         if (!backend_type.has_value()) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -137,8 +139,10 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
         }
         return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
             .type = backend_type.value(),
-            .connstring = std::move(connstring),
+            .connstring =
+                redis_cluster ? std::string(entry) : std::move(connstring),
             .cluster_namespace = "",
+            .redis_read_only = backend_type.value() == ha::HABackendType::REDIS,
         }};
     }
 

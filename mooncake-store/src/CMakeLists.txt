@@ -34,6 +34,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
+    client_session_registry.cpp
+    client_session_event_dispatcher.cpp
     dynamic_replication_controller.cpp
     eviction/evictor.cpp
     eviction/offloading_reclaimer.cpp
@@ -69,6 +71,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
+    ha/common/redis/redis_cluster_client.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
     shutdown_request.cpp
@@ -128,6 +131,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_codec.cpp
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
+    nvme_kv/object_store.cpp
     transfer_task.cpp
     config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp

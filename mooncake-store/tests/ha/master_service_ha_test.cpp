@@ -989,7 +989,8 @@ class MasterServiceHATest : public ::testing::Test {
 
     static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
     }
 
     static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
@@ -1083,10 +1084,8 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const UUID& source_client,
         const TenantId& tenant_id, const std::string& key,
         CreateTask create_task) {
-        auto liveness =
-            MasterServiceTestPeer(service).FindClientRecord(source_client);
-        auto serving_guard =
-            liveness ? liveness->TryAcquireServingGuard() : std::nullopt;
+        auto serving_guard = MasterServiceTestPeer::ClientSessions(service)
+                                 .TryAcquireServingSession(source_client);
         if (!serving_guard) {
             return false;
         }
@@ -1121,26 +1120,24 @@ class MasterServiceHATest : public ::testing::Test {
         return task.get().has_value() && reached_discovery && metadata_released;
     }
 
-    // PutStart is the only caller in these tests that holds the snapshot
-    // barrier shared, so a barrier that cannot be taken exclusively while the
-    // client lock is free means PutStart reached it and let the client lock
-    // go.
+    // PutStart is the only caller in this test that holds the snapshot
+    // barrier shared. The test holds its key, so an unavailable barrier means
+    // PutStart finished the session lookups and is waiting for that key.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
         MasterService& service) {
-        std::unique_lock<std::shared_mutex> client_lock(
-            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
-        if (!client_lock.owns_lock()) {
-            return false;
-        }
         std::unique_lock<std::shared_mutex> snapshot_lock(
             MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
-    static std::unique_lock<std::shared_mutex> LockClientForTesting(
+    static void StopClientSessionsForTesting(MasterService& service) {
+        // These tests drive residual jobs manually, without live listeners.
+        MasterServiceTestPeer::ClientSessions(service).Stop();
+    }
+
+    static ClientSessionRegistry::RestoreBatch RestoreClientsForTesting(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::ClientMutex(service));
+        return MasterServiceTestPeer::ClientSessions(service).BeginRestore();
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
@@ -2175,13 +2172,15 @@ TEST_F(MasterServiceHATest,
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
-    // ReMountSegment holds client_mutex_ exclusively while waiting for the
-    // snapshot barrier. PutStart must not reacquire it inside that barrier.
-    auto client_lock = LockClientForTesting(service);
-    key_lock.reset();
-    const bool completed_while_client_locked =
-        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.unlock();
+    // Restore holds the session lifecycle barrier. PutStart must not need a
+    // registration scope while it holds the snapshot barrier.
+    bool completed_while_client_locked = false;
+    {
+        auto restore = RestoreClientsForTesting(service);
+        key_lock.reset();
+        completed_while_client_locked =
+            put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
 
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
@@ -2228,19 +2227,24 @@ TEST_F(MasterServiceHATest,
                     .has_value());
     const auto record = ClientRecordForTesting(service, mounted.client_id);
     ASSERT_TRUE(record);
-    auto retaining_guard = record->TryAcquireRetainingGuard();
+    auto retaining_guard = MasterServiceTestPeer::ClientSessions(service)
+                               .TryAcquireRetainingSession(mounted.client_id);
     ASSERT_TRUE(retaining_guard);
 
     Replica replica(mounted.client_id, 1024, "retained_add_replica_endpoint",
                     ReplicaStatus::COMPLETE, record);
-    auto client_lock = LockClientForTesting(service);
-    auto add = std::async(std::launch::async, [&] {
-        return AddReplicaForRetainedClientForTesting(
-            service, mounted.client_id, "retained_add_replica_key", replica);
-    });
-    const bool completed_while_client_locked =
-        add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.unlock();
+    std::future<tl::expected<bool, ErrorCode>> add;
+    bool completed_while_client_locked = false;
+    {
+        auto restore = RestoreClientsForTesting(service);
+        add = std::async(std::launch::async, [&] {
+            return AddReplicaForRetainedClientForTesting(
+                service, mounted.client_id, "retained_add_replica_key",
+                replica);
+        });
+        completed_while_client_locked =
+            add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
 
     ASSERT_EQ(add.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = add.get();
@@ -2268,23 +2272,18 @@ TEST_F(MasterServiceHATest,
 
     const auto liveness = ClientRecordForTesting(service, client_id);
     ASSERT_TRUE(liveness);
+    StopClientSessionsForTesting(service);
     const auto now = ClientLivenessRecord::Clock::now();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    MasterMetricManager::instance().client_liveness_became_offline();
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     writer->RejectNextCommit();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
@@ -2322,23 +2321,18 @@ TEST_F(MasterServiceHATest,
 
     const auto liveness = ClientRecordForTesting(service, client_id);
     ASSERT_TRUE(liveness);
+    StopClientSessionsForTesting(service);
     const auto now = ClientLivenessRecord::Clock::now();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    MasterMetricManager::instance().client_liveness_became_offline();
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     writer->RejectNextSegmentUnmount();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
@@ -2862,7 +2856,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
               metric_before);
 
-    // Rollback leaves nothing behind: no metadata, no liveness records. A
+    // Rollback leaves nothing behind: no metadata, no client sessions. A
     // retry must see an empty index rather than already-existing objects.
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_survivor"),
@@ -2870,7 +2864,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 
     // Retry: the writer accepts now, and the same restore lands cleanly.
     auto retry = service.RestoreFromStandbySnapshot(
@@ -2944,7 +2938,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_ld_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -2957,7 +2951,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_ld_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).contains(
         disk_owner));
 }
 
@@ -3008,7 +3002,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_timeout_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 
     // The first repair may still become durable after the local restore
     // has rolled back. Resume the writer, then retry the same snapshot.
@@ -3074,7 +3068,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_nowriter_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 }
 
 TEST_F(MasterServiceHATest, FailedRepairRestoreKeepsReplicaIdCounterAdvanced) {
@@ -5022,7 +5016,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
-       RemoveBeforeDurableHidesReplicasFromPrimaryReads) {
+       RemoveBeforeDurableHidesReplicasButKeepsKvMediaAnnounced) {
     const std::string cluster_id = "test_batch_record_e2e_remove_visibility";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -5033,37 +5027,227 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
+    // Exercise the route observer even when built without ZMQ support.
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
+    struct ReleaseOnExit {
+        BlockingBatchHaKvBackend& backend;
+        GatedOrderedOpLogWriter& writer;
+        ~ReleaseOnExit() {
+            backend.AllowTxn();
+            writer.ResumeCallbacks();
+        }
+    } release{*backend, *writer};
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_remove_segment");
-    OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord batch;
-    ReadBatchEventually(storage, 1, batch);
-
     const std::string key = "batch_e2e_remove_key";
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_e2e_remove_segment");
-    ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(2));
+
+    const MasterServiceTestPeer::ObjectIdentity object_id{kDefaultTenant, key};
+    const auto expect_announced = [&] {
+        auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+        ASSERT_TRUE(guard.has_value());
+        EXPECT_EQ(KvEventPublisher::kMediumCpu,
+                  guard->state().announced_kv_media);
+    };
+    expect_announced();
 
     backend->BlockTxn();
-    auto removed = service.Remove(key, kDefaultTenant, /*force=*/true);
-    EXPECT_TRUE(removed.has_value());
+    ASSERT_TRUE(service.Remove(key, kDefaultTenant, /*force=*/true));
+    ASSERT_TRUE(backend->WaitForBlockedTxn());
     EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+    // The replica is hidden locally, but retracting its announcement now
+    // would lose the index entry if the primary failed before durability.
+    expect_announced();
+    OpLogBatchStorage storage(cluster_id, *backend);
     DurablePrefix prefix;
-    auto prefix_read = storage.ReadDurablePrefix(prefix);
-    EXPECT_EQ(ErrorCode::OK, prefix_read);
-    if (prefix_read == ErrorCode::OK) {
-        EXPECT_EQ(2u, prefix.batch_id);
-        EXPECT_EQ(2u, prefix.last_seq);
-    }
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
 
+    auto durable = writer->AwaitDurable(3);
+    EXPECT_FALSE(durable.hasResult());
     backend->AllowTxn();
-    ReadBatchEventually(storage, 3, batch);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!durable.hasResult() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(durable.hasResult());
+    EXPECT_EQ(ErrorCode::OK, std::move(durable).get());
+    OpLogBatchRecord batch;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(3, batch));
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
     EXPECT_EQ(key, batch.entries[0].object_key);
+    // Even after persistence, the announcement belongs to the resident
+    // replica until its durable finalizer actually erases it.
+    expect_announced();
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_FALSE(MasterServiceTestPeer::ReadObject(service, object_id));
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       PartialRemovalDoesNotMaskUpsertKvInvalidation) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(0)
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("pending_remove_upsert_kv")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
+    struct ResumeOnExit {
+        GatedOrderedOpLogWriter& writer;
+        ~ResumeOnExit() { writer.ResumeCallbacks(); }
+    } resume{*writer};
+
+    const auto first = PrepareSimpleSegment(service, "upsert_pending_first");
+    PrepareSimpleSegment(service, "upsert_pending_second",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    const std::string key = "upsert_pending_key";
+    ReplicateConfig write_config;
+    write_config.replica_num = 2;
+    ASSERT_TRUE(service.PutStart(first.client_id, key, kDefaultTenant, 1024,
+                                 write_config));
+    ASSERT_TRUE(service.PutEnd(first.client_id, key, kDefaultTenant,
+                               ReplicaType::MEMORY));
+    ASSERT_TRUE(writer->PauseCallbacksAfter(3));
+
+    auto cleared = service.BatchReplicaClear({key}, first.client_id,
+                                             "upsert_pending_first");
+    ASSERT_TRUE(cleared);
+    ASSERT_EQ(cleared->size(), 1u);
+    const MasterServiceTestPeer::ObjectIdentity object_id{kDefaultTenant, key};
+    {
+        auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+        ASSERT_TRUE(guard);
+        ASSERT_EQ(guard->metadata().CountReplicas([](const Replica& replica) {
+            return replica.status() == ReplicaStatus::REMOVED;
+        }),
+                  1u);
+        EXPECT_EQ(guard->state().announced_kv_media,
+                  KvEventPublisher::kMediumCpu);
+    }
+
+    ASSERT_TRUE(service.UpsertStart(first.client_id, key, kDefaultTenant, 1024,
+                                    write_config));
+    {
+        auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+        ASSERT_TRUE(guard);
+        EXPECT_EQ(guard->state().announced_kv_media, 0);
+        EXPECT_EQ(guard->state().live_kv_media, 0);
+    }
+    ASSERT_TRUE(service.UpsertEnd(first.client_id, key, kDefaultTenant,
+                                  ReplicaType::MEMORY));
+    {
+        auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+        ASSERT_TRUE(guard);
+        EXPECT_EQ(guard->state().announced_kv_media,
+                  KvEventPublisher::kMediumCpu);
+    }
+    ASSERT_TRUE(writer->RunCallbacksThrough(5));
+    auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+    ASSERT_TRUE(guard);
+    EXPECT_EQ(guard->metadata().CountReplicas(), 1u);
+    EXPECT_EQ(guard->state().announced_kv_media, KvEventPublisher::kMediumCpu);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       SameTierRecoveryIsOrderedAgainstRemoveAllClear) {
+    for (bool global : {false, true}) {
+        for (bool recover_before_clear : {false, true}) {
+            SCOPED_TRACE(global);
+            SCOPED_TRACE(recover_before_clear);
+            auto backend = std::make_shared<FakeBatchHaKvBackend>();
+            auto config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("same_tier_remove_all_kv")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+            MasterService service(config);
+            MasterServiceTestPeer peer(service);
+            peer.SetKvTenantEpochTrackingForTesting(true);
+            auto* writer = InstallGatedWriter(service, backend);
+            struct ResumeOnExit {
+                GatedOrderedOpLogWriter& writer;
+                ~ResumeOnExit() { writer.ResumeCallbacks(); }
+            } resume{*writer};
+
+            const auto mounted = PrepareSimpleSegment(service);
+            const std::string key = "same_tier_recovery";
+            ASSERT_TRUE(service.PutStart(mounted.client_id, key, kDefaultTenant,
+                                         1024, ReplicateConfig{}));
+            auto allocator = std::make_shared<DummyBufferAllocator>(
+                "recovery-nof", "recovery-nof");
+            const MasterServiceTestPeer::ObjectIdentity object_id{
+                kDefaultTenant, key};
+            {
+                auto guard =
+                    MasterServiceTestPeer::WriteObject(service, object_id);
+                ASSERT_TRUE(guard);
+                std::vector<Replica> replicas;
+                replicas.emplace_back(
+                    std::make_unique<AllocatedBuffer>(allocator, nullptr, 1024),
+                    ReplicaStatus::PROCESSING, ReplicaType::NOF_SSD);
+                guard->metadata().AddReplicas(std::move(replicas));
+            }
+            ASSERT_TRUE(service.PutEnd(mounted.client_id, key, kDefaultTenant,
+                                       ReplicaType::ALL));
+            ASSERT_TRUE(writer->PauseCallbacksAfter(2));
+
+            bool recovered = false;
+            const auto recover_disk = [&] {
+                Replica disk(mounted.client_id, 1024, "local://recovery",
+                             ReplicaStatus::COMPLETE);
+                auto added = service.AddReplica(mounted.client_id, key,
+                                                kDefaultTenant, disk);
+                ASSERT_TRUE(added);
+                ASSERT_TRUE(*added);
+                recovered = true;
+            };
+            if (recover_before_clear) {
+                peer.SetRemoveAllTenantHookForTesting(
+                    [&](const TenantId&) { recover_disk(); });
+            }
+            EXPECT_EQ(global ? service.RemoveAll(true)
+                             : service.RemoveAll(kDefaultTenant, true),
+                      1);
+            peer.SetRemoveAllTenantHookForTesting(nullptr);
+            EXPECT_EQ(peer.GetKvClearedPublishedForTesting(),
+                      recover_before_clear ? 0u : 1u);
+            EXPECT_EQ(peer.GetKvClearedSuppressedForTesting(),
+                      recover_before_clear ? 1u : 0u);
+            if (!recover_before_clear) {
+                recover_disk();
+            }
+            ASSERT_TRUE(recovered);
+
+            // The finalizer must remove only the old replicas, not the disk
+            // registration that raced with the clear. All four interleavings
+            // leave a live, announced LOCAL_DISK replica.
+            ASSERT_TRUE(writer->RunCallbacksThrough(4));
+            auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+            ASSERT_TRUE(guard);
+            ASSERT_EQ(guard->metadata().CountReplicas(), 1u);
+            EXPECT_TRUE(guard->metadata()
+                            .GetAllReplicas()
+                            .front()
+                            .is_local_disk_replica());
+            EXPECT_EQ(guard->state().announced_kv_media,
+                      KvEventPublisher::kMediumDisk);
+            EXPECT_EQ(guard->state().live_kv_media,
+                      KvEventPublisher::kMediumDisk);
+        }
+    }
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest, RemoveByRegexWritesBatchRecordOpLog) {
@@ -5918,7 +6102,7 @@ TEST_F(MasterServiceHATest,
     const std::string cluster_id = "test_batch_record_move_end_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
+                              .set_default_kv_lease_ttl(1000)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
                               .set_cluster_id(cluster_id)
@@ -5950,6 +6134,21 @@ TEST_F(MasterServiceHATest,
                                "batch_move_visible_src",
                                "batch_move_visible_dst")
                     .has_value());
+
+    const auto before = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->replicas.size(), 1u);
+    const auto leased_end =
+        service.MoveEnd(source.client_id, key, kDefaultTenant);
+    ASSERT_FALSE(leased_end);
+    EXPECT_EQ(leased_end.error(), ErrorCode::OBJECT_HAS_LEASE);
+    const auto still_visible =
+        service.GetReplicaListForAdmin(key, kDefaultTenant);
+    ASSERT_TRUE(still_visible);
+    ASSERT_EQ(still_visible->replicas.size(), 1u);
+    EXPECT_EQ(still_visible->replicas.front().id, before->replicas.front().id);
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(before->lease_ttl_ms));
 
     backend->BlockTxn();
     auto move_future = std::async(std::launch::async, [&] {

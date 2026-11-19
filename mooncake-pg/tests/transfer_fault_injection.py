@@ -22,6 +22,11 @@ def _build_preload(output: Path) -> None:
         repository_root / "mooncake-transfer-engine" / "include"
     )
     process_group_include = repository_root / "mooncake-pg" / "include"
+    # transport.h includes a header that CMake generates in the build tree.
+    generated_config = next(
+        repository_root.glob("build*/**/mooncake_te_build_config.h"), None
+    )
+    generated_include = [f"-I{generated_config.parent}"] if generated_config else []
     command = [
         os.environ.get("CXX", "c++"),
         "-std=c++20",
@@ -30,6 +35,7 @@ def _build_preload(output: Path) -> None:
         "-fPIC",
         f"-I{transfer_engine_include}",
         f"-I{process_group_include}",
+        *generated_include,
         str(source),
         "-ldl",
         "-o",
@@ -164,12 +170,25 @@ class TransferFault:
         self._get_count = self._library.mooncakePgTestGetFailureCount
         self._get_count.argtypes = []
         self._get_count.restype = ctypes.c_uint64
+        self._delay_flags = self._library.mooncakePgTestDelayFlagCompletion
+        self._delay_flags.argtypes = [ctypes.c_int64]
+        self._delay_flags.restype = None
+        self._reset_counts = self._library.mooncakePgTestResetTransferCounts
+        self._reset_counts.argtypes = []
+        self._reset_counts.restype = None
+        self._get_held = self._library.mooncakePgTestGetHeldFlagBatchCount
+        self._get_held.argtypes = []
+        self._get_held.restype = ctypes.c_uint64
+        self._get_count_reads = self._library.mooncakePgTestGetCountReadCount
+        self._get_count_reads.argtypes = []
+        self._get_count_reads.restype = ctypes.c_uint64
         if local_rank < 0:
             raise ValueError("local rank must be non-negative")
         self._local_rank = local_rank
         self._set_enabled(0)
         self._clear_failed_targets()
         self._reset_count()
+        self._reset_counts()
         self._active = False
 
     @staticmethod
@@ -226,6 +245,22 @@ class TransferFault:
         with self.failing_links(((source_rank, target_rank),)):
             yield
 
+    def delay_flag_completion(self, seconds: float) -> None:
+        """Make this rank's sync flag writes report completion late."""
+        self._delay_flags(int(seconds * 1_000_000))
+
+    def reset_transfer_counts(self) -> None:
+        """Restart held_flag_batches and count_reads from zero."""
+        self._reset_counts()
+
     @property
     def injected_count(self) -> int:
         return int(self._get_count())
+
+    @property
+    def held_flag_batches(self) -> int:
+        return int(self._get_held())
+
+    @property
+    def count_reads(self) -> int:
+        return int(self._get_count_reads())

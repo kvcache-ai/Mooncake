@@ -136,6 +136,11 @@ def parse_args():
         help="Process group backend (default: nccl; mooncake requires RDMA)",
     )
     parser.add_argument(
+        "--require-native",
+        action="store_true",
+        help="Fail when the buffer selects the Python fallback (for native CI).",
+    )
+    parser.add_argument(
         "--warmup-iters",
         type=int,
         default=20,
@@ -228,6 +233,8 @@ class EPBenchmarkWorker:
             args.num_tokens, args.hidden_size, args.num_ranks, args.num_experts
         )
         self.buf = Buffer(self.group, num_ep_buffer_bytes)
+        if args.require_native and self.buf._use_fallback:
+            raise RuntimeError("Native EP fast path is required")
 
         self.topk_idx, self.topk_weights = ROUTING_MODES[args.routing_mode](
             num_tokens=args.num_tokens,
@@ -380,7 +387,9 @@ class EPBenchmarkWorker:
 
         if self.rank == 0:
             # A step completes only when the slowest rank finishes (critical path).
-            dispatch_critical = torch.stack(all_dispatch).max(dim=0).values.cpu().tolist()
+            dispatch_critical = (
+                torch.stack(all_dispatch).max(dim=0).values.cpu().tolist()
+            )
             combine_critical = torch.stack(all_combine).max(dim=0).values.cpu().tolist()
             e2e_critical = torch.stack(all_e2e).max(dim=0).values.cpu().tolist()
 

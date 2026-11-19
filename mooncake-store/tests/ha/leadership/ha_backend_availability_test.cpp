@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <utility>
+
 namespace mooncake {
 
 namespace ha {
@@ -52,6 +54,28 @@ TEST(HABackendAvailabilityTest, ClientSpecParsingMatchesK8sBuildFlag) {
     ASSERT_FALSE(spec.has_value());
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, spec.error());
 #endif
+}
+
+TEST(HABackendAvailabilityTest, RedisDiscoveryPreservesConnectionSemantics) {
+    const std::pair<const char*, const char*> cases[] = {
+        {"redis://127.0.0.1:6379", "127.0.0.1:6379"},
+        {"redis+cluster://127.0.0.1:6379,127.0.0.2:6379",
+         "redis+cluster://127.0.0.1:6379,127.0.0.2:6379"},
+    };
+    for (const auto& [entry, expected_connstring] : cases) {
+        SCOPED_TRACE(entry);
+        auto spec = ParseHABackendSpec(entry);
+#ifdef STORE_USE_REDIS
+        ASSERT_TRUE(spec.has_value());
+        ASSERT_TRUE(spec->has_value());
+        EXPECT_EQ(HABackendType::REDIS, (*spec)->type);
+        EXPECT_EQ(expected_connstring, (*spec)->connstring);
+        EXPECT_TRUE((*spec)->redis_read_only);
+#else
+        ASSERT_FALSE(spec.has_value());
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, spec.error());
+#endif
+    }
 }
 
 TEST(HABackendAvailabilityTest, ExplicitEtcdSchemeNormalizesEndpoints) {
