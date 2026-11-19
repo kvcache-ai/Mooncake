@@ -83,8 +83,10 @@ from .te import (
     WeightAllocationGuardProvider,
     WeightAllocationGuardProviders,
 )
+from .plan_cache import WeightTransferPlanCache
 
 __all__ = [
+    "WeightTransferPlanCache",
     "BoundTiledCOOReadPlan",
     "TiledCOODenseFragment",
     "TiledCOOIndexRange",

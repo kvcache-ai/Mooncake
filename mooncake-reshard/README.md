@@ -178,6 +178,18 @@ The sweep sorts unique allocations once instead of repeatedly comparing every
 pair of views in the same arena. View-overlap and declared-alias checks are
 unchanged; no persistent validation cache or new lifetime owner is introduced.
 
+## Optional Logical Plan Cache
+
+`WeightTransferPlanCache` is an explicit, process-local LRU for address-free
+local-target plans. It is disabled by default; existing planner, Reader, Sink,
+and Store callers do not read its environment variables or use it
+automatically. See [configuration and costs](plan_cache.md).
+
+`MC_RESHARD_PLAN_CACHE_ENABLED=1` enables the cache when an explicit caller
+uses `WeightTransferPlanCache.from_environment()`. `MC_RESHARD_PLAN_CACHE_MAX_ENTRIES` sets a positive
+entry limit (default `2`). Limits count entries, not bytes, and every execution
+still obtains and validates fresh runtime bindings and allocation guards.
+
 ## Transfer Engine Execution
 
 `mooncake.reshard.transfer_engine` executes resource-neutral physical batches
