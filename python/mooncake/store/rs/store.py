@@ -345,6 +345,11 @@ class MooncakeDistributedStore:
             return self._worker.call(name, *args, **kwargs)
         return getattr(self._native, name)(*args, **kwargs)
 
+    def _structured_object_backend(self):
+        from ._structured_backend import StoreRSStructuredBackend
+
+        return StoreRSStructuredBackend(self)
+
     def _invoke_cache(
         self,
         name: str,
@@ -1335,6 +1340,8 @@ def _tensor_from_raw_bytes(raw: bytes):
         raise ValueError(f"unsupported dtype code: {dtype_i32}")
     torch_dtype = getattr(torch, dtype_str)
     # Single copy via bytearray from memoryview slice (avoids double-copy).
+    if data_bytes == 0:
+        return torch.empty(shape, dtype=torch_dtype)
     data = bytearray(memoryview(raw)[data_offset : data_offset + data_bytes])
     tensor = torch.frombuffer(data, dtype=torch_dtype).reshape(shape)
     return tensor

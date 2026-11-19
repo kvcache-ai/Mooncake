@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import ctypes
-import importlib
 import io
 import json
 import sys
@@ -25,6 +24,14 @@ from typing import (
 import numpy as np
 
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
+from mooncake._structured_backend import (
+    StructuredStoreBackend,
+    cpp_tensor_codec_module as _cpp_tensor_codec_module,
+    deserialize_tensor_payload as _deserialize_tensor_payload,
+    slice_tensor_metadata as _slice_tensor_metadata,
+    structured_store_backend,
+    tensor_codec_helper as _tensor_codec_helper,
+)
 from mooncake._structured_ranges import (
     PreparedRangeLayoutChanged as PreparedRangeLayoutChanged,
     PreparedStructuredMemberRanges,
@@ -341,6 +348,7 @@ class _MatrixRead:
     ranges: tuple[tuple[int, int, int], ...]
     metadata_bytes: int
     destination: Any
+    deserialize_tensor: Callable[[bytes], Any]
 
     def decode(self, staging: bytes) -> Any:
         if self.dtype is not None:
@@ -359,7 +367,7 @@ class _MatrixRead:
         return (
             payload
             if self.destination is not None
-            else _deserialize_tensor_payload(payload)
+            else self.deserialize_tensor(payload)
         )
 
     def finish(self, value: Any) -> Any:
@@ -590,6 +598,8 @@ class MooncakeBundleTransfer:
                 )
             group_id = group_ids[0] if group_ids else None
         if group_id is None:
+            if not self._transport._backend.supports_storage_groups:
+                return None
             return f"structured-{uuid.uuid4().hex}"
         if not isinstance(group_id, str):
             raise ValueError(
@@ -597,6 +607,10 @@ class MooncakeBundleTransfer:
             )
         if group_id == "":
             return None
+        if not self._transport._backend.supports_storage_groups:
+            raise NotImplementedError(
+                "this store backend does not support storage groups"
+            )
         return group_id
 
     def put_bundle(
@@ -608,8 +622,17 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
         config: Any = None,
+        *,
+        pre_registered_buffers: Optional[Mapping[str, bool]] = None,
     ) -> RemoteBundleRef:
         """Store raw metadata bytes plus named buffers as a low-level bundle."""
+        # Older RS callers passed a boolean registration map in the config slot.
+        if isinstance(config, Mapping) and all(
+            isinstance(v, bool) for v in config.values()
+        ):
+            if pre_registered_buffers is not None:
+                raise TypeError("pre_registered_buffers was specified twice")
+            pre_registered_buffers, config = config, None
         return self._bundle_store.put_bundle(
             meta=meta,
             buffers=buffers,
@@ -618,6 +641,7 @@ class MooncakeBundleTransfer:
             policy=policy,
             max_inflight_put=max_inflight_put,
             config=config,
+            pre_registered_buffers=pre_registered_buffers,
         )
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
@@ -638,8 +662,7 @@ class MooncakeBundleTransfer:
             if stage_ref.manifest_key == previous_stage_ref.manifest_key:
                 continue
 
-            is_exist = getattr(self.store, "is_exist", None)
-            if callable(is_exist) and is_exist(stage_ref.manifest_key) == 0:
+            if self._transport._backend.existence_status(stage_ref.manifest_key) == 0:
                 continue
             new_manifest = self._bundle_store.resolve_manifest(stage_ref)
             old_buffer_names = {
@@ -1373,7 +1396,7 @@ class MooncakeBundleTransfer:
                     for out, row in enumerate(indices)
                 ],
             )
-        return _deserialize_tensor_payload(sliced_metadata + data)
+        return self._transport._backend.deserialize_tensor(sliced_metadata + data)
 
     def _read_structured_non_tensor_payload_indices(
         self,
@@ -1507,8 +1530,10 @@ class MooncakeBundleTransfer:
                 payload_members,
                 metadata,
                 read_null_mask=lambda: read_member_indices("null_mask", indices),
-                read_key_payload=lambda encoded: self._read_structured_non_tensor_payload_indices(
-                    stage_ref, encoded, indices
+                read_key_payload=lambda encoded: (
+                    self._read_structured_non_tensor_payload_indices(
+                        stage_ref, encoded, indices
+                    )
                 ),
             )
 
@@ -1694,8 +1719,10 @@ class MooncakeBundleTransfer:
                 payload_members,
                 metadata,
                 read_null_mask=lambda: read_member("null_mask", start, end),
-                read_key_payload=lambda encoded: self._read_structured_non_tensor_payload_slice(
-                    stage_ref, encoded, row_slice, total_rows
+                read_key_payload=lambda encoded: (
+                    self._read_structured_non_tensor_payload_slice(
+                        stage_ref, encoded, row_slice, total_rows
+                    )
                 ),
             )
 
@@ -1853,6 +1880,7 @@ class MooncakeBundleTransfer:
         field_schemas: Optional[Mapping[str, FieldSchema]] = None,
         config: Any = None,
     ) -> MooncakeDataProtoRef:
+        self._transport._backend.validate_write_config(config)
         batch, non_tensor_batch, meta_info = _split_dataproto_like(data)
         _validate_dataproto_schema_sections(
             batch, non_tensor_batch, meta_info, field_schemas
@@ -3745,7 +3773,13 @@ class _StructuredObjectLayer:
                 continue
             reads.append(
                 _prepare_matrix_read(
-                    name, payload_spec, field_spec, rows, columns, destination
+                    name,
+                    payload_spec,
+                    field_spec,
+                    rows,
+                    columns,
+                    destination,
+                    self._bundle_store._transport._backend,
                 )
             )
         if any(int(read.field_spec["shape"][0]) != batch_size for read in reads):
@@ -3788,7 +3822,14 @@ class _StructuredObjectLayer:
             else value.contiguous()
         )
         if read.dtype is None and read.destination is not None:
-            value = _tensor_payload_bytes(_TensorPayload(value))[0]
+            metadata = self._bundle_store.read_payload_range(
+                read.payload_spec, 0, read.metadata_bytes
+            )
+            value = value.cpu()
+            nbytes = value.numel() * value.element_size()
+            value = _slice_tensor_metadata(metadata, value.shape, nbytes) + (
+                ctypes.string_at(value.data_ptr(), nbytes) if nbytes else b""
+            )
         return value
 
     def _resolve_structured_read(
@@ -3885,7 +3926,7 @@ class _StructuredObjectLayer:
             return _deserialize_torch_save_payload(
                 self._bundle_store.read_payload(payload_spec)
             )
-        return _deserialize_tensor_payload(
+        return self._bundle_store._transport._backend.deserialize_tensor(
             self._bundle_store.read_payload(payload_spec)
         )
 
@@ -3970,7 +4011,9 @@ class _StructuredObjectLayer:
         data = self._bundle_store.read_payload_range(
             payload_spec, data_offset, data_length
         )
-        return _deserialize_tensor_payload(sliced_metadata + data)
+        return self._bundle_store._transport._backend.deserialize_tensor(
+            sliced_metadata + data
+        )
 
     def _read_bytes_member(
         self,
@@ -4075,7 +4118,9 @@ class _BundleManifestStore:
         policy: Optional[BundleTransferPolicy],
         max_inflight_put: Optional[int],
         config: Any = None,
+        pre_registered_buffers: Optional[Mapping[str, bool]] = None,
     ) -> RemoteBundleRef:
+        self._transport._backend.validate_write_config(config)
         _validate_key_segment(partition, "partition")
         meta_view = _bytes_view(meta, "meta")
         target_chunk_bytes = _validate_chunk_bytes(
@@ -4087,6 +4132,7 @@ class _BundleManifestStore:
         manifest_key = f"{base_key}/manifest"
         written_keys: list[str] = []
         buffer_specs: dict[str, Any] = {}
+        pre_registered_map = dict(pre_registered_buffers or {})
         try:
             meta_spec, meta_keys = self._put_payload(
                 f"{base_key}/meta",
@@ -4129,6 +4175,7 @@ class _BundleManifestStore:
                         target_chunk_bytes,
                         transfer_policy,
                         config=config,
+                        pre_registered=bool(pre_registered_map.get(name, False)),
                     )
                 buffer_specs[name] = payload_spec
                 written_keys.extend(payload_keys)
@@ -4164,6 +4211,7 @@ class _BundleManifestStore:
         cleanup_keys: Optional[Sequence[str]] = None,
         config: Any = None,
     ) -> RemoteBundleRef:
+        self._transport._backend.validate_write_config(config)
         _validate_key_segment(partition, "partition")
         meta_view = _bytes_view(meta, "meta")
         target_chunk_bytes = _validate_chunk_bytes(
@@ -4225,24 +4273,18 @@ class _BundleManifestStore:
         embedded_manifest = (
             ref.manifest if isinstance(ref, RemoteBundleRef) else ref.get("manifest")
         )
-        is_exist = getattr(self._store, "is_exist", None)
-        if (
-            not embedded_manifest
-            and isinstance(manifest_key, str)
-            and callable(is_exist)
-        ):
-            status = is_exist(manifest_key)
-            if status == 0:
+        backend = self._transport._backend
+        if not embedded_manifest and isinstance(manifest_key, str):
+            if backend.existence_status(manifest_key) == 0:
                 return
-            if status != 1:
-                raise RuntimeError(f"is_exist failed for {manifest_key}: {status}")
         try:
             manifest = self.resolve_manifest(ref)
-        except Exception:
+        except (KeyError, json.JSONDecodeError) as error:
+            if isinstance(error, json.JSONDecodeError) and error.doc:
+                raise
             if (
                 isinstance(manifest_key, str)
-                and callable(is_exist)
-                and is_exist(manifest_key) == 0
+                and backend.existence_status(manifest_key) == 0
             ):
                 return
             raise
@@ -4388,26 +4430,32 @@ class _BundleManifestStore:
                 "bytes": total_bytes,
                 "chunks": [{"key": key, "bytes": total_bytes}],
             }, [key]
-        if transfer_policy.copy_mode != "copy":
-            if transfer_policy.copy_mode == "zero_copy":
-                raise ValueError(
-                    "zero-copy structured tensor fields require a BufferPool tensor-object buffer"
-                )
+        native_tensor = self._transport._backend.supports_native_tensor(value.tensor)
+        if transfer_policy.copy_mode == "zero_copy":
+            raise ValueError(
+                "zero-copy structured tensor fields require a BufferPool tensor-object buffer"
+            )
+        if native_tensor and transfer_policy.copy_mode != "copy":
             tensor_spec = self._transport.put_tensor_payload_direct(key, value, config)
             if tensor_spec is not None:
                 return tensor_spec, [key]
             try:
-                total_bytes = self._transport.put_tensor_payload_from_pool(
-                    key, value, config
+                total_bytes, metadata_bytes = (
+                    self._transport.put_tensor_payload_from_pool(key, value, config)
                 )
                 return {
                     "key": key,
                     "bytes": total_bytes,
+                    "metadata_bytes": metadata_bytes,
                     "chunks": [{"key": key, "bytes": total_bytes}],
                 }, [key]
             except RuntimeError:
                 pass
-        if not _has_tensor_codec_helpers() or value.tensor.dim() == 0:
+        if (
+            not native_tensor
+            or not _has_tensor_codec_helpers()
+            or value.tensor.dim() == 0
+        ):
             payload = _torch_save_payload_bytes(value.tensor)
             payload_spec, payload_keys = self._put_payload(
                 key,
@@ -4436,6 +4484,7 @@ class _BundleManifestStore:
         chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
         config: Any = None,
+        pre_registered: bool = False,
     ) -> tuple[dict[str, Any], list[str]]:
         if len(value) == 0:
             return {"key": key, "bytes": 0, "chunks": []}, []
@@ -4449,6 +4498,7 @@ class _BundleManifestStore:
             [[chunk] for chunk in chunks],
             transfer_policy,
             config,
+            pre_registered=pre_registered,
         )
         payload_spec = {
             "key": key,
@@ -4570,7 +4620,18 @@ class _BundleManifestStore:
 
         def _put_chunk_batch(keys, batches):
             for ck, (start, count, size) in zip(keys, batches):
-                lease = pool.acquire(size)
+                lease = transport._try_acquire_pool_lease(pool, size)
+                if lease is None:
+                    buf = memoryview(
+                        np.concatenate(
+                            [
+                                a.ravel().view(np.uint8)
+                                for a in arrays[start : start + count]
+                            ]
+                        ).data
+                    ).cast("B")
+                    transport._put_chunks_direct([ck], [buf], config)
+                    continue
                 try:
                     copied = _concat_arrays_into(arrays, lease.ptr, size, start, count)
                     if copied != size:
@@ -4770,35 +4831,30 @@ class _MooncakePayloadTransport:
 
     def __init__(self, store: BundleStore, buffer_pool: Any = None) -> None:
         self._store = store
+        self._backend = structured_store_backend(store)
         self._buffer_pool = buffer_pool
         self._batch_put_from = getattr(store, "batch_put_from", None)
-        self._put_tensor_from = getattr(store, "put_tensor_from", None)
+        self._put_tensor_from = self._backend.pointer_put()
         self._batch_get_into = getattr(store, "batch_get_into", None)
         self._get_into = getattr(store, "get_into", None)
-        self._get_into_ranges = getattr(store, "get_into_ranges", None)
+        self._get_into_ranges = self._backend.get_into_ranges
         self._register_buffer = getattr(store, "register_buffer", None)
         self._unregister_buffer = getattr(store, "unregister_buffer", None)
 
-    def _store_can_auto_create_buffer_pool(self) -> bool:
-        get_capsule = getattr(self._store, "_get_pyclient_capsule", None)
-        if not callable(get_capsule):
-            return False
-        try:
-            return get_capsule() is not None
-        except Exception:
-            return False
-
     def _ensure_buffer_pool(self) -> Any:
         if self._buffer_pool is None:
-            if not self._store_can_auto_create_buffer_pool():
-                return None
             try:
-                from mooncake.buffer_pool import BufferPool
-
-                self._buffer_pool = BufferPool(self._store)
+                self._buffer_pool = self._backend.create_buffer_pool()
             except (ImportError, AttributeError, RuntimeError, TypeError):
                 return None
         return self._buffer_pool
+
+    @staticmethod
+    def _try_acquire_pool_lease(pool: Any, size: int) -> Any:
+        try:
+            return pool.acquire(size, block=False)
+        except RuntimeError:
+            return None
 
     def put_multi_buffer_payload_chunks(
         self,
@@ -4806,32 +4862,37 @@ class _MooncakePayloadTransport:
         chunk_groups: Sequence[Sequence[memoryview]],
         transfer_policy: BundleTransferPolicy,
         config: Any = None,
+        *,
+        pre_registered: bool = False,
     ) -> list[str]:
-        def fallback_to_direct_put() -> list[str]:
-            chunks = [memoryview(b"".join(group)) for group in chunk_groups]
-            return self._put_chunks_direct(chunk_keys, chunks, config)
-
-        if transfer_policy.copy_mode == "zero_copy":
-            raise RuntimeError("zero-copy put requires tensor-object buffers")
-        if transfer_policy.copy_mode == "copy" or self._ensure_buffer_pool() is None:
-            return fallback_to_direct_put()
-        if all(len(group) == 1 for group in chunk_groups):
-            self.batch_put_buffer_groups_from(
-                chunk_keys, [[group[0]] for group in chunk_groups], config
-            )
-            return list(chunk_keys)
-        if not callable(self._batch_put_from):
-            return fallback_to_direct_put()
-        put_mode = self._resolve_buffer_group_put_mode(chunk_groups, transfer_policy)
-        if put_mode == "batch":
-            self.batch_put_buffer_groups_from(chunk_keys, chunk_groups, config)
-            return list(chunk_keys)
-        return self._put_buffer_groups_parallel(
-            list(chunk_keys),
-            [list(group) for group in chunk_groups],
-            transfer_policy.max_inflight_put,
-            config,
+        registered_put = pre_registered or (
+            self._backend.prefer_registered_put
+            and transfer_policy.copy_mode != "copy"
+            and callable(self._batch_put_from)
+            and self._has_buffer_registration_support()
+            and all(len(group) == 1 for group in chunk_groups)
         )
+        if transfer_policy.copy_mode == "zero_copy" and not pre_registered:
+            raise RuntimeError("zero-copy put requires tensor-object buffers")
+        put_mode = self._resolve_buffer_group_put_mode(chunk_groups, transfer_policy)
+        if not registered_put:
+            if transfer_policy.copy_mode != "copy":
+                self._ensure_buffer_pool()
+            if transfer_policy.copy_mode == "copy":
+                chunks = [memoryview(b"".join(group)) for group in chunk_groups]
+                return self._put_chunks_direct(chunk_keys, chunks, config)
+        if put_mode == "parallel" and len(chunk_keys) > 1:
+            return self._put_buffer_groups_parallel(
+                list(chunk_keys),
+                list(chunk_groups),
+                transfer_policy.max_inflight_put,
+                config,
+                pre_registered,
+            )
+        self.batch_put_buffer_groups_from(
+            chunk_keys, chunk_groups, config, pre_registered
+        )
+        return list(chunk_keys)
 
     def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
         expected_bytes = int(payload_spec["bytes"])
@@ -4864,12 +4925,7 @@ class _MooncakePayloadTransport:
         destination: _TensorObjectBufferPayload,
     ) -> Any:
         if payload_spec.get("kind") == "tensor":
-            get_tensor_into = getattr(self._store, "get_tensor_into", None)
-            if not callable(get_tensor_into):
-                raise RuntimeError(
-                    "structured tensor payload does not support get_tensor_into"
-                )
-            result = get_tensor_into(
+            result = self._backend.get_tensor_into(
                 payload_spec["key"], destination.ptr, destination.size
             )
             _ = destination.owner
@@ -5024,10 +5080,7 @@ class _MooncakePayloadTransport:
                 return None
         if not fragments:
             return [b"" for _request in requests]
-        try:
-            lease = pool.acquire(total_bytes, block=False)
-        except RuntimeError:
-            return None
+        lease = self._try_acquire_pool_lease(pool, total_bytes)
         if lease is None:
             return None
         sizes = [[part[4]] for part in fragments]
@@ -5060,7 +5113,7 @@ class _MooncakePayloadTransport:
             raise RuntimeError("put_from is unavailable")
         _check_status(
             _put_from_with_optional_config(
-                self._store, key, value.ptr, value.size, config
+                self._backend, key, value.ptr, value.size, config
             ),
             "put_from",
             key,
@@ -5074,14 +5127,12 @@ class _MooncakePayloadTransport:
         value: _TensorPayload,
         config: Any = None,
     ) -> dict[str, Any] | None:
-        put_tensor = getattr(
-            self._store, "put_tensor" if config is None else "pub_tensor", None
-        )
+        put_tensor = self._backend.tensor_put(config)
         if not callable(put_tensor):
             return None
         tensor = value.tensor
         nbytes = int(getattr(tensor, "nbytes", 0))
-        metadata_bytes = _tensor_metadata_size()
+        metadata_bytes = self._backend.tensor_metadata_size()
         total_bytes = metadata_bytes + nbytes
         _check_status(
             _call_write_with_optional_config(
@@ -5108,7 +5159,7 @@ class _MooncakePayloadTransport:
         key: str,
         value: _TensorPayload,
         config: Any = None,
-    ) -> int:
+    ) -> tuple[int, int]:
         if self._buffer_pool is None:
             raise RuntimeError("structured tensor zero-copy requires a BufferPool")
         put_tensor_from = self._put_tensor_from
@@ -5117,7 +5168,9 @@ class _MooncakePayloadTransport:
             raise RuntimeError("put_from is unavailable")
         metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(value)
         total_bytes = len(metadata) + tensor_nbytes
-        lease = self._buffer_pool.acquire(total_bytes)
+        lease = self._buffer_pool.acquire(total_bytes, block=False)
+        if lease is None:
+            raise RuntimeError("structured tensor staging pool is unavailable")
         view = None
         try:
             view = lease.buffer
@@ -5128,13 +5181,13 @@ class _MooncakePayloadTransport:
             view = None
             _check_status(
                 _put_from_with_optional_config(
-                    self._store, key, lease.ptr, total_bytes, config
+                    self._backend, key, lease.ptr, total_bytes, config
                 ),
                 "put_from",
                 key,
             )
             _ = owner
-            return total_bytes
+            return total_bytes, len(metadata)
         finally:
             if view is not None:
                 view.release()
@@ -5145,31 +5198,83 @@ class _MooncakePayloadTransport:
         chunk_keys: Sequence[str],
         chunk_groups: Sequence[Sequence[memoryview]],
         config: Any = None,
+        pre_registered: bool = False,
     ) -> None:
-        batch_put_from = self._batch_put_from
-        if not callable(batch_put_from):
-            raise RuntimeError("batch_put_from is unavailable")
         if not chunk_keys:
             return
-        sizes = [_buffer_group_nbytes(group) for group in chunk_groups]
-        pool = self._buffer_pool
-        # Stream one chunk at a time: acquire -> memcpy -> put -> release.
-        # This keeps pool pressure minimal and allows RDMA transfers to pipeline.
-        for chunk_key, group, size in zip(chunk_keys, chunk_groups, sizes):
-            # Each pool lease maps to one physical key, so a single logical group id
-            # stays length-1 for each batch_put_from call in this path.
-            lease = pool.acquire(size)
-            try:
-                _copy_memoryviews_to_lease(group, lease)
-                results = _batch_put_from_with_optional_config(
-                    batch_put_from, [chunk_key], [lease.ptr], [size], config
+        batch_put_from = self._batch_put_from
+        registered_put = pre_registered or (
+            self._backend.prefer_registered_put
+            and callable(batch_put_from)
+            and self._has_buffer_registration_support()
+            and all(len(group) == 1 for group in chunk_groups)
+        )
+        if registered_put:
+            chunks = [group[0] for group in chunk_groups]
+            prepared = [
+                (
+                    chunk,
+                    int(np.frombuffer(chunk, dtype=np.uint8).ctypes.data),
+                    len(chunk),
                 )
-                self._check_batch_put_results(results, [chunk_key], "batch_put_from")
+                if pre_registered
+                else _prepare_chunk_source_buffer(chunk)
+                for chunk in chunks
+            ]
+            # Keep copied readonly sources alive until every synchronous write completes.
+            ptrs = [item[1] for item in prepared]
+            sizes = [item[2] for item in prepared]
+            try:
+                with self._registered_buffers(
+                    ptrs, sizes, "bundle source", pre_registered
+                ):
+                    if callable(batch_put_from):
+                        results = _batch_put_from_with_optional_config(
+                            batch_put_from, chunk_keys, ptrs, sizes, config
+                        )
+                        self._check_batch_put_results(
+                            results, chunk_keys, "batch_put_from"
+                        )
+                    else:
+                        for key, ptr, size in zip(chunk_keys, ptrs, sizes):
+                            _check_status(
+                                _put_from_with_optional_config(
+                                    self._backend, key, ptr, size, config
+                                ),
+                                "put_from",
+                                key,
+                            )
             except Exception:
                 _cleanup_keys(self._store, chunk_keys, strict=False)
                 raise
-            finally:
-                lease.release()
+            return
+        if not callable(batch_put_from) or self._buffer_pool is None:
+            self._put_chunks_direct(
+                chunk_keys,
+                [memoryview(b"".join(group)) for group in chunk_groups],
+                config,
+            )
+            return
+        try:
+            for key, group in zip(chunk_keys, chunk_groups):
+                size = _buffer_group_nbytes(group)
+                lease = self._try_acquire_pool_lease(self._buffer_pool, size)
+                if lease is None:
+                    self._put_chunks_direct(
+                        [key], [memoryview(b"".join(group))], config
+                    )
+                    continue
+                try:
+                    _copy_memoryviews_to_lease(group, lease)
+                    results = _batch_put_from_with_optional_config(
+                        batch_put_from, [key], [lease.ptr], [size], config
+                    )
+                    self._check_batch_put_results(results, [key], "batch_put_from")
+                finally:
+                    lease.release()
+        except Exception:
+            _cleanup_keys(self._store, chunk_keys, strict=False)
+            raise
 
     @staticmethod
     def _check_batch_put_results(
@@ -5208,6 +5313,7 @@ class _MooncakePayloadTransport:
         chunk_groups: list[Sequence[memoryview]],
         max_inflight_put: int,
         config: Any = None,
+        pre_registered: bool = False,
     ) -> list[str]:
         groups = self._group_buffer_group_ranges(
             chunk_keys, chunk_groups, max_inflight_put
@@ -5223,6 +5329,7 @@ class _MooncakePayloadTransport:
                         group_keys,
                         group_chunks,
                         config,
+                        pre_registered,
                     )
                     for group_keys, group_chunks in groups
                 ]
@@ -5404,9 +5511,8 @@ class _MooncakePayloadTransport:
         pool = self._ensure_buffer_pool()
         if pool is None:
             return None
-        try:
-            lease = pool.acquire(nbytes)
-        except RuntimeError:
+        lease = self._try_acquire_pool_lease(pool, nbytes)
+        if lease is None:
             return None
         owner = _PoolLeaseOwner(lease)
         try:
@@ -5589,25 +5695,22 @@ class _MooncakePayloadTransport:
             _check_status(unregister_buffer(ptr), "unregister_buffer", label)
 
     @contextmanager
-    def _registered_buffer(
+    def _registered_buffers(
         self,
-        destination: bytearray | np.ndarray,
+        buffer_ptrs: Sequence[int],
+        sizes: Sequence[int],
         label: str,
         pre_registered: bool = False,
-    ) -> Iterator[int]:
-        base_ptr = _buffer_ptr(destination)
-        if pre_registered:
-            yield base_ptr
-            return
+    ) -> Iterator[None]:
         registered_ptrs = self._register_buffers(
-            [base_ptr], [_buffer_nbytes(destination)], False, label
+            buffer_ptrs, sizes, pre_registered, label
         )
         if not registered_ptrs:
-            yield base_ptr
+            yield
             return
         succeeded = False
         try:
-            yield base_ptr
+            yield
             succeeded = True
         finally:
             try:
@@ -5615,6 +5718,19 @@ class _MooncakePayloadTransport:
             except Exception:
                 if succeeded:
                     raise
+
+    @contextmanager
+    def _registered_buffer(
+        self,
+        destination: bytearray | np.ndarray,
+        label: str,
+        pre_registered: bool = False,
+    ) -> Iterator[int]:
+        base_ptr = _buffer_ptr(destination)
+        with self._registered_buffers(
+            [base_ptr], [_buffer_nbytes(destination)], label, pre_registered
+        ):
+            yield base_ptr
 
     def _resolve_buffer_group_put_mode(
         self,
@@ -5647,6 +5763,7 @@ def _prepare_matrix_read(
     rows: range | tuple[int, ...],
     columns: slice,
     destination: Any,
+    backend: StructuredStoreBackend,
 ) -> _MatrixRead:
     encoding = field_spec.get("encoding")
     shape = tuple(int(value) for value in field_spec["shape"])
@@ -5658,7 +5775,7 @@ def _prepare_matrix_read(
     if (
         itemsize <= 0
         or metadata_bytes < 0
-        or (dtype is None and metadata_bytes < _tensor_metadata_size())
+        or (dtype is None and metadata_bytes < backend.tensor_metadata_size())
     ):
         raise ValueError(f"DataProto matrix field {name!r} is missing range metadata")
     plan = plan_matrix_read(shape, itemsize, rows, columns, MAX_MATRIX_RANGES)
@@ -5699,6 +5816,7 @@ def _prepare_matrix_read(
         ranges,
         metadata_bytes,
         destination,
+        backend.deserialize_tensor,
     )
 
 
@@ -6646,29 +6764,12 @@ def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
     return result
 
 
-def _cpp_tensor_codec_module():
-    try:
-        return importlib.import_module("mooncake._store")
-    except ModuleNotFoundError as exc:
-        if exc.name != "mooncake._store":
-            raise
-        return None
-
-
 def _has_tensor_codec_helpers() -> bool:
     module = _cpp_tensor_codec_module()
     return module is not None and all(
         callable(getattr(module, name, None))
         for name in ("_serialize_tensor", "_deserialize_tensor")
     )
-
-
-def _tensor_metadata_size() -> int:
-    module = _cpp_tensor_codec_module()
-    if module is None:
-        return 0
-    helper = getattr(module, "_tensor_metadata_size", None)
-    return int(helper()) if callable(helper) else 0
 
 
 def _torch_save_payload_bytes(value: Any) -> bytes:
@@ -6781,42 +6882,11 @@ def _nested_tensor_from_parts(
     )
 
 
-def _slice_tensor_metadata(
-    metadata: bytes, shape: Sequence[int], data_bytes: int
-) -> bytes:
-    patched = bytearray(metadata)
-    ctypes.c_uint64.from_buffer(patched, 32).value = int(data_bytes)
-    global_shape_offset = 40
-    local_shape_offset = global_shape_offset + 8 * 8
-    for index, dim in enumerate(shape):
-        ctypes.c_int64.from_buffer(
-            patched, global_shape_offset + index * 8
-        ).value = int(dim)
-        ctypes.c_int64.from_buffer(patched, local_shape_offset + index * 8).value = int(
-            dim
-        )
-    return bytes(patched)
-
-
 def _tensor_payload_bytes(value: _TensorPayload) -> tuple[bytes, int]:
     metadata, data_ptr, tensor_nbytes, _owner = _tensor_payload_parts(value)
     if tensor_nbytes == 0:
         return metadata, len(metadata)
     return metadata + ctypes.string_at(data_ptr, tensor_nbytes), len(metadata)
-
-
-def _deserialize_tensor_payload(payload: bytes) -> Any:
-    return _tensor_codec_helper("_deserialize_tensor")(payload)
-
-
-def _tensor_codec_helper(name: str) -> Any:
-    module = _cpp_tensor_codec_module()
-    helper = None if module is None else getattr(module, name, None)
-    if not callable(helper):
-        raise RuntimeError(
-            "the C++ Store tensor codec is required for this structured tensor operation"
-        )
-    return helper
 
 
 def _structured_field_specs(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -7002,13 +7072,10 @@ def _put_with_optional_config(
 
 
 def _put_from_with_optional_config(
-    store: BundleStore, key: str, ptr: int, size: int, config: Any = None
+    backend: StructuredStoreBackend, key: str, ptr: int, size: int, config: Any = None
 ) -> int:
     config = _config_for_grouped_keys(config, 1)
-    put_tensor_from = getattr(store, "put_tensor_from", None)
-    if config is None and callable(put_tensor_from):
-        return put_tensor_from(key, ptr, size)
-    put_from = getattr(store, "put_from", None)
+    put_from = backend.pointer_put(config)
     if callable(put_from):
         return _call_write_with_optional_config(put_from, key, ptr, size, config=config)
     raise RuntimeError("put_from is unavailable")
@@ -7046,7 +7113,7 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
     if callable(batch_remove) and pending_keys:
         try:
             try:
-                results = batch_remove(pending_keys, True)
+                results = batch_remove(pending_keys, force=True)
             except TypeError:
                 results = batch_remove(pending_keys)
             if len(results) != len(pending_keys):
@@ -7068,7 +7135,7 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
     retry_errors = []
     for key in pending_keys:
         try:
-            status = store.remove(key, True)
+            status = store.remove(key, force=True)
         except KeyError:
             continue
         except Exception:
