@@ -216,9 +216,8 @@ if(WITH_STORE)
     integration_utils.h)
   set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
                                                               "$ORIGIN")
-  if(USE_TENT)
-    target_link_libraries(store PRIVATE tent)
-  endif()
+  # transfer_engine provides TENT through tent_link_group. Linking tent
+  # directly would move its dependencies outside that archive rescan group.
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags

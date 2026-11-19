@@ -20,9 +20,11 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <type_traits>
 
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -1782,6 +1784,18 @@ void bind_coro_rpc_interface(py::module_& m) {
     m.attr("CoroRPCInterface") = py::object(m.attr("RpcInterface"));
 }
 
+namespace {
+
+template <typename Enum>
+void bind_enum_integer_conversion(py::enum_<Enum>& type) {
+    const auto to_integer = [](Enum value) {
+        return static_cast<std::underlying_type_t<Enum>>(value);
+    };
+    type.def("__int__", to_integer).def("__index__", to_integer);
+}
+
+}  // namespace
+
 NB_MODULE(engine, m) {
 #ifdef USE_XPU
     m.attr("SUPPORT_XPU") = true;
@@ -1839,14 +1853,20 @@ NB_MODULE(engine, m) {
     m.attr("SUPPORT_MULTI_PROTOCOL") = false;
 #endif
 
-    py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
-        m, "TransferOpcode", py::is_arithmetic());
-    transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
-        .value("Write", TransferEnginePy::TransferOpcode::WRITE)
+    using Opcode = TransferEnginePy::TransferOpcode;
+    py::enum_<Opcode> transfer_opcode(m, "TransferOpcode");
+    bind_enum_integer_conversion(transfer_opcode);
+    transfer_opcode.value("Read", Opcode::READ)
+        .value("Write", Opcode::WRITE)
+        .def("__lt__", std::less<Opcode>{}, py::is_operator())
+        .def("__le__", std::less_equal<Opcode>{}, py::is_operator())
+        .def("__gt__", std::greater<Opcode>{}, py::is_operator())
+        .def("__ge__", std::greater_equal<Opcode>{}, py::is_operator())
         .export_values();
 
-    py::enum_<TransferStatusEnum>(m, "TransferStatus")
-        .value("WAITING", TransferStatusEnum::WAITING)
+    py::enum_<TransferStatusEnum> transfer_status(m, "TransferStatus");
+    bind_enum_integer_conversion(transfer_status);
+    transfer_status.value("WAITING", TransferStatusEnum::WAITING)
         .value("PENDING", TransferStatusEnum::PENDING)
         .value("INVALID", TransferStatusEnum::INVALID)
         .value("CANCELED", TransferStatusEnum::CANCELED)
@@ -1854,8 +1874,10 @@ NB_MODULE(engine, m) {
         .value("TIMEOUT", TransferStatusEnum::TIMEOUT)
         .value("FAILED", TransferStatusEnum::FAILED);
 
-    py::enum_<ScatterTransferCompletionStatus>(
-        m, "ScatterTransferCompletionStatus")
+    py::enum_<ScatterTransferCompletionStatus> scatter_status(
+        m, "ScatterTransferCompletionStatus");
+    bind_enum_integer_conversion(scatter_status);
+    scatter_status
         .value("COMPLETED", ScatterTransferCompletionStatus::COMPLETED)
         .value("FAILED_DRAINED",
                ScatterTransferCompletionStatus::FAILED_DRAINED)
