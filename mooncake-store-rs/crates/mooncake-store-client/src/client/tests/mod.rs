@@ -296,9 +296,18 @@ struct BlockingCasGateState {
 }
 
 #[derive(Default)]
+struct PublishGateState {
+    segment: Option<SegmentName>,
+    entered: bool,
+    release: bool,
+}
+
+#[derive(Default)]
 struct RecoverableMetadataState {
     lease_failures_remaining: usize,
     unpublish_failures_remaining: usize,
+    unpublish_response_failures_remaining: usize,
+    publish_gate: Arc<(StdMutex<PublishGateState>, Condvar)>,
     hidden_clients: BTreeSet<String>,
     hidden_segments: BTreeSet<String>,
     hide_route_policy: bool,
@@ -645,6 +654,45 @@ impl RecoverableMetadataBackend {
             .unpublish_failures_remaining = count;
     }
 
+    fn fail_next_unpublish_response(&self) {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .unpublish_response_failures_remaining = 1;
+    }
+
+    fn publish_gate_handle(&self) -> Arc<(StdMutex<PublishGateState>, Condvar)> {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .publish_gate
+            .clone()
+    }
+
+    fn arm_publish_gate(&self, segment: &SegmentName) {
+        let gate_handle = self.publish_gate_handle();
+        let (lock, _) = &*gate_handle;
+        let mut gate = lock.lock().expect("publish gate lock should succeed");
+        gate.segment = Some(segment.clone());
+    }
+
+    fn wait_publish_gate_entered(&self) {
+        let gate_handle = self.publish_gate_handle();
+        let (lock, cv) = &*gate_handle;
+        let mut gate = lock.lock().expect("publish gate lock should succeed");
+        while !gate.entered {
+            gate = cv.wait(gate).expect("publish gate wait should succeed");
+        }
+    }
+
+    fn release_publish_gate(&self) {
+        let gate_handle = self.publish_gate_handle();
+        let (lock, cv) = &*gate_handle;
+        let mut gate = lock.lock().expect("publish gate lock should succeed");
+        gate.release = true;
+        cv.notify_all();
+    }
+
     fn hide_runtime_metadata(&self, runtime: &ClientRuntimeId) {
         let segments = self
             .inner
@@ -930,6 +978,18 @@ impl MetadataBackend for RecoverableMetadataBackend {
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> mooncake_store_core::Result<()> {
+        {
+            let gate_handle = self.publish_gate_handle();
+            let (lock, cv) = &*gate_handle;
+            let mut gate = lock.lock().expect("publish gate lock should succeed");
+            if gate.segment.as_ref() == Some(&segment.segment_name) {
+                gate.entered = true;
+                cv.notify_all();
+                while !gate.release {
+                    gate = cv.wait(gate).expect("publish gate wait should succeed");
+                }
+            }
+        }
         self.state
             .lock()
             .expect("recoverable metadata state lock should succeed")
@@ -955,7 +1015,18 @@ impl MetadataBackend for RecoverableMetadataBackend {
                 ));
             }
         }
-        self.inner.unpublish_segment(owner, segment)
+        let result = self.inner.unpublish_segment(owner, segment);
+        let mut state = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed");
+        if result.is_ok() && state.unpublish_response_failures_remaining > 0 {
+            state.unpublish_response_failures_remaining -= 1;
+            return Err(StoreError::Metadata(
+                "simulated lost segment unpublish response".to_string(),
+            ));
+        }
+        result
     }
 
     fn get_segment(

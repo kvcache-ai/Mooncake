@@ -289,6 +289,8 @@ impl StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("repair_local_metadata");
+        let retirement_lock = self.state.lock().retirement_lock.clone();
+        let _retirement_guard = retirement_lock.lock();
         let result = (|| {
             let refreshed_transports =
                 self.repair_local_transport_metadata_after_heartbeat_recovery()?;
@@ -300,8 +302,17 @@ impl StoreClient {
                 self.route_topk,
             )?;
             let announcements = self.allocator.lock().announcements();
+            let pending_names = self
+                .state
+                .lock()
+                .pending_retirements
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
             for announcement in &announcements {
-                self.metadata.publish_segment(announcement)?;
+                if !pending_names.contains(&announcement.segment_name) {
+                    self.metadata.publish_segment(announcement)?;
+                }
             }
             self.cold_tier
                 .repair_after_metadata_recovery(self.storage_owner.as_ref())?;

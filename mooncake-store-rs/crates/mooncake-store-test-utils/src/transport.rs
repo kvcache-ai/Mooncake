@@ -579,12 +579,16 @@ pub struct FaultConfig {
     pub disconnected: AtomicBool,
     pub submit_failures_remaining: AtomicU64,
     pub open_failures_remaining: AtomicU64,
+    pub unregister_failures_remaining: AtomicU64,
+    pub free_failures_remaining: AtomicU64,
     pub submit_latency: parking_lot::Mutex<Duration>,
     pub open_latency: parking_lot::Mutex<Duration>,
     /// Deterministic jitter amplitude in milliseconds (0 = disabled).
     pub jitter_ms: AtomicU64,
     pub submit_call_count: AtomicU64,
     pub open_call_count: AtomicU64,
+    pub unregister_call_count: AtomicU64,
+    pub free_call_count: AtomicU64,
 }
 
 impl Default for FaultConfig {
@@ -593,11 +597,15 @@ impl Default for FaultConfig {
             disconnected: AtomicBool::new(false),
             submit_failures_remaining: AtomicU64::new(0),
             open_failures_remaining: AtomicU64::new(0),
+            unregister_failures_remaining: AtomicU64::new(0),
+            free_failures_remaining: AtomicU64::new(0),
             submit_latency: parking_lot::Mutex::new(Duration::ZERO),
             open_latency: parking_lot::Mutex::new(Duration::ZERO),
             jitter_ms: AtomicU64::new(0),
             submit_call_count: AtomicU64::new(0),
             open_call_count: AtomicU64::new(0),
+            unregister_call_count: AtomicU64::new(0),
+            free_call_count: AtomicU64::new(0),
         }
     }
 }
@@ -617,6 +625,15 @@ impl FaultConfig {
 
     pub fn fail_next_opens(&self, n: u64) {
         self.open_failures_remaining.store(n, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_unregisters(&self, n: u64) {
+        self.unregister_failures_remaining
+            .store(n, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_frees(&self, n: u64) {
+        self.free_failures_remaining.store(n, Ordering::SeqCst);
     }
 
     pub fn disconnect(&self) {
@@ -639,16 +656,23 @@ impl FaultConfig {
         self.disconnected.store(false, Ordering::SeqCst);
         self.submit_failures_remaining.store(0, Ordering::SeqCst);
         self.open_failures_remaining.store(0, Ordering::SeqCst);
+        self.unregister_failures_remaining
+            .store(0, Ordering::SeqCst);
+        self.free_failures_remaining.store(0, Ordering::SeqCst);
         *self.submit_latency.lock() = Duration::ZERO;
         *self.open_latency.lock() = Duration::ZERO;
         self.jitter_ms.store(0, Ordering::SeqCst);
         self.submit_call_count.store(0, Ordering::SeqCst);
         self.open_call_count.store(0, Ordering::SeqCst);
+        self.unregister_call_count.store(0, Ordering::SeqCst);
+        self.free_call_count.store(0, Ordering::SeqCst);
     }
 
     pub fn reset_counters(&self) {
         self.submit_call_count.store(0, Ordering::SeqCst);
         self.open_call_count.store(0, Ordering::SeqCst);
+        self.unregister_call_count.store(0, Ordering::SeqCst);
+        self.free_call_count.store(0, Ordering::SeqCst);
     }
 
     /// Deterministic delay: delay_ms = (call_count * 7 + 13) % jitter_ms.
@@ -659,6 +683,29 @@ impl FaultConfig {
         }
         let delay_ms = (call_count.wrapping_mul(7).wrapping_add(13)) % jitter;
         Duration::from_millis(delay_ms)
+    }
+
+    fn consume_failure(failures: &AtomicU64) -> bool {
+        loop {
+            let remaining = failures.load(Ordering::SeqCst);
+            if remaining == 0 {
+                return false;
+            }
+            if failures
+                .compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn should_fail_unregister(&self) -> bool {
+        Self::consume_failure(&self.unregister_failures_remaining)
+    }
+
+    fn should_fail_free(&self) -> bool {
+        Self::consume_failure(&self.free_failures_remaining)
     }
 
     fn should_fail_submit(&self) -> bool {
@@ -769,6 +816,12 @@ impl StoreTransport for FaultyTransport {
     }
 
     fn free_memory(&self, addr: *mut c_void) -> Result<()> {
+        self.faults.free_call_count.fetch_add(1, Ordering::SeqCst);
+        if self.faults.should_fail_free() {
+            return Err(StoreError::Transport(
+                "faulty transport: injected free failure".to_string(),
+            ));
+        }
         self.inner.free_memory(addr)
     }
 
@@ -798,6 +851,14 @@ impl StoreTransport for FaultyTransport {
     }
 
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
+        self.faults
+            .unregister_call_count
+            .fetch_add(1, Ordering::SeqCst);
+        if self.faults.should_fail_unregister() {
+            return Err(StoreError::Transport(
+                "faulty transport: injected unregister failure".to_string(),
+            ));
+        }
         self.inner.unregister_memory(addr, size)
     }
 

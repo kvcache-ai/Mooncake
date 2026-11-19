@@ -1354,12 +1354,23 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("retire_segment");
+        let retirement_lock = self.state.lock().retirement_lock.clone();
+        let _retirement_guard = retirement_lock.lock();
         self.ensure_local_memory()?;
-        let announcement = self
-            .allocator
+        let pending = self
+            .state
             .lock()
-            .announcement(segment)
-            .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment.0)))?;
+            .pending_retirements
+            .get(segment)
+            .cloned();
+        let announcement = match &pending {
+            Some(pending) => pending.announcement.clone(),
+            None => self
+                .allocator
+                .lock()
+                .announcement(segment)
+                .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment.0)))?,
+        };
         if announcement.state != SegmentLifecycleState::Draining {
             let result = Err(StoreError::InvalidState(format!(
                 "segment {} is not draining",
@@ -1373,6 +1384,41 @@ impl MooncakeCompatibilityFacade for StoreClient {
             tracker.finish(&result, 0);
             return result;
         }
+
+        let transport = match &pending {
+            Some(pending) => pending.transport.clone(),
+            None => {
+                let transport = if segment == &self.segment_name()? {
+                    self.transport.clone().ok_or_else(|| {
+                        StoreError::Unsupported("transport is not configured".to_string())
+                    })?
+                } else {
+                    self.state
+                        .lock()
+                        .local_transports
+                        .get(&segment.0)
+                        .cloned()
+                        .ok_or_else(|| {
+                            StoreError::NotFound(format!(
+                                "local transport for segment {} not found",
+                                segment.0
+                            ))
+                        })?
+                };
+                self.state
+                    .lock()
+                    .pending_retirements
+                    .insert(
+                        segment.clone(),
+                        PendingSegmentRetirement {
+                            announcement,
+                            transport: transport.clone(),
+                            region: None,
+                        },
+                    );
+                transport
+            }
+        };
         let result = self
             .metadata
             .unpublish_segment(&self.lease.runtime, segment)
@@ -1382,36 +1428,54 @@ impl MooncakeCompatibilityFacade for StoreClient {
             registry::record_segment_lifecycle("retire_segment", "error");
             return result;
         }
+
+        let region = {
+            let mut state = self.state.lock();
+            let pending = state
+                .pending_retirements
+                .get_mut(segment)
+                .expect("retirement should be pending");
+            match pending.region.take() {
+                Some(region) => region,
+                None => match state.memory_mut()?.detach_storage_segment(segment) {
+                    Ok(region) => region,
+                    Err(error) => {
+                        let result = Err(error);
+                        tracker.finish(&result, 0);
+                        registry::record_segment_lifecycle("retire_segment", "error");
+                        return result;
+                    }
+                },
+            }
+        };
+        if let Err(error) = region.release(transport.as_ref()) {
+            self.state
+                .lock()
+                .pending_retirements
+                .get_mut(segment)
+                .expect("retirement should be pending")
+                .region = Some(region);
+            let result = Err(error);
+            tracker.finish(&result, 0);
+            registry::record_segment_lifecycle("retire_segment", "error");
+            return result;
+        }
         {
             let mut state = self.state.lock();
-            let transport = if segment == &self.segment_name()? {
-                self.transport.clone().ok_or_else(|| {
-                    StoreError::Unsupported("transport is not configured".to_string())
-                })?
-            } else {
-                state.local_transports.remove(&segment.0).ok_or_else(|| {
-                    StoreError::NotFound(format!(
-                        "local transport for segment {} not found",
-                        segment.0
-                    ))
-                })?
-            };
-            state
-                .memory_mut()?
-                .remove_storage_segment(transport.as_ref(), segment)?;
+            if segment != &self.segment_name()? {
+                state.local_transports.remove(&segment.0);
+            }
             self.allocator.lock().remove(segment);
+            state.pending_retirements.remove(segment);
         }
         info!(
             runtime = %self.lease.runtime,
             segment = %segment.0,
             "retired drained segment"
         );
+        let result = Ok(true);
         tracker.finish(&result, 0);
-        if result.as_ref().copied().unwrap_or(false) {
-            registry::record_segment_lifecycle("retire_segment", "ok");
-        } else if result.is_err() {
-            registry::record_segment_lifecycle("retire_segment", "error");
-        }
+        registry::record_segment_lifecycle("retire_segment", "ok");
         result
     }
 

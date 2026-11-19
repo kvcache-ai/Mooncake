@@ -9,14 +9,16 @@
 //   - Segment lifecycle (mount, expand, drain, retire)
 //   - Evacuation entry-point for a single-node empty store
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, HandoffKind, MetadataBackend, SegmentLifecycleState,
     SegmentName, StoreError,
 };
 use mooncake_store_rs_metadata::InMemoryMetadataBackend;
-use mooncake_store_test_utils::transport::TestTransport;
+use mooncake_store_test_utils::transport::{FaultConfig, FaultyTransport, TestTransport};
 
 use crate::{
     memory::{with_test_numa_locations, LocalMemoryConfig},
@@ -86,6 +88,56 @@ fn build_storage_client_with_transport(
         .expect("build");
     c.register_local_memory().expect("register");
     c
+}
+
+fn build_retirement_client(meta: Arc<RecoverableMetadataBackend>, stable_id: &str) -> StoreClient {
+    let segment = format!("{stable_id}-seg");
+    let transport = Arc::new(TestTransport::new(&segment));
+    let factory = transport.factory();
+    let client = StoreClientBuilder::new(meta, stable_id)
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:0")
+        .segment_name(&segment)
+        .transport(Arc::new(transport.peer(&segment)))
+        .transport_factory(factory)
+        .local_memory(storage_config_with_bytes(8 * 1024))
+        .build(test_future_expiry_ms())
+        .expect("build");
+    client.register_local_memory().expect("register");
+    client
+}
+
+fn build_faulty_retirement_client(
+    meta: Arc<InMemoryMetadataBackend>,
+    stable_id: &str,
+) -> (StoreClient, Arc<FaultConfig>, Arc<TestTransport>) {
+    let segment = format!("{stable_id}-seg");
+    let transport = Arc::new(TestTransport::new(&segment));
+    let factory = transport.factory();
+    let (faulty_transport, faults) = FaultyTransport::new(transport.clone());
+    let client = StoreClientBuilder::new(meta, stable_id)
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:0")
+        .segment_name(&segment)
+        .transport(Arc::new(faulty_transport))
+        .transport_factory(factory)
+        .local_memory(storage_config_with_bytes(8 * 1024))
+        .build(test_future_expiry_ms())
+        .expect("build");
+    client.register_local_memory().expect("register");
+    (client, faults, transport)
+}
+
+fn hold_region(
+    client: &StoreClient,
+    segment: &SegmentName,
+) -> Arc<crate::memory::RegisteredRegion> {
+    let state = client.state.lock();
+    state
+        .memory_ref()
+        .expect("memory should be registered")
+        .storage_region(segment)
+        .expect("segment should exist")
 }
 
 // ===========================================================================
@@ -814,6 +866,297 @@ fn retire_segment_retries_after_unpublish_failure() {
     assert!(!client
         .list_segments()
         .expect("local segment listing should succeed")
+        .iter()
+        .any(|segment| segment.segment_name == expanded));
+}
+
+#[test]
+fn retire_segment_recovers_after_inflight_copy() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let meta = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let client = build_retirement_client(meta, "seg-retire-copy");
+    let owner = client.runtime_id().clone();
+    let expanded = client
+        .expand_local_memory(4 * 1024)
+        .expect("expand")
+        .segment_name;
+    client.drain_segment(&expanded).expect("drain");
+    let region = hold_region(&client, &expanded);
+
+    let error = client
+        .retire_segment(&expanded)
+        .expect_err("copy reference must block retirement");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    let local = client.list_segments().expect("local segment listing");
+    assert!(local.iter().any(|segment| {
+        segment.segment_name == expanded && segment.state == SegmentLifecycleState::Draining
+    }));
+    assert!(client
+        .state
+        .lock()
+        .local_transports
+        .contains_key(&expanded.0));
+
+    drop(region);
+    assert!(client.retire_segment(&expanded).expect("retry"));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing")
+        .iter()
+        .any(|segment| segment.segment_name == expanded));
+}
+
+#[test]
+fn failed_retirement_is_not_republished_by_heartbeat_recovery() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let meta = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let client = build_retirement_client(meta, "seg-retire-recovery-retry");
+    let owner = client.runtime_id().clone();
+    let expanded = client
+        .expand_local_memory(4 * 1024)
+        .expect("expand")
+        .segment_name;
+    client.drain_segment(&expanded).expect("drain");
+    let region = hold_region(&client, &expanded);
+
+    let error = client
+        .retire_segment(&expanded)
+        .expect_err("copy reference must block the first retirement");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+
+    client
+        .repair_local_metadata_after_heartbeat_recovery()
+        .expect("heartbeat recovery should succeed");
+    assert!(
+        inner
+            .get_segment(&owner, &expanded)
+            .expect("metadata segment lookup should succeed")
+            .is_none(),
+        "heartbeat recovery must not republish a pending retirement"
+    );
+
+    drop(region);
+    assert!(client.retire_segment(&expanded).expect("retry"));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing")
+        .iter()
+        .any(|segment| segment.segment_name == expanded));
+}
+
+#[test]
+fn retire_segment_lost_response_keeps_pending_and_blocks_name_reuse() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let meta = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let client = build_retirement_client(meta.clone(), "seg-retire-lost-response");
+    let owner = client.runtime_id().clone();
+    let primary = client.segment_name().expect("primary segment name");
+    let expanded = client
+        .expand_local_memory(4 * 1024)
+        .expect("expand")
+        .segment_name;
+    client.drain_segment(&expanded).expect("drain");
+    meta.fail_next_unpublish_response();
+
+    let error = client
+        .retire_segment(&expanded)
+        .expect_err("lost unpublish response must be returned");
+    assert!(matches!(error, StoreError::Metadata(_)));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    client.state.lock().next_local_segment_id = 1;
+    let next_name = client.state.lock().next_segment_name(&primary);
+    assert_eq!(next_name.0, format!("{}-ext-2", primary.0));
+    assert!(client
+        .state
+        .lock()
+        .pending_retirements
+        .contains_key(&expanded));
+
+    assert!(client.retire_segment(&expanded).expect("retry"));
+    assert!(client.state.lock().pending_retirements.is_empty());
+    client.state.lock().next_local_segment_id = 1;
+    assert_eq!(client.state.lock().next_segment_name(&primary), expanded);
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing")
+        .iter()
+        .any(|segment| segment.segment_name == expanded));
+}
+
+#[test]
+fn retire_segment_retries_after_unregister_failure() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let (client, faults, transport) =
+        build_faulty_retirement_client(meta.clone(), "seg-retire-unregister-retry");
+    let owner = client.runtime_id().clone();
+    let primary = client.segment_name().expect("primary segment name");
+    client.expand_local_memory(4 * 1024).expect("expand");
+    client.drain_segment(&primary).expect("drain");
+    let (registered_before, allocations_before) = {
+        let state = transport.state.lock();
+        (state.registered_memory.len(), state.allocations.len())
+    };
+    faults.fail_next_unregisters(1);
+
+    let error = client
+        .retire_segment(&primary)
+        .expect_err("injected unregister failure must be returned");
+    assert!(matches!(error, StoreError::Transport(_)));
+    assert!(meta
+        .get_segment(&owner, &primary)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(client
+        .state
+        .lock()
+        .pending_retirements
+        .get(&primary)
+        .is_some_and(|pending| pending.region.is_some()));
+    assert_eq!(faults.unregister_call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(faults.free_call_count.load(Ordering::SeqCst), 0);
+    {
+        let state = transport.state.lock();
+        assert_eq!(state.registered_memory.len(), registered_before);
+        assert_eq!(state.allocations.len(), allocations_before);
+    }
+
+    assert!(client.retire_segment(&primary).expect("retry"));
+    assert_eq!(faults.unregister_call_count.load(Ordering::SeqCst), 2);
+    assert_eq!(faults.free_call_count.load(Ordering::SeqCst), 1);
+    {
+        let state = transport.state.lock();
+        assert_eq!(state.registered_memory.len(), registered_before - 1);
+        assert_eq!(state.allocations.len(), allocations_before - 1);
+    }
+    assert!(client.state.lock().pending_retirements.is_empty());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing")
+        .iter()
+        .any(|segment| segment.segment_name == primary));
+}
+
+#[test]
+fn retire_segment_retries_free_without_repeating_unregister() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let (client, faults, transport) =
+        build_faulty_retirement_client(meta.clone(), "seg-retire-free-retry");
+    let owner = client.runtime_id().clone();
+    let primary = client.segment_name().expect("primary segment name");
+    client.expand_local_memory(4 * 1024).expect("expand");
+    client.drain_segment(&primary).expect("drain");
+    let (registered_before, allocations_before) = {
+        let state = transport.state.lock();
+        (state.registered_memory.len(), state.allocations.len())
+    };
+    faults.fail_next_frees(1);
+
+    let error = client
+        .retire_segment(&primary)
+        .expect_err("injected free failure must be returned");
+    assert!(matches!(error, StoreError::Transport(_)));
+    assert!(meta
+        .get_segment(&owner, &primary)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(client
+        .state
+        .lock()
+        .pending_retirements
+        .get(&primary)
+        .is_some_and(|pending| pending.region.is_some()));
+    assert_eq!(faults.unregister_call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(faults.free_call_count.load(Ordering::SeqCst), 1);
+    {
+        let state = transport.state.lock();
+        assert_eq!(state.registered_memory.len(), registered_before - 1);
+        assert_eq!(state.allocations.len(), allocations_before);
+    }
+
+    assert!(client.retire_segment(&primary).expect("retry"));
+    assert_eq!(
+        faults.unregister_call_count.load(Ordering::SeqCst),
+        1,
+        "retry must not unregister an already unregistered region"
+    );
+    assert_eq!(faults.free_call_count.load(Ordering::SeqCst), 2);
+    {
+        let state = transport.state.lock();
+        assert_eq!(state.registered_memory.len(), registered_before - 1);
+        assert_eq!(state.allocations.len(), allocations_before - 1);
+    }
+    assert!(client.state.lock().pending_retirements.is_empty());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing")
+        .iter()
+        .any(|segment| segment.segment_name == primary));
+}
+
+#[test]
+fn retirement_waits_for_heartbeat_recovery_publication() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let meta = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let client = Arc::new(build_retirement_client(meta.clone(), "seg-retire-recovery"));
+    let owner = client.runtime_id().clone();
+    let expanded = client
+        .expand_local_memory(4 * 1024)
+        .expect("expand")
+        .segment_name;
+    client.drain_segment(&expanded).expect("drain");
+    meta.arm_publish_gate(&expanded);
+
+    let recovery_client = client.clone();
+    let recovery = std::thread::spawn(move || {
+        recovery_client.repair_local_metadata_after_heartbeat_recovery()
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    meta.wait_publish_gate_entered();
+    let retire_client = client.clone();
+    let expanded_for_retire = expanded.clone();
+    let retire = std::thread::spawn(move || retire_client.retire_segment(&expanded_for_retire));
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(!retire.is_finished());
+
+    meta.release_publish_gate();
+    recovery
+        .join()
+        .expect("recovery thread should not panic")
+        .expect("recovery should succeed");
+    assert!(retire
+        .join()
+        .expect("retire thread should not panic")
+        .expect("retire should succeed"));
+    assert!(inner
+        .get_segment(&owner, &expanded)
+        .expect("metadata segment lookup should succeed")
+        .is_none());
+    assert!(!client
+        .list_segments()
+        .expect("local segment listing")
         .iter()
         .any(|segment| segment.segment_name == expanded));
 }

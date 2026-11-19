@@ -515,6 +515,13 @@ impl LocalMemoryState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn storage_region(&self, segment: &SegmentName) -> Option<Arc<RegisteredRegion>> {
+        self.storage
+            .get(segment)
+            .map(|extent| extent.region.clone())
+    }
+
     pub fn storage_segments(&self) -> Vec<StorageExtentInfo> {
         self.storage
             .iter()
@@ -529,16 +536,15 @@ impl LocalMemoryState {
             .collect()
     }
 
-    pub fn remove_storage_segment(
+    pub fn detach_storage_segment(
         &mut self,
-        transport: &dyn StoreTransport,
         segment: &SegmentName,
-    ) -> Result<()> {
+    ) -> Result<Arc<RegisteredRegion>> {
         let extent = self.storage.remove(segment).ok_or_else(|| {
             StoreError::NotFound(format!("storage segment {} not found", segment.0))
         })?;
         match Arc::try_unwrap(extent.region) {
-            Ok(region) => region.release(transport),
+            Ok(region) => Ok(Arc::new(region)),
             Err(region) => {
                 self.storage.insert(
                     segment.clone(),
@@ -554,6 +560,14 @@ impl LocalMemoryState {
                 )))
             }
         }
+    }
+
+    pub fn remove_storage_segment(
+        &mut self,
+        transport: &dyn StoreTransport,
+        segment: &SegmentName,
+    ) -> Result<()> {
+        self.detach_storage_segment(segment)?.release(transport)
     }
 
     pub fn release_scratch(self, transport: &dyn StoreTransport) -> Result<()> {
@@ -913,6 +927,14 @@ fn storage_target_chunks(
         .collect()
 }
 
+#[derive(Debug, Default)]
+struct ReleaseState {
+    unregister_started: bool,
+    unregister_completed: bool,
+    free_started: bool,
+    free_completed: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct RegisteredRegion {
     base_addr: usize,
@@ -920,6 +942,7 @@ pub(crate) struct RegisteredRegion {
     alignment: usize,
     target_chunks: Vec<SegmentTargetChunk>,
     owner: RegionOwner,
+    release_state: Mutex<ReleaseState>,
 }
 
 impl RegisteredRegion {
@@ -989,6 +1012,7 @@ impl RegisteredRegion {
             alignment,
             target_chunks,
             owner,
+            release_state: Mutex::new(ReleaseState::default()),
         })
     }
 
@@ -1171,10 +1195,32 @@ impl RegisteredRegion {
         })
     }
 
-    pub(crate) fn release(self, transport: &dyn StoreTransport) -> Result<()> {
+    pub(crate) fn release(&self, transport: &dyn StoreTransport) -> Result<()> {
         let base = self.base_ptr();
-        transport.unregister_memory(base, self.capacity)?;
-        self.owner.release(transport, base)
+        let mut state = self.release_state.lock();
+        if !state.unregister_completed {
+            let first_attempt = !state.unregister_started;
+            state.unregister_started = true;
+            match transport.unregister_memory(base, self.capacity) {
+                Ok(()) => state.unregister_completed = true,
+                Err(StoreError::NotFound(_)) if !first_attempt => {
+                    state.unregister_completed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !state.free_completed {
+            let first_attempt = !state.free_started;
+            state.free_started = true;
+            match self.owner.release(transport, base) {
+                Ok(()) => state.free_completed = true,
+                Err(StoreError::NotFound(_)) if !first_attempt => {
+                    state.free_completed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1269,10 +1315,10 @@ enum RegionOwner {
 }
 
 impl RegionOwner {
-    fn release(self, transport: &dyn StoreTransport, base: *mut c_void) -> Result<()> {
+    fn release(&self, transport: &dyn StoreTransport, base: *mut c_void) -> Result<()> {
         match self {
             Self::Transport => transport.free_memory(base),
-            Self::HugePageMmap { mapped_len } => free_hugepage_region(base, mapped_len),
+            Self::HugePageMmap { mapped_len } => free_hugepage_region(base, *mapped_len),
         }
     }
 }
@@ -1547,7 +1593,7 @@ mod tests {
     use super::{
         align_up, allocate_hugepage_region, with_test_numa_locations, LocalMemoryConfig,
         LocalMemoryState, LocalRegionPlan, MemoryRegistration, RegionOwner, RegisteredRegion,
-        StorageSegmentSpec, StoreTransport,
+        ReleaseState, StorageSegmentSpec, StoreTransport,
     };
     #[cfg(target_os = "linux")]
     use super::{free_hugepage_region, hugepage_map_flag};
@@ -2148,6 +2194,7 @@ mod tests {
             alignment: 16,
             target_chunks: Vec::new(),
             owner: RegionOwner::Transport,
+            release_state: Mutex::new(ReleaseState::default()),
         };
 
         let error = region
@@ -2182,6 +2229,7 @@ mod tests {
             alignment: 8,
             target_chunks: Vec::new(),
             owner: RegionOwner::Transport,
+            release_state: Mutex::new(ReleaseState::default()),
         });
         let target_base = 0xabc0_0000u64;
         let target_info = SegmentInfo {
@@ -2755,6 +2803,7 @@ mod tests {
             alignment: 8,
             target_chunks: Vec::new(),
             owner: RegionOwner::Transport,
+            release_state: Mutex::new(ReleaseState::default()),
         };
         let error = region
             .plan(usize::MAX, 8)
