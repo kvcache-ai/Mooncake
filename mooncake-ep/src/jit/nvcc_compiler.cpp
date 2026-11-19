@@ -14,11 +14,14 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <spawn.h>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+
+extern char** environ;
 
 namespace mooncake {
 namespace jit {
@@ -26,6 +29,8 @@ namespace {
 
 struct ProcessResult {
     int exit_code = -1;
+    bool started = false;
+    bool exited = false;
     std::string output;
 };
 
@@ -98,6 +103,8 @@ std::string command_to_string(const std::vector<std::string>& argv) {
 bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
     if (result == nullptr) return false;
     result->exit_code = -1;
+    result->started = false;
+    result->exited = false;
     result->output.clear();
     if (argv.empty()) {
         result->output = "empty command";
@@ -116,25 +123,45 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
         raw_argv.push_back(const_cast<char*>(arg.c_str()));
     raw_argv.push_back(nullptr);
 
-    const pid_t pid = fork();
-    if (pid < 0) {
-        const int saved_errno = errno;
+    const auto close_pipe_and_report_error = [&](const char* operation,
+                                                 int error) {
         close(pipe_fd[0]);
         close(pipe_fd[1]);
-        result->output =
-            std::string("fork failed: ") + std::strerror(saved_errno);
+        result->output = std::string(operation) +
+                         " failed: " + std::strerror(error) +
+                         " (errno=" + std::to_string(error) + ")";
         return false;
+    };
+
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawn_file_actions_init(&actions);
+    if (error != 0)
+        return close_pipe_and_report_error("posix_spawn_file_actions_init",
+                                           error);
+
+    // The child only writes to this pipe, so close its read end.
+    // Do this before dup2: pipe_fd[0] could be fd 1 or 2.
+    error = posix_spawn_file_actions_addclose(&actions, pipe_fd[0]);
+    if (error == 0)
+        error = posix_spawn_file_actions_adddup2(&actions, pipe_fd[1],
+                                                 STDOUT_FILENO);
+    if (error == 0)
+        error = posix_spawn_file_actions_adddup2(&actions, pipe_fd[1],
+                                                 STDERR_FILENO);
+    if (error == 0 && pipe_fd[1] != STDOUT_FILENO &&
+        pipe_fd[1] != STDERR_FILENO)
+        error = posix_spawn_file_actions_addclose(&actions, pipe_fd[1]);
+    if (error != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return close_pipe_and_report_error("posix_spawn_file_actions", error);
     }
 
-    if (pid == 0) {
-        close(pipe_fd[0]);
-        dup2(pipe_fd[1], STDOUT_FILENO);
-        dup2(pipe_fd[1], STDERR_FILENO);
-        close(pipe_fd[1]);
-
-        execvp(raw_argv[0], raw_argv.data());
-        _exit(127);
-    }
+    pid_t pid = -1;
+    error = posix_spawnp(&pid, raw_argv[0], &actions, nullptr, raw_argv.data(),
+                         environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error != 0) return close_pipe_and_report_error("posix_spawnp", error);
+    result->started = true;
 
     close(pipe_fd[1]);
     char buffer[4096];
@@ -160,6 +187,7 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
     }
 
     if (WIFEXITED(status)) {
+        result->exited = true;
         result->exit_code = WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
         result->exit_code = 128 + WTERMSIG(status);
@@ -175,21 +203,30 @@ void compiler_log(const JitCompileInput& input, const std::string& message) {
 }  // namespace
 
 std::string NvccCompiler::compiler_id() const {
-    static const std::string id = [] {
-        const std::string nvcc = resolve_nvcc();
-        ProcessResult result;
-        const std::vector<std::string> argv = {nvcc, "--version"};
-        if (run_process(argv, &result)) {
-            return "nvcc=" + nvcc + "\n" + result.output;
-        }
+    std::string id;
+    std::string error;
+    if (probe_compiler_id(&id, &error)) return id;
+    return error;
+}
 
-        std::ostringstream out;
-        out << "nvcc=" << nvcc << "\nversion unavailable";
-        if (result.exit_code >= 0) out << " exit_code=" << result.exit_code;
-        if (!result.output.empty()) out << "\n" << result.output;
-        return out.str();
-    }();
-    return id;
+bool NvccCompiler::probe_compiler_id(std::string* id,
+                                     std::string* error) const {
+    if (id == nullptr) return false;
+    const std::string nvcc = resolve_nvcc();
+    ProcessResult result;
+    const std::vector<std::string> argv = {nvcc, "--version"};
+    if (run_process(argv, &result)) {
+        *id = "nvcc=" + nvcc + "\n" + result.output;
+        return true;
+    }
+
+    std::ostringstream out;
+    out << "nvcc=" << nvcc << " --version failed";
+    if (result.exit_code >= 0) out << " exit_code=" << result.exit_code;
+    if (!result.output.empty()) out << "\n" << result.output;
+    id->clear();
+    if (error != nullptr) *error = out.str();
+    return false;
 }
 
 std::vector<std::string> NvccCompiler::compile_options(
@@ -238,6 +275,7 @@ bool NvccCompiler::compile_to_cubin(const JitCompileInput& input,
     output->cubin.clear();
     output->log.clear();
     output->compiler_sec = 0.0;
+    output->cacheable_failure = false;
 
     if (input.source_path.empty() || input.cubin_path.empty()) {
         output->log =
@@ -291,6 +329,9 @@ bool NvccCompiler::compile_to_cubin(const JitCompileInput& input,
     output->log = log.str();
 
     if (!ok) {
+        output->cacheable_failure = result.started && result.exited &&
+                                    result.exit_code != 0 &&
+                                    result.exit_code != 127;
         compiler_log(input, "compiler=nvcc action=compile_failed exit_code=" +
                                 std::to_string(result.exit_code) +
                                 " nvcc_process_sec=" +

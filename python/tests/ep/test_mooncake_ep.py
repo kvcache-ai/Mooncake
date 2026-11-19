@@ -1,3 +1,9 @@
+"""Legacy EP correctness and bandwidth test with optional NCCL bootstrap.
+
+Single-node P2P: python test_mooncake_ep.py --pg-backend nccl --require-native
+"""
+
+import argparse
 import random
 import torch
 import torch.distributed as dist
@@ -59,7 +65,7 @@ def test_main(
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
-    active_ranks = torch.ones((num_tokens,), dtype=torch.int32, device="cuda")
+    active_ranks = torch.ones((num_ranks,), dtype=torch.int32, device="cuda")
     for return_recv_hook in (False, True):
         for dispatch_use_fp8 in [False, True]:
             num_times += 1
@@ -270,8 +276,8 @@ def test_main(
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int):
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+def test_loop(local_rank: int, num_local_ranks: int, args):
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks, args.pg_backend)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
@@ -280,11 +286,23 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if local_rank == 0:
         print(f"Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...", flush=True)
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
-    # Mock a broken rank 1 to test effectiveness of EP recovery
-    if local_rank != 1:
-        buffer.update_ep_member()
-    else:
-        buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
+    # The asymmetric update/rebuild scenario uses Mooncake PG recovery.
+    # NCCL bootstrap keeps fixed membership: update and initial connect have
+    # different collective sequences, so run the healthy data-path checks.
+    if args.pg_backend == "mooncake":
+        if local_rank != 1:
+            buffer.update_ep_member()
+        else:
+            buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
+    elif local_rank == 0:
+        print("NCCL bootstrap: skipping asymmetric member recovery", flush=True)
+    if args.require_native:
+        assert not buffer._use_fallback, "Native EP fast path is required"
+    print(
+        f"rank={rank} device={torch.cuda.get_device_name(local_rank)} "
+        f"fallback={buffer._use_fallback}",
+        flush=True,
+    )
     test_main(
         num_tokens,
         hidden,
@@ -296,6 +314,8 @@ def test_loop(local_rank: int, num_local_ranks: int):
         buffer,
         seed=1,
     )
+
+    print(f"rank={rank} MOONCAKE_EP_TEST_PASS", flush=True)
 
     do_pressure_test = False
     for seed in range(int(1e9) if do_pressure_test else 0):
@@ -338,5 +358,15 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == "__main__":
     # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 2
-    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pg-backend", choices=("mooncake", "nccl"), default="mooncake"
+    )
+    parser.add_argument("--num-ranks", type=int, default=2)
+    parser.add_argument("--require-native", action="store_true")
+    args = parser.parse_args()
+    if args.num_ranks < 2:
+        parser.error("num-ranks must be at least 2")
+    torch.multiprocessing.spawn(
+        test_loop, args=(args.num_ranks, args), nprocs=args.num_ranks
+    )

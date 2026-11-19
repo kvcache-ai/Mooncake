@@ -8,11 +8,13 @@
 
 #include "common_types.h"
 #include "pg_assert.h"
+#include "device_comm/device_utils/d2h_request_slot.cuh"
+#include "device_comm/device_utils/h2d_request_slot.cuh"
 #include "device_comm/device_utils/device_timeout.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
-#include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.cuh"
 #include "device_comm/device_transfer/routes/rdma_route/rdma_route.cuh"
+#include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
 
 namespace mooncake {
 
@@ -39,14 +41,22 @@ __device__ __forceinline__ void validateRemoteSignal(
     }
 }
 
-static __device__ __noinline__ void drainTransfers(
-    const DeviceTransferHandle& handle, const GlobalRank* peers,
-    uint32_t peer_count) {
+inline __device__ __noinline__ void DeviceTransferHandle::drain(
+    const GlobalRank* peers, uint32_t peer_count) const {
     // One thread drains after all producers stop submitting. P2P has no
     // outstanding asynchronous transport work to drain.
-    drainRdmaTransfers(handle, peers, peer_count);
-    drainHostProxyTransfers(handle.route_context.host_proxy,
-                            handle.drain_timeout_ticks);
+    drainRdmaTransfers(*this, peers, peer_count);
+    drainHostProxyTransfers(*this);
+}
+
+__device__ __forceinline__ void DeviceTransferHandle::pauseIfRequested() const {
+    PauseMailbox::PauseSlot::ReceivedRequest received;
+    while (pause_mailbox->pause.tryReceive(received)) {
+        PG_ASSERT(received.pinned);
+        received.handle.reply({});
+        auto resume_request = pause_mailbox->resume.submit({});
+        resume_request.wait();
+    }
 }
 
 class TransferTicket {

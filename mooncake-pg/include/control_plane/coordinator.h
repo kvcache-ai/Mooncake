@@ -57,6 +57,9 @@ class CoordinatorStateMachine {
                                                              uint64_t epoch,
                                                              bool applied) = 0;
 
+    virtual CoordinatorApplyResult<void> handleTransferEndpointUpdateAck(
+        const TransferEndpointUpdateAck& ack) = 0;
+
     virtual CoordinatorApplyResult<void> tick() = 0;
 
     virtual CoordinatorApplyResult<void> requestShutdown() = 0;
@@ -112,6 +115,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                                      uint64_t epoch,
                                                      bool applied) override;
 
+    CoordinatorApplyResult<void> handleTransferEndpointUpdateAck(
+        const TransferEndpointUpdateAck& ack) override;
+
     CoordinatorApplyResult<void> tick() override;
 
     CoordinatorApplyResult<void> requestShutdown() override;
@@ -150,6 +156,34 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // Per-GlobalRank coordinator state.
     std::vector<RankInfo> ranks_;
+
+    // Tracks an endpoint installation until every participating Agent session
+    // confirms completion or is invalidated.
+    struct PendingTransferEndpointInstallation {
+        // Fixed endpoint snapshot sent to the participating agents.
+        DeviceTransferSnapshot snapshot;
+        std::unordered_set<GlobalRank> waiting_acks;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
+    // Transfer endpoint installation follows additions to the Synced set,
+    // including new rank epochs. For a world of N ranks, if each arriving rank
+    // triggers an installation that completes before the next rank arrives,
+    // startup takes N installation rounds. This is expensive for the NCCL
+    // device route, which rebuilds its communicator and registers its windows
+    // during each installation.
+    //
+    // As a simple startup optimization, wait until all active ranks in the
+    // first group (often the world group) have registered before starting the
+    // installation.
+    //
+    // FIXME: Revisit this if large expansions after startup become a
+    // bottleneck.
+    bool transfer_endpoint_updates_started_ = false;
+    std::optional<DeviceTransferSnapshot> installed_transfer_endpoints_;
+    std::optional<PendingTransferEndpointInstallation>
+        pending_transfer_endpoint_installation_;
+    uint64_t next_transfer_snapshot_version_ = 1;
 
     std::unordered_map<GroupId, GroupView> group_views_;
 
@@ -251,6 +285,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                               GroupId group_id) const;
     void resolvePendingSyncs(std::vector<CoordinatorEffect>& effects);
 
+    DeviceTransferSnapshot transferEndpointSnapshot() const;
+    void updateTransferEndpoints(std::vector<CoordinatorEffect>& effects);
+    void tryCompleteTransferEndpointInstallation(
+        std::vector<CoordinatorEffect>& effects);
+
+    bool isDeviceLinkUp(GlobalRank rank) const;
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
 
     // Preserve existing healthy ranks that are still mutually connected,

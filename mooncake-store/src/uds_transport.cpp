@@ -271,10 +271,14 @@ void UdsAcceptor::registerHandler(Handler handler) {
     handler_ = std::move(handler);
 }
 
-tl::expected<void, std::string> UdsAcceptor::start() {
+tl::expected<void, std::string> UdsAcceptor::start(int backlog) {
     if (running_.load()) return {};
     if (!handler_) {
         return tl::make_unexpected("UDS acceptor handler is not registered");
+    }
+
+    if (backlog <= 0) {
+        return tl::make_unexpected("UDS listen backlog must be positive");
     }
 
     listen_fd_ = createCloexecUdsSocket();
@@ -299,7 +303,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         return tl::make_unexpected(error);
     }
 
-    if (listen(listen_fd_, 5) < 0) {
+    if (listen(listen_fd_, backlog) < 0) {
         auto error = errnoMessage("Failed to listen on UDS socket '" +
                                   socket_name_ + "'");
         ::close(listen_fd_);
