@@ -33,8 +33,9 @@ TEST(ShmHelperTest, AllocatesWithParallelPopulationPath) {
     EXPECT_NE(helper->get_shm(buffer), nullptr);
     std::vector<unsigned char> resident(size / getpagesize());
     EXPECT_EQ(mincore(buffer, size, resident.data()), 0);
-    EXPECT_TRUE(std::all_of(resident.begin(), resident.end(),
-                            [](unsigned char page) { return (page & 1) != 0; }));
+    EXPECT_TRUE(
+        std::all_of(resident.begin(), resident.end(),
+                    [](unsigned char page) { return (page & 1) != 0; }));
     EXPECT_EQ(helper->free(buffer), 0);
 }
 
