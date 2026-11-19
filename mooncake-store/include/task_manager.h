@@ -214,8 +214,11 @@ class ScopedTaskWriteAccess {
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
+    // Sets *completed_drain_task when this call transitions a drain-retained
+    // task to a finished status.
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
-                            TaskStatus status, const std::string& message);
+                            TaskStatus status, const std::string& message,
+                            bool* completed_drain_task = nullptr);
 
     ErrorCode cancel_task(const UUID& task_id, const TenantId& tenant_id);
 

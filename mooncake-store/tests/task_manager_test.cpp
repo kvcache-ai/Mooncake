@@ -554,6 +554,49 @@ TEST_P(PendingTaskCompletionQuotaTest, ReleasesPendingQuotaExactlyOnce) {
     EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
 }
 
+TEST_F(ClientTaskManagerTest, CompleteTaskReportsDrainRetentionOnce) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    const UUID client_id = generate_uuid();
+    const UUID wrong_client = generate_uuid();
+    const ReplicaMovePayload payload{
+        .key = "key", .source = "source", .target = "target"};
+
+    auto regular =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, payload, /*retained_by_drain=*/false);
+    auto drain =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, payload, /*retained_by_drain=*/true);
+    ASSERT_TRUE(regular.has_value());
+    ASSERT_TRUE(drain.has_value());
+
+    bool completed_drain_task = true;
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client_id, *regular, TaskStatus::SUCCESS, "done",
+                  &completed_drain_task),
+              ErrorCode::OK);
+    EXPECT_FALSE(completed_drain_task);
+
+    completed_drain_task = true;
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  wrong_client, *drain, TaskStatus::SUCCESS, "wrong",
+                  &completed_drain_task),
+              ErrorCode::ILLEGAL_CLIENT);
+    EXPECT_FALSE(completed_drain_task);
+
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client_id, *drain, TaskStatus::SUCCESS, "done",
+                  &completed_drain_task),
+              ErrorCode::OK);
+    EXPECT_TRUE(completed_drain_task);
+
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client_id, *drain, TaskStatus::SUCCESS, "duplicate",
+                  &completed_drain_task),
+              ErrorCode::OK);
+    EXPECT_FALSE(completed_drain_task);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     TerminalStatusAndCleanup, PendingTaskCompletionQuotaTest,
     ::testing::Combine(::testing::Values(TaskStatus::SUCCESS,
