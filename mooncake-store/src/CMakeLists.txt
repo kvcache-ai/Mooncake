@@ -172,6 +172,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp
     device/xpu_accelerator_device.cpp
+    device/tpu_accelerator_device.cpp
     local_hot_cache.cpp
     store_c.cpp
     memory_alloc.cpp

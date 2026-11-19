@@ -16,6 +16,9 @@ void EnsureCudaLikeAcceleratorDeviceLinked();
 #if defined(USE_XPU)
 void EnsureXpuAcceleratorDeviceLinked();
 #endif
+#if defined(USE_TPU)
+void EnsureTpuAcceleratorDeviceLinked();
+#endif
 
 namespace {
 
@@ -107,6 +110,9 @@ const AcceleratorRegistry& GetAcceleratorRegistry() {
 #endif
 #if defined(USE_XPU)
     EnsureXpuAcceleratorDeviceLinked();
+#endif
+#if defined(USE_TPU)
+    EnsureTpuAcceleratorDeviceLinked();
 #endif
     return MutableRegistry();
 }

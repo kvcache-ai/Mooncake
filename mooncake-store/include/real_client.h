@@ -144,7 +144,8 @@ class RealClient : public PyClient {
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
      * @note Direct RDMA reads require register_buffer() or the setup-time local
-     * buffer. NVLink can read directly into an ordinary device allocation.
+     * buffer. NVLink can read directly into an ordinary device allocation, and
+     * TENT into TPU memory.
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
