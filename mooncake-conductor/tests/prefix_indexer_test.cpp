@@ -1639,4 +1639,33 @@ TEST(Capacity, OrderTrackingStaysInSyncWithBlocks) {
     EXPECT_GT(sizes.evicted_by_capacity, 0);
 }
 
+TEST(Capacity, QueriedSharedPrefixSurvivesNewerStores) {
+    PrefixCacheTable table(10);
+    RegisterOrFail(table, Registration());
+    const auto shared = Tokens(64);
+    ASSERT_EQ(table.StoreEngine(Device(Hashes(shared))), "");
+
+    for (uint64_t i = 1; i <= 30; ++i) {
+        ASSERT_EQ(table.Query(TestContext(), shared).at("instance-a").device,
+                  64);
+        ASSERT_EQ(table.StoreEngine(Device({Prefix(i)})), "");
+    }
+    EXPECT_EQ(table.Query(TestContext(), shared).at("instance-a").device, 64);
+    EXPECT_LE(PrefixCacheTableTestPeer::Order(table, TestContext()).blocks,
+              10u);
+}
+
+TEST(Capacity, QueryProtectsPrefixForOneEvictionPass) {
+    PrefixCacheTable table(10);
+    RegisterOrFail(table, Registration());
+    const auto shared = Tokens(64);
+    ASSERT_EQ(table.StoreEngine(Device(Hashes(shared))), "");
+    ASSERT_EQ(table.Query(TestContext(), shared).at("instance-a").device, 64);
+
+    for (uint64_t i = 1; i <= 30; ++i) {
+        ASSERT_EQ(table.StoreEngine(Device({Prefix(i)})), "");
+    }
+    EXPECT_EQ(table.Query(TestContext(), shared).at("instance-a").device, 0);
+}
+
 }  // namespace
