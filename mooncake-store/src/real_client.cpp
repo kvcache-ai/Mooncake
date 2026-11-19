@@ -1071,6 +1071,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
     offload_rpc_drain_ = RpcDrainGuard{};
+    mount_drain_ = RpcDrainGuard{};
     storage_shutdown_error_ = ErrorCode::OK;
 
     this->protocol = protocol;
@@ -1948,6 +1949,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
         LOG(WARNING) << "Waiting for in-flight offload RPCs during teardown";
     }
+    while (!mount_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(WARNING) << "Waiting for in-flight segment mounts during teardown";
+    }
 
     // Runs while Client is still up, so it keeps heartbeating, serving remote
     // reads and running the drain tasks the master sends it.
@@ -2233,6 +2237,11 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
                              size_t size, const std::string &protocol,
                              const std::string &location,
                              std::vector<std::string> &out_segment_ids) {
+    RpcDrainGuard::ScopedCall mounting(mount_drain_);
+    if (!mounting.ok()) {
+        LOG(ERROR) << "Client is closing";
+        return -1;
+    }
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -2476,6 +2485,11 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
 int RealClient::allocateAndMountSegment(
     size_t size, const std::string &protocol, const std::string &location,
     std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {
+    RpcDrainGuard::ScopedCall mounting(mount_drain_);
+    if (!mounting.ok()) {
+        LOG(ERROR) << "Client is closing";
+        return -1;
+    }
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
