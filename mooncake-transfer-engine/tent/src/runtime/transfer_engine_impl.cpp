@@ -3203,9 +3203,8 @@ Status TransferEngineImpl::refillDispatchWindow() {
         expired_waits.push_back(reinterpret_cast<BatchID>(batch));
     }
     std::sort(expired_waits.begin(), expired_waits.end());
-    expired_waits.erase(
-        std::unique(expired_waits.begin(), expired_waits.end()),
-        expired_waits.end());
+    expired_waits.erase(std::unique(expired_waits.begin(), expired_waits.end()),
+                        expired_waits.end());
     for (const auto batch_id : expired_waits) {
         CHECK_STATUS(cancelQueuedOwners(batch_id));
     }
