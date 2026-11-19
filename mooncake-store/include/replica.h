@@ -541,6 +541,16 @@ class Replica {
         return replica.is_memory_replica();
     }
 
+    [[nodiscard]] bool is_live_memory_replica() const {
+        return is_memory_replica() && status_ != ReplicaStatus::REMOVED &&
+               status_ != ReplicaStatus::FAILED;
+    }
+
+    [[nodiscard]] static bool fn_is_live_memory_replica(
+        const Replica& replica) {
+        return replica.is_live_memory_replica();
+    }
+
     [[nodiscard]] bool is_nof_replica() const {
         return std::holds_alternative<NoFReplicaData>(data_);
     }
