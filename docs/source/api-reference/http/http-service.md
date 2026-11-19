@@ -577,6 +577,11 @@ Drain jobs migrate all objects away from one or more segments so they can be
 unmounted safely. Job states follow `CREATED -> PLANNING -> RUNNING ->
 SUCCEEDED | FAILED | CANCELED`.
 
+An object moves only to a target with room for it. Until a target has room,
+the object counts as blocked. When the job has no `target_segments`, the
+master also starts eviction to make room. An object larger than every target
+counts as failed.
+
 #### `POST /api/v1/drain_jobs`
 Create a drain job for the given segments.
 

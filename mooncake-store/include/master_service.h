@@ -2206,9 +2206,22 @@ class MasterService {
     bool FinishDrainJobCancellation(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
-    std::optional<std::string> SelectDrainTargetForKey(
+    enum class DrainTargetMiss {
+        // No target can take the object now, e.g. while this job's planned
+        // moves fill them.
+        kNoTarget,
+        // A target could hold the object once some of its allocated bytes
+        // are freed.
+        kNoRoom,
+        // Every target is smaller than the object.
+        kTooLarge,
+    };
+    // Picks the least used target with room for the object, counting the
+    // bytes already planned for it.
+    tl::expected<std::string, DrainTargetMiss> SelectDrainTargetForKey(
         const ObjectMetadata& metadata, const std::string& source_segment,
-        const std::vector<std::string>& requested_targets);
+        const std::vector<std::string>& requested_targets,
+        const std::unordered_map<std::string, size_t>& pending_bytes);
     std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
