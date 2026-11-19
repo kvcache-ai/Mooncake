@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mooncake-master
+  labels:
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/component: master
+    app.kubernetes.io/part-of: mooncake
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mooncake-master
+  endpoints:
+    - port: metrics
+      interval: 15s
