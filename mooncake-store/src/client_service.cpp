@@ -1639,8 +1639,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
             filtered.reserve(query_result.replicas.size());
             for (const auto& replica : query_result.replicas) {
                 const std::string endpoint = PeerReplicaEndpoint(replica);
-                if (!endpoint.empty() &&
-                    excluded_endpoints.count(endpoint)) {
+                if (!endpoint.empty() && excluded_endpoints.count(endpoint)) {
                     continue;
                 }
                 filtered.push_back(replica);
@@ -1756,8 +1755,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
             filtered.reserve(query_result.replicas.size());
             for (const auto& replica : query_result.replicas) {
                 const std::string endpoint = PeerReplicaEndpoint(replica);
-                if (!endpoint.empty() &&
-                    excluded_endpoints.count(endpoint)) {
+                if (!endpoint.empty() && excluded_endpoints.count(endpoint)) {
                     continue;
                 }
                 filtered.push_back(replica);
