@@ -108,11 +108,16 @@ endif()
 # features. Owner: F15 (S58, W01-W04, W06, W07); close after all assigned items.
 # F01-T110 also covers buffer_pool.cpp and buffer_pool.py installation in S13.
 if(WITH_STORE)
+  if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "p2p")
+    set(STORE_BINDING_SOURCE store/p2p_store_py.cpp)
+  else()
+    set(STORE_BINDING_SOURCE store/store_py.cpp)
+  endif()
   pybind11_add_module(
     store
     ${SOURCES}
     ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
+    ${STORE_BINDING_SOURCE}
     integration_utils.h)
   set_target_properties(
     store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
