@@ -144,6 +144,10 @@ tl::expected<void, std::string> FileUtil::SaveStringToFile(
         }
 
         file.close();
+        if (!file) {
+            return tl::make_unexpected("Failed to close file after writing: " +
+                                       file_path);
+        }
         return {};
     } catch (const std::exception &e) {
         return tl::make_unexpected(
@@ -168,6 +172,10 @@ tl::expected<void, std::string> FileUtil::SaveBinaryToFile(
         }
 
         file.close();
+        if (!file) {
+            return tl::make_unexpected("Failed to close file after writing: " +
+                                       file_path);
+        }
         return {};
     } catch (const std::exception &e) {
         return tl::make_unexpected(
