@@ -1,7 +1,5 @@
 #pragma once
 
-#include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -10,6 +8,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+
+#include "ascii_string.h"
 
 namespace mooncake {
 
@@ -67,28 +67,29 @@ inline std::optional<uint64_t> try_string_to_byte_size_impl(
 
     std::string unit = value_string.substr(unit_offset);
     unit.erase(0, unit.find_first_not_of(" \t\r\n"));
-    std::transform(unit.begin(), unit.end(), unit.begin(),
-                   [](unsigned char c) -> char { return std::toupper(c); });
+    // Locale-independent folding: std::toupper('i') stays 'i' under tr_TR,
+    // which would silently reject every IEC spelling there.
+    unit = AsciiToLower(unit);
 
     constexpr double kKiB = 1024.0;
     constexpr double kMiB = kKiB * 1024.0;
     constexpr double kGiB = kMiB * 1024.0;
     constexpr double kTiB = kGiB * 1024.0;
     const bool is_iec_unit =
-        unit == "KIB" || unit == "MIB" || unit == "GIB" || unit == "TIB";
+        unit == "kib" || unit == "mib" || unit == "gib" || unit == "tib";
     if (is_iec_unit && unit_set == ByteSizeUnitSet::kLegacyOnly) {
         return std::nullopt;
     }
     double multiplier = 1.0;
-    if (unit == "KIB" || unit == "KB" || unit == "K") {
+    if (unit == "kib" || unit == "kb" || unit == "k") {
         multiplier = kKiB;
-    } else if (unit == "MIB" || unit == "MB" || unit == "M") {
+    } else if (unit == "mib" || unit == "mb" || unit == "m") {
         multiplier = kMiB;
-    } else if (unit == "GIB" || unit == "GB" || unit == "G") {
+    } else if (unit == "gib" || unit == "gb" || unit == "g") {
         multiplier = kGiB;
-    } else if (unit == "TIB" || unit == "TB" || unit == "T") {
+    } else if (unit == "tib" || unit == "tb" || unit == "t") {
         multiplier = kTiB;
-    } else if (unit != "B" && !unit.empty()) {
+    } else if (unit != "b" && !unit.empty()) {
         return std::nullopt;
     }
     // UINT64_MAX itself rounds up as a double, so check an exclusive limit
