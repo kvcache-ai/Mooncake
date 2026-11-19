@@ -18,7 +18,8 @@ enum class ClientLivenessState {
     OFFLINE,
 };
 
-// Readable spelling for log lines and diagnostics.
+// Readable spelling for log lines and diagnostics; operator-facing messages
+// should not print the numeric enum value.
 [[nodiscard]] constexpr std::string_view toString(
     ClientLivenessState state) noexcept {
     switch (state) {
@@ -44,6 +45,10 @@ enum class ClientLivenessObservation {
     REJECTED_OFFLINE,
 };
 
+// The liveness state machine of one client incarnation. It reports every
+// transition to the caller that caused it and has no side effects of its own:
+// whoever mutates a record owns what a transition means. Only the session
+// registry does; everyone else holds the read-only ClientSessionSharedPtr.
 class ClientLivenessRecord {
    public:
     using Clock = std::chrono::steady_clock;
@@ -147,7 +152,9 @@ class ClientLivenessRecord {
     TimePoint suspected_since_{};
 };
 
-// Resources retain the exact incarnation without permission to mutate it.
+// Read-only, shared identity of one client registration, including its stable
+// client ID. The shared identity distinguishes incarnations with the same ID.
+// Resources retain this handle; mutation and admission belong to the registry.
 using ClientSessionSharedPtr = std::shared_ptr<const ClientLivenessRecord>;
 
 }  // namespace mooncake

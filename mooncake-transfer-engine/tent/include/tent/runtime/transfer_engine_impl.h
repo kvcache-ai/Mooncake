@@ -396,6 +396,10 @@ class TransferEngineImpl {
             return Status::InvalidArgument(
                 "Runtime config snapshot must not be null" LOC_MARK);
         }
+        // No gpu_wait guard is needed here: enable_runtime_queue is
+        // bootstrap-only (see classifyConfigPath), so a runtime generation can
+        // never carry it and deferred dispatch cannot be turned on after
+        // construct() validated the sync mode against it.
         std::atomic_store_explicit(&runtime_config_snapshot_,
                                    std::move(snapshot),
                                    std::memory_order_release);
@@ -585,8 +589,8 @@ class TransferEngineImpl {
     Status sendNotificationViaRpc(SegmentID target_id,
                                   const Notification& notifi);
 
-    void findStagingPolicy(const Request& req,
-                           std::vector<std::string>& policy);
+    void findStagingPolicy(const Request& req, std::vector<std::string>& policy,
+                           bool allow_device_direct = true);
 
     // True when a request touching XPU or MLU memory can go over RDMA without
     // host staging: the RDMA transport advertises the device capability the

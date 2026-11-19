@@ -67,7 +67,16 @@ if(USE_MLU)
     add_test(NAME ${mlu_test} COMMAND ${mlu_test})
   endforeach()
 endif()
+add_store_test(real_client_shutdown_test real_client_shutdown_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(real_client_shutdown_test
+                             PRIVATE MOONCAKE_TEST_WRAP_UNREGISTER)
+  target_link_options(
+    real_client_shutdown_test PRIVATE
+    "-Wl,--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
+add_store_test(read_singleflight_test read_singleflight_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
 add_store_test(local_shm_conflict_test local_shm_conflict_test.cpp)
 add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
@@ -76,6 +85,8 @@ add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(client_session_registry_test client_session_registry_test.cpp)
+add_store_test(client_session_event_dispatcher_test
+               client_session_event_dispatcher_test.cpp)
 add_store_test(client_session_expiry_test client_session_expiry_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
@@ -202,6 +213,7 @@ add_test(
 )
 set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
+add_store_test(soft_pin_rpc_test soft_pin_rpc_test.cpp)
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
@@ -415,6 +427,14 @@ add_ha_test(batch_oplog_snapshot_writer_test
             ha/snapshot/batch_oplog/writer_test.cpp)
 add_ha_test(batch_oplog_snapshot_provider_test
             ha/snapshot/batch_oplog/provider_test.cpp)
+find_package(AWSSDK QUIET COMPONENTS s3)
+if(AWSSDK_FOUND)
+  add_ha_test(s3_snapshot_object_store_test
+              ha/snapshot/object/backends/s3/s3_snapshot_object_store_test.cpp)
+  target_compile_definitions(s3_snapshot_object_store_test PRIVATE HAVE_AWS_SDK)
+  target_link_libraries(s3_snapshot_object_store_test
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
 add_ha_test(batch_oplog_snapshot_publisher_test
             ha/snapshot/batch_oplog/publisher_test.cpp)
 add_ha_test(batch_oplog_pruning_coordinator_test
