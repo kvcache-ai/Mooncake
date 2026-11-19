@@ -92,13 +92,19 @@ impl StorageOwnerState {
         let tracker = OperationTracker::new("storage_owner_pending_delete_gc");
         let result = (|| {
             let limit = max_backings.max(1);
+            // Serialize scan progress, including calls made by device cleanup.
+            // Global and device-specific sweeps each retain their own position.
+            let mut cursors = self.pending_delete_gc_cursors.lock();
+            let scope = device_id.map(str::to_string);
             let routes = self.metadata.as_ref().list_object_routes_by_cold_backing(
                 &mooncake_store_core::ColdBackingRouteFilter {
-                    device_id: device_id.map(str::to_string),
+                    device_id: scope.clone(),
+                    after_key: cursors.get(&scope).cloned(),
                     limit: Some(limit),
                     ..mooncake_store_core::ColdBackingRouteFilter::default()
                 },
             )?;
+            let exhausted = routes.len() < limit;
             let mut result = PendingDeleteGcResult::default();
             let mut live_foreign_owners = BTreeSet::new();
             for listed_route in routes {
@@ -106,6 +112,9 @@ impl StorageOwnerState {
                     break;
                 }
                 result.scanned_routes = result.scanned_routes.saturating_add(1);
+                // Advance even when this entry is deferred or its reclaim fails.
+                // Update per entry so an error cannot skip the rest of the page.
+                cursors.insert(scope.clone(), listed_route.key.clone());
                 let Some(listed_backing) = listed_route.cold_backing.as_ref() else {
                     continue;
                 };
@@ -127,6 +136,9 @@ impl StorageOwnerState {
                     continue;
                 }
                 self.reclaim_pending_delete_cold_route(&listed_route, listed_backing, &mut result)?;
+            }
+            if exhausted {
+                cursors.remove(&scope);
             }
             Ok(result)
         })();

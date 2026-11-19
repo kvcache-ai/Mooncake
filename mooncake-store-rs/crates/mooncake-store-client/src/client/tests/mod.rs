@@ -20316,6 +20316,7 @@ mod namespace_adversarial;
 mod namespace_isolation_tests;
 mod perf_invariant_tests;
 mod quota_prop;
+mod review_gc_starvation;
 mod route_migration_tests;
 mod routing_prop;
 mod routing_tests;
