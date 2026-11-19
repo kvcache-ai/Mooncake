@@ -343,6 +343,13 @@ if(USE_TCP)
                                                   gtest_main)
   add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
 
+  add_executable(tcp_unregister_republish_test
+                 ${WORKSPACE}/tcp_unregister_republish_test.cpp)
+  target_link_libraries(tcp_unregister_republish_test PUBLIC transfer_engine gtest
+                                                             gtest_main)
+  add_test(NAME tcp_unregister_republish_test
+           COMMAND tcp_unregister_republish_test)
+
   add_executable(tcp_write_visibility_test
                  ${WORKSPACE}/tcp_write_visibility_test.cpp)
   target_compile_definitions(tcp_write_visibility_test

@@ -1193,7 +1193,23 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("mount_segment").input_bytes(capacity_bytes);
+        let retirement_lock = self.state.lock().retirement_lock.clone();
+        let _retirement_guard = retirement_lock.lock();
         let segment_name = self.segment_name()?;
+        if self
+            .state
+            .lock()
+            .pending_retirements
+            .contains_key(&segment_name)
+        {
+            let result = Err(StoreError::InvalidState(format!(
+                "segment {} is pending retirement",
+                segment_name.0
+            )));
+            tracker.finish(&result, used_bytes);
+            registry::record_segment_lifecycle("mount_segment", "error");
+            return result;
+        }
         let segment = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
             transport_endpoint: self.local_transport_endpoint(&segment_name),
@@ -1241,14 +1257,31 @@ impl MooncakeCompatibilityFacade for StoreClient {
             tracker.finish(&result, 0);
             return result;
         }
+        let plans = self.storage_segment_plans(storage_bytes)?;
+        let retirement_lock = self.state.lock().retirement_lock.clone();
+        let _retirement_guard = retirement_lock.lock();
         let primary = self.segment_name()?;
         let mut announcements = Vec::new();
-        for plan in self.storage_segment_plans(storage_bytes)? {
+        for plan in plans {
             let attach_primary = {
                 let state = self.state.lock();
                 let memory = state.memory_ref()?;
                 !memory.has_storage_segment(&primary) && memory.storage_segments().is_empty()
             };
+            if attach_primary
+                && self
+                    .state
+                    .lock()
+                    .pending_retirements
+                    .contains_key(&primary)
+            {
+                let result = Err(StoreError::InvalidState(format!(
+                    "segment {} is pending retirement",
+                    primary.0
+                )));
+                tracker.finish(&result, 0);
+                return result;
+            }
             let segment_name = if attach_primary {
                 primary.clone()
             } else {
@@ -1354,9 +1387,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("retire_segment");
+        self.ensure_local_memory()?;
         let retirement_lock = self.state.lock().retirement_lock.clone();
         let _retirement_guard = retirement_lock.lock();
-        self.ensure_local_memory()?;
         let pending = self
             .state
             .lock()
@@ -1388,7 +1421,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let transport = match &pending {
             Some(pending) => pending.transport.clone(),
             None => {
-                let transport = if segment == &self.segment_name()? {
+                if segment == &self.segment_name()? {
                     self.transport.clone().ok_or_else(|| {
                         StoreError::Unsupported("transport is not configured".to_string())
                     })?
@@ -1404,29 +1437,73 @@ impl MooncakeCompatibilityFacade for StoreClient {
                                 segment.0
                             ))
                         })?
-                };
-                self.state
-                    .lock()
-                    .pending_retirements
-                    .insert(
-                        segment.clone(),
-                        PendingSegmentRetirement {
-                            announcement,
-                            transport: transport.clone(),
-                            region: None,
-                        },
-                    );
-                transport
+                }
             }
         };
-        let result = self
-            .metadata
-            .unpublish_segment(&self.lease.runtime, segment)
-            .map(|_| true);
-        if result.is_err() {
-            tracker.finish(&result, 0);
-            registry::record_segment_lifecycle("retire_segment", "error");
-            return result;
+        if pending
+            .as_ref()
+            .is_none_or(|pending| pending.region.is_none())
+        {
+            let mut state = self.state.lock();
+            let detach_result = state
+                .memory_mut()
+                .and_then(|memory| memory.detach_storage_segment(segment));
+            let region = match detach_result {
+                Ok(region) => region,
+                Err(error) => {
+                    let result = Err(error);
+                    tracker.finish(&result, 0);
+                    registry::record_segment_lifecycle("retire_segment", "error");
+                    return result;
+                }
+            };
+            if let Some(pending) = state.pending_retirements.get_mut(segment) {
+                pending.region = Some(region);
+            } else {
+                state.pending_retirements.insert(
+                    segment.clone(),
+                    PendingSegmentRetirement {
+                        announcement,
+                        transport: transport.clone(),
+                        region: Some(region),
+                        unpublished: false,
+                    },
+                );
+            }
+        }
+        if pending
+            .as_ref()
+            .is_none_or(|pending| !pending.unpublished)
+        {
+            let result = self
+                .metadata
+                .unpublish_segment(&self.lease.runtime, segment)
+                .map(|_| true);
+            if result.is_err() {
+                let mut state = self.state.lock();
+                let (region, lifecycle_state, tags) = {
+                    let pending = state
+                        .pending_retirements
+                        .get_mut(segment)
+                        .expect("retirement should be pending");
+                    (
+                        pending
+                            .region
+                            .take()
+                            .expect("pending retirement should own a detached region"),
+                        pending.announcement.state,
+                        pending.announcement.tags.clone(),
+                    )
+                };
+                state
+                    .memory
+                    .as_mut()
+                    .expect("local memory should remain registered during retirement")
+                    .restore_detached_storage_segment(segment, region, lifecycle_state, tags);
+                tracker.finish(&result, 0);
+                registry::record_segment_lifecycle("retire_segment", "error");
+                return result;
+            }
         }
 
         let region = {
@@ -1435,18 +1512,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .pending_retirements
                 .get_mut(segment)
                 .expect("retirement should be pending");
-            match pending.region.take() {
-                Some(region) => region,
-                None => match state.memory_mut()?.detach_storage_segment(segment) {
-                    Ok(region) => region,
-                    Err(error) => {
-                        let result = Err(error);
-                        tracker.finish(&result, 0);
-                        registry::record_segment_lifecycle("retire_segment", "error");
-                        return result;
-                    }
-                },
-            }
+            pending.unpublished = true;
+            pending
+                .region
+                .take()
+                .expect("pending retirement should own a detached region")
         };
         if let Err(error) = region.release(transport.as_ref()) {
             self.state
@@ -2523,6 +2593,11 @@ impl Drop for StoreClient {
         let mut state = self.state.lock();
         for (_, handle) in std::mem::take(&mut state.remote_segments) {
             let _ = transport.close_segment(handle);
+        }
+        for (_, pending) in std::mem::take(&mut state.pending_retirements) {
+            if let Some(region) = pending.region {
+                let _ = region.release(pending.transport.as_ref());
+            }
         }
         if let Some(mut memory) = state.memory.take() {
             let segments = memory.storage_segments();

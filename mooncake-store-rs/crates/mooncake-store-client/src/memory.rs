@@ -562,6 +562,28 @@ impl LocalMemoryState {
         }
     }
 
+    pub fn restore_detached_storage_segment(
+        &mut self,
+        segment: &SegmentName,
+        region: Arc<RegisteredRegion>,
+        state: SegmentLifecycleState,
+        tags: Vec<String>,
+    ) {
+        assert!(
+            !self.storage.contains_key(segment),
+            "detached storage segment {} already has a replacement",
+            segment.0
+        );
+        self.storage.insert(
+            segment.clone(),
+            StorageExtent {
+                region,
+                state,
+                tags,
+            },
+        );
+    }
+
     pub fn remove_storage_segment(
         &mut self,
         transport: &dyn StoreTransport,

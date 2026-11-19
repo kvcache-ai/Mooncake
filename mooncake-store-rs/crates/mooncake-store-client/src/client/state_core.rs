@@ -767,6 +767,7 @@ struct PendingSegmentRetirement {
     announcement: SegmentAnnouncement,
     transport: Arc<dyn StoreTransport>,
     region: Option<Arc<crate::memory::RegisteredRegion>>,
+    unpublished: bool,
 }
 
 #[derive(Default)]

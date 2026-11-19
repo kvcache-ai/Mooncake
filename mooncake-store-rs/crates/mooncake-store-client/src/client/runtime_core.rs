@@ -309,14 +309,17 @@ impl StoreClient {
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>();
+            let mut republished = 0;
             for announcement in &announcements {
                 if !pending_names.contains(&announcement.segment_name) {
                     self.metadata.publish_segment(announcement)?;
+                    republished += 1;
                 }
             }
+            drop(_retirement_guard);
             self.cold_tier
                 .repair_after_metadata_recovery(self.storage_owner.as_ref())?;
-            Ok((announcements.len(), refreshed_transports))
+            Ok((republished, refreshed_transports))
         })();
         match &result {
             Ok((republished, refreshed_transports)) => {
