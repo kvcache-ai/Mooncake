@@ -56,12 +56,6 @@ class ControlUpdateBuilder {
     ControlUpdate update_;
 };
 
-// Briefly acquires the mapped slot in Writing, copies an already complete
-// host-local update, then makes it visible as Published or Pinned with one
-// release store. This is the only path that owns Writing.
-void publishControlUpdate(ControlUpdateSlot& slot, const ControlUpdate& update,
-                          bool pinned = false);
-
 }  // namespace mooncake
 
 #endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_CONTROL_UPDATE_H

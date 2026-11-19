@@ -33,11 +33,14 @@ enum class EndpointStoreType {
     SIEVE = 1,
 };
 
-// Which NICs the EFA transport registers a buffer on.
-enum class EfaNicSelection {
+// Which NICs the EFA or RDMA transport registers a buffer on.
+enum class NicSelection {
     ALL = 0,    // every NIC, the historical behavior
     LOCAL = 1,  // device memory only on that GPU's topology-local NICs
 };
+
+// Former EFA-only name, kept so existing code keeps building.
+using EfaNicSelection = NicSelection;
 
 enum class HipKfdPinFix {
     OFF = 0,    // never hold a KFD pin anchor
@@ -63,6 +66,20 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // Receive queue depth of the RDMA transport's data RC QPs.  The transport
+    // only posts one-sided READ/WRITE on these QPs and never posts a receive,
+    // so the receive queue is never used.  0 keeps the historical behavior
+    // (max_recv_wr == max_wr); a positive value (1-65535, clamped to the
+    // device's max_qp_wr) shrinks it.  Override via MC_MAX_RECV_WR.
+    size_t max_recv_wr = 0;
+    // Outstanding RDMA READ/atomic depth of the RDMA transport's data RC QPs.
+    // max_rd_atomic is the initiator depth (set at RTS); max_dest_rd_atomic
+    // is the responder depth (set at RTR).  0 keeps the device-derived default
+    // (the device's max_qp_init_rd_atom / max_qp_rd_atom, capped at 16); a
+    // positive value (1-255) requests that depth, clamped to the device's
+    // limit.  Override via MC_MAX_RD_ATOMIC / MC_MAX_DEST_RD_ATOMIC.
+    int max_rd_atomic = 0;
+    int max_dest_rd_atomic = 0;
     // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
     // a signaled completion every N WRs plus the end of each ibv_post_send
     // chain. Override via MC_RDMA_SIGNAL_INTERVAL.
@@ -162,6 +179,12 @@ struct GlobalConfig {
     // memory is always registered on every NIC. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
     EfaNicSelection efa_nic_selection = EfaNicSelection::LOCAL;
+    // Which NICs a buffer is registered on in the RDMA transport. ALL
+    // (default) registers every buffer on every opened HCA. LOCAL registers
+    // GPU memory only on the HCAs the topology prefers for that GPU and
+    // publishes zero keys for the others; host memory keeps every HCA. Set via
+    // MC_RDMA_NIC_SELECTION=all|local.
+    NicSelection rdma_nic_selection = NicSelection::ALL;
     // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
     // cap.
     int efa_cq_threads = 1;

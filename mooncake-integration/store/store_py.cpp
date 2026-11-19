@@ -13,6 +13,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "common.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -148,6 +149,23 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
+py::object materialize_contiguous_tensor(const py::handle &tensor) {
+    py::object contiguous = tensor.attr("contiguous")();
+#ifdef USE_MLU
+    if (!contiguous.is(tensor) &&
+        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        // CNRT copies do not wait for work on PyTorch's current MLU stream.
+        // The caller can synchronize its input, but this new copy is ours.
+        // Wait before exposing its pointer to Store, including for TP shards.
+        py::module_::import("torch")
+            .attr("mlu")
+            .attr("current_stream")(contiguous.attr("device"))
+            .attr("synchronize")();
+    }
+#endif
+    return contiguous;
+}
+
 PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                       const std::string &key_name,
                                       bool require_contiguous,
@@ -172,7 +190,7 @@ PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         }
 
         py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
+            require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
         info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = inspected.attr("numel")().cast<size_t>();
@@ -511,12 +529,13 @@ class RangedReadSnapshotPy {
    public:
     RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
                          std::vector<std::string> keys)
-        : store_(std::move(store)), keys_(std::move(keys)) {
-        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+        : store_(store), keys_(std::move(keys)) {
+        snapshot_ = store->prepare_get_into_ranges_snapshot(keys_);
     }
 
     bool belongs_to(const std::shared_ptr<PyClient> &store) const {
-        return store_.get() == store.get();
+        const auto owner = store_.lock();
+        return owner && owner.get() == store.get();
     }
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
@@ -526,16 +545,28 @@ class RangedReadSnapshotPy {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (snapshot_.should_refresh()) {
-            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        // A snapshot must not keep a closed Store and its segments alive;
+        // reject use after close instead of reading through a torn-down
+        // client.
+        auto store = store_.lock();
+        if (!store) {
+            throw std::runtime_error(
+                "RangedReadSnapshot is no longer usable: the Store was "
+                "closed");
         }
-        return store_->get_into_ranges_from_snapshot(
+        if (snapshot_.should_refresh()) {
+            store->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store->get_into_ranges_from_snapshot(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
             snapshot_);
     }
 
    private:
-    std::shared_ptr<PyClient> store_;
+    // Weak by design: an idle snapshot must not extend the native client's
+    // lifetime beyond close(), otherwise its segments stay published and a
+    // later reader can observe a stale MEMORY replica (issue #5464).
+    std::weak_ptr<PyClient> store_;
     std::vector<std::string> keys_;
     PyClient::RangedReadSnapshot snapshot_;
     std::mutex mutex_;
@@ -2308,6 +2339,7 @@ PYBIND11_MODULE(_store, m) {
         .value("PROCESSING", TaskStatus::PROCESSING)
         .value("SUCCESS", TaskStatus::SUCCESS)
         .value("FAILED", TaskStatus::FAILED)
+        .value("CANCELED", TaskStatus::CANCELED)
         .export_values();
 
     py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
@@ -2333,6 +2365,42 @@ PYBIND11_MODULE(_store, m) {
                 << ", message=\"" << self.message << "\")";
             return oss.str();
         });
+
+    py::enum_<JobType>(m, "JobType").value("DRAIN", JobType::DRAIN);
+    py::enum_<JobStatus>(m, "JobStatus")
+        .value("CREATED", JobStatus::CREATED)
+        .value("PLANNING", JobStatus::PLANNING)
+        .value("RUNNING", JobStatus::RUNNING)
+        .value("SUCCEEDED", JobStatus::SUCCEEDED)
+        .value("FAILED", JobStatus::FAILED)
+        .value("CANCELED", JobStatus::CANCELED)
+        .value("CANCELING", JobStatus::CANCELING)
+        .value("TIMED_OUT", JobStatus::TIMED_OUT);
+
+    py::class_<QueryJobResponse>(m, "QueryJobResponse")
+        .def_readonly("id", &QueryJobResponse::id)
+        .def_readonly("type", &QueryJobResponse::type)
+        .def_readonly("status", &QueryJobResponse::status)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryJobResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryJobResponse::last_updated_at_ms_epoch)
+        .def_readonly("segments", &QueryJobResponse::segments)
+        .def_readonly("succeeded_units", &QueryJobResponse::succeeded_units)
+        .def_readonly("failed_units", &QueryJobResponse::failed_units)
+        .def_readonly("blocked_units", &QueryJobResponse::blocked_units)
+        .def_readonly("active_units", &QueryJobResponse::active_units)
+        .def_readonly("migrated_bytes", &QueryJobResponse::migrated_bytes)
+        .def_readonly("message", &QueryJobResponse::message);
+
+    py::class_<ListDrainJobsResponse>(m, "ListDrainJobsResponse")
+        .def_readonly("jobs", &ListDrainJobsResponse::jobs)
+        .def_readonly("next_page_token",
+                      &ListDrainJobsResponse::next_page_token);
+
+    py::class_<ListTasksResponse>(m, "ListTasksResponse")
+        .def_readonly("tasks", &ListTasksResponse::tasks)
+        .def_readonly("next_page_token", &ListTasksResponse::next_page_token);
 
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
@@ -3527,7 +3595,149 @@ PYBIND11_MODULE(_store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        .def(
+            "create_drain_job",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &segments,
+               const std::vector<std::string> &target_segments,
+               int64_t max_concurrency, int64_t timeout_ms) -> py::tuple {
+                if (!self.is_client_initialized() || max_concurrency <= 0 ||
+                    max_concurrency > std::numeric_limits<uint32_t>::max() ||
+                    timeout_ms < 0) {
+                    return py::make_tuple(UUID{},
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                CreateDrainJobRequest request{
+                    segments, target_segments,
+                    static_cast<uint32_t>(max_concurrency)};
+                auto result =
+                    timeout_ms == 0
+                        ? self.store_->create_drain_job(request)
+                        : self.store_->create_timed_drain_job(
+                              request, static_cast<uint64_t>(timeout_ms));
+                py::gil_scoped_acquire acquire;
+                return py::make_tuple(result.value_or(UUID{}),
+                                      result ? 0 : toInt(result.error()));
+            },
+            py::arg("segments"),
+            py::arg("target_segments") = std::vector<std::string>{},
+            py::arg("max_concurrency") = 4, py::arg("timeout_ms") = 0,
+            "Start draining mounted memory segments.\n\n"
+            "Args:\n"
+            "    segments: Source segment names.\n"
+            "    target_segments: Target segment names; an empty list lets "
+            "the master choose.\n"
+            "    max_concurrency: Maximum concurrent tasks (default: 4).\n"
+            "    timeout_ms: Timeout in milliseconds from job creation. "
+            "Defaults to 0, which means no timeout is set.\n\n"
+            "On timeout, the job cancels in-flight tasks and keeps "
+            "unfinished sources DRAINING.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (job ID, error code; 0 on success).")
+        .def(
+            "query_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) -> py::tuple {
+                if (!self.is_client_initialized()) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->query_drain_job(job_id);
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("job_id"),
+            "Return (job, error_code). The job is None on error.")
+        .def(
+            "cancel_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_drain_job(job_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("job_id"),
+            "Request cancellation. In-flight moves may finish; query until "
+            "the job reaches CANCELED, or TIMED_OUT if its deadline triggered "
+            "first. Cancellation may wait for an executor or replication "
+            "cleanup. Returns an error code.")
+        .def(
+            "list_drain_jobs",
+            [](MooncakeStorePyWrapper &self, std::optional<JobStatus> status,
+               const std::optional<std::string> &segment, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_drain_jobs(
+                    {status, segment, page_token,
+                     static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("segment") = py::none(),
+            py::arg("limit") = 100, py::arg("page_token") = "",
+            "Return (page, error_code) for cluster-wide drain jobs. Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "list_tasks",
+            [](MooncakeStorePyWrapper &self, std::optional<TaskStatus> status,
+               std::optional<TaskType> type,
+               std::optional<UUID> assigned_client,
+               const std::optional<std::string> &key, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_tasks(
+                    {.status = status,
+                     .type = type,
+                     .assigned_client = assigned_client,
+                     .key = key,
+                     .page_token = page_token,
+                     .limit = static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("type") = py::none(),
+            py::arg("assigned_client") = py::none(),
+            py::arg("key") = py::none(), py::arg("limit") = 100,
+            py::arg("page_token") = "",
+            "Return (page, error_code) for tasks in this client's tenant. "
+            "Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "cancel_task",
+            [](MooncakeStorePyWrapper &self, const UUID &task_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_task(task_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("task_id"),
+            "Cancel a pending task immediately or request cancellation of a "
+            "processing task. Returns an error code. Query the final status.");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(
@@ -3545,7 +3755,15 @@ PYBIND11_MODULE(_store, m) {
                              << ". Valid range: 0-" << max_node;
             }
 
-            if (numa_run_on_node(node) != 0) {
+            int rc;
+            {
+                // numa_run_on_node() fills libnuma's per-node cpumask cache
+                // on first use; see numaNodeCpuCacheMutex().
+                std::lock_guard<std::mutex> guard(
+                    mooncake::numaNodeCpuCacheMutex());
+                rc = numa_run_on_node(node);
+            }
+            if (rc != 0) {
                 LOG(WARNING) << "numa_run_on_node failed for node " << node;
             }
 

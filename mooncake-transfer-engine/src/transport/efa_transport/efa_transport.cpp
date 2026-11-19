@@ -772,25 +772,20 @@ int EfaTransport::allocateLocalSegmentID() {
 std::unordered_map<std::string, std::vector<size_t>>
 EfaTransport::buildLocalNicMap(const TopologyMatrix& matrix,
                                const std::vector<std::string>& device_names) {
-    std::unordered_map<std::string, size_t> name_to_index;
-    for (size_t i = 0; i < device_names.size(); ++i)
-        name_to_index[device_names[i]] = i;
+    // A preferred HCA can be missing from `device_names`: non-EFA devices are
+    // filtered out of context_list_, and an EFA device whose construct()
+    // failed was dropped. A location left with no NIC has no entry, so the
+    // caller's lookup miss falls back to all NICs.
+    return buildPreferredNicIndexMap(matrix, device_names);
+}
 
-    std::unordered_map<std::string, std::vector<size_t>> local_nic_map;
-    for (const auto& entry : matrix) {
-        std::vector<size_t> indices;
-        for (const auto& hca : entry.second.preferred_hca) {
-            auto it = name_to_index.find(hca);
-            // A preferred HCA can be missing here: non-EFA devices are filtered
-            // out of context_list_, and an EFA device whose construct() failed
-            // was dropped. Skipping it leaves the rest of the set usable.
-            if (it != name_to_index.end()) indices.push_back(it->second);
-        }
-        // No entry at all rather than an empty one, so the caller's lookup miss
-        // falls back to all NICs instead of registering the buffer nowhere.
-        if (!indices.empty()) local_nic_map[entry.first] = std::move(indices);
-    }
-    return local_nic_map;
+int EfaTransport::indexTopologyOverDevices(
+    const Topology& topology, const std::vector<std::string>& device_names,
+    Topology& indexed) {
+    if (device_names.empty()) return ERR_DEVICE_NOT_FOUND;
+    // parse() keeps only the listed HCAs, each entry in its own order, and
+    // resolves fresh indices for them.
+    return indexed.parse(topology.toString(), device_names);
 }
 
 int EfaTransport::registerLocalMemoryBatch(
@@ -1384,15 +1379,8 @@ int EfaTransport::initializeEfaResources() {
         return ERR_DEVICE_NOT_FOUND;
     }
 
-    // Disable non-EFA devices (e.g. ibp* IB devices) in the topology so that
-    // topology device indices stay aligned with context_list_ indices.
-    // Without this, selectDevice() can return an index from the full topology
-    // (which includes non-EFA devices), causing out-of-bounds access on
-    // context_list_ which only contains EFA devices.
     for (auto& device_name : non_efa_devices) {
-        local_topology_->disableDevice(device_name);
-        LOG(INFO) << "EfaTransport: Disabled non-EFA device " << device_name
-                  << " in topology";
+        LOG(INFO) << "EfaTransport: Skipping non-EFA device " << device_name;
     }
 
     for (auto& device_name : efa_devices) {
@@ -1401,7 +1389,6 @@ int EfaTransport::initializeEfaResources() {
         int ret = context->construct(config.num_cq_per_ctx, config.max_cqe,
                                      config.max_ep_per_ctx);
         if (ret) {
-            local_topology_->disableDevice(device_name);
             LOG(WARNING) << "EfaTransport: Disable device " << device_name;
         } else {
             context_list_.push_back(context);
@@ -1411,6 +1398,43 @@ int EfaTransport::initializeEfaResources() {
     if (context_list_.empty()) {
         LOG(ERROR) << "EfaTransport: none of the EFA devices could be opened";
         return ERR_DEVICE_NOT_FOUND;
+    }
+
+    // Number the topology over exactly the opened devices, so that a topology
+    // index, a context_list_ index and an lkey/rkey index name the same NIC.
+    // Working on a copy also leaves the topology that the engine shares with
+    // other transports untouched.
+    std::vector<std::string> opened;
+    opened.reserve(context_list_.size());
+    for (auto& context : context_list_) opened.push_back(context->deviceName());
+    if (opened != hca_list) {
+        auto indexed = std::make_shared<Topology>();
+        int ret = indexTopologyOverDevices(*local_topology_, opened, *indexed);
+        if (ret) {
+            LOG(ERROR) << "EfaTransport: cannot index the topology over the "
+                          "opened EFA devices";
+            return ret;
+        }
+        std::unordered_map<std::string, std::shared_ptr<EfaContext>> by_name;
+        for (auto& context : context_list_)
+            by_name[context->deviceName()] = context;
+        std::vector<std::shared_ptr<EfaContext>> ordered;
+        ordered.reserve(context_list_.size());
+        for (const auto& name : indexed->getHcaList()) {
+            auto it = by_name.find(name);
+            if (it != by_name.end()) ordered.push_back(it->second);
+        }
+        if (ordered.size() != context_list_.size()) {
+            LOG(ERROR) << "EfaTransport: the topology lists " << ordered.size()
+                       << " of the " << context_list_.size()
+                       << " opened EFA devices";
+            return ERR_DEVICE_NOT_FOUND;
+        }
+        context_list_ = std::move(ordered);
+        local_topology_ = std::move(indexed);
+        LOG(INFO) << "EfaTransport: indexed the topology over "
+                  << context_list_.size() << " EFA devices (of "
+                  << hca_list.size() << " listed)";
     }
 
     if (globalConfig().efa_nic_selection == EfaNicSelection::LOCAL) {
