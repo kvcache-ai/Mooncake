@@ -1266,8 +1266,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         batch_id = engine_->allocateBatchID(batch_size);
-        if (batch_id == 0 || batch_id == INVALID_BATCH_ID ||
-            batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+        if (!Transport::isValidBatchID(batch_id)) {
             return 0;
         }
         if (!engine_->isUsingTent()) {
@@ -1312,11 +1311,9 @@ int TransferEnginePy::getBatchTransferStatus(
     pybind11::gil_scoped_release release;
     if (!engine_) return -1;
     for (auto& batch_id : batch_ids) {
-        if (batch_id == 0 || batch_id == INVALID_BATCH_ID ||
-            batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+        if (!Transport::isValidBatchID(batch_id)) {
             for (auto& valid_id : batch_ids) {
-                if (valid_id != 0 && valid_id != INVALID_BATCH_ID &&
-                    valid_id != static_cast<batch_id_t>(ERR_MEMORY)) {
+                if (Transport::isValidBatchID(valid_id)) {
                     engine_->freeBatchID(valid_id);
                 }
             }
@@ -1414,8 +1411,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     }
 
     auto batch_id = engine_->allocateBatchID(1);
-    if (batch_id == 0 || batch_id == INVALID_BATCH_ID ||
-        batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+    if (!Transport::isValidBatchID(batch_id)) {
         return 0;
     }
     if (!engine_->isUsingTent()) {
@@ -1441,8 +1437,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 }
 
 int TransferEnginePy::checkSingleBatchStatus(batch_id_t batch_id) {
-    if (!engine_ || batch_id == 0 || batch_id == INVALID_BATCH_ID ||
-        batch_id == static_cast<batch_id_t>(ERR_MEMORY)) {
+    if (!engine_ || !Transport::isValidBatchID(batch_id)) {
         return -1;
     }
     TransferStatus status;
