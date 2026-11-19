@@ -101,8 +101,9 @@ class XpuPlatform : public CpuPlatform {
     void submitCopies(const std::vector<CopyRequest> &copies,
                       std::vector<CopyResult> &results, CopyFence &fence);
     // State of the copies behind `fence` (a null fence has completed).
-    // kFailed: they are over, but waiting for them failed, so their data is
-    // not known to have landed.
+    // kFailed: they are over, but waiting for them failed or their queue
+    // reported an asynchronous error while they ran, so their data is not
+    // known to have landed.
     enum class CopyStatus : uint8_t { kPending, kCompleted, kFailed };
     static CopyStatus copyStatus(const CopyFence &fence);
 

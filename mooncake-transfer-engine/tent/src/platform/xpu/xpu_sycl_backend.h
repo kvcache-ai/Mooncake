@@ -44,6 +44,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -253,7 +255,9 @@ class XpuSyclBackend {
                     }
                 }
                 if (!known) contexts_.push_back(ctx);
-                queues_.push_back(makeQueue(ctx, d));
+                queue_errors_.push_back(
+                    std::make_shared<std::atomic<uint64_t>>(0));
+                queues_.push_back(makeQueue(ctx, d, queue_errors_.back()));
                 std::optional<DeviceUuid> uuid;
                 if (d.has(sycl::aspect::ext_intel_device_info_uuid)) {
                     const auto raw =
@@ -272,6 +276,7 @@ class XpuSyclBackend {
             // Leave no partially-built state: a later init() retry must start
             // from an empty queue list, not resume with duplicate ordinals.
             queues_.clear();
+            queue_errors_.clear();
             idle_copy_queues_.clear();
             contexts_.clear();
             uuids_.clear();
@@ -487,8 +492,12 @@ class XpuSyclBackend {
     // enqueued on. The queues are in-order, so each of those events completes
     // only after every earlier copy on its queue. Destroying a fence waits for
     // it, so the memory its copies touch may be released once it is gone.
-    // A fence whose wait threw is done but failed(): the copies are over, yet
-    // their result is not known to be written.
+    // A fence is done but failed() when waiting threw or its queue reported
+    // an asynchronous error (a copy failing on the device) while the copies
+    // were in flight: they are over, yet their result is not known to be
+    // written. The runtime delivers such errors to the queue's async_handler
+    // only from wait_and_throw(), not from wait() or a status query, so
+    // completion always goes through wait().
     class CopyFence {
        public:
         ~CopyFence() { wait(); }
@@ -496,16 +505,16 @@ class XpuSyclBackend {
         bool done() {
             if (done_.load(std::memory_order_acquire)) return true;
             try {
-                for (auto &event : events_) {
-                    if (event.get_info<
+                for (auto &pending : pending_) {
+                    if (pending.event.get_info<
                             sycl::info::event::command_execution_status>() !=
                         sycl::info::event_command_status::complete)
                         return false;
                 }
             } catch (const sycl::exception &) {
-                wait();  // Cannot query the status; the copies still end.
+                // Cannot query the status; the copies still end.
             }
-            done_.store(true, std::memory_order_release);
+            wait();
             return true;
         }
 
@@ -514,19 +523,30 @@ class XpuSyclBackend {
 
         void wait() noexcept {
             if (done_.load(std::memory_order_acquire)) return;
-            for (auto &event : events_) {
+            for (auto &pending : pending_) {
                 try {
-                    event.wait();
+                    pending.event.wait_and_throw();
                 } catch (const sycl::exception &) {
                     failed_.store(true, std::memory_order_release);
                 }
+                if (pending.errors->load(std::memory_order_acquire) !=
+                    pending.errors_before)
+                    failed_.store(true, std::memory_order_release);
             }
             done_.store(true, std::memory_order_release);
         }
 
        private:
         friend class XpuSyclBackend;
-        std::vector<sycl::event> events_;
+        struct Pending {
+            sycl::event event;
+            // Error count of the event's queue, and its value when the
+            // copies were enqueued; the queue is shared, so an error of any
+            // copy on it in that window fails this fence.
+            std::shared_ptr<std::atomic<uint64_t>> errors;
+            uint64_t errors_before;
+        };
+        std::vector<Pending> pending_;
         std::atomic<bool> done_{false};
         std::atomic<bool> failed_{false};
     };
@@ -547,6 +567,7 @@ class XpuSyclBackend {
         };
         std::vector<Plan> plans(n);
         std::vector<sycl::queue> queues;
+        std::vector<std::shared_ptr<std::atomic<uint64_t>>> errors;
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (!initialized_) {
@@ -554,6 +575,7 @@ class XpuSyclBackend {
                 return nullptr;
             }
             queues = queues_;
+            errors = queue_errors_;
             for (size_t i = 0; i < n; ++i) {
                 const int src = resolveLocked(ops[i].src, ops[i].len);
                 const int dst = resolveLocked(ops[i].dst, ops[i].len);
@@ -575,6 +597,9 @@ class XpuSyclBackend {
                 }
             }
         }
+        std::vector<uint64_t> errors_before(queues.size());
+        for (size_t q = 0; q < queues.size(); ++q)
+            errors_before[q] = errors[q]->load(std::memory_order_acquire);
         std::vector<std::optional<sycl::event>> last(queues.size());
         for (size_t i = 0; i < n; ++i) {
             if (results[i] != kCopySubmitted) continue;
@@ -591,10 +616,12 @@ class XpuSyclBackend {
             }
         }
         auto fence = std::make_shared<CopyFence>();
-        for (auto &event : last) {
-            if (event) fence->events_.push_back(std::move(*event));
+        for (size_t q = 0; q < last.size(); ++q) {
+            if (last[q])
+                fence->pending_.push_back(CopyFence::Pending{
+                    std::move(*last[q]), errors[q], errors_before[q]});
         }
-        if (fence->events_.empty()) return nullptr;
+        if (fence->pending_.empty()) return nullptr;
         return fence;
     }
 
@@ -1087,10 +1114,31 @@ class XpuSyclBackend {
     }
 
     // Builds every queue the backend uses, so the per-copy queues get the
-    // same properties as queues_.
-    static sycl::queue makeQueue(const sycl::context &ctx,
-                                 const sycl::device &dev) {
-        return sycl::queue(ctx, dev, sycl::property::queue::in_order());
+    // same properties as queues_. Asynchronous errors (copies that fail on
+    // the device after being enqueued) are counted in `errors` instead of
+    // reaching the default handler, which terminates the process; CopyFence
+    // reads the count to report them.
+    static sycl::queue makeQueue(
+        const sycl::context &ctx, const sycl::device &dev,
+        const std::shared_ptr<std::atomic<uint64_t>> &errors) {
+        return sycl::queue(
+            ctx, dev,
+            [errors](sycl::exception_list exceptions) {
+                for (const auto &exception : exceptions) {
+                    try {
+                        std::rethrow_exception(exception);
+                    } catch (const std::exception &e) {
+                        LOG(ERROR) << "XPU queue reported an asynchronous "
+                                      "error: "
+                                   << e.what();
+                    } catch (...) {
+                        LOG(ERROR) << "XPU queue reported an asynchronous "
+                                      "error";
+                    }
+                }
+                errors->fetch_add(exceptions.size(), std::memory_order_acq_rel);
+            },
+            sycl::property::queue::in_order());
     }
 
     int copy(void *dst, const void *src, size_t len, bool to_host) {
@@ -1101,6 +1149,7 @@ class XpuSyclBackend {
         // the peak number of concurrent copies per device.
         std::optional<sycl::queue> q;
         std::optional<sycl::queue> proto;
+        std::shared_ptr<std::atomic<uint64_t>> proto_errors;
         int device_index;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -1112,11 +1161,13 @@ class XpuSyclBackend {
                 idle.pop_back();
             } else {
                 proto = queues_[device_index];
+                proto_errors = queue_errors_[device_index];
             }
         }
         if (!q) {
             try {
-                q = makeQueue(proto->get_context(), proto->get_device());
+                q = makeQueue(proto->get_context(), proto->get_device(),
+                              proto_errors);
             } catch (...) {
                 // No new queue: run this copy on the device's shared queue,
                 // as all copies did before they had queues of their own.
@@ -1149,6 +1200,9 @@ class XpuSyclBackend {
     bool initialized_ = false;
     std::vector<sycl::context> contexts_;
     std::vector<sycl::queue> queues_;
+    // Per queues_ entry: asynchronous errors reported by that queue and the
+    // per-copy queues of its device (see makeQueue).
+    std::vector<std::shared_ptr<std::atomic<uint64_t>>> queue_errors_;
     // Per queues_ entry: in-order queues on the same context and device that
     // no copy() is using.
     std::vector<std::vector<sycl::queue>> idle_copy_queues_;
