@@ -68,6 +68,8 @@ struct SourceLayout {
     LayoutSource source = LayoutSource::kVllm;
     std::map<int64_t, size_t> groups;
     std::vector<ObjectPartRule> objects;
+    // Model component of the declared AscendStore keys, not the query context.
+    std::optional<std::string> physical_model_name;
     std::string storage_domain;
     std::set<std::string> readable_domains;
     HashDomain hash_domain = HashDomain::kRaw;

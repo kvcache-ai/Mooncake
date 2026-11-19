@@ -65,7 +65,8 @@ std::string ObjectMutation(const common::ServiceConfig& service,
         object.object_key->empty())
         return "backend_id and object_key are required";
     if (fields.tenant_id != service.tenant_id ||
-        (fields.model_name && *fields.model_name != service.model_name) ||
+        (fields.model_name && *fields.model_name != service.model_name &&
+         fields.model_name != binding.physical_model_name) ||
         (fields.lora_name && *fields.lora_name != service.lora_name))
         return "object context conflicts with registered layout";
     const std::string_view key = *object.object_key;

@@ -10,9 +10,9 @@
 namespace mooncake::conductor::prefixindex {
 namespace {
 
-bool IsLayerwiseNamespace(std::string_view prefix, const std::string& model,
-                          const std::string& group, int64_t block_tokens) {
-    const auto head = model + "@mooncake_hybrid_v1:";
+bool IsLayerwiseNamespace(std::string_view prefix, const std::string& group,
+                          int64_t block_tokens) {
+    constexpr std::string_view head = "mooncake_hybrid_v1:";
     const auto tail =
         "@group:" + group + "@block:" + std::to_string(block_tokens) + "@";
     if (prefix.size() != head.size() + 64 + tail.size() ||
@@ -53,9 +53,7 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
     };
     if (!root["format"].isString() ||
         root["format"].asString() != "ascend-store-v1" ||
-        !root["model_name"].isString() ||
-        FindModelCacheSpec(root["model_name"].asString()) != model ||
-        !positive(root["hash_unit_tokens"]) ||
+        !root["model_name"].isString() || !positive(root["hash_unit_tokens"]) ||
         root["hash_unit_tokens"].asInt64() != service.block_size ||
         !positive(root["alignment_tokens"]) ||
         !root["storage_domain"].isString() ||
@@ -80,6 +78,12 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
     binding.layout = layout;
     binding.storage_domain = root["storage_domain"].asString();
     binding.readable_domains.insert(binding.storage_domain);
+    const auto declared_model = root["model_name"].asString();
+    if (!declared_model.empty()) {
+        binding.physical_model_name = declared_model;
+    } else if (layerwise) {
+        return "layerwise deployment requires a physical model name";
+    }
     bool checkpoint = false, dense = false;
     std::set<std::pair<std::string, std::string>> namespaces;
     for (const auto& item : root["groups"]) {
@@ -121,20 +125,30 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
             const auto& part = item["key_prefixes"][part_id];
             if (!part.isString()) return "invalid object namespace";
             const auto prefix = part.asString();
+            const auto separator = prefix.find('@');
+            if (separator == 0 || separator == std::string::npos)
+                return "missing physical model in object namespace";
+            const auto key_model =
+                std::string_view(prefix).substr(0, separator);
+            // Whole-key producers may declare an empty basename for a model
+            // path ending in '/'. Every group and shard must still agree.
+            if (!binding.physical_model_name)
+                binding.physical_model_name.emplace(key_model);
+            if (key_model != *binding.physical_model_name)
+                return "object namespace conflicts with physical model name";
             if (layerwise && !suffixes[part_id].isString())
                 return "invalid layerwise object suffix";
             const auto suffix = layerwise ? suffixes[part_id].asString() : "";
             const bool valid_namespace =
                 layerwise
-                    ? IsLayerwiseNamespace(prefix,
-                                           root["model_name"].asString(),
-                                           group.id, group.block_tokens) &&
+                    ? IsLayerwiseNamespace(
+                          std::string_view(prefix).substr(separator + 1),
+                          group.id, group.block_tokens) &&
                           suffix == "@" + std::to_string(part_id)
                     : prefix.find("@group:" + group.id + "@") !=
                               std::string::npos &&
                           prefix.find("@cache_role:kv@") != std::string::npos;
             if (prefix.size() > 1024 || !prefix.ends_with('@') ||
-                !prefix.starts_with(root["model_name"].asString() + "@") ||
                 !valid_namespace || !namespaces.emplace(prefix, suffix).second)
                 return "invalid or duplicate object namespace";
             binding.objects.push_back({.key_prefix = prefix,

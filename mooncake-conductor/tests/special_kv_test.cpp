@@ -799,10 +799,12 @@ TEST(SpecialKVEvents, MooncakeMinimalRemoveRetractsOneRequiredObject) {
     EXPECT_EQ(Query(*manager.GetIndexer()).cpu_share, 0);
 }
 
-Json::Value AscendDeployment(bool layerwise = false) {
+Json::Value AscendDeployment(
+    bool layerwise = false,
+    const std::string& physical_model = "GLM-5.3-Flash") {
     Json::Value root;
     root["format"] = "ascend-store-v1";
-    root["model_name"] = "GLM-5.3-Flash";
+    root["model_name"] = physical_model;
     root["hash_unit_tokens"] = 16;
     root["alignment_tokens"] = 64;
     root["storage_domain"] = "ascend://master:1";
@@ -819,15 +821,16 @@ Json::Value AscendDeployment(bool layerwise = false) {
         for (int rank = 0; rank < (id == 0 ? 1 : 2); ++rank) {
             if (layerwise) {
                 group["key_prefixes"].append(
-                    "GLM-5.3-Flash@mooncake_hybrid_v1:" + std::string(64, 'a') +
-                    "@group:" + std::to_string(id) +
+                    physical_model + "@mooncake_hybrid_v1:" +
+                    std::string(64, 'a') + "@group:" + std::to_string(id) +
                     "@block:" + std::to_string(id == 0 ? 16 : 64) + "@");
                 group["key_suffixes"].append("@" + std::to_string(rank));
             } else {
                 group["key_prefixes"].append(
-                    "GLM-5.3-Flash@dcp:0@head_or_tp_rank:" +
-                    std::to_string(rank) + "@pp_rank:0@group:" +
-                    std::to_string(id) + "@cache_role:kv@cache_family:c1@");
+                    physical_model +
+                    "@dcp:0@head_or_tp_rank:" + std::to_string(rank) +
+                    "@pp_rank:0@group:" + std::to_string(id) +
+                    "@cache_role:kv@cache_family:c1@");
             }
         }
         root["groups"].append(group);
@@ -836,6 +839,37 @@ Json::Value AscendDeployment(bool layerwise = false) {
 }
 
 class SpecialKVDeploymentFormats : public ::testing::TestWithParam<bool> {};
+
+TEST_P(SpecialKVDeploymentFormats, BindsOnlyAConsistentPhysicalModelNamespace) {
+    auto service = Service(PublisherKind::kVllm);
+    service.model_name = "GLM-5.3-Flash";
+    const std::string physical = "GLM-5.3-Flash-w8a8-4layers-rand";
+    auto declaration = AscendDeployment(GetParam(), physical);
+    SourceLayout binding;
+    auto resolve = [&] {
+        return ResolveVllmDeployment(service, declaration.toStyledString(),
+                                     &binding);
+    };
+    ASSERT_EQ(resolve(), "");
+    EXPECT_EQ(binding.layout->id, service.model_name);
+    EXPECT_EQ(binding.physical_model_name, physical);
+
+    declaration["model_name"] = "other-weights";
+    EXPECT_FALSE(resolve().empty());
+    declaration["model_name"] = "";
+    if (GetParam()) {
+        EXPECT_FALSE(resolve().empty());
+        return;
+    }
+    ASSERT_EQ(resolve(), "");
+    EXPECT_EQ(binding.physical_model_name, physical);
+    auto& last_prefix = declaration["groups"][1]["key_prefixes"][1];
+    const auto suffix = last_prefix.asString().substr(physical.size());
+    last_prefix = "other-weights" + suffix;
+    EXPECT_FALSE(resolve().empty());
+    last_prefix = suffix;  // No model component at all.
+    EXPECT_FALSE(resolve().empty());
+}
 
 TEST_P(SpecialKVDeploymentFormats,
        CompleteDeclarationIsValidatedBeforeActivation) {
@@ -848,8 +882,8 @@ TEST_P(SpecialKVDeploymentFormats,
     EXPECT_EQ(binding.layout->groups.size(), 2u);
     EXPECT_EQ(binding.layout->groups[1].match, MatchPolicy::kCheckpoint);
     EXPECT_EQ(binding.layout->groups[1].parts.size(), 2u);
-    for (const auto* field :
-         {"format", "hash_unit_tokens", "storage_domain", "groups"}) {
+    for (const auto* field : {"format", "model_name", "hash_unit_tokens",
+                              "storage_domain", "groups"}) {
         auto invalid = valid;
         invalid[field] = Json::arrayValue;
         EXPECT_FALSE(
@@ -940,7 +974,9 @@ TEST_P(SpecialKVDeploymentFormats,
     ASSERT_NE(strategy, nullptr) << error;
     std::vector<HashBlock> hashes;
     ASSERT_EQ(strategy->Compute(context, Tokens(), std::nullopt, &hashes), "");
-    const auto declaration = AscendDeployment(GetParam());
+    const std::string physical = "GLM-5.3-Flash-w8a8-4layers-rand";
+    auto declaration = AscendDeployment(GetParam(), physical);
+    if (!GetParam()) declaration["model_name"] = "";
     auto object_key = [&](int group, int part, size_t index) {
         return declaration["groups"][group]["key_prefixes"][part].asString() +
                DigestToHex(hashes.at(index).digest) +
@@ -957,10 +993,12 @@ TEST_P(SpecialKVDeploymentFormats,
     stored.fields.backend_id = "master";
     stored.fields.tenant_id = "default";
     stored.fields.medium = "cpu";
+    stored.fields.model_name = service.model_name;
     for (size_t i = 0; i < hashes.size(); ++i) {
         stored.object.object_key = object_key(0, 0, i);
         send(stored);
     }
+    stored.fields.model_name.reset();
     for (int part = 0; part < 2; ++part) {
         stored.object.object_key = object_key(1, part, 7);
         send(stored);
@@ -968,6 +1006,7 @@ TEST_P(SpecialKVDeploymentFormats,
     zmq::MooncakeRemovedEvent removed;
     removed.fields.backend_id = "master";
     removed.fields.tenant_id = "default";
+    removed.fields.model_name = physical;
     removed.object.object_key = object_key(1, 0, 7);
     send(removed);  // Preserve Store/Remove order even before declaration.
     auto hit = [&] {
@@ -985,7 +1024,15 @@ TEST_P(SpecialKVDeploymentFormats,
     batch.events.push_back({.event = zmq::VllmEvent(announcement)});
     ASSERT_EQ(engine.HandleBatch(batch, Metadata(service)), "");
     EXPECT_EQ(hit(), 0);
+    stored.fields.model_name = service.model_name;
+    stored.object.object_key = "other-" + object_key(1, 0, 7);
+    send(stored);  // Same hash and claimed context, different physical key.
+    EXPECT_EQ(hit(), 0);
     stored.object.object_key = object_key(1, 0, 7);
+    stored.fields.model_name = "other-weights";
+    send(stored);  // Matching key but conflicting model assertion.
+    EXPECT_EQ(hit(), 0);
+    stored.fields.model_name = physical;
     send(stored);
     EXPECT_EQ(hit(), 128);
     ASSERT_TRUE(manager.GetIndexer()
