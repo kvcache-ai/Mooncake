@@ -4,9 +4,9 @@ orphan: true
 
 # Adaptive Congestion Control: Shared Core and Startup Configuration
 
-Classic TE RDMA connects the shared pressure/window controller to worker
-admission and completion feedback. TENT transport integration remains a separate
-follow-up. The build option and runtime mode both default to `off`.
+Classic TE and TENT RDMA connect the shared pressure/window controller to worker
+admission and completion feedback. The build option and runtime mode both default
+to `off`.
 
 The core tracks in-flight bytes, adapts byte windows using completion feedback,
 and fences permits by generation. It does not own failure detection,
@@ -18,7 +18,8 @@ it does not create a second health/recovery state machine.
 
 `MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL` defaults to `OFF`. When enabled,
 the shared core target is available to Classic TE and TENT builds. Each Classic
-RDMA worker pool snapshots the environment during construction.
+RDMA worker pool and TENT RDMA worker group snapshots the environment during
+construction.
 
 Installed headers read this build setting from `mooncake_te_build_config.h` so
 their public layouts match the library. Consumers do not need to define the
@@ -35,8 +36,8 @@ macro themselves; the generated header overrides conflicting definitions.
 
 Numeric variables accept positive decimal integers only. Epoch counts must fit
 in an unsigned 32-bit integer. Invalid input returns an invalid result with
-adaptive control disabled. Classic RDMA logs the initialization error once and
-preserves its original transfer behavior.
+adaptive control disabled. Both adapters log the initialization error once and
+preserve their original transfer behavior.
 
 ## Classic RDMA integration
 
@@ -67,7 +68,30 @@ state machine. Idle epochs do not grow the window.
 
 With the build option disabled, adapter state and branches are compiled out.
 With runtime mode `off`, workers use the original posting path. No task-status
-API or TENT admission behavior is added by this integration.
+API is added by this integration.
+
+## TENT RDMA integration
+
+TENT applies the same device and peer-route byte windows immediately before
+posting. Deferred slices stay on their current posting owner without charging
+admission deferrals as rail failures. `observe` records feedback without limiting
+posts; `off` bypasses admission and accounting.
+
+An admitted slice keeps its permit domains alive until the attempt is retired.
+Completions, retries, cancellation and endpoint teardown return permits exactly
+once. Selective signaling still retires every WR in the completed prefix, and a
+bounded post preserves a signaled tail. Endpoint generations fence stale error
+feedback. Window updates use the existing worker monitor; rail/device health
+and recovery remain owned by the existing TENT mechanisms.
+
+Worker route caches and an endpoint binding fast path avoid shared route-map
+lookups after binding. Permits for slices left unposted by QP capacity are
+returned in the same posting pass.
+
+This adapter does not add task-status APIs or change recovery probes.
+The generated build configuration is also
+available to standalone TENT builds so conditional RDMA layouts use the same
+setting as the library.
 
 ## Health ownership and draft migration
 
@@ -78,6 +102,6 @@ existing transport's health/recovery configuration instead. Legacy health
 signal fields and path-state enum values remain source-compatible, but the
 shared controller does not use them to quarantine, probe, or recover a path.
 
-TENT integration, task-scoped status APIs, and physical congestion-benefit
-validation are separate follow-ups. The core microbenchmark measures only
+Task-scoped TENT status APIs and congestion-benefit validation are separate
+follow-ups. The core microbenchmark measures only
 controller overhead and is not evidence of end-to-end RDMA performance.
