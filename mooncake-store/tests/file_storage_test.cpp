@@ -1910,6 +1910,41 @@ TEST_F(FileStorageTest, StagingAllocRaReleaseWakesWaiter) {
     EXPECT_EQ(waiter_result.total_size, 2 * 1024 * 1024);
 }
 
+TEST_F(FileStorageTest, StagingAllocReleaseInWaitGapIsNotLost) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 3000;
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    auto holder =
+        FileStorageAllocateBatch(fileStorage, {"holder"}, {2 * 1024 * 1024});
+    ASSERT_TRUE(holder);
+    const uint64_t holder_id = holder.value()->batch_id;
+    RegisterHolderBatch(fileStorage, std::move(holder.value()));
+
+    AllocOutcome waiter_result{ErrorCode::INTERNAL_ERROR, 0};
+    std::thread waiter([&] {
+        waiter_result = TryAllocate(fileStorage, {"waiter"}, {2 * 1024 * 1024});
+    });
+    // Release with no delay so the release races the reader's
+    // failed-allocation-to-sleep transition. Whichever side of the sleep it
+    // lands on, the reader must make prompt progress: a release that lands in
+    // that gap is seen by the generation predicate, not slept through until
+    // the full budget.
+    auto start = std::chrono::steady_clock::now();
+    bool released = fileStorage.ReleaseBuffer(holder_id);
+    waiter.join();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_TRUE(released);
+    ASSERT_EQ(waiter_result.error, ErrorCode::OK);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(800))
+        << "a release in the wait gap must not be lost until the budget";
+    EXPECT_EQ(waiter_result.total_size, 2 * 1024 * 1024);
+}
+
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     std::unordered_map<std::string, int64_t> offloading_objects;
     for (size_t i = 0; i < 35; i++) {
