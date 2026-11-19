@@ -32,6 +32,13 @@ on:
         required: false
         type: boolean
         default: false
+      run-store-rs:
+        description: >-
+          Append the Store-RS SGLang case to the established six T-One cases
+          using the exact combined wheel artifact supplied by the caller.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   test-sglang-integration:
@@ -178,6 +185,12 @@ jobs:
             ENV_INFO="${ENV_INFO} USE_TENT=true"
             JOB_NAME="mooncake-ci-tent-${SHA}"
           fi
+          if [ "${{ inputs.run-store-rs }}" = "true" ]; then
+            # The wheel comes from this Nightly run, while the test scripts
+            # must come from the same branch under validation. Without BRANCH,
+            # T-One falls back to the repository's default branch.
+            ENV_INFO="${ENV_INFO} BRANCH=${{ github.ref_name }} RUN_STORE_RS_TESTS=true"
+          fi
           signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
           signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
           curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"${JOB_NAME}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"${ENV_INFO}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
@@ -190,7 +203,7 @@ jobs:
           job_id=$(jq .data.id job.json)
           echo "check job status here and remember to cancel it before restart the job !"
           echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}?tab=4"
-          echo "job_id=${job_id}" >> $GITHUB_ENV
+          echo "job_id=${job_id}" >> "$GITHUB_ENV"
         shell: bash
 
       - name: qurey job results

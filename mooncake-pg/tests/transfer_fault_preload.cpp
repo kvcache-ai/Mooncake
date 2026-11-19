@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -42,6 +43,21 @@ std::unordered_map<mooncake::SegmentID, mooncake::GlobalRank>
     segment_id_to_rank;
 std::unordered_map<mooncake::BatchID, std::vector<mooncake::GlobalRank>>
     batch_id_to_target_ranks;
+
+// While set, a batch of sync flag writes is sent at once but reports completion
+// only after this delay, so its rank finishes the collective late.
+std::atomic<int64_t> flag_completion_delay_us{0};
+// The bytes of a sync flag that the collective worker sends: kSyncFlagBytes in
+// mooncake_worker.cuh, which needs the GPU toolchain's headers.
+constexpr size_t kSyncFlagBytes = 2 * sizeof(uint64_t);
+std::unordered_map<mooncake::BatchID, std::chrono::steady_clock::time_point>
+    held_flag_batches;
+std::atomic<uint64_t> held_flag_batch_count{0};
+// The bytes of a READ of a peer's read counts, which the worker sends before it
+// stores into a half that the peer may still be reading:
+// sizeof(HalfSendSync::halfReads) in mooncake_worker.cuh.
+constexpr size_t kReadCountsBytes = 2 * sizeof(uint32_t);
+std::atomic<uint64_t> count_read_count{0};
 
 constexpr char kGetTransferStatusSymbol[] =
     "_ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_"
@@ -130,6 +146,26 @@ Status TransferEngine::submitTransfer(
         }
         batch_id_to_target_ranks.insert_or_assign(batch_id,
                                                   std::move(target_ranks));
+        const auto delay_us =
+            flag_completion_delay_us.load(std::memory_order_acquire);
+        bool flags_only = !entries.empty();
+        uint64_t count_reads = 0;
+        for (const auto& entry : entries) {
+            flags_only &= entry.opcode == TransferRequest::WRITE &&
+                          entry.length == kSyncFlagBytes;
+            if (entry.opcode == TransferRequest::READ &&
+                entry.length == kReadCountsBytes) {
+                ++count_reads;
+            }
+        }
+        count_read_count.fetch_add(count_reads, std::memory_order_relaxed);
+        held_flag_batches.erase(batch_id);
+        if (delay_us > 0 && flags_only) {
+            held_flag_batches.emplace(batch_id,
+                                      std::chrono::steady_clock::now() +
+                                          std::chrono::microseconds(delay_us));
+            held_flag_batch_count.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return result;
 }
@@ -139,6 +175,14 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     auto real = findRealGetTransferStatus();
     if (!real) std::abort();
     auto result = real(this, batch_id, task_id, status);
+    if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+        std::lock_guard<std::mutex> lock(mapping_mutex);
+        auto held = held_flag_batches.find(batch_id);
+        if (held != held_flag_batches.end() &&
+            std::chrono::steady_clock::now() < held->second) {
+            status.s = TransferStatusEnum::WAITING;
+        }
+    }
     if (result.ok() && status.s == TransferStatusEnum::COMPLETED &&
         fault_enabled.load(std::memory_order_acquire)) {
         GlobalRank target_rank = kInvalidGlobalRank;
@@ -184,6 +228,23 @@ extern "C" void mooncakePgTestResetFailureCount() {
     injected_failure_count.store(0, std::memory_order_release);
 }
 
+extern "C" void mooncakePgTestDelayFlagCompletion(int64_t delay_us) {
+    flag_completion_delay_us.store(delay_us, std::memory_order_release);
+}
+
 extern "C" uint64_t mooncakePgTestGetFailureCount() {
     return injected_failure_count.load(std::memory_order_acquire);
+}
+
+extern "C" void mooncakePgTestResetTransferCounts() {
+    held_flag_batch_count.store(0, std::memory_order_release);
+    count_read_count.store(0, std::memory_order_release);
+}
+
+extern "C" uint64_t mooncakePgTestGetHeldFlagBatchCount() {
+    return held_flag_batch_count.load(std::memory_order_acquire);
+}
+
+extern "C" uint64_t mooncakePgTestGetCountReadCount() {
+    return count_read_count.load(std::memory_order_acquire);
 }

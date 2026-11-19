@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -705,6 +706,7 @@ Status UbTransport::submitTransferTasks(
 
     const auto notify_progress = ub_batch->notify_progress;
     const auto progress_batch_id = ub_batch->progress_batch_id;
+    auto progress_armed = std::make_shared<std::atomic<bool>>(false);
     std::vector<ub::UbTask::Ptr> new_tasks;
     new_tasks.reserve(request_list.size());
     for (const auto& request : request_list) {
@@ -717,9 +719,12 @@ Status UbTransport::submitTransferTasks(
                 "transports/ub/max_slices_per_task" LOC_MARK);
         }
         auto task = ub::UbTask::create(
-            request,
-            [notify_progress, progress_batch_id](const TransferStatus&) {
-                if (notify_progress) notify_progress(progress_batch_id);
+            request, [notify_progress, progress_batch_id,
+                      progress_armed](const TransferStatus&) {
+                if (progress_armed->load(std::memory_order_acquire) &&
+                    notify_progress) {
+                    notify_progress(progress_batch_id);
+                }
             });
         size_t offset = 0;
         while (offset < request.length) {
@@ -741,15 +746,15 @@ Status UbTransport::submitTransferTasks(
         new_tasks.push_back(std::move(task));
     }
 
-    for (auto& task : new_tasks) {
-        ub_batch->task_list.push_back(task);
-        auto status = impl_->workers->submit(task, ub_batch->device_mask);
-        if (!status.ok()) {
-            for (auto& queued : new_tasks) {
-                if (queued) queued->requestCancellation();
-            }
-            return status;
-        }
+    CHECK_STATUS(impl_->workers->submitBatch(new_tasks, ub_batch->device_mask));
+    ub_batch->task_list.insert(ub_batch->task_list.end(), new_tasks.begin(),
+                               new_tasks.end());
+    progress_armed->store(true, std::memory_order_release);
+    // A very small task can finish between worker publication and the batch
+    // append above. Its callback intentionally stays disarmed until the task
+    // is queryable; this notification closes that race.
+    if (!new_tasks.empty() && notify_progress) {
+        notify_progress(progress_batch_id);
     }
     return Status::OK();
 }

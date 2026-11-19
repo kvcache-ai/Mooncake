@@ -106,6 +106,9 @@ class RailMonitor {
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
+    // Same-name entry in direct_rails_. Returns -1 when names differ.
+    int directRemoteDevice(int local_nic) const;
+
     const Topology *local() const {
         std::lock_guard<std::mutex> guard(mutex_);
         return local_.get();

@@ -100,6 +100,7 @@ RUN mkdir -p build && \
         -DUSE_ETCD=ON \
         -DUSE_CUDA=ON \
         -DWITH_EP=ON \
+        -DWITH_CONDUCTOR=ON \
         -DSTORE_USE_ETCD=ON \
         -DYLT_DOWNLOAD_DIR=/workspace/.cache/yalantinglibs \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \

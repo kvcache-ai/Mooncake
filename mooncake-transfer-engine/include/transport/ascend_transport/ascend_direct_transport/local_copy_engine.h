@@ -16,13 +16,16 @@
 #ifndef LOCAL_COPY_ENGINE_H
 #define LOCAL_COPY_ENGINE_H
 
+#include <acl/acl.h>
+
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
-#include <acl/acl.h>
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -30,99 +33,129 @@
 namespace mooncake {
 using Slice = Transport::Slice;
 
-// LocalCopyEngine handles local memory copy operations for Ascend devices.
-// It provides optimized copy methods for different memory types and transfer
-// patterns, including synchronous host copies and async multi-stream copies.
+// Same-host copies through the ACL copy engine, one instance per local engine.
+// Copies are submitted asynchronously: six streams carry aclrtMemcpyAsync work
+// and each stream ends with a D2H write of a host completion flag. The
+// transport polls the flags from its status path and marks slices complete, so
+// the transfer worker does not wait for the streams.
+//
+// This is the TENT local-copy engine's model, kept on the classic transport:
+//
+//  * one instance owns one device's context and streams, so there is no device
+//    map and no caller-side device lookup;
+//  * Copy() issues the whole group before it returns, so a submitter cannot be
+//    between its copies and its completion flag while Poll() aborts the
+//    streams. That is what makes a single mutex sufficient: no per-stream
+//    lock, no submission gate and no in-flight issue counter is needed;
+//  * a failed submission or a timed-out group aborts and destroys the streams,
+//    recreates them, and fails every group that was still pending on them.
+//    Aborting drops the queued work of those groups, so their flags can no
+//    longer complete and failing them is the only honest answer.
 class LocalCopyEngine {
    public:
-    // Runs a task on another thread of the pool that calls Copy().
+    // Runs one stream's issue work. The transport supplies a pool so a group
+    // spread over several streams does not issue one stream at a time.
     using TaskRunner = std::function<void(std::function<void()>)>;
 
     LocalCopyEngine();
-
     ~LocalCopyEngine();
 
-    // Initialize the local copy engine.
-    // transfer_timeout: timeout in milliseconds for sync operations.
-    // device_count: local NPUs this engine serves. One device creates its 6
-    // streams now, when a context is already current. More than one device
-    // leaves every stream group uncreated until the first copy on that device.
-    // Returns 0 on success, non-zero on failure.
-    int Initialize(int32_t transfer_timeout, size_t device_count);
+    LocalCopyEngine(const LocalCopyEngine&) = delete;
+    LocalCopyEngine& operator=(const LocalCopyEngine&) = delete;
 
-    // Finalize and cleanup resources
+    // context: the ACL context of the local engine this instance copies for.
+    // transfer_timeout: per-group timeout in milliseconds.
+    // local_engine_count: how many local engines this process runs. With more
+    // than one, the six copy streams are created on the first copy that needs
+    // them instead of at Initialize: a multi-engine process (a store driving
+    // one engine per NPU) copies locally only on the devices it actually
+    // serves, so creating six streams for every engine at install would leave
+    // most of them unused.
+    int Initialize(aclrtContext context, int32_t transfer_timeout,
+                   size_t local_engine_count);
     void Finalize();
-
-    // Runs each async-copy stream task on `runner`. Pass an empty runner to
-    // keep those tasks on the calling thread. Must not be called while a
-    // Copy() is in flight.
     void SetTaskRunner(TaskRunner runner);
 
-    // Perform local memory copy for a list of slices.
-    // This is the main entry point that determines the optimal copy method
-    // based on memory types and transfer size.
-    // opcode: WRITE for local->remote, READ for remote->local
-    // slice_list: list of slices to copy
-    // dest_addrs: either empty, meaning each slice's own dest_addr is already
-    //   a valid local address, or exactly one entry per slice holding that
-    //   slice's destination rebased onto this process's mapping. The latter is
-    //   needed for a segment owned by another process on this machine, whose
-    //   virtual addresses mean nothing here.
+    // Advances completion of every pending group. The transport calls this
+    // from getTransferStatus(), matching the TENT local-copy engine, which has
+    // no completion thread of its own.
+    void Poll();
+
+    // Issues the whole group and returns. Poll() marks every slice
+    // success/failure when the streams finish (or the group times out).
     void Copy(TransferRequest::OpCode opcode,
               const std::vector<Slice*>& slice_list,
               const std::vector<void*>& dest_addrs = {});
 
    private:
-    // Destination for slice_list[index], honouring the rebased addresses when
-    // the caller supplied them.
+    static constexpr size_t kCopyStreamCount = 6;
+    static constexpr size_t kFlagBytes = sizeof(uint32_t);
+    static constexpr size_t kFlagStride = 64;
+    static constexpr uint32_t kDoneFlag = 1;
+
+    struct Group {
+        // One flag per stream this group used, padded apart so two streams
+        // never land their completion write in the same cache line.
+        void* host_flags = nullptr;
+        size_t stream_count = 0;
+        std::vector<Slice*> slices;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
+    // Binds target as the calling thread's ACL context for the lifetime of the
+    // guard and restores the caller's context afterwards. ACL stream and
+    // memory APIs only work on the thread that has the owning device's context
+    // bound, while Poll() runs on whichever thread calls getTransferStatus().
+    class ContextGuard {
+       public:
+        explicit ContextGuard(aclrtContext target);
+        ~ContextGuard();
+        bool ok() const { return ok_; }
+
+        ContextGuard(const ContextGuard&) = delete;
+        ContextGuard& operator=(const ContextGuard&) = delete;
+
+       private:
+        aclrtContext saved_{nullptr};
+        bool ok_{false};
+    };
+
     static void* DestAddr(const std::vector<Slice*>& slice_list,
                           const std::vector<void*>& dest_addrs, size_t index);
+    static aclrtMemcpyKind GetMemcpyKind(TransferRequest::OpCode opcode,
+                                         aclrtPtrAttributes& src_attrs,
+                                         aclrtPtrAttributes& dst_attrs);
+    static volatile uint32_t* FlagAt(void* host_flags, size_t index);
 
-    // Perform synchronous memory copy for each slice individually
+    // H2H copies are small and stay synchronous.
     void CopyWithSync(TransferRequest::OpCode opcode,
                       const std::vector<Slice*>& slice_list,
                       const std::vector<void*>& dest_addrs,
                       aclrtMemcpyKind kind);
 
-    // Six streams per device. copy_mu keeps two copies on that device off the
-    // same streams. Copies on different devices do not share a lock.
-    struct AsyncStreamGroup {
-        std::mutex copy_mu;
-        aclrtContext context = nullptr;
-        std::vector<aclrtStream> streams;
-    };
+    // All of these run with mutex_ held and bind the device context while they
+    // touch ACL state. Stream creation/destruction requires that no Copy() is
+    // in progress, which mutex_ guarantees because Copy() holds it from the
+    // first stream call to the last.
+    bool CreateStreamsLocked();
+    void DestroyStreamsLocked();
+    // Aborts and destroys the streams, recreates them, and fails every pending
+    // group. The streams are dropped first so the aborts cancel any queued D2H
+    // flag write before a group's host flags are released.
+    void FailAndRecreateLocked();
+    bool IssueGroupLocked(size_t stream_count,
+                          const std::function<bool(size_t)>& issue_stream);
+    void ReleaseGroupLocked(void* handle, bool success);
+    void FailAllGroupsLocked();
 
-    // Finds or creates the group for device_id. The group stays put until
-    // Finalize. The caller locks group->copy_mu before using the streams.
-    AsyncStreamGroup* GroupFor(int32_t device_id);
-
-    // Creates this device's 6 streams when the group does not have them yet.
-    // The caller holds group->copy_mu. Returns false when creation fails.
-    bool EnsureAsyncCopyStreams(AsyncStreamGroup* group, int32_t device_id,
-                                aclrtContext context);
-
-    // Submit aclrtMemcpyAsync through the memcpy pool and synchronize each
-    // stream. With no pool, the caller submits and synchronizes the streams.
-    void CopyWithMultiStreamAsync(TransferRequest::OpCode opcode,
-                                  const std::vector<Slice*>& slice_list,
-                                  const std::vector<void*>& dest_addrs,
-                                  aclrtMemcpyKind kind);
-
-    // Determine the appropriate memcpy kind based on source and dest memory
-    // types
-    static aclrtMemcpyKind GetMemcpyKind(TransferRequest::OpCode opcode,
-                                         aclrtPtrAttributes& src_attrs,
-                                         aclrtPtrAttributes& dst_attrs);
-
-   private:
-    // Protects async_stream_groups_. A copy releases this before taking the
-    // group's copy_mu, so Finalize can wait for an in-flight copy.
-    std::mutex groups_mu_;
-    std::unordered_map<int32_t, std::unique_ptr<AsyncStreamGroup>>
-        async_stream_groups_;
-    int32_t transfer_timeout_;
-    bool initialized_;
+    std::mutex mutex_;
+    aclrtContext context_{nullptr};
+    std::vector<aclrtStream> streams_;
+    void* device_one_{nullptr};
+    std::unordered_map<void*, std::unique_ptr<Group>> groups_;
     TaskRunner task_runner_;
+    int32_t transfer_timeout_ = 10000;
+    bool initialized_ = false;
 };
 
 }  // namespace mooncake

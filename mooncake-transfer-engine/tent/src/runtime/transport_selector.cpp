@@ -301,7 +301,9 @@ void TransportSelector::loadPolicies() {
 }
 
 TransportSelector::TransportSelector(std::shared_ptr<Config> config)
-    : config_(config), force_tcp_(config_->get("transports/force_tcp", false)) {
+    : config_(config),
+      force_tcp_(config_->get("transports/force_tcp", false)),
+      force_fabric_(config_->get("transports/force_fabric", false)) {
     loadPolicies();
 }
 
@@ -507,6 +509,13 @@ bool TransportSelector::isTransportAvailable(
     // RDMA; otherwise the engine stages it through host DRAM.
     auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
 
+    if (type == RDMA && context.segment_type == SegmentType::Memory &&
+        !context.local_segment && !context.rdma_device_direct &&
+        (is_gpu(context.local_memory_type) ||
+         is_gpu(context.remote_memory_type))) {
+        return false;
+    }
+
     // For file segments, check file-specific capabilities (original logic)
     if (context.segment_type == SegmentType::File) {
         if (context.local_memory_type == MTYPE_CPU) return caps.dram_to_file;
@@ -578,8 +587,11 @@ SelectionResult TransportSelector::select(
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
+    static const std::vector<TransportType> kFabricOnly{FABRIC};
     const auto& raw =
         force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        : force_fabric_ && context.segment_type == SegmentType::Memory
+            ? kFabricOnly
         : !matching_policy->transports.empty() ? matching_policy->transports
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;

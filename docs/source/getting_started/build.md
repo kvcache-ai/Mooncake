@@ -34,6 +34,27 @@ runs `go mod tidy` during configuration. The `go` command must be on `PATH`;
 uncached modules or toolchains require network access, and `go.mod` or `go.sum`
 may be updated. Other optional Go components can still download during build.
 
+(build-with-hpe-slingshot-cxi)=
+### Build with HPE Slingshot (CXI)
+
+In addition to the common dependencies above, install the site's CXI drivers,
+libcxi, and libfabric with the CXI provider. Check the provider before building:
+
+```bash
+fi_info -p cxi
+cmake -S . -B build-cxi -DUSE_CXI=ON -DUSE_EFA=OFF -DUSE_TENT=OFF
+cmake --build build-cxi -j
+sudo cmake --install build-cxi
+```
+
+If libfabric is outside the default search paths, pass
+`-DLIBFABRIC_INCLUDE_DIR=/path/to/libfabric/include` and
+`-DLIBFABRIC_LIBRARY=/path/to/libfabric/lib/libfabric.so` (or `lib64`), and make
+that library directory available to the runtime linker. For GPU buffers, add
+`-DUSE_CUDA=ON` or `-DUSE_HIP=ON` and use the matching libfabric memory support.
+See {ref}`HPE Slingshot (CXI) <hpe-slingshot-cxi>` for protocol
+selection, device discovery, and current limitations.
+
 ### Build with VRAM Segment
 
 To enable VRAM Segment, install CUDA toolkit and build Mooncake with
@@ -60,6 +81,81 @@ cd build
 cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
 make -j
 sudo make install
+```
+
+(build-with-mlu-store)=
+### Build with MLU Store Support
+
+Install the Cambricon Neuware SDK. If it is installed outside
+`/usr/local/neuware`, set `NEUWARE_HOME` to its root directory.
+
+Follow the Default Build steps above, adding
+`-DWITH_STORE=ON -DUSE_MLU=ON -DUSE_CUDA=OFF` to the `cmake ..` command.
+
+For the Python Tensor API, install `torch_mlu` along with the `torch` and
+Neuware SDK versions supported by that release.
+
+Both Classic TE and TENT can use this Store backend. To use TENT, also add
+`-DUSE_TENT=ON` when building and set `MC_USE_TENT=1` before starting the client.
+
+(mlu-tensor-offload-and-reload)=
+#### MLU Tensor Offload and Reload
+
+Store uses CNRT for MLU pointer detection, device selection, synchronous copies,
+and pinned host buffers.
+
+Start `mooncake_master` and create a `store` client as shown in
+{ref}`Start a Store Client <start-a-store-client>`. The following example
+offloads a Tensor to Store and reloads it into a new MLU allocation:
+
+```python
+from uuid import uuid4
+
+import torch
+import torch_mlu
+
+key = f"mlu-example-{uuid4().hex}"
+source = torch.arange(4096, dtype=torch.float32).to("mlu")
+torch.mlu.synchronize()  # Finish the producer before Store reads the pointer.
+result = store.put_tensor(key, source)
+if result != 0:
+    raise RuntimeError(f"put_tensor failed: {result}")
+try:
+    del source
+    destination = torch.empty(4096, dtype=torch.float32, device="mlu")
+    size = destination.numel() * destination.element_size()
+    result = store.register_buffer(destination.data_ptr(), size)
+    if result != 0:
+        raise RuntimeError(f"register_buffer failed: {result}")
+    try:
+        # This API also accepts contiguous MLU tensors.
+        result = store.get_tensor_into_cuda(key, destination)
+        if result != size:
+            raise RuntimeError(f"get_tensor_into_cuda returned {result}, expected {size}")
+        if not torch.equal(destination.cpu(), torch.arange(4096, dtype=torch.float32)):
+            raise RuntimeError("Reloaded Tensor does not match the original data")
+    finally:
+        result = store.unregister_buffer(destination.data_ptr())
+        if result != 0:
+            raise RuntimeError(f"unregister_buffer failed: {result}")
+finally:
+    result = store.remove(key, force=True)
+    if result != 0:
+        raise RuntimeError(f"remove failed: {result}")
+```
+
+Keep registered Tensor owners alive until transfers finish and buffers are
+unregistered. For a producer on a nondefault stream, synchronize its event or
+stream before calling Store. Tensor writes currently gather metadata and payload
+into host staging; registered-pointer writes use the Transfer Engine path.
+
+With `mooncake_master` running, run the real-device regression suite from the
+repository root:
+
+```bash
+MC_STORE_TEST_REQUIRE_MLU=1 MASTER_SERVER=127.0.0.1:50051 \
+  PROTOCOL=tcp python3 -m unittest discover -s mooncake-wheel/tests \
+  -p test_mlu_tensor.py
 ```
 
 (build-with-intel-xpu)=
@@ -451,6 +547,7 @@ The following options can be passed to `cmake ..`.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/transport/efa_transport.md). |
+| `-DUSE_CXI=ON/OFF` | Disabled unless set | Enable HPE Slingshot Cassini transport via libfabric's CXI provider. See {ref}`Build with HPE Slingshot <build-with-hpe-slingshot-cxi>`. |
 | `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
 | `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
 | `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |
