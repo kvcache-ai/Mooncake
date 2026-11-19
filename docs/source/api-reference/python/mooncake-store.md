@@ -2325,6 +2325,34 @@ store.close()
 
 ---
 
+(python-timed-drain-job)=
+#### create_drain_job()
+
+Start draining mounted memory segments using an initialized
+`MooncakeDistributedStore` with the C++ backend. A positive `timeout_ms`
+sets a deadline in milliseconds from job creation. The default of `0`
+creates a job with no deadline.
+
+The following example creates a job with a 30-second deadline.
+
+```python
+job_id, error_code = store.create_drain_job(
+    segments=["segment_0"],
+    target_segments=["segment_1"],
+    timeout_ms=30_000,
+)
+if error_code != 0:
+    raise RuntimeError(f"Failed to create drain job ({error_code})")
+```
+
+Poll `store.query_drain_job(job_id)` for `(job, error_code)`. When
+`error_code` is `0`, read `job.status`. A job that reaches its deadline
+enters `JobStatus.CANCELING` and reaches `JobStatus.TIMED_OUT` after in-flight
+tasks and their cleanup finish. Unfinished source segments stay `DRAINING`
+so a new job can resume draining them.
+
+---
+
 #### close()
 Terminate the store and clean up its resources. Before calling `close()`, wait
 for setup and all application and offload calls to finish; do not issue new
