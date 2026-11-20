@@ -149,10 +149,10 @@ static inline bool IsUint64Vector(const py::array& array) {
            array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
 }
 
-// A cancelled task can sit behind the QP retry timer: with the default RDMA
-// settings (send_timeout 14 ~= 67 ms, send_retry_count 7) draining one task
-// takes up to ~540 ms. Use one full retry budget before telling the caller its
-// buffers may still be in use.
+// Bound for the wait after a failed batch. A task sitting behind the QP retry
+// timer (send_timeout 14 ~= 67 ms, send_retry_count 7) needs up to ~540 ms to
+// finish. At the deadline the engine cancels what is still running and reports
+// the statuses it sees, so the caller learns whether the buffers are idle.
 constexpr uint64_t kSettleTimeoutMs = 600;
 
 // =============================================================================
@@ -814,6 +814,7 @@ PYBIND11_MODULE(tent, m) {
                 const auto* len_ptr =
                     static_cast<const uint64_t*>(lengths.data());
                 std::string wait_error;
+                Status transfer_error;
                 {
                     py::gil_scoped_release release;
                     std::vector<Request> request_list(count);
@@ -826,7 +827,11 @@ PYBIND11_MODULE(tent, m) {
                         request.length = static_cast<size_t>(len_ptr[i]);
                     }
                     const auto batch_id = self.allocateBatch(count);
-                    if (batch_id) {
+                    if (!batch_id) {
+                        transfer_error = Status::TooManyRequests(
+                            "No free batch slot for a transfer_sync_arrays "
+                            "call" LOC_MARK);
+                    } else {
                         BatchGuard guard(&self,
                                          static_cast<uint64_t>(batch_id));
                         // A failed submit or wait leaves ownership with the
@@ -837,7 +842,6 @@ PYBIND11_MODULE(tent, m) {
                             auto status = self.waitTransfer(
                                 batch_id, &settle_status, kSettleTimeoutMs);
                             if (!status.ok()) return false;
-                            if (settle_status.empty()) return true;
                             return settle_status.size() == count &&
                                    std::none_of(
                                        settle_status.begin(),
@@ -874,7 +878,7 @@ PYBIND11_MODULE(tent, m) {
                                     "waitTransfer returned " +
                                     std::to_string(status_list.size()) +
                                     " statuses for " + std::to_string(count) +
-                                    " descriptors";
+                                    " descriptors" LOC_MARK;
                             } else {
                                 for (size_t i = 0; i < count; ++i) {
                                     states[i] =
@@ -885,8 +889,11 @@ PYBIND11_MODULE(tent, m) {
                     }
                 }
                 if (!wait_error.empty()) {
-                    ThrowStatus(Status::InternalError(wait_error + LOC_MARK),
+                    ThrowStatus(Status::InternalError(wait_error),
                                 "transfer_sync_arrays");
+                }
+                if (!transfer_error.ok()) {
+                    ThrowStatus(transfer_error, "transfer_sync_arrays");
                 }
                 return result;
             },
@@ -895,11 +902,13 @@ PYBIND11_MODULE(tent, m) {
             "one-dimensional uint64 arrays of equal length and must not be "
             "modified until the call returns. Malformed non-empty input is "
             "reported as INVALID for every entry; an empty input that is not "
-            "three empty uint64 vectors raises InvalidArgumentError. A failed "
-            "submit or wait cancels the batch and waits one RDMA retry budget "
-            "(600 ms) for every descriptor to stop; when that does not happen "
-            "the call raises InternalError, which says src and dst must not be "
-            "reused. This call has no timeout.",
+            "three empty uint64 vectors raises InvalidArgumentError; running "
+            "out of batch slots raises TooManyRequests. A failed submit or "
+            "wait waits one RDMA retry budget (600 ms) for every descriptor to "
+            "stop, cancelling whatever still runs at the deadline; if "
+            "descriptors are still pending then, the call raises "
+            "InternalError, which says src and dst must not be reused. This "
+            "call has no timeout.",
             py::arg("src"), py::arg("dst"), py::arg("lengths"),
             py::arg("target_id"), py::arg("opcode"))
 

@@ -116,7 +116,7 @@ class ArrayTransferTest(unittest.TestCase):
             client_addr = client.allocate_local_memory(buffer_size)
             server.register_local_memory(server_addr, buffer_size)
             client.register_local_memory(client_addr, buffer_size)
-            segment = 0
+            segment = None
             try:
                 ctypes.memmove(client_addr, pattern, buffer_size)
                 segment = client.open_segment(server.get_segment_name())
@@ -138,7 +138,7 @@ class ArrayTransferTest(unittest.TestCase):
                 self.assertEqual(states.tolist(), [COMPLETED])
                 self.assertEqual(ctypes.string_at(client_addr, buffer_size), pattern)
             finally:
-                if segment:
+                if segment is not None:
                     client.close_segment(segment)
                 client.unregister_local_memory(client_addr, buffer_size)
                 server.unregister_local_memory(server_addr, buffer_size)
