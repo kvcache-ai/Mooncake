@@ -17,12 +17,14 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -147,6 +149,34 @@ static inline bool IsUint64Vector(const py::array& array) {
     // applies when there is an element to address.
     return array.size() == 0 ||
            array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
+}
+
+// Cancel every task of a batch that will not complete and wait for the
+// transport to stop touching the caller's buffers. Returns true when every
+// task reached a terminal state within the settle window.
+static bool CancelAndSettle(TransferEngine& engine, BatchID batch_id,
+                            size_t count) {
+    for (size_t task_id = 0; task_id < count; ++task_id) {
+        (void)engine.cancelTransfer(batch_id, task_id);
+    }
+    constexpr auto kSettleWindow = std::chrono::milliseconds(250);
+    const auto deadline = std::chrono::steady_clock::now() + kSettleWindow;
+    std::vector<TransferStatus> status_list;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!engine.getTransferStatus(batch_id, status_list).ok() ||
+            status_list.size() != count) {
+            return false;
+        }
+        bool pending = false;
+        for (const auto& status : status_list) {
+            pending = pending || status.s == TransferStatusEnum::PENDING;
+        }
+        if (!pending) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return false;
 }
 
 // =============================================================================
@@ -823,13 +853,27 @@ PYBIND11_MODULE(tent, m) {
                     if (batch_id) {
                         BatchGuard guard(&self,
                                          static_cast<uint64_t>(batch_id));
-                        if (self.submitTransfer(batch_id, request_list).ok()) {
+                        auto submit_status =
+                            self.submitTransfer(batch_id, request_list);
+                        if (!submit_status.ok()) {
+                            // A rejected submit can still leave tasks in
+                            // flight; cancel them before the guard frees the
+                            // batch.
+                            (void)CancelAndSettle(self, batch_id, count);
+                        } else {
                             std::vector<TransferStatus> status_list;
                             auto wait_status =
                                 self.waitTransfer(batch_id, &status_list, 0);
                             if (!wait_status.ok()) {
+                                const bool idle =
+                                    CancelAndSettle(self, batch_id, count);
                                 wait_error = "waitTransfer failed: " +
                                              wait_status.ToString();
+                                if (!idle) {
+                                    wait_error +=
+                                        "; the batch may still access src and "
+                                        "dst, so do not reuse them";
+                                }
                             } else if (status_list.size() != count) {
                                 wait_error =
                                     "waitTransfer returned " +
@@ -857,8 +901,10 @@ PYBIND11_MODULE(tent, m) {
             "modified until the call returns. Malformed non-empty input and "
             "failed submits are reported as INVALID for every entry; an empty "
             "input that is not three empty uint64 vectors raises "
-            "InvalidArgumentError, and a failed wait raises InternalError. "
-            "This call has no timeout.",
+            "InvalidArgumentError. A failed wait cancels the batch and waits "
+            "up to 250 ms for every descriptor to stop before raising "
+            "InternalError; the error says src and dst must not be reused when "
+            "that does not happen. This call has no timeout.",
             py::arg("src"), py::arg("dst"), py::arg("lengths"),
             py::arg("target_id"), py::arg("opcode"))
 
