@@ -107,6 +107,12 @@ jobs:
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
 
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
+
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
