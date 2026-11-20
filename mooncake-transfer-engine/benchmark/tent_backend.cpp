@@ -17,6 +17,8 @@
 #include "split_output.h"
 #include "char_util.h"
 
+#include <numa.h>
+
 #include <atomic>
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
@@ -264,6 +266,12 @@ int TENTBenchRunner::allocateBuffers() {
         }
 
         for (int i = 0; i < num_buffers; ++i) {
+            // Grace (GB200/GH200) exposes many memory-less GPU NUMA nodes;
+            // allocating a DRAM buffer bound to one of them fails mbind() and
+            // the remaining allocations can exhaust the memory nodes.
+            if (device_prefix == "cpu" &&
+                numa_node_size64(start_idx + i, nullptr) <= 0)
+                continue;
             auto location = device_prefix + ":" + std::to_string(start_idx + i);
             MemoryOptions options;
             options.location = location;
