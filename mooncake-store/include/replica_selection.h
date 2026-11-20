@@ -186,9 +186,10 @@ inline const Replica::Descriptor *SelectBestReplica(
             // LOCAL_DISK always overrides DFS and DISK. Among LOCAL_DISK
             // replicas the first wins, the same rule as SelectSessionReplica:
             // the master lists the most recently registered owner first.
-            if (!best || !best->is_local_disk_replica()) best = &r;
+            best = &r;
+            break;
         } else if (r.is_dfs_replica()) {
-            if (!best || !best->is_local_disk_replica()) best = &r;
+            best = &r;
         } else if (r.is_disk_replica() && !best) {
             best = &r;
         }
