@@ -14,7 +14,7 @@ import subprocess
 import time
 import unittest
 
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 try:
     import torch
@@ -95,6 +95,17 @@ class TestStandaloneStoreE2E(unittest.TestCase):
         self.assertEqual(self.store.get_size(key), len(payload))
         self.assertEqual(self.store.get(key), payload)
         self.assertEqual(self.store.is_exist(key), 1)
+
+    def test_put_only_to_named_segment(self) -> None:
+        key = f"standalone_strict_{os.getpid()}_{time.time_ns()}"
+        payload = b"strict-placement"
+        config = ReplicateConfig()
+        config.allowed_memory_segments = ["not-a-mounted-segment"]
+        self.assertNotEqual(self.store.put(key, payload, config), 0)
+        self.assertEqual(self.store.is_exist(key), 0)
+        config.allowed_memory_segments = [self.store.get_hostname()]
+        self.assertEqual(self.store.put(key, payload, config), 0)
+        self.assertEqual(self.store.get(key), payload)
 
     def test_batch_put_from_and_get(self) -> None:
         batch_size = 3

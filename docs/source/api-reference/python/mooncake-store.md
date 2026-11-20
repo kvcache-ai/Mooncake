@@ -817,6 +817,24 @@ publish session tags. Upgrade the Store client and Master to enable attribution.
 A storage node's disk scan alone cannot reconstruct metadata tags after all
 Master metadata is lost; preserve the metadata recovery artifacts as well.
 
+#### allowed_memory_segments
+
+On the native Store client, set `config.allowed_memory_segments = ["home-a", "home-b"]`
+to restrict **new memory allocations** for a put to these logical segment names.
+Use the mounted names, not transfer endpoints or host IDs. `None` (the default)
+keeps existing best-effort placement. An empty list or an empty name is invalid.
+
+If no listed segment can fit a key, `PutStart` returns `NO_AVAILABLE_HANDLE`
+even when an unlisted segment has room. `BatchPutStart` decides independently
+for each key; an earlier success is not rolled back and later keys are still
+tried. Strict names take precedence over soft segment and writer-locality hints.
+This option does not change replica-count policy, migrate existing keys, pin
+objects against eviction, or disable a globally configured disk mirror.
+
+Use it with memory-only put requests, not upserts, NoF/DFS requests or the
+dummy-client proxy. A master without strict-placement RPC support returns an
+RPC error instead of silently placing the key elsewhere.
+
 #### residency_affinity_ids
 **Type:** `Optional[List[str]]`
 **Default:** `None`

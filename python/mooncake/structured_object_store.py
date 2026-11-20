@@ -6874,6 +6874,7 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 
 
 _WRITE_CONFIG_COPY_FIELDS = (
+    "allowed_memory_segments",
     "data_type",
     "dfs_replica_num",
     "group_ids",

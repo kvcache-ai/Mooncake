@@ -508,6 +508,29 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::PutStartStrict(const UUID& client_id,
+                                     const std::string& key,
+                                     uint64_t slice_length,
+                                     const ReplicateConfig& config,
+                                     const std::string& tenant_id) {
+    if (!config.allowed_memory_segments) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return PutStart(client_id, key, slice_length, config, tenant_id);
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+WrappedMasterService::BatchPutStartStrict(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
+    const std::string& tenant_id) {
+    if (!config.allowed_memory_segments) {
+        return {keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS)};
+    }
+    return BatchPutStart(client_id, keys, slice_lengths, config, tenant_id);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id) {
@@ -586,7 +609,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (!resolved_tenant_id) {
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
-    } else if (config.prefer_alloc_in_same_node) {
+    } else if (config.prefer_alloc_in_same_node &&
+               !config.allowed_memory_segments) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
             new_config.SetKeyIds(config, i);
@@ -2132,6 +2156,8 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
+        &WrappedMasterService::PutStartStrict,
+        &WrappedMasterService::BatchPutStartStrict,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,
