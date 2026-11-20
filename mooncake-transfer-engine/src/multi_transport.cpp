@@ -157,7 +157,7 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     // Non-opted-in batches never hook the wake (RFC #5164).
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
-    batch_desc_set_[batch_desc->id] = batch_desc;
+    batch_desc_set_[batch_desc->id] = std::shared_ptr<BatchDesc>(batch_desc);
     batch_desc_lock_.unlock();
 #endif
     return batch_desc->id;
@@ -251,10 +251,11 @@ Status MultiTransport::tryFreeBatchID(
     // id out of a later drain.
     if (batch_desc.event_enabled) suppressCompletion(&batch_desc);
     if (before_delete) before_delete();
-    delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
+#else
+    delete &batch_desc;
 #endif
     return Status::OK();
 }
