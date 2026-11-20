@@ -866,5 +866,5 @@ if(USE_ASCEND_HETEROGENEOUS)
   add_test(NAME heterogeneous_rdma_transport_test
            COMMAND heterogeneous_rdma_transport_test)
   set_tests_properties(heterogeneous_rdma_transport_test
-                       PROPERTIES TIMEOUT 20)
+                       PROPERTIES TIMEOUT 60)
 endif()

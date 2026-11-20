@@ -429,9 +429,9 @@ extern "C" int aclrtMemcpy(void *, size_t, const void *, size_t,
     return 0;
 }
 
-extern "C" int aclrtPointerGetAttributes(void *,
-                                         aclrtPtrAttributes *attributes) {
-    attributes->location.type = 1;
+extern "C" aclError aclrtPointerGetAttributes(const void *,
+                                              aclrtPtrAttributes *attributes) {
+    attributes->location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
     return 0;
 }
 
