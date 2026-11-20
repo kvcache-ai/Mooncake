@@ -541,7 +541,7 @@ HA leadership and metadata replication are configured separately:
 - `--oplog_prune_chunk_batch_count`: Maximum batch ID positions covered by one delete request. Defaults to `10`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_prune_max_batches_per_second`: Average pruning rate limit in batch ID positions per second. Defaults to `50`; must be greater than zero when `enable_oplog_snapshot=true`. This limits ID advancement rather than deleted bytes.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
-- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
+- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`. The standby restore repair group is one indivisible record and may exceed this admission target; oversized groups are additionally bounded by the writer's 1 MiB encoded-record limit.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
 For the new batch OpLog snapshot path, configure:
@@ -981,7 +981,7 @@ mooncake_master \
 | `--oplog_prune_chunk_batch_count` | `10` | Maximum batch ID positions per delete request; must be positive when batch snapshots are enabled |
 | `--oplog_prune_max_batches_per_second` | `50` | Average pruning rate limit in batch ID positions per second; must be positive when batch snapshots are enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
-| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
+| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch; the standby restore repair group is exempt and bounded by the writer's 1 MiB encoded-record limit |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
 **Batch OpLog Snapshot**
