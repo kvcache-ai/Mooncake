@@ -3241,8 +3241,8 @@ TEST_F(FileStorageTest,
     // Small pool, so the probe below can exhaust it and drive the eager GC.
     file_storage_config.local_buffer_size = kBufferSize;
     file_storage_config.total_keys_limit = 1000;
-    // Short-ish lease so an abandoned batch becomes reclaimable quickly.
-    file_storage_config.client_buffer_gc_ttl_ms = 2000;
+    // Keep the initial whole-pool probe independent of the runner's speed.
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 60 * 1000;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_FALSE(keys.empty());
@@ -3296,11 +3296,10 @@ TEST_F(FileStorageTest,
         << "An unexpired lease should keep the shared staging buffer "
            "reserved";
 
-    // Let the lease expire, then drive the eager GC once more: the same
-    // whole-pool allocation must now succeed (AllocateBatch retries after
-    // collecting expired entries) and the staging must be gone.
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        file_storage_config.client_buffer_gc_ttl_ms + 100));
+    // Expire each reader's lease before the same allocation drives eager GC.
+    for (const auto id : batch_ids) {
+        ASSERT_TRUE(ExpireClientBufferBatch(fileStorage, id));
+    }
     probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
     ASSERT_TRUE(probe);
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
