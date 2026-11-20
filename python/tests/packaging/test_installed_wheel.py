@@ -44,6 +44,7 @@ def test_wheel_imports_outside_the_repository(
     with zipfile.ZipFile(wheel) as archive:
         wheel_files = set(archive.namelist())
     assert "mooncake/store/__init__.py" in wheel_files
+    assert "mooncake/_structured_backend.py" in wheel_files
     assert "mooncake/_structured_ranges.py" in wheel_files
     assert {"mooncake/py.typed", "mooncake/engine.pyi"} <= wheel_files
     assert not any(name.endswith("mooncake_store_rs.pth") for name in wheel_files)
@@ -475,7 +476,7 @@ assert mooncake.BufferPool is store.BufferPool
 assert module_buffer_pool is store.BufferPool
 assert store.RegisteredBufferPool is store.BufferPool
 assert not hasattr(store, "EngramStore")
-assert public_structured.MooncakeBundleTransfer is not rs_structured.MooncakeBundleTransfer
+assert public_structured.MooncakeBundleTransfer is rs_structured.MooncakeBundleTransfer
 assert public_structured.MooncakeBundleTransfer.__module__ == "mooncake.structured_object_store"
 entry_points = {
     item.name for item in metadata.entry_points(group="console_scripts")
