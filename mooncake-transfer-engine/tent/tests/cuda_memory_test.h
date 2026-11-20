@@ -217,14 +217,14 @@ inline void increment(void* address) {
 }
 
 inline void copy(TransferEngine& engine, SegmentID peer, void* local,
-                 Request::OpCode operation) {
+                 Request::OpCode operation, TransportType type) {
     Request request{};
     request.opcode = operation;
     request.source = local;
     request.target_id = peer;
     request.target_offset = kAddress;
     request.length = kBytes;
-    request.transport_hint = NVLINK;
+    request.transport_hint = type;
     auto batch = engine.allocateBatch(1);
     ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
     TransferStatus status{};
@@ -279,36 +279,25 @@ inline void roundTrip(TransportType type) {
     ASSERT_TRUE(engine.unmapRemoteMemory(owner, remote).ok());
     EXPECT_FALSE(engine.unmapRemoteMemory(owner, remote).ok());
     ASSERT_TRUE(engine.mapRemoteMemory(owner, remote, kBytes).ok());
-    if (type == NVLINK) {
-        // Calling device 0 differs from the source buffer's device. The VMM
-        // copy path must grant source-device access to the existing mapping.
-        options.global_address = 0;
-        options.location = devices > 1 ? "cuda:1" : "cuda:0";
-        void* local = nullptr;
-        ASSERT_TRUE(engine.allocateLocalMemory(&local, kBytes, options).ok());
-        ASSERT_TRUE(engine.registerLocalMemory(local, kBytes, options).ok());
-        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-        copy(engine, owner, local, Request::READ);
-        ASSERT_FALSE(::testing::Test::HasFatalFailure());
-        ASSERT_EQ(
-            cudaMemcpy(&value, local, sizeof(value), cudaMemcpyDeviceToHost),
-            cudaSuccess);
-        EXPECT_EQ(value, kInitial + 1);
-        ASSERT_EQ(cudaMemset(local, 0x35, kBytes), cudaSuccess);
-        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-        copy(engine, owner, local, Request::WRITE);
-        ASSERT_FALSE(::testing::Test::HasFatalFailure());
-        ASSERT_TRUE(engine.unregisterLocalMemory(local).ok());
-        ASSERT_TRUE(engine.freeLocalMemory(local).ok());
-    } else {
-        // MNNVL's existing copy-submission implementation is unchanged. This
-        // independently verifies async device access through its GVA mapping.
-        cudaStream_t stream;
-        ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
-        ASSERT_EQ(cudaMemsetAsync(remote, 0x35, kBytes, stream), cudaSuccess);
-        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
-    }
+    // Calling device 0 differs from the source buffer's device. Both
+    // transports must honor the GVA mapping for actual engine READ/WRITE.
+    options.global_address = 0;
+    options.location = devices > 1 ? "cuda:1" : "cuda:0";
+    void* local = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&local, kBytes, options).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(local, kBytes, options).ok());
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    copy(engine, owner, local, Request::READ, type);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_EQ(cudaMemcpy(&value, local, sizeof(value), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(value, kInitial + 1);
+    ASSERT_EQ(cudaMemset(local, 0x35, kBytes), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    copy(engine, owner, local, Request::WRITE, type);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_TRUE(engine.unregisterLocalMemory(local).ok());
+    ASSERT_TRUE(engine.freeLocalMemory(local).ok());
     ASSERT_TRUE(engine.unmapRemoteMemory(owner, remote).ok());
     ASSERT_TRUE(engine.closeSegment(owner).ok());
     EXPECT_EQ(exporter.finish(), 0);

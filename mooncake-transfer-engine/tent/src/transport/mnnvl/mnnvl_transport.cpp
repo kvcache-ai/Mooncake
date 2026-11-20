@@ -338,7 +338,13 @@ Status MnnvlTransport::install(std::string &local_segment_name,
 
     if (!conf) conf = std::make_shared<Config>();
     CHECK_STATUS(parseMnnvlConfig(*conf, options_));
-    if (!supportFabricMem()) {
+    auto handle_type_str = conf->get("transports/nvlink/handle_type", "fabric");
+    handle_type_ = handle_type_str == "fabric"
+                       ? CU_MEM_HANDLE_TYPE_FABRIC
+                       : CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    // Same-host POSIX-FD VMM sharing does not require a FABRIC-capable GPU.
+    // parseMnnvlConfig already rejects POSIX-FD handles in strict mode.
+    if (handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC && !supportFabricMem()) {
         return Status::InvalidArgument(
             "CUDA Fabric handle type not supported " LOC_MARK);
     }
@@ -362,12 +368,6 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     if (Platform::getLoader().type() != "cpu") caps.gpu_to_gpu = true;
 
     supported_ = true;
-    auto handle_type_str =
-        conf_->get("transports/nvlink/handle_type", "fabric");
-    if (handle_type_str == "fabric")
-        handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
-    else
-        handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     host_register_ = conf_->get("transports/nvlink/host_register", true);
     egm_enabled_ = options_.egm_enabled;
     egm_strict_ = conf_->get("transports/mnnvl/egm_strict", false);
@@ -735,7 +735,8 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     err = cudaMemcpyBatchAsyncCompat(dsts.data(), srcs.data(), sizes.data(),
                                      srcs.size(), &attr, &attrs_idx, 1,
                                      &fail_idx, stream);
-    if (err != cudaSuccess && fail_idx < tasks.size()) {
+    if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver &&
+        fail_idx < tasks.size()) {
         LOG(ERROR) << "MnnvlTransport::startTransfer internal error: "
                    << "cudaMemcpyBatchAsync failed at task index " << fail_idx
                    << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
@@ -743,16 +744,21 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
                    << "): " << cudaGetErrorString(err);
     }
 #else
-    err = cudaSuccess;
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        auto single_err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i],
-                                          cudaMemcpyDefault, stream);
-        if (single_err != cudaSuccess) {
-            err = single_err;
-            break;
+    err = cudaErrorCallRequiresNewerDriver;
+#endif
+
+    // A runtime can expose batch memcpy while the installed driver cannot
+    // execute it. Mirror NVLink's fallback on the same ordered stream. Other
+    // errors may follow a partially accepted batch and must not replay copies.
+    if (err == cudaErrorCallRequiresNewerDriver) {
+        (void)cudaGetLastError();
+        err = cudaSuccess;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
+                                  stream);
+            if (err != cudaSuccess) break;
         }
     }
-#endif
 
     if (err == cudaSuccess) err = cudaEventRecord(completion.event, stream);
     if (err != cudaSuccess) {
@@ -1145,7 +1151,8 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
     if (!addr)
         return Status::InvalidArgument("Null allocation output" LOC_MARK);
-    *addr = nullptr;
+    // A failed fixed-address allocation must preserve the caller's output.
+    if (!options.global_address) *addr = nullptr;
     if (!size) return Status::InvalidArgument("Empty allocation" LOC_MARK);
     LocationParser location(options.location);
     if (location.type() != "cuda" && location.type() != "cpu" &&
