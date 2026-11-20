@@ -1,4 +1,6 @@
 #include "client_service.h"
+#include <stdexcept>
+#include <cstdint>
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -1360,6 +1362,407 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     return client;
+}
+
+AsyncMemoryBatchGet::AsyncMemoryBatchGet(std::shared_ptr<Client> owner,
+                                         std::vector<Entry> entries)
+    : owner_(std::move(owner)),
+      pending_(false),
+      key_count_(entries.size()),
+      entries_(std::move(entries)) {}
+
+AsyncMemoryBatchGet::AsyncMemoryBatchGet(std::shared_ptr<Client> owner,
+                                         size_t key_count)
+    : owner_(std::move(owner)), pending_(true), key_count_(key_count) {}
+
+AsyncMemoryBatchGet::~AsyncMemoryBatchGet() {
+    // Backend futures must drain before their state and Client are freed.
+    // A pending handle owns no DMA itself; the manager retains a reference
+    // until it has completed every accepted operation.
+    if (!pending_) (void)wait();
+}
+
+bool AsyncMemoryBatchGet::ready() {
+    if (completed_flag_.load(std::memory_order_acquire)) return true;
+    if (pending_) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (completed_) return true;
+    for (auto& entry : entries_) {
+        if (entry.transfer && !entry.transfer->isReady()) return false;
+    }
+    return true;
+}
+
+void AsyncMemoryBatchGet::Complete(std::vector<int64_t> results) {
+    if (results.size() != key_count_) {
+        results.assign(key_count_,
+                       static_cast<int64_t>(ErrorCode::INTERNAL_ERROR));
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (completed_) return;
+        completed_.emplace(std::move(results));
+        completed_flag_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();
+}
+
+std::vector<int64_t> AsyncMemoryBatchGet::wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (pending_) {
+        cv_.wait(lock, [this] { return completed_.has_value(); });
+        return *completed_;
+    }
+    if (completed_) return *completed_;
+    std::vector<int64_t> results;
+    results.reserve(entries_.size());
+    // A successful transfer is not consumable until its checksum and lease
+    // have also been validated. All failures still drain the transfer.
+    for (auto& entry : entries_) {
+        if (entry.transfer) {
+            const ErrorCode status = entry.transfer->get();
+            entry.transfer.reset();
+            if (status != ErrorCode::OK) {
+                entry.result = static_cast<int64_t>(status);
+            } else {
+                auto verified = owner_->VerifyObjectChecksum(
+                    entry.key, entry.slices, entry.bytes,
+                    entry.query->object_checksum);
+                if (!verified) {
+                    entry.result = static_cast<int64_t>(verified.error());
+                } else if (entry.query->IsLeaseExpired()) {
+                    entry.result =
+                        static_cast<int64_t>(ErrorCode::LEASE_EXPIRED);
+                } else {
+                    entry.result = static_cast<int64_t>(entry.bytes);
+                }
+            }
+        }
+        results.push_back(entry.result);
+    }
+    completed_ = results;
+    completed_flag_.store(true, std::memory_order_release);
+    lock.unlock();
+    cv_.notify_all();
+    return results;
+}
+
+std::optional<std::vector<int64_t>> AsyncMemoryBatchGet::wait_for(
+    std::chrono::milliseconds timeout) {
+    if (timeout.count() < 0) {
+        throw std::invalid_argument("wait timeout must be nonnegative");
+    }
+    if (!pending_) {
+        // Raw backend handles are not exposed to Python. Avoid claiming a
+        // deadline guarantee on their blocking transport completion.
+        if (!ready()) return std::nullopt;
+        return wait();
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!cv_.wait_for(lock, timeout,
+                      [this] { return completed_.has_value(); })) {
+        return std::nullopt;
+    }
+    return *completed_;
+}
+
+AsyncMemoryGetManager::AsyncMemoryGetManager(std::shared_ptr<Client> owner,
+                                             size_t max_operations,
+                                             size_t max_bytes,
+                                             SubmitFunction submit)
+    : owner_(std::move(owner)),
+      submit_(std::move(submit)),
+      max_operations_(max_operations),
+      max_bytes_(max_bytes) {
+    if (max_operations_ == 0 || max_bytes_ == 0) {
+        throw std::invalid_argument("async get budgets must be positive");
+    }
+    if (!submit_) {
+        if (!owner_) {
+            throw std::invalid_argument("async get requires a Store client");
+        }
+        submit_ = [owner = owner_](const auto& keys, const auto& destinations) {
+            return owner->SubmitAsyncMemoryBatchGet(owner, keys, destinations);
+        };
+    }
+    submission_thread_ = std::thread([this] { RunSubmissions(); });
+    try {
+        completion_thread_ = std::thread([this] { RunCompletions(); });
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        submission_thread_.join();
+        throw;
+    }
+}
+
+AsyncMemoryGetManager::~AsyncMemoryGetManager() { CloseAndDrain(); }
+
+std::pair<size_t, size_t> AsyncMemoryGetManager::InFlight() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {active_.size(), used_bytes_};
+}
+
+std::shared_ptr<AsyncMemoryBatchGet> AsyncMemoryGetManager::Submit(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<Slice>>& destinations) {
+    if (keys.empty() || keys.size() != destinations.size()) {
+        throw std::invalid_argument(
+            "async get requires nonempty matching keys");
+    }
+    size_t bytes = 0;
+    std::vector<MemoryRange> ranges;
+    std::unordered_set<std::string> seen;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!seen.insert(keys[i]).second || destinations[i].empty()) {
+            throw std::invalid_argument(
+                "async get requires unique keys and slices");
+        }
+        for (const auto& slice : destinations[i]) {
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(slice.ptr);
+            if (ptr == 0 || slice.size == 0 ||
+                slice.size > std::numeric_limits<uintptr_t>::max() - ptr ||
+                slice.size > max_bytes_ - std::min(bytes, max_bytes_)) {
+                throw std::invalid_argument(
+                    "invalid or oversized async get slice");
+            }
+            bytes += slice.size;
+            ranges.emplace_back(ptr, ptr + slice.size);
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first < ranges[i - 1].second) {
+            throw std::invalid_argument("overlapping async destinations");
+        }
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stopping_) throw std::runtime_error("async get is closed");
+    if (active_.size() >= max_operations_ || bytes > max_bytes_ - used_bytes_) {
+        throw std::runtime_error("async get admission budget exhausted");
+    }
+    for (const auto& active : active_) {
+        for (const auto& region : ranges) {
+            for (const auto& existing : active.ranges) {
+                if (region.first < existing.second &&
+                    existing.first < region.second) {
+                    throw std::invalid_argument(
+                        "destination already used by an in-flight async read");
+                }
+            }
+        }
+    }
+    auto operation = std::make_shared<AsyncMemoryBatchGet>(owner_, keys.size());
+    // Reserve the tracking slot first. A failed queue allocation must not
+    // leave a pending operation without a manager to complete it.
+    active_.push_back({operation, nullptr, std::move(ranges), bytes});
+    try {
+        queue_.push_back({operation, keys, destinations});
+    } catch (...) {
+        active_.pop_back();
+        throw;
+    }
+    used_bytes_ += bytes;
+    lock.unlock();
+    cv_.notify_all();
+    return operation;
+}
+
+void AsyncMemoryGetManager::RunSubmissions() {
+    for (;;) {
+        Pending pending;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+            if (queue_.empty() && stopping_) return;
+            pending = std::move(queue_.front());
+            queue_.pop_front();
+        }
+        std::shared_ptr<AsyncMemoryBatchGet> backend;
+        try {
+            backend = submit_(pending.keys, pending.destinations);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "async get submission failed: " << e.what();
+        } catch (...) {
+            LOG(ERROR) << "async get submission raised an unknown error";
+        }
+        if (!backend) {
+            pending.operation->Complete(std::vector<int64_t>(
+                pending.keys.size(),
+                static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)));
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = std::find_if(
+                active_.begin(), active_.end(), [&](const Active& active) {
+                    return active.operation == pending.operation;
+                });
+            if (it != active_.end()) {
+                if (backend) {
+                    it->backend = std::move(backend);
+                } else {
+                    used_bytes_ -= it->bytes;
+                    active_.erase(it);
+                }
+            }
+        }
+        cv_.notify_all();
+    }
+}
+
+void AsyncMemoryGetManager::RunCompletions() {
+    for (;;) {
+        std::shared_ptr<AsyncMemoryBatchGet> backend;
+        std::shared_ptr<AsyncMemoryBatchGet> operation;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            // Sleep without polling while no backend is submitted. Pending
+            // metadata requests are handled by the submission thread.
+            cv_.wait(lock, [this] {
+                return (stopping_ && active_.empty() && queue_.empty()) ||
+                       std::any_of(active_.begin(), active_.end(),
+                                   [](const Active& item) {
+                                       return item.backend != nullptr;
+                                   });
+            });
+            if (stopping_ && active_.empty() && queue_.empty()) return;
+            for (auto& active : active_) {
+                if (active.backend && active.backend->ready()) {
+                    backend = std::move(active.backend);
+                    operation = active.operation;
+                    // Null backend marks a completion in progress; keep
+                    // the range reservation and its credits until drain.
+                    break;
+                }
+            }
+        }
+        if (!backend) {
+            // One bounded poll interval only when a real transfer is active.
+            // Avoid spinning when a submitter is still resolving metadata.
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(1));
+            continue;
+        }
+        std::vector<int64_t> results;
+        try {
+            results = backend->wait();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "async get completion failed: " << e.what();
+        } catch (...) {
+            LOG(ERROR) << "async get completion raised an unknown error";
+        }
+        operation->Complete(std::move(results));
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = std::find_if(active_.begin(), active_.end(),
+                                   [&](const Active& active) {
+                                       return active.operation == operation;
+                                   });
+            if (it != active_.end()) {
+                used_bytes_ -= it->bytes;
+                active_.erase(it);
+            }
+        }
+        cv_.notify_all();
+    }
+}
+
+void AsyncMemoryGetManager::Drain() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return active_.empty() && queue_.empty(); });
+}
+
+void AsyncMemoryGetManager::CloseAndDrain() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+    }
+    cv_.notify_all();
+    if (submission_thread_.joinable()) submission_thread_.join();
+    if (completion_thread_.joinable()) completion_thread_.join();
+}
+
+std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
+    std::shared_ptr<Client> owner, const std::vector<std::string>& keys,
+    const std::vector<std::vector<Slice>>& destinations) {
+    if (owner.get() != this || keys.empty() ||
+        keys.size() != destinations.size() || !transfer_submitter_ ||
+        protocol_ != "rdma") {
+        throw std::invalid_argument(
+            "async memory batch get requires RDMA and matching descriptors");
+    }
+    const auto queries = BatchQuery(keys);
+    if (queries.size() != keys.size()) {
+        throw std::runtime_error("async batch read metadata count mismatch");
+    }
+    std::unordered_set<std::string> seen;
+    std::vector<AsyncMemoryBatchGet::Entry> entries;
+    entries.reserve(keys.size());
+    auto select = MakeReadReplicaSelector();
+
+    // All-key preflight before the first DMA submission.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!seen.insert(keys[i]).second || destinations[i].empty()) {
+            throw std::invalid_argument(
+                "async get requires unique keys and valid destination slices");
+        }
+        AsyncMemoryBatchGet::Entry entry;
+        entry.key = keys[i];
+        entry.slices = destinations[i];
+        for (const auto& slice : entry.slices) {
+            if (!slice.ptr || slice.size == 0 ||
+                slice.size > SIZE_MAX - entry.bytes) {
+                throw std::invalid_argument("async batch read invalid slice");
+            }
+            entry.bytes += slice.size;
+        }
+        if (!queries[i]) {
+            // A cache miss is a key-level failure, not a malformed operation.
+            // Preserve the input index while other memory replicas advance.
+            entry.result = static_cast<int64_t>(queries[i].error());
+            entries.emplace_back(std::move(entry));
+            continue;
+        }
+        const auto& query = queries[i].value();
+        if (query.IsLeaseExpired()) {
+            entry.result = static_cast<int64_t>(ErrorCode::LEASE_EXPIRED);
+            entries.emplace_back(std::move(entry));
+            continue;
+        }
+        const ErrorCode error =
+            select(query.replicas, entry.slices, entry.replica);
+        if (error != ErrorCode::OK || !entry.replica.is_memory_replica() ||
+            entry.replica.get_memory_descriptor().buffer_descriptor.protocol_ !=
+                "rdma") {
+            throw std::invalid_argument(
+                "async batch get supports only RDMA memory replicas");
+        }
+        if (entry.bytes != calculate_total_size(entry.replica)) {
+            throw std::invalid_argument("async batch read size mismatch");
+        }
+        entry.query.emplace(query);
+        entries.emplace_back(std::move(entry));
+    }
+
+    // The owning handle exists BEFORE any transfer submission. If a submit
+    // raises, its destructor drains all previously submitted operations.
+    auto backend = std::make_shared<AsyncMemoryBatchGet>(std::move(owner),
+                                                         std::move(entries));
+    for (auto& entry : backend->entries_) {
+        if (!entry.query) continue;
+        auto submitted = SubmitSingleTransfer(entry.replica, entry.slices,
+                                              TransferRequest::READ,
+                                              TransferIntent::kForegroundGet);
+        if (submitted) {
+            entry.transfer.emplace(std::move(submitted.value()));
+        } else {
+            entry.result = static_cast<int64_t>(submitted.error());
+        }
+    }
+    return backend;
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,

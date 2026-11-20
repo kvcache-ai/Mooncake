@@ -3,6 +3,9 @@
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
+#include <deque>
+#include <cstdint>
+#include <utility>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -71,6 +74,115 @@ class QueryResult {
     bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
         return now >= lease_timeout;
     }
+};
+
+class Client;
+
+// Phase 1 of RFC #5668: one memory-only operation, owning its in-flight
+// transfers and metadata until their completion. Destinations are borrowed:
+// their registered allocations must stay alive until wait() returns.
+class AsyncMemoryGetManager;
+class AsyncMemoryBatchGetTestPeer;
+
+// A terminal read result is published only after all associated transfer
+// futures have been drained. Caller-owned destination memory must remain
+// registered and alive until wait() returns.
+class AsyncMemoryBatchGet {
+   public:
+    struct Entry {
+        std::string key;
+        std::vector<Slice> slices;
+        std::optional<QueryResult> query;
+        Replica::Descriptor replica;
+        std::optional<TransferFuture> transfer;
+        size_t bytes = 0;
+        int64_t result = static_cast<int64_t>(ErrorCode::INVALID_PARAMS);
+    };
+
+    AsyncMemoryBatchGet(std::shared_ptr<Client> owner,
+                        std::vector<Entry> entries);
+    // Admission handle, completed by the Store-owned async manager.
+    AsyncMemoryBatchGet(std::shared_ptr<Client> owner, size_t key_count);
+    ~AsyncMemoryBatchGet();
+
+    AsyncMemoryBatchGet(const AsyncMemoryBatchGet&) = delete;
+    AsyncMemoryBatchGet& operator=(const AsyncMemoryBatchGet&) = delete;
+
+    bool ready();
+    std::vector<int64_t> wait();
+    // A timeout only ends the caller's wait; it never cancels in-flight DMA.
+    std::optional<std::vector<int64_t>> wait_for(
+        std::chrono::milliseconds timeout);
+
+   private:
+    friend class AsyncMemoryGetManager;
+    friend class AsyncMemoryBatchGetTestPeer;
+    friend class Client;
+    void Complete(std::vector<int64_t> results);
+
+    std::shared_ptr<Client> owner_;
+    const bool pending_;
+    const size_t key_count_;
+    std::vector<Entry> entries_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::optional<std::vector<int64_t>> completed_;
+    std::atomic<bool> completed_flag_{false};
+};
+
+// One bounded Store-owned dispatcher, not one waiting thread per operation.
+// The submission thread may resolve and submit L1 while L0 is still running;
+// the completion thread independently drains ready operations. Backpressure
+// credits cover queued AND submitted transfers.
+class AsyncMemoryGetManager {
+   public:
+    using SubmitFunction = std::function<std::shared_ptr<AsyncMemoryBatchGet>(
+        const std::vector<std::string>&,
+        const std::vector<std::vector<Slice>>&)>;
+
+    AsyncMemoryGetManager(std::shared_ptr<Client> owner, size_t max_operations,
+                          size_t max_bytes, SubmitFunction submit = {});
+    ~AsyncMemoryGetManager();
+
+    AsyncMemoryGetManager(const AsyncMemoryGetManager&) = delete;
+    AsyncMemoryGetManager& operator=(const AsyncMemoryGetManager&) = delete;
+
+    std::shared_ptr<AsyncMemoryBatchGet> Submit(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<Slice>>& destinations);
+    void Drain();
+    void CloseAndDrain();
+    std::pair<size_t, size_t> InFlight();
+
+   private:
+    using MemoryRange = std::pair<uintptr_t, uintptr_t>;
+    struct Pending {
+        std::shared_ptr<AsyncMemoryBatchGet> operation;
+        std::vector<std::string> keys;
+        std::vector<std::vector<Slice>> destinations;
+    };
+    struct Active {
+        std::shared_ptr<AsyncMemoryBatchGet> operation;
+        std::shared_ptr<AsyncMemoryBatchGet> backend;
+        std::vector<MemoryRange> ranges;
+        size_t bytes;
+    };
+
+    void RunSubmissions();
+    void RunCompletions();
+
+    std::shared_ptr<Client> owner_;
+    SubmitFunction submit_;
+    const size_t max_operations_;
+    const size_t max_bytes_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<Pending> queue_;
+    std::vector<Active> active_;
+    size_t used_bytes_{0};
+    bool stopping_{false};
+    std::thread submission_thread_;
+    std::thread completion_thread_;
 };
 
 /**
@@ -159,6 +271,13 @@ class Client {
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       std::vector<Slice>& slices);
+
+    // Memory-backed RDMA only. Queries and transfer submissions happen before
+    // return; completion does not. The returned operation holds Client alive.
+    // Unsupported replica paths fail before any transfer is submitted.
+    std::shared_ptr<AsyncMemoryBatchGet> SubmitAsyncMemoryBatchGet(
+        std::shared_ptr<Client> owner, const std::vector<std::string>& keys,
+        const std::vector<std::vector<Slice>>& destinations);
 
     /**
      * @brief Batch retrieve data for multiple keys

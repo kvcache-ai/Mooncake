@@ -1,0 +1,46 @@
+name: Async Store CPU Test (RFC 5668)
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - mooncake-store/**
+      - mooncake-integration/store/store_py.cpp
+      - .github/workflows/async-store-cpu-rfc5668.yml
+  push:
+    branches:
+      - work/async-store-batch-get-rfc5668
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  async-store-cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Mooncake build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo bash dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      - name: Configure CPU-only Store build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DUSE_HTTP=ON \
+            -DUSE_CUDA=OFF \
+            -DUSE_ETCD=ON \
+            -DSTORE_USE_ETCD=ON \
+            -DBUILD_UNIT_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_DEBUG_SYMBOLS=OFF
+      - name: Build focused async Store unit-test binary
+        run: cmake --build build --target async_memory_batch_get_test --parallel 2
+      - name: Run deterministic CPU tests
+        run: ctest --test-dir build -R '^async_memory_batch_get_test$' --output-on-failure
