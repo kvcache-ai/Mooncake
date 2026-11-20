@@ -46,6 +46,143 @@
 
 namespace mooncake::test {
 
+class SnapshotObservingStrategy final : public AllocationStrategy {
+   public:
+    explicit SnapshotObservingStrategy(
+        std::shared_ptr<AllocationStrategy> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    AllocatorSnapshotMetadata GetSnapshotMetadata() const noexcept override {
+        return delegate_->GetSnapshotMetadata();
+    }
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& snapshot, size_t size, size_t count,
+        const std::vector<std::string>& preferred,
+        const std::set<std::string>& excluded, ReplicaType type) override {
+        Observe(snapshot);
+        return delegate_->Allocate(snapshot, size, count, preferred, excluded,
+                                   type);
+    }
+
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& snapshot, size_t size,
+        const std::string& segment) override {
+        Observe(snapshot);
+        return delegate_->AllocateFrom(snapshot, size, segment);
+    }
+
+    std::vector<bool> owner_observations;
+
+   private:
+    void Observe(const AllocatorManager& snapshot) {
+        owner_observations.push_back(
+            std::any_of(snapshot.getNames().begin(), snapshot.getNames().end(),
+                        [&](const auto& name) {
+                            return snapshot.GetOwnerClientId(name).has_value();
+                        }));
+    }
+
+    std::shared_ptr<AllocationStrategy> delegate_;
+};
+
+TEST_F(MasterServiceTest, NonSsdAllocationSnapshotsOmitOwners) {
+    for (const auto type : {AllocationStrategyType::RANDOM,
+                            AllocationStrategyType::FREE_RATIO_FIRST,
+                            AllocationStrategyType::LOCAL_FIRST}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        MasterServiceConfig config;
+        config.allocation_strategy_type = type;
+        config.enable_offload = true;
+        config.promotion_on_hit = true;
+        config.promotion_admission_threshold = 1;
+        MasterService service(config);
+        auto observer = std::make_shared<SnapshotObservingStrategy>(
+            MasterServiceTestPeer::AllocationStrategy(service));
+        MasterServiceTestPeer::AllocationStrategy(service) = observer;
+        const auto source = PrepareSimpleSegment(service, "snapshot-source");
+        PrepareSimpleSegment(service, "snapshot-target", 0x400000000ULL);
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        replicate.preferred_segment = "snapshot-source";
+        ASSERT_TRUE(service.PutStart(source.client_id, "snapshot-key",
+                                     TenantId::Default(), 1024, replicate));
+        ASSERT_TRUE(service.PutEnd(source.client_id, "snapshot-key",
+                                   TenantId::Default(), ReplicaType::MEMORY));
+        ASSERT_TRUE(service.CopyStart(source.client_id, "snapshot-key",
+                                      TenantId::Default(), "snapshot-source",
+                                      {"snapshot-target"}));
+        ASSERT_TRUE(service.CopyRevoke(source.client_id, "snapshot-key",
+                                       TenantId::Default()));
+        ASSERT_TRUE(service.MoveStart(source.client_id, "snapshot-key",
+                                      TenantId::Default(), "snapshot-source",
+                                      "snapshot-target"));
+        ASSERT_TRUE(service.MoveRevoke(source.client_id, "snapshot-key",
+                                       TenantId::Default()));
+        ASSERT_TRUE(service.UpsertStart(source.client_id, "snapshot-key",
+                                        TenantId::Default(), 2048, replicate));
+        ASSERT_TRUE(service.UpsertRevoke(source.client_id, "snapshot-key",
+                                         TenantId::Default(),
+                                         ReplicaType::MEMORY));
+        // Enter the promotion allocation path through a real LOCAL_DISK-only
+        // object and the normal promotion admission gate.
+        ASSERT_TRUE(service.MountLocalDiskSegment(source.client_id, true));
+        const std::string cold_key = "snapshot-cold-key";
+        StorageObjectMetadata stored;
+        stored.bucket_id = 0;
+        stored.offset = 0;
+        stored.key_size = static_cast<int64_t>(cold_key.size());
+        stored.data_size = 1024;
+        stored.transport_endpoint = "snapshot-source";
+        ASSERT_TRUE(service.NotifyOffloadSuccess(
+            source.client_id,
+            {OffloadTaskItem{.tenant_id = std::string(TenantId::kDefaultValue),
+                             .key = cold_key,
+                             .size = 1024}},
+            {stored}));
+        ASSERT_TRUE(service.GetReplicaList(cold_key, TenantId::Default()));
+        ASSERT_TRUE(service.PromotionAllocStart(source.client_id, cold_key,
+                                                TenantId::Default(), 1024, {}));
+        EXPECT_EQ(observer->owner_observations, std::vector<bool>(5, false));
+    }
+}
+
+TEST_F(MasterServiceTest, SsdAllocationSnapshotsPreserveOwnerRanking) {
+    MasterServiceConfig config;
+    config.allocation_strategy_type =
+        AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+    MasterService service(config);
+    auto observer = std::make_shared<SnapshotObservingStrategy>(
+        MasterServiceTestPeer::AllocationStrategy(service));
+    MasterServiceTestPeer::AllocationStrategy(service) = observer;
+    const auto busy = PrepareSimpleSegment(service, "busy-memory");
+    const auto free =
+        PrepareSimpleSegment(service, "free-memory", 0x400000000ULL);
+    auto& ssd = MasterServiceTestPeer::LocalSsdManager(service);
+    ASSERT_EQ(ssd.RegisterClient(busy.client_id, true), ErrorCode::OK);
+    ASSERT_EQ(ssd.RegisterClient(free.client_id, true), ErrorCode::OK);
+    ASSERT_TRUE(ssd.ReportCapacity(busy.client_id, 1000));
+    ASSERT_TRUE(ssd.ReportCapacity(free.client_id, 1000));
+    ASSERT_TRUE(ssd.AdjustUsedBytes(busy.client_id, 900));
+    ASSERT_TRUE(ssd.AdjustUsedBytes(free.client_id, 100));
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    for (size_t i = 0; i < 16; ++i) {
+        auto result = service.PutStart(busy.client_id, "ssd-snapshot-key",
+                                       TenantId::Default(), 1024, replicate);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->size(), 1u);
+        EXPECT_EQ(result->front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "free-memory");
+        ASSERT_TRUE(service.PutRevoke(busy.client_id, "ssd-snapshot-key",
+                                      TenantId::Default(),
+                                      ReplicaType::MEMORY));
+    }
+    EXPECT_EQ(observer->owner_observations, std::vector<bool>(16, true));
+}
+
 class ScopedEnvVar {
    public:
     explicit ScopedEnvVar(const char* name) : name_(name) {

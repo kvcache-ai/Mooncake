@@ -4931,7 +4931,8 @@ auto MasterService::AllocateReplicas(const std::string& key,
                             << host_ordered_segments.size();
                 }
             }
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+            allocator_snapshot = allocator_access.SnapshotAllocatorManager(
+                allocation_strategy_->GetSnapshotMetadata());
         }
 
         if (StoreHcaAffinityEnabled()) {
@@ -6635,7 +6636,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+        allocator_snapshot = allocator_access.SnapshotAllocatorManager(
+            allocation_strategy_->GetSnapshotMetadata());
     }
 
     for (auto& tgt_segment : tgt_segments) {
@@ -7017,7 +7019,8 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+            allocator_snapshot = allocator_access.SnapshotAllocatorManager(
+                allocation_strategy_->GetSnapshotMetadata());
         }
         auto replica = allocation_strategy_->AllocateFrom(
             allocator_snapshot, metadata.TotalLength(), tgt_segment);
@@ -9253,7 +9256,8 @@ auto MasterService::PromotionAllocStart(
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+        allocator_snapshot = allocator_access.SnapshotAllocatorManager(
+            allocation_strategy_->GetSnapshotMetadata());
     }
     auto allocation_result = allocation_strategy_->Allocate(
         allocator_snapshot, size, config.replica_num, preferred_segments);
