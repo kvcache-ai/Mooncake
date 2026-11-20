@@ -169,3 +169,65 @@ def test_topology_cli_runs_from_the_canonical_source_tree() -> None:
 
     assert "Dump device topology" in result.stdout
     assert "--custom-topo-json" in result.stdout
+
+
+@pytest.mark.parametrize("name", ["MC_USE_TENT", "MC_USE_TEV1"])
+@pytest.mark.parametrize(
+    ("value", "backend"),
+    [
+        (None, "te"),
+        ("0", "te"),
+        ("false", "te"),
+        ("off", "te"),
+        ("no", "te"),
+        ("", "tent"),
+        ("FALSE", "tent"),
+        ("1", "tent"),
+    ],
+)
+def test_topology_auto_without_engine_extension(
+    monkeypatch, mooncake_pkg, name, value, backend
+):
+    monkeypatch.setitem(sys.modules, "mooncake.engine", None)
+    for flag in ("MC_USE_TENT", "MC_USE_TEV1"):
+        monkeypatch.delenv(flag, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    assert (
+        _load_module("transfer_engine_topology_dump.py").resolve_backend("auto")
+        == backend
+    )
+
+
+def test_topology_auto_follows_installed_engine(monkeypatch, mooncake_pkg):
+    module = _load_module("transfer_engine_topology_dump.py")
+    engine = ModuleType("mooncake.engine")
+    engine._is_tent_selected = lambda: False
+    monkeypatch.setitem(sys.modules, "mooncake.engine", engine)
+    monkeypatch.setenv("MC_USE_TENT", "1")
+    assert module.resolve_backend("auto") == "te"
+    engine._is_tent_selected = lambda: True
+    assert module.resolve_backend("auto") == "tent"
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_explicit_tent_fallback_checks_build(monkeypatch, mooncake_pkg, supported):
+    module = _load_module("transfer_engine_topology_dump.py")
+    engine = ModuleType("mooncake.engine")
+    engine.SUPPORT_TENT = supported
+    engine.TransferEngine = lambda: SimpleNamespace(
+        get_local_topology=lambda device_name: (os.environ["MC_USE_TENT"], device_name)
+    )
+    monkeypatch.setitem(sys.modules, "mooncake.engine", engine)
+    monkeypatch.setitem(sys.modules, "tent", None)
+    monkeypatch.setenv("MC_USE_TENT", "0")
+    monkeypatch.setenv("MC_USE_TEV1", "off")
+    module.apply_backend("tent")
+    if supported:
+        assert module.dump_tent_topology("nic0") == ("1", "nic0")
+    else:
+        with pytest.raises(RuntimeError, match="TENT"):
+            module.dump_tent_topology("nic0")
+    module.apply_backend("te")
+    assert "MC_USE_TENT" not in os.environ
+    assert "MC_USE_TEV1" not in os.environ

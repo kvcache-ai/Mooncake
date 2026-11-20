@@ -22,9 +22,10 @@ SUPPORT_MUSA: bool
 SUPPORT_TENT: bool
 SUPPORT_XPU: bool
 
+def _is_tent_selected() -> bool: ...
+
 class CompletionNotificationFallback(Exception):
     """Notification was requested, but this submit must fall back to polling."""
-
 
 class TransferStatus:
     """Values carried by ``drain_completions`` rows as ``status``."""
@@ -44,7 +45,6 @@ class TransferStatus:
     def name(self) -> str: ...
     @property
     def value(self) -> int: ...
-
 
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]

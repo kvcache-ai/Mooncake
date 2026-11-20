@@ -56,16 +56,26 @@ def parse_args():
 
 
 def resolve_backend(backend: str) -> str:
-    if backend == "auto":
-        if os.environ.get("MC_USE_TENT") or os.environ.get("MC_USE_TEV1"):
-            return "tent"
-        return "te"
-    return backend
+    if backend != "auto":
+        return backend
+    try:
+        from mooncake.engine import _is_tent_selected
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("mooncake", "mooncake.engine"):
+            raise
+        # The diagnostic can also run with just the standalone tent module.
+        disabled = (None, "0", "false", "off", "no")
+        use_tent = any(
+            os.getenv(name) not in disabled for name in ("MC_USE_TENT", "MC_USE_TEV1")
+        )
+    else:
+        use_tent = _is_tent_selected()
+    return "tent" if use_tent else "te"
 
 
 def apply_backend(backend: str) -> None:
     if backend == "tent":
-        os.environ.setdefault("MC_USE_TENT", "1")
+        os.environ["MC_USE_TENT"] = "1"
     else:
         os.environ.pop("MC_USE_TENT", None)
         os.environ.pop("MC_USE_TEV1", None)
@@ -130,13 +140,17 @@ def dump_tent_topology(device_name: str) -> str:
 
     try:
         import tent
-
-        engine = tent.TransferEngine()
-        if not engine.available():
-            raise RuntimeError("tent.TransferEngine is not available")
-        return engine.get_local_topology()
     except ImportError:
+        from mooncake.engine import SUPPORT_TENT
+
+        if not SUPPORT_TENT:
+            raise RuntimeError("This Mooncake build has no TENT backend") from None
         return dump_te_topology(device_name)
+
+    engine = tent.TransferEngine()
+    if not engine.available():
+        raise RuntimeError("tent.TransferEngine is not available")
+    return engine.get_local_topology()
 
 
 def main():

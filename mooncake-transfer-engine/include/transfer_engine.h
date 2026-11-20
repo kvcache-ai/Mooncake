@@ -139,6 +139,9 @@ class TransferEngine {
 
     int getRpcPort();
 
+    // Backend a newly constructed engine will use in this build and
+    // environment.
+    static bool isTentSelectedFromEnv();
     bool isUsingTent() const { return use_tent_; }
     // Expose the internal TENT engine so callers (Store, TransferSubmitter)
     // can call tent::TransferEngine native API directly, bypassing the
