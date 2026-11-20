@@ -239,7 +239,7 @@ bool LinuxNvmeInitiator::ProbeSegment(const std::string& text,
         probe->segment->queue->Poll(0);
         if (!probe->pending) break;
         if (std::chrono::steady_clock::now() >= deadline) {
-            return fail("Linux NoF probe timed out");
+            return fail(kNofProbeCompletionTimeout);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

@@ -564,7 +564,7 @@ class SpdkInitiator::Impl {
             done && probe_ctx->success.load(std::memory_order_acquire);
         if (!ok && error_reason) {
             if (!done) {
-                *error_reason = "completion_timeout";
+                *error_reason = kNofProbeCompletionTimeout;
             } else {
                 std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
                 *error_reason = probe_ctx->error_reason.empty()

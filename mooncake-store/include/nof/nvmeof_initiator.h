@@ -25,6 +25,7 @@ enum class NofIOOp : int {
 };
 
 constexpr uint32_t kInvalidBlockSize = 0xFFFFFFFF;
+inline constexpr char kNofProbeCompletionTimeout[] = "completion_timeout";
 
 // Neutral completion result: no spdk_nvme_cpl outside the implementation.
 // On failure, SPDK sets sc, sct and error_string; Linux sets error_string

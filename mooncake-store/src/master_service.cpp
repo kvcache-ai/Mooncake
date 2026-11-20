@@ -10275,7 +10275,7 @@ void MasterService::NofHeartbeatThreadFunc() {
         }
 
         MasterMetricManager::instance().inc_nof_heartbeat_failure_total();
-        if (error_reason == "completion_timeout") {
+        if (error_reason == kNofProbeCompletionTimeout) {
             MasterMetricManager::instance().inc_nof_heartbeat_timeout_total();
         }
 
