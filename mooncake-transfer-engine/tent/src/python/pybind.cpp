@@ -149,9 +149,11 @@ static inline bool IsUint64Vector(const py::array& array) {
            array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
 }
 
-// How long a failed synchronous batch waits for cancellation to land before
-// the caller is told its buffers may still be in use.
-constexpr uint64_t kSettleTimeoutMs = 250;
+// A cancelled task can sit behind the QP retry timer: with the default RDMA
+// settings (send_timeout 14 ~= 67 ms, send_retry_count 7) draining one task
+// takes up to ~540 ms. Use one full retry budget before telling the caller its
+// buffers may still be in use.
+constexpr uint64_t kSettleTimeoutMs = 600;
 
 // =============================================================================
 // RAII Wrappers
@@ -894,10 +896,10 @@ PYBIND11_MODULE(tent, m) {
             "modified until the call returns. Malformed non-empty input is "
             "reported as INVALID for every entry; an empty input that is not "
             "three empty uint64 vectors raises InvalidArgumentError. A failed "
-            "submit or wait cancels the batch and waits up to 250 ms for every "
-            "descriptor to stop; when that does not happen the call raises "
-            "InternalError, which says src and dst must not be reused. This "
-            "call has no timeout.",
+            "submit or wait cancels the batch and waits one RDMA retry budget "
+            "(600 ms) for every descriptor to stop; when that does not happen "
+            "the call raises InternalError, which says src and dst must not be "
+            "reused. This call has no timeout.",
             py::arg("src"), py::arg("dst"), py::arg("lengths"),
             py::arg("target_id"), py::arg("opcode"))
 
