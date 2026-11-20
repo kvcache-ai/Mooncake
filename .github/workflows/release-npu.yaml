@@ -35,6 +35,7 @@ jobs:
 
     env:
       NPU_BUILD: "1"
+      GOEXPERIMENT: "norandomizedheapbase64"
 
     steps:
       - name: Checkout code

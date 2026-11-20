@@ -721,7 +721,7 @@ These apply to any Mooncake caller — the framework sections below only add the
 | `MC_MAX_WR` | provider's transmit depth | Per-NIC in-flight WR cap. **Do not set** — see below |
 | `MC_EFA_STALL_MIN_MS` | `1000` | How long a peer must refuse every post (unbroken `FI_EAGAIN`, at least 1024 waves) before its slices fail. A new connection's first completions take 50–100 ms, so much lower values fail healthy peers. `<= 0` restores the count-only check |
 | `MC_EFA_CQ_THREADS` | `1` | CQ polling threads. **Leave alone** — see below |
-| `MC_EFA_NIC_SELECTION` | `local` | `local` registers each device buffer only on its topology-local NICs; `all` registers it on every NIC — see below |
+| `MC_EFA_NIC_SELECTION` | `local` | `local` registers each device buffer only on its topology-local NICs, however many chunks it is split into; `all` registers it on every NIC — see below |
 | `MC_EFA_DISABLE_NEURON` | unset | `1` skips Neuron HBM registration and stages through host memory — see [AWS Neuron](#efa-neuron) |
 | `MC_MS_AUTO_DISC`, `MC_MS_FILTERS` | on / unset | Mooncake Store device auto-discovery — see [Verification](#verification) |
 | `FI_PROVIDER`, `FI_EFA_USE_DEVICE_RDMA`, `LD_LIBRARY_PATH` | set by the EFA installer | libfabric-side, not Mooncake's. Only needed if a container image drops them |
@@ -750,6 +750,8 @@ These apply to any Mooncake caller — the framework sections below only add the
 
 > **`MC_EFA_NIC_SELECTION`** — `local` (default) registers each device buffer only on the NICs the topology reports as closest to its GPU; `all` registers every buffer on every NIC. Registering one device buffer on N NICs costs roughly N registrations, plus a per-domain cost on top, while it buys no steady-state bandwidth: `Topology::selectDevice()` picks a device buffer's NIC from `preferred_hca` — the same topology-local set — on every first attempt, so keys on the other NICs are only used by retries. What `local` gives up is retrying a device buffer over a non-local NIC after its local NICs fail; set `all` if you need that. Host (`cpu:N`) buffers are never narrowed — a NUMA node's NIC set is half the machine, not a rail group.
 >
+> `local` also holds for a device buffer the transport splits into chunks (see [Registering Large Memory](#efa-large-memory)): every chunk stays on the GPU's local NICs, divided among them when the PTE budget forces a partition (`Local disjoint NIC partition` in the log). On p6-b300 a 100 GiB KV cache on 4 KB pages becomes two chunks, one per local NIC. Transfers spread across such a buffer now run over the GPU's own NICs instead of mostly over the other socket's, so the aggregate bandwidth of the buffer goes up; a transfer confined to a single chunk is served by that chunk's one local NIC. Only a buffer with more chunks than local NICs falls back to the all-NIC plans, with a warning that `local` was not applied.
+>
 > | Measured | `all` | `local` |
 > |---|---|---|
 > | p5.48xlarge, 48 × 391 MB GPU buffers registered serially | 123.7 s (32 NICs) | 17.6 s (4 NICs) |
@@ -771,7 +773,7 @@ Back large buffers with huge pages, either THP or hugetlb. This is a requirement
 
 An EFA NIC maps a registered buffer through a page table of about 22 million entries. With 4 KB pages, one registration covers at most about 88 GiB. With 2 MB pages the same entries cover about 44 TB, so the device's `max_mr_size` becomes the limit instead. For a 4 KB-backed buffer larger than that, the transport splits it into chunks and plans each NIC against the same budget:
 
-- With several NICs, each chunk is registered on only some of them (`Disjoint NIC partition` in the log). Transfers that touch a chunk then use only those NICs.
+- With several NICs, each chunk is registered on only some of them (`Disjoint NIC partition` in the log; for a device buffer under `MC_EFA_NIC_SELECTION=local`, `Local disjoint NIC partition`, dividing only the GPU's local NICs). Transfers that touch a chunk then use only those NICs.
 - With one NIC, for example r8i.48xlarge, a 4 KB-backed buffer above about 88 GiB is rejected (`per-NIC PTE budget ... is exceeded even with round-robin`).
 
 The `Auto-split params: page_size=...` log line shows which budget a registration was planned with.
@@ -991,7 +993,7 @@ The same fix applies to `... is libfabric 1.17, but the EFA transport needs 1.18
 
 ### Large buffer registration fails or is split across NICs
 
-`fi_mr_reg ... Cannot allocate memory`, `Disjoint NIC partition`, or `per-NIC PTE budget ... is exceeded` on a large buffer means it is backed by 4 KB pages. Back it with huge pages; see [Registering Large Memory](#efa-large-memory).
+`fi_mr_reg ... Cannot allocate memory`, `Disjoint NIC partition`, `Local disjoint NIC partition`, or `per-NIC PTE budget ... is exceeded` on a large buffer means it is backed by 4 KB pages. Back it with huge pages; see [Registering Large Memory](#efa-large-memory).
 
 `Cannot allocate memory` can also mean the host is out of memory to pin. Check `MemAvailable` before shrinking anything. On GPU hosts, inference engines' host caches can already hold most of the DRAM.
 

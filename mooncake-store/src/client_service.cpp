@@ -757,7 +757,9 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
 ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
     auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
     if (!ha_backend_spec) {
-        LOG(ERROR) << "Invalid HA backend entry: " << master_server_entry;
+        // Invalid HA entries may contain credentials; omit the raw input.
+        LOG(ERROR) << "Invalid HA backend entry: error="
+                   << toString(ha_backend_spec.error());
         return ha_backend_spec.error();
     }
 
@@ -769,8 +771,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
                        << "backend="
                        << ha::HABackendTypeToString(
                               ha_backend_spec.value()->type)
-                       << " endpoints='" << ha_backend_spec.value()->connstring
-                       << "' error=" << toString(coordinator.error());
+                       << " error=" << toString(coordinator.error());
             return coordinator.error();
         }
 
