@@ -108,6 +108,14 @@ class HAMetricManager {
         uint64_t errors{0};
         uint64_t elapsed_us{0};
     };
+    struct BatchOpLogPrunerRuntime {
+        bool active{false};
+        uint64_t cursor_batch_id{0};
+        uint64_t observed_floor_batch_id{0};
+        uint64_t chunks_deleted_total{0};
+        uint64_t batch_ids_advanced_total{0};
+        uint64_t errors_total{0};
+    };
     void reset_snapshot_runtime(bool enabled);
     SnapshotRuntime get_snapshot_runtime() const;
     SnapshotOperationStats get_snapshot_operation(
@@ -122,6 +130,12 @@ class HAMetricManager {
     void record_snapshot_skip(SnapshotSkipReason reason);
     void record_snapshot_operation(SnapshotOperation operation, int64_t error,
                                    std::chrono::steady_clock::time_point start);
+    void reset_batch_oplog_pruner_runtime();
+    void update_batch_oplog_pruner_state(bool active, uint64_t cursor_batch_id,
+                                         uint64_t observed_floor_batch_id);
+    void inc_batch_oplog_pruner_chunks_deleted(uint64_t count = 1);
+    void inc_batch_oplog_pruner_batch_ids_advanced(uint64_t count);
+    void inc_batch_oplog_pruner_errors(uint64_t count = 1);
 
     struct WriterRuntimeSnapshot {
         bool accepting{false};
@@ -375,6 +389,8 @@ class HAMetricManager {
     ylt::metric::counter_t state_transitions_total_;
 
     mutable std::mutex snapshot_runtime_mutex_;
+    mutable std::mutex batch_oplog_pruner_mutex_;
+    BatchOpLogPrunerRuntime batch_oplog_pruner_runtime_;
     SnapshotRuntime snapshot_runtime_;
     std::array<SnapshotOperationStats,
                static_cast<size_t>(SnapshotOperation::Count)>
