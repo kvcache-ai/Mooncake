@@ -23,7 +23,16 @@
 
 namespace mooncake {
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
-    : endpoint_type_(endpoint_type) {}
+    : endpoint_type_(endpoint_type) {
+    const char* mode = getenv("MC_UB_TRANS_MODE");
+    rm_mode_ = (mode != nullptr &&
+                (strcmp(mode, "rm") == 0 || strcmp(mode, "RM") == 0 ||
+                 strcmp(mode, "1") == 0));
+    if (rm_mode_) {
+        LOG(INFO) << "UbTransport: using RM (Reliable Message) mode "
+                     "(UBoE compatible)";
+    }
+}
 
 UbTransport::~UbTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET

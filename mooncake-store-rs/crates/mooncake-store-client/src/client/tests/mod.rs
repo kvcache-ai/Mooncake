@@ -284,7 +284,10 @@ struct BlockingCasMetadataBackend {
 struct RecoverableMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     state: StdMutex<RecoverableMetadataState>,
+    cold_usage_settlement_gate: StdMutex<Option<ColdUsageSettlementGate>>,
 }
+
+type ColdUsageSettlementGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 #[derive(Default)]
 struct BlockingCasGateState {
@@ -627,6 +630,7 @@ impl RecoverableMetadataBackend {
         Self {
             inner,
             state: StdMutex::new(RecoverableMetadataState::default()),
+            cold_usage_settlement_gate: StdMutex::new(None),
         }
     }
 
@@ -840,6 +844,15 @@ impl MetadataBackend for RecoverableMetadataBackend {
         delta: mooncake_store_core::ColdTierUsageDelta,
         updated_at_ms: u64,
     ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+        if delta.used_bytes > 0 {
+            let gate = self.cold_usage_settlement_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).expect("test should wait for settlement");
+                release
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test should release settlement");
+            }
+        }
         self.inner
             .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
     }
@@ -14976,6 +14989,65 @@ fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
 }
 
 #[test]
+fn remove_reclaims_legacy_allocation_when_quota_finalize_fails() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    inner
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(16),
+                        max_objects: Some(2),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
+    let metadata = Arc::new(FinalizeFailureMetadataBackend::new(
+        inner.clone(),
+        "quota-client:1:tenant-a:2",
+    ));
+    let transport = Arc::new(TestTransport::new("delete-finalize-reclaim-segment"));
+    let mut compatibility = CompatibilityDescriptor::default();
+    compatibility
+        .capabilities
+        .remove(mooncake_store_core::ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    let client = StoreClientBuilder::new(metadata, "quota-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .compatibility(compatibility)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    let first = client.put("key", b"1234").expect("put should succeed");
+    let first_offset = first.replicas[0].segment_offset;
+    let error = client
+        .remove("key", true)
+        .expect_err("delete should fail when quota finalization fails");
+    assert!(error.to_string().contains("injected finalize failure"));
+    assert!(!client.is_exist("key").expect("is_exist should succeed"));
+    client
+        .remove("key", true)
+        .expect("forced retry should be idempotent after route deletion");
+
+    let second = client
+        .put("other", b"1234")
+        .expect("legacy allocation should have been reclaimed");
+    assert_eq!(second.replicas[0].segment_offset, first_offset);
+}
+
+#[test]
 fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("runtime-policy-client-segment"));
@@ -20303,6 +20375,7 @@ mod namespace_adversarial;
 mod namespace_isolation_tests;
 mod perf_invariant_tests;
 mod quota_prop;
+mod review_gc_starvation;
 mod route_migration_tests;
 mod routing_prop;
 mod routing_tests;

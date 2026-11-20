@@ -442,6 +442,8 @@ The soft-pin lifetime starts when the first replica becomes readable. When its d
 
 Soft pin is runtime-only eviction-priority state. It is not persisted in snapshots or the HA OpLog, so recovery and Standby promotion downgrade restored objects to ordinary cache. Existing snapshot fields are retained only for format compatibility and ignored during recovery.
 
+An explicitly started drain job can move a soft-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its soft pin and TTL throughout the move.
+
 There are three startup parameters in `master_service` related to the soft pin mechanism:
 
 - `default_kv_soft_pin_ttl`: The fixed soft-pin lifetime (in milliseconds) used when an `ENABLE` request omits `soft_pin_ttl_ms`. The default value is `30 minutes`; reads do not extend it.
@@ -478,6 +480,8 @@ Both the client and master must support `BatchUpdateSoftPin`.
 For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
 
 Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
+
+An explicitly started drain job can move a hard-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its hard pin throughout the move.
 
 Key differences from soft pin:
 

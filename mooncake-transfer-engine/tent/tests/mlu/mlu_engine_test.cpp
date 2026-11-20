@@ -32,6 +32,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/proxy_manager.h"
 #include "tent/transport/rdma/rdma_transport.h"
+#include "peer_access_test.h"
 
 namespace mooncake {
 namespace tent {
@@ -91,9 +92,19 @@ class MluFaultTransport : public tent::Transport {
             bool source_device =
                 platform.getMemoryType(request.source) == tent::MTYPE_MLU;
             if (local) {
-                device_copy |= source_device ||
-                               platform.getMemoryType(reinterpret_cast<void*>(
-                                   request.target_offset)) == tent::MTYPE_MLU;
+                const bool target_device =
+                    platform.getMemoryType(reinterpret_cast<void*>(
+                        request.target_offset)) == tent::MTYPE_MLU;
+                device_copy |= source_device || target_device;
+                if (source_device || target_device) {
+                    ++device_copy_tasks;
+                    if (source_device && target_device) ++device_pair_tasks;
+                    auto largest = max_copy_length.load();
+                    while (largest < request.length &&
+                           !max_copy_length.compare_exchange_weak(
+                               largest, request.length)) {
+                    }
+                }
             } else {
                 remote = true;
                 if (source_device) {
@@ -162,6 +173,8 @@ class MluFaultTransport : public tent::Transport {
         return delegate_->freeLocalMemory(ptr, size);
     }
     std::atomic<int> memory_allocations{0};
+    std::atomic<int> device_copy_tasks{0}, device_pair_tasks{0};
+    std::atomic<size_t> max_copy_length{0};
     std::atomic<int> copy_failures{0}, network_failures{0};  // -1: persistent
     std::atomic<int> network_passes_before_failure{0};
     std::atomic<int> injected_failures{0}, live_batches{0};
@@ -185,6 +198,14 @@ class TransferEngineImplTestPeer {
     static tent::SelectionResult route(tent::TransferEngineImpl& engine,
                                        const tent::Request& request) {
         return engine.resolveTransport(request, 0);
+    }
+    static tent::SelectionResult routeWithoutHostStage(
+        tent::TransferEngineImpl& engine, const tent::Request& request) {
+        auto topology = engine.topology_;
+        engine.topology_ = std::make_shared<tent::Topology>();
+        auto result = route(engine, request);
+        engine.topology_ = topology;
+        return result;
     }
     static bool hasMluTag(tent::TransferEngineImpl& engine, void* address) {
         auto desc = engine.metadata_->segmentManager().getLocal();
@@ -459,6 +480,117 @@ TEST_P(MluEngineTest, DefaultRegistrationSelectsLocalMluCopy) {
     auto route = TransferEngineImplTestPeer::route(*a_, request);
     EXPECT_EQ(route.transport, MLU);
     EXPECT_TRUE(route.staging_params.empty());
+}
+
+TEST_P(MluEngineTest, LocalDevicePairSelectsDirectMluCopy) {
+    void *source = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &source));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &target));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target);
+    request.length = kLength;
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    EXPECT_EQ(route.transport, MLU);
+    EXPECT_TRUE(route.staging_params.empty());
+}
+
+TEST_P(MluEngineTest, OneWayLocalPairChecksActualCopyDirection) {
+    void *source = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &source));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &target));
+    // Expose target as device 1 only for peer checks; allocations stay real.
+    mlu_test::InaccessiblePeer remote_device(target, kLength);
+    Request request{};
+    request.source = source;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target);
+    request.length = kLength;
+    for (auto allowed : {Request::WRITE, Request::READ}) {
+        mlu_test::OneWayPeer peer(allowed == Request::READ ? 1 : 0,
+                                  allowed == Request::READ ? 0 : 1);
+        for (auto opcode : {Request::WRITE, Request::READ}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "allowed=" << allowed << ", opcode=" << opcode);
+            request.opcode = opcode;
+            const auto route = TransferEngineImplTestPeer::route(*a_, request);
+            EXPECT_EQ(route.transport, MLU);
+            EXPECT_EQ(route.staging_params.empty(), opcode == allowed);
+            EXPECT_EQ(mlu_test::last_peer_src.load(),
+                      opcode == Request::READ ? 1 : 0);
+            EXPECT_EQ(mlu_test::last_peer_dst.load(),
+                      opcode == Request::READ ? 0 : 1);
+            const auto no_stage =
+                TransferEngineImplTestPeer::routeWithoutHostStage(*a_, request);
+            EXPECT_EQ(no_stage.transport, opcode == allowed ? MLU : UNSPEC);
+        }
+    }
+}
+
+TEST_P(MluEngineTest, InaccessibleLocalPairWithoutHostStageFailsSelection) {
+    void *source = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &source));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &target));
+    Request request{};
+    request.source = source;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target);
+    request.length = kLength;
+    request.opcode = Request::WRITE;
+    mlu_test::InaccessiblePeer inaccessible(source, kLength);
+    auto rejected =
+        TransferEngineImplTestPeer::routeWithoutHostStage(*a_, request);
+    EXPECT_EQ(rejected.transport, UNSPEC);
+    EXPECT_TRUE(rejected.staging_params.empty());
+}
+
+TEST_P(MluEngineTest, InaccessibleLocalPairUsesOneChunkPool) {
+    void *local = nullptr, *target = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &target));
+    mlu_test::InaccessiblePeer inaccessible(local, kLength);
+    std::vector<uint8_t> seed(kLength), zero(kLength, 0), readback(kLength);
+    for (size_t i = 0; i < seed.size(); ++i) seed[i] = i % 251;
+    auto& platform = Platform::getLoader();
+
+    for (auto opcode : {Request::WRITE, Request::READ}) {
+        void* src = opcode == Request::WRITE ? local : target;
+        void* dst = opcode == Request::WRITE ? target : local;
+        ASSERT_TRUE(platform.copy(src, seed.data(), kLength).ok());
+        ASSERT_TRUE(platform.copy(dst, zero.data(), kLength).ok());
+        Request request{};
+        request.opcode = opcode;
+        request.source = local;
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target);
+        request.length = kLength;
+        auto route = TransferEngineImplTestPeer::route(*a_, request);
+        ASSERT_EQ(route.transport, MLU);
+        ASSERT_EQ(route.staging_params.size(), 3u);
+        EXPECT_TRUE(route.staging_params[0].empty());
+        EXPECT_FALSE(route.staging_params[1].empty());
+        EXPECT_TRUE(route.staging_params[2].empty());
+        auto batch = a_->allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        batches_.push_back({a_.get(), batch});
+        ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
+        auto status = wait(batch);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+        ASSERT_TRUE(platform.copy(readback.data(), dst, kLength).ok());
+        EXPECT_EQ(readback, seed);
+        EXPECT_EQ(local_copy_->device_pair_tasks.load(), 0);
+        EXPECT_LE(local_copy_->max_copy_length.load(), 1UL << 20);
+        EXPECT_EQ(local_network_->device_copy_tasks.load(), 0);
+        EXPECT_EQ(peer_copy_->device_copy_tasks.load(), 0);
+        ASSERT_TRUE(a_->freeBatch(batch).ok());
+        batches_.pop_back();
+    }
+    EXPECT_EQ(local_copy_->memory_allocations.load(), 1);
+    EXPECT_EQ(peer_copy_->memory_allocations.load(), 0);
+    checkIdleResources();
 }
 
 TEST_P(MluEngineTest, StaleLocalRouteCannotSubmitAfterUnregister) {
