@@ -40,8 +40,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-# Install system dependencies before copying source so edits reuse this layer;
-# submodules are initialized in the source stage after the repository is copied.
+# Install system dependencies independently of the source and submodule.
 COPY dependencies.sh /workspace/dependencies.sh
 RUN bash dependencies.sh -y --skip-submodules
 
@@ -64,10 +63,12 @@ Path("/tmp/build-requirements.txt").write_text(
 )
 Path("/tmp/runtime-requirements.txt").write_text("\n".join(metadata["project"]["dependencies"]))
 PYTHON
+COPY scripts/conductor-wheel-api-requirements.txt scripts/conductor-wheel-e2e-requirements.txt /tmp/
 # Resolve Torch and Mooncake runtime requirements together. Seed the download
 # directory with links so pip can reuse Torch wheels without copying them.
 RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    python${PYTHON_VERSION} -m pip wheel --wheel-dir /opt/python-wheels/build -r /tmp/build-requirements.txt && \
+    python${PYTHON_VERSION} -m pip wheel --wheel-dir /opt/python-wheels/build \
+        -r /tmp/build-requirements.txt -r /tmp/conductor-wheel-e2e-requirements.txt && \
     mkdir -p /opt/python-wheels/runtime && \
     ln -s /tmp/torch-wheels/*.whl /opt/python-wheels/runtime/ && \
     python${PYTHON_VERSION} -m pip download --only-binary=:all: --find-links=/tmp/torch-wheels \
@@ -85,18 +86,43 @@ ARG GH_MIRROR
 COPY mooncake-common/FindYLT.cmake /tmp/FindYLT.cmake
 RUN cmake -DGH_MIRROR="${GH_MIRROR}" -DYLT_ARCHIVE=/opt/yalantinglibs.tar.gz -P /tmp/FindYLT.cmake
 
+# Key the download on the submodule URL and gitlink, independently of the
+# surrounding Git index and history.
+FROM system-deps AS pybind11-pin
+COPY .gitmodules /tmp/.gitmodules
+RUN --mount=type=bind,source=.git,target=/workspace/.git \
+    git config -f /tmp/.gitmodules --get submodule.extern/pybind11.url > /tmp/pybind11-url && \
+    git ls-files --stage -- extern/pybind11 | \
+    awk '$1 == "160000" && $3 == 0 { print $2; found = 1 } END { exit !found }' > /tmp/pybind11-revision
+
+FROM system-deps AS pybind11-deps
+COPY --from=pybind11-pin /tmp/pybind11-url /tmp/pybind11-revision /tmp/
+RUN git init -q /opt/pybind11 && \
+    cd /opt/pybind11 && \
+    git remote add origin "$(cat /tmp/pybind11-url)" && \
+    git fetch --depth=1 origin "$(cat /tmp/pybind11-revision)" && \
+    git checkout --detach FETCH_HEAD && \
+    git submodule update --init --recursive
+
 FROM system-deps AS source
 RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
     python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/torch-wheels /tmp/torch-wheels/torch-*.whl
+ARG TORCH_VERSION
+RUN --network=none --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
+    --mount=type=bind,from=python-wheels,source=/opt/python-wheels,target=/tmp/python-wheels \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/python-wheels/build \
+        -r /tmp/python-wheels/build-requirements.txt && \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/python-wheels/runtime \
+        --find-links=/tmp/torch-wheels -r /tmp/python-wheels/runtime-requirements.txt "torch==${TORCH_VERSION}"
 ENV GOMODCACHE=/opt/go-mod-cache
 COPY --from=go-deps /opt/go-mod-cache /opt/go-mod-cache
 COPY --from=ylt-deps /opt/yalantinglibs.tar.gz /opt/yalantinglibs.tar.gz
+COPY --from=pybind11-deps /opt/pybind11 /opt/pybind11
 COPY . /workspace
-RUN git submodule sync --recursive && git submodule update --init --recursive
+RUN --network=none mkdir -p extern && rm -rf extern/pybind11 && mv /opt/pybind11 extern/pybind11
 
 FROM source AS builder
 
-ARG TORCH_VERSION
 ARG CMAKE_BUILD_TYPE=Release
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0;10.3"
 ARG CLEAN_BUILD_ARTIFACTS=0
@@ -111,11 +137,9 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
 # Configure and build the wheel in one layer, then remove build/ only after
 # auditwheel has resolved libraries from it. The large intermediate tree is
 # not retained in the builder layer when CLEAN_BUILD_ARTIFACTS=1.
-RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
+RUN --network=none --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
     --mount=type=bind,from=python-wheels,source=/opt/python-wheels,target=/tmp/python-wheels \
-    python${PYTHON_VERSION} -m pip install --find-links=/tmp/python-wheels/build -r /tmp/python-wheels/build-requirements.txt && \
-    export PIP_FIND_LINKS="/tmp/python-wheels/runtime /tmp/torch-wheels" && \
-    python${PYTHON_VERSION} -m pip install -r /tmp/python-wheels/runtime-requirements.txt "torch==${TORCH_VERSION}" && \
+    export PIP_FIND_LINKS="/tmp/python-wheels/build /tmp/python-wheels/runtime /tmp/torch-wheels" && \
     mkdir -p build && \
     cd build && \
     cmake -G Ninja .. \

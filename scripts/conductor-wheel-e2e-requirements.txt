@@ -1,0 +1,3 @@
+-r conductor-wheel-api-requirements.txt
+msgpack>=1,<2
+pyzmq>=25,<28

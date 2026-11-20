@@ -93,13 +93,19 @@ def main():
             check=True,
         )
         if args.test_api or server is not None:
-            dependencies = ["pytest>=7,<9", "pytest-timeout>=2,<3"]
+            requirements = (
+                Path(__file__)
+                .resolve()
+                .with_name("conductor-wheel-api-requirements.txt")
+            )
             tests_dir = (
                 Path(__file__).resolve().parents[1] / "mooncake-conductor/tests/python"
             )
             tests = [str(tests_dir / "test_client_validation.py")]
             if server is not None:
-                dependencies += ["msgpack>=1,<2", "pyzmq>=25,<28"]
+                requirements = requirements.with_name(
+                    "conductor-wheel-e2e-requirements.txt"
+                )
                 tests.append(str(tests_dir / "test_client_e2e.py"))
                 env["CONDUCTOR_BINARY"] = str(server)
                 # Only the server subprocess may use build-time library paths.
@@ -109,7 +115,7 @@ def main():
                     os.environ.get("LD_LIBRARY_PATH", ""),
                 )
             subprocess.run(
-                [python, "-I", "-m", "pip", "install", *dependencies],
+                [python, "-I", "-m", "pip", "install", "-r", str(requirements)],
                 env=env,
                 check=True,
             )
