@@ -155,6 +155,8 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 | Environment Variable | Default | Description |
 |---|---|---|
+| `MOONCAKE_OFFLOAD_READ_IO_WORKERS` | `0` (disabled) | Shared reader count across bucket files and their sub batches. `0` retains the caller-driven read path; positive values enable parallel full-object and range reads through `BatchIoScheduler`. |
+| `MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS` | `32` | Maximum read plans (one per object or range) per read sub batch; minimum `4` when readers are enabled. Each sub batch stays within one bucket file. |
 | `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `0` (disabled) | Shared writer count across buckets and their sub batches. `0` retains sequential offload; positive values enable parallel offload through `BatchIoScheduler`. |
 | `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS` | `128` | Logical source Slices per write sub batch; minimum `4` when writers are enabled. Small tails up to one quarter join the preceding group within the same bucket. |
 | `MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS` | `300` | Positive delay in milliseconds before writers recheck pending or in-flight reads. |
@@ -179,9 +181,23 @@ export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS=128
 export MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS=300
 ```
 
-Leave the worker count unset or set it to `0` to retain sequential offload. Positive values enable a shared write worker pool across buckets. Benchmark throughput, tail latency, and CPU usage on the target volume to select a worker count. Parallel offload prepares all bucket plans in memory, publishes their sub batches together, and commits each bucket independently after its data writes and sync complete. Writers defer new sub batches while reads are active; this setting does not change master-side DRAM eviction policy. Reads retain the existing synchronous path. `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
+Leave the worker count unset or set it to `0` to retain sequential offload. Positive values enable a shared write worker pool across buckets. Benchmark throughput, tail latency, and CPU usage on the target volume to select a worker count. Parallel offload prepares all bucket plans in memory, publishes their sub batches together, and commits each bucket independently after its data writes and sync complete. Writers defer new sub batches while reads are active; this setting does not change master-side DRAM eviction policy. Parallel reads are configured independently as described below. `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
 
 Write sub batches are formed within each bucket file. A final group of at most `floor(sub_batch_size / 4)` Slices joins the previous group: with the default `128`, `160` Slices form one group, while `161` form groups of `128` and `33`. Different bucket files' tails are never merged. Invalid write controls fail backend initialization.
+
+### Optional parallel Bucket offload reads
+
+Set the read controls in the **Real Client** environment before starting the embedded Real Client:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_READ_IO_WORKERS=8
+export MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS=32
+```
+
+Leave the reader count unset or set it to `0` to retain the caller-driven read path. Positive values enable a shared read worker pool. All read sub batches in a request are published together, allowing full-object and range reads from multiple bucket files to have I/O in flight together. Bucket guards and destination buffers remain valid until the request finishes. With io_uring enabled, read workers use independent thread-local rings.
+
+Read sub batches never span bucket files, and the configured maximum is a strict per-sub-batch limit; small tails form their own sub batches rather than joining a full preceding group. Invalid read controls fail backend initialization. Foreground reads retain priority over new offload-write admission, independently of the read worker count.
 
 For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
 that grows to fit its largest bucket and is released when the thread exits.
