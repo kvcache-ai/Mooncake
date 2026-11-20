@@ -86,6 +86,7 @@ class AscendDirectTransport : public Transport {
     // client owns all devices) instead of using the single current-device
     // context.
     bool agent_mode_{false};
+    bool single_segment_{false};
     bool roce_mode_{false};
     // Whether this TE uses Ascend fabric memory (host mem for Store, e.g. RoCE
     // D2H/H2D). Captured once at install time from globalConfig() and gated on

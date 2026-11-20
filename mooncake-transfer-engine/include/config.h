@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -66,6 +67,20 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // Receive queue depth of the RDMA transport's data RC QPs.  The transport
+    // only posts one-sided READ/WRITE on these QPs and never posts a receive,
+    // so the receive queue is never used.  0 keeps the historical behavior
+    // (max_recv_wr == max_wr); a positive value (1-65535, clamped to the
+    // device's max_qp_wr) shrinks it.  Override via MC_MAX_RECV_WR.
+    size_t max_recv_wr = 0;
+    // Outstanding RDMA READ/atomic depth of the RDMA transport's data RC QPs.
+    // max_rd_atomic is the initiator depth (set at RTS); max_dest_rd_atomic
+    // is the responder depth (set at RTR).  0 keeps the device-derived default
+    // (the device's max_qp_init_rd_atom / max_qp_rd_atom, capped at 16); a
+    // positive value (1-255) requests that depth, clamped to the device's
+    // limit.  Override via MC_MAX_RD_ATOMIC / MC_MAX_DEST_RD_ATOMIC.
+    int max_rd_atomic = 0;
+    int max_dest_rd_atomic = 0;
     // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
     // a signaled completion every N WRs plus the end of each ibv_post_send
     // chain. Override via MC_RDMA_SIGNAL_INTERVAL.
@@ -148,6 +163,7 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    bool rdma_write_prefer_dest_nic = false;
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
@@ -232,6 +248,8 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    // Share each standalone Store allocation across all local NPU engines.
+    bool ascend_standalone_single_segment = false;
     bool sunrise_use_device_mem = false;
     // Transient flag scoped to a single TE init: set true by the Store entry
     // (Client::InitTransferEngine) before installing the ascend transport, and
@@ -273,6 +291,17 @@ uint16_t getDefaultHandshakePort();
 // Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
 std::pair<int, int> ValidatePortRange(int min_port, int max_port,
                                       int default_min, int default_max);
+
+// Returns the primary environment variable when set and non-empty, otherwise
+// falls back to the legacy environment variable name.
+inline const char* getEnvWithFallback(const char* primary,
+                                      const char* fallback) {
+    const char* value = primary != nullptr ? std::getenv(primary) : nullptr;
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return fallback != nullptr ? std::getenv(fallback) : nullptr;
+}
 
 }  // namespace mooncake
 

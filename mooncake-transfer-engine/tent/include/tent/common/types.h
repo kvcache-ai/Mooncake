@@ -177,6 +177,15 @@ struct Request {
     // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
+    // Optional producer-completion event (a cudaEvent_t on CUDA platforms).
+    // When set, the copy is ordered after the work captured by the event's
+    // most recent record, on the device and without blocking the caller, so
+    // the source may be produced on any application stream. The event must
+    // stay valid and must not be re-recorded until the request completes.
+    // Only transports reporting supportsProducerEvent() honor it; a request
+    // whose route cannot honor it (including staged routes) is rejected
+    // rather than submitted without the dependency.
+    void* producer_event = nullptr;
 };
 
 enum TransferStatusEnum {

@@ -18,8 +18,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <utility>
 #include <exception>
 #include <limits>
@@ -75,6 +77,24 @@ int32_t ParseEnvInt(const char* name, int32_t fallback) {
     }
 }
 
+int32_t ParseEnvIntWithFallback(const char* primary, const char* fallback,
+                                int32_t default_val) {
+    const char* raw = std::getenv(primary);
+    if (raw != nullptr && raw[0] != '\0') {
+        return ParseEnvInt(primary, default_val);
+    }
+    return fallback != nullptr ? ParseEnvInt(fallback, default_val)
+                               : default_val;
+}
+
+bool ParseEnvBoolFlagWithFallback(const char* primary, const char* fallback) {
+    const char* raw = GetAscendEnv(primary, fallback);
+    if (raw == nullptr || raw[0] == '\0') {
+        return false;
+    }
+    return ConfigHelper::parseBool(raw, false);
+}
+
 bool ValidBasePort(int32_t base_port) {
     return base_port >= kMinListenPort &&
            base_port <= kMaxListenPort - kPortRange;
@@ -82,6 +102,11 @@ bool ValidBasePort(int32_t base_port) {
 
 std::string EnvOrEmpty(const char* name) {
     const char* raw = std::getenv(name);
+    return raw ? std::string(raw) : std::string();
+}
+
+std::string EnvOrEmptyWithFallback(const char* primary, const char* fallback) {
+    const char* raw = GetAscendEnv(primary, fallback);
     return raw ? std::string(raw) : std::string();
 }
 
@@ -181,8 +206,20 @@ bool NicTopoPathIsSet(const json& root) {
 
 }  // namespace
 
+const char* GetAscendEnv(const char* primary, const char* fallback) {
+    const char* raw = primary != nullptr ? std::getenv(primary) : nullptr;
+    if (raw != nullptr && raw[0] != '\0') {
+        return raw;
+    }
+    return fallback != nullptr ? std::getenv(fallback) : nullptr;
+}
+
 bool ParseEnvEnabled(const char* name) {
     return EnvFlagIsOne(std::getenv(name));
+}
+
+bool ParseEnvEnabled(const char* primary, const char* fallback) {
+    return EnvFlagIsOne(GetAscendEnv(primary, fallback));
 }
 
 std::string InjectNicTopoPathFromCustomTopoTent(
@@ -243,24 +280,50 @@ AscendDirectOptions LoadAscendDirectOptions(
         options.transfer_timeout_ms = static_cast<int32_t>(
             conf->get("transports/ascend_direct/transfer_timeout_ms",
                       static_cast<long long>(kAscendDefaultTransferTimeoutMs)));
+    } else {
+        options.transfer_timeout_ms = ParseEnvIntWithFallback(
+            "MC_ASCEND_TRANSFER_TIMEOUT", "ASCEND_TRANSFER_TIMEOUT",
+            options.transfer_timeout_ms);
     }
-    options.transfer_timeout_ms =
-        ParseEnvInt("ASCEND_TRANSFER_TIMEOUT", options.transfer_timeout_ms);
     if (options.transfer_timeout_ms <= 0) {
         options.transfer_timeout_ms = kAscendDefaultTransferTimeoutMs;
     }
 
-    options.base_port = ParseEnvInt("ASCEND_BASE_PORT", kAscendDefaultBasePort);
     if (conf && conf->contains("transports/ascend_direct/base_port")) {
         options.base_port = static_cast<int32_t>(
             conf->get("transports/ascend_direct/base_port",
-                      static_cast<long long>(options.base_port)));
+                      static_cast<long long>(kAscendDefaultBasePort)));
+    } else {
+        options.base_port = ParseEnvIntWithFallback(
+            "MC_ASCEND_BASE_PORT", "ASCEND_BASE_PORT", kAscendDefaultBasePort);
     }
     if (!ValidBasePort(options.base_port)) {
-        LOG(WARNING) << "Invalid ASCEND_BASE_PORT/base_port="
-                     << options.base_port << ", using "
-                     << kAscendDefaultBasePort;
+        LOG(WARNING)
+            << "Invalid MC_ASCEND_BASE_PORT/ASCEND_BASE_PORT/base_port="
+            << options.base_port << ", using " << kAscendDefaultBasePort;
         options.base_port = kAscendDefaultBasePort;
+    }
+
+    int32_t thread_pool_size =
+        static_cast<int32_t>(kAscendDefaultThreadPoolSize);
+    if (conf && conf->contains("transports/ascend_direct/thread_pool_size")) {
+        thread_pool_size = static_cast<int32_t>(
+            conf->get("transports/ascend_direct/thread_pool_size",
+                      static_cast<long long>(kAscendDefaultThreadPoolSize)));
+    } else {
+        thread_pool_size = ParseEnvIntWithFallback("MC_ASCEND_THREAD_POOL_SIZE",
+                                                   "ASCEND_THREAD_POOL_SIZE",
+                                                   thread_pool_size);
+    }
+    if (thread_pool_size < 1 ||
+        static_cast<size_t>(thread_pool_size) > kAscendMaxThreadPoolSize) {
+        LOG(WARNING) << "Invalid MC_ASCEND_THREAD_POOL_SIZE/"
+                        "ASCEND_THREAD_POOL_SIZE/thread_pool_size="
+                     << thread_pool_size << ", using "
+                     << kAscendDefaultThreadPoolSize;
+        options.thread_pool_size = kAscendDefaultThreadPoolSize;
+    } else {
+        options.thread_pool_size = static_cast<size_t>(thread_pool_size);
     }
 
     if (conf) {
@@ -268,22 +331,30 @@ AscendDirectOptions LoadAscendDirectOptions(
         options.rdma_sl = conf->get("transports/ascend_direct/rdma_sl", "");
     }
     if (options.rdma_tc.empty()) {
-        options.rdma_tc = EnvOrEmpty("ASCEND_RDMA_TC");
+        options.rdma_tc =
+            EnvOrEmptyWithFallback("MC_ASCEND_RDMA_TC", "ASCEND_RDMA_TC");
     }
     if (options.rdma_tc.empty()) {
         options.rdma_tc = EnvOrEmpty("HCCL_RDMA_TC");
     }
     if (options.rdma_sl.empty()) {
-        options.rdma_sl = EnvOrEmpty("ASCEND_RDMA_SL");
+        options.rdma_sl =
+            EnvOrEmptyWithFallback("MC_ASCEND_RDMA_SL", "ASCEND_RDMA_SL");
     }
     if (options.rdma_sl.empty()) {
         options.rdma_sl = EnvOrEmpty("HCCL_RDMA_SL");
     }
 
-    const char* local_comm = std::getenv("ASCEND_LOCAL_COMM_RES");
-    options.local_comm_res = (local_comm && local_comm[0] != '\0')
-                                 ? local_comm
-                                 : kDefaultLocalCommRes;
+    std::string local_comm;
+    if (conf && conf->contains("transports/ascend_direct/local_comm_res")) {
+        local_comm = conf->get("transports/ascend_direct/local_comm_res", "");
+    }
+    if (local_comm.empty()) {
+        local_comm = EnvOrEmptyWithFallback("MC_ASCEND_LOCAL_COMM_RES",
+                                            "ASCEND_LOCAL_COMM_RES");
+    }
+    options.local_comm_res =
+        local_comm.empty() ? kDefaultLocalCommRes : local_comm;
 
     std::string raw_resource;
     if (conf &&
@@ -292,7 +363,9 @@ AscendDirectOptions LoadAscendDirectOptions(
             conf->get("transports/ascend_direct/global_resource_config", "");
     }
     if (raw_resource.empty()) {
-        raw_resource = EnvOrEmpty("ASCEND_GLOBAL_RESOURCE_CONFIG");
+        raw_resource =
+            EnvOrEmptyWithFallback("MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+                                   "ASCEND_GLOBAL_RESOURCE_CONFIG");
     }
     options.global_resource_config =
         ResolveGlobalResourceConfig(raw_resource, options.store_te_init);
@@ -302,12 +375,32 @@ AscendDirectOptions LoadAscendDirectOptions(
     json resolved = ParseResourceJson(options.global_resource_config);
     // Store isolation: the TENT shim copies fabric_mem onto Config only when
     // this engine is a Store TE. P2P TENT in the same process does not inherit
-    // ASCEND_ENABLE_USE_FABRIC_MEM unless store_te_init is set on this Config.
+    // (MC_)ASCEND_ENABLE_USE_FABRIC_MEM unless store_te_init is set on this
+    // Config.
     options.use_fabric_mem =
         conf_fabric ||
         (options.store_te_init &&
-         ParseEnvEnabled("ASCEND_ENABLE_USE_FABRIC_MEM")) ||
+         ParseEnvBoolFlagWithFallback("MC_ASCEND_ENABLE_USE_FABRIC_MEM",
+                                      "ASCEND_ENABLE_USE_FABRIC_MEM")) ||
         HasFabricMemory(resolved);
+
+    if (conf && conf->contains("transports/ascend_direct/use_shmem")) {
+        options.use_shmem =
+            conf->get("transports/ascend_direct/use_shmem", false);
+    } else {
+        options.use_shmem = ParseEnvBoolFlagWithFallback("MC_ASCEND_USE_SHMEM",
+                                                         "ASCEND_USE_SHMEM");
+    }
+
+    if (conf &&
+        conf->contains("transports/ascend_direct/standalone_single_segment")) {
+        options.standalone_single_segment = conf->get(
+            "transports/ascend_direct/standalone_single_segment", false);
+    } else {
+        options.standalone_single_segment =
+            ParseEnvBoolFlagWithFallback("MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
+                                         "ASCEND_STANDALONE_SINGLE_SEGMENT");
+    }
 
     options.roce_mode = ParseEnvEnabled("HCCL_INTRA_ROCE_ENABLE") ||
                         HasRoceProtocolDesc(resolved);
@@ -507,6 +600,42 @@ HixlNameResolver::HixlNameResolver(const MemorySegmentDesc& detail) {
         }
         ranges_.push_back(BufferRange{buf.addr, buf.length, name_idx});
     }
+}
+
+namespace {
+bool RangeCovers(uint64_t begin, uint64_t length, uint64_t offset,
+                 size_t request_length) {
+    if (request_length == 0) {
+        return offset >= begin && offset - begin < length;
+    }
+    return offset >= begin && request_length <= length &&
+           offset - begin <= length - request_length;
+}
+}  // namespace
+
+std::vector<size_t> HixlNameResolver::CoveringNameIndices(uint64_t dest_addr,
+                                                          size_t length) const {
+    if (names_.empty()) {
+        return {};
+    }
+    if (names_.size() == 1) {
+        return {0};
+    }
+    std::set<size_t> found;
+    for (const auto& range : ranges_) {
+        if (RangeCovers(range.begin, range.length, dest_addr, length) &&
+            range.name_idx < names_.size()) {
+            found.insert(range.name_idx);
+        }
+    }
+    return {found.begin(), found.end()};
+}
+
+const std::string& HixlNameResolver::NameAt(size_t index) const {
+    if (index >= names_.size()) {
+        return empty_;
+    }
+    return names_[index];
 }
 
 const std::string& HixlNameResolver::Resolve(uint64_t dest_addr) const {

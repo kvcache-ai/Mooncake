@@ -148,6 +148,14 @@ struct ColdTierDeviceManager {
 struct ColdTierOffloadManager {
     queue: Mutex<PendingOffloadQueue>,
     materializing: AtomicBool,
+    settling_backings: Mutex<BTreeMap<ColdBackingIdentity, usize>>,
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct ColdBackingIdentity {
+    owner: ClientRuntimeId,
+    cold_tier_id: String,
+    object_locator: String,
 }
 
 #[derive(Default)]
