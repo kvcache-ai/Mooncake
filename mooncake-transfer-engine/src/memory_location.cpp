@@ -22,6 +22,9 @@
 #include <fstream>
 
 #include "cuda_alike.h"
+#ifdef USE_HIP
+#include "transport/hip_gem_lookup.h"
+#endif
 
 namespace mooncake {
 
@@ -170,8 +173,12 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
         }
 
         if (attributes.type == cudaMemoryTypeDevice) {
-            entries.push_back(
-                {(uint64_t)start, len, genGpuNodeName(attributes.device)});
+            int device = attributes.device;
+#ifdef USE_HIP
+            // The location picks the NICs on both ends of a transfer.
+            device = hipDeviceOfPointer(start, device);
+#endif
+            entries.push_back({(uint64_t)start, len, genGpuNodeName(device)});
             return entries;
         }
     }

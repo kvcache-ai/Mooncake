@@ -161,6 +161,14 @@ if(USE_UBSHMEM)
     COMPONENT python)
 endif()
 
+if(USE_HIP)
+  install(
+    FILES
+      "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/hip-gem-allocator/hip_gem_allocator.so"
+    DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+    COMPONENT python)
+endif()
+
 if(WITH_STORE)
   if(USE_CUDA)
     add_subdirectory(../mooncake-store/src/engram
