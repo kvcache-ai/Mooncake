@@ -8,6 +8,7 @@
 #include <thread>
 #include <stop_token>
 
+#include <gflags/gflags.h>
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <cstring>
@@ -116,11 +117,7 @@ bool IsHostStoreSegmentProtocol(const std::string &protocol) {
 #ifdef USE_ASCEND_DIRECT
 // Split standalone store capacity across NPUs: cap each mount at total/n.
 size_t AgentModeStoreChunkCap(size_t total_size) {
-    const uint32_t n = ContextManager::getInstance().getDeviceCount();
-    if (n <= 1 || total_size == 0) {
-        return 0;
-    }
-    return total_size / n;
+    return ascend_agent_mode_store_chunk_cap(total_size);
 }
 
 bool RestoreAgentModeDeviceZero() {
