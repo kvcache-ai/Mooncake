@@ -657,4 +657,14 @@ if(USE_NOF AND USE_NOF_LINUX)
   add_store_test(nof_linux_initiator_test nof_linux_initiator_test.cpp)
   target_include_directories(nof_linux_initiator_test PRIVATE ../src)
   target_link_libraries(nof_linux_initiator_test PUBLIC mooncake_nof_linux)
+
+  add_executable(nof_linux_io_queue_test nof_linux_io_queue_test.cpp)
+  target_include_directories(nof_linux_io_queue_test PRIVATE ../src)
+  target_link_libraries(
+    nof_linux_io_queue_test PRIVATE mooncake_nof_linux Mooncake::liburing
+                                    gtest_main)
+  target_link_options(nof_linux_io_queue_test PRIVATE
+                      "-Wl,--wrap=io_uring_submit")
+  add_test(NAME nof_linux_io_queue_test COMMAND nof_linux_io_queue_test)
+  set_tests_properties(nof_linux_io_queue_test PROPERTIES TIMEOUT 30)
 endif()

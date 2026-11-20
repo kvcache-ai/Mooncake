@@ -530,8 +530,9 @@ if(USE_NOF AND USE_NOF_SPDK)
 endif()
 
 if(USE_NOF AND USE_NOF_LINUX)
-  add_library(mooncake_nof_linux STATIC nof/linux_initiator.cpp
-                                        nof/linux_device.cpp)
+  add_library(
+    mooncake_nof_linux STATIC nof/linux_initiator.cpp nof/linux_device.cpp
+                              nof/linux_io_queue.cpp)
   target_include_directories(
     mooncake_nof_linux
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include

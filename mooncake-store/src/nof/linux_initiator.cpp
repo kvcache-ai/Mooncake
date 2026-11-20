@@ -1,7 +1,6 @@
 #include "nof/linux_initiator.h"
 
 #include <fcntl.h>
-#include <liburing.h>
 #include <linux/fs.h>
 #include <linux/nvme_ioctl.h>
 #include <sys/ioctl.h>
@@ -20,10 +19,10 @@
 #include <map>
 #include <mutex>
 #include <thread>
-#include <vector>
 
 #include "environment_value_parser.h"
 #include "linux_device.h"
+#include "linux_io_queue.h"
 
 namespace mooncake {
 namespace {
@@ -45,101 +44,6 @@ unsigned GetLinuxNofQueueDepth() {
     }();
     return depth;
 }
-
-class IoQueue {
-   public:
-    int Init(unsigned depth) {
-        requests_.resize(depth);
-        free_.reserve(depth);
-        for (auto& request : requests_) free_.push_back(&request);
-        const int ret = io_uring_queue_init(depth, &ring_, 0);
-        if (ret < 0) return ret;
-        initialized_ = true;
-        return 0;
-    }
-
-    ~IoQueue() {
-        if (!initialized_) return;
-        // Closing a ring is not a buffer-lifetime barrier. Drain original
-        // CQEs before freeing any request or probe memory. Operators must use
-        // finite kernel controller-loss/I/O timeouts for bounded shutdown.
-        while (pending_ != 0) {
-            Poll(0);
-            if (pending_ != 0) {
-                io_uring_cqe* cqe = nullptr;
-                __kernel_timespec timeout{0, 1000000};
-                const int ret =
-                    io_uring_wait_cqe_timeout(&ring_, &cqe, &timeout);
-                if (ret < 0 && ret != -EINTR && ret != -ETIME)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-        io_uring_queue_exit(&ring_);
-    }
-
-    int Submit(int fd, void* buffer, uint64_t offset, uint32_t length,
-               NofIOOp op, const NofIOAdaptor& adaptor) {
-        if (free_.empty()) return -EAGAIN;
-        auto* sqe = io_uring_get_sqe(&ring_);
-        if (!sqe) return -EAGAIN;
-        auto* request = free_.back();
-        free_.pop_back();
-        request->adaptor = adaptor;
-        request->length = length;
-        if (op == NofIOOp::kRead)
-            io_uring_prep_read(sqe, fd, buffer, length, offset);
-        else
-            io_uring_prep_write(sqe, fd, buffer, length, offset);
-        io_uring_sqe_set_data(sqe, request);
-        ++pending_;
-        return 0;
-    }
-
-    int64_t Poll(uint32_t maximum) {
-        int submit_error = 0;
-        if (io_uring_sq_ready(&ring_)) {
-            const int ret = io_uring_submit(&ring_);
-            if (ret < 0 && ret != -EINTR && ret != -EAGAIN && ret != -EBUSY)
-                submit_error = ret;
-        }
-        int64_t completed = 0;
-        io_uring_cqe* cqe = nullptr;
-        while ((maximum == 0 || completed < maximum) &&
-               io_uring_peek_cqe(&ring_, &cqe) == 0) {
-            auto* request = static_cast<Request*>(io_uring_cqe_get_data(cqe));
-            const int result = cqe->res;
-            io_uring_cqe_seen(&ring_, cqe);
-            --pending_;
-            const auto adaptor = request->adaptor;
-            NofIOCompletion completion;
-            completion.success =
-                result >= 0 && static_cast<uint32_t>(result) == request->length;
-            if (!completion.success) {
-                completion.error_string =
-                    result < 0
-                        ? std::string("Linux NoF I/O: ") +
-                              std::strerror(-result)
-                        : "Linux NoF short I/O: " + std::to_string(result) +
-                              "/" + std::to_string(request->length);
-            }
-            free_.push_back(request);
-            ++completed;
-            adaptor.cb(adaptor.ctx, completion);
-        }
-        return completed != 0 ? completed : submit_error;
-    }
-
-   private:
-    struct Request {
-        NofIOAdaptor adaptor{};
-        uint32_t length = 0;
-    };
-    io_uring ring_{};
-    std::vector<Request> requests_;
-    std::vector<Request*> free_;
-    size_t pending_ = 0;
-    bool initialized_ = false;
-};
 
 class LinuxSegment final : public NofSegmentHandle {
    public:
