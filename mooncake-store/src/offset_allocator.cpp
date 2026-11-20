@@ -567,6 +567,14 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
 }
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
+    return allocate(size, nullptr);
+}
+
+std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(
+    size_t size, AllocationFailureReason* failure_reason) {
+    if (failure_reason != nullptr) {
+        *failure_reason = AllocationFailureReason::kOther;
+    }
     if (size == 0) {
         return std::nullopt;
     }
@@ -575,7 +583,8 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     // highest free-bin boundary rounds up to a higher bin and cannot fit. The
     // cached value is only a fast-fail hint: a stale larger value merely falls
     // through to the mutex-protected allocator.
-    if (size > getLargestFreeRegion()) {
+    const bool rejected_by_hint = size > getLargestFreeRegion();
+    if (rejected_by_hint && failure_reason == nullptr) {
         return std::nullopt;
     }
 
@@ -594,8 +603,24 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
+    if (rejected_by_hint) {
+        // The cached region also becomes zero when allocator nodes run out.
+        if (m_allocator->m_freeOffset == m_allocator->m_max_capacity) {
+            *failure_reason = AllocationFailureReason::kNodeExhausted;
+        } else if (fake_size > m_allocator->storageReport().largestFreeRegion) {
+            *failure_reason = AllocationFailureReason::kNoFittingRegion;
+        }
+        return std::nullopt;
+    }
+
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
     if (allocation.isNoSpace()) {
+        if (failure_reason != nullptr) {
+            *failure_reason =
+                m_allocator->m_freeOffset == m_allocator->m_max_capacity
+                    ? AllocationFailureReason::kNodeExhausted
+                    : AllocationFailureReason::kNoFittingRegion;
+        }
         // A request can pass the conservative hint but still fail because
         // the allocator state changed concurrently. Tighten the hint after
         // observing the authoritative state under the mutex.

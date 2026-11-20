@@ -66,6 +66,22 @@ TEST_F(SsdMetricsTest, SerializeTest) {
     std::cout << "Serialized SSD Metrics:\n" << serialized << std::endl;
 }
 
+TEST_F(SsdMetricsTest, SerializesOffloadAllocationFailures) {
+    const std::map<std::string, std::string> labels = {{"cluster_id", "test"}};
+    SsdMetric metrics(labels);
+    metrics.ssd_offload_node_exhausted.inc(2);
+    metrics.ssd_offload_no_fitting_region.inc(3);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(serialized.find("mooncake_ssd_offload_node_exhausted_total"
+                              "{cluster_id=\"test\"} 2\n"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_ssd_offload_no_fitting_region_total"
+                              "{cluster_id=\"test\"} 3\n"),
+              std::string::npos);
+}
+
 TEST_F(SsdMetricsTest, SummaryMetricsTest) {
     SsdMetric metrics;
 

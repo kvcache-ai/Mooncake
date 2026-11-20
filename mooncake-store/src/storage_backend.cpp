@@ -31,6 +31,7 @@
 #include "nvme_kv/backend.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
+#include "client_metric.h"
 #include "crc32c.h"
 #include "environ.h"
 #include "environment_variables.h"
@@ -4443,10 +4444,12 @@ BucketStorageBackend::GetFileInstance() const {
 
 OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
     const FileStorageConfig& file_storage_config_,
-    const OffsetAllocatorBackendConfig& offset_backend_config)
+    const OffsetAllocatorBackendConfig& offset_backend_config,
+    SsdMetric* ssd_metric)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      cfg_(offset_backend_config) {
+      cfg_(offset_backend_config),
+      ssd_metric_(ssd_metric) {
     capacity_ = file_storage_config_.total_size_limit;
 }
 
@@ -5864,7 +5867,10 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         }
 
         // ---- (C) Allocate ----
-        auto allocation = allocator_->allocate(record_size);
+        using FailureReason =
+            offset_allocator::OffsetAllocator::AllocationFailureReason;
+        FailureReason failure_reason;
+        auto allocation = allocator_->allocate(record_size, &failure_reason);
 
         // ---- (D) Fallback eviction (nullopt retry loop) ----
         if (!allocation.has_value() && eviction_on) {
@@ -5901,19 +5907,29 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 // bounds total eviction per key.
                 if (now_largest <= prev_largest) break;
                 prev_largest = now_largest;
-                allocation = allocator_->allocate(record_size);
+                allocation = allocator_->allocate(record_size, &failure_reason);
             }
         }
 
         if (!allocation.has_value()) {
+            const char* reason = "other";
+            if (failure_reason == FailureReason::kNodeExhausted) {
+                reason = "node_exhausted";
+                if (ssd_metric_) ssd_metric_->ssd_offload_node_exhausted.inc();
+            } else if (failure_reason == FailureReason::kNoFittingRegion) {
+                reason = "no_fitting_region";
+                if (ssd_metric_)
+                    ssd_metric_->ssd_offload_no_fitting_region.inc();
+            }
             if (eviction_on) {
                 eviction_skips_.fetch_add(1, std::memory_order_relaxed);
-                LOG(WARNING) << "Skipping key after eviction attempts: " << key;
+                LOG(WARNING) << "Skipping key after eviction attempts: " << key
+                             << " reason=" << reason;
                 continue;
             } else {
                 LOG(ERROR) << "Failed to allocate " << record_size
                            << " bytes for key: " << key
-                           << " - stopping processing";
+                           << " - stopping processing reason=" << reason;
                 break;
             }
         }
@@ -6667,7 +6683,7 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 //-----------------------------------------------------------------------------
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config) {
+CreateStorageBackend(const FileStorageConfig& config, SsdMetric* ssd_metric) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
@@ -6699,7 +6715,7 @@ CreateStorageBackend(const FileStorageConfig& config) {
                     "Invalid OffsetAllocatorBackendConfig");
             }
             return std::make_shared<OffsetAllocatorStorageBackend>(
-                config, offset_backend_config);
+                config, offset_backend_config, ssd_metric);
         }
         case StorageBackendType::kNvmeKv:
             return std::make_shared<NvmeKvStorageBackend>(config);
