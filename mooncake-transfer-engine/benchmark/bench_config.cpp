@@ -198,6 +198,9 @@ bool validateSweep(std::string* error) {
     if (XferBenchConfig::duration <= 0) {
         return fail(error, "--duration must be positive");
     }
+    if (XferBenchConfig::warmup_ms < 0) {
+        return fail(error, "--warmup_ms must be non-negative");
+    }
     return true;
 }
 
