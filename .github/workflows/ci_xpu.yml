@@ -18,6 +18,8 @@ on:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_digest }}
+      artifact_attempt:
+        value: ${{ jobs.build-wheel-xpu.outputs.artifact_attempt }}
   workflow_dispatch:
 
 permissions:
@@ -36,14 +38,15 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
       artifact_id: ${{ steps.artifact.outputs.artifact-id }}
       artifact_digest: ${{ steps.artifact.outputs.artifact-digest }}
+      artifact_attempt: ${{ steps.source.outputs.attempt }}
     env:
       XPU_BUILD: "1"
       PYTHON_VERSION: "3.12"
       BUILD_DIR: build-xpu-ci
       OUTPUT_DIR: dist-xpu-ci
       DEBIAN_FRONTEND: noninteractive
-      SCCACHE_GHA_ENABLED: "true"
-      # Match the other wheel builders: PRs read shared entries but do not evict them.
+      SCCACHE_GHA_ENABLED: ${{ inputs.checkout_ref == '' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+      ENABLE_SCCACHE: ${{ inputs.checkout_ref == '' && (github.event_name == 'push' || github.event_name == 'schedule') && 'ON' || 'OFF' }}
       SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       # As in ROCm CI, git must exist before checkout to avoid a source tarball.
@@ -64,6 +67,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Install toolchain and dependencies
         run: |
@@ -84,6 +88,7 @@ jobs:
           "$RUNNER_TEMP/xpu-build-env/bin/python" -m pip install numpy==2.5.4
 
       - name: Set up compiler cache
+        if: inputs.checkout_ref == '' && (github.event_name == 'push' || github.event_name == 'schedule')
         uses: ./.github/actions/setup-sccache
 
       - name: Configure and build project
@@ -103,7 +108,7 @@ jobs:
           cmake -G Ninja -S . -B "$BUILD_DIR" \
             -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
             -DPython3_EXECUTABLE="$(command -v python)" \
-            -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE=ON \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE="$ENABLE_SCCACHE" \
             -DUSE_XPU=ON -DUSE_TENT=ON -DUSE_CUDA=OFF -DUSE_XPU_GDS=OFF \
             -DWITH_EP=ON -DMOONCAKE_EP_XPU_AOT_DEVICES=bmg \
             -DWITH_STORE=ON -DWITH_STORE_RUST=OFF -DWITH_STORE_RS=OFF \
@@ -134,18 +139,10 @@ jobs:
             --gtest_output=xml:xpu-ci-output/reports/ep.xml
           "$BUILD_DIR/mooncake-store/tests/crc32c_test" \
             --gtest_output=xml:xpu-ci-output/reports/crc32c.xml
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
-          for name in ("config", "ep", "crc32c"):
-              cases = ET.parse(f"xpu-ci-output/reports/{name}.xml").findall(".//testcase")
-              if not cases:
-                  raise RuntimeError(f"{name}: no tests executed")
-              for case in cases:
-                  if (case.get("status"), case.get("result")) != ("run", "completed") or any(
-                      case.find(tag) is not None for tag in ("failure", "error", "skipped")
-                  ):
-                      raise RuntimeError(f"{name}: test did not pass: {case.attrib}")
-          PY
+          python scripts/e2e/python/verify_xpu_ci.py reports \
+            xpu-ci-output/reports/config.xml \
+            xpu-ci-output/reports/ep.xml \
+            xpu-ci-output/reports/crc32c.xml
 
       - name: Apply wheel version override
         if: inputs.version_override != ''
@@ -176,7 +173,17 @@ jobs:
           "$smoke_venv/bin/python" -m pip install xpu-ci-output/*.whl
           # Do not expose build libraries or the source package to the check.
           cd "$RUNNER_TEMP"
-          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_wheel.py"
+          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_ci.py"
+
+      - name: Package Python dependencies for hardware
+        run: |
+          set -euo pipefail
+          out=xpu-ci-output/python-deps
+          mkdir -p "$out"
+          for wheel in xpu-ci-output/*.whl; do
+            python -m pip download --only-binary=:all: --dest "$out" "$wheel"
+            rm "$out/$(basename "$wheel")"
+          done
 
       - name: Package native tests
         run: |
@@ -186,6 +193,7 @@ jobs:
           export LD_LIBRARY_PATH="$library_dirs:${LD_LIBRARY_PATH:-}"
           out=xpu-ci-output/native-tests
           mkdir -p "$out/lib"
+          cp -R xpu-ci-output/python-deps "$out/"
           cp xpu-ci-output/provenance.txt "$out/"
           for binary in \
             "$BUILD_DIR"/mooncake-transfer-engine/tent/tests/tent_xpu_{platform,transport,engine,ipc_process}_test \
