@@ -328,7 +328,18 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
     static void global_init_once() {
         static std::once_flag once;
-        std::call_once(once, [] { curl_global_init(CURL_GLOBAL_ALL); });
+        std::call_once(once, [] {
+            curl_global_init(CURL_GLOBAL_ALL);
+            // Snapshot MC_METADATA_HTTP_TOKEN while the calling process is
+            // still single-threaded with respect to environ(3). A concurrent
+            // setenv(3)/putenv(3) can realloc __environ on glibc, leaving a
+            // getenv(3) result pointing into freed storage; the garbage bytes
+            // were observed as a malformed `Authorization: Bearer ...` header
+            // in the wild (SGLang's 8 DP ranks racing setenv). Reading once
+            // here, before the first HTTP request, removes the race.
+            const char *env = std::getenv("MC_METADATA_HTTP_TOKEN");
+            authTokenValue() = env ? std::string(env) : std::string();
+        });
     }
 
     struct ThreadLocalCurl {
@@ -365,13 +376,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     // Optional shared-token authentication for the Python HTTP metadata
     // server (#4444): both sides read MC_METADATA_HTTP_TOKEN, and a server
     // with the token set rejects requests without it.
-    static const std::string &authToken() {
-        static const std::string token = [] {
-            const char *env = std::getenv("MC_METADATA_HTTP_TOKEN");
-            return env ? std::string(env) : std::string();
-        }();
-        return token;
-    }
+    static const std::string &authToken() { return authTokenValue(); }
 
     static curl_slist *appendAuthHeader(curl_slist *headers) {
         if (!authToken().empty()) {
@@ -591,6 +596,14 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
    private:
     const std::string metadata_uri_;
+
+    // The shared token, snapshotted once by global_init_once. A mutable
+    // reference is returned inside the call_once lambda; the public read path
+    // uses authToken() which exposes only a const reference.
+    static std::string &authTokenValue() {
+        static std::string value;
+        return value;
+    }
 };
 
 #endif  // USE_HTTP
