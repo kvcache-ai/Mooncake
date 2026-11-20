@@ -189,6 +189,8 @@ class KvcsLowLevelDriver final : public KvcsDriver {
     }
     uint64_t MaxValueSize() const override { return config_.max_value_size; }
     uint32_t MaxKeySize() const override { return config_.max_key_size; }
+    size_t MaxBatchKeys() const override { return config_.max_keys_per_batch; }
+    size_t ReadConcurrency() const override { return config_.get_workers; }
 
     tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() override {
@@ -269,6 +271,15 @@ class KvcsLowLevelDriver final : public KvcsDriver {
     }
 
     KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
+        return BatchGetUntil(requests, ReadDeadlineNs());
+    }
+
+    int64_t ReadDeadlineNs() const override {
+        return DeadlineNs(config_.operation_timeout_ms);
+    }
+
+    KvcsIoResults BatchGetUntil(std::span<const KvcsIoRequest> requests,
+                                int64_t deadline_ns) override {
         if (!client_)
             return Errors<KvcsIoResults>(requests.size(),
                                          ErrorCode::INTERNAL_ERROR);
@@ -294,10 +305,18 @@ class KvcsLowLevelDriver final : public KvcsDriver {
                 buffers[i] = request.slices.front().ptr;
                 capacities[i] = static_cast<size_t>(request.size);
             }
+            const auto now =
+                std::chrono::steady_clock::now().time_since_epoch();
+            if (std::chrono::duration_cast<std::chrono::nanoseconds>(now)
+                    .count() >= deadline_ns) {
+                SetBatchError(results, valid_indices, begin, count,
+                              ErrorCode::RPC_TIMEOUT);
+                continue;
+            }
             const int call = kvcs_ll_batch_get_into(
                 client_, items.data(), static_cast<int>(count), buffers.data(),
-                capacities.data(), statuses.data(), lengths.data(),
-                DeadlineNs(config_.operation_timeout_ms), &options_);
+                capacities.data(), statuses.data(), lengths.data(), deadline_ns,
+                &options_);
             if (call < 0) {
                 SetBatchError(results, valid_indices, begin, count,
                               CallError(call));

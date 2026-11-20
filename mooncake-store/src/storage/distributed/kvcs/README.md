@@ -75,6 +75,25 @@ deployment variable is absent, the defaults are index `1` and mountpoint ID
 | `MOONCAKE_KVCS_SIMPLE_WORKERS` | 1 |
 | `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` | 30000 ms |
 
+With `MOONCAKE_KVCS_GET_WORKERS` greater than one, an adapter shares that many
+read-dispatch threads across callers. Each SDK call contains at most
+`MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` keys; small batches can also use the configured
+concurrency. The default of one GET worker keeps each caller's serial dispatch
+without adding a global caller lock. Setting zero retains the SDK's disabled
+GET behavior. No separate read-worker setting is introduced.
+
+Completed sub-batches release matching in-flight DFS readers without waiting
+for unrelated sub-batches. Each consumer is validated and scatter destinations
+are filled before completion is published. A request that needs a slow object
+still waits for that object; this is not a completed-value cache. Overlapping
+destination buffers retain ordinary batch I/O. A read batch captures one
+absolute `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` deadline before dispatch; queueing
+and subsequent SDK sub-batches consume the same budget. Reads that expire
+before reaching the SDK return `RPC_TIMEOUT` without accessing their output
+buffers. Already accepted SDK reads are drained before returning, including
+when a completion callback throws, so the deadline does not bypass buffer
+lifetime requirements.
+
 ## Capacity source
 
 Master calls the KVCS SDK 0.6.0+ `kvcs_ll_mp_stat` API and selects the entry

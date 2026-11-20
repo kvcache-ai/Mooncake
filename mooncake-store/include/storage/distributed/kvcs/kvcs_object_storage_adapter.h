@@ -9,6 +9,8 @@
 
 namespace mooncake {
 
+class ThreadPool;
+
 inline constexpr char kKvcsLowLevelAdapterName[] = "kvcs-lowlevel";
 
 // Bridges the distributed object-storage contract to KVCS Low Level.
@@ -29,6 +31,9 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
                                         void* buf, size_t len) override;
     std::vector<tl::expected<size_t, ErrorCode>> GetBatch(
         const std::vector<ObjectGetRequest>& requests) override;
+    std::vector<tl::expected<size_t, ErrorCode>> GetBatchWithCompletion(
+        const std::vector<ObjectGetRequest>& requests,
+        const ReadCompletion& completed) override;
     tl::expected<bool, ErrorCode> Exists(
         const std::string& logical_key) override;
     tl::expected<void, ErrorCode> Delete(
@@ -47,6 +52,7 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
 
     std::string efc_config_path_;
     std::unique_ptr<KvcsDriver> driver_;
+    std::unique_ptr<ThreadPool> read_workers_;
     bool initialized_ = false;
 };
 

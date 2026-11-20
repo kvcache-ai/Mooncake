@@ -139,8 +139,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     struct ReadInvalidation;
     tl::expected<DfsReadRequest, ErrorCode> ValidateReadRequest(
         const DfsReadRequest& request) const;
+    using ReadCompletion =
+        std::function<void(size_t, const tl::expected<void, ErrorCode>&)>;
     std::vector<tl::expected<void, ErrorCode>> BatchReadOnce(
-        const std::vector<DfsReadRequest>& requests);
+        const std::vector<DfsReadRequest>& requests,
+        const ReadCompletion& completed, bool allow_early_completion);
 
     tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
         const DistributedFSDescriptor& descriptor);
