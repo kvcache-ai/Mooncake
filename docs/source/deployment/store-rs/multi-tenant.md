@@ -29,7 +29,7 @@ Current scope model:
 
 Object identity is deterministic across that scope model: the default namespace keeps the legacy route key shape `tenant::logical_key`, while non-default `domain` / `object_set` scopes use a full-scope route key so the same tenant can store the same logical key in different scopes without collision.
 
-Python compatibility clients can now select a default namespace scope at setup time with `tenant`, `domain`, and `object_set`, or through `MC_STORE_RS_TENANT`, `MC_STORE_RS_DOMAIN`, and `MC_STORE_RS_OBJECT_SET` when an integration layer such as SGLang cannot forward those fields directly. The compatibility API applies that default scope to both read and write paths unless the caller supplies an explicit tenant override. Treat `object_set` as an opaque namespace component; URI-like values such as checkpoint paths are percent-encoded in route keys rather than parsed or inferred from object key patterns.
+Python compatibility clients can now select a default namespace scope at setup time with `tenant`, `domain`, and `object_set`, or through `MC_STORE_RS_TENANT`, `MC_STORE_RS_DOMAIN`, and `MC_STORE_RS_OBJECT_SET` when an integration layer such as SGLang cannot forward those fields directly. The compatibility API applies that default scope to both read and write paths. An explicit tenant value must match the runtime's bound tenant; use a separate setup for another tenant. Treat `object_set` as an opaque namespace component; URI-like values such as checkpoint paths are percent-encoded in route keys rather than parsed or inferred from object key patterns.
 
 In Phase 1 strict quota rollout, mutable quota state is still tenant-root metadata. Nested selectors remain useful for object-accounting lookups and for future policy expansion.
 
@@ -42,6 +42,10 @@ Use this split of responsibilities:
 - `tenant` remains the default namespace selector used for startup policy lookup and request builders
 
 For metadata backends that support tenant binding, each Store-RS runtime binds metadata to its default tenant during bootstrap. Runtime control-plane metadata such as client leases, client resource records, object routes, and handoff plans is stored under a tenant-rooted keyspace like `<prefix>/tenants/<tenant>/...`; route-authority discovery uses that tenant-bound metadata namespace too. This is separate from request-path object identity: route keys still carry deterministic tenant/domain/object-set identity, but metadata listing and lookup for runtime state starts from the tenant root instead of scanning a global root and filtering in process.
+
+A `StoreClient` backed by tenant-bound metadata belongs to exactly one tenant. Explicit APIs such as `get_in_tenant`, `put_in_tenant`, and tenant-bearing batch requests may restate that tenant, but they cannot switch the client's control plane. A different tenant requires a separately built `StoreClient`; cross-tenant requests fail before route or storage access. This prevents a request from combining one tenant's object identity with another tenant's leases, routes, quota state, or placement view.
+
+Tenant policy APIs take the policy scope as their single tenant source. When they are called on an unbound administrative backend, the backend derives the tenant keyspace from `TenantPolicyScope`; callers do not need to call `for_tenant` first. When they are called on an already tenant-bound backend, the scope tenant must match the bound tenant or the operation is rejected.
 
 This keeps management explicit while avoiding control-plane policy decisions in the fast path.
 
@@ -154,7 +158,7 @@ let client = StoreClientBuilder::new(metadata, "tenant-a-store-1")
 Important points:
 
 - `tenant(...)` selects the default scope used for startup policy lookup and request builders
-- request-scoped APIs and per-request replication settings are still normal execution-time inputs
+- request-scoped domain, object-set, QoS, and replication settings remain normal execution-time inputs; an explicit request tenant must match the client's bound tenant
 - transport and memory setup remain runtime responsibilities even when route / quota policy is metadata-managed
 
 Python real-mode example:

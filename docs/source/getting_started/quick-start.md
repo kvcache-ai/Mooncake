@@ -169,6 +169,46 @@ pip install mooncake-transfer-engine-rocm
 ```
 :::
 
+:::{tab-item} Intel XPU
+**Prerequisites**
+
+- Python 3.10 or later; XPU-enabled PyTorch for tensor APIs.
+- An Intel GPU with a compatible driver and Level Zero runtime.
+- Intel oneAPI DPC++ compiler (`icpx`) and SYCL runtime. Source
+  `/opt/intel/oneapi/setvars.sh` before building and running Mooncake.
+
+**Installation**
+
+Build from source with XPU support enabled rather than using the default
+CUDA or non-CUDA wheel:
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+source /opt/intel/oneapi/setvars.sh
+python -m pip install . \
+  -Ccmake.define.CMAKE_C_COMPILER=icx \
+  -Ccmake.define.CMAKE_CXX_COMPILER=icpx \
+  -Ccmake.define.USE_TENT=ON \
+  -Ccmake.define.USE_XPU=ON \
+  -Ccmake.define.USE_CUDA=OFF
+
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export MC_USE_TENT=1
+```
+
+XPU requires TENT; the classic Transfer Engine has no XPU support. Use `tcp`
+or `rdma` for Store setup. With `rdma`, XPU memory uses dma-buf RDMA when
+available and is otherwise staged through host memory. XPUs on the same node
+copy directly only when the devices have peer access; across processes, this
+also needs same-node IPC (same PID namespace, and Yama `ptrace_scope` 0 or 1,
+or `CAP_SYS_PTRACE` for scope 2). Otherwise the copy goes through host memory
+or the network path.
+See {ref}`build-with-intel-xpu` and
+{ref}`Intel XPU Transport <intel-xpu-transport>` for details and limitations.
+:::
+
 :::{tab-item} Moore Threads MUSA
 **Prerequisites**
 
@@ -189,20 +229,26 @@ pip install mooncake-transfer-engine-musa
 - An AWS instance with EFA (for example p5 or p6).
 - AWS EFA driver and libfabric. Verify with `fi_info -p efa`, and keep
   `/opt/amazon/efa/lib` on `LD_LIBRARY_PATH`.
-- CUDA 12.1–12.9 or CUDA 13 if you use the GPU-aware EFA wheels.
+- No separate package: the default wheels include the EFA transport since
+  0.3.14. Install the one that matches your CUDA version.
 
 **Installation**
 
 ```bash
-# GPU memory transfers with CUDA 12
-pip install mooncake-transfer-engine-efa
+# CUDA 12
+pip install mooncake-transfer-engine
 
-# GPU memory transfers with CUDA 13
-pip install mooncake-transfer-engine-efa-cuda13
+# CUDA 13
+pip install mooncake-transfer-engine-cuda13
 
-# CPU/DRAM-only transfers
-pip install mooncake-transfer-engine-efa-non-cuda
+# No CUDA (host memory, or Neuron HBM on Trainium)
+pip install mooncake-transfer-engine-non-cuda
 ```
+
+Select the transport with `protocol=efa`: `MOONCAKE_PROTOCOL=efa` in SGLang,
+or `"mooncake_protocol":"efa"` in vLLM's `kv_connector_extra_config`. The
+`mooncake-transfer-engine-efa*` packages are no longer needed and stop at
+0.3.13.post1.
 
 See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md)
 for prerequisites and configuration.
@@ -303,6 +349,29 @@ cmake .. -DUSE_SUPA=ON -DBIREN_HOME=/usr/local/birensupa/all/latest
 make -j
 sudo make install
 ```
+:::
+
+
+:::{tab-item} MemFabric
+**Prerequisites**
+
+- Python 3.10 or later.
+- Ascend CANN Toolkit. Source `/usr/local/Ascend/cann/set_env.sh` before
+  running Mooncake.
+- The `MemFabric` runtime dependency, installed with `pip install memfabric_hybrid`.
+
+**Installation**
+
+```bash
+pip install memfabric_hybrid
+pip install mooncake-transfer-engine-memfabric
+source /usr/local/Ascend/cann/set_env.sh
+```
+
+See [MemFabric guide Transport](../design/transfer-engine/transport/memfabric_transport.md)
+for the recommended MemFabric TENT path. A detailed Chinese walkthrough, including SGLang
+configuration examples, is available in the
+[Mooncake (MemFabric) complete guide](https://memfabric-hybrid.readthedocs.io/zh-cn/latest/wiki/user_guide/integration/Mooncake-MemFabric-Guide/).
 :::
 
 ::::

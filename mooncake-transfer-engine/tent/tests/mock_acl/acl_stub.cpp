@@ -20,6 +20,8 @@ aclError aclrtGetDevice(int32_t* device_id) {
     return kUnsupported;
 }
 
+aclError aclrtSetDevice(int32_t) { return kUnsupported; }
+
 aclError aclrtPointerGetAttributes(const void* ptr,
                                    aclrtPtrAttributes* attributes) {
     if (!ptr || !attributes) return kInvalidArgument;

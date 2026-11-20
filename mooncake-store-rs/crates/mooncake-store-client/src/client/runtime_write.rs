@@ -368,8 +368,8 @@ impl StoreClient {
         &self,
         requests: &[BatchPutItem<'_>],
         policy: Option<&ReplicationPolicy>,
-    ) -> Result<Vec<ObjectRoute>> {
-        self.batch_put_scoped_routed_with_route_conflicts(
+    ) -> Result<Vec<Result<ObjectRoute>>> {
+        self.batch_put_scoped_routed_with_route_conflicts_statuses(
             requests,
             policy,
             BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
@@ -395,17 +395,19 @@ impl StoreClient {
         requests: &[BatchPutItem<'_>],
         policy: Option<&ReplicationPolicy>,
     ) -> Vec<Result<ObjectRoute>> {
-        match self.batch_put_scoped_routed_accept_existing(
-            requests,
-            policy,
-        ) {
-            Ok(routes) if routes.len() == requests.len() => routes.into_iter().map(Ok).collect(),
-            Ok(routes) => {
+        match self.batch_put_scoped_routed_accept_existing(requests, policy) {
+            Ok(statuses) if statuses.len() == requests.len() => statuses,
+            Ok(statuses) => {
                 let error = StoreError::InvalidState(format!(
-                    "batch put status route count mismatch: got={} expected={}",
-                    routes.len(),
+                    "batch put status count mismatch: got={} expected={}",
+                    statuses.len(),
                     requests.len()
                 ));
+                std::iter::repeat_with(|| Err(error.clone()))
+                    .take(requests.len())
+                    .collect()
+            }
+            Err(error @ StoreError::Backpressure(_)) => {
                 std::iter::repeat_with(|| Err(error.clone()))
                     .take(requests.len())
                     .collect()
@@ -438,8 +440,26 @@ impl StoreClient {
         policy: Option<&ReplicationPolicy>,
         conflict_policy: BatchPutRouteConflictPolicy,
     ) -> Result<Vec<ObjectRoute>> {
+        self.batch_put_scoped_routed_with_route_conflicts_statuses(requests, policy, conflict_policy)?
+            .into_iter()
+            .collect()
+    }
+
+    // Outer errors precede route publication and may safely split the batch.
+    // Once publication starts, every request keeps its own terminal result.
+    fn batch_put_scoped_routed_with_route_conflicts_statuses(
+        &self,
+        requests: &[BatchPutItem<'_>],
+        policy: Option<&ReplicationPolicy>,
+        conflict_policy: BatchPutRouteConflictPolicy,
+    ) -> Result<Vec<Result<ObjectRoute>>> {
+        for request in requests {
+            self.ensure_control_plane_tenant(
+                request.tenant.unwrap_or(self.default_tenant()),
+            )?;
+        }
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
         self.validate_unique_requests(requests)?;
         let transport = self.transport()?;
         let planner = self.request_placement_planner();
@@ -470,22 +490,29 @@ impl StoreClient {
             })
             .collect::<Vec<_>>();
         let mut max_write_attempts = 1usize;
-        let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
-            for entry in entries {
-                let _ =
-                    self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
-            }
-        };
         let release_prepared = |entries: &[PreparedObjectWrite<'_>], context: &str| {
             for entry in entries {
-                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                self.release_reservations_or_enqueue(&entry.reservations, context);
                 let _ =
                     self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
         };
+        let retain_prepared_after_unknown_route_publish =
+            |entries: &[PreparedObjectWrite<'_>], context: &str| {
+                for entry in entries {
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
+                        &entry.reservations,
+                        context,
+                    );
+                    let _ = self.abort_tenant_quota_reservation(
+                        entry.quota_reservation.as_ref(),
+                        context,
+                    );
+                }
+            };
         let (routes, prepared) = loop {
             write_attempt = write_attempt.saturating_add(1);
-            self.flush_due_reclaims()?;
+            self.flush_due_reclaims_best_effort();
 
             let rank_tracker = OperationTracker::new("batch_put_stage_rank");
             let rank_result = planner.rank_many(self, &object_refs);
@@ -517,7 +544,7 @@ impl StoreClient {
 
             let release_pending = |entries: &[PendingBatchReservation<'_>], context: &str| {
                 for entry in entries {
-                    let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                    self.release_reservations_or_enqueue(&entry.reservations, context);
                     let _ = self.abort_tenant_quota_reservation(
                         entry.quota_reservation.as_ref(),
                         context,
@@ -686,6 +713,19 @@ impl StoreClient {
                         });
                     }
                 }
+                // C++ Store always has a master-chosen segment. A masterless
+                // client can race peer announcements, so keep the local
+                // segment as a last resort instead of failing the whole put.
+                if self.can_prefer_local_storage_for_write_mode()
+                    && seen.insert(self.lease.runtime.clone())
+                {
+                    candidates.push(ReplicaPlacementCandidate {
+                        target: ReplicaPlacementTarget::StorageRuntime(
+                            self.lease.runtime.clone(),
+                        ),
+                        soft: true,
+                    });
+                }
                 if candidates.is_empty() {
                     return Err(BatchPutReserveStageError::retryable(
                         StoreError::InvalidState(format!(
@@ -727,6 +767,8 @@ impl StoreClient {
                     reservations: Vec::with_capacity(resolved_policy.replica_count),
                 });
             }
+
+            let mut last_backpressure = None;
 
             let mut reservation_order = pending
                 .iter()
@@ -797,6 +839,9 @@ impl StoreClient {
                 }
                 if let Some(key) = exhausted_key {
                     release_pending(&pending, "batch_put_reserve_failed");
+                    if let Some(error) = last_backpressure {
+                        return Err(BatchPutReserveStageError::terminal(error));
+                    }
                     return Err(BatchPutReserveStageError::retryable(
                         StoreError::InvalidState(format!(
                             "not enough writable owners for key {key}"
@@ -821,6 +866,9 @@ impl StoreClient {
                             pending[index].reservations.push(reservation);
                         }
                         Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            if matches!(error, StoreError::Backpressure(_)) {
+                                last_backpressure = Some(error.clone());
+                            }
                             exhausted_candidates += 1;
                             debug!(
                                 key = %pending[index].scoped_key.0,
@@ -848,6 +896,9 @@ impl StoreClient {
                         || entry.next_candidate >= entry.candidates.len()
                 }) {
                     release_pending(&pending, "batch_put_reserve_failed");
+                    if let Some(error) = last_backpressure {
+                        return Err(BatchPutReserveStageError::terminal(error));
+                    }
                     return Err(BatchPutReserveStageError::retryable(
                         StoreError::InvalidState(
                             "batch put exhausted all placement candidates".to_string(),
@@ -1008,11 +1059,40 @@ impl StoreClient {
                                     .map(|memory| memory.has_storage_segment(&target.segment_name))
                                     .unwrap_or(false);
                             let offset = if is_local {
-                                let value = if let Some(value) = entry.value {
+                                // NPU device sources cannot be hashed/copied on
+                                // the CPU; stage them into host memory once.
+                                let staged_source: Option<Vec<u8>> =
+                                    if entry.value.is_none() {
+                                        match entry.registered_source {
+                                            Some(source)
+                                                if mooncake_store_rs_transport::ascend_pointer_is_device(
+                                                    source,
+                                                ) == Some(true) =>
+                                            {
+                                                let mut host = vec![0u8; entry.value_len];
+                                                mooncake_store_rs_transport::ascend_copy_d2h(
+                                                    host.as_mut_ptr().cast::<c_void>(),
+                                                    source.cast::<c_void>(),
+                                                    entry.value_len,
+                                                )
+                                                .map_err(StoreError::Transport)?;
+                                                Some(host)
+                                            }
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let value: &[u8] = if let Some(value) = entry.value {
                                     value
+                                } else if let Some(host) = staged_source.as_deref() {
+                                    host
                                 } else if let Some(source) = entry.registered_source {
                                     unsafe {
-                                        slice::from_raw_parts(source.cast::<u8>(), entry.value_len)
+                                        slice::from_raw_parts(
+                                            source.cast::<u8>(),
+                                            entry.value_len,
+                                        )
                                     }
                                 } else {
                                     return Err(StoreError::InvalidState(format!(
@@ -1077,6 +1157,7 @@ impl StoreClient {
                             replicas.push(ReplicaRoute {
                                 owner: target.storage_runtime.clone(),
                                 segment_name: target.segment_name.clone(),
+                                allocation_id: Some(reservation.allocation_id),
                                 offset: Some(offset),
                                 segment_offset: reservation.offset_bytes,
                                 length: entry.value_len as u64,
@@ -1344,6 +1425,7 @@ impl StoreClient {
                         .iter()
                         .flat_map(|entry| entry.targets.iter().cloned())
                         .collect::<Vec<_>>();
+                    release_prepared(&prepared, "batch_put_remote_write_failed");
                     self.note_remote_write_failure(
                         &failed_targets,
                         &error,
@@ -1407,8 +1489,11 @@ impl StoreClient {
         let mut cas_results = match cas_results_result {
             Ok(results) => results,
             Err(error) => {
-                release_prepared(&prepared, "batch_put_failed_before_publish");
-                return Err(error);
+                retain_prepared_after_unknown_route_publish(
+                    &prepared,
+                    "batch_put_route_compare_and_swap_outcome_unknown",
+                );
+                return Ok(vec![Err(error); requests.len()]);
             }
         };
         let mut floor_retry_requests = Vec::new();
@@ -1417,9 +1502,13 @@ impl StoreClient {
             let pending = &routes[index];
             if let Ok(cas) = result {
                 if !cas.applied && pending.expected_version.is_none() && cas.current.is_none() {
+                    if cas.delete_version.is_none() && cas.version_floor.is_some() {
+                        registry::record_delete_marker_event("legacy_floor_retry", 1);
+                    }
                     let retry_version = cas
-                        .version_floor
-                        .map(|floor| floor.next())
+                        .delete_version
+                        .or(cas.version_floor)
+                        .map(|version| version.next())
                         .unwrap_or_else(|| {
                             let keys = &[routes[index].key.clone()];
                             let current = vec![None; 1];
@@ -1449,10 +1538,7 @@ impl StoreClient {
             retry_tracker.finish(&retry_result, 0);
             let retry_results = match retry_result {
                 Ok(results) => results,
-                Err(error) => {
-                    release_prepared(&prepared, "batch_put_floor_retry_failed");
-                    return Err(error);
-                }
+                Err(error) => vec![Err(error); floor_retry_indices.len()],
             };
             for (index, result) in floor_retry_indices.into_iter().zip(retry_results) {
                 cas_results[index] = result;
@@ -1516,7 +1602,7 @@ impl StoreClient {
                             Ok(cas) if !cas.applied && cas.current.is_none() => {
                                 routes[index].expected_version = None;
                                 fallback_indices.push(index);
-                                fallback_floors.push(cas.version_floor);
+                                fallback_floors.push(cas.delete_version.or(cas.version_floor));
                             }
                             _ => {
                                 cas_results[index] = result;
@@ -1558,24 +1644,23 @@ impl StoreClient {
                                 }
                             }
                             Err(error) => {
-                                release_prepared(
-                                    &prepared,
-                                    "batch_put_stale_overwrite_fallback_failed",
-                                );
-                                return Err(error);
+                                for index in fallback_indices {
+                                    cas_results[index] = Err(error.clone());
+                                }
                             }
                         }
                     }
                 }
                 Err(error) => {
-                    release_prepared(&prepared, "batch_put_stale_overwrite_failed");
-                    return Err(error);
+                    for (index, _) in stale_overwrite_indices {
+                        cas_results[index] = Err(error.clone());
+                    }
                 }
             }
         }
 
         let mut published = Vec::with_capacity(routes.len());
-        let mut first_error = None;
+        let mut statuses = Vec::with_capacity(routes.len());
         for ((index, pending), cas_result) in
             routes.into_iter().enumerate().zip(cas_results)
         {
@@ -1590,32 +1675,27 @@ impl StoreClient {
                         Ok(Some(updated)) => updated,
                         Ok(None) => pending.route,
                         Err(error) => {
-                            first_error.get_or_insert(error);
+                            statuses.push(Err(error));
                             continue;
                         }
                     };
                     self.storage_owner.track_route(&route);
                     if let Some(previous) = pending.previous.as_ref() {
-                        if let Err(error) = self.schedule_route_reclaim(previous) {
-                            warn!(
-                                runtime = %self.lease.runtime,
-                                key = %pending.key.0,
-                                error = %error,
-                                "batch route overwrite reclaim scheduling failed after authoritative publish"
-                            );
-                        }
+                        self.schedule_reclaim_after_logical_remove(previous);
                     }
+                    statuses.push(Ok(route.clone()));
                     published.push(route);
                 }
                 Ok(cas) => {
-                    let _ = self.release_reserved_allocations(
-                        &prepared[index].targets,
+                    self.release_reservations_or_enqueue(
                         &prepared[index].reservations,
+                        "batch_put_route_compare_and_swap_conflict",
                     );
                     let _ = self.abort_tenant_quota_reservation(
                         prepared[index].quota_reservation.as_ref(),
                         "batch_put_route_compare_and_swap_conflict",
                     );
+                    let mut acceptance_error = None;
                     let accepted_current = match conflict_policy {
                         BatchPutRouteConflictPolicy::AcceptExistingActiveRoute => {
                             if let Some(current) = cas.current.filter(|route| {
@@ -1642,7 +1722,7 @@ impl StoreClient {
                                             ) => Some(current),
                                     Ok(_) => None,
                                     Err(error) => {
-                                        first_error.get_or_insert(error);
+                                        acceptance_error.get_or_insert(error);
                                         None
                                     }
                                 }
@@ -1659,39 +1739,34 @@ impl StoreClient {
                                 route_version = current.version.0,
                                 "batch put route conflict accepted existing active route"
                             );
+                            statuses.push(Ok(current.clone()));
                             published.push(current);
                         }
                         None => {
-                            first_error.get_or_insert_with(|| {
+                            statuses.push(Err(acceptance_error.unwrap_or_else(|| {
                                 StoreError::Conflict(format!(
                                     "route update lost race for key {}",
                                     pending.key.0
                                 ))
-                            });
+                            })));
                         }
                     }
                 }
                 Err(error) => {
-                    let _ = self.release_reserved_allocations(
-                        &prepared[index].targets,
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
                         &prepared[index].reservations,
+                        "batch_put_route_compare_and_swap_outcome_unknown",
                     );
                     let _ = self.abort_tenant_quota_reservation(
                         prepared[index].quota_reservation.as_ref(),
-                        "batch_put_route_compare_and_swap_error",
+                        "batch_put_route_compare_and_swap_outcome_unknown",
                     );
-                    first_error.get_or_insert(error);
+                    statuses.push(Err(error));
                 }
             }
         }
-        if first_error.is_some() {
-            abort_prepared_quota(&prepared, "batch_put_partial_publish_cleanup");
-        }
         self.track_remote_storage_owners_best_effort(&published);
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(published)
+        Ok(statuses)
     }
 
     fn validate_unique_requests(&self, requests: &[BatchPutItem<'_>]) -> Result<()> {

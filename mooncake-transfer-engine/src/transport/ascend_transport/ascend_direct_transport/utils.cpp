@@ -15,11 +15,25 @@
 
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
-#include <cstring>
-#include <memory>
+#include <dlfcn.h>
 #include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <fstream>
+#include <future>
+#include <memory>
+#include <optional>
 #include <random>
+#include <set>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
@@ -35,10 +49,16 @@ namespace mooncake {
 namespace {
 constexpr int32_t kPortRange = 100;
 constexpr int32_t kMaxGenPortAttempts = 500;
+
 constexpr const char* kProtocolDescFlatKey =
     "comm_resource_config.protocol_desc";
 constexpr const char* kRocePrefix = "roce:";
 constexpr const char* kStoreConfigKey = "store";
+constexpr const char* kCommResourceConfigKey = "comm_resource_config";
+constexpr const char* kNicTopoPathKey = "nic_topo_path";
+constexpr const char* kNicTopoPathFlatKey =
+    "comm_resource_config.nic_topo_path";
+constexpr const char* kCustomTopoJsonEnv = "MC_CUSTOM_TOPO_JSON";
 
 std::string SerializeCompactJson(const Json::Value& value) {
     Json::StreamWriterBuilder writer;
@@ -58,6 +78,21 @@ bool ProtocolDescValueContainsRoce(const Json::Value& value) {
     if (value.isArray()) {
         for (const auto& item : value) {
             if (item.isString() && IsRoceProtocolDesc(item.asString())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ProtocolDescValueContainsExact(const Json::Value& value,
+                                    const std::string& expected) {
+    if (value.isString()) {
+        return value.asString() == expected;
+    }
+    if (value.isArray()) {
+        for (const auto& item : value) {
+            if (item.isString() && item.asString() == expected) {
                 return true;
             }
         }
@@ -99,58 +134,49 @@ bool ParseGlobalResourceConfigObject(const char* config_str,
     }
     return true;
 }
-}  // namespace
 
-bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
-    Json::Value root;
-    if (!ParseGlobalResourceConfigObject(config_str, root)) {
-        return false;
+// True when comm_resource_config.nic_topo_path is set to a non-empty string,
+// accepting either the flat key or the nested comm_resource_config object.
+// An explicit empty string counts as "not configured" (matching HIXL).
+bool NicTopoPathIsSet(const Json::Value& root) {
+    if (root.isMember(kNicTopoPathFlatKey) &&
+        root[kNicTopoPathFlatKey].isString() &&
+        !root[kNicTopoPathFlatKey].asString().empty()) {
+        return true;
     }
-    const Json::Value* protocol_desc = FindProtocolDescValue(root);
-    if (protocol_desc == nullptr) {
-        return false;
+    if (root.isMember(kCommResourceConfigKey) &&
+        root[kCommResourceConfigKey].isObject() &&
+        root[kCommResourceConfigKey].isMember(kNicTopoPathKey)) {
+        const auto& value = root[kCommResourceConfigKey][kNicTopoPathKey];
+        return value.isString() && !value.asString().empty();
     }
-    return ProtocolDescValueContainsRoce(*protocol_desc);
+    return false;
 }
 
-std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
-    if (config_str == nullptr || config_str[0] == '\0') {
-        return std::string();
+bool ObjectSelectsRoceHost(const Json::Value& object) {
+    if (!object.isObject()) {
+        return false;
     }
-    Json::CharReaderBuilder builder;
-    builder["collectComments"] = false;
-    Json::Value root;
-    std::string errs;
-    const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
-    if (!reader->parse(config_str, config_str + std::strlen(config_str), &root,
-                       &errs)) {
-        // Not valid JSON: leave it untouched and let adxl reject/handle it.
-        return std::string(config_str);
+    const Json::Value* protocol_desc = FindProtocolDescValue(object);
+    return protocol_desc != nullptr &&
+           ProtocolDescValueContainsExact(*protocol_desc, "roce:host");
+}
+
+}  // namespace
+
+bool IsHcclIntraRoceEnabled() {
+    const char* value = std::getenv("HCCL_INTRA_ROCE_ENABLE");
+    if (value == nullptr) {
+        return false;
     }
-    if (!root.isObject() || !root.isMember(kStoreConfigKey)) {
-        // Plain (legacy) config without a "store" override: pass verbatim.
-        return std::string(config_str);
-    }
-    if (globalConfig().ascend_store_te_init) {
-        return SerializeCompactJson(root[kStoreConfigKey]);
-    }
-    Json::Value normal = root;
-    normal.removeMember(kStoreConfigKey);
-    return SerializeCompactJson(normal);
+    const auto parsed = parseFromString<int32_t>(value);
+    return parsed.has_value() && parsed.value() == 1;
 }
 
 bool IsRoceModeEnabled() {
-    const char* store_te =
-        globalConfig().ascend_store_te_init ? "true" : "false";
-    char* roce_enable_str = std::getenv("HCCL_INTRA_ROCE_ENABLE");
-    LOG(INFO) << "[AscendTE] resolving link config, te is created for store="
-              << store_te << ", HCCL_INTRA_ROCE_ENABLE="
-              << (roce_enable_str ? roce_enable_str : "(unset)");
+    const char* roce_enable_str = std::getenv("HCCL_INTRA_ROCE_ENABLE");
     if (roce_enable_str) {
-        const auto roce_enable = parseFromString<int32_t>(roce_enable_str);
-        if (roce_enable.has_value() && roce_enable.value() == 1) {
-            LOG(INFO) << "[AscendTE] roce mode enabled via "
-                         "HCCL_INTRA_ROCE_ENABLE.";
+        if (IsHcclIntraRoceEnabled()) {
             return true;
         }
         LOG(WARNING) << "HCCL_INTRA_ROCE_ENABLE is not valid, value:"
@@ -163,52 +189,10 @@ bool IsRoceModeEnabled() {
                  "(protocol_desc): "
               << (resolved.empty() ? "(none)" : resolved);
     if (HasRoceProtocolDescInGlobalResourceConfig(resolved.c_str())) {
-        LOG(INFO) << "[AscendTE] roce mode enabled via "
-                     "ASCEND_GLOBAL_RESOURCE_CONFIG protocol_desc.";
         return true;
     }
     return false;
 }
-
-// AscendThreadPool implementation
-AscendThreadPool::AscendThreadPool(size_t num_threads) : running_(true) {
-    for (size_t i = 0; i < num_threads; ++i) {
-        workers_.emplace_back([this, i] {
-            auto thread_name = "ascend-wk-" + std::to_string(i);
-            pthread_setname_np(pthread_self(), thread_name.c_str());
-            while (true) {
-                std::function<void()> task;
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex_);
-                    condition_.wait(
-                        lock, [this] { return !running_ || !tasks_.empty(); });
-
-                    if (!running_ && tasks_.empty()) return;
-
-                    task = std::move(tasks_.front());
-                    tasks_.pop();
-                }
-                task();
-            }
-        });
-    }
-}
-
-AscendThreadPool::~AscendThreadPool() { stop(); }
-
-void AscendThreadPool::stop() {
-    bool expected = true;
-    if (!running_.compare_exchange_strong(expected, false)) {
-        return;  // Already stopped
-    }
-
-    condition_.notify_all();
-    for (std::thread& worker : workers_) {
-        if (worker.joinable()) worker.join();
-    }
-}
-
-bool AscendThreadPool::isRunning() const { return running_; }
 
 std::string GenAdxlEngineName(const std::string& ip, const uint64_t port) {
     if (globalConfig().use_ipv6) {
@@ -217,18 +201,23 @@ std::string GenAdxlEngineName(const std::string& ip, const uint64_t port) {
     return ip + ":" + std::to_string(port);
 }
 
-uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id) {
+uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports) {
     int32_t physical_dev_id;
     CHECK_ACL(aclrtGetPhyDevIdByLogicDevId(device_id, &physical_dev_id));
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
     const int min_port = base_port + physical_dev_id * kPortRange;
-    const int max_port = base_port + (physical_dev_id + 1) * kPortRange;
+    const int max_port = base_port + (physical_dev_id + 1) * kPortRange - 1;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
     bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
     for (int attempt = 0; attempt < kMaxGenPortAttempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        if (std::find(excluded_ports.begin(), excluded_ports.end(), port) !=
+            excluded_ports.end()) {
+            continue;
+        }
         sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
@@ -275,4 +264,120 @@ int SetDeviceAndGetContext(int32_t device_id, aclrtContext* out_context) {
     CHECK_ACL(aclrtGetCurrentContext(out_context));
     return 0;
 }
+
+bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
+    const Json::Value* protocol_desc = FindProtocolDescValue(root);
+    if (protocol_desc == nullptr) {
+        return false;
+    }
+    return ProtocolDescValueContainsRoce(*protocol_desc);
+}
+
+bool HasHccsDeviceProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
+    const Json::Value* protocol_desc = FindProtocolDescValue(root);
+    if (protocol_desc == nullptr) {
+        return false;
+    }
+    return ProtocolDescValueContainsExact(*protocol_desc, "hccs:device");
+}
+
+bool HasRoceHostProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
+    if (ObjectSelectsRoceHost(root)) {
+        return true;
+    }
+    // "store" is a sibling config, not a protocol_desc value. Host segments
+    // are allocated after the store-role flag is cleared, so look here too.
+    return root.isMember(kStoreConfigKey) &&
+           ObjectSelectsRoceHost(root[kStoreConfigKey]);
+}
+
+std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
+    if (config_str == nullptr || config_str[0] == '\0') {
+        return std::string();
+    }
+    Json::CharReaderBuilder builder;
+    builder["collectComments"] = false;
+    Json::Value root;
+    std::string errs;
+    const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    if (!reader->parse(config_str, config_str + std::strlen(config_str), &root,
+                       &errs)) {
+        // Not valid JSON: leave it untouched and let adxl reject/handle it.
+        return std::string(config_str);
+    }
+    if (!root.isObject() || !root.isMember(kStoreConfigKey)) {
+        // Plain (legacy) config without a "store" override: pass verbatim.
+        return std::string(config_str);
+    }
+    if (globalConfig().ascend_store_te_init) {
+        return SerializeCompactJson(root[kStoreConfigKey]);
+    }
+    Json::Value normal = root;
+    normal.removeMember(kStoreConfigKey);
+    return SerializeCompactJson(normal);
+}
+
+std::string InjectNicTopoPathFromCustomTopoEnvTe(
+    const std::string& resolved_config) {
+    // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
+    // the MC_CUSTOM_TOPO_JSON path is written into it when it is empty.
+    const char* custom_topo_json = std::getenv(kCustomTopoJsonEnv);
+    if (custom_topo_json == nullptr || custom_topo_json[0] == '\0') {
+        return resolved_config;
+    }
+
+    Json::Value root;
+    if (resolved_config.empty()) {
+        root = Json::Value(Json::objectValue);
+    } else {
+        Json::CharReaderBuilder builder;
+        builder["collectComments"] = false;
+        std::string errs;
+        const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        if (!reader->parse(resolved_config.c_str(),
+                           resolved_config.c_str() + resolved_config.size(),
+                           &root, &errs) ||
+            !root.isObject()) {
+            LOG(WARNING)
+                << "Cannot inject MC_CUSTOM_TOPO_JSON into "
+                   "comm_resource_config.nic_topo_path: GlobalResourceConfig "
+                   "is not a JSON object";
+            return resolved_config;
+        }
+    }
+
+    // An explicitly configured nic_topo_path always wins over
+    // MC_CUSTOM_TOPO_JSON.
+    if (NicTopoPathIsSet(root)) {
+        return resolved_config;
+    }
+
+    // Prefer the nested form when comm_resource_config already exists so HIXL
+    // sees a single representation; drop any stale flat key in that case
+    // (mirrors WithHixlListenPort).
+    if (root.isMember(kCommResourceConfigKey) &&
+        root[kCommResourceConfigKey].isObject()) {
+        root[kCommResourceConfigKey][kNicTopoPathKey] = custom_topo_json;
+        root.removeMember(kNicTopoPathFlatKey);
+    } else {
+        root[kNicTopoPathFlatKey] = custom_topo_json;
+    }
+    LOG(INFO) << "[AscendTE] comm_resource_config.nic_topo_path is empty, "
+                 "injecting MC_CUSTOM_TOPO_JSON: "
+              << custom_topo_json;
+    return SerializeCompactJson(root);
+}
+
 }  // namespace mooncake

@@ -377,7 +377,7 @@ void UbWorkerPool::performPostSend(int thread_id) {
             if (context_.active() && failed_nr_polls > 32 &&
                 !success_nr_polls) {
                 LOG(WARNING)
-                    << "Failed to establish peer endpoints in local RNIC "
+                    << "Failed to establish peer endpoints on local UB device "
                     << context_.nicPath() << ", mark it inactive";
                 context_.set_active(false);
             }
@@ -426,7 +426,7 @@ void UbWorkerPool::performPoll(int thread_id) {
             failed_nr_polls++;
             if (context_.active() && failed_nr_polls > 32 &&
                 !success_nr_polls) {
-                LOG(WARNING) << "Too many errors found in local RNIC "
+                LOG(WARNING) << "Too many errors found on local UB device "
                              << context_.nicPath() << ", mark it inactive";
                 context_.set_active(false);
             }

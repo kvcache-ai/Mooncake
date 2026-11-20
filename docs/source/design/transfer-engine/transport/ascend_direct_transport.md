@@ -6,13 +6,19 @@ Ascend Direct Transport (referred to as Transport throughout this document) is l
 
 Transport is a transmission adapter layer built on CANN's ADXL capabilities, providing direct compatibility with the Mooncake Transfer Engine. With Transport, users can perform Host-to-Device, Device-to-Host, and Device-to-Device transfers in Ascend environments using various communication protocols such as HCCS and RDMA. Future enhancements will enable data transfer between heterogeneous Ascend and GPU environments.
 
-To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option.
+To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option (the legacy `USE_ASCEND` option now selects the same Ascend Direct transport).
 
 ### Additional Dependencies
 
 **Ascend Compute Architecture for Neural Networks (CANN)**
 
 Please install the latest version of Ascend Compute Architecture for Neural Networks.
+
+The TENT transport backend for Ascend (`MC_USE_TENT=1`) uses HIXL's AutoConnect
+session mode and keeps peer sessions open until teardown, so it requires
+**CANN/HIXL 9.2.0 or newer**. On 9.1.x and earlier, deregistering a memory
+region while AutoConnect sessions to that peer are still open fails; use the
+classic `ascend` transport on those versions.
 
 ### Test Cases
 
@@ -54,7 +60,7 @@ The following environment variables can be configured to control Ascend Direct T
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | Global resource configuration | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
 | `ASCEND_CONNECT_TIMEOUT` | Link establishment timeout in milliseconds | 10000 | `ASCEND_CONNECT_TIMEOUT=5000` |
 | `ASCEND_TRANSFER_TIMEOUT` | Data transfer timeout in milliseconds | 10000 | `ASCEND_TRANSFER_TIMEOUT=10000` |
-| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 8 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=16` |
+| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 16 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=32` |
 | `ASCEND_USE_SHORT_CONNECTION` | Enable short connection mode (disconnect after each transfer) | 0 (disabled) | `ASCEND_USE_SHORT_CONNECTION=1` |
 | `ASCEND_BUFFER_POOL` | Buffer pool configuration for intermediate transfer mode (BUFFER_NUM:BUFFER_SIZE_MB) | "0:0" (disabled) | `ASCEND_BUFFER_POOL=4:8` |
 | `ASCEND_BASE_PORT` | Base port for ADXL engine port allocation | 20000 | `ASCEND_BASE_PORT=20000` |
@@ -68,6 +74,7 @@ The following environment variables can be configured to control Ascend Direct T
 - **ASCEND_ENABLE_USE_FABRIC_MEM**: Requires CANN 9.0+ and HDK 26.0+. Recommended when using Mooncake Store on supported A3 platforms: it can significantly improve transmission performance.
 - **ASCEND_USE_ASYNC_TRANSFER**: Requires CANN 8.5+. Enables HIXL asynchronous transfer mode, defaults to synchronous mode.
 - **ASCEND_GLOBAL_RESOURCE_CONFIG**: Configures HIXL global resources. Refer to HIXL documentation for `OPTION_GLOBAL_RESOURCE_CONFIG` settings.
+- **MC_CUSTOM_TOPO_JSON**: Path to a NIC topology JSON file; Transfer Engine also uses it to configure HIXL's `comm_resource_config.nic_topo_path` (`npu:<user_device_id>` key) for Host RoCE endpoint generation. Under TENT, this is read from `topology/custom_json_path` (set via `MC_TENT_CONF` or `MC_CUSTOM_TOPO_JSON`); when both are set, `MC_CUSTOM_TOPO_JSON` takes precedence.
 
 ### Important Notes
 
@@ -75,7 +82,7 @@ The following environment variables can be configured to control Ascend Direct T
 
 2. **TCP Connection**: Transport internally establishes a host-side TCP connection and automatically searches for available ports. An error will be reported if no ports are available.
 
-3. **Memory Alignment for HCCS**: When using the `HCCS` communication protocol, registered memory addresses must be aligned with page tables (device memory: 2MB alignment).
+3. **Memory Alignment for HCCS**: When using the `HCCS` communication protocol, registered memory addresses must be aligned with page tables (device memory: 2MB alignment). Registering a remote-accessible device buffer whose base address is not 2MB-aligned (for example, a sub-block from the torch_npu caching allocator) fails immediately with `ERR_INVALID_ARGUMENT` instead of failing later at connection time.
 
 4. **Configuration File**: Ensure `/etc/hccn.conf` exists, especially in containers. Mount `/etc/hccn.conf` or copy the host file to the container's `/etc` path.
 

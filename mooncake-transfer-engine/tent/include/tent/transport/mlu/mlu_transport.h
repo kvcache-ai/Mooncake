@@ -16,45 +16,86 @@
 #define TENT_MLU_TRANSPORT_H_
 
 #include <atomic>
+#include <array>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_set>
+#include <cn_api.h>
 
 #include "tent/platform/mlu.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/segment.h"
 #include "tent/runtime/transport.h"
 
 namespace mooncake {
 namespace tent {
 
+class MluTransportTestPeer;
+
+namespace mlu_detail {
+struct ImportEntry {
+    std::string attr;
+    uint64_t base = 0;
+    uint64_t size = 0;
+    std::shared_ptr<void> mapping;
+};
+}  // namespace mlu_detail
+
+struct MluCopyQueue {
+    CNcontext context = nullptr;
+    CNqueue handle = nullptr;
+    std::mutex mutex;
+    Status error;  // Guarded by mutex; do not submit to a failed queue.
+    ~MluCopyQueue();
+    Status synchronize();
+
+   private:
+    friend struct MluTask;
+    void deferRelease(CNnotifier notifier, std::shared_ptr<void> mapping);
+    struct DeferredRelease {
+        CNnotifier notifier;
+        std::shared_ptr<void> mapping;
+    };
+    // Guarded by mutex. Release only after a successful queue drain.
+    std::unique_ptr<std::vector<DeferredRelease>> deferred_;
+};
+
 struct MluTask {
     Request request;
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
+    std::shared_ptr<MluCopyQueue> queue;
+    std::shared_ptr<void> imported_target;
+    CNnotifier completion = nullptr;
+    bool drain_on_error = false;
 
     MluTask() = default;
-    // vector::reserve needs a copy or move constructor despite the atomics.
-    MluTask(const MluTask &other)
-        : request(other.request),
-          status_word(other.status_word.load()),
-          transferred_bytes(other.transferred_bytes.load()) {}
+    MluTask(MluTask &&other) noexcept;
+    ~MluTask();
 };
 
 struct MluSubBatch : public Transport::SubBatch {
     std::vector<MluTask> task_list;
     size_t max_size;
-    size_t size() const override { return task_list.size(); }
+    std::atomic<size_t> published_size{0};
+    size_t size() const override { return published_size.load(); }
+    bool needsProgressPolling() const override { return true; }
 };
 
-// Executes synchronous copies with exactly one MLU endpoint, within the local
-// segment. Peer transfers use the engine's host-staging pipeline.
+// Executes local MLU copies and same-host IPC copies of peer process buffers.
 class MluTransport : public Transport {
    public:
+    ~MluTransport() override;
     Status install(std::string &local_segment_name,
                    std::shared_ptr<ControlService> metadata,
                    std::shared_ptr<Topology> local_topology,
                    std::shared_ptr<Config> conf = nullptr) override;
 
     Status uninstall() override;
+    Status quiesce() override;
 
     Status allocateSubBatch(SubBatchRef &batch, size_t max_size) override;
 
@@ -66,18 +107,55 @@ class MluTransport : public Transport {
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus &status) override;
 
+    Status allocateLocalMemory(void **addr, size_t size,
+                               MemoryOptions &options) override;
+    Status freeLocalMemory(void *addr, size_t size) override;
+
     Status addMemoryBuffer(BufferDesc &desc,
                            const MemoryOptions &options) override;
 
     Status removeMemoryBuffer(BufferDesc &desc) override;
 
+    bool mayMapRemoteBuffer(SegmentID target_id, const SegmentDesc &segment,
+                            const BufferDesc &entry) const;
+    bool prepareRemoteBuffer(SegmentID target_id, const SegmentDesc &segment,
+                             const BufferDesc &entry, void *local_source,
+                             Request::OpCode opcode);
+    void closeRemoteSegment(SegmentID target_id);
+
+    // Both addresses must be local (or already imported), in the actual copy
+    // direction. READ callers must swap the request's source and target.
+    // A false result requires engine-managed staging.
+    static bool canCopyPeer(void *src, void *dst);
+
     const char *getName() const override { return "mlu"; }
 
    private:
-    void startTransfer(MluTask *task, MluSubBatch *batch);
+    friend class MluTransportTestPeer;
 
+    Status submitCopy(MluTask &task, bool to_device);
+    Status submitPeerCopy(MluTask &task);
+    Status enqueueCopy(MluTask &task, std::shared_ptr<MluCopyQueue> &queue,
+                       CNcontext context, void *dst, void *src,
+                       CNcontext dst_context = nullptr);
+    void startTransfer(MluTask *task);
+    Status quiesceLocked();
+    Status drainTask(MluTask &task);
+    Status drainBuffer(uint64_t addr, size_t size);
+    std::shared_ptr<void> relocate(SegmentID target_id, uint64_t &addr,
+                                   size_t length);
+
+    std::mutex mutex_;
+    // D2H/D2D on the source context, H2D on the destination context.
+    std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 2>> queues_;
+    std::unordered_set<MluSubBatch *> batches_;
+    std::map<SegmentID, std::vector<mlu_detail::ImportEntry>> imports_;
+    std::map<SegmentID, uint64_t> high_water_;
+    std::string machine_id_;
     bool installed_ = false;
+    bool ipc_enabled_ = true;
     MluPlatform *platform_ = nullptr;
+    std::shared_ptr<ControlService> metadata_;
 };
 
 }  // namespace tent

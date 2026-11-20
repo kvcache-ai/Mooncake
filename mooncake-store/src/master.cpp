@@ -9,6 +9,7 @@
 #include <memory>   // For std::unique_ptr
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -19,6 +20,7 @@
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
+#include "etcd_helper.h"
 #include "ha/ha_types.h"
 #include "ha/leadership/master_service_supervisor.h"
 #include "ha/snapshot/batch_oplog/config.h"
@@ -27,6 +29,7 @@
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
 #include "rpc_service.h"
+#include "shutdown_request.h"
 #include "types.h"
 #include "common/network.h"
 #include "glog_compat.h"
@@ -44,13 +47,14 @@ static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
-static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 24 * 60 * 60 * 1000,
+static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS ==
+                  7 * 24 * 60 * 60 * 1000,
               "Update kDefaultMaxKvSoftPinTtlFlagValue when "
               "DEFAULT_MAX_KV_SOFT_PIN_TTL_MS changes");
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
-constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
+constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "604800000";
 // Allowed range of --ha_leader_lease_ttl_sec.
 constexpr int64_t kMinHaLeaderLeaseTtlSec = 2;
 constexpr int64_t kMaxHaLeaderLeaseTtlSec = 60;
@@ -140,6 +144,9 @@ DEFINE_string(metrics_host,
               std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
+DEFINE_string(metrics_key_groups, "",
+              "Break key count and value bytes down by key, e.g. "
+              "\"kv:suffix:_k,state:prefix:state_\"; empty disables it");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -173,6 +180,22 @@ DEFINE_double(tenant_eviction_high_watermark_ratio,
               "quota sits at or below eviction_high_watermark_ratio reaches "
               "its own ceiling before the pool crosses the pool-wide "
               "watermark, so nothing ever reclaims on its behalf");
+DEFINE_uint32(eviction_worker_threads,
+              mooncake::DEFAULT_EVICTION_WORKER_THREADS,
+              "Threads that walk the eviction index in each memory eviction "
+              "pass. 0 picks one per 16M filed keys, clamped to [1, 64]; 1-64 "
+              "sets the count. Passes stay serial when an eviction policy, "
+              "reclaimer or observer cannot run concurrently (e.g. with "
+              "oplog or offload-on-evict)");
+DEFINE_validator(eviction_worker_threads,
+                 [](const char* flagname, uint32_t value) {
+                     if (value > mooncake::MAX_EVICTION_WORKER_THREADS) {
+                         LOG(ERROR) << flagname << " must be between 0 and "
+                                    << mooncake::MAX_EVICTION_WORKER_THREADS;
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -250,7 +273,7 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
     // bound (1e8) keeps `offloading_queue_limit_ *
     // offload_cap_ratio_` well within signed long range to
     // avoid overflow when computing offload_cap in
-    // BatchEvict / EvictTenantMemoryForQuota.
+    // BatchEvict / EvictNamespaceMemory.
     if (value == 0) {
         LOG(FATAL) << "offloading_queue_limit must be greater than 0";
         return false;
@@ -339,12 +362,17 @@ DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
     }
     return true;
 });
+DEFINE_uint32(ha_redis_expected_replicas_per_shard, 0,
+              "Expected replica membership per Redis shard; must be positive");
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_int32(etcd_max_send_message_bytes, 2 * 1024 * 1024,
+             "Maximum outgoing gRPC message size in bytes for the HA store "
+             "etcd client; must be positive. Does not change server limits.");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "Deprecated alias for --client_active_ttl_sec");
 DEFINE_int64(client_active_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
@@ -384,6 +412,9 @@ DEFINE_bool(weight_management_oplog_capability_confirmed, false,
             "and lease entry types before enabling weight mutations");
 DEFINE_bool(enable_oplog_snapshot, false,
             "Enable standby batch OpLog snapshot production");
+DEFINE_uint64(weight_import_idle_timeout_ms, 5 * 60 * 1000,
+              "Abort managed weight imports after this many milliseconds "
+              "without accepted member writes");
 DEFINE_uint64(snapshot_chunk_object_count, 1000000,
               "Maximum objects per standby batch OpLog snapshot chunk");
 DEFINE_uint64(snapshot_interval_seconds, 600,
@@ -565,6 +596,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         "tenant_eviction_high_watermark_ratio",
         &master_config.tenant_eviction_high_watermark_ratio,
         FLAGS_tenant_eviction_high_watermark_ratio);
+    default_config.GetUInt32("eviction_worker_threads",
+                             &master_config.eviction_worker_threads,
+                             FLAGS_eviction_worker_threads);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -672,11 +706,18 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetUInt32(
+        "ha_redis_expected_replicas_per_shard",
+        &master_config.ha_redis_expected_replicas_per_shard,
+        FLAGS_ha_redis_expected_replicas_per_shard);
     default_config.GetInt64("ha_leader_lease_ttl_sec",
                             &master_config.ha_leader_lease_ttl_sec,
                             FLAGS_ha_leader_lease_ttl_sec);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
+    default_config.GetInt32("etcd_max_send_message_bytes",
+                            &master_config.etcd_max_send_message_bytes,
+                            FLAGS_etcd_max_send_message_bytes);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
@@ -688,6 +729,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_oplog_snapshot",
                            &master_config.enable_oplog_snapshot,
                            FLAGS_enable_oplog_snapshot);
+    default_config.GetUInt64("weight_import_idle_timeout_ms",
+                             &master_config.weight_import_idle_timeout_ms,
+                             FLAGS_weight_import_idle_timeout_ms);
     default_config.GetUInt64("snapshot_chunk_object_count",
                              &master_config.snapshot_chunk_object_count,
                              FLAGS_snapshot_chunk_object_count);
@@ -796,10 +840,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                          << ". Please migrate to use rpc_thread_num only.";
         }
         master_config.rpc_thread_num = rpc_thread_num;
-    } else {
-        if (!conf_set) {
-            master_config.rpc_thread_num = server_thread_num;
-        }
+    } else if (!conf_set || master_config.rpc_thread_num == 0) {
+        // A config file without rpc_thread_num leaves it at the flag's 0,
+        // which must fall back like the command line does: the RPC handler
+        // worker pool below is sized from it.
+        master_config.rpc_thread_num = server_thread_num;
     }
 
     // Determine RPC server port with compatibility warnings
@@ -906,6 +951,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.tenant_eviction_high_watermark_ratio =
             FLAGS_tenant_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("eviction_worker_threads", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.eviction_worker_threads = FLAGS_eviction_worker_threads;
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1110,6 +1160,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.ha_leader_lease_ttl_sec = FLAGS_ha_leader_lease_ttl_sec;
     }
+    if (google::GetCommandLineFlagInfo("ha_redis_expected_replicas_per_shard",
+                                       &info) &&
+        !info.is_default) {
+        master_config.ha_redis_expected_replicas_per_shard =
+            FLAGS_ha_redis_expected_replicas_per_shard;
+    }
+    if (master_config.enable_ha && master_config.ha_backend_type == "redis" &&
+        master_config.ha_redis_expected_replicas_per_shard == 0) {
+        LOG(FATAL) << "ha_redis_expected_replicas_per_shard must be positive";
+    }
     if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
         master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
         LOG(FATAL) << "ha_leader_lease_ttl_sec must be in ["
@@ -1120,6 +1180,15 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
+    }
+    if ((google::GetCommandLineFlagInfo("etcd_max_send_message_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.etcd_max_send_message_bytes =
+            FLAGS_etcd_max_send_message_bytes;
+    }
+    if (master_config.etcd_max_send_message_bytes <= 0) {
+        LOG(FATAL) << "etcd_max_send_message_bytes must be positive";
     }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
@@ -1162,6 +1231,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_oplog_snapshot = FLAGS_enable_oplog_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("weight_import_idle_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.weight_import_idle_timeout_ms =
+            FLAGS_weight_import_idle_timeout_ms;
     }
     if ((google::GetCommandLineFlagInfo("snapshot_chunk_object_count", &info) &&
          !info.is_default) ||
@@ -1454,6 +1530,8 @@ int main(int argc, char* argv[]) {
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
+        mooncake::MasterMetricManager::instance().configure_key_groups(
+            FLAGS_metrics_key_groups);
     } catch (const std::exception& error) {
         LOG(ERROR) << "Invalid metrics bootstrap configuration: "
                    << error.what();
@@ -1509,9 +1587,13 @@ int main(int argc, char* argv[]) {
     if (!master_config.ha_backend_connstring.empty() &&
         !master_config.etcd_endpoints.empty() &&
         master_config.ha_backend_connstring != master_config.etcd_endpoints) {
+        const std::string_view ha_backend_connstring_for_log =
+            master_config.ha_backend_type == "redis"
+                ? std::string_view{"<Redis endpoints>"}
+                : std::string_view{master_config.ha_backend_connstring};
         LOG(WARNING) << "Both ha_backend_connstring and etcd_endpoints are "
                      << "set. Using ha_backend_connstring="
-                     << master_config.ha_backend_connstring
+                     << ha_backend_connstring_for_log
                      << " for HA coordinator setup";
     }
     if (master_config.memory_allocator != "cachelib" &&
@@ -1519,6 +1601,14 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "Invalid memory allocator: "
                    << master_config.memory_allocator
                    << ", must be 'cachelib' or 'offset'";
+        return 1;
+    }
+
+    if (master_config.enable_ha && master_config.ha_backend_type == "etcd" &&
+        mooncake::EtcdHelper::SetMaxSendMessageBytes(
+            master_config.etcd_max_send_message_bytes) !=
+            mooncake::ErrorCode::OK) {
+        LOG(ERROR) << "Failed to configure etcd_max_send_message_bytes";
         return 1;
     }
 
@@ -1567,6 +1657,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    const std::string_view ha_backend_connstring_for_log =
+        master_config.ha_backend_type == "redis"
+            ? std::string_view{"<Redis endpoints>"}
+            : std::string_view{ha_backend_connstring};
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -1583,6 +1677,7 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", tenant_eviction_high_watermark_ratio="
         << master_config.tenant_eviction_high_watermark_ratio
+        << ", eviction_worker_threads=" << master_config.eviction_worker_threads
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
         << ", weight_management_oplog_capability_confirmed="
@@ -1599,9 +1694,11 @@ int main(int argc, char* argv[]) {
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
-        << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", ha_backend_connstring=" << ha_backend_connstring_for_log
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
+        << ", etcd_max_send_message_bytes="
+        << master_config.etcd_max_send_message_bytes
         << ", client_active_ttl_sec=" << master_config.client_active_ttl_sec
         << ", client_suspicion_ttl_sec="
         << master_config.client_suspicion_ttl_sec
@@ -1671,12 +1768,34 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
+        // Arm the shutdown bound and the handlers before any lease can be
+        // acquired; without them a SIGTERM kills a leader mid-term. This
+        // call is serial and one-shot from main(): the check-then-store in
+        // StartShutdownWatchdog assumes no concurrent caller.
+        if (!mooncake::StartShutdownWatchdog(
+                mooncake::ha::kHaShutdownDeadline)) {
+            LOG(ERROR) << "Failed to start the shutdown watchdog, "
+                          "refusing to start";
+            return 1;
+        }
+        if (!mooncake::InstallShutdownSignalHandlers()) {
+            PLOG(ERROR) << "Failed to install SIGINT/SIGTERM handlers, "
+                           "refusing to start";
+            return 1;
+        }
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
-        return supervisor.Start();
+        const int result = supervisor.Start();
+        // Finish a requested process exit without further main/static
+        // teardown; supervisor-owned cleanup may already have run on this
+        // error path.
+        if (mooncake::ShutdownRequested() || mooncake::ShutdownLatched()) {
+            mooncake::ExitAfterShutdown(result);
+        }
+        return result;
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
@@ -1708,6 +1827,12 @@ int main(int argc, char* argv[]) {
             mooncake::ha::MasterRuntimeState::kServing);
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
+
+        // Open the restore lifecycle (RFC #4700, slice 1): the non-HA path
+        // has no promotion restore, so it moves Constructed -> Ready ->
+        // Serving explicitly, before the RPC service is registered.
+        wrapped_master_service->MarkReadyForServing();
+        wrapped_master_service->ActivateServing();
 
         // Declared after the service so that it drains before the service
         // is destroyed.

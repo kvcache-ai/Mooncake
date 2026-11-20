@@ -31,17 +31,13 @@ class FailingPosixFsAdapter : public PosixFsAdapter {
    public:
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
+    void ClearWriteFailure() { fail_write_call_.store(-1); }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
         const int fail = fail_write_call_.load();
-        // Model a genuine, non-recoverable write failure: once the armed call
-        // is reached, keep failing. The backend retries POSIX write failures
-        // once after an fd reopen (SupportsFdReopen), so a single-call failure
-        // would be masked by the retry; a persistent failure correctly
-        // surfaces to the caller.
         if (fail > 0 && call >= fail) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -526,6 +522,35 @@ TEST_F(DfsSyncClientTest, DfsMetricsCountSuccessfulWriteAndRead) {
     EXPECT_EQ(metric->dfs_writes_skipped.value(), 0);
 }
 
+TEST_F(DfsSyncClientTest, RangeReadMetricsCountWindowBytes) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+    const int64_t base_read_bytes = metric->dfs_read_bytes.value();
+
+    const std::string key = "dfs_metric_window";
+    std::string value(4096, 'W');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_FALSE(query->replicas.empty());
+
+    constexpr size_t kWindow = 1024;
+    std::vector<char> output(kWindow, '\0');
+    auto results = writer_->BatchReadFileReplicaRanges(
+        {key}, {query->replicas.front()}, {Slice{output.data(), kWindow}}, {0});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value()) << toString(results[0].error());
+    EXPECT_EQ(std::memcmp(output.data(), value.data(), kWindow), 0);
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+    EXPECT_EQ(metric->dfs_read_bytes.value(),
+              base_read_bytes + static_cast<int64_t>(kWindow));
+}
+
 TEST_F(DfsSyncClientTest, DfsMetricsCountWriteFailureSeparatelyFromOps) {
     auto* metric = writer_->GetDfsMetricPtr();
     if (metric == nullptr) {
@@ -623,6 +648,7 @@ TEST_F(DfsSyncClientTest, DfsOnlyBatchFailureOnlyRevokesFailedKey) {
     adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
 
     auto results = writer_->BatchPut(keys, slices, DfsOnlyConfig());
+    adapter_->ClearWriteFailure();
     ASSERT_EQ(results.size(), keys.size());
     EXPECT_TRUE(results[0].has_value());
     ASSERT_FALSE(results[1].has_value());

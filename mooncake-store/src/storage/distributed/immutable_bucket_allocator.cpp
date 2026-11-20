@@ -546,7 +546,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
     auto deleted = fs_adapter_->DeleteFile(BucketDataPath(bucket.bucket_id_));
     if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
         std::lock_guard lock(mutex_);
-        failed_deletions_.insert(bucket.bucket_id_);
+        waiting_deletions_.insert_or_assign(
+            bucket.bucket_id_, std::chrono::system_clock::time_point{});
         return tl::make_unexpected(deleted.error());
     }
 
@@ -556,16 +557,27 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
         current->second->lifecycle = BucketLifecycle::RETIRED;
         buckets_.erase(current);
     }
-    failed_deletions_.erase(bucket.bucket_id_);
+    waiting_deletions_.erase(bucket.bucket_id_);
     return {};
+}
+
+void ImmutableBucketAllocator::DeferDeletion(
+    EvictedBucket&& bucket, std::chrono::system_clock::time_point not_before) {
+    if (bucket.bucket_id_ < 0) return;
+    std::lock_guard lock(mutex_);
+    waiting_deletions_.insert_or_assign(bucket.bucket_id_, not_before);
+    bucket.bucket_id_ = -1;
+    bucket.identity_.reset();
 }
 
 size_t ImmutableBucketAllocator::RetryFailedEvictions() {
     std::vector<std::pair<int64_t, BucketPtr>> retries;
     {
+        const auto now = std::chrono::system_clock::now();
         std::lock_guard lock(mutex_);
-        retries.reserve(failed_deletions_.size());
-        for (const int64_t id : failed_deletions_) {
+        retries.reserve(waiting_deletions_.size());
+        for (const auto& [id, not_before] : waiting_deletions_) {
+            if (not_before > now) continue;
             const auto it = buckets_.find(id);
             if (it != buckets_.end() &&
                 it->second->lifecycle == BucketLifecycle::EVICTING) {
@@ -586,7 +598,7 @@ size_t ImmutableBucketAllocator::RetryFailedEvictions() {
         }
         bucket->lifecycle = BucketLifecycle::RETIRED;
         buckets_.erase(current);
-        failed_deletions_.erase(id);
+        waiting_deletions_.erase(id);
         ++completed;
     }
     return completed;

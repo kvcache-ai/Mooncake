@@ -1,6 +1,6 @@
 use mooncake_store_core::{
-    ClientRuntimeId, ClientStableId, ColdBackingState, ObjectKey, RoutePolicyDomain, SegmentName,
-    TenantPolicyScope,
+    ClientRuntimeId, ClientStableId, ColdBackingState, ObjectKey, Result, RoutePolicyDomain,
+    SegmentName, StoreError, TenantPolicyScope,
 };
 use std::borrow::Cow;
 
@@ -16,6 +16,8 @@ use std::borrow::Cow;
 pub struct MetadataKeyspace {
     raw_prefix: String,
     slot_tag: String,
+    bound_tenant: Option<String>,
+    tenant_root_prefix: Option<String>,
 }
 
 impl MetadataKeyspace {
@@ -25,6 +27,8 @@ impl MetadataKeyspace {
         Self {
             raw_prefix,
             slot_tag,
+            bound_tenant: None,
+            tenant_root_prefix: None,
         }
     }
 
@@ -326,6 +330,22 @@ impl MetadataKeyspace {
         }
     }
 
+    pub fn tenant_index(&self) -> String {
+        format!("{}/indexes/tenants", self.slot_tag)
+    }
+
+    pub fn tenant_index_prefix(&self) -> String {
+        format!("{}/indexes/tenants/", self.slot_tag)
+    }
+
+    pub fn tenant_index_entry(&self, tenant: &str) -> String {
+        format!(
+            "{}{}",
+            self.tenant_index_prefix(),
+            encode_key_component(tenant)
+        )
+    }
+
     pub fn tenant_policy_index(&self, tenant: &str) -> String {
         format!(
             "{}/system/tenant-policy-index/by-tenant/{}",
@@ -427,12 +447,37 @@ impl MetadataKeyspace {
         &self.raw_prefix
     }
 
+    pub fn bound_tenant(&self) -> Option<&str> {
+        self.bound_tenant.as_deref()
+    }
+
+    pub fn validate_tenant(&self, tenant: &str) -> Result<()> {
+        if let Some(bound_tenant) = self.bound_tenant() {
+            if bound_tenant != tenant {
+                return Err(StoreError::InvalidState(format!(
+                    "metadata backend is bound to tenant {bound_tenant}, but the operation targets tenant {tenant}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn tenant_prefixed(&self, tenant: &str) -> Self {
-        Self::new(format!(
+        if self.bound_tenant() == Some(tenant) {
+            return self.clone();
+        }
+        let root_prefix = self
+            .tenant_root_prefix
+            .as_deref()
+            .unwrap_or(self.raw_prefix.as_str());
+        let mut keyspace = Self::new(format!(
             "{}/tenants/{}",
-            self.raw_prefix,
+            root_prefix,
             encode_key_component(tenant)
-        ))
+        ));
+        keyspace.bound_tenant = Some(tenant.to_string());
+        keyspace.tenant_root_prefix = Some(root_prefix.to_string());
+        keyspace
     }
 }
 
@@ -498,6 +543,14 @@ pub fn parse_tenant_policy_scope(
     };
     scope.validate().ok()?;
     Some(scope)
+}
+
+pub fn parse_tenant_index_entry(keyspace: &MetadataKeyspace, key: &str) -> Option<String> {
+    let encoded = key.strip_prefix(&keyspace.tenant_index_prefix())?;
+    if encoded.is_empty() || encoded.contains('/') {
+        return None;
+    }
+    Some(decode_key_component_checked(encoded)?.into_owned())
 }
 
 pub(crate) fn encode_key_component(value: &str) -> String {
@@ -569,6 +622,17 @@ mod tests {
     #[test]
     fn tenant_prefixed_keyspace_roots_control_plane_under_tenant() {
         let keyspace = MetadataKeyspace::new("mc/store-rs/v2").tenant_prefixed("tenant/a");
+        assert_eq!(keyspace.bound_tenant(), Some("tenant/a"));
+        assert!(keyspace.validate_tenant("tenant/a").is_ok());
+        assert!(keyspace.validate_tenant("tenant-b").is_err());
+        assert_eq!(
+            keyspace.tenant_prefixed("tenant/a").prefix(),
+            keyspace.prefix(),
+            "rebinding the same tenant must not nest the tenant prefix"
+        );
+        let rebound = keyspace.tenant_prefixed("tenant-b");
+        assert_eq!(rebound.prefix(), "mc/store-rs/v2/tenants/tenant-b");
+        assert_eq!(rebound.bound_tenant(), Some("tenant-b"));
         let runtime = ClientRuntimeId::new("writer", ClientEpoch(9));
         let stable = ClientStableId::new("writer");
         let object = ObjectKey::new("alpha");

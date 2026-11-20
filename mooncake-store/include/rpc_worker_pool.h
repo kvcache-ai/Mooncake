@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <tuple>
@@ -63,7 +64,10 @@ class PooledHandler<Method, Service, std::tuple<Params...>> {
 // goes back to reading.
 class RpcWorkerPool {
    public:
-    explicit RpcWorkerPool(size_t thread_count) : threads_(thread_count) {}
+    // asio starts no threads for a count of 0, which would leave every
+    // pooled call queued forever, so at least one worker is started.
+    explicit RpcWorkerPool(size_t thread_count)
+        : threads_(std::max<size_t>(thread_count, 1)) {}
     // Waits for the calls already queued. Destroy it after the server has
     // stopped and before the service the handlers call into.
     ~RpcWorkerPool() { threads_.join(); }

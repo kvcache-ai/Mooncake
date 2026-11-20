@@ -28,7 +28,7 @@ Transport selection is driven by configuration with pattern-based rules.
       "intent_type": "foreground_get",
       "priority": "high",
       "devices": ["mlx5_0", "mlx5_1", "mlx5_2"],
-      "transports": ["nvlink", "rdma", "shm"]
+      "transports": ["nvlink", "xpu", "rdma", "shm"]
     },
     {
       "name": "low_prio_slow",
@@ -56,6 +56,13 @@ Transport selection is driven by configuration with pattern-based rules.
 | `intent_type` | string or int | No | Match a standard transfer intent such as `"foreground_get"`, `"background_prefetch"`, `"migration"`, `"checkpoint"`, `"weight_loading"`, or `"staging_internal"` |
 | `devices` | array[string] | No | List of allowed device names (empty = all devices) |
 | `transports` | array[string] | No | Transport preference list (evaluated in order) |
+
+A non-empty `transports` list replaces the transports registered on the
+buffer, so it must name every transport the policy should use. In particular,
+same-host Intel XPU peer-to-peer copies (Level Zero IPC between processes)
+are only used when the list contains `"xpu"`; put it ahead of `"rdma"`, as in
+the example above. A policy that omits it keeps such requests on the network
+path (RDMA dma-buf or host staging).
 
 ### Intent-Based Policy Binding
 
@@ -103,7 +110,16 @@ For `memory` segments, you can filter by source/destination memory type:
 | `"cpu"` | CPU/host memory |
 | `"hip"` | ROCm/HIP GPU memory |
 | `"npu"` | Ascend NPU memory |
+| `"xpu"` | Intel GPU device memory (host/shared USM matches `"cpu"`) |
 | `"*"` | Any memory type |
+
+For standard `tcp`, the local memory type always describes the initiating
+process's buffer, for both READ and WRITE. A CPU-only build can transfer between
+its host buffer and a peer's registered GPU buffer when the peer exports that
+buffer over TCP. The peer's device-enabled RPC handler performs the GPU copy
+through host staging; the initiator does not need a local GPU runtime. Local GPU
+buffers still require a device-enabled build. This applies to standard `tcp`;
+`hp_tcp` currently supports host memory only.
 
 ### Size Filters
 

@@ -47,6 +47,14 @@ struct VecInt<16> {
     using vec_t = int4;
 };
 
+__device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
+                                             int qps_per_rank,
+                                             int active_qps_per_rank) {
+    int active_qps = active_qps_per_rank;
+    if (active_qps <= 0 || active_qps > qps_per_rank) active_qps = qps_per_rank;
+    return expert_local_idx % active_qps;
+}
+
 // ---- TMA / mbarrier helpers (CUDA only) ----
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 

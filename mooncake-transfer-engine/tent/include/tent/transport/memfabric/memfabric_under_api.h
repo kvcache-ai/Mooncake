@@ -2,7 +2,9 @@
 #define MEMFABRIC_UNDER_API_H_
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include "memfabric_types.h"
 
@@ -28,6 +30,9 @@ using smemTransBatchStatusQueryFunc = int32_t (*)(smem_trans_t, uint64_t,
                                                   int32_t*, uint32_t);
 using smemSetLogLevelFunc = int32_t (*)(int);
 
+using smemMemAllocFunc = int32_t (*)(uint16_t, uint64_t, uint32_t, void**);
+using smemMemFreeFunc = int32_t (*)(void*);
+
 class MemFabricUnderApi {
     friend class MemFabricTransportTest;
 
@@ -35,6 +40,10 @@ class MemFabricUnderApi {
     static bool LoadLibrary();
     static void CleanupLibrary();
     static bool IsLoaded() { return gLoaded; }
+    static int32_t SmemMemAlloc(uint16_t deviceId, uint64_t size,
+                                uint32_t flags, void** address);
+    // managed distinguishes fabric allocations from ACL Host buffers.
+    static int32_t SmemMemFree(void* address, bool& managed);
 
     static inline int32_t SmemTransInit(uint32_t deviceId, uint32_t flags) {
         if (pSmemTransInit == nullptr) return -1;
@@ -99,9 +108,23 @@ class MemFabricUnderApi {
     }
 
    private:
+    // Keep allocation functions and their library alive with outstanding
+    // buffers.
+    struct MemoryApi {
+        std::shared_ptr<void> library;
+        smemMemAllocFunc allocate = nullptr;
+        smemMemFreeFunc free = nullptr;
+    };
+
+    static bool LoadLibraryLocked();
+    static void ResetSymbols();
     static std::mutex gMutex;
     static bool gLoaded;
     static void* gLibHandle;
+    static std::shared_ptr<const MemoryApi> gMemoryApi;
+    static std::weak_ptr<const MemoryApi> gMemoryApiWeak;
+    static std::unordered_map<void*, std::shared_ptr<const MemoryApi>>
+        gAllocations;
 
     static smemTransInitFunc pSmemTransInit;
     static smemTransUninitFunc pSmemTransUninit;

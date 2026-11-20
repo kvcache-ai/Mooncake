@@ -35,7 +35,8 @@ class TransferEngineImpl;
 // notifyBatchMaybeReady to wake this worker, which then drives one
 // progressBatch step per notification. When the runtime queue has active work,
 // the worker also uses a low-frequency fallback tick so transports that do not
-// yet emit completion wakes can still drain the queue.
+// yet emit completion wakes can still drain the queue. Sub-batches without
+// completion wakes can also opt into periodic polling outside that queue.
 class ProgressWorker {
    public:
     explicit ProgressWorker(TransferEngineImpl* impl,
@@ -55,7 +56,8 @@ class ProgressWorker {
     // Safe from any thread. De-duplicates: enqueueing a batch that is already
     // queued is a no-op. No-op if the worker has been stopped or never
     // started.
-    void notifyBatchMaybeReady(BatchID batch_id);
+    void notifyBatchMaybeReady(BatchID batch_id,
+                               bool poll_until_terminal = false);
 
     // Safe from any thread. Coalesces multiple runtime queue wakes into one
     // bounded refill step.
@@ -72,6 +74,7 @@ class ProgressWorker {
     std::mutex mu_;
     std::condition_variable cv_;
     std::unordered_set<BatchID> queued_;
+    std::unordered_set<BatchID> polling_;
     std::deque<BatchID> order_;
     bool queue_ready_{false};
 };

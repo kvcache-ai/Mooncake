@@ -133,6 +133,14 @@ Status HttpMetaStore::set(const std::string &key, const std::string &value) {
     // set content-type to application/json
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    // The value is already buffered; do not wait for 100 Continue.
+    auto *without_expect = curl_slist_append(headers, "Expect:");
+    if (!without_expect) {
+        curl_slist_free_all(headers);
+        return Status::InternalError(
+            "HTTP cannot allocate request headers" LOC_MARK);
+    }
+    headers = without_expect;
     curl_easy_setopt(client.h, CURLOPT_HTTPHEADER, headers);
     CURLcode res = curl_easy_perform(client.h);
     curl_slist_free_all(headers);  // free headers

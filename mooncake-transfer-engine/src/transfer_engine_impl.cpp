@@ -25,6 +25,7 @@
 #ifdef WITH_METRICS
 #include <iomanip>
 #include <sstream>
+#include "transfer_engine_metrics.h"
 #endif
 
 #include "transfer_metadata_plugin.h"
@@ -32,6 +33,9 @@
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+#include "transport/rdma_transport/rdma_transport.h"
+#endif
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -129,11 +133,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    // The only difference in initializing the Ascend Transport is that the
-    // `local_server_name` must include the physical NPU card ID. The format
-    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
-    // While the desc_name stored in the metadata remains in the format of
-    // ip:port.
+    // Ascend builds also accept the legacy `ip:port:npu_x` local_server_name
+    // form. The NPU id is only informational now (the Ascend Direct transport
+    // selects devices through ACL/adxl); the segment name stored in the
+    // metadata stays in the `ip:port` form.
     int devicePhyId = -1;
     auto [host_name, port] =
         parseHostNameWithPortAscend(local_server_name, &devicePhyId);
@@ -174,15 +177,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;
             }
-#if defined(USE_ASCEND)
-            // The current version of Ascend Transport does not support IPv6,
-            // but it will be added in a future release.
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
-#else
             local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
                                  std::to_string(desc.rpc_port);
-#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -221,15 +217,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
               << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-#ifdef USE_ASCEND
-    std::string mutable_server_name =
-        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
-#else
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
-#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
@@ -301,8 +290,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     auto_discover_config_.enabled = false;
 #endif
 
-#if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+#if defined(USE_CXL) && !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
@@ -323,7 +311,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using custom topology from: " << path;
             auto topo_json = loadTopologyJsonFile(path);
             if (!topo_json.empty()) {
-                local_topology_->parse(topo_json);
+                ret = local_topology_->parse(topo_json, filter_);
+                if (ret == 0 && !filter_.empty() &&
+                    local_topology_->getHcaList().empty()) {
+                    std::string names;
+                    for (const auto& name : filter_)
+                        names += (names.empty() ? "" : ",") + name;
+                    LOG(ERROR) << "No HCA in " << path
+                               << " matches device filter [" << names << "]";
+                    return ERR_DEVICE_NOT_FOUND;
+                }
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
@@ -461,13 +458,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using " << gpu_p2p_name << " transport "
                       << "(forced or no HCA detected)";
         } else if (!no_hca || force_hca) {
-            Transport* t =
-                multi_transports_->installTransport("rdma", local_topology_);
+            const char* rdma_protocol =
+                globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
+            Transport* t = multi_transports_->installTransport(rdma_protocol,
+                                                               local_topology_);
             if (!t) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
             }
-            LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+            LOG(INFO) << "Using RDMA transport, type=" << rdma_protocol;
         } else {
 #ifdef USE_TCP
             Transport* t = multi_transports_->installTransport("tcp", nullptr);
@@ -522,10 +521,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         // TODO: install other transports automatically
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        // Opt-in: MC_ENABLE_HYLINK=1 (default off). After RDMA/TCP so the
+        // segment protocol becomes "rdma,hylink" or "tcp,hylink". Install
+        // HipTransport below only if HyLink was not installed.
+        if (envFlagEnabled("MC_ENABLE_HYLINK")) {
+            Transport* hylink_transport =
+                multi_transports_->installTransport("hylink", nullptr);
+            if (!hylink_transport) {
+                LOG(WARNING) << "MC_ENABLE_HYLINK is set but failed to install "
+                                "HyLink transport (HSL unavailable)";
+            } else {
+                LOG(INFO) << "MC_ENABLE_HYLINK is set, HyLink transport "
+                             "installed";
+            }
+        }
+#endif
+
 #ifdef USE_HIP
-        // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
-        // coexist with the cross-node transport (RDMA/TCP) selected above.
-        {
+        if (!multi_transports_->getTransport("hylink")) {
             Transport* hip_transport =
                 multi_transports_->installTransport("hip", nullptr);
             if (!hip_transport) {
@@ -836,6 +850,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    clearSkipRegistrationLocked(addr);
     eraseMemoryRegionLocked(addr);
     return 0;
 }
@@ -928,6 +943,10 @@ void TransferEngineImpl::rollbackAllRegistrations(
             record.transport->unregisterLocalMemory(record.addr, true);
         }
     }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& record : records) {
+        clearSkipRegistrationLocked(record.addr);
+    }
 }
 
 int TransferEngineImpl::mp_unregisterLocalMemory(
@@ -953,6 +972,7 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& buffer : buffer_list) {
+            if (protocol == "rdma") clearSkipRegistrationLocked(buffer.addr);
             eraseMemoryRegionLocked(buffer.addr);
         }
     }
@@ -1008,6 +1028,13 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
         if (ret) {
+            // The transport only reports the regions that failed. The ones
+            // that did register are released below too, so say so here.
+            LOG(ERROR) << "Failed to register a batch of " << buffer_list.size()
+                       << " memory region(s) with transport "
+                       << transport->getName() << " (ret=" << ret
+                       << "); unregistering the whole batch, so none of its "
+                          "regions stays registered";
             for (auto it = attempted_transports.rbegin();
                  it != attempted_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
@@ -1038,6 +1065,7 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {
+        clearSkipRegistrationLocked(addr);
         eraseMemoryRegionLocked(addr);
     }
     return 0;
@@ -1108,6 +1136,7 @@ void TransferEngineImpl::releaseMemoryRegions(
     const std::vector<MemoryRegion>& regions) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (const auto& region : regions) {
+        clearSkipRegistrationLocked(region.addr);
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
@@ -1119,6 +1148,15 @@ void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
 
 void TransferEngineImpl::eraseMemoryRegionLocked(void* addr) {
     local_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
+}
+
+void TransferEngineImpl::clearSkipRegistrationLocked(void* addr) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // Clear the skip record before releasing mutex_ and allowing address reuse.
+    auto* rdma =
+        dynamic_cast<RdmaTransport*>(multi_transports_->getTransport("rdma"));
+    if (rdma) rdma->clearSkipRegistration(addr);
+#endif
 }
 
 #ifdef WITH_METRICS
@@ -1160,6 +1198,11 @@ void TransferEngineImpl::InitializeMetricsConfig() {
                          << interval_env
                          << ", using default: " << metrics_interval_seconds_;
         }
+    }
+
+    if (metrics_enabled_) {
+        TransferEngineMetrics::enable();
+        TransferEngineMetrics::instance().initializeFromEnv();
     }
 }
 

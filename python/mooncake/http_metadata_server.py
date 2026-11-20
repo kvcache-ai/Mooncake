@@ -8,7 +8,10 @@ used by Mooncake. It can be used as an alternative to etcd for metadata storage.
 
 import argparse
 import asyncio
+import hmac
+import ipaddress
 import logging
+import os
 import signal
 import sys
 import threading
@@ -16,6 +19,28 @@ from enum import Enum
 from time import sleep
 
 from aiohttp import web
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class KVPoll(Enum):
@@ -40,20 +65,77 @@ class KVBootstrapServer:
         """
         self.port = port
         self.host = host
-        self.app = web.Application()
+        self.max_body_bytes = _int_env("MC_METADATA_MAX_BODY_BYTES", 1 << 20)
+        self.max_concurrent_puts = _int_env("MC_METADATA_MAX_CONCURRENT_PUTS", 8)
+        self.app = web.Application(client_max_size=self.max_body_bytes)
         self.store = dict()
         self.lock = asyncio.Lock()
+        self._put_slots = asyncio.Semaphore(self.max_concurrent_puts)
+        # Shared-token authentication (#4444). Both this server and every
+        # engine's HTTPStoragePlugin read the same env. Unset is only
+        # tolerated on loopback binds or with an explicit insecure opt-in;
+        # run() refuses anything else.
+        self.auth_token = os.environ.get("MC_METADATA_HTTP_TOKEN") or None
+        # Store quotas account for key and value payload bytes. A separate
+        # semaphore bounds concurrent request-body reads so parallel PUTs
+        # cannot multiply the per-body memory cap without bound.
+        self.max_keys = _int_env("MC_METADATA_MAX_KEYS", 65536)
+        self.max_total_bytes = _int_env("MC_METADATA_MAX_TOTAL_BYTES", 1 << 30)
+        self._total_bytes = 0
         self._loop = None
         self._runner = None
         self.thread = None
         self._setup_routes()
 
+    @staticmethod
+    def _insecure_opted_in() -> bool:
+        return os.environ.get("MC_METADATA_HTTP_ALLOW_INSECURE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
     def run(self):
-        """Start the server in a background thread."""
+        """Start the server in a background thread.
+
+        Refuses to start when bound to a non-loopback address with no
+        authentication token: that combination serves unauthenticated
+        GET/PUT/DELETE to the network. Set MC_METADATA_HTTP_TOKEN, bind a
+        loopback address, or export MC_METADATA_HTTP_ALLOW_INSECURE=1 to
+        keep the legacy open behavior.
+        """
+        if (
+            self.auth_token is None
+            and not _is_loopback(self.host)
+            and not self._insecure_opted_in()
+        ):
+            raise RuntimeError(
+                f"HTTP Metadata Server refuses to bind {self.host}:{self.port} "
+                "without an authentication token: anyone who can reach this "
+                "port could read and rewrite cluster metadata. Set "
+                "MC_METADATA_HTTP_TOKEN here and on every engine, bind a "
+                "loopback address, or export MC_METADATA_HTTP_ALLOW_INSECURE=1 "
+                "to keep the legacy open behavior."
+            )
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
         logging.info(f"HTTP Metadata Server started on {self.host}:{self.port}")
+        if self.auth_token is None and not _is_loopback(self.host):
+            logging.warning(
+                f"HTTP Metadata Server is bound to {self.host} with no "
+                "authentication token (MC_METADATA_HTTP_ALLOW_INSECURE "
+                "opt-in): anyone who can reach this port can read and "
+                "rewrite cluster metadata. Set MC_METADATA_HTTP_TOKEN here "
+                "and on every engine."
+            )
         return self.thread
+
+    def _token_ok(self, request: web.Request) -> bool:
+        header = request.headers.get("Authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not presented:
+            return False
+        return hmac.compare_digest(presented.encode(), self.auth_token.encode())
 
     def _setup_routes(self):
         """Set up the HTTP routes."""
@@ -61,6 +143,11 @@ class KVBootstrapServer:
 
     async def _handle_metadata(self, request: web.Request):
         """Handle metadata requests."""
+        if self.auth_token is not None and not self._token_ok(request):
+            return web.Response(
+                text="unauthorized", status=401, content_type="application/json"
+            )
+
         key = request.query.get("key", "").strip()
         if not key:
             return web.Response(
@@ -72,6 +159,15 @@ class KVBootstrapServer:
         if request.method == "GET":
             return await self._handle_get(key)
         elif request.method == "PUT":
+            if (
+                request.content_length is not None
+                and request.content_length > self.max_body_bytes
+            ):
+                return web.Response(
+                    text="request body too large",
+                    status=413,
+                    content_type="application/json",
+                )
             return await self._handle_put(key, request)
         elif request.method == "DELETE":
             return await self._handle_delete(key)
@@ -89,9 +185,14 @@ class KVBootstrapServer:
             )
         return web.Response(body=value, status=200, content_type="application/json")
 
+    @staticmethod
+    def _entry_bytes(key: str, value: bytes) -> int:
+        return len(key.encode("utf-8")) + len(value)
+
     async def _handle_put(self, key, request):
         """Handle PUT requests."""
-        data = await request.read()
+        async with self._put_slots:
+            data = await request.read()
         async with self.lock:
             if key.find("rpc_meta") != -1 and key in self.store:
                 # Re-publishing the same rpc_meta value is idempotent; only a
@@ -108,7 +209,26 @@ class KVBootstrapServer:
                     status=400,
                     content_type="application/json",
                 )
+            old = self.store.get(key)
+            if old is None and len(self.store) >= self.max_keys:
+                return web.Response(
+                    text="metadata key budget exhausted",
+                    status=507,
+                    content_type="application/json",
+                )
+            new_total = (
+                self._total_bytes
+                - (self._entry_bytes(key, old) if old is not None else 0)
+                + self._entry_bytes(key, data)
+            )
+            if new_total > self.max_total_bytes:
+                return web.Response(
+                    text="metadata size budget exhausted",
+                    status=507,
+                    content_type="application/json",
+                )
             self.store[key] = data
+            self._total_bytes = new_total
         return web.Response(
             text="metadata updated", status=200, content_type="application/json"
         )
@@ -122,6 +242,7 @@ class KVBootstrapServer:
                     status=404,
                     content_type="application/json",
                 )
+            self._total_bytes -= self._entry_bytes(key, self.store[key])
             del self.store[key]
         return web.Response(
             text="metadata deleted", status=200, content_type="application/json"

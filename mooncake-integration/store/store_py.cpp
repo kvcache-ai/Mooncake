@@ -2,17 +2,15 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
-#include <functional>
 #include <limits>
 #include <mutex>
-#include <numeric>
 #include <optional>
-#include <unordered_map>
 #include <unordered_set>
 
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "common.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -24,64 +22,12 @@
 
 #include "integration_utils.h"
 #include "buffer_pool.h"
-
-// Forward declaration for EngramStore bindings
-namespace mooncake {
-namespace engram {
-void bind_engram_store(py::module &m);
-}
-}  // namespace mooncake
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
+#include "store_py_internal.h"
 
 namespace py = pybind11;
 
 namespace mooncake {
 namespace {
-
-struct PyTensorInfo {
-    uintptr_t data_ptr;
-    size_t tensor_size;
-    TensorMetadata metadata;
-    py::object owner;
-
-    bool valid() const {
-        // Basic size check
-        if (data_ptr == 0 && tensor_size != 0) {
-            return false;
-        }
-
-        // Validate metadata
-        TensorMetadata validated = metadata;
-        validated.header.data_bytes = tensor_size;
-
-        // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
-        // excluding UNKNOWN=-1)
-        if (validated.header.dtype >=
-            static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
-            return false;
-        }
-
-        // Check ndim is within valid range (0 to shape array size)
-        const int kMaxDims = kMaxTensorDims;
-        if (validated.header.ndim < 0 || validated.header.ndim > kMaxDims) {
-            return false;
-        }
-
-        // Validate shape array
-        // For valid dimensions (0 to ndim-1), shape should be >= 0
-        auto shape = TensorShapeToVector(validated.layout.local_shape,
-                                         validated.header.ndim);
-        for (int i = 0; i < validated.header.ndim; ++i) {
-            if (shape[i] < 0) {
-                return false;  // Invalid dimension size
-            }
-        }
-
-        return ValidateTensorMetadata(
-            validated, validated.header.data_offset + tensor_size);
-    }
-};
 
 // A serialized tensor object is laid out as [metadata][payload].  The raw
 // *_tensor_from APIs accept host, pinned-host, and device addresses.  Reading
@@ -146,79 +92,6 @@ std::optional<RawTensorObjectParts> make_raw_tensor_object_parts(
     // pointer appear unregistered.
     parts.metadata_ptr = buffer_ptr;
     return parts;
-}
-
-TensorMetadata build_full_tensor_metadata(const py::handle &tensor,
-                                          TensorDtype dtype_enum,
-                                          size_t tensor_size);
-std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
-    BufferHandle *buffer_handle, char *usr_buffer, int64_t data_length,
-    bool *take_ownership, char **exported_data, size_t *total_length);
-std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
-                                                  int shard_count);
-
-PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
-                                      const std::string &key_name,
-                                      bool require_contiguous,
-                                      const char *role) {
-    PyTensorInfo info = {0, 0, {}, py::none()};
-    if (!(tensor.attr("__class__")
-              .attr("__name__")
-              .cast<std::string>()
-              .find("Tensor") != std::string::npos)) {
-        LOG(ERROR) << role << " " << (key_name.empty() ? "" : "for " + key_name)
-                   << " is not a PyTorch tensor";
-        return info;
-    }
-
-    try {
-        if (require_contiguous &&
-            !tensor.attr("is_contiguous")().cast<bool>()) {
-            LOG(ERROR) << role << " "
-                       << (key_name.empty() ? "" : "for " + key_name)
-                       << " must be contiguous";
-            return info;
-        }
-
-        py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
-        info.owner = inspected;
-        info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
-        size_t numel = inspected.attr("numel")().cast<size_t>();
-        size_t element_size = inspected.attr("element_size")().cast<size_t>();
-        info.tensor_size = numel * element_size;
-
-        TensorDtype dtype_enum = get_tensor_dtype(inspected.attr("dtype"));
-        if (dtype_enum == TensorDtype::UNKNOWN) {
-            LOG(ERROR) << "Unsupported tensor dtype"
-                       << (key_name.empty() ? "" : " for " + key_name);
-            return {0, 0, {}, py::none()};
-        }
-        int32_t ndim = static_cast<int32_t>(py::len(inspected.attr("shape")));
-        if (ndim > static_cast<int32_t>(kMaxTensorDims)) {
-            LOG(ERROR) << "Tensor has more than " << kMaxTensorDims
-                       << " dimensions: " << ndim;
-            return {0, 0, {}, py::none()};
-        }
-        info.metadata =
-            build_full_tensor_metadata(inspected, dtype_enum, info.tensor_size);
-    } catch (const std::exception &e) {
-        LOG(ERROR) << "Error extracting tensor info: " << e.what();
-        return {0, 0, {}, py::none()};
-    }
-
-    return info;
-}
-
-PyTensorInfo extract_tensor_info(const py::object &tensor,
-                                 const std::string &key_name = "") {
-    return extract_tensor_info_impl(tensor, key_name, false, "Input");
-}
-
-PyTensorInfo extract_tensor_destination_info(const py::object &tensor,
-                                             const std::string &key_name = "") {
-    return extract_tensor_info_impl(tensor, key_name, true,
-                                    "Destination tensor");
 }
 
 py::tuple tensor_shape_tuple(const TensorMetadata &metadata) {
@@ -491,7 +364,52 @@ inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
 }
 
-#include "store_py_internal.h"
+// View a Python buffer as the bytes it covers. `buffer_info::size` counts
+// elements, not bytes, so the byte length is size * itemsize; a span cannot
+// describe a non-contiguous buffer, so those are rejected. Call this before
+// releasing the GIL: it may raise.
+inline std::span<const char> contiguous_buffer_span(
+    const py::buffer_info &info) {
+    if (info.size > 0) {
+        py::ssize_t expected_stride = info.itemsize;
+        for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+            if (info.shape[dim] > 1 && info.strides[dim] != expected_stride) {
+                throw py::value_error(
+                    "value must be a C-contiguous buffer (bytes, bytearray, "
+                    "or a contiguous array); got a strided view");
+            }
+            expected_stride *= info.shape[dim];
+        }
+    }
+    return {static_cast<const char *>(info.ptr),
+            static_cast<size_t>(info.size * info.itemsize)};
+}
+
+void append_tensor_write_buffers(const PyTensorInfo &info,
+                                 std::vector<void *> &buffers,
+                                 std::vector<size_t> &sizes) {
+    buffers.push_back(const_cast<TensorMetadata *>(&info.metadata));
+    sizes.push_back(info.metadata.header.data_offset);
+    if (info.tensor_size > 0) {
+        buffers.push_back(reinterpret_cast<void *>(info.data_ptr));
+        sizes.push_back(info.tensor_size);
+    }
+}
+
+void apply_tensor_batch_results(std::vector<int> &results,
+                                const std::vector<size_t> &original_indices,
+                                const std::vector<int> &op_results,
+                                const char *operation_name) {
+    if (op_results.size() != original_indices.size()) {
+        LOG(ERROR) << operation_name << " returned unexpected result count";
+        for (size_t index : original_indices) {
+            results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+        }
+        return;
+    }
+    for (size_t i = 0; i < op_results.size(); ++i)
+        results[original_indices[i]] = op_results[i];
+}
 
 }  // namespace
 
@@ -499,12 +417,13 @@ class RangedReadSnapshotPy {
    public:
     RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
                          std::vector<std::string> keys)
-        : store_(std::move(store)), keys_(std::move(keys)) {
-        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+        : store_(store), keys_(std::move(keys)) {
+        snapshot_ = store->prepare_get_into_ranges_snapshot(keys_);
     }
 
     bool belongs_to(const std::shared_ptr<PyClient> &store) const {
-        return store_.get() == store.get();
+        const auto owner = store_.lock();
+        return owner && owner.get() == store.get();
     }
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
@@ -514,16 +433,28 @@ class RangedReadSnapshotPy {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (snapshot_.should_refresh()) {
-            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        // A snapshot must not keep a closed Store and its segments alive;
+        // reject use after close instead of reading through a torn-down
+        // client.
+        auto store = store_.lock();
+        if (!store) {
+            throw std::runtime_error(
+                "RangedReadSnapshot is no longer usable: the Store was "
+                "closed");
         }
-        return store_->get_into_ranges_from_snapshot(
+        if (snapshot_.should_refresh()) {
+            store->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store->get_into_ranges_from_snapshot(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
             snapshot_);
     }
 
    private:
-    std::shared_ptr<PyClient> store_;
+    // Weak by design: an idle snapshot must not extend the native client's
+    // lifetime beyond close(), otherwise its segments stay published and a
+    // later reader can observe a stale MEMORY replica (issue #5464).
+    std::weak_ptr<PyClient> store_;
     std::vector<std::string> keys_;
     PyClient::RangedReadSnapshot snapshot_;
     std::mutex mutex_;
@@ -1171,68 +1102,41 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {
-        ReplicateConfig indexed_config = config;
-        if (config.session_ids) {
-            indexed_config.session_ids->clear();
-            for (size_t index : original_indices) {
-                indexed_config.session_ids->push_back(
-                    config.session_ids->at(index));
-            }
-        }
-        if (!config.group_ids.has_value()) {
-            return indexed_config;
-        }
-
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size());
-        for (size_t index : original_indices) {
-            group_ids.push_back(config.group_ids->at(index));
-        }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return config.ForKeySubset(original_indices);
     }
 
     ReplicateConfig MakeRepeatedIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
-        ReplicateConfig indexed_config = config;
-        if (config.session_ids) {
-            indexed_config.session_ids->clear();
-            for (size_t index : original_indices) {
-                for (int i = 0; i < repeat_count; ++i) {
-                    indexed_config.session_ids->push_back(
-                        config.session_ids->at(index));
-                }
-            }
+        if (!config.group_ids && !config.session_ids &&
+            !config.residency_affinity_ids &&
+            !config.per_key_preferred_hca_names) {
+            return config;
         }
-        if (!config.group_ids.has_value()) {
-            return indexed_config;
-        }
-
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size() *
-                          static_cast<size_t>(repeat_count));
+        std::vector<size_t> shard_indices;
+        shard_indices.reserve(original_indices.size() *
+                              static_cast<size_t>(repeat_count));
         for (size_t index : original_indices) {
             for (int i = 0; i < repeat_count; ++i) {
-                group_ids.push_back(config.group_ids->at(index));
+                shard_indices.push_back(index);
             }
         }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return config.ForKeySubset(shard_indices);
     }
 
-    std::vector<int> ValidateGroupIdsForBatchConfig(
-        const ReplicateConfig &config, size_t key_count,
-        const char *operation_name) const {
+    std::vector<int> ValidateBatchKeyHints(const ReplicateConfig &config,
+                                           size_t key_count,
+                                           const char *operation_name) const {
         if (!config.ValidSessionIds(key_count)) {
             LOG(ERROR) << operation_name << ": invalid per-key session IDs";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
-        if (config.group_ids.has_value() &&
-            config.group_ids->size() != key_count) {
-            LOG(ERROR) << operation_name
-                       << ": group_ids size must match keys size";
+        if (!config.HasValidKeyHints(key_count)) {
+            LOG(ERROR)
+                << operation_name
+                << ": group, affinity and per-key HCA hint counts must match "
+                   "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1243,9 +1147,20 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        if (!config.ValidSessionIds(1))
+        // Single-tensor TP keeps per-shard group/HCA hints. Session and
+        // residency affinity IDs describe the source tensor, not each shard.
+        if (!config.ValidSessionIds(1) ||
+            (config.residency_affinity_ids &&
+             config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
+            ReplicateConfig tp_config = config;
+            if (config.residency_affinity_ids) {
+                tp_config.residency_affinity_ids = std::vector<std::string>(
+                    tp_size, config.residency_affinity_ids->front());
+            }
+            if (!tp_config.HasValidKeyHints(tp_size))
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
@@ -1257,7 +1172,6 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            ReplicateConfig tp_config = config;
             if (config.session_ids) {
                 tp_config.session_ids =
                     std::vector<std::string>(tp_size, config.SessionId());
@@ -1292,6 +1206,8 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto config_error = ValidateBatchKeyHints(config, keys.size(), "put");
+        if (!config_error.empty()) return config_error;
         if (auto cuda_ipc_results =
                 try_dummy_cuda_ipc_batch_put_tensor_impl(keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1318,6 +1234,9 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto config_error =
+            ValidateBatchKeyHints(config, keys.size(), "upsert");
+        if (!config_error.empty()) return config_error;
         if (auto cuda_ipc_results = try_dummy_cuda_ipc_batch_upsert_tensor_impl(
                 keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1381,10 +1300,10 @@ class MooncakeStorePyWrapper {
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-        auto group_ids_error = ValidateGroupIdsForBatchConfig(
-            config, base_keys.size(), "batch_put_tensor_with_tp");
-        if (!group_ids_error.empty()) {
-            return group_ids_error;
+        auto config_error = ValidateBatchKeyHints(config, base_keys.size(),
+                                                  "batch_put_tensor_with_tp");
+        if (!config_error.empty()) {
+            return config_error;
         }
         try {
             for (size_t i = 0; i < base_keys.size(); ++i) {
@@ -1563,26 +1482,6 @@ class MooncakeStorePyWrapper {
         return results[0];
     }
 
-    int put_manifest_impl(const std::string &key,
-                          const WriterShardManifest &manifest,
-                          const ReplicateConfig &config) {
-        return write_manifest_impl(
-            key, manifest, "put",
-            [this, &key, &config](std::span<const char> bytes) {
-                return store_->put(key, bytes, config);
-            });
-    }
-
-    int upsert_manifest_impl(const std::string &key,
-                             const WriterShardManifest &manifest,
-                             const ReplicateConfig &config) {
-        return write_manifest_impl(
-            key, manifest, "upsert",
-            [this, &key, &config](std::span<const char> bytes) {
-                return store_->upsert(key, bytes, config);
-            });
-    }
-
     int put_tensor_with_tp_from(const std::string &key, uintptr_t buffer_ptr,
                                 size_t size, int tp_rank = 0, int tp_size = 1,
                                 int split_dim = 0) {
@@ -1671,62 +1570,302 @@ class MooncakeStorePyWrapper {
         return final_results;
     }
 
-#include "store_py_parallel_write.h"
+    template <typename CudaIpcBatchWriteFn>
+    std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_write_tensor_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+        const char *operation_name, CudaIpcBatchWriteFn &&write_cuda_ipc) {
+        if (!use_dummy_client_ || keys.size() != infos.size())
+            return std::nullopt;
 
-    std::shared_ptr<RealClient> get_real_client() const {
-        if (use_dummy_client_) {
-            return nullptr;
+        struct CudaStreamContext {
+            int32_t device_id;
+            uintptr_t stream_handle;
+        };
+        std::vector<std::optional<CudaStreamContext>> cuda_stream_contexts(
+            infos.size());
+        for (size_t i = 0; i < infos.size(); ++i) {
+            const py::object &owner = infos[i].owner;
+            if (!infos[i].valid() || !owner || owner.is_none()) continue;
+
+            try {
+                if (!owner.attr("is_cuda").cast<bool>()) continue;
+                cuda_stream_contexts[i] = CudaStreamContext{
+                    .device_id = owner.attr("get_device")().cast<int32_t>(),
+                    .stream_handle =
+                        torch_module()
+                            .attr("cuda")
+                            .attr("current_stream")(owner.attr("device"))
+                            .attr("cuda_stream")
+                            .cast<uintptr_t>(),
+                };
+            } catch (const py::error_already_set &) {
+                PyErr_Clear();
+            } catch (const py::cast_error &) {
+                PyErr_Clear();
+            }
         }
-        return real_client_;
+
+        std::vector<int> results(keys.size(), 0);
+        py::gil_scoped_release release_gil;
+
+        std::vector<std::optional<CudaIpcBufferHandle>> ipc_payloads(
+            infos.size());
+        for (size_t i = 0; i < infos.size(); ++i) {
+            if (!infos[i].valid()) {
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            if (infos[i].tensor_size == 0) return std::nullopt;
+
+            auto payload = mooncake::device::ExportCudaIpcBuffer(
+                reinterpret_cast<const void *>(infos[i].data_ptr),
+                infos[i].tensor_size);
+            if (!payload) return std::nullopt;
+            ipc_payloads[i] = std::move(*payload);
+        }
+
+        bool stream_context_invalid = false;
+        for (size_t i = 0; i < infos.size(); ++i) {
+            if (!ipc_payloads[i].has_value()) continue;
+            if (!cuda_stream_contexts[i].has_value() ||
+                cuda_stream_contexts[i]->device_id !=
+                    ipc_payloads[i]->device_id) {
+                results[i] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                stream_context_invalid = true;
+            }
+        }
+        if (stream_context_invalid) {
+            LOG(ERROR) << "CUDA IPC tensor stream context validation failed";
+            for (size_t i = 0; i < infos.size(); ++i) {
+                if (ipc_payloads[i].has_value()) {
+                    results[i] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
+            }
+            return results;
+        }
+
+        std::vector<CudaIpcWriteRequest> write_requests;
+        std::vector<size_t> original_indices;
+        std::vector<std::unique_ptr<BufferHandle>> metadata_allocations;
+        std::vector<std::pair<int32_t, uintptr_t>> unique_streams;
+        write_requests.reserve(infos.size());
+        original_indices.reserve(infos.size());
+        metadata_allocations.reserve(infos.size());
+        unique_streams.reserve(infos.size());
+
+        for (size_t i = 0; i < infos.size(); ++i) {
+            if (!ipc_payloads[i].has_value()) continue;
+
+            size_t metadata_size = infos[i].metadata.header.data_offset;
+            auto metadata = store_->allocate_client_buffer(metadata_size);
+            if (!metadata) {
+                results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+
+            std::memcpy(metadata->ptr(), &infos[i].metadata, metadata_size);
+            write_requests.push_back(CudaIpcWriteRequest{
+                .key = keys[i],
+                .metadata =
+                    CudaIpcShmBufferRef{
+                        .ptr = reinterpret_cast<uint64_t>(metadata->ptr()),
+                        .size = static_cast<uint64_t>(metadata_size),
+                    },
+                .payload = *ipc_payloads[i],
+            });
+            original_indices.push_back(i);
+            metadata_allocations.push_back(
+                std::make_unique<BufferHandle>(std::move(*metadata)));
+
+            const CudaStreamContext &stream_context = *cuda_stream_contexts[i];
+            bool stream_is_unique = true;
+            for (const auto &[device_id, stream_handle] : unique_streams) {
+                if (device_id == stream_context.device_id &&
+                    stream_handle == stream_context.stream_handle) {
+                    stream_is_unique = false;
+                    break;
+                }
+            }
+            if (stream_is_unique) {
+                unique_streams.emplace_back(stream_context.device_id,
+                                            stream_context.stream_handle);
+            }
+        }
+
+        if (!write_requests.empty()) {
+            ReplicateConfig write_config =
+                MakeIndexedConfig(config, original_indices);
+            auto dummy_client = std::static_pointer_cast<DummyClient>(store_);
+            for (const auto &[device_id, stream_handle] : unique_streams) {
+                if (!mooncake::device::SynchronizeCudaStream(device_id,
+                                                             stream_handle)) {
+                    LOG(ERROR)
+                        << "CUDA IPC tensor stream synchronization failed";
+                    for (size_t index : original_indices) {
+                        results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                    }
+                    return results;
+                }
+            }
+            std::vector<int> op_results =
+                write_cuda_ipc(dummy_client, write_requests, write_config);
+            if (!apply_indexed_results(operation_name, op_results,
+                                       original_indices, results)) {
+                return results;
+            }
+        }
+        return results;
     }
 
-    std::optional<RealClient::WritableBufferRegion>
-    resolve_writable_buffer_region(uintptr_t buffer_ptr, size_t size,
-                                   const std::string &context) const {
-        auto real_client = get_real_client();
-        if (!real_client) {
-            LOG(ERROR) << context << ": real client is not available";
-            return std::nullopt;
-        }
-
-        auto region = real_client->resolve_writable_buffer_region(
-            reinterpret_cast<void *>(buffer_ptr));
-        if (!region.has_value()) {
-            LOG(ERROR) << context
-                       << ": buffer is not Store-managed writable memory";
-            return std::nullopt;
-        }
-
-        if (region->offset + size > region->size) {
-            LOG(ERROR) << context << ": buffer range exceeds writable region";
-            return std::nullopt;
-        }
-
-        return region;
+    std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
+        return try_dummy_cuda_ipc_batch_write_tensor_impl(
+            keys, infos, config, "put",
+            [](auto dummy_client, const auto &requests,
+               const auto &write_config) {
+                return dummy_client->batch_put_from_cuda_ipc(requests,
+                                                             write_config);
+            });
     }
 
-    std::optional<ParsedParallelismManifest> load_parallelism_manifest(
-        const std::string &key, const std::string &context) const {
-        std::shared_ptr<BufferHandle> manifest_handle;
+    std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_upsert_tensor_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
+        return try_dummy_cuda_ipc_batch_write_tensor_impl(
+            keys, infos, config, "upsert",
+            [](auto dummy_client, const auto &requests,
+               const auto &write_config) {
+                return dummy_client->batch_upsert_from_cuda_ipc(requests,
+                                                                write_config);
+            });
+    }
+
+    template <typename StagedBatchWriteFn, typename DirectBatchWriteFn>
+    std::vector<int> batch_write_tensor_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+        const char *operation_name, StagedBatchWriteFn &&staged_batch_write,
+        DirectBatchWriteFn &&direct_batch_write) {
+        if (keys.size() != infos.size()) {
+            LOG(ERROR) << operation_name
+                       << ": keys and tensor infos must have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        std::vector<int> results(keys.size(), 0);
         {
             py::gil_scoped_release release_gil;
-            manifest_handle =
-                store_->get_buffer(get_parallelism_manifest_key_name(key));
-        }
-        auto parsed_manifest =
-            parse_writer_shard_manifest(manifest_handle.get());
-        if (!parsed_manifest.has_value()) {
-            return std::nullopt;
-        }
-        if (parsed_manifest->manifest.header.ndim !=
-            static_cast<int32_t>(parsed_manifest->global_shape.size())) {
-            LOG(ERROR) << context << ": invalid parallelism manifest shape";
-            return std::nullopt;
-        }
-        return parsed_manifest;
-    }
+            std::vector<std::string> valid_keys;
+            std::vector<size_t> original_indices;
+            valid_keys.reserve(infos.size());
+            original_indices.reserve(infos.size());
 
-#include "store_py_parallel_read.h"
+            auto run_staged_write = [&]() -> std::vector<int> {
+                auto runtime_accelerator =
+                    mooncake::device::GetAcceleratorRegistry()
+                        .RuntimeAccelerators();
+                std::vector<void *> buffer_ptrs;
+                std::vector<size_t> buffer_sizes;
+                std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+                buffer_ptrs.reserve(infos.size());
+                buffer_sizes.reserve(infos.size());
+                temp_allocations.reserve(infos.size());
+
+                for (size_t i = 0; i < infos.size(); ++i) {
+                    if (!infos[i].valid()) {
+                        results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                        continue;
+                    }
+
+                    size_t total_size = infos[i].metadata.header.data_offset +
+                                        infos[i].tensor_size;
+                    auto alloc_result =
+                        store_->allocate_client_buffer(total_size);
+                    if (!alloc_result) {
+                        LOG(ERROR) << "Failed to allocate buffer for "
+                                   << operation_name << " key: " << keys[i];
+                        results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
+                        continue;
+                    }
+
+                    char *dst = static_cast<char *>(alloc_result->ptr());
+                    std::memcpy(dst, &infos[i].metadata,
+                                infos[i].metadata.header.data_offset);
+                    if (infos[i].tensor_size > 0) {
+                        if (!runtime_accelerator.CopyToHost(
+                                dst + infos[i].metadata.header.data_offset,
+                                reinterpret_cast<const void *>(
+                                    infos[i].data_ptr),
+                                infos[i].tensor_size)) {
+                            LOG(ERROR) << "Failed to copy tensor payload for "
+                                       << operation_name << " key: " << keys[i];
+                            results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                            continue;
+                        }
+                    }
+
+                    valid_keys.push_back(keys[i]);
+                    buffer_ptrs.push_back(alloc_result->ptr());
+                    buffer_sizes.push_back(total_size);
+                    original_indices.push_back(i);
+                    temp_allocations.push_back(std::make_unique<BufferHandle>(
+                        std::move(*alloc_result)));
+                }
+
+                if (!valid_keys.empty()) {
+                    ReplicateConfig write_config =
+                        MakeIndexedConfig(config, original_indices);
+                    std::vector<int> op_results = staged_batch_write(
+                        valid_keys, buffer_ptrs, buffer_sizes, write_config);
+                    apply_tensor_batch_results(results, original_indices,
+                                               op_results, operation_name);
+                }
+                return results;
+            };
+
+            if (use_dummy_client_) return run_staged_write();
+
+            if (!real_client_) {
+                LOG(ERROR) << operation_name
+                           << ": real client is not available";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+
+            std::vector<std::vector<void *>> all_buffers;
+            std::vector<std::vector<size_t>> all_sizes;
+            all_buffers.reserve(infos.size());
+            all_sizes.reserve(infos.size());
+
+            for (size_t i = 0; i < infos.size(); ++i) {
+                if (!infos[i].valid()) {
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+
+                all_buffers.emplace_back();
+                all_sizes.emplace_back();
+                append_tensor_write_buffers(infos[i], all_buffers.back(),
+                                            all_sizes.back());
+                valid_keys.push_back(keys[i]);
+                original_indices.push_back(i);
+            }
+
+            if (!valid_keys.empty()) {
+                ReplicateConfig write_config =
+                    MakeIndexedConfig(config, original_indices);
+                std::vector<int> op_results = direct_batch_write(
+                    valid_keys, all_buffers, all_sizes, write_config);
+                apply_tensor_batch_results(results, original_indices,
+                                           op_results, operation_name);
+            }
+        }
+
+        return results;
+    }
 
     // --- Upsert tensor methods ---
 
@@ -1765,41 +1904,6 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         return upsert_tensor_impl(key, tensor, ReplicateConfig{});
-    }
-
-    int upsert_tensor_with_tp_impl(
-        const std::string &key, pybind11::object tensor,
-        const ReplicateConfig &config = ReplicateConfig{}, int tp_size = 1,
-        int split_dim = 0) {
-        try {
-            auto infos = build_tp_shard_infos(
-                tensor, tp_size, split_dim,
-                [this, &key](int rank) { return get_tp_key_name(key, rank); });
-            if (!infos.has_value()) {
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            std::vector<std::string> tp_keys;
-            tp_keys.reserve(tp_size);
-            for (int rank = 0; rank < tp_size; ++rank) {
-                tp_keys.push_back(get_tp_key_name(key, rank));
-            }
-            auto results =
-                batch_upsert_tensor_infos_impl(tp_keys, *infos, config);
-            if (results.size() != tp_keys.size()) {
-                LOG(ERROR) << "Upsert with TP returned " << results.size()
-                           << " results, expected " << tp_keys.size();
-                return to_py_ret(ErrorCode::INTERNAL_ERROR);
-            }
-            for (int ret : results) {
-                if (ret != 0) return ret;
-            }
-            return 0;
-
-        } catch (const std::exception &e) {
-            LOG(ERROR) << "Failed to upsert tensor with tp: " << e.what();
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
     }
 
     std::vector<int> batch_upsert_tensor_from(
@@ -2196,6 +2300,38 @@ PYBIND11_MODULE(_store, m) {
                 config.session_ids.reset();
                 if (ids) config.session_ids = std::move(*ids);
             })
+        .def_property(
+            "residency_affinity_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.residency_affinity_ids) return std::nullopt;
+                return *config.residency_affinity_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.residency_affinity_ids.reset();
+                if (ids) config.residency_affinity_ids = std::move(*ids);
+            })
+        .def_property(
+            "preferred_hca_names",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                return config.preferred_hca_names;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> value) {
+                config.preferred_hca_names = std::move(value);
+            })
+        .def_property(
+            "per_key_preferred_hca_names",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::vector<std::string>>> {
+                return config.per_key_preferred_hca_names;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::vector<std::string>>> value) {
+                config.per_key_preferred_hca_names = std::move(value);
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -2210,6 +2346,15 @@ PYBIND11_MODULE(_store, m) {
         .value("REMOVED", ReplicaStatus::REMOVED)
         .value("FAILED", ReplicaStatus::FAILED)
         .export_values();
+
+    py::class_<ExistOptions>(m, "ExistOptions")
+        .def(py::init<>())
+        .def_readwrite("prefetch_to_memory", &ExistOptions::prefetch_to_memory)
+        .def("__str__", [](const ExistOptions &options) {
+            std::ostringstream oss;
+            oss << options;
+            return oss.str();
+        });
 
     py::class_<MemoryDescriptor>(m, "MemoryDescriptor")
         .def_readwrite("buffer_descriptor",
@@ -2267,6 +2412,7 @@ PYBIND11_MODULE(_store, m) {
         .value("PROCESSING", TaskStatus::PROCESSING)
         .value("SUCCESS", TaskStatus::SUCCESS)
         .value("FAILED", TaskStatus::FAILED)
+        .value("CANCELED", TaskStatus::CANCELED)
         .export_values();
 
     py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
@@ -2292,6 +2438,42 @@ PYBIND11_MODULE(_store, m) {
                 << ", message=\"" << self.message << "\")";
             return oss.str();
         });
+
+    py::enum_<JobType>(m, "JobType").value("DRAIN", JobType::DRAIN);
+    py::enum_<JobStatus>(m, "JobStatus")
+        .value("CREATED", JobStatus::CREATED)
+        .value("PLANNING", JobStatus::PLANNING)
+        .value("RUNNING", JobStatus::RUNNING)
+        .value("SUCCEEDED", JobStatus::SUCCEEDED)
+        .value("FAILED", JobStatus::FAILED)
+        .value("CANCELED", JobStatus::CANCELED)
+        .value("CANCELING", JobStatus::CANCELING)
+        .value("TIMED_OUT", JobStatus::TIMED_OUT);
+
+    py::class_<QueryJobResponse>(m, "QueryJobResponse")
+        .def_readonly("id", &QueryJobResponse::id)
+        .def_readonly("type", &QueryJobResponse::type)
+        .def_readonly("status", &QueryJobResponse::status)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryJobResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryJobResponse::last_updated_at_ms_epoch)
+        .def_readonly("segments", &QueryJobResponse::segments)
+        .def_readonly("succeeded_units", &QueryJobResponse::succeeded_units)
+        .def_readonly("failed_units", &QueryJobResponse::failed_units)
+        .def_readonly("blocked_units", &QueryJobResponse::blocked_units)
+        .def_readonly("active_units", &QueryJobResponse::active_units)
+        .def_readonly("migrated_bytes", &QueryJobResponse::migrated_bytes)
+        .def_readonly("message", &QueryJobResponse::message);
+
+    py::class_<ListDrainJobsResponse>(m, "ListDrainJobsResponse")
+        .def_readonly("jobs", &ListDrainJobsResponse::jobs)
+        .def_readonly("next_page_token",
+                      &ListDrainJobsResponse::next_page_token);
+
+    py::class_<ListTasksResponse>(m, "ListTasksResponse")
+        .def_readonly("tasks", &ListTasksResponse::tasks)
+        .def_readonly("next_page_token", &ListTasksResponse::next_page_token);
 
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
@@ -2387,33 +2569,6 @@ PYBIND11_MODULE(_store, m) {
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
-    // Helper function to extract PyClient shared_ptr from
-    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
-    // PyClient We return it as a Python capsule to avoid type registration
-    // issues
-    m.def(
-        "_get_pyclient_from_wrapper",
-        [](MooncakeStorePyWrapper &wrapper) -> py::object {
-            if (!wrapper.store_) {
-                return py::none();
-            }
-            // Return as a capsule containing the shared_ptr
-            // The caller (engram_store_py.cpp) will extract it
-            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
-            // freed; otherwise release() transfers ownership to the capsule.
-            auto ptr =
-                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
-            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
-            py::object cap = py::capsule(raw_ptr, [](void *p) {
-                delete static_cast<std::shared_ptr<PyClient> *>(p);
-            });
-            (void)ptr.release();  // Transfer ownership to capsule
-            return cap;
-        },
-        py::arg("wrapper"),
-        "Get PyClient from MooncakeDistributedStore (internal use, returns "
-        "capsule)");
-
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
@@ -2514,7 +2669,8 @@ PYBIND11_MODULE(_store, m) {
             "  rdma_devices: RDMA device list.\n"
             "  enable_egm_store_pool: Use EGM DRAM for the global Store pool "
             "(default false; requires protocol 'nvlink', "
-            "global_segment_size>0, and local_buffer_size=0).\n"
+            "global_segment_size>0). Local buffers use the existing "
+            "client-buffer allocator.\n"
             "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
             "IDs; default 'auto').\n"
             "  master_server_addr: Master server address.\n"
@@ -2526,6 +2682,12 @@ PYBIND11_MODULE(_store, m) {
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
             "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "  enable_ssd_prefetch: Enable best-effort SSD-to-DRAM prefetch "
+            "on exist probes (default false).\n"
+            "  ssd_prefetch_cooldown_sec: Prefetch memory-pressure backoff "
+            "in seconds (default 5, 0 disables).\n"
+            "  ssd_prefetch_dedup_ttl_sec: Prefetch per-key dedup/rate-limit "
+            "TTL in seconds (default 30, 0 disables).\n"
             "  enable_embedded_master: Start an in-process master so no "
             "external mooncake_master is required (default false). This is "
             "test/eval plumbing, not a documented deployment mode.")
@@ -2637,20 +2799,32 @@ PYBIND11_MODULE(_store, m) {
             py::arg("keys"), py::arg("force") = false,
             "Batch remove objects by keys. Returns a list of status codes "
             "(0=success, negative=error code) for each key.")
-        .def("is_exist",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                 py::gil_scoped_release release;
-                 return self.store_->isExist(key);
-             })
+        .def(
+            "is_exist",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const ExistOptions &options) {
+                py::gil_scoped_release release;
+                return self.store_->isExist(key, options);
+            },
+            py::arg("key"), py::arg("options") = ExistOptions{},
+            "Check if an object exists. Returns 1 if exists, 0 if not "
+            "exists, negative error code on failure. When "
+            "options.prefetch_to_memory is true and the client is configured "
+            "with enable_ssd_prefetch, SSD-only keys get a best-effort "
+            "asynchronous SSD-to-DRAM promotion so a later get can hit DRAM.")
         .def(
             "batch_is_exist",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys,
+               const ExistOptions &options) {
                 py::gil_scoped_release release;
-                return self.store_->batchIsExist(keys);
+                return self.store_->batchIsExist(keys, options);
             },
-            py::arg("keys"),
-            "Check if multiple objects exist. Returns list of results: 1 if "
+            py::arg("keys"), py::arg("options") = ExistOptions{},
+            "Check if multiple objects exist. When options.prefetch_to_memory "
+            "is true (and enable_ssd_prefetch is configured), triggers "
+            "best-effort SSD-to-DRAM promotion for keys that only have "
+            "LOCAL_DISK replicas. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def(
             "probe_key",
@@ -2932,12 +3106,9 @@ PYBIND11_MODULE(_store, m) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->upsert(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->upsert(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{},
@@ -2990,9 +3161,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3022,7 +3191,10 @@ PYBIND11_MODULE(_store, m) {
             },
             py::arg("buffer_ptr"),
             "Unregister a previously registered memory "
-            "buffer for direct access operations")
+            "buffer for direct access operations. The caller must ensure no "
+            "transfer on this buffer is in flight: deregistration does not "
+            "wait for in-flight RDMA/NoF operations, and freeing or remapping "
+            "the buffer while a transfer is active is unsafe")
         .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,
@@ -3196,12 +3368,9 @@ PYBIND11_MODULE(_store, m) {
                py::buffer buf,
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->put(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->put(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{})
@@ -3247,9 +3416,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3501,7 +3668,149 @@ PYBIND11_MODULE(_store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        .def(
+            "create_drain_job",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &segments,
+               const std::vector<std::string> &target_segments,
+               int64_t max_concurrency, int64_t timeout_ms) -> py::tuple {
+                if (!self.is_client_initialized() || max_concurrency <= 0 ||
+                    max_concurrency > std::numeric_limits<uint32_t>::max() ||
+                    timeout_ms < 0) {
+                    return py::make_tuple(UUID{},
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                CreateDrainJobRequest request{
+                    segments, target_segments,
+                    static_cast<uint32_t>(max_concurrency)};
+                auto result =
+                    timeout_ms == 0
+                        ? self.store_->create_drain_job(request)
+                        : self.store_->create_timed_drain_job(
+                              request, static_cast<uint64_t>(timeout_ms));
+                py::gil_scoped_acquire acquire;
+                return py::make_tuple(result.value_or(UUID{}),
+                                      result ? 0 : toInt(result.error()));
+            },
+            py::arg("segments"),
+            py::arg("target_segments") = std::vector<std::string>{},
+            py::arg("max_concurrency") = 4, py::arg("timeout_ms") = 0,
+            "Start draining mounted memory segments.\n\n"
+            "Args:\n"
+            "    segments: Source segment names.\n"
+            "    target_segments: Target segment names; an empty list lets "
+            "the master choose.\n"
+            "    max_concurrency: Maximum concurrent tasks (default: 4).\n"
+            "    timeout_ms: Timeout in milliseconds from job creation. "
+            "Defaults to 0, which means no timeout is set.\n\n"
+            "On timeout, the job cancels in-flight tasks and keeps "
+            "unfinished sources DRAINING.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (job ID, error code; 0 on success).")
+        .def(
+            "query_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) -> py::tuple {
+                if (!self.is_client_initialized()) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->query_drain_job(job_id);
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("job_id"),
+            "Return (job, error_code). The job is None on error.")
+        .def(
+            "cancel_drain_job",
+            [](MooncakeStorePyWrapper &self, const UUID &job_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_drain_job(job_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("job_id"),
+            "Request cancellation. In-flight moves may finish; query until "
+            "the job reaches CANCELED, or TIMED_OUT if its deadline triggered "
+            "first. Cancellation may wait for an executor or replication "
+            "cleanup. Returns an error code.")
+        .def(
+            "list_drain_jobs",
+            [](MooncakeStorePyWrapper &self, std::optional<JobStatus> status,
+               const std::optional<std::string> &segment, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_drain_jobs(
+                    {status, segment, page_token,
+                     static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("segment") = py::none(),
+            py::arg("limit") = 100, py::arg("page_token") = "",
+            "Return (page, error_code) for cluster-wide drain jobs. Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "list_tasks",
+            [](MooncakeStorePyWrapper &self, std::optional<TaskStatus> status,
+               std::optional<TaskType> type,
+               std::optional<UUID> assigned_client,
+               const std::optional<std::string> &key, int64_t limit,
+               const std::string &page_token) -> py::tuple {
+                if (!self.is_client_initialized() || limit < 1 ||
+                    limit > 1000) {
+                    return py::make_tuple(py::none(),
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->list_tasks(
+                    {.status = status,
+                     .type = type,
+                     .assigned_client = assigned_client,
+                     .key = key,
+                     .page_token = page_token,
+                     .limit = static_cast<uint32_t>(limit)});
+                py::gil_scoped_acquire acquire;
+                if (!result) {
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(std::move(*result), 0);
+            },
+            py::arg("status") = py::none(), py::arg("type") = py::none(),
+            py::arg("assigned_client") = py::none(),
+            py::arg("key") = py::none(), py::arg("limit") = 100,
+            py::arg("page_token") = "",
+            "Return (page, error_code) for tasks in this client's tenant. "
+            "Follow "
+            "page.next_page_token with the same filters until it is empty.")
+        .def(
+            "cancel_task",
+            [](MooncakeStorePyWrapper &self, const UUID &task_id) {
+                if (!self.is_client_initialized()) {
+                    return toInt(ErrorCode::INVALID_PARAMS);
+                }
+                py::gil_scoped_release release;
+                auto result = self.store_->cancel_task(task_id);
+                return result ? 0 : toInt(result.error());
+            },
+            py::arg("task_id"),
+            "Cancel a pending task immediately or request cancellation of a "
+            "processing task. Returns an error code. Query the final status.");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(
@@ -3519,7 +3828,15 @@ PYBIND11_MODULE(_store, m) {
                              << ". Valid range: 0-" << max_node;
             }
 
-            if (numa_run_on_node(node) != 0) {
+            int rc;
+            {
+                // numa_run_on_node() fills libnuma's per-node cpumask cache
+                // on first use; see numaNodeCpuCacheMutex().
+                std::lock_guard<std::mutex> guard(
+                    mooncake::numaNodeCpuCacheMutex());
+                rc = numa_run_on_node(node);
+            }
+            if (rc != 0) {
                 LOG(WARNING) << "numa_run_on_node failed for node " << node;
             }
 
@@ -3533,9 +3850,6 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
-
-    // Add EngramStore bindings
-    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake

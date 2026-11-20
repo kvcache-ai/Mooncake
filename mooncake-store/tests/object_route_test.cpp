@@ -535,6 +535,35 @@ TEST(ObjectRouteTest, KeptSlotIsReusedByTheNextPublication) {
     EXPECT_TRUE(route.Contains("k1"));
 }
 
+TEST(ObjectRouteTest, AStripeGivesItsBucketsBackAsItsSlotsGo) {
+    ObjectRoute route;
+    // Keys that all land in one stripe, enough to grow its map past the shrink
+    // floor.
+    const size_t stripe = ObjectRouteTestPeer::StripeIndex("shrink_0");
+    std::vector<std::string> keys;
+    for (size_t i = 0; keys.size() < 2 * kShrinkMinBucketCount; ++i) {
+        std::string key = "shrink_" + std::to_string(i);
+        if (ObjectRouteTestPeer::StripeIndex(key) == stripe) {
+            keys.push_back(std::move(key));
+        }
+    }
+    for (const auto& key : keys) {
+        ASSERT_NE(PublishObject(route, key), 0u);
+    }
+    const size_t high_water =
+        ObjectRouteTestPeer::StripeBucketCount(route, stripe);
+    ASSERT_GT(high_water, kShrinkMinBucketCount);
+
+    // Tearing the objects down is all it takes, whichever path does it: no
+    // caller has to ask for the shrink.
+    for (size_t i = 1; i < keys.size(); ++i) {
+        ASSERT_TRUE(TearDownKey(route, keys[i]));
+    }
+    EXPECT_LT(ObjectRouteTestPeer::StripeBucketCount(route, stripe),
+              high_water / 2);
+    EXPECT_TRUE(route.Contains(keys.front()));
+}
+
 // --- Cursors -----------------------------------------------------------------
 
 TEST(ObjectRouteTest, ReadCursorVisitsEveryObjectOnce) {
@@ -825,11 +854,17 @@ class RecordingObserver final : public route::RouteObserver {
         bool processing;
     };
 
+    void OnBeforeTearDown(const route::WriteGuard& guard) override {
+        ASSERT_TRUE(guard.has_object());
+        torn_down.push_back({guard.key(), guard.state().announced_kv_media});
+    }
+
     void OnWriteRelease(const route::WriteGuard& guard) override {
         releases.push_back({guard.key(), guard.has_object(),
                             guard.has_object() && guard.state().is_processing});
     }
 
+    std::vector<std::pair<std::string, uint8_t>> torn_down;
     std::vector<Release> releases;
 };
 
@@ -869,8 +904,12 @@ TEST(ObjectRouteTest, ObserverSeesEveryWriteGuardAsItIsReleased) {
     {
         auto guard = route.Write("k1");
         ASSERT_TRUE(guard.has_value());
+        guard->state().announced_kv_media = 0x3;
         guard->TearDown();
     }
+    ASSERT_EQ(observer.torn_down.size(), 1u);
+    EXPECT_EQ(observer.torn_down[0],
+              (std::pair<std::string, uint8_t>{"k1", 3}));
     ASSERT_EQ(observer.releases.size(), 4u);
     EXPECT_FALSE(observer.releases[3].has_object);
 }

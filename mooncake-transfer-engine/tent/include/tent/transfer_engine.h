@@ -64,6 +64,16 @@ typedef struct tent_status tent_status_t;
 
 typedef void* tent_engine_t;
 
+/* Integer-returning operations return 0 on success or the negative native
+ * mooncake::tent::Status::Code on failure (not errno). For example, -2 is
+ * TooManyRequests and -134 is RpcConnectionError. Invalid arguments remain
+ * -1; wrapper allocation failures return -199 (InternalError).
+ * tent_available is a boolean query. Pointer/handle/void return values are
+ * unchanged. Transfer state in tent_status_t is separate from the return code
+ * of a status query: a successful query can report STATUS_FAILED.
+ * An error code alone is not proof of physical quiescence or permission to
+ * replay a batch: earlier accepted tasks may have taken effect. */
+
 struct tent_buffer_info {
     uint64_t base, length;
     char location[64];
@@ -353,6 +363,17 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    // Blocks until every task in the batch terminates. status_list gets one
+    // entry per request; with a null status_list, a task that did not complete
+    // fails the call. On timeout the queued tasks are canceled and in-flight
+    // tasks are asked to stop; without status_list the call returns TimedOut,
+    // so the caller must confirm the tasks stopped before reusing the buffers.
+    // A PENDING entry means the engine may still touch that request's memory
+    // (0 waits forever). The batch stays owned by the caller.
+    Status waitTransfer(BatchID batch_id,
+                        std::vector<TransferStatus>* status_list = nullptr,
+                        uint64_t timeout_ms = 0);
 
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit

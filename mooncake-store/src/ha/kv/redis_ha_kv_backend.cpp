@@ -7,6 +7,7 @@
 
 #include <glog/logging.h>
 
+#include "ha/kv/redis_write_ack.h"
 #include "types.h"
 
 #ifdef STORE_USE_REDIS
@@ -17,14 +18,35 @@ namespace mooncake {
 namespace {
 
 constexpr char kPutScript[] = R"LUA(
+if #KEYS ~= 2 or #ARGV ~= 2 then return {-1} end
+local index_type = redis.call('TYPE', KEYS[1]).ok
+if index_type ~= 'none' and index_type ~= 'zset' then return {-2} end
 redis.call('SET', KEYS[2], ARGV[1])
 redis.call('ZADD', KEYS[1], 0, ARGV[2])
-return 1
+return {1}
 )LUA";
 
 constexpr char kTxnScript[] = R"LUA(
+if #KEYS < 2 or #ARGV < 2 then return {-1} end
 local ncomp = tonumber(ARGV[1])
 local nputs = tonumber(ARGV[2])
+if not ncomp or not nputs or ncomp < 0 or nputs < 0 or
+   ncomp ~= math.floor(ncomp) or nputs ~= math.floor(nputs) or
+   #ARGV ~= 2 + 3 * (ncomp + nputs) then return {-1} end
+-- Validate every argument before performing any mutation. Redis scripts do
+-- not roll back writes if a later command raises an error.
+for j = 3, #ARGV, 3 do
+  local slot = tonumber(ARGV[j])
+  if not slot or slot ~= math.floor(slot) or slot < 2 or slot > #KEYS then
+    return {-1}
+  end
+  if j < 3 + 3 * ncomp then
+    local kind = ARGV[j + 1]
+    if kind ~= 'not_exists' and kind ~= 'value_equals' then return {-1} end
+  end
+end
+local index_type = redis.call('TYPE', KEYS[1]).ok
+if index_type ~= 'none' and index_type ~= 'zset' then return {-2} end
 local i = 3
 for _ = 1, ncomp do
   local slot = tonumber(ARGV[i])
@@ -36,14 +58,14 @@ for _ = 1, ncomp do
   local current = redis.call('GET', KEYS[slot])
   if kind == 'not_exists' then
     if current then
-      return 0
+      return {0}
     end
   elseif kind == 'value_equals' then
     if (not current) or current ~= expected then
-      return 0
+      return {0}
     end
   else
-    return -1
+    return {-1}
   end
 end
 for _ = 1, nputs do
@@ -56,7 +78,7 @@ for _ = 1, nputs do
   redis.call('SET', KEYS[slot], value)
   redis.call('ZADD', KEYS[1], 0, logical)
 end
-return 1
+return {1}
 )LUA";
 
 constexpr char kRangeScript[] = R"LUA(
@@ -84,10 +106,29 @@ end
 return out
 )LUA";
 
+// Declares only the index key and derives the record keys from its contents
+// (redis_prefix .. rest). Declaring every record key instead would follow the
+// scripting guidance, but a script cannot be redirected, so a derived key that
+// is mid-migration aborts the EVAL mid-way and Lua cannot roll back what the
+// delete already removed.
+//
+// The alternative costs one extra round trip (scan members, then EVAL with the
+// index plus every record key), adds ~70 B of request and ~27 B of reply per
+// record with the extra cost dominated by client side key construction, and
+// caps one call at 16383 records because RedisClusterClient::Execute bounds an
+// EVAL to 16384 declared keys.
 constexpr char kDeleteRangeScript[] = R"LUA(
+if #KEYS ~= 1 or #ARGV ~= 4 then return {-1} end
+local index_type = redis.call('TYPE', KEYS[1]).ok
+if index_type ~= 'none' and index_type ~= 'zset' then return {-2} end
 local members = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], ARGV[2])
 local logical_prefix = ARGV[3]
 local redis_prefix = ARGV[4]
+for _, logical in ipairs(members) do
+  if string.sub(logical, 1, #logical_prefix) ~= logical_prefix then
+    return {-2}
+  end
+end
 for _, logical in ipairs(members) do
   if string.sub(logical, 1, #logical_prefix) == logical_prefix then
     local rest = string.sub(logical, #logical_prefix + 1)
@@ -95,7 +136,7 @@ for _, logical in ipairs(members) do
   end
   redis.call('ZREM', KEYS[1], logical)
 end
-return 1
+return {1}
 )LUA";
 
 struct MappedOpLogKey {
@@ -157,19 +198,24 @@ std::string ReplyBytes(const redisReply* reply) {
     return std::string(reply->str, static_cast<size_t>(reply->len));
 }
 
-RedisReplyPtr Exec(redisContext* context,
-                   const std::vector<std::string>& args) {
-    std::vector<const char*> argv;
-    std::vector<size_t> argvlen;
-    argv.reserve(args.size());
-    argvlen.reserve(args.size());
-    for (const auto& arg : args) {
-        argv.push_back(arg.data());
-        argvlen.push_back(arg.size());
+bool ScriptWasNotExecuted(std::string_view error) {
+    // Only top-level routing/admission errors prove Lua did not execute.
+    // Runtime errors, including errors after partial writes, remain unknown.
+    for (const auto prefix :
+         {"MOVED ", "ASK ", "CROSSSLOT ", "READONLY ", "CLUSTERDOWN ",
+          "NOSCRIPT ", "NOAUTH ", "NOPERM ", "BUSY ", "LOADING ",
+          "ERR Error compiling script"}) {
+        if (error.substr(0, std::char_traits<char>::length(prefix)) == prefix) {
+            return true;
+        }
     }
-    auto* raw = static_cast<redisReply*>(redisCommandArgv(
-        context, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
-    return RedisReplyPtr(raw);
+    return false;
+}
+
+uint16_t NamespaceSlot(std::string_view cluster_id) {
+    // Validated cluster IDs are the hash tag, so CRC16/XMODEM hashes only
+    // this component, regardless of the logical key's suffix.
+    return ha::common::redis::Crc16Xmodem(cluster_id) % 16384;
 }
 
 #endif
@@ -179,8 +225,98 @@ RedisReplyPtr Exec(redisContext* context,
 ErrorCode RedisHaKvBackend::Connect(std::string connstring) {
     std::lock_guard<std::mutex> lock(mu_);
     connstring_ = std::move(connstring);
-    context_.reset();
+    client_.reset();
+    const auto validation = ValidateRedisWriteDurabilityPolicy(write_policy_);
+    if (validation != ErrorCode::OK) {
+        return validation;
+    }
     return EnsureConnectedLocked();
+}
+
+KvWriteResult RedisHaKvBackend::ExecuteWriteLocked(
+    const std::vector<std::string>& command, const char* operation,
+    const std::string& cluster_id) {
+    const auto validation = ValidateRedisWriteDurabilityPolicy(write_policy_);
+    if (validation != ErrorCode::OK) {
+        auto result = KvWriteResult::FromError(validation);
+        result.replicas_required = write_policy_.replicas_required;
+        return result;
+    }
+    const auto connected = EnsureConnectedLocked();
+    if (connected != ErrorCode::OK) {
+        auto result = KvWriteResult::FromError(connected);
+        if (result.status == KvWriteStatus::kOutcomeUnknown) {
+            result.status = KvWriteStatus::kFailedBeforeCommit;
+        }
+        result.replicas_required = write_policy_.replicas_required;
+        return result;
+    }
+#ifdef STORE_USE_REDIS
+    auto lease = client_->Execute(command, command.at(3), true);
+    const auto result = ExecuteRedisWriteWithAck(
+        write_policy_,
+        [&]() -> KvWriteResult {
+            auto& reply = lease.reply;
+            if (lease.error != ErrorCode::OK) {
+                return {.status = lease.may_have_executed
+                                      ? KvWriteStatus::kOutcomeUnknown
+                                      : KvWriteStatus::kFailedBeforeCommit,
+                        .error = lease.error};
+            }
+            if (reply == nullptr) {
+                return KvWriteResult::FromError(
+                    ErrorCode::ETCD_OPERATION_ERROR);
+            }
+            if (reply->type == REDIS_REPLY_ERROR) {
+                return {.status = ScriptWasNotExecuted(ReplyBytes(reply.get()))
+                                      ? KvWriteStatus::kFailedBeforeCommit
+                                      : KvWriteStatus::kOutcomeUnknown,
+                        .error = ErrorCode::ETCD_OPERATION_ERROR};
+            }
+            if (reply->type != REDIS_REPLY_ARRAY || reply->elements != 1 ||
+                reply->element == nullptr || reply->element[0] == nullptr ||
+                reply->element[0]->type != REDIS_REPLY_INTEGER) {
+                return KvWriteResult::FromError(
+                    ErrorCode::ETCD_OPERATION_ERROR);
+            }
+            switch (reply->element[0]->integer) {
+                case 1:
+                    return KvWriteResult::Committed();
+                case 0:
+                    return KvWriteResult::FromError(
+                        ErrorCode::ETCD_TRANSACTION_FAIL);
+                case -1:
+                    return KvWriteResult::FromError(ErrorCode::INVALID_PARAMS);
+                case -2:
+                    return {.status = KvWriteStatus::kFailedBeforeCommit,
+                            .error = ErrorCode::ETCD_OPERATION_ERROR};
+                default:
+                    return KvWriteResult::FromError(
+                        ErrorCode::ETCD_OPERATION_ERROR);
+            }
+        },
+        [&](size_t replicas, std::chrono::milliseconds wait_timeout)
+            -> tl::expected<size_t, ErrorCode> {
+            return client_->Wait(lease, replicas, wait_timeout);
+        });
+    if (result.status == KvWriteStatus::kOutcomeUnknown ||
+        lease.routing_error !=
+            ha::common::redis::RedisClusterClient::RoutingError::None) {
+        LOG(WARNING) << "Redis " << operation
+                     << " unconfirmed: cluster=" << cluster_id
+                     << " slot=" << NamespaceSlot(cluster_id)
+                     << " required=" << result.replicas_required
+                     << " acked=" << result.replicas_acked << " routing_error="
+                     << ha::common::redis::RedisClusterClient::RoutingErrorName(
+                            lease.routing_error);
+    }
+    return result;
+#else
+    (void)command;
+    (void)operation;
+    (void)cluster_id;
+    return KvWriteResult::FromError(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#endif
 }
 
 ErrorCode RedisHaKvBackend::EnsureConnectedLocked() {
@@ -190,16 +326,18 @@ ErrorCode RedisHaKvBackend::EnsureConnectedLocked() {
     if (connstring_.empty()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    if (context_ != nullptr && context_->err == 0) {
-        return ErrorCode::OK;
+    if (client_) return ErrorCode::OK;
+    auto client = std::make_unique<ha::common::redis::RedisClusterClient>();
+    const auto result =
+        client->ConnectDetailed(connstring_, write_policy_.replicas_required);
+    if (result.error != ErrorCode::OK) {
+        LOG(ERROR) << "Redis KV startup failed: error="
+                   << toString(result.error) << " routing_error="
+                   << ha::common::redis::RedisClusterClient::RoutingErrorName(
+                          result.routing_error);
+        return result.error;
     }
-    context_.reset();
-    auto connected = ha::common::redis::ConnectRedis(
-        connstring_, ErrorCode::ETCD_OPERATION_ERROR);
-    if (!connected) {
-        return connected.error();
-    }
-    context_ = std::move(connected.value());
+    client_ = std::move(client);
     return ErrorCode::OK;
 #endif
 }
@@ -217,18 +355,18 @@ ErrorCode RedisHaKvBackend::Get(std::string_view key, std::string& value) {
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply = Exec(context_.get(), {"GET", mapped->redis_key});
+    auto lease =
+        client_->Execute({"GET", mapped->redis_key}, mapped->redis_key, false);
+    auto& reply = lease.reply;
     if (reply == nullptr) {
         LOG(WARNING) << "Redis GET failed for OpLog key";
-        context_.reset();
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
         return ErrorCode::ETCD_KEY_NOT_EXIST;
     }
     if (reply->type == REDIS_REPLY_ERROR) {
-        LOG(WARNING) << "Redis GET returned error: "
-                     << (reply->str != nullptr ? reply->str : "unknown");
+        LOG(WARNING) << "Redis GET returned an error";
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     if (reply->type != REDIS_REPLY_STRING || reply->str == nullptr) {
@@ -243,34 +381,20 @@ ErrorCode RedisHaKvBackend::Get(std::string_view key, std::string& value) {
 }
 
 ErrorCode RedisHaKvBackend::Put(std::string_view key, std::string_view value) {
+    return PutWithResult(key, value).ToLegacyError();
+}
+
+KvWriteResult RedisHaKvBackend::PutWithResult(std::string_view key,
+                                              std::string_view value) {
     auto mapped = MapOpLogKey(key);
     if (!mapped) {
-        return mapped.error();
+        return KvWriteResult::FromError(mapped.error());
     }
     std::lock_guard<std::mutex> lock(mu_);
-    const ErrorCode connected = EnsureConnectedLocked();
-    if (connected != ErrorCode::OK) {
-        return connected;
-    }
-#ifdef STORE_USE_REDIS
-    auto reply = Exec(context_.get(), {"EVAL", kPutScript, "2",
-                                       mapped->index_key, mapped->redis_key,
-                                       std::string(value), std::string(key)});
-    if (reply == nullptr) {
-        LOG(WARNING) << "Redis PUT failed for OpLog key";
-        context_.reset();
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (reply->type == REDIS_REPLY_ERROR ||
-        reply->type != REDIS_REPLY_INTEGER || reply->integer != 1) {
-        LOG(WARNING) << "Redis PUT script failed";
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-#else
-    (void)value;
-    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
-#endif
+    return ExecuteWriteLocked(
+        {"EVAL", kPutScript, "2", mapped->index_key, mapped->redis_key,
+         std::string(value), std::string(key)},
+        "PUT", mapped->cluster_id);
 }
 
 ErrorCode RedisHaKvBackend::Range(std::string_view begin_key,
@@ -298,20 +422,19 @@ ErrorCode RedisHaKvBackend::Range(std::string_view begin_key,
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply =
-        Exec(context_.get(),
-             {"EVAL", kRangeScript, "1", begin->index_key,
-              std::string("[") + std::string(begin_key),
-              std::string("(") + std::string(end_key), std::to_string(limit),
-              begin->logical_prefix, begin->redis_prefix});
+    auto lease = client_->Execute(
+        {"EVAL", kRangeScript, "1", begin->index_key,
+         std::string("[") + std::string(begin_key),
+         std::string("(") + std::string(end_key), std::to_string(limit),
+         begin->logical_prefix, begin->redis_prefix},
+        begin->index_key, false);
+    auto& reply = lease.reply;
     if (reply == nullptr) {
         LOG(WARNING) << "Redis RANGE failed for OpLog keys";
-        context_.reset();
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     if (reply->type == REDIS_REPLY_ERROR) {
-        LOG(WARNING) << "Redis RANGE script failed: "
-                     << (reply->str != nullptr ? reply->str : "unknown");
+        LOG(WARNING) << "Redis RANGE script failed";
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     if (reply->type != REDIS_REPLY_ARRAY || (reply->elements % 2) != 0) {
@@ -339,60 +462,48 @@ ErrorCode RedisHaKvBackend::Range(std::string_view begin_key,
 
 ErrorCode RedisHaKvBackend::DeleteRange(std::string_view begin_key,
                                         std::string_view end_key) {
-    const ErrorCode bounds = ValidateRangeBounds(begin_key, end_key);
+    return DeleteRangeWithResult(begin_key, end_key).ToLegacyError();
+}
+
+KvWriteResult RedisHaKvBackend::DeleteRangeWithResult(
+    std::string_view begin_key, std::string_view end_key) {
+    const auto bounds = ValidateRangeBounds(begin_key, end_key);
     if (bounds != ErrorCode::OK) {
-        return bounds;
+        return KvWriteResult::FromError(bounds);
     }
     if (begin_key == end_key) {
-        return ErrorCode::OK;
+        return KvWriteResult::Committed();
     }
     auto begin = MapOpLogKey(begin_key);
     auto end = MapOpLogKey(end_key);
-    if (!begin || !end) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    if (begin->cluster_id != end->cluster_id) {
-        return ErrorCode::INVALID_PARAMS;
+    if (!begin || !end || begin->cluster_id != end->cluster_id) {
+        return KvWriteResult::FromError(ErrorCode::INVALID_PARAMS);
     }
     std::lock_guard<std::mutex> lock(mu_);
-    const ErrorCode connected = EnsureConnectedLocked();
-    if (connected != ErrorCode::OK) {
-        return connected;
-    }
-#ifdef STORE_USE_REDIS
-    auto reply =
-        Exec(context_.get(), {"EVAL", kDeleteRangeScript, "1", begin->index_key,
-                              std::string("[") + std::string(begin_key),
-                              std::string("(") + std::string(end_key),
-                              begin->logical_prefix, begin->redis_prefix});
-    if (reply == nullptr) {
-        LOG(WARNING) << "Redis delete range failed for OpLog keys";
-        context_.reset();
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (reply->type == REDIS_REPLY_ERROR ||
-        reply->type != REDIS_REPLY_INTEGER || reply->integer != 1) {
-        LOG(WARNING) << "Redis delete range script failed";
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-#else
-    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
-#endif
+    return ExecuteWriteLocked(
+        {"EVAL", kDeleteRangeScript, "1", begin->index_key,
+         std::string("[") + std::string(begin_key),
+         std::string("(") + std::string(end_key), begin->logical_prefix,
+         begin->redis_prefix},
+        "DELETE_RANGE", begin->cluster_id);
 }
 
 ErrorCode RedisHaKvBackend::Txn(const KvTxn& txn) {
+    return TxnWithResult(txn).ToLegacyError();
+}
+
+KvWriteResult RedisHaKvBackend::TxnWithResult(const KvTxn& txn) {
     for (const auto& compare : txn.compares) {
         if (compare.kind == KvCompareKind::kCreateRevisionEquals) {
-            return ErrorCode::INVALID_PARAMS;
+            return KvWriteResult::FromError(ErrorCode::INVALID_PARAMS);
         }
         if (compare.kind != KvCompareKind::kValueEquals &&
             compare.kind != KvCompareKind::kKeyNotExists) {
-            return ErrorCode::INVALID_PARAMS;
+            return KvWriteResult::FromError(ErrorCode::INVALID_PARAMS);
         }
     }
     if (txn.compares.empty() && txn.puts.empty()) {
-        return ErrorCode::OK;
+        return KvWriteResult::Committed();
     }
 
     std::vector<std::string> keys;
@@ -426,7 +537,7 @@ ErrorCode RedisHaKvBackend::Txn(const KvTxn& txn) {
     for (const auto& compare : txn.compares) {
         auto slot = add_key(compare.key);
         if (!slot) {
-            return slot.error();
+            return KvWriteResult::FromError(slot.error());
         }
         args.push_back(std::to_string(slot.value()));
         args.push_back(compare.kind == KvCompareKind::kKeyNotExists
@@ -437,19 +548,13 @@ ErrorCode RedisHaKvBackend::Txn(const KvTxn& txn) {
     for (const auto& put : txn.puts) {
         auto slot = add_key(put.key);
         if (!slot) {
-            return slot.error();
+            return KvWriteResult::FromError(slot.error());
         }
         args.push_back(std::to_string(slot.value()));
         args.push_back(put.value);
         args.push_back(put.key);
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
-    const ErrorCode connected = EnsureConnectedLocked();
-    if (connected != ErrorCode::OK) {
-        return connected;
-    }
-#ifdef STORE_USE_REDIS
     std::vector<std::string> command;
     command.reserve(3 + keys.size() + args.size());
     command.emplace_back("EVAL");
@@ -457,30 +562,8 @@ ErrorCode RedisHaKvBackend::Txn(const KvTxn& txn) {
     command.emplace_back(std::to_string(keys.size()));
     command.insert(command.end(), keys.begin(), keys.end());
     command.insert(command.end(), args.begin(), args.end());
-    auto reply = Exec(context_.get(), command);
-    if (reply == nullptr) {
-        LOG(WARNING) << "Redis OpLog transaction failed at the connection";
-        context_.reset();
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (reply->type == REDIS_REPLY_ERROR) {
-        LOG(WARNING) << "Redis OpLog transaction script failed: "
-                     << (reply->str != nullptr ? reply->str : "unknown");
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (reply->type != REDIS_REPLY_INTEGER) {
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    if (reply->integer == 0) {
-        return ErrorCode::ETCD_TRANSACTION_FAIL;
-    }
-    if (reply->integer != 1) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    return ErrorCode::OK;
-#else
-    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
-#endif
+    std::lock_guard<std::mutex> lock(mu_);
+    return ExecuteWriteLocked(command, "TXN", cluster_id);
 }
 
 }  // namespace mooncake

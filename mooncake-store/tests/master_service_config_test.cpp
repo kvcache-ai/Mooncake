@@ -183,6 +183,23 @@ TEST(MasterServiceConfigTest, OplogSnapshotDefaultsAndOverridesPropagate) {
     EXPECT_EQ(17u, service_config.snapshot_chunk_object_count);
 }
 
+TEST(MasterServiceConfigTest,
+     WeightImportTimeoutPropagatesThroughConfiguration) {
+    MasterConfig master_config{};
+    EXPECT_EQ(300'000u, master_config.weight_import_idle_timeout_ms);
+    master_config.weight_import_idle_timeout_ms = 1234;
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(1234u, service_config.weight_import_idle_timeout_ms);
+    EXPECT_EQ(1234u, WrappedMasterServiceConfig(master_config, 1)
+                         .weight_import_idle_timeout_ms);
+    EXPECT_EQ(2345u, MasterServiceConfig::builder()
+                         .set_weight_import_idle_timeout_ms(2345)
+                         .build()
+                         .weight_import_idle_timeout_ms);
+}
+
 TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     MasterConfig config{};
     EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
@@ -237,6 +254,31 @@ TEST(MasterServiceConfigTest, WeightCapabilityConfirmationPropagates) {
             .set_weight_management_oplog_capability_confirmed(true)
             .build();
     EXPECT_TRUE(built.weight_management_oplog_capability_confirmed);
+}
+
+TEST(MasterServiceConfigTest, EvictionWorkerThreadsPropagates) {
+    EXPECT_EQ(DEFAULT_EVICTION_WORKER_THREADS,
+              MasterServiceConfig{}.eviction_worker_threads);
+    EXPECT_EQ(DEFAULT_EVICTION_WORKER_THREADS,
+              MasterServiceConfig::builder().build().eviction_worker_threads);
+    EXPECT_EQ(8u, MasterServiceConfig::builder()
+                      .set_eviction_worker_threads(8)
+                      .build()
+                      .eviction_worker_threads);
+
+    MasterConfig master_config{};
+    EXPECT_EQ(DEFAULT_EVICTION_WORKER_THREADS,
+              master_config.eviction_worker_threads);
+    master_config.eviction_worker_threads = 8;
+    const WrappedMasterServiceConfig from_master(master_config, 1);
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+    const WrappedMasterServiceConfig from_supervisor(supervisor_config, 1);
+
+    EXPECT_EQ(8u, supervisor_config.eviction_worker_threads);
+    EXPECT_EQ(8u, from_master.eviction_worker_threads);
+    EXPECT_EQ(8u, from_supervisor.eviction_worker_threads);
+    EXPECT_EQ(8u, MasterServiceConfig(from_master).eviction_worker_threads);
+    EXPECT_EQ(8u, MasterServiceConfig(from_supervisor).eviction_worker_threads);
 }
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
