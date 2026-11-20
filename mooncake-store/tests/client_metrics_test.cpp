@@ -594,8 +594,14 @@ TEST_F(ClientMetricsTest, BatchReadItemMetricsExposeNativeReadResults) {
                   {"present", "missing"},
                   {{buffer.data() + 384, buffer.data() + 448},
                    {buffer.data() + 512, buffer.data() + 576}},
-                  {{64, 64}, {64, 64}}, false),
+                  {{32, 32}, {32, 32}}, false),
               (std::vector<int>{64, not_found}));
+    // The Classic multi-buffer transfer currently rejects this size mismatch.
+    // Count its final failure, rather than inferring success from object size.
+    EXPECT_EQ(client->batch_get_into_multi_buffers(
+                  {"present"}, {{buffer.data() + 704, buffer.data() + 768}},
+                  {{64, 64}}, false),
+              (std::vector<int>{toInt(ErrorCode::TRANSFER_FAIL)}));
 
     const auto metrics =
         FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
@@ -618,6 +624,7 @@ TEST_F(ClientMetricsTest, BatchReadItemMetricsExposeNativeReadResults) {
     EXPECT_EQ(sample_value("batch_get_into", "error"), 1);
     EXPECT_EQ(sample_value("batch_get_into_multi_buffers", "success"), 1);
     EXPECT_EQ(sample_value("batch_get_into_multi_buffers", "not_found"), 1);
+    EXPECT_EQ(sample_value("batch_get_into_multi_buffers", "error"), 1);
     EXPECT_EQ(client->unregister_buffer(buffer.data()), 0);
     EXPECT_EQ(client->tearDownAll(), 0);
 }

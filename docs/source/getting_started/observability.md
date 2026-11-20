@@ -293,8 +293,9 @@ rate. The same counts appear in the client summary
 when observed, including periodic dummy-client summaries. The bounded outcome
 labels are:
 
-- `success`: a nonnegative native byte receipt. A destination with excess
-  capacity is still a successful object read.
+- `success`: a nonnegative native byte receipt, including a read that
+  returns fewer bytes than the destination capacity. This counts the returned
+  result; it does not guarantee that every read path accepts excess capacity.
 - `not_found`: the returned error is `OBJECT_NOT_FOUND`.
 - `error`: any other negative result, including staging-copy failures on the
   dummy client.
