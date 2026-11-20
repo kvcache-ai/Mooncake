@@ -71,16 +71,17 @@ struct AllReduceLayout {
 
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ CollectiveResult
-runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
+runRingRound(const RingPlan& plan, SimplePrimitives<T>& primitives,
              const AllReduceLayout<T>& layout, uint64_t chunk_index,
              cooperative_groups::thread_block block) {
+    const uint32_t participant_count = plan.participant_count;
     const auto [send_op, reduce_op, final_op] =
-        makeRingReductionOps<T, Op>(view.participant_count);
-    const uint64_t ring_steps = view.participant_count - 1;
+        makeRingReductionOps<T, Op>(participant_count);
+    const uint64_t ring_steps = participant_count - 1;
     // Start reduce-scatter by injecting this rank's contribution for its own
     // shard into the ring.
     const uint32_t first_shard_index =
-        ringIndexAtDistance(view.self_active_index, view.participant_count, 0);
+        ringIndexAtDistance(plan.self_index, participant_count, 0);
     const auto first_chunk = layout.chunk(first_shard_index, chunk_index);
     PG_COLL_TRY(primitives.transformSend(first_chunk, block, send_op));
 
@@ -88,7 +89,7 @@ runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
     // shard, adds this rank's contribution, and forwards the new partial.
     for (uint64_t distance = 1; distance < ring_steps; ++distance) {
         const uint32_t shard_index = ringIndexAtDistance(
-            view.self_active_index, view.participant_count, distance);
+            plan.self_index, participant_count, distance);
         const auto chunk = layout.chunk(shard_index, chunk_index);
         PG_COLL_TRY(primitives.recvTransformSend(chunk, block, reduce_op));
     }
@@ -96,7 +97,7 @@ runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
     // The final reduce-scatter receive completes one shard. Store the reduced
     // value in local output and forward it as the first all-gather send.
     const uint32_t completed_shard_index = ringIndexAtDistance(
-        view.self_active_index, view.participant_count, ring_steps);
+        plan.self_index, participant_count, ring_steps);
     const auto completed_chunk =
         layout.chunk(completed_shard_index, chunk_index);
     PG_COLL_TRY(
@@ -106,14 +107,14 @@ runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
     // into local output, and forward them without another reduction.
     for (uint64_t distance = 0; distance + 1 < ring_steps; ++distance) {
         const uint32_t shard_index = ringIndexAtDistance(
-            view.self_active_index, view.participant_count, distance);
+            plan.self_index, participant_count, distance);
         const auto chunk = layout.chunk(shard_index, chunk_index);
         PG_COLL_TRY(primitives.recvCopySend(chunk, block));
     }
 
     // Receive the last fully reduced shard without forwarding it.
     const uint32_t last_shard_index = ringIndexAtDistance(
-        view.self_active_index, view.participant_count, ring_steps - 1);
+        plan.self_index, participant_count, ring_steps - 1);
     const auto last_chunk = layout.chunk(last_shard_index, chunk_index);
     return primitives.recvCopy(last_chunk, block);
 }
@@ -130,7 +131,7 @@ runRingChannel(const AllReduceRequest& request, RingDeviceState* state,
     }
 
     const uint32_t channel_count = RingChannelPartition::chooseChannelCount(
-        request.count * sizeof(T) / view.participant_count,
+        request.count * sizeof(T) / plan.participant_count,
         plan.workspace.bytes);
     if (channel >= channel_count) {
         // The fixed launch capacity keeps host submission independent of the
@@ -156,7 +157,7 @@ runRingChannel(const AllReduceRequest& request, RingDeviceState* state,
         .output = output,
         .channel_elements = partition.count,
         .shard_element_capacity =
-            ceilDiv(partition.count, view.participant_count),
+            ceilDiv(partition.count, plan.participant_count),
         .chunk_element_capacity = primitives.chunkElements(),
     };
 
@@ -169,7 +170,7 @@ runRingChannel(const AllReduceRequest& request, RingDeviceState* state,
     // chunk index.
     for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
         PG_COLL_TRY(
-            runRingRound<T, Op>(view, primitives, layout, chunk_index, block));
+            runRingRound<T, Op>(plan, primitives, layout, chunk_index, block));
     }
 
     return primitives.finish(block);

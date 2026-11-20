@@ -74,19 +74,25 @@ PGResult<RingPlan> RingAlgorithm::buildPlan(
         .status = DevicePlanStatus::Ready,
         .workspace = {static_cast<char*>(workspace_.buffer().addr()),
                       view.buffer_size, nullptr},
+        .participant_count = static_cast<uint32_t>(count),
+        .self_index = static_cast<uint32_t>(index),
     };
     for (size_t participant = 0; participant < count; ++participant) {
         const auto& peer = view.participants[participant];
+        plan.participant_ranks[participant] = peer.layout_rank;
         if (participant != index) {
             PG_VALIDATE_STATE(findEndpoint(peer.algorithms),
                               "Active peer has no compatible ring endpoint");
         }
     }
     if (count > 1) {
-        plan.predecessor_index =
-            static_cast<uint32_t>((index + count - 1) % count);
-        plan.successor_index = static_cast<uint32_t>((index + 1) % count);
-        const auto& successor = view.participants[plan.successor_index];
+        const auto predecessor = (index + count - 1) % count;
+        const auto successor_index = (index + 1) % count;
+        plan.predecessor_index = view.participants[predecessor].active_index;
+        plan.successor_index = view.participants[successor_index].active_index;
+        plan.predecessor_rank = view.participants[predecessor].layout_rank;
+        plan.successor_rank = view.participants[successor_index].layout_rank;
+        const auto& successor = view.participants[successor_index];
         PG_TRY(plan.workspace,
                simple_.bindWorkspace(workspace_, successor.global_rank,
                                      view.buffer_size));

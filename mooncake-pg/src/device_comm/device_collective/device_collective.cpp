@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <new>
 #include <utility>
 
@@ -38,11 +39,13 @@ DeviceCollectiveRuntime::DeviceCollectiveRuntime(
     DeviceCollectiveWorkspace& workspace, int device_index,
     InGroupRank self_rank, uint32_t max_group_size,
     int32_t* active_ranks_mirror, RegionSlice view_epoch_signals,
-    StrongStream& strong_stream, GpuEvent handoff_event)
+    StrongStream& strong_stream, GpuEvent handoff_event,
+    uint32_t ranks_per_node)
     : transfer_service_(transfer_service),
       workspace_(workspace),
       device_index_(device_index),
       self_rank_(self_rank),
+      ranks_per_node_(ranks_per_node),
       view_epoch_signals_(std::move(view_epoch_signals)),
       strong_stream_(strong_stream),
       active_ranks_mirror_(active_ranks_mirror),
@@ -64,6 +67,11 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
     PG_VALIDATE_ARG(max_group_size <= kMaxNumRanks,
                     "device collective group capacity is too large");
 
+    uint32_t ranks_per_node = 0;
+    if (const char* value = std::getenv("MOONCAKE_PG_RANKS_PER_NODE")) {
+        ranks_per_node = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+    }
+
     PG_TRY(auto timeout_ticks,
            gpuTimeoutTicks(device_index, collective_timeout_us));
     const uint64_t view_epoch_signal_bytes =
@@ -77,7 +85,7 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
         std::unique_ptr<DeviceCollectiveRuntime>(new DeviceCollectiveRuntime(
             transfer_service, workspace, device_index, self_rank,
             max_group_size, active_ranks_mirror, std::move(view_epoch_signals),
-            strong_stream, std::move(handoff_event)));
+            strong_stream, std::move(handoff_event), ranks_per_node));
     {
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
         std::array<uint64_t, kMaxNumRanks> initial_view_epoch_signals;
@@ -126,6 +134,13 @@ DeviceGroupEndpoint DeviceCollectiveRuntime::localEndpoint() const {
         .view_epoch_signal_count = static_cast<uint32_t>(active_ranks_count_),
     };
     dispatcher_->fillLocalEndpoint(endpoint);
+    if (ranks_per_node_ > 0) {
+        endpoint.algorithms.push_back(AlgorithmEndpoint::encode(
+            kDeviceTopologyKey, kDeviceTopologyVersion,
+            DeviceTopologyInfo{
+                static_cast<uint32_t>(self_rank_ / ranks_per_node_),
+                static_cast<uint32_t>(self_rank_ % ranks_per_node_)}));
+    }
     return endpoint;
 }
 
@@ -275,9 +290,17 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
             resolved.self_active_index =
                 static_cast<int32_t>(resolved.participants.size());
         }
+        const auto active_index =
+            static_cast<uint32_t>(resolved.participants.size());
         resolved.participants.push_back(ResolvedParticipant{
             .global_rank = global_rank,
             .in_group_rank = in_group_rank,
+            .active_index = active_index,
+            .layout_rank = static_cast<uint32_t>(in_group_rank),
+            .protocols = {},
+            .algorithms = {},
+            .workspace = {},
+            .view_epoch_signal_offset = 0,
         });
     }
 

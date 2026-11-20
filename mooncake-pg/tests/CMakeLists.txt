@@ -7,3 +7,13 @@ target_include_directories(
 target_compile_features(pg_host_ip_resolve_test PRIVATE cxx_std_20)
 target_link_libraries(pg_host_ip_resolve_test PUBLIC gtest gtest_main)
 add_test(NAME pg_host_ip_resolve_test COMMAND pg_host_ip_resolve_test)
+
+# Header-only hierarchical topology policy tests (no CUDA / mooncake_pg link).
+add_executable(pg_hierarchical_topology_test pg_hierarchical_topology_test.cpp)
+target_include_directories(
+  pg_hierarchical_topology_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
+target_compile_features(pg_hierarchical_topology_test PRIVATE cxx_std_20)
+target_link_libraries(pg_hierarchical_topology_test PUBLIC gtest gtest_main)
+add_test(NAME pg_hierarchical_topology_test COMMAND pg_hierarchical_topology_test)

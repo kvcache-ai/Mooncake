@@ -14,16 +14,15 @@ namespace {
 struct AllGatherLayout {
     const uint8_t* input;
     uint8_t* output;
-    const DeviceGroupView& view;
+    const RingPlan& plan;
     uint64_t rank_bytes;
     RingChannelPartition channel;
     uint64_t chunk_capacity;
 
     [[nodiscard]] __device__ __forceinline__ uint8_t* destination(
         uint32_t active_index, uint64_t offset) const {
-        PG_ASSERT(active_index < view.participant_count);
-        const auto rank = view.participants[active_index].in_group_rank;
-        PG_ASSERT(rank >= 0);
+        PG_ASSERT(active_index < plan.participant_count);
+        const auto rank = plan.participant_ranks[active_index];
         return output + static_cast<uint64_t>(rank) * rank_bytes + offset;
     }
 
@@ -45,25 +44,25 @@ struct AllGatherLayout {
 };
 
 [[nodiscard]] __device__ __forceinline__ CollectiveResult
-runRingRound(const DeviceGroupView& view, SimplePrimitives<uint8_t>& primitives,
+runRingRound(const RingPlan& plan, SimplePrimitives<uint8_t>& primitives,
              const AllGatherLayout& layout, uint64_t chunk_index,
              cooperative_groups::thread_block block) {
-    const uint64_t ring_steps = view.participant_count - 1;
+    const uint64_t ring_steps = plan.participant_count - 1;
     // Each rank injects its own contribution and stores it in local output.
     const uint32_t first_active_index =
-        ringIndexAtDistance(view.self_active_index, view.participant_count, 0);
+        ringIndexAtDistance(plan.self_index, plan.participant_count, 0);
     const auto first_chunk = layout.chunk(first_active_index, chunk_index);
     PG_COLL_TRY(primitives.copySend(first_chunk, block));
 
     for (uint64_t distance = 1; distance < ring_steps; ++distance) {
         const uint32_t active_index = ringIndexAtDistance(
-            view.self_active_index, view.participant_count, distance);
+            plan.self_index, plan.participant_count, distance);
         const auto chunk = layout.chunk(active_index, chunk_index);
         PG_COLL_TRY(primitives.recvCopySend(chunk, block));
     }
 
     const uint32_t last_active_index = ringIndexAtDistance(
-        view.self_active_index, view.participant_count, ring_steps);
+        plan.self_index, plan.participant_count, ring_steps);
     const auto last_chunk = layout.chunk(last_active_index, chunk_index);
     return primitives.recvCopy(last_chunk, block);
 }
@@ -96,7 +95,7 @@ runRingChannel(const AllGatherRequest& request, uint64_t rank_bytes,
     const AllGatherLayout layout{
         .input = input,
         .output = output,
-        .view = view,
+        .plan = plan,
         .rank_bytes = rank_bytes,
         .channel = partition,
         .chunk_capacity = primitives.chunkElements(),
@@ -106,7 +105,7 @@ runRingChannel(const AllGatherRequest& request, uint64_t rank_bytes,
     const uint64_t chunk_count = layout.chunkCount();
     // Each round circulates the chunk at this index from every participant.
     for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
-        PG_COLL_TRY(runRingRound(view, primitives, layout, chunk_index, block));
+        PG_COLL_TRY(runRingRound(plan, primitives, layout, chunk_index, block));
     }
     return primitives.finish(block);
 }

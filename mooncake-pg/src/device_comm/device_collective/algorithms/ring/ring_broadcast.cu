@@ -13,8 +13,16 @@ namespace {
     const BroadcastRequest& request, uint64_t bytes, RingDeviceState* state,
     uint32_t channel, cooperative_groups::thread_block block) {
     const auto& view = *state->collective.group_view;
-    // A captured request may outlive its root's membership.
-    if (view.activeIndex(request.root) < 0) {
+    const auto& plan = state->plan;
+    // A captured request may outlive its root's subgroup membership.
+    bool root_present = false;
+    for (uint32_t index = 0; index < plan.participant_count; ++index) {
+        if (plan.participant_ranks[index] == request.root) {
+            root_present = true;
+            break;
+        }
+    }
+    if (!root_present) {
         return {
             .failed_rank = request.root,
             .failure_type = CollectiveFailureType::UnavailableParticipant,
@@ -22,15 +30,13 @@ namespace {
     }
     if (bytes == 0) return {};
 
-    const auto& plan = state->plan;
     const uint32_t channel_count =
         RingChannelPartition::chooseChannelCount(bytes, plan.workspace.bytes);
     if (channel >= channel_count) return {};
     const auto partition =
         RingChannelPartition::make(bytes, channel, channel_count);
-    const bool is_root = view.self().in_group_rank == request.root;
-    const bool is_last =
-        view.participants[plan.successor_index].in_group_rank == request.root;
+    const bool is_root = plan.participant_ranks[plan.self_index] == request.root;
+    const bool is_last = plan.successor_rank == request.root;
     // Non-root callers need no send buffer. Never form an address from it.
     const auto* input = is_root
                             ? static_cast<const uint8_t*>(request.send_buffer) +

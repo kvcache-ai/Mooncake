@@ -109,6 +109,18 @@ using RouteEndpoint = ProviderEndpoint;
 using ProtocolEndpoint = ProviderEndpoint;
 using AlgorithmEndpoint = ProviderEndpoint;
 
+// Static node topology published by each device communicator. local_rank is
+// the rank's slot inside node_id; ranks per node is inferred from the group.
+struct DeviceTopologyInfo {
+    uint32_t node_id = 0;
+    uint32_t local_rank = 0;
+
+    bool operator==(const DeviceTopologyInfo&) const = default;
+};
+
+inline constexpr std::string_view kDeviceTopologyKey = "device-topology";
+inline constexpr uint32_t kDeviceTopologyVersion = 1;
+
 // Process-level collective buffer in DTS's peer-accessible region.
 struct DeviceCollectiveWorkspaceEndpoint {
     uint64_t buffer_offset = 0;
@@ -165,6 +177,7 @@ enum class DeviceCollectiveAlgorithm : uint8_t {
     OneShot = 2,
     Pairwise = 3,
     Star = 4,
+    Hierarchical = 5,
 };
 
 // Runtime, protocol and algorithm endpoints owned by one communicator.

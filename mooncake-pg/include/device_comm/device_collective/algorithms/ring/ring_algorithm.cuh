@@ -21,9 +21,17 @@ struct RingPlan {
 
     SimpleWorkspace workspace;
 
-    // Active indices in DeviceGroupView
+    // Subgroup scope. A full-group Ring plan uses all participants; a
+    // hierarchical plan uses one node or one node stripe.
+    uint32_t participant_count = 0;
+    uint32_t self_index = 0;
+    uint32_t participant_ranks[kMaxNumRanks] = {};
+
+    // Active indices in DeviceGroupView and their subgroup layout ranks.
     uint32_t predecessor_index = 0;
     uint32_t successor_index = 0;
+    uint32_t predecessor_rank = 0;
+    uint32_t successor_rank = 0;
 };
 
 // Local device state owned by RingAlgorithm and shared by its kernels.
