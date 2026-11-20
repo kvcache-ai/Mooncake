@@ -1489,6 +1489,16 @@ TEST_F(MasterMetricsTest, NofCacheHitCountersAreExportedAndIndependent) {
 }
 
 #ifdef USE_NOF
+static NoFSegment MakeNoFSegment() {
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "metrics_nof_segment";
+    segment.base = 0x400000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = "metrics_nof_segment_endpoint";
+    return segment;
+}
+
 // End-to-end: a GetReplicaList served by a NoF replica must count against
 // the NoF cache-hit counters (previously NoF hits were counted nowhere).
 TEST_F(MasterMetricsTest, GetReplicaListNoFHitCountsNofCounters) {
@@ -1499,12 +1509,7 @@ TEST_F(MasterMetricsTest, GetReplicaListNoFHitCountsNofCounters) {
     WrappedMasterService service_(service_config);
     const UUID client_id = generate_uuid();
 
-    NoFSegment nof_segment;
-    nof_segment.id = generate_uuid();
-    nof_segment.name = "metrics_nof_segment";
-    nof_segment.base = 0x400000000;
-    nof_segment.size = 1024 * 1024 * 16;
-    nof_segment.te_endpoint = "metrics_nof_segment_endpoint";
+    const auto nof_segment = MakeNoFSegment();
     ASSERT_TRUE(service_.MountNoFSegment(nof_segment, client_id).has_value());
 
     constexpr uint64_t kValueLength = 2048;
@@ -1542,6 +1547,64 @@ TEST_F(MasterMetricsTest, GetReplicaListNoFHitCountsNofCounters) {
     EXPECT_EQ(sample("file_cache_hit_bytes_total"), base_file_bytes);
     EXPECT_EQ(sample("mem_cache_hit_nums_"), base_mem_nums);
     EXPECT_EQ(sample("mem_cache_hit_bytes_total"), base_mem_bytes);
+}
+
+// Counting rule: a hit is classified by the FIRST readable replica descriptor
+// the master returns, not by every replica of the key. With one memory and one
+// NoF replica only the first (memory) counts; NoF must not be double counted.
+TEST_F(MasterMetricsTest, MixedMemoryAndNoFReplicaCountsFirstDescriptorOnly) {
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = true;
+    WrappedMasterService service(service_config);
+    const UUID client_id = generate_uuid();
+
+    Segment mem_segment;
+    mem_segment.id = generate_uuid();
+    mem_segment.name = "metrics_mem_segment";
+    mem_segment.base = 0x300000000;
+    mem_segment.size = 1024 * 1024 * 16;
+    ASSERT_TRUE(service.MountSegment(mem_segment, client_id).has_value());
+    const auto nof_segment = MakeNoFSegment();
+    ASSERT_TRUE(service.MountNoFSegment(nof_segment, client_id).has_value());
+
+    constexpr int64_t kValueLength = 2048;
+    const std::string key = "metrics_mixed_hit_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, kValueLength, config).has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(client_id, ObjectMeta{key, std::nullopt}, ReplicaType::ALL)
+            .has_value());
+
+    const auto before = metrics.serialize_metrics();
+    const auto result = service.GetReplicaList(key);
+    ASSERT_TRUE(result.has_value());
+    SCOPED_TRACE(
+        "Only the first readable descriptor counts as a hit. "
+        "Mixed puts allocate memory before NoF.");
+    const auto& replicas = result->replicas;
+    ASSERT_EQ(replicas.size(), 2u);
+    ASSERT_TRUE(replicas[0].is_memory_replica());
+    ASSERT_TRUE(replicas[1].is_nof_replica());
+
+    const auto after = metrics.serialize_metrics();
+    const auto delta = [&](const std::string& name) {
+        return MetricSampleValue(after, name) - MetricSampleValue(before, name);
+    };
+    const auto mem_hits = delta("mem_cache_hit_nums_");
+    const auto nof_hits = delta("nof_cache_hit_nums");
+    EXPECT_EQ(mem_hits, 1);
+    EXPECT_EQ(delta("mem_cache_hit_bytes_total"), kValueLength);
+    EXPECT_EQ(nof_hits, 0);
+    EXPECT_EQ(delta("nof_cache_hit_bytes_total"), 0);
+    EXPECT_EQ(delta("file_cache_hit_nums_"), 0);
+    EXPECT_EQ(delta("file_cache_hit_bytes_total"), 0);
+    EXPECT_EQ(mem_hits + nof_hits, 1);
 }
 #endif  // USE_NOF
 

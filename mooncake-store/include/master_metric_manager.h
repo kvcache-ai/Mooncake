@@ -47,7 +47,6 @@ class MasterMetricManager {
     void inc_nof_cache_hit_bytes(int64_t val = 1);
     int64_t get_mem_cache_hit_bytes();
     int64_t get_file_cache_hit_bytes();
-    int64_t get_nof_cache_hit_bytes();
     void inc_mem_cache_nums(int64_t val = 1);
     void inc_file_cache_nums(int64_t val = 1);
     int64_t get_mem_cache_nums();

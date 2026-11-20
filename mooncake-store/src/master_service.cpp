@@ -4693,6 +4693,9 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    // Only the first readable descriptor returned by the master determines the
+    // memory, file, or NoF hit. The client may read a different replica.
+    // The memory/SSD total hit ratio includes only memory and file hits.
     if (replica_list[0].is_memory_replica()) {
         MasterMetricManager::instance().inc_mem_cache_hit_nums();
         MasterMetricManager::instance().inc_mem_cache_hit_bytes(
@@ -4703,8 +4706,6 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         MasterMetricManager::instance().inc_file_cache_hit_bytes(
             static_cast<int64_t>(metadata.TotalLength()));
     } else if (replica_list[0].is_nof_replica()) {
-        // NoF hits are tracked separately from the SSD file cache: the
-        // pools are provisioned and sized independently.
         MasterMetricManager::instance().inc_nof_cache_hit_nums();
         MasterMetricManager::instance().inc_nof_cache_hit_bytes(
             static_cast<int64_t>(metadata.TotalLength()));

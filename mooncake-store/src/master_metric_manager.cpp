@@ -342,18 +342,22 @@ MasterMetricManager::MasterMetricManager()
       file_cache_hit_nums_("file_cache_hit_nums_",
                            "Total number of GetReplicaList results served from "
                            "the SSD cache"),
-      nof_cache_hit_nums_("nof_cache_hit_nums",
-                          "Total number of GetReplicaList results served from "
-                          "the NVMe-oF SSD pool"),
+      nof_cache_hit_nums_(
+          "nof_cache_hit_nums",
+          "Total number of GetReplicaList results whose first readable replica "
+          "descriptor returned by the master identifies a NoF (NVMe-oF SSD) "
+          "replica. The client may read a different replica."),
       mem_cache_hit_bytes_("mem_cache_hit_bytes_total",
                            "Total bytes of GetReplicaList results served from "
                            "the memory pool"),
       file_cache_hit_bytes_("file_cache_hit_bytes_total",
                             "Total bytes of GetReplicaList results served from "
                             "the SSD cache"),
-      nof_cache_hit_bytes_("nof_cache_hit_bytes_total",
-                           "Total bytes of GetReplicaList results served from "
-                           "the NVMe-oF SSD pool"),
+      nof_cache_hit_bytes_(
+          "nof_cache_hit_bytes_total",
+          "Total object bytes for GetReplicaList results whose first readable "
+          "replica descriptor returned by the master identifies a NoF "
+          "(NVMe-oF SSD) replica. The client may read a different replica."),
       mem_cache_nums_("mem_cache_nums_",
                       "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
@@ -1208,9 +1212,6 @@ int64_t MasterMetricManager::get_mem_cache_hit_bytes() {
 }
 int64_t MasterMetricManager::get_file_cache_hit_bytes() {
     return file_cache_hit_bytes_.value();
-}
-int64_t MasterMetricManager::get_nof_cache_hit_bytes() {
-    return nof_cache_hit_bytes_.value();
 }
 void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
     mem_cache_nums_.inc(val);
