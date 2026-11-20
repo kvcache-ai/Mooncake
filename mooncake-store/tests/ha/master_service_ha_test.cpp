@@ -4974,6 +4974,71 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_EQ(key, batch.entries[0].object_key);
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       UnwrittenDiskRevokeAllowsImmediateRemoveWhileOpLogIsBlocked) {
+    const std::string cluster_id = "batch_disk_reservation_revoke";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_root_fs_dir("/tmp")
+                              .set_oplog_batch_max_entries(4)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "disk_revoke_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "disk_revoke_key";
+    auto started = service.PutStart(mounted.client_id, key, kDefaultTenant,
+                                    1024, ReplicateConfig{});
+    ASSERT_TRUE(started.has_value());
+    ASSERT_EQ(started->size(), 2u);
+    ASSERT_TRUE(
+        std::any_of(started->begin(), started->end(), [](const auto& replica) {
+            return replica.is_disk_replica() &&
+                   replica.status == ReplicaStatus::PROCESSING;
+        }));
+
+    backend->BlockTxn();
+    {
+        struct UnblockOnExit {
+            BlockingBatchHaKvBackend& backend;
+            ~UnblockOnExit() { backend.AllowTxn(); }
+        } unblock{*backend};
+
+        ASSERT_TRUE(service
+                        .PutRevoke(mounted.client_id, key, kDefaultTenant,
+                                   ReplicaType::DISK)
+                        .has_value());
+        ASSERT_TRUE(backend->WaitForBlockedTxn());
+        ASSERT_TRUE(service
+                        .PutEnd(mounted.client_id, key, kDefaultTenant,
+                                ReplicaType::MEMORY)
+                        .has_value());
+        auto removed = service.Remove(key, kDefaultTenant, /*force=*/true);
+        EXPECT_TRUE(removed.has_value())
+            << (removed ? "" : toString(removed.error()));
+    }
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_EQ(batch.entries.size(), 1u);
+    EXPECT_EQ(batch.entries[0].op_type, OpType::REMOVE);
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_EQ(batch.entries.size(), 2u);
+    EXPECT_EQ(batch.entries[0].op_type, OpType::PUT_END);
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    ASSERT_EQ(payload.replicas.size(), 1u);
+    EXPECT_TRUE(payload.replicas[0].is_memory_replica());
+    EXPECT_EQ(payload.replicas[0].status, ReplicaStatus::COMPLETE);
+    EXPECT_EQ(batch.entries[1].op_type, OpType::REMOVE);
+}
+
 TEST_F(MasterServiceBatchRecordE2ETest, RemoveByRegexWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_remove_regex";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

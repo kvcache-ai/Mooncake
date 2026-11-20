@@ -1247,12 +1247,34 @@ class RealClient : public PyClient {
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+    // A start, end or revoke owns its keys until its RPCs return and the
+    // corresponding local session changes are applied.
+    std::unordered_set<std::string> put_session_operations_;
 
-    void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
-                               const std::vector<std::string> &keys);
+    class PutSessionOperation {
+       public:
+        PutSessionOperation(RealClient &client, size_t key_count);
+        ~PutSessionOperation();
+        PutSessionOperation(const PutSessionOperation &) = delete;
+        PutSessionOperation &operator=(const PutSessionOperation &) = delete;
+
+        // Call with session_mutex_ held.
+        bool TryClaim(const std::string &key);
+
+       private:
+        RealClient &client_;
+        // References to claimed set elements survive rehash.
+        std::vector<const std::string *> keys_;
+    };
 
     std::vector<tl::expected<void, ErrorCode>> prepare_put_session_finalize(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, PutSessionOperation &operation);
+    void revoke_put_session_disks(
+        const std::vector<std::string> &keys,
+        std::vector<tl::expected<void, ErrorCode>> &results);
+    void revoke_put_sessions(
+        const std::vector<std::string> &keys,
+        std::vector<tl::expected<void, ErrorCode>> &results);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

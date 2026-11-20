@@ -5544,46 +5544,45 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     };
 
     if (enable_oplog_ && ordered_oplog_writer_) {
+        // DISK here is an unwritten file reservation. Once the OpLog update
+        // has been queued, remove it under the key lock so a subsequent
+        // PutEnd(MEMORY) and Remove see no outstanding DISK replica.
+        const bool defer_removal = replica_type != ReplicaType::DISK;
         auto remaining =
             BuildRemainingReplicaDescriptors(metadata, target_pred);
-        std::vector<ReplicaID> removed_ids;
         auto reservation = ReserveBatchOpLogSlot();
         if (!reservation) {
             return tl::make_unexpected(reservation.error());
         }
-        metadata.VisitReplicas(target_pred, [&removed_ids](Replica& r) {
-            removed_ids.push_back(r.id());
-            r.mark_removed();
-        });
-        metadata.ClearPendingSoftPinIfNoViableReplica();
-        metadata.ClearSessionTagIfNoViableReplica();
 
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
-        if (remaining.empty()) {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::REMOVE,
-                tenant_id.value(), key, {},
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                        removed_ids);
-                });
-        } else {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::PUT_END,
-                tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                remaining),
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                        removed_ids);
-                });
+        DurableFinalizeCallback finalize;
+        if (defer_removal) {
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(target_pred, [&removed_ids](Replica& r) {
+                removed_ids.push_back(r.id());
+                r.mark_removed();
+            });
+            metadata.ClearPendingSoftPinIfNoViableReplica();
+            metadata.ClearSessionTagIfNoViableReplica();
+            finalize = [this, removed_ids = std::move(removed_ids)](
+                           const OpLogEntry& durable_entry) {
+                FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
+            };
         }
+        auto persist_result = AppendReservedOpLogWithDurableFinalize(
+            std::move(reservation.value()),
+            remaining.empty() ? OpType::REMOVE : OpType::PUT_END,
+            object_id.tenant_id.value(), key,
+            remaining.empty() ? std::string{}
+                              : SerializeMetadataForOpLogFromReplicaDescriptors(
+                                    metadata, remaining),
+            std::move(finalize));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
-        return {};
+        if (defer_removal) {
+            return {};
+        }
     }
 
     EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
