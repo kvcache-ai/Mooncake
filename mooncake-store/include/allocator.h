@@ -237,14 +237,15 @@ class BufferAllocatorBase {
     [[nodiscard]] size_t GetUsageBytes() const noexcept {
         return cur_size_.load(std::memory_order_relaxed);
     }
-    void RecordAllocation(size_t bytes) noexcept;
-    void RecordDeallocation(size_t bytes) noexcept;
+    void RecordAllocation(size_t bytes, size_t rounding_bytes = 0) noexcept;
+    void RecordDeallocation(size_t bytes, size_t rounding_bytes = 0) noexcept;
     void SetUsageBytesForRestore(size_t bytes) noexcept {
         cur_size_.store(bytes, std::memory_order_relaxed);
     }
 
    private:
     std::atomic_size_t cur_size_{0};
+    std::atomic_size_t rounding_bytes_{0};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
     std::shared_ptr<const SegmentLocality> locality_;
     std::atomic<bool> has_locality_{false};
@@ -424,6 +425,9 @@ class OffsetBufferAllocator
     }
 
    private:
+    [[nodiscard]] size_t GetRoundingBytes(
+        size_t requested_bytes) const noexcept;
+
     // metadata
     const std::string segment_name_;
     const size_t base_;
