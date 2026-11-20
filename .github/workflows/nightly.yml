@@ -186,6 +186,8 @@ jobs:
           apt update -y
           apt install -y ninja-build
           bash -x dependencies.sh -y
+          export PATH="/usr/local/go/bin:$PATH"
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir build
           cd build
           cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
@@ -350,6 +352,7 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
+          export PATH="/usr/local/go/bin:$PATH"
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir build && cd build
           cmake -G Ninja .. \
@@ -617,6 +620,8 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
+          export PATH="/usr/local/go/bin:$PATH"
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir build
           cd build
           cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF

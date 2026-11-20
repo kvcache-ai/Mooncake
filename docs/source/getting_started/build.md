@@ -30,9 +30,10 @@ sudo make install
 ```
 
 When the Go-based etcd wrapper or Kubernetes Lease backend is enabled, CMake
-runs `go mod tidy` during configuration. The `go` command must be on `PATH`;
-uncached modules or toolchains require network access, and `go.mod` or `go.sum`
-may be updated. Other optional Go components can still download during build.
+prepares Go dependencies during configuration using copies of `go.mod` and
+`go.sum` in the build directory. CMake looks for Go on `PATH` and in
+`/usr/local/go/bin`. Uncached modules or toolchains require network access.
+Other optional Go components can still download during build.
 
 (build-with-hpe-slingshot-cxi)=
 ### Build with HPE Slingshot (CXI)
@@ -442,12 +443,12 @@ cd /Mooncake-main/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
 
-For repeated source builds, `./docker/build-mooncake.sh` uses a verified
-host-side YLT archive cache, sets `DOCKER_BUILDKIT=1` (the Dockerfile uses
-`RUN --mount`), and forwards proxy environment variables. The resulting image
-is tagged `mooncake:from-source` and `mooncake:<git short id>`. Direct
-`docker build` remains supported but requires BuildKit (the default since
-Docker 23.0).
+Both Docker build commands cache the verified YLT archive before copying the
+source tree. `./docker/build-mooncake.sh` enables BuildKit, forwards proxy
+environment variables, and tags the image `mooncake:from-source` and
+`mooncake:<git short id>`. Direct `docker build` requires BuildKit (the
+default since Docker 23.0). Set `GH_MIRROR` when calling the helper or pass
+`--build-arg GH_MIRROR=...` directly to use a YLT download URL prefix.
 
 For SGLang HiCache deployments inside Docker, reserve HugeTLB pages on the host before starting the container and pass the allocator settings through the container environment:
 
