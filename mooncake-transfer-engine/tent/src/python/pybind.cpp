@@ -827,15 +827,28 @@ PYBIND11_MODULE(tent, m) {
                     if (batch_id) {
                         BatchGuard guard(&self,
                                          static_cast<uint64_t>(batch_id));
+                        // A failed submit or wait leaves ownership with the
+                        // transport; ask it to stop before the guard frees the
+                        // batch, or the caller may reuse live buffers.
+                        const auto settled = [&] {
+                            std::vector<TransferStatus> settle_status;
+                            auto status = self.waitTransfer(
+                                batch_id, &settle_status, kSettleTimeoutMs);
+                            if (!status.ok()) return false;
+                            if (settle_status.empty()) return true;
+                            return settle_status.size() == count &&
+                                   std::none_of(
+                                       settle_status.begin(),
+                                       settle_status.end(),
+                                       [](const TransferStatus& item) {
+                                           return item.s ==
+                                                  TransferStatusEnum::PENDING;
+                                       });
+                        };
                         auto submit_status =
                             self.submitTransfer(batch_id, request_list);
                         if (!submit_status.ok()) {
-                            // A rejected submit can still leave tasks in
-                            // flight; stop them before the guard frees the
-                            // batch, or the caller may reuse live buffers.
-                            auto settle =
-                                self.cancelAndWait(batch_id, kSettleTimeoutMs);
-                            if (!settle.ok()) {
+                            if (!settled()) {
                                 wait_error =
                                     "submitTransfer failed: " +
                                     submit_status.ToString() +
@@ -847,11 +860,9 @@ PYBIND11_MODULE(tent, m) {
                             auto wait_status =
                                 self.waitTransfer(batch_id, &status_list, 0);
                             if (!wait_status.ok()) {
-                                auto settle = self.cancelAndWait(
-                                    batch_id, kSettleTimeoutMs);
                                 wait_error = "waitTransfer failed: " +
                                              wait_status.ToString();
-                                if (!settle.ok()) {
+                                if (!settled()) {
                                     wait_error +=
                                         "; the batch may still access src and "
                                         "dst, so do not reuse them";
