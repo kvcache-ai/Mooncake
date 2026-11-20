@@ -211,11 +211,13 @@ TEST_F(TcpUnregisterRepublishTest, BatchRetryCompletesCollectivePublication) {
               ERR_ADDRESS_NOT_REGISTERED);
 }
 
-TEST_F(TcpUnregisterRepublishTest, MixedBatchCompletesKnownRemoval) {
+TEST_F(TcpUnregisterRepublishTest, MixedBatchReportsUnknownAfterKnownRemoval) {
     ASSERT_EQ(registerMemory(first_.data(), first_.size(), false), 0);
 
-    EXPECT_EQ(unregisterBatch({first_.data(), second_.data()}), 0);
+    EXPECT_EQ(unregisterBatch({first_.data(), second_.data()}),
+              ERR_ADDRESS_NOT_REGISTERED);
     EXPECT_FALSE(hasLocalBuffer(first_.data()));
+    EXPECT_EQ(plugin_->setCalls(), 1);
     EXPECT_EQ(unregisterBatch({first_.data(), second_.data()}),
               ERR_ADDRESS_NOT_REGISTERED);
 }

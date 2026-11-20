@@ -561,7 +561,6 @@ int TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
     std::lock_guard<std::mutex> pending_lock(pending_republish_mutex_);
     int first_error = 0;
-    bool any_cleaned = false;
     bool any_not_registered = false;
     std::vector<void*> cleaned_addrs;
     for (auto& addr : addr_list) {
@@ -575,7 +574,6 @@ int TcpTransport::unregisterLocalMemoryBatch(
             if (!first_error) first_error = ret;
             continue;
         }
-        any_cleaned = true;
         cleaned_addrs.push_back(addr);
     }
     int metadata_ret = metadata_->updateLocalSegmentDesc();
@@ -583,7 +581,7 @@ int TcpTransport::unregisterLocalMemoryBatch(
         for (void* addr : cleaned_addrs) clearPendingRepublish((uint64_t)addr);
     }
     if (first_error) return first_error;
-    if (any_not_registered && !any_cleaned) return ERR_ADDRESS_NOT_REGISTERED;
+    if (any_not_registered) return ERR_ADDRESS_NOT_REGISTERED;
     return metadata_ret;
 }
 
