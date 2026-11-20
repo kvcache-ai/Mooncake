@@ -37,6 +37,7 @@
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
+#include "tent/transport/rdma/numa_dispatch.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -256,6 +257,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     }
 
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
+    SET_WORKERS(prefer_nic_local, params->workers.prefer_nic_local);
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
@@ -579,6 +581,8 @@ Status RdmaTransport::submitTransferTasks(
     static std::atomic<int> g_caller_threads(0);
     thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
     int next_worker_idx = tl_caller_id;
+    RdmaNumaLaneCursor numa_lanes(num_workers,
+                                  params_->workers.prefer_nic_local);
     for (auto& request : request_list) {
         bool flush_ready = false;
         auto opcode = request.opcode;
@@ -648,6 +652,17 @@ Status RdmaTransport::submitTransferTasks(
             }
             offset += length;
             int part_id = next_worker_idx % num_workers;
+            if (numa_lanes.enabled() && slice->source_dev_id >= 0) {
+                const auto* nic =
+                    local_topology_->getNicEntry(slice->source_dev_id);
+                if (nic) {
+                    part_id = numa_lanes.select(
+                        slice->source_dev_id, nic->numa_node, part_id,
+                        [this](int lane) {
+                            return workers_->boundNumaNode(lane);
+                        });
+                }
+            }
             auto& list = slice_lists[part_id];
             auto& tail = slice_tails[part_id];
             list.num_slices++;

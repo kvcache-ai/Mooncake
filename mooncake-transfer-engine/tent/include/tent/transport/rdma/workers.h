@@ -82,6 +82,15 @@ class Workers {
 
     DeviceSelector* getDeviceSelector() const { return device_selector_.get(); }
 
+    // Unknown until a worker has published its actual CPU NUMA placement.
+    int boundNumaNode(int worker_id) const {
+        if (!worker_context_ || worker_id < 0 ||
+            worker_id >= static_cast<int>(num_workers_))
+            return -1;
+        return worker_context_[worker_id].bound_numa_node.load(
+            std::memory_order_acquire);
+    }
+
     // Submit-side allocation with pinned peer metadata. An empty result leaves
     // allocation to each worker slice (e.g. a request spans memory locations).
     Status allocateDevices(const Request& request, uint32_t num_slices,
@@ -369,6 +378,7 @@ class Workers {
 
     struct WorkerContext {
         std::thread thread;
+        std::atomic<int> bound_numa_node{-1};
         BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
         // Only this lane may touch its own set, so slices swept by another
