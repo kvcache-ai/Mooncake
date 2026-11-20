@@ -84,6 +84,14 @@ Status TransferEngine::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     return impl_->getSegmentInfo(handle, info);
 }
 
+Status TransferEngine::republishLocalSegment() {
+    if (!available()) {
+        return Status::InternalError(
+            "Cannot republish an unavailable TENT engine" LOC_MARK);
+    }
+    return impl_->metadata_->segmentManager().synchronizeLocal();
+}
+
 Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
                                            Location location) {
     return impl_->allocateLocalMemory(addr, size, location);

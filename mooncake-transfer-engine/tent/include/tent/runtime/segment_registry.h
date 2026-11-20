@@ -47,6 +47,15 @@ class SegmentRegistry {
     virtual Status putSegmentDesc(SegmentDescRef &desc) = 0;
 
     virtual Status deleteSegmentDesc(const std::string &segment_name) = 0;
+
+    // Delete only if the registry still holds the caller's publication. The
+    // default preserves legacy registry implementations; the central registry
+    // overrides this with an ownership check.
+    virtual Status deleteSegmentDescIfOwned(const std::string &segment_name,
+                                            const SegmentDescRef &expected) {
+        (void)expected;
+        return deleteSegmentDesc(segment_name);
+    }
 };
 
 class CentralSegmentRegistry : public SegmentRegistry {
@@ -55,6 +64,8 @@ class CentralSegmentRegistry : public SegmentRegistry {
 
     virtual ~CentralSegmentRegistry() {}
 
+    bool available() const { return plugin_ != nullptr; }
+
    public:
     virtual Status getSegmentDesc(SegmentDescRef &desc,
                                   const std::string &segment_name);
@@ -62,6 +73,9 @@ class CentralSegmentRegistry : public SegmentRegistry {
     virtual Status putSegmentDesc(SegmentDescRef &desc);
 
     virtual Status deleteSegmentDesc(const std::string &segment_name);
+
+    Status deleteSegmentDescIfOwned(const std::string &segment_name,
+                                    const SegmentDescRef &expected) override;
 
    private:
     std::shared_ptr<MetaStore> plugin_;

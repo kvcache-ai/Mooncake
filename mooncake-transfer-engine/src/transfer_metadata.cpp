@@ -24,6 +24,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 #include "common.h"
@@ -342,9 +343,10 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
     }
     storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
     if (!storage_plugin_) {
-        LOG(ERROR)
-            << "Unable to create metadata storage plugin with conn string "
-            << conn_string;
+        throw std::invalid_argument(
+            "Unable to create metadata storage plugin for backend '" +
+            protocol + "' with conn string '" + conn_string +
+            "': unsupported or disabled backend");
     }
     startMetadataRefreshPollingIfNeeded();
 }

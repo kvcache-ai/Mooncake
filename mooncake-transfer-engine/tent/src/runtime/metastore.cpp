@@ -81,7 +81,7 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string& type,
         if (status.ok())
             return redis_plugin;
         else {
-            LOG(FATAL) << status.ToString();
+            LOG(ERROR) << status.ToString();
             return nullptr;
         }
     }
@@ -93,7 +93,7 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string& type,
     }
 #endif  // USE_HTTP
     if (!plugin) {
-        LOG(FATAL) << "Protocol " << type
+        LOG(ERROR) << "Protocol " << type
                    << " not installed. Please rebuild the package.";
         return nullptr;
     }
@@ -101,7 +101,7 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string& type,
     if (status.ok())
         return plugin;
     else {
-        LOG(FATAL) << status.ToString();
+        LOG(ERROR) << status.ToString();
         return nullptr;
     }
 }
