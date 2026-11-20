@@ -110,8 +110,8 @@ class TestMooncakeConfig(unittest.TestCase):
     def test_size_boundaries_in_file_and_env(self):
         for invalid in ("16777216TiB", "-0.0005KiB"):
             self.write_config({**self.valid_config, "global_segment_size": invalid})
-            with self.subTest(source="file", value=invalid), self.assertRaises(
-                ValueError
+            with self.subTest(source="file", value=invalid), self.assertRaisesRegex(
+                ValueError, "global_segment_size"
             ):
                 MooncakeConfig.from_file(self.config_file)
             with patch.dict(
@@ -122,8 +122,8 @@ class TestMooncakeConfig(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with self.subTest(source="env", value=invalid), self.assertRaises(
-                    ValueError
+                with self.subTest(source="env", value=invalid), self.assertRaisesRegex(
+                    ValueError, "local_buffer_size"
                 ):
                     MooncakeConfig.load_from_env()
 

@@ -133,25 +133,25 @@ def _check_segment_size(value, field_name: str) -> None:
         raise ValueError(f"Invalid {field_name}: {value!r}. Size must fit in uint64.")
 
 
-def _parse_segment_size(value) -> int:
+def _parse_segment_size(value, field_name: str = "segment size") -> int:
     """Parse bytes or binary size suffixes, including IEC KiB/MiB/GiB/TiB."""
     if isinstance(value, str):
         s = value.strip().lower()
         if not s:
-            raise ValueError("Invalid segment size: empty string")
+            raise ValueError(f"Invalid {field_name}: empty string")
         for suffix, multiplier in _SIZE_SUFFIXES:
             if s.endswith(suffix):
                 num = s[: -len(suffix)].strip()
                 if not num:
                     raise ValueError(
-                        f"Invalid segment size: missing number before '{suffix}'"
+                        f"Invalid {field_name}: missing number before '{suffix}'"
                     )
                 value = float(num) * multiplier
                 break
         else:
             value = float(s)
     # Validate the scaled value while a negative fraction is still negative.
-    _check_segment_size(value, "segment size")
+    _check_segment_size(value, field_name)
     return int(value)
 
 
@@ -320,10 +320,12 @@ class MooncakeConfig:
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
             global_segment_size=_parse_segment_size(
-                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
+                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE),
+                "global_segment_size",
             ),
             local_buffer_size=_parse_segment_size(
-                config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
+                config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE),
+                "local_buffer_size",
             ),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
@@ -361,10 +363,12 @@ class MooncakeConfig:
                 global_segment_size=_parse_segment_size(
                     os.getenv(
                         "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
-                    )
+                    ),
+                    "global_segment_size",
                 ),
                 local_buffer_size=_parse_segment_size(
-                    os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
+                    os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE),
+                    "local_buffer_size",
                 ),
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
