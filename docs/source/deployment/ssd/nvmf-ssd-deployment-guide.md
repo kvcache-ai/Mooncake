@@ -29,12 +29,13 @@ Mooncake automatically finds the device from the connection information and
 NSID; no device-path configuration is needed. The operating system manages
 connections and reconnections.
 
-**Build and enable.** Install the liburing development package and enable
-these CMake options:
+**Build and enable.** Install the liburing development package and configure
+a Linux-only build with these CMake options, including when reusing a build directory:
 
 ```text
 -DUSE_NOF=ON
 -DUSE_NOF_LINUX=ON
+-DUSE_NOF_SPDK=OFF
 ```
 
 Set the following environment variable for the master and every client process
@@ -58,7 +59,7 @@ sudo nvme connect \
   -t tcp \
   -a 192.168.65.56 \
   -s 4420 \
-  -n nqn.2026-10.io.example:cache \
+  -n nqn.2016-06.io.spdk:cnode1 \
   --keep-alive-tmo=10 \
   --reconnect-delay=1 \
   --ctrl-loss-tmo=-1 \
@@ -101,8 +102,21 @@ connected, but successful startup or registration does not mean storage is
 ready. Complete device connections before registering segments and enabling
 NoF traffic.
 
-Use the existing segment registration workflow. The registered connection
-information and NSID must match the kernel connection.
+The registered connection information and NSID must match the kernel
+connection. The registration tools default to RDMA. For an SPDK target using TCP, set
+`MC_NOF_TRTYPE=TCP` on both the registration command and the command that
+unregisters a namespace by endpoint. Registration discovers the subsystem NQN
+from the target. Use that same NQN to unregister NSID 1:
+
+```bash
+MC_NOF_TRTYPE=TCP python3 -m mooncake.mooncake_ssd_register \
+    --master_server_address=192.168.65.81:50051 \
+    --spdk_target_info="ip:192.168.65.56 path:/home/spdk"
+
+MC_NOF_TRTYPE=TCP python3 -m mooncake.mooncake_ssd_unregister \
+    --master_server_address=192.168.65.81:50051 \
+    --spdk_target_info="ip:192.168.65.56 ns:1 nqn:nqn.2016-06.io.spdk:cnode1"
+```
 
 **Failure recovery.** The kernel handles reconnection after temporary
 disconnections. If a device has been deleted or recreated, restore the

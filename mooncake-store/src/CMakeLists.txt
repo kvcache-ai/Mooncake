@@ -798,6 +798,16 @@ endif()
 if(USE_NOF AND USE_NOF_LINUX)
   target_link_libraries(mooncake_store PRIVATE mooncake_nof_linux)
 endif()
+# Cargo and cgo assemble their own link lines for the static Store.
+if(TARGET mooncake_nof_linux AND NOT BUILD_SHARED_LIBS)
+  set(MOONCAKE_STORE_LINK_NOF_LINUX
+      TRUE
+      CACHE INTERNAL "Link the Linux NoF archive in native bindings")
+else()
+  set(MOONCAKE_STORE_LINK_NOF_LINUX
+      FALSE
+      CACHE INTERNAL "Link the Linux NoF archive in native bindings")
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
