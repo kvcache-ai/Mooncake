@@ -3,6 +3,48 @@
 # Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
 # Example: ./scripts/build_wheel.sh 3.10 dist-3.10
 
+cleanup_build_directory() {
+    DEVICE_STAGING_TEMP=""
+    if [ "$FREE_BUILD_DIR" != "0" ] && { [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; }; then
+        for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+            if [ -f "${DEVICE_STAGING_DIR}/${device_library}" ]; then
+                if [ -z "$DEVICE_STAGING_TEMP" ]; then
+                    DEVICE_STAGING_TEMP=$(mktemp -d)
+                fi
+                cp "${DEVICE_STAGING_DIR}/${device_library}" "$DEVICE_STAGING_TEMP/"
+            fi
+        done
+        if [ -n "$DEVICE_STAGING_TEMP" ]; then
+            echo "Preserved selected EP/PG device libraries to ${DEVICE_STAGING_TEMP} before build-dir cleanup"
+            if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -d "$CUDA_EP_JIT_DIR" ]; then
+                cp -r "$CUDA_EP_JIT_DIR" "$DEVICE_STAGING_TEMP/"
+                CUDA_EP_JIT_DIR="${DEVICE_STAGING_TEMP}/mooncake_ep_jit"
+                echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+            fi
+        fi
+        echo "Freeing disk space: removing build directory (artifacts already copied)"
+        rm -rf "${BUILD_DIR}/"
+    fi
+}
+
+# XPU wheels leave the SYCL and Intel compiler runtimes to the user's PyTorch
+# XPU environment (see the auditwheel excludes below). Print the directories
+# $1 resolves them from, so the wheel smoke client can load them without
+# inheriting build-tree library paths.
+intel_runtime_library_path() {
+    ldd "$1" | awk '
+        $2 == "=>" && $3 ~ "^/" && $1 ~ "^lib(sycl|svml|imf|irng|intlc)[.]so" {
+            dir = $3; sub("/[^/]*$", "", dir)
+            if (!seen[dir]++) dirs = dirs (dirs ? ":" : "") dir
+        }
+        END { if (dirs) print dirs }'
+}
+
+# Sourcing exposes the helpers above without starting a wheel build.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
@@ -13,7 +55,13 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build). EP and PG device extensions share
 # the existing staging directory and are selected from the CMake cache below.
 BUILD_DIR="${BUILD_DIR:-build}"
-BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+BUILD_DIR_ABS="$(cd "$BUILD_DIR" && pwd)"
+# Release wheels expose mooncake.conductor in every supported variant. Fail
+# before touching staging files if the native API was not built.
+if ! compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
+    echo "Error: missing _conductor extension; configure with -DWITH_CONDUCTOR=ON and build it" >&2
+    exit 1
+fi
 INCLUDE_STORE_RS="${INCLUDE_STORE_RS:-0}"
 BUILD_ROOT="$(pwd)"
 CMAKE_CACHE="${BUILD_DIR_ABS}/CMakeCache.txt"
@@ -152,6 +200,16 @@ else
     echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
+# Copy _conductor.so to mooncake directory (client API for mooncake.conductor)
+if compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
+    echo "Copying _conductor.so..."
+    cp ${BUILD_DIR}/mooncake-integration/_conductor.*.so mooncake-wheel/mooncake/
+    CONDUCTOR_CLIENT_LD_LIBRARY_PATH=$(intel_runtime_library_path ${BUILD_DIR}/mooncake-integration/_conductor.*.so)
+else
+    echo "Error: required _conductor extension disappeared during staging" >&2
+    exit 1
+fi
+
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
 if [ -f ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
@@ -238,33 +296,23 @@ cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-
 # libraries remain in post-repair staging so patchelf never touches CUDA fatbins.
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
+# Preserve the Conductor server and its build-local runtime dependency before
+# CI deletes build/. These files are only for the E2E server, not wheel contents.
+CONDUCTOR_SMOKE_DIR=$(mktemp -d)
+cleanup_conductor_smoke() {
+    rm -rf "$CONDUCTOR_SMOKE_DIR"
+}
+trap cleanup_conductor_smoke EXIT
+cp "${BUILD_DIR_ABS}/mooncake-conductor/mooncake_conductor" "$CONDUCTOR_SMOKE_DIR/"
+cp "${BUILD_DIR_ABS}/mooncake-common/libasio.so" "$CONDUCTOR_SMOKE_DIR/"
 # Kernel header tree the CUDA EP JIT compiles against at runtime.
 CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 
-# CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
-# Preserve selected component libraries and EP JIT headers if the build
-# directory is removed before auditwheel injection.
-DEVICE_STAGING_TEMP=""
-if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
-    for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
-        if [ -f "${DEVICE_STAGING_DIR}/${device_library}" ]; then
-            if [ -z "$DEVICE_STAGING_TEMP" ]; then
-                DEVICE_STAGING_TEMP=$(mktemp -d)
-            fi
-            cp "${DEVICE_STAGING_DIR}/${device_library}" "$DEVICE_STAGING_TEMP/"
-        fi
-    done
-    if [ -n "$DEVICE_STAGING_TEMP" ]; then
-        echo "Preserved selected EP/PG device libraries to ${DEVICE_STAGING_TEMP} before build-dir cleanup"
-        if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -d "$CUDA_EP_JIT_DIR" ]; then
-            cp -r "$CUDA_EP_JIT_DIR" "$DEVICE_STAGING_TEMP/"
-            CUDA_EP_JIT_DIR="${DEVICE_STAGING_TEMP}/mooncake_ep_jit"
-            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
-        fi
-    fi
-    echo "Freeing disk space: removing build directory (artifacts already copied)"
-    rm -rf "${BUILD_DIR}/"
-fi
+# CI only: remove build/ to free disk before python -m build.
+# FREE_BUILD_DIR=1 enables local cleanup; 0 preserves build dependencies and tests.
+# If EP/PG .so files were staged inside the build directory, preserve them in a
+# temporary location so they survive the cleanup.
+cleanup_build_directory
 
 # Release builds still compile with -g (ENABLE_DEBUG_SYMBOLS defaults to ON),
 # and DWARF made up most of each wheel, pushing the CUDA wheels past the
@@ -327,6 +375,7 @@ MIGRATED_PYTHON_MODULES=(
     cli.py
     cli_bench.py
     cli_client.py
+    conductor.py
     transfer_engine_topology_dump.py
     buffer_pool.py
     mooncake_config.py
@@ -362,7 +411,7 @@ cleanup_migrated_python_staging() {
     rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_migrated_python_staging EXIT
+trap 'cleanup_migrated_python_staging; cleanup_conductor_smoke' EXIT
 cleanup_migrated_python_staging
 if [ "$WITH_PG_BUILD" != "1" ] && [ -f "$PG_MODULE_SOURCE" ]; then
     PG_MODULE_BACKUP=$(mktemp)
@@ -391,10 +440,11 @@ cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
     cleanup_migrated_python_staging
+    cleanup_conductor_smoke
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MEMFABRIC_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MEMFABRIC_BUILD MUSA_BUILD HIP_BUILD XPU_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -459,34 +509,6 @@ elif [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-memfabric"
-elif [ "$EFA_BUILD" = "1" ]; then
-    echo "Modifying package name for AWS EFA build (CUDA)"
-    # Backup original pyproject.toml
-    cp pyproject.toml pyproject.toml.backup
-    # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa"/' pyproject.toml
-    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA version)"/' pyproject.toml
-    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-efa"
-elif [ "$EFA_CU13_BUILD" = "1" ]; then
-    echo "Modifying package name for AWS EFA build (CUDA 13)"
-    # Backup original pyproject.toml
-    cp pyproject.toml pyproject.toml.backup
-    # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-cuda13"/' pyproject.toml
-    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA 13 version)"/' pyproject.toml
-    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda13"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-efa-cuda13"
-elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
-    echo "Modifying package name for AWS EFA build (non-CUDA)"
-    # Backup original pyproject.toml
-    cp pyproject.toml pyproject.toml.backup
-    # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-non-cuda"/' pyproject.toml
-    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, Non-CUDA version)"/' pyproject.toml
-    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "non-cuda"]/' pyproject.toml
-    sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-efa-non-cuda"
 elif [ "$MUSA_BUILD" = "1" ]; then
     echo "Modifying package name for MUSA build"
     # Backup original pyproject.toml
@@ -509,6 +531,14 @@ elif [ "$HIP_BUILD" = "1" ]; then
     sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "rocm", "amd", "hip"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-rocm"
+elif [ "$XPU_BUILD" = "1" ]; then
+    echo "Modifying package name for Intel XPU build"
+    cp pyproject.toml pyproject.toml.backup
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-xpu"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Intel XPU version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "intel", "xpu", "sycl"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-xpu"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
@@ -897,6 +927,13 @@ for wheel in "${wheels[@]}"; do
     fi
 done
 
+WHEEL_OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 cd ..
+
+# Validate the final repaired artifact, not the build tree.
+CONDUCTOR_CLIENT_LD_LIBRARY_PATH="${CONDUCTOR_CLIENT_LD_LIBRARY_PATH}" \
+CONDUCTOR_SERVER_LD_LIBRARY_PATH="${CONDUCTOR_SMOKE_DIR}:${LD_LIBRARY_PATH}" \
+    python${PYTHON_VERSION} scripts/smoke_conductor_wheel.py "${WHEEL_OUTPUT_DIR}"/*.whl \
+    --server "${CONDUCTOR_SMOKE_DIR}/mooncake_conductor"
 
 echo "Wheel package built and repaired successfully!"

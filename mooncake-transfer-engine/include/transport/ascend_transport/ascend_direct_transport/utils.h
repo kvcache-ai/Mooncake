@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -28,6 +29,7 @@
 
 #include <acl/acl.h>
 #include "ascend_affinity.h"
+#include "ascend_device_index.h"
 
 namespace mooncake {
 
@@ -82,7 +84,8 @@ class ScopeGuard {
 // helpers. The NUMA affinity plan/thread pool come from ascend_affinity.h.
 std::string GenAdxlEngineName(const std::string& ip, const uint64_t port);
 
-uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
+uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports = {});
 
 // True only when HCCL_INTRA_ROCE_ENABLE=1. The standalone holder's
 // RoceDummyRealSliceDispatcher is selected from this flag. roce:device and

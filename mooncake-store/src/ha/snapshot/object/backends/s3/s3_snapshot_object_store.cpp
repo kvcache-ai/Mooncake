@@ -2,29 +2,11 @@
 
 #ifdef HAVE_AWS_SDK
 
-#include <algorithm>
-#include <cctype>
-#include <string_view>
-
 #include <glog/logging.h>
 
 #include "common/s3_helper.h"
 
 namespace mooncake {
-
-namespace {
-
-bool ContainsAsciiInsensitive(std::string_view haystack,
-                              std::string_view needle) {
-    return std::search(
-               haystack.begin(), haystack.end(), needle.begin(), needle.end(),
-               [](char lhs, char rhs) {
-                   return std::tolower(static_cast<unsigned char>(lhs)) ==
-                          std::tolower(static_cast<unsigned char>(rhs));
-               }) != haystack.end();
-}
-
-}  // namespace
 
 class S3SnapshotObjectStore::Impl {
    public:
@@ -93,10 +75,7 @@ S3SnapshotObjectStore::InspectObject(const std::string& key) {
 }
 
 bool S3SnapshotObjectStore::IsNotFoundError(const std::string& error) const {
-    return ContainsAsciiInsensitive(error, "nosuchkey") ||
-           ContainsAsciiInsensitive(error, "not found") ||
-           ContainsAsciiInsensitive(error, "does not exist") ||
-           ContainsAsciiInsensitive(error, "404");
+    return S3Helper::IsNotFoundError(error);
 }
 
 std::string S3SnapshotObjectStore::GetConnectionInfo() const {

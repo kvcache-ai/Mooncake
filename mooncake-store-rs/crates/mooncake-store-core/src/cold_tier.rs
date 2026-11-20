@@ -15,6 +15,8 @@ pub struct ColdBackingRouteFilter {
     pub device_id: Option<String>,
     pub state: Option<ColdBackingState>,
     pub owner: Option<ClientRuntimeId>,
+    /// Exclusive object-key continuation, applied before `limit` in key order.
+    pub after_key: Option<crate::ObjectKey>,
     pub limit: Option<usize>,
 }
 

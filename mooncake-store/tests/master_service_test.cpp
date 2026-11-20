@@ -847,6 +847,19 @@ TEST_F(MasterServiceTest, SoftPinMasterConfigRejectsDefaultAboveMaximum) {
     EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
 }
 
+TEST_F(MasterServiceTest, RejectsTooManyEvictionWorkerThreads) {
+    auto max_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS)
+            .build();
+    EXPECT_NO_THROW(MasterService service(max_config));
+    auto invalid_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS + 1)
+            .build();
+    EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
+}
+
 TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 
@@ -1690,6 +1703,7 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
 
     {
         MasterService service;
+        MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
         const auto context = PrepareSimpleSegment(service);
         ReplicateConfig config;
         config.replica_num = 1;
@@ -1704,45 +1718,42 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
                                 TenantId::Default(), ReplicaType::ALL)
                         .has_value());
 
-        // Memory + DFS collapse to exactly the two logical tiers, sorted the
-        // same way the publisher sorts them.
-        auto media = KvMediaForKey(service, "dfs_kv_media");
+        // Memory + DFS collapse to the two logical KV media bits on the route.
+        auto media = AnnouncedKvMediaForKey(service, "dfs_kv_media");
         ASSERT_TRUE(media.has_value());
-        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *media);
-
-        auto removal_media = KvRemovalMediaForKey(service, "dfs_kv_media");
-        ASSERT_TRUE(removal_media.has_value());
-        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *removal_media);
+        EXPECT_EQ(KvEventPublisher::kMediumCpu | KvEventPublisher::kMediumDisk,
+                  *media);
     }
 
     std::error_code ec;
     std::filesystem::remove_all(dfs_root, ec);
 }
 
-// A removal path can run while a replica is still PROCESSING. That medium was
-// never announced as available, but the removal snapshot must still name it:
-// otherwise a tier that a subscriber may have seen is never retracted. The
-// contrast with KvMediaForKey, which counts only completed replicas, is the
-// whole point of having two helpers.
-TEST_F(MasterServiceTest, ProcessingReplicaMediumAppearsInRemovalSnapshot) {
+// PutStart without PutEnd leaves the replica PROCESSING; the route observer
+// keeps announced_kv_media at 0, so revoking the uncommitted write tears down
+// the slot without bumping the tenant epoch or retracting an unannounced tier.
+TEST_F(MasterServiceTest, ProcessingReplicaRemainsUnannouncedOnRoute) {
     MasterService service;
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // PutStart without PutEnd leaves the replica PROCESSING.
     auto start = service.PutStart(context.client_id, "processing_kv_media",
                                   TenantId::Default(), 4096, config);
     ASSERT_TRUE(start.has_value());
 
-    auto media = KvMediaForKey(service, "processing_kv_media");
+    auto media = AnnouncedKvMediaForKey(service, "processing_kv_media");
     ASSERT_TRUE(media.has_value());
-    EXPECT_TRUE(media->empty()) << "a PROCESSING replica is not yet available "
-                                   "and must not be announced";
+    EXPECT_EQ(0u, *media) << "a PROCESSING replica is not yet available and "
+                             "must not be marked announced";
 
-    auto removal_media = KvRemovalMediaForKey(service, "processing_kv_media");
-    ASSERT_TRUE(removal_media.has_value());
-    EXPECT_EQ(std::vector<std::string>({"cpu"}), *removal_media);
+    ASSERT_TRUE(service
+                    .PutRevoke(context.client_id, "processing_kv_media",
+                               TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_FALSE(
+        AnnouncedKvMediaForKey(service, "processing_kv_media").has_value());
 }
 
 // A RemoveAll whose oplog slot reservation fails must leave the object in
@@ -2174,6 +2185,210 @@ TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
               AllocationStrategyType::LOCAL_FIRST);
 }
 
+namespace {
+class PreferredSequenceRecorder final : public RandomAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& manager, size_t length, size_t replicas,
+        const std::vector<std::string>& preferred,
+        const std::set<std::string>& excluded, ReplicaType type) override {
+        names = preferred;
+        return RandomAllocationStrategy::Allocate(manager, length, replicas,
+                                                  preferred, excluded, type);
+    }
+
+    std::vector<std::string> names;
+};
+}  // namespace
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitPriorityAndFirstOccurrence) {
+    for (bool use_hint : {false, true}) {
+        SCOPED_TRACE(use_hint);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            use_hint ? AllocationStrategyType::RANDOM
+                     : AllocationStrategyType::LOCAL_FIRST;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        size_t index = 0;
+        for (const auto& [name, host] :
+             std::vector<std::pair<std::string, std::string>>{
+                 {"A", "host-a"},
+                 {"B", "host-b"},
+                 {"A", "host-c"},
+                 {"C", "host-c"}}) {
+            auto segment =
+                MakeSegment(name, kDefaultSegmentBase + index++ * 65536, 65536);
+            segment.host_id = host;
+            ASSERT_TRUE(service.MountSegment(segment, owner));
+        }
+        ReplicateConfig incoming;
+        incoming.host_id = "host-b";
+        incoming.prefer_alloc_in_same_node = use_hint;
+        incoming.preferred_segments = {"", "C", "C", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "array", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "array", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        // The singular preference takes precedence over the array, and its
+        // remote host stays ahead of the automatically preferred local host.
+        incoming.preferred_segment = "C";
+        ASSERT_TRUE(service.PutStart(owner, "single", TenantId::Default(), 4096,
+                                     incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "B", "A"}));
+        ASSERT_TRUE(service.PutRevoke(owner, "single", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+
+        incoming.preferred_segment.clear();
+        incoming.preferred_segments.clear();
+        const std::string key = "cross-host-duplicate";
+        ASSERT_TRUE(
+            service.PutStart(owner, key, TenantId::Default(), 4096, incoming));
+        // host-b comes first, then host-c's rotated A/C, then host-a's A.
+        // The final A must not be appended again.
+        const bool c_first = std::hash<std::string>{}(key) % 2 != 0;
+        EXPECT_EQ(recorder->names,
+                  (c_first ? std::vector<std::string>{"B", "C", "A"}
+                           : std::vector<std::string>{"B", "A", "C"}));
+        ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                      ReplicaType::MEMORY));
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesExplicitNamesAcrossManyAppends) {
+    for (bool use_hint : {false, true}) {
+        for (size_t prefix_length : {0U, 96U}) {
+            SCOPED_TRACE(use_hint);
+            SCOPED_TRACE(prefix_length);
+            MasterServiceConfig config;
+            config.memory_allocator = BufferAllocatorType::OFFSET;
+            config.allocation_strategy_type =
+                use_hint ? AllocationStrategyType::RANDOM
+                         : AllocationStrategyType::LOCAL_FIRST;
+            MasterService service(config);
+            auto recorder = std::make_shared<PreferredSequenceRecorder>();
+            MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+            const UUID owner{1, 1};
+            const std::string prefix(prefix_length, 'x');
+            const std::string explicit_name = prefix + "preferred";
+            std::vector<std::string> expected{explicit_name};
+            size_t index = 0;
+            auto mount = [&](const std::string& name, const std::string& host) {
+                auto segment = MakeSegment(
+                    name, kDefaultSegmentBase + index++ * 65536, 65536);
+                segment.host_id = host;
+                return service.MountSegment(segment, owner);
+            };
+            for (size_t i = 0; i < 64; ++i) {
+                const auto name = prefix + "s" + std::to_string(i);
+                ASSERT_TRUE(mount(name, "host-" + std::to_string(100 + i)));
+                expected.push_back(name);
+            }
+            // These duplicates arrive after enough appends to relocate an
+            // unreserved vector. Short explicit names exercise SSO storage;
+            // the automatic duplicate has equal content in another string.
+            ASSERT_TRUE(mount(explicit_name, "host-z"));
+            ASSERT_TRUE(mount(expected[1], "host-zz"));
+            ReplicateConfig incoming;
+            incoming.host_id = "host-100";
+            incoming.prefer_alloc_in_same_node = use_hint;
+            incoming.preferred_segments = {"", explicit_name, explicit_name,
+                                           ""};
+            for (size_t request = 0; request < 2; ++request) {
+                const auto key = "many-appends-" + std::to_string(request);
+                ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(),
+                                             4096, incoming));
+                EXPECT_EQ(recorder->names, expected);
+                ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
+                                              ReplicaType::MEMORY));
+            }
+        }
+    }
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesUnknownHostAndUnavailableSegmentFallback) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+    MasterService service(config);
+    auto recorder = std::make_shared<PreferredSequenceRecorder>();
+    MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+    const UUID owner{1, 1};
+    std::vector<Segment> segments;
+    for (size_t i = 0; i < 3; ++i) {
+        auto segment = MakeSegment(std::string(1, 'A' + i),
+                                   kDefaultSegmentBase + i * 65536, 65536);
+        segment.host_id = "host-" + std::string(1, 'a' + i);
+        ASSERT_TRUE(service.MountSegment(segment, owner));
+        segments.push_back(segment);
+    }
+    ReplicateConfig incoming;
+    incoming.host_id = "host-bb";
+    ASSERT_TRUE(service.PutStart(owner, "unknown", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "unknown", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    incoming.host_id = "host-z";
+    ASSERT_TRUE(
+        service.PutStart(owner, "wrap", TenantId::Default(), 4096, incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A", "B", "C"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "wrap", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName("B", SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    incoming.host_id = "host-b";
+    ASSERT_TRUE(service.PutStart(owner, "draining", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A"}));
+    ASSERT_TRUE(service.PutRevoke(owner, "draining", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+
+    ASSERT_TRUE(service.UnmountSegment(segments[2].id, owner));
+    ASSERT_TRUE(service.PutStart(owner, "unmounted", TenantId::Default(), 4096,
+                                 incoming));
+    EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+}
+
+TEST_F(MasterServiceTest,
+       LocalFirstMergePreservesPreferencesWithoutAutomaticCandidates) {
+    for (bool local_first : {false, true}) {
+        SCOPED_TRACE(local_first);
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type =
+            local_first ? AllocationStrategyType::LOCAL_FIRST
+                        : AllocationStrategyType::RANDOM;
+        MasterService service(config);
+        auto recorder = std::make_shared<PreferredSequenceRecorder>();
+        MasterServiceTestPeer::AllocationStrategy(service) = recorder;
+        const UUID owner{1, 1};
+        // No host identity is registered, so local-first has no automatic
+        // candidates; ordinary placement must not add any either.
+        ASSERT_TRUE(service.MountSegment(MakeSegment("A"), owner));
+        ReplicateConfig incoming;
+        incoming.host_id = "unknown";
+        incoming.preferred_segments = {"", "A", "A", ""};
+        ASSERT_TRUE(service.PutStart(owner, "no-host", TenantId::Default(),
+                                     4096, incoming));
+        EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
+    }
+}
+
 TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     const uint64_t kv_lease_ttl = 100;
     const uint64_t client_live_ttl = 600;
@@ -2412,6 +2627,54 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     auto remove_result = service_->Remove(key2, TenantId::Default());
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
+}
+
+TEST_F(MasterServiceTest, StaleCleanupUsesLocalDiskSessionState) {
+    MasterService service;
+    // Drive liveness synchronously, without the offboarding worker removing
+    // replicas before the generic stale-handle sweep can inspect them.
+    StopClientSessionsForTest(service);
+    auto memory_segment = MakeSegment("cleanup_memory_owner");
+    const UUID memory_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(memory_segment, memory_owner).has_value());
+    const auto key =
+        PutObjectOnSegment(service, memory_owner, memory_segment.name);
+
+    auto disk_segment = MakeSegment("cleanup_disk_owner", 0x400000000);
+    const UUID disk_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(disk_segment, disk_owner).has_value());
+    Replica disk(disk_owner, 1024, "disk-endpoint", ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service.AddReplica(disk_owner, key, TenantId::Default(), disk)
+                    .has_value());
+    const auto record = FindClientLivenessForTest(service, disk_owner);
+    ASSERT_TRUE(record);
+
+    const auto expect_replica_count = [&](size_t count) {
+        auto result = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->replicas.size(), count);
+    };
+    ClearInvalidHandlesForTest(service);
+    expect_replica_count(2);
+
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ClearInvalidHandlesForTest(service);
+    // Recover after sweeping so the read API exposes the retained disk replica.
+    ASSERT_EQ(record->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    expect_replica_count(2);
+
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    ClearInvalidHandlesForTest(service);
+    expect_replica_count(1);
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
@@ -2745,6 +3008,38 @@ TEST_F(MasterServiceTest, MoveEndReleasesSourceRefcountWhenTargetGone) {
         GetReplicaRefcntBySegmentName(*service, "refcnt_key", "refcnt_source");
     ASSERT_TRUE(source_refcnt.has_value());
     EXPECT_EQ(0, source_refcnt.value());
+}
+
+TEST_F(MasterServiceTest, PutStartPartialMemoryAllocationDoesNotArmEviction) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.eviction_ratio = 0;
+    service_config.eviction_high_watermark_ratio = 1;
+    MasterService service(service_config);
+    const auto full = PrepareSimpleSegment(service, "full");
+    PrepareSimpleSegment(service, "available",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig fill;
+    fill.replica_num = 1;
+    fill.preferred_segment = "full";
+    ASSERT_TRUE(service.PutStart(full.client_id, "fill", TenantId::Default(),
+                                 kDefaultSegmentSize, fill));
+    ASSERT_TRUE(service.PutEnd(full.client_id, "fill", TenantId::Default(),
+                               ReplicaType::MEMORY));
+    ASSERT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
+        EXPECT_TRUE(access.getAllocatorManager().hasEnoughServingNames(2));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto result = service.PutStart(full.client_id, "partial",
+                                   TenantId::Default(), 1024, config);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
 }
 
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
@@ -4046,6 +4341,60 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_FALSE(segment_names.contains("segment_0"));
 }
 
+TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(10000).build();
+    auto service = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service, "move_source");
+    PrepareSimpleSegment(*service, "move_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto tenant = TenantId::Default();
+    const auto key =
+        PutObjectOnSegment(*service, source.client_id, "move_source");
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.preferred_segment = "move_source";
+
+    auto upsert =
+        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    ASSERT_TRUE(upsert);
+    auto premature_move = service->MoveStart(source.client_id, key, tenant,
+                                             "move_source", "move_target");
+    ASSERT_FALSE(premature_move);
+    EXPECT_EQ(premature_move.error(), ErrorCode::REPLICA_NOT_FOUND);
+    ASSERT_TRUE(
+        service->UpsertEnd(source.client_id, key, tenant, ReplicaType::MEMORY));
+
+    auto before = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->replicas.size(), 1u);
+    const auto source_id = before->replicas.front().id;
+    auto move = service->MoveStart(source.client_id, key, tenant, "move_source",
+                                   "move_target");
+    ASSERT_TRUE(move);
+    ASSERT_TRUE(move->target);
+
+    auto concurrent_upsert =
+        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    ASSERT_FALSE(concurrent_upsert);
+    EXPECT_EQ(concurrent_upsert.error(),
+              ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    auto during = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(during);
+    ASSERT_EQ(during->replicas.size(), 1u);
+    EXPECT_EQ(during->replicas.front().id, source_id);
+    ASSERT_TRUE(service->MoveRevoke(source.client_id, key, tenant));
+
+    auto after = service->GetReplicaList(key, tenant);
+    ASSERT_TRUE(after);
+    ASSERT_EQ(after->replicas.size(), 1u);
+    EXPECT_EQ(after->replicas.front().id, source_id);
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  "move_target"),
+              0);
+}
+
 // Drain plans and completes one tenant at a time: the segment counts as
 // drained only once every tenant's object under the same user key has left
 // it.
@@ -4137,7 +4486,369 @@ TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     EXPECT_EQ(restored_status.value(), SegmentStatus::OK);
 }
 
-TEST_F(MasterServiceTest, CancelDrainJobRejectsActiveMoveTasks) {
+TEST_F(MasterServiceTest, DrainJobTimeoutWaitsForMoveAndCanResume) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 3; ++i) {
+        keys.push_back(
+            PutObjectOnSegment(*service_, generate_uuid(), "segment_0"));
+    }
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 2;
+    auto first = service_->CreateTimedDrainJob(request, 3000);
+    ASSERT_TRUE(first);
+
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*first);
+        return job && job->active_units == 2;
+    });
+    auto fetched = service_->FetchTasks(source.client_id, 1);
+    ASSERT_TRUE(fetched);
+    ASSERT_EQ(fetched->size(), 1u);
+    const auto assignment = fetched->front();
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, assignment.payload);
+    ASSERT_TRUE(service_->MoveStart(source.client_id, payload.key,
+                                    TenantId(payload.tenant_id), payload.source,
+                                    payload.target));
+
+    WaitUntil(
+        [&] {
+            auto job = service_->QueryDrainJob(*first);
+            return job && job->status == JobStatus::CANCELING;
+        },
+        std::chrono::seconds(8));
+    auto job = service_->QueryDrainJob(*first);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->active_units, 1u);  // The other pending task was canceled.
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINING);
+    auto cancellation =
+        service_->IsTaskCancellationRequested(source.client_id, assignment.id);
+    ASSERT_TRUE(cancellation);
+    EXPECT_TRUE(*cancellation);
+    auto overlapping = service_->CreateDrainJob(request);
+    ASSERT_FALSE(overlapping);
+    EXPECT_EQ(overlapping.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    // A user cancellation after the deadline must not overwrite the reason.
+    ASSERT_TRUE(service_->CancelDrainJob(*first));
+
+    // A move that committed concurrently with the deadline stays successful.
+    ASSERT_TRUE(service_->MoveEnd(source.client_id, payload.key,
+                                  TenantId(payload.tenant_id)));
+    TaskCompleteRequest completion;
+    completion.id = assignment.id;
+    completion.status = TaskStatus::SUCCESS;
+    ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+    WaitUntil(
+        [&] {
+            auto result = service_->QueryDrainJob(*first);
+            return result && result->status == JobStatus::TIMED_OUT;
+        },
+        std::chrono::seconds(8));
+    job = service_->QueryDrainJob(*first);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->active_units, 0u);
+    EXPECT_EQ(job->succeeded_units, 1u);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINING);
+    DrainJobListRequest filter;
+    filter.status = JobStatus::TIMED_OUT;
+    auto page = service_->ListDrainJobs(filter);
+    ASSERT_TRUE(page);
+    ASSERT_EQ(page->jobs.size(), 1u);
+    EXPECT_EQ(page->jobs.front().id, *first);
+
+    auto retry = service_->CreateDrainJob(request);
+    ASSERT_TRUE(retry);
+    EXPECT_NE(*retry, *first);
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service_, source.client_id);
+            auto result = service_->QueryDrainJob(*retry);
+            return result && result->status == JobStatus::SUCCEEDED;
+        },
+        std::chrono::seconds(10));
+    EXPECT_EQ(service_->QueryDrainJob(*first)->status, JobStatus::TIMED_OUT);
+    EXPECT_EQ(service_->QueryDrainJob(*retry)->succeeded_units, 2u);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINED);
+    for (const auto& key : keys) {
+        auto replicas = service_->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas);
+        ASSERT_EQ(replicas->replicas.size(), 1u);
+        EXPECT_EQ(replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "segment_1");
+    }
+}
+
+TEST_F(MasterServiceTest, DrainJobTimeoutPreservesPartiallyDrainedSources) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(config);
+    [[maybe_unused]] const auto source_a = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto source_b = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_2", 0x500000000, kDefaultSegmentSize);
+    ReplicateConfig replica_config;
+    replica_config.replica_num = 1;
+    replica_config.preferred_segments = {"segment_1"};
+    replica_config.with_hard_pin = true;
+    PutCompletedObject(*service_, generate_uuid(), "timeout-pinned",
+                       replica_config);
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0", "segment_1"};
+    request.target_segments = {"segment_2"};
+    auto job_id = service_->CreateTimedDrainJob(request, 1500);
+    ASSERT_TRUE(job_id);
+    WaitUntil(
+        [&] {
+            auto job = service_->QueryDrainJob(*job_id);
+            return job && job->status == JobStatus::TIMED_OUT;
+        },
+        std::chrono::seconds(6));
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINED);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_1").value(),
+              SegmentStatus::DRAINING);
+
+    // Reusing the original source list preserves the already drained segment.
+    auto retry = service_->CreateDrainJob(request);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINED);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_1").value(),
+              SegmentStatus::DRAINING);
+    ASSERT_TRUE(service_->CancelDrainJob(*retry));
+}
+
+TEST_F(MasterServiceTest, DrainJobUserCancelBeforeDeadlineRemainsCanceled) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    auto job_id = service_->CreateTimedDrainJob(request, 2000);
+    ASSERT_TRUE(job_id);
+    std::vector<TaskAssignment> assignments;
+    WaitUntil([&] {
+        auto tasks = service_->FetchTasks(source.client_id, 1);
+        if (!tasks || tasks->empty()) return false;
+        assignments = std::move(*tasks);
+        return true;
+    });
+    ASSERT_EQ(assignments.size(), 1u);
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELING);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELING);
+    TaskCompleteRequest completion;
+    completion.id = assignments.front().id;
+    completion.status = TaskStatus::CANCELED;
+    ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*job_id);
+        return job && job->status == JobStatus::CANCELED;
+    });
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELED);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, DrainJobDeadlineDoesNotWaitForAnotherJobLock) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(config);
+    [[maybe_unused]] const auto source_a = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto source_b = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_2", 0x500000000, kDefaultSegmentSize);
+    ReplicateConfig replica_config;
+    replica_config.replica_num = 1;
+    replica_config.with_hard_pin = true;
+    for (const auto& name : {"segment_0", "segment_1"}) {
+        replica_config.preferred_segments = {name};
+        PutCompletedObject(*service_, generate_uuid(),
+                           std::string("pinned-") + name, replica_config);
+    }
+    CreateDrainJobRequest first_request;
+    first_request.segments = {"segment_0"};
+    first_request.target_segments = {"segment_2"};
+    CreateDrainJobRequest second_request;
+    second_request.segments = {"segment_1"};
+    second_request.target_segments = {"segment_2"};
+    auto first = service_->CreateTimedDrainJob(first_request, 300);
+    auto second = service_->CreateTimedDrainJob(second_request, 500);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    auto held =
+        MasterServiceTestPeer::LockDrainJobForTesting(*service_, *first);
+    ASSERT_TRUE(held.owns_lock());
+    WaitUntil(
+        [&] {
+            auto job = service_->QueryDrainJob(*second);
+            return job && job->status == JobStatus::TIMED_OUT;
+        },
+        std::chrono::seconds(5));
+    EXPECT_EQ(service_->QueryDrainJob(*second)->status, JobStatus::TIMED_OUT);
+    held.unlock();
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*first);
+        return job && job->status == JobStatus::TIMED_OUT;
+    });
+    EXPECT_EQ(service_->QueryDrainJob(*first)->status, JobStatus::TIMED_OUT);
+}
+
+TEST_F(MasterServiceTest, DrainJobDeadlineDoesNotOverwriteSuccess) {
+    auto service_ = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto source = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    auto job_id = service_->CreateTimedDrainJob(request, 1500);
+    ASSERT_TRUE(job_id);
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*job_id);
+        return job && job->status == JobStatus::SUCCEEDED;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::SUCCEEDED);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINED);
+}
+
+TEST_F(MasterServiceTest, DrainJobRejectsTimeoutOverflowWithoutDraining) {
+    auto service_ = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto source = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    auto job_id = service_->CreateTimedDrainJob(
+        request, std::numeric_limits<uint64_t>::max());
+    ASSERT_FALSE(job_id);
+    EXPECT_EQ(job_id.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobCancelsPendingTasks) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    const auto key =
+        PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*job_id);
+        return job && job->active_units == 1;
+    });
+
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELED);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::OK);
+    EXPECT_TRUE(service_->FetchTasks(source.client_id, 16)->empty());
+    TaskListRequest task_filter;
+    task_filter.key = key;
+    auto tasks = service_->ListTasks(task_filter);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(tasks->tasks.size(), 1u);
+    EXPECT_EQ(tasks->tasks.front().status, TaskStatus::CANCELED);
+    auto replicas = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_0");
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobCancelsTasksAcrossTenants) {
+    const TenantId tenant_a("drain_cancel_a");
+    const TenantId tenant_b("drain_cancel_b");
+    auto service_config =
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()});
+    service_config.default_kv_lease_ttl = 0;
+    auto service_ = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"segment_0"};
+    for (const auto& tenant : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service_, generate_uuid(), "same-key", tenant,
+                           config);
+    }
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 2;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*job_id);
+        return job && job->active_units == 2;
+    });
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELED);
+    EXPECT_TRUE(service_->FetchTasks(source.client_id, 16)->empty());
+    for (const auto& tenant : {tenant_a, tenant_b}) {
+        TaskListRequest filter;
+        filter.tenant_id = tenant.value();
+        filter.key = "same-key";
+        auto tasks = service_->ListTasks(filter);
+        ASSERT_TRUE(tasks);
+        ASSERT_EQ(tasks->tasks.size(), 1u);
+        EXPECT_EQ(tasks->tasks.front().status, TaskStatus::CANCELED);
+        auto replicas = service_->GetReplicaList("same-key", tenant);
+        ASSERT_TRUE(replicas);
+        ASSERT_EQ(replicas->replicas.size(), 1u);
+        EXPECT_EQ(replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "segment_0");
+    }
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobWaitsForProcessingTaskAndCleanup) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
     auto service_ = std::make_unique<MasterService>(service_config);
@@ -4149,23 +4860,182 @@ TEST_F(MasterServiceTest, CancelDrainJobRejectsActiveMoveTasks) {
 
     const UUID put_client_id = generate_uuid();
     PutObjectOnSegment(*service_, put_client_id, "segment_0");
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
 
     CreateDrainJobRequest request;
     request.segments = {"segment_0"};
     request.target_segments = {"segment_1"};
-    request.max_concurrency = 1;
+    request.max_concurrency = 2;
 
     auto job_id = service_->CreateDrainJob(request);
     ASSERT_TRUE(job_id.has_value());
 
     WaitUntil([&] {
-        auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
-        return fetched.has_value() && !fetched->empty();
+        auto job = service_->QueryDrainJob(*job_id);
+        return job && job->active_units == 2;
     });
+    auto fetched = service_->FetchTasks(ctx0.client_id, 1);
+    ASSERT_TRUE(fetched);
+    ASSERT_EQ(fetched->size(), 1u);
+    const auto assignment = fetched->front();
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, assignment.payload);
+    ASSERT_TRUE(service_->MoveStart(ctx0.client_id, payload.key,
+                                    TenantId(payload.tenant_id), payload.source,
+                                    payload.target));
 
-    auto cancel_result = service_->CancelDrainJob(job_id.value());
-    ASSERT_FALSE(cancel_result.has_value());
-    EXPECT_EQ(cancel_result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    auto job = service_->QueryDrainJob(*job_id);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->status, JobStatus::CANCELING);
+    EXPECT_EQ(job->active_units, 1u);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINING);
+    auto requested =
+        service_->IsTaskCancellationRequested(ctx0.client_id, assignment.id);
+    ASSERT_TRUE(requested);
+    EXPECT_TRUE(*requested);
+    EXPECT_TRUE(service_->FetchTasks(ctx0.client_id, 16)->empty());
+    DrainJobListRequest filter;
+    filter.status = JobStatus::CANCELING;
+    auto canceling = service_->ListDrainJobs(filter);
+    ASSERT_TRUE(canceling);
+    ASSERT_EQ(canceling->jobs.size(), 1u);
+    EXPECT_EQ(canceling->jobs.front().id, *job_id);
+
+    // Even a terminal report is insufficient while a failed revoke has left
+    // an ongoing replication task. Cleanup must precede segment restoration.
+    TaskCompleteRequest completion;
+    completion.id = assignment.id;
+    completion.status = TaskStatus::FAILED;
+    completion.message = "revoke failed";
+    ASSERT_TRUE(service_->MarkTaskToComplete(ctx0.client_id, completion));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELING);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::DRAINING);
+    EXPECT_TRUE(service_->FetchTasks(ctx0.client_id, 16)->empty());
+
+    ASSERT_TRUE(service_->MoveRevoke(ctx0.client_id, payload.key,
+                                     TenantId(payload.tenant_id)));
+    WaitUntil([&] {
+        auto result = service_->QueryDrainJob(*job_id);
+        return result && result->status == JobStatus::CANCELED;
+    });
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::OK);
+    auto replicas = service_->GetReplicaList(payload.key, TenantId::Default());
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_0");
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobKeepsMoveCommittedDuringCancellation) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    std::vector<TaskAssignment> assignments;
+    WaitUntil([&] {
+        auto tasks = service_->FetchTasks(source.client_id, 1);
+        if (!tasks || tasks->empty()) return false;
+        assignments = std::move(*tasks);
+        return true;
+    });
+    ASSERT_EQ(assignments.size(), 1u);
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, assignments.front().payload);
+    ASSERT_TRUE(service_->MoveStart(source.client_id, payload.key,
+                                    TenantId(payload.tenant_id), payload.source,
+                                    payload.target));
+    ASSERT_TRUE(service_->CancelDrainJob(*job_id));
+    ASSERT_TRUE(service_->MoveEnd(source.client_id, payload.key,
+                                  TenantId(payload.tenant_id)));
+    TaskCompleteRequest completion;
+    completion.id = assignments.front().id;
+    completion.status = TaskStatus::SUCCESS;
+    completion.message = "committed before cancellation";
+    ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+    WaitUntil([&] {
+        auto result = service_->QueryDrainJob(*job_id);
+        return result && result->status == JobStatus::CANCELED;
+    });
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->succeeded_units, 1u);
+    auto replicas = service_->GetReplicaList(payload.key, TenantId::Default());
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+    EXPECT_TRUE(service_->FetchTasks(source.client_id, 16)->empty());
+}
+
+TEST_F(MasterServiceTest, DrainJobRetriesTimedOutMovesAfterAcknowledgment) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(0)
+                      .set_processing_task_timeout_sec(1)
+                      .build();
+    auto service_ = std::make_unique<MasterService>(config);
+    const auto source = PrepareSimpleSegment(*service_, "segment_0",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_0");
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::vector<TaskAssignment> assignments;
+        WaitUntil([&] {
+            auto tasks = service_->FetchTasks(source.client_id, 1);
+            if (!tasks || tasks->empty()) return false;
+            assignments = std::move(*tasks);
+            return true;
+        });
+        ASSERT_EQ(assignments.size(), 1u);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        MasterServiceTestPeer::TaskManager(*service_)
+            .get_write_access()
+            .prune_expired_tasks();
+        auto cancellation = service_->IsTaskCancellationRequested(
+            source.client_id, assignments.front().id);
+        ASSERT_TRUE(cancellation);
+        EXPECT_TRUE(*cancellation);
+        EXPECT_EQ(service_->QueryTask(assignments.front().id)->status,
+                  TaskStatus::PROCESSING);
+        TaskCompleteRequest completion;
+        completion.id = assignments.front().id;
+        completion.status = TaskStatus::CANCELED;
+        ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+    }
+    WaitUntil([&] {
+        auto job = service_->QueryDrainJob(*job_id);
+        return job && job->status == JobStatus::FAILED;
+    });
+    EXPECT_EQ(service_->QueryDrainJob(*job_id)->failed_units, 3u);
+    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
+              SegmentStatus::OK);
 }
 
 TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
@@ -4384,7 +5254,7 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(service.UnmountSegment(retired.id, owner));
     // Retirement invalidates old snapshots before metadata cleanup.
     EXPECT_EQ(service.GetKeyCount(), keys.size());
-    EXPECT_FALSE(retired_registration->IsServing());
+    EXPECT_FALSE(retired_registration->IsAllocatable());
     EXPECT_EQ(retired_registration->Allocate(1024), nullptr);
     EXPECT_FALSE(old_buffer->isAvailable());
     for (const auto& key : keys) {
@@ -4427,12 +5297,46 @@ TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
         liveness->Evaluate(ClientLivenessRecord::Clock::now(),
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
 
     ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
     EXPECT_EQ(liveness->state(), ClientLivenessState::SUSPECTED);
     EXPECT_EQ(service.Ping(client_id)->client_status, ClientStatus::OK);
     EXPECT_EQ(liveness->state(), ClientLivenessState::ACTIVE);
+}
+
+TEST_F(MasterServiceTest, FailedRemountPreservesCommittedClientHostId) {
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build());
+    const UUID local_owner = generate_uuid();
+    const UUID remote_owner = generate_uuid();
+
+    auto local_seg = MakeSegment("local_host_seg", /*base=*/0x100000000);
+    local_seg.host_id = "host-a";
+    auto remote_seg = MakeSegment("remote_host_seg", /*base=*/0x200000000);
+    remote_seg.host_id = "host-b";
+    ASSERT_TRUE(service.MountSegment(local_seg, local_owner).has_value());
+    ASSERT_TRUE(service.MountSegment(remote_seg, remote_owner).has_value());
+
+    auto invalid_remount = local_seg;
+    invalid_remount.size *= 2;
+    invalid_remount.host_id = "host-b";
+    auto remount = service.ReMountSegment({invalid_remount}, local_owner);
+    ASSERT_FALSE(remount.has_value());
+    EXPECT_EQ(remount.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put = service.PutStart(local_owner, "local_after_failed_remount",
+                                TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put.has_value()) << toString(put.error());
+    ASSERT_EQ(put->size(), 1u);
+    const auto addr =
+        (*put)[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_GE(addr, local_seg.base);
+    EXPECT_LT(addr, local_seg.base + local_seg.size);
 }
 
 TEST_F(MasterServiceTest,
@@ -4453,7 +5357,6 @@ TEST_F(MasterServiceTest,
         liveness->Evaluate(ClientLivenessRecord::Clock::now(),
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
 
     auto upsert =
         service.UpsertStart(client_id, key, TenantId::Default(), 1024, config);
@@ -4481,14 +5384,9 @@ TEST_F(MasterServiceTest,
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
-    EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.metadata_cleanup_accepted);
     EXPECT_TRUE(job.local_ssd_unregistered);
@@ -4516,28 +5414,23 @@ TEST_F(MasterServiceTest,
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = FindClientLivenessForTest(service, client_id);
-    ASSERT_TRUE(job.liveness);
-    job.pending_prepare_segments = {
-        {.segment_id = prepared_segment.id,
-         .segment_name = prepared_segment.name,
-         .transport_endpoint = prepared_segment.te_endpoint},
-        {.segment_id = blocked_segment.id,
-         .segment_name = blocked_segment.name,
-         .transport_endpoint = blocked_segment.te_endpoint}};
+    job.retired_session = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.retired_session);
 
+    // The job names only the incarnation; each attempt finds the segments the
+    // client still owns. One of them is held by another unmount, so the job
+    // prepares the other and waits.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
-    EXPECT_EQ(job.pending_prepare_segments.front().segment_id,
-              blocked_segment.id);
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
     const auto retained_capacity =
         job.prepared_segments.front().metrics_dec_capacity;
 
+    // Its own prepared segment is still mounted, but must not be prepared, or
+    // mistaken for another unmount's, a second time.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
     EXPECT_EQ(job.prepared_segments.front().metrics_dec_capacity,
               retained_capacity);
@@ -4547,8 +5440,136 @@ TEST_F(MasterServiceTest,
                                  blocked_metrics_dec_capacity));
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
     EXPECT_TRUE(job.prepared_segments.empty());
-    EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+TEST_F(MasterServiceTest, SessionManagerOwnsOffboardingShutdown) {
+    for (bool finish_cleanup : {false, true}) {
+        SCOPED_TRACE(finish_cleanup);
+        MasterServiceConfig config;
+        config.client_active_ttl_sec = 1;
+        config.client_suspicion_ttl_sec = 1;
+        MasterService service(config);
+        const UUID client_id = generate_uuid();
+        auto segment = MakeSegment("session_shutdown_segment");
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        size_t capacity = 0;
+        ASSERT_EQ(ErrorCode::OK,
+                  PrepareUnmountSegmentForTest(service, segment.id, capacity));
+
+        // UNMOUNTING keeps the automatically scheduled cleanup retrying.
+        WaitUntil([&] { return HasPendingOffboardingForTest(service); },
+                  std::chrono::seconds(10));
+        QuiesceClientSessionsForTest(service);
+        ASSERT_TRUE(HasPendingOffboardingForTest(service));
+        if (finish_cleanup) {
+            ASSERT_EQ(ErrorCode::OK,
+                      CommitUnmountSegmentForTest(service, segment.id,
+                                                  client_id, capacity));
+            // Quiesce stops monitoring, not the cleanup worker or barrier.
+            WaitUntil([&] { return !HasPendingOffboardingForTest(service); },
+                      std::chrono::seconds(10));
+            EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+        }
+        StopClientSessionsForTest(service);
+        // A job dropped at shutdown leaves its OFFLINE session registered, so
+        // the barrier outlives the worker instead of lifting over a partial
+        // cleanup.
+        EXPECT_EQ(HasPendingOffboardingForTest(service), !finish_cleanup);
+        if (!finish_cleanup) {
+            ASSERT_EQ(ErrorCode::OK,
+                      CommitUnmountSegmentForTest(service, segment.id,
+                                                  client_id, capacity));
+        }
+    }
+}
+
+// Manual fault-injection experiment for #3936; excluded from normal test runs.
+TEST_F(MasterServiceTest, DISABLED_Repro3936RemountKeepsHealthyPings) {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    MasterServiceConfig config;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
+    MasterService service(config);
+    constexpr size_t count = 4;
+    std::vector<UUID> clients;
+    std::vector<Segment> segments;
+    std::vector<std::shared_ptr<ClientLivenessRecord>> records;
+    for (size_t i = 0; i < count; ++i) {
+        clients.push_back(generate_uuid());
+        segments.push_back(MakeSegment("repro3936_" + std::to_string(i)));
+        ASSERT_TRUE(service.MountSegment(segments.back(), clients.back()));
+        ASSERT_TRUE(service.ReMountSegment({segments.back()}, clients.back()));
+        records.push_back(FindClientLivenessForTest(service, clients.back()));
+        PutObjectOnSegment(service, clients.back(), segments.back().name);
+    }
+    const auto initial_keys = service.GetKeyCount();
+    std::atomic<bool> running{true};
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> need_remount{0};
+    std::atomic<int64_t> max_latency_ms{0};
+    std::vector<std::thread> pingers;
+    for (const auto& client : clients) {
+        pingers.emplace_back([&, client] {
+            while (running.load()) {
+                const auto start = Clock::now();
+                const auto result = service.Ping(client);
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - start)
+                        .count();
+                auto previous = max_latency_ms.load();
+                while (
+                    elapsed > previous &&
+                    !max_latency_ms.compare_exchange_weak(previous, elapsed)) {
+                }
+                if (!result || result->client_status != ClientStatus::OK) {
+                    ++need_remount;
+                }
+                ++completed;
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+    }
+    std::this_thread::sleep_for(200ms);
+    const auto baseline = completed.load();
+    // A real remount holds only its per-incarnation registration lock here.
+    // Holding snapshot_mutex_ models a slow restore/snapshot critical section.
+    std::unique_lock snapshot_lock(
+        MasterServiceTestPeer::MasterStateMutex(service));
+    bool remount_ok = false;
+    std::thread remounter([&] {
+        remount_ok =
+            service.ReMountSegment({segments[0]}, clients[0]).has_value();
+    });
+    std::this_thread::sleep_for(200ms);
+    const auto before_stall = completed.load();
+    std::this_thread::sleep_for(4s);
+    const auto during_stall = completed.load();
+    snapshot_lock.unlock();
+    remounter.join();
+    std::this_thread::sleep_for(3s);
+    running.store(false);
+    for (auto& pinger : pingers) pinger.join();
+    size_t offline = 0;
+    for (const auto& record : records) {
+        offline += record->state() == ClientLivenessState::OFFLINE;
+    }
+    const auto final_keys = service.GetKeyCount();
+    std::cout << "REPRO3936 baseline_pings=" << baseline
+              << " pings_during_4s_stall=" << during_stall - before_stall
+              << " max_ping_ms=" << max_latency_ms.load()
+              << " need_remount=" << need_remount.load()
+              << " offline=" << offline << "/" << count
+              << " keys=" << initial_keys << "->" << final_keys << std::endl;
+    EXPECT_GT(baseline, 0u);
+    EXPECT_TRUE(remount_ok);
+    EXPECT_GT(during_stall - before_stall, 100u);
+    EXPECT_LT(max_latency_ms.load(), 1000);
+    EXPECT_EQ(offline, 0u);
+    EXPECT_EQ(final_keys, initial_keys);
+    EXPECT_EQ(need_remount.load(), 0u);
 }
 
 // Localhost-only HTTP server that records DELETE request lines. A test picks
@@ -4791,6 +5812,113 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
     // Cleanup stays disabled: neither a co-located server nor a remote URL.
     MasterServiceTestPeer(service).CleanupHttpMetadataForTesting("segment_a");
     service.StopHttpMetadataCleanup();
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentCopyEndAndCopyRevokeOnSameClientSerializeCleanly) {
+    auto service_config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(600).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service, "concurrent_copy_source",
+                                             kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "concurrent_copy_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = source.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "concurrent_copy_source";
+
+    constexpr int kNumKeys = 16;
+    for (int i = 0; i < kNumKeys; ++i) {
+        const std::string key = "concurrent_copy_key_" + std::to_string(i);
+        PutCompletedObject(*service, client_id, key, config);
+        ASSERT_TRUE(service
+                        ->CopyStart(client_id, key, TenantId::Default(),
+                                    "concurrent_copy_source",
+                                    {"concurrent_copy_target"})
+                        .has_value());
+
+        std::promise<void> go;
+        std::shared_future<void> start = go.get_future().share();
+        auto end_future = std::async(std::launch::async, [&] {
+            start.wait();
+            return service->CopyEnd(client_id, key, TenantId::Default());
+        });
+        auto revoke_future = std::async(std::launch::async, [&] {
+            start.wait();
+            return service->CopyRevoke(client_id, key, TenantId::Default());
+        });
+        go.set_value();
+
+        const auto end_res = end_future.get();
+        const auto revoke_res = revoke_future.get();
+        ASSERT_NE(end_res.has_value(), revoke_res.has_value());
+        const auto& loser = end_res.has_value() ? revoke_res : end_res;
+        EXPECT_EQ(loser.error(), ErrorCode::OBJECT_NO_REPLICATION_TASK);
+
+        auto replicas = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas.has_value());
+        EXPECT_EQ(replicas->replicas.size(), end_res.has_value() ? 2u : 1u);
+    }
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentFetchTasksOnSameClientDispatchesEachTaskOnce) {
+    auto service_config =
+        MasterServiceConfig::builder().set_client_live_ttl_sec(600).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto source = PrepareSimpleSegment(*service, "concurrent_task_source",
+                                             kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "concurrent_task_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = source.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "concurrent_task_source";
+
+    constexpr int kNumTasks = 16;
+    std::set<UUID> expected_ids;
+    for (int i = 0; i < kNumTasks; ++i) {
+        const std::string key = "concurrent_task_key_" + std::to_string(i);
+        PutCompletedObject(*service, client_id, key, config);
+        auto task_id = service->CreateCopyTask(key, TenantId::Default(),
+                                               {"concurrent_task_target"});
+        ASSERT_TRUE(task_id.has_value());
+        EXPECT_TRUE(expected_ids.insert(*task_id).second);
+    }
+
+    constexpr int kWorkers = 4;
+    std::barrier sync_point(kWorkers);
+    std::vector<std::future<std::vector<UUID>>> workers;
+    workers.reserve(kWorkers);
+    for (int w = 0; w < kWorkers; ++w) {
+        workers.push_back(std::async(std::launch::async, [&] {
+            std::vector<UUID> popped;
+            sync_point.arrive_and_wait();
+            for (;;) {
+                auto batch = service->FetchTasks(client_id, /*batch_size=*/2);
+                EXPECT_TRUE(batch.has_value());
+                if (!batch.has_value() || batch->empty()) {
+                    break;
+                }
+                for (const auto& assignment : *batch) {
+                    popped.push_back(assignment.id);
+                }
+            }
+            return popped;
+        }));
+    }
+
+    std::vector<UUID> all_popped;
+    for (auto& worker : workers) {
+        auto part = worker.get();
+        all_popped.insert(all_popped.end(), part.begin(), part.end());
+    }
+    EXPECT_EQ(all_popped.size(), static_cast<size_t>(kNumTasks));
+    std::set<UUID> unique_popped(all_popped.begin(), all_popped.end());
+    EXPECT_EQ(unique_popped, expected_ids);
 }
 
 }  // namespace mooncake::test

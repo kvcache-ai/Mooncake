@@ -3,8 +3,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <functional>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "config.h"
 #include "cuda_alike.h"
@@ -312,6 +315,133 @@ TEST(ToplogyTest, ParseWithDeviceFilterMatchingNothing) {
     ASSERT_EQ(topology.parse(kTwoNicTopologyJson, {"mlx5_9"}), 0);
     EXPECT_TRUE(topology.getHcaList().empty());
     EXPECT_TRUE(topology.empty());
+}
+
+namespace {
+int hcaIndex(const mooncake::Topology &topology, const std::string &name) {
+    return topology.getDeviceIndex(mooncake::kWildcardLocation, name);
+}
+
+std::function<bool(int)> rejecting(const mooncake::Topology &topology,
+                                   std::set<std::string> names) {
+    std::set<int> rejected;
+    for (const auto &name : names) rejected.insert(hcaIndex(topology, name));
+    return [rejected](int device_id) { return rejected.count(device_id) == 0; };
+}
+}  // namespace
+
+// `device_filter` drops devices before the selection rule applies: retry 0
+// picks among the accepted preferred HCAs (or accepted available ones when none
+// is left), and a positive retry indexes the accepted preferred + available
+// list.
+TEST(ToplogyTest, SelectDeviceFilterDropsRejectedDevices) {
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["a","b","c"],["d","e"]]})"), 0);
+    const auto filter = rejecting(topology, {"b", "d"});
+
+    std::set<int> seen;
+    for (int i = 0; i < 200; ++i)
+        seen.insert(topology.selectDevice("cpu:0", 0, filter));
+    EXPECT_EQ(seen, (std::set<int>{hcaIndex(topology, "a"),
+                                   hcaIndex(topology, "c")}));
+
+    const std::vector<std::string> order = {"a", "c", "e"};
+    for (int retry = 1; retry <= 6; ++retry) {
+        EXPECT_EQ(topology.selectDevice("cpu:0", retry, filter),
+                  hcaIndex(topology, order[(retry - 1) % order.size()]))
+            << retry;
+    }
+
+    const auto accept_only_e = rejecting(topology, {"a", "b", "c", "d"});
+    EXPECT_EQ(topology.selectDevice("cpu:0", 0, accept_only_e),
+              hcaIndex(topology, "e"));
+}
+
+// Round-robin first attempts cycle through the accepted devices only.
+TEST(ToplogyTest, SelectDeviceFilterRoundRobinCyclesAcceptedDevices) {
+    ASSERT_EQ(::setenv("MC_PATH_ROUNDROBIN", "1", 1), 0);
+    mooncake::Topology topology;
+    ::unsetenv("MC_PATH_ROUNDROBIN");
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["a","b","c"],[]]})"), 0);
+    const auto filter = rejecting(topology, {"b"});
+    const std::set<int> accepted = {hcaIndex(topology, "a"),
+                                    hcaIndex(topology, "c")};
+    int previous = topology.selectDevice("cpu:0", 0, filter);
+    ASSERT_TRUE(accepted.count(previous));
+    for (int i = 0; i < 8; ++i) {
+        const int device_id = topology.selectDevice("cpu:0", 0, filter);
+        ASSERT_TRUE(accepted.count(device_id)) << i;
+        EXPECT_NE(device_id, previous) << i;
+        previous = device_id;
+    }
+    // A selection that finds no accepted device does not advance the turn.
+    const auto accept_none = [](int) { return false; };
+    ASSERT_EQ(topology.selectDevice("cpu:0", 0, accept_none),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_NE(topology.selectDevice("cpu:0", 0, filter), previous);
+}
+
+TEST(ToplogyTest, SelectDeviceFilterTellsEmptyFromAbsent) {
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["a"],["b"]]})"), 0);
+    const auto accept_none = [](int) { return false; };
+    for (int retry : {0, 1, 3}) {
+        EXPECT_EQ(topology.selectDevice("cpu:0", retry, accept_none),
+                  ERR_ADDRESS_NOT_REGISTERED)
+            << retry;
+        EXPECT_EQ(topology.selectDevice("cpu:9", retry, accept_none),
+                  ERR_DEVICE_NOT_FOUND)
+            << retry;
+    }
+}
+
+TEST(ToplogyTest, SelectDeviceAcceptingEveryDeviceIsUnchanged) {
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["a","b"],["c"]]})"), 0);
+    const auto accept_all = [](int) { return true; };
+    const std::vector<std::string> order = {"a", "b", "c"};
+    for (int retry = 1; retry <= 9; ++retry) {
+        const int expected =
+            hcaIndex(topology, order[(retry - 1) % order.size()]);
+        EXPECT_EQ(topology.selectDevice("cpu:0", retry), expected) << retry;
+        EXPECT_EQ(topology.selectDevice("cpu:0", retry, accept_all), expected)
+            << retry;
+    }
+    const std::set<int> preferred = {hcaIndex(topology, "a"),
+                                     hcaIndex(topology, "b")};
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_TRUE(preferred.count(topology.selectDevice("cpu:0", 0)));
+        EXPECT_TRUE(
+            preferred.count(topology.selectDevice("cpu:0", 0, accept_all)));
+    }
+}
+
+// With a peer-affinity mapping, filtering never widens the candidates to the
+// rest of the entry.
+TEST(ToplogyTest, SelectDeviceByLocalHcaFilterStaysInMapping) {
+    auto &cfg = mooncake::globalConfig();
+    const bool old_enable = cfg.enable_hca_peer_affinity;
+    const auto old_map = cfg.nic_peer_affinity;
+    cfg.enable_hca_peer_affinity = true;
+    cfg.nic_peer_affinity = {{"L", {"P0"}}};
+    const std::string gpu_loc = GPU_PREFIX + "0";
+    mooncake::Topology topology;
+    const int rc =
+        topology.parse("{\"" + gpu_loc + "\" : [[\"P0\",\"P1\"],[]]}");
+    cfg.enable_hca_peer_affinity = old_enable;
+    cfg.nic_peer_affinity = old_map;
+    ASSERT_EQ(rc, 0);
+
+    const auto filter = rejecting(topology, {"P0"});
+    for (int retry : {0, 1, 2, 3}) {
+        EXPECT_EQ(topology.selectDeviceByLocalHca(gpu_loc, "L", retry, filter),
+                  ERR_ADDRESS_NOT_REGISTERED)
+            << retry;
+        EXPECT_EQ(
+            topology.selectDeviceByLocalHca(gpu_loc, "other", retry, filter),
+            hcaIndex(topology, "P1"))
+            << retry;
+    }
 }
 
 int main(int argc, char **argv) {

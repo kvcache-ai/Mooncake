@@ -80,13 +80,22 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
 // seccomp profile that blocks get_mempolicy blocks mbind too).
 std::vector<int> FilterNumaNodesToAllowed(const std::vector<int>& nodes);
 
+// One region per node, each bound to its node. With base pages the mapping is
+// advised for THP and total_size must be a multiple of 2MB * numa_nodes.size().
 void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
 
-// Anonymous 2MB-aligned mapping advised for THP and interleaved across the
-// allowed NUMA nodes. total_size must be a multiple of 2MB. Free with
-// free_buffer_mmap_memory(ptr, total_size).
-void* allocate_buffer_thp_interleaved(size_t total_size);
+enum class ThpNumaPolicy {
+    // The task's NUMA policy governs the mapping.
+    kInheritTask,
+    // Interleaved across the allowed NUMA nodes, unless the task has an
+    // explicit policy (e.g. numactl --membind), which is left in force.
+    kInterleaveIfDefault,
+};
+
+// Anonymous slab-aligned (16MB) mapping advised for THP. total_size must be a
+// multiple of 2MB. Free with free_buffer_mmap_memory(ptr, total_size).
+void* allocate_buffer_thp(size_t total_size, ThpNumaPolicy numa_policy);
 
 }  // namespace mooncake
