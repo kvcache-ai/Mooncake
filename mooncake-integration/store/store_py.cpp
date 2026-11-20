@@ -5,6 +5,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unordered_map.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <numa.h>
 
@@ -2281,9 +2282,26 @@ NB_MODULE(_store, m) {
                 return *config.session_ids;
             },
             [](ReplicateConfig &config,
-               std::optional<std::vector<std::string>> ids) {
-                config.session_ids.reset();
-                if (ids) config.session_ids = std::move(*ids);
+               std::optional<std::vector<
+                   std::variant<std::string, py::bytes, py::bytearray>>>
+                   ids) {
+                if (!ids) {
+                    config.session_ids.reset();
+                    return;
+                }
+                // Keep the old binding's raw bytes support. The store
+                // validates UTF-8 when the IDs are used in a write.
+                std::vector<std::string> session_ids;
+                session_ids.reserve(ids->size());
+                for (const auto &id : *ids) {
+                    std::visit(
+                        [&session_ids](const auto &value) {
+                            session_ids.emplace_back(value.c_str(),
+                                                     value.size());
+                        },
+                        id);
+                }
+                config.session_ids = std::move(session_ids);
             })
         .def_prop_rw(
             "residency_affinity_ids",
