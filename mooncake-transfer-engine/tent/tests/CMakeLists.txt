@@ -965,7 +965,7 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
   add_executable(tent_ascend_direct_transport_test
                  ascend_direct_transport_test.cpp)
   target_link_libraries(tent_ascend_direct_transport_test
-                        PRIVATE gtest gtest_main tent_link_group)
+                        PRIVATE gtest gtest_main tent_link_group glog::glog)
   if(TARGET asio_shared)
     target_link_libraries(tent_ascend_direct_transport_test PRIVATE asio_shared)
   endif()

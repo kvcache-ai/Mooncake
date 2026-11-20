@@ -79,6 +79,7 @@ class UrmaContext : public UbContext {
     urma_jfc_t* jfc();
     urma_jfr_t* jfr();
     urma_jfce_t* JFCE();
+    bool rmMode() const { return engine_.rmMode(); }
     static bool uninit();
     static bool init();
 
