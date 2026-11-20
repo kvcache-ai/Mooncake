@@ -1862,30 +1862,39 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
     auto enabled = IsEnableOffloading();
     if (!enabled) return tl::make_unexpected(enabled.error());
     if (!*enabled) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
-        // Keys-only fast fail: size quotas are enforced per disk inside
-        // PrepareEviction (dev moved the global total_size_/pending budget
-        // into per-disk accounting).
-        SharedMutexLocker lock(&mutex_, shared_lock);
-        if (object_bucket_map_.size() + pending_write_keys_.size() +
-                plan.objects.size() >
-            static_cast<size_t>(file_storage_config_.total_keys_limit))
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    // Admit the write and select eviction victims under offload_publish_mutex_,
+    // then release it before notifying master. The handler may synchronously
+    // re-enter these entry points (it is master/user code and the mutex is
+    // non-recursive); same-key safety comes from pending_eviction_keys_/
+    // pending_write_keys_ under mutex_, not from holding the lock across the
+    // notification.
+    {
+        std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
+        if (bucket_backend_config_.eviction_policy ==
+            BucketEvictionPolicy::NONE) {
+            // Keys-only fast fail: size quotas are enforced per disk inside
+            // PrepareEviction (dev moved the global total_size_/pending budget
+            // into per-disk accounting).
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            if (object_bucket_map_.size() + pending_write_keys_.size() +
+                    plan.objects.size() >
+                static_cast<size_t>(file_storage_config_.total_keys_limit))
+                return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        }
+        auto reserved = PrepareEviction(
+            plan.bucket->data_size + plan.bucket->meta_size,
+            plan.bucket->keys);
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        plan.pending = std::move(*reserved);
+        plan.disk_index = plan.pending->disk_index;
+        plan.bucket->disk_index = plan.disk_index;
     }
-    auto reserved = PrepareEviction(
-        plan.bucket->data_size + plan.bucket->meta_size, plan.bucket->keys);
-    if (!reserved) return tl::make_unexpected(reserved.error());
-    plan.pending = std::move(*reserved);
-    plan.disk_index = plan.pending->disk_index;
-    plan.bucket->disk_index = plan.disk_index;
     if (plan.eviction && !plan.pending->keys.empty()) {
         auto notified = plan.eviction(plan.pending->keys);
         if (!notified) return notified;
     }
     CommitPreparedEviction(*plan.pending);
     plan.eviction_committed = true;
-    publish_lock.unlock();
     auto finalized = FinalizeEviction(*plan.pending);
     if (!finalized)
         LOG(WARNING) << "Offload eviction cleanup: " << finalized.error();
@@ -2047,14 +2056,26 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     const int64_t required_size = file_bytes + bucket->meta_size;
-    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
-    if (!prepare_result) {
-        return tl::make_unexpected(prepare_result.error());
+    PendingEviction pending;
+    // Admit the write and select eviction victims under offload_publish_mutex_,
+    // then release it before notifying master. The handler is master/user code
+    // that may synchronously re-enter these entry points (the
+    // BucketPendingEvictionRejectsConcurrentDuplicateWrite regression test
+    // re-offloads a key from inside the eviction handler), and the mutex is
+    // non-recursive. Same-key safety does not depend on holding the lock
+    // across the notification: PrepareEviction already erased the victims
+    // from object_bucket_map_ and marked them in pending_eviction_keys_, so a
+    // concurrent write of a victim key fails with OBJECT_ALREADY_EXISTS.
+    {
+        std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
+        auto prepare_result = PrepareEviction(required_size, bucket->keys);
+        if (!prepare_result) {
+            return tl::make_unexpected(prepare_result.error());
+        }
+        pending = std::move(prepare_result.value());
+        bucket->disk_index = pending.disk_index;
     }
-    PendingEviction pending = std::move(prepare_result.value());
     const int disk_index = pending.disk_index;
-    bucket->disk_index = disk_index;
 
     // Notify master about evicted keys BEFORE touching the files.
     if (eviction_handler && !pending.keys.empty()) {
@@ -2065,7 +2086,6 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     CommitPreparedEviction(pending);
-    publish_lock.unlock();
 
     // Phase 2: delete evicted files NOW, before writing the new bucket, so
     // that the freed disk space is available for the incoming write.
@@ -2092,7 +2112,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitOffloadedBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket,
     std::vector<StorageObjectMetadata>& metadatas, PendingEviction& pending,
     const OffloadComplete& complete_handler) {
-    std::lock_guard<std::mutex> publish_lock(offload_publish_mutex_);
+    // Admit the publication (commit bookkeeping) under offload_publish_mutex_,
+    // then release it before invoking the registration callback. The callback
+    // is re-entrant — BucketPendingWriteSkipsReentrantDuplicate re-offloads a
+    // key from inside it — and the mutex is non-recursive. Cross-flow ordering
+    // is preserved without holding the mutex across the RPC: the committed
+    // bucket is marked in registering_bucket_ids_ under mutex_ before the lock
+    // is released, so a concurrent PrepareEviction skips it while the
+    // registration is in flight and can never acknowledge keys that are about
+    // to register.
+    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
     // dev's commit bookkeeping is per disk; the plan/bucket was placed by
     // PrepareEviction, which records the disk here.
     const int disk_index = pending.disk_index;
@@ -2171,7 +2200,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitOffloadedBucket(
         buckets_.emplace(bucket_id, std::move(bucket));
         disk.fifo_index.insert(bucket_id);
         disk.lru_index.emplace(ts, bucket_id);
+        // Mark registration in flight BEFORE releasing offload_publish_mutex_,
+        // atomically w.r.t. victim selection (both under mutex_): a concurrent
+        // PrepareEviction must not select this bucket while its registration
+        // is still in flight. Erased once the callback settles, below.
+        if (complete_handler != nullptr) {
+            registering_bucket_ids_.insert(bucket_id);
+        }
     }
+    publish_lock.unlock();
     // Lock released. From this point forward, concurrent BatchLoad
     // can find the keys and read from the committed bucket files.
 
@@ -2180,18 +2217,43 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitOffloadedBucket(
     // complete_handler before the RPC); int64_t fields carry the metadata
     // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(committed_keys, committed_metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << committed_keys.size()
+        ErrorCode error_code;
+        bool handler_threw = false;
+        try {
+            error_code = complete_handler(committed_keys, committed_metadatas);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Complete handler threw: " << e.what()
                        << ", Bucket id: " << bucket_id;
-            // Master was NOT notified. The local index has entries that
-            // Master doesn't know about — a "client can read but Master
-            // doesn't know" ghost replica. Rollback the local commit
-            // (removes index entries + waits for inflight reads + deletes
-            // on-disk files).
+            error_code = ErrorCode::INTERNAL_ERROR;
+            handler_threw = true;
+        } catch (...) {
+            LOG(ERROR) << "Complete handler threw an unknown exception, "
+                          "Bucket id: "
+                       << bucket_id;
+            error_code = ErrorCode::INTERNAL_ERROR;
+            handler_threw = true;
+        }
+        if (handler_threw || error_code != ErrorCode::OK) {
+            if (!handler_threw) {
+                LOG(ERROR) << "Complete handler failed: " << error_code
+                           << ", Key count: " << committed_keys.size()
+                           << ", Bucket id: " << bucket_id;
+            }
+            // Master was NOT notified (the throw case leaves the notification
+            // state unknown). The local index has entries that Master doesn't
+            // know about — a "client can read but Master doesn't know" ghost
+            // replica. Rollback the local commit (removes index entries +
+            // waits for inflight reads + deletes on-disk files).
             RollbackCommittedBucket(bucket_id, committed_keys, disk_index);
+            {
+                SharedMutexLocker lock(&mutex_);
+                registering_bucket_ids_.erase(bucket_id);
+            }
             return tl::make_unexpected(error_code);
+        }
+        {
+            SharedMutexLocker lock(&mutex_);
+            registering_bucket_ids_.erase(bucket_id);
         }
     }
 
@@ -4248,6 +4310,13 @@ BucketStorageBackend::PrepareEviction(
 
         auto evict_it = SelectEvictionCandidate(disk_index);
         if (evict_it == buckets_.end()) break;
+        if (registering_bucket_ids_.count(evict_it->first) != 0) {
+            // Its registration RPC is still in flight; evicting it now could
+            // acknowledge keys that are about to register on the master.
+            // Defer to the next round instead of scanning past it —
+            // registration is transient, so this is a bounded deferral.
+            break;
+        }
 
         int64_t evict_id = evict_it->first;
         std::shared_ptr<BucketMetadata> evict_meta =
@@ -4556,16 +4625,22 @@ BucketStorageBackend::EvictAboveDiskWatermark(
         const auto target_total_size =
             static_cast<int64_t>(max_total_size * low_watermark_ratio);
         const auto synthetic_required_size = max_total_size - target_total_size;
-        // Serialize the reservation-to-commit window against concurrent
-        // offload publishes; file deletion (FinalizeEviction) stays outside.
-        std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
-        auto prepare_result =
-            PrepareEviction(synthetic_required_size, /*write_keys=*/{},
-                            /*disk_hint=*/static_cast<int>(index));
-        if (!prepare_result) {
-            return tl::make_unexpected(prepare_result.error());
+        // Admit victims under offload_publish_mutex_, then release it before
+        // notifying master (see BatchOffload): the handler may synchronously
+        // re-enter these entry points, and victims are already invisible to
+        // concurrent writes via pending_eviction_keys_. File deletion
+        // (FinalizeEviction) stays outside as well.
+        PendingEviction pending;
+        {
+            std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
+            auto prepare_result =
+                PrepareEviction(synthetic_required_size, /*write_keys=*/{},
+                                /*disk_hint=*/static_cast<int>(index));
+            if (!prepare_result) {
+                return tl::make_unexpected(prepare_result.error());
+            }
+            pending = std::move(prepare_result.value());
         }
-        PendingEviction pending = std::move(prepare_result.value());
         evicted_keys.insert(evicted_keys.end(), pending.keys.begin(),
                             pending.keys.end());
 
@@ -4577,7 +4652,6 @@ BucketStorageBackend::EvictAboveDiskWatermark(
             }
         }
         CommitPreparedEviction(pending);
-        publish_lock.unlock();
         auto finalize_result = FinalizeEviction(pending);
         if (!finalize_result) {
             LOG(ERROR)

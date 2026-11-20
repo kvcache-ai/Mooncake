@@ -1423,6 +1423,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     // backend, not of one disk.
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
+    // Buckets whose local commit is published but whose registration RPC is
+    // still in flight. Victim selection skips them, so a concurrent eviction
+    // can never acknowledge keys that are about to register on the master.
+    std::unordered_set<int64_t> GUARDED_BY(mutex_) registering_bucket_ids_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
@@ -1431,8 +1435,14 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::unique_ptr<BatchIoScheduler> write_io_scheduler_;
     std::atomic<size_t> active_reads_{0};
     std::atomic<bool> write_stopping_{false};
-    // Order local publication/master notification against eviction admission.
-    // Data sub batches never hold this mutex.
+    // Order write/eviction admission bookkeeping against local publication.
+    // Data sub batches never hold this mutex, and no callback or RPC may run
+    // under it: eviction handlers re-enter these entry points synchronously
+    // (BucketPendingEvictionRejectsConcurrentDuplicateWrite), the registration
+    // callback re-enters too (BucketPendingWriteSkipsReentrantDuplicate), and
+    // the mutex is non-recursive. Cross-flow ordering is preserved by
+    // registering_bucket_ids_: a committed bucket is marked before the lock is
+    // released and skipped by victim selection until its registration settles.
     std::mutex offload_publish_mutex_;
 
     mutable Mutex offloading_mutex_;
