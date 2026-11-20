@@ -17,6 +17,7 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include <stdexcept>
@@ -59,12 +60,23 @@ std::pair<std::shared_ptr<SharedSegment>, py::bytes> SegmentCreate(
     return {std::move(segment), py::bytes(blob.data(), blob.size())};
 }
 
+using PythonBlob = std::variant<py::bytes, py::bytearray, std::string>;
+
 void SegmentComplete(const std::shared_ptr<SharedSegment>& segment,
-                     const std::vector<std::string>& blobs) {
+                     const std::vector<PythonBlob>& blobs) {
+    std::vector<std::string> binary_blobs;
+    binary_blobs.reserve(blobs.size());
+    for (const auto& blob : blobs) {
+        std::visit(
+            [&binary_blobs](const auto& value) {
+                binary_blobs.emplace_back(value.c_str(), value.size());
+            },
+            blob);
+    }
     Status status = Status::OK();
     {
         py::gil_scoped_release release;
-        status = segment->Complete(blobs);
+        status = segment->Complete(binary_blobs);
     }
     ThrowIfError(status);
 }

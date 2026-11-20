@@ -72,19 +72,13 @@ class RpcInterface {
     void setDataReceiveCallback(py::callable callback);
     void setTensorReceiveCallback(py::callable callback);
 
-    void handleIncomingData(std::string_view source_address,
-                            std::string_view data);
-    void handleIncomingTensor(std::string_view source_address,
-                              std::string_view data,
-                              const std::vector<size_t>& shape,
-                              std::string_view dtype);
-
    private:
     friend void bind_rpc_interface(py::module_& m);
     static int traversePythonReferences(PyObject* self, visitproc visit,
                                         void* arg);
     static int clearPythonReferences(PyObject* self);
 
+    void shutdown();
     std::unique_ptr<Impl> impl_;
 };
 
