@@ -13,6 +13,14 @@ OffloadTaskItem Offload(std::string tenant, std::string key, int64_t size) {
         .tenant_id = std::move(tenant), .key = std::move(key), .size = size};
 }
 
+OffloadTaskItem TakeOne(LocalSsdTaskMailbox& mailbox, const std::string& key) {
+    EXPECT_TRUE(mailbox.EnqueueOffload(Offload("tenant", key, 1), 10) ==
+                ErrorCode::OK);
+    auto tasks = mailbox.SetOffloadingAndTakePending(true);
+    EXPECT_EQ(tasks.size(), 1);
+    return tasks.empty() ? OffloadTaskItem{} : tasks.front();
+}
+
 PromotionTaskItem Promotion(std::string tenant, std::string key, int64_t size) {
     return PromotionTaskItem{
         .tenant_id = std::move(tenant), .key = std::move(key), .size = size};
@@ -47,78 +55,64 @@ TEST(LocalSsdTaskMailboxTest, DisabledOffloadingDrainsPendingTasks) {
                 ErrorCode::UNABLE_OFFLOADING);
 }
 
-TEST(LocalSsdTaskMailboxTest, RemovedTakenOffloadStaysCancelledUntilRetaken) {
+TEST(LocalSsdTaskMailboxTest, RemoveCancelsTakenTasksOfThatKeyOnly) {
     LocalSsdTaskMailbox mailbox(true);
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "key", 1), 10) ==
-                ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
-
+    const auto first = TakeOne(mailbox, "key");
+    const auto other = TakeOne(mailbox, "other");
     EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "key"));
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "unrelated", 1),
-                                       10) == ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("other"), "key"));
-    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
-    ASSERT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
-    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
+    const auto second = TakeOne(mailbox, "key");
+    ASSERT_TRUE(first.task_id && second.task_id && other.task_id);
+    EXPECT_NE(*first.task_id, *second.task_id);
 
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "key", 1), 10) ==
-                ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(first));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(first));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(second));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(other));
+
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "other"));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(other));
 }
 
-TEST(LocalSsdTaskMailboxTest, OnlyRemovedTakenOffloadsAreCancelled) {
+TEST(LocalSsdTaskMailboxTest, OnlyCompletionsWithoutTaskIdAreUntracked) {
     LocalSsdTaskMailbox mailbox(true);
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "done", 1), 10) ==
-                ErrorCode::OK);
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "queued", 1), 10) ==
-                ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "queued", 1), 10) ==
-                ErrorCode::OK);
+    const auto taken = TakeOne(mailbox, "key");
+    ASSERT_TRUE(taken.task_id);
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "key"));
 
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
-    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "done"));
-    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
-
-    EXPECT_TRUE(mailbox.RemoveOffload(TenantId("tenant"), "queued"));
-    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "queued"));
-    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
-
-    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "never"));
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "never"));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(Offload("tenant", "key", 1)));
+    auto other_tenant = taken;
+    other_tenant.tenant_id = "other";
+    EXPECT_TRUE(mailbox.FinishTakenOffload(other_tenant));
+    auto unknown = taken;
+    unknown.task_id = *taken.task_id + 1;
+    EXPECT_TRUE(mailbox.FinishTakenOffload(unknown));
 }
 
-TEST(LocalSsdTaskMailboxTest, OnlyFinishedOffloadsExpire) {
+TEST(LocalSsdTaskMailboxTest, ExpiredTasksAreSkipped) {
     LocalSsdTaskMailbox mailbox(true, std::chrono::seconds(0));
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "finished", 1), 10) ==
+                ErrorCode::OK);
     ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "open", 1), 10) ==
                 ErrorCode::OK);
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "done", 1), 10) ==
-                ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
-    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "open"));
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
-    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "done"));
+    const auto tasks = mailbox.SetOffloadingAndTakePending(true);
+    ASSERT_EQ(tasks.size(), 2);
+    const auto& finished = tasks[0];
+    const auto& open = tasks[1];
+    EXPECT_FALSE(mailbox.FinishTakenOffload(finished));
 
-    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
-    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "open"));
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
+    ASSERT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+    EXPECT_TRUE(mailbox.FinishTakenOffload(finished));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(open));
 }
 
-TEST(LocalSsdTaskMailboxTest, DrainWithOffloadingDisabledTracksNothing) {
+TEST(LocalSsdTaskMailboxTest, DrainWithOffloadingDisabledAssignsNoTaskId) {
     LocalSsdTaskMailbox mailbox(true);
-    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "taken", 1), 10) ==
-                ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
     ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "key", 1), 10) ==
                 ErrorCode::OK);
-    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(false).size(), 1);
-    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "key"));
-    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
-    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "taken"));
-    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "taken"));
+    auto tasks = mailbox.SetOffloadingAndTakePending(false);
+    ASSERT_EQ(tasks.size(), 1);
+    EXPECT_FALSE(tasks.front().task_id);
+    EXPECT_FALSE(mailbox.FinishTakenOffload(tasks.front()));
 }
 
 TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {

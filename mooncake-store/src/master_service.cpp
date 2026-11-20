@@ -8334,8 +8334,7 @@ auto MasterService::NotifyOffloadSuccess(
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
-            if (local_ssd_manager_.FinishTakenOffload(
-                    client_id, TenantId(task.tenant_id), task.key)) {
+            if (local_ssd_manager_.FinishTakenOffload(client_id, task)) {
                 ++skipped_nacked;
                 continue;
             }
@@ -8381,8 +8380,7 @@ auto MasterService::NotifyOffloadSuccess(
             const bool segment_mounted =
                 !enable_offload_ || HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
-            if (local_ssd_manager_.FinishTakenOffload(
-                    client_id, TenantId(task.tenant_id), task.key)) {
+            if (local_ssd_manager_.FinishTakenOffload(client_id, task)) {
                 ++skipped_completed;
                 continue;
             }

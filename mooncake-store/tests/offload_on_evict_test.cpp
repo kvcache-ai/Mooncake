@@ -288,6 +288,57 @@ TEST_F(OffloadOnEvictTest, StaleOffloadNackKeepsRecreatedObjectsMarker) {
     service->RemoveAll();
 }
 
+TEST_F(OffloadOnEvictTest, StaleCompletionAfterRetakeSkipsRecreatedObject) {
+    auto service = MakeEvictingService();
+    auto ctx = PrepareSegment(*service, "test_segment", kDefaultSegmentBase,
+                              kSegmentSize);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+    auto tasks = PutAndTakeOffloads(*service, ctx.client_id);
+    ASSERT_FALSE(tasks.empty());
+    std::vector<OffloadTaskItem> stale{tasks.front()};
+    const std::string key = stale[0].key;
+
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true));
+    PutObject(*service, ctx.client_id, key, kObjectSize);
+    auto fresh = TakeOffloadsQueuedByEviction(*service, ctx.client_id);
+    ASSERT_EQ(fresh.size(), 1u);
+    ASSERT_EQ(fresh[0].key, key);
+
+    ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, stale,
+                                              DiskMetadatas(stale)));
+    EXPECT_FALSE(HasLocalDiskReplica(*service, key));
+    ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, fresh,
+                                              DiskMetadatas(fresh)));
+    EXPECT_TRUE(HasLocalDiskReplica(*service, key));
+
+    service->RemoveAll();
+}
+
+TEST_F(OffloadOnEvictTest, StaleNackAfterRetakeKeepsRecreatedObjectsMarker) {
+    auto service = MakeEvictingService();
+    auto ctx = PrepareSegment(*service, "test_segment", kDefaultSegmentBase,
+                              kSegmentSize);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+    auto tasks = PutAndTakeOffloads(*service, ctx.client_id);
+    ASSERT_FALSE(tasks.empty());
+    std::vector<OffloadTaskItem> stale{tasks.front()};
+    const std::string key = stale[0].key;
+
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true));
+    PutObject(*service, ctx.client_id, key, kObjectSize);
+    auto fresh = TakeOffloadsQueuedByEviction(*service, ctx.client_id);
+    ASSERT_EQ(fresh.size(), 1u);
+    ASSERT_EQ(fresh[0].key, key);
+
+    stale[0].size = -1;
+    ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, stale,
+                                              DiskMetadatas(stale)));
+    EXPECT_FALSE(service->UpsertStart(ctx.client_id, key, TenantId::Default(),
+                                      kObjectSize, ReplicateConfig{}));
+
+    service->RemoveAll();
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

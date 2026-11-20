@@ -28,7 +28,7 @@ class LocalSsdTaskMailbox {
     ErrorCode EnqueueOffload(OffloadTaskItem task, size_t limit);
     std::vector<OffloadTaskItem> SetOffloadingAndTakePending(bool enabled);
     bool RemoveOffload(const TenantId& tenant_id, std::string_view key);
-    bool FinishTakenOffload(const TenantId& tenant_id, std::string_view key);
+    bool FinishTakenOffload(const OffloadTaskItem& task);
 
     ErrorCode EnqueuePromotion(PromotionTaskItem task);
     std::vector<PromotionTaskItem> TakePromotions(size_t max_items);
@@ -42,8 +42,10 @@ class LocalSsdTaskMailbox {
 
    private:
     struct TakenOffload {
+        uint64_t task_id;
         bool cancelled{false};
-        std::optional<std::chrono::steady_clock::time_point> finished_until;
+        bool finished{false};
+        std::chrono::steady_clock::time_point expires_at;
     };
 
     mutable Mutex mutex_;
@@ -51,8 +53,9 @@ class LocalSsdTaskMailbox {
     const std::chrono::seconds taken_offload_ttl_;
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_
         GUARDED_BY(mutex_);
-    std::unordered_map<std::string, TakenOffload> taken_offloads_
+    std::unordered_map<std::string, std::vector<TakenOffload>> taken_offloads_
         GUARDED_BY(mutex_);
+    uint64_t next_offload_task_id_ GUARDED_BY(mutex_);
     // Dedup map + recency order. seq is monotone; enqueue, a duplicate
     // enqueue, and TouchPromotion all re-mark the entry with a fresh seq, so
     // TakePromotions can deliver the most-recently-touched key first instead
@@ -104,8 +107,7 @@ class LocalSsdManager {
     SetOffloadingAndTakePending(const UUID& client_id, bool enabled);
     bool RemoveOffload(const UUID& client_id, const TenantId& tenant_id,
                        std::string_view key);
-    bool FinishTakenOffload(const UUID& client_id, const TenantId& tenant_id,
-                            std::string_view key);
+    bool FinishTakenOffload(const UUID& client_id, const OffloadTaskItem& task);
     size_t RemoveOffloadFromAll(const TenantId& tenant_id,
                                 std::string_view key);
     bool CancelOffloadsIfAllPending(const std::vector<UUID>& client_ids,
