@@ -141,6 +141,29 @@ class DelayedReadBackend : public BucketStorageBackend {
     std::atomic<size_t> loads{0};
 };
 
+class GatedBatchLoadBackend final : public BucketStorageBackend {
+   public:
+    GatedBatchLoadBackend(const FileStorageConfig& config,
+                          const BucketBackendConfig& bucket_config)
+        : BucketStorageBackend(config, bucket_config),
+          released_(release.get_future().share()) {}
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& slices) override {
+        loads.fetch_add(1, std::memory_order_relaxed);
+        entered.set_value();
+        released_.wait();
+        return BucketStorageBackend::BatchLoad(slices);
+    }
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::atomic<size_t> loads{0};
+
+   private:
+    std::shared_future<void> released_;
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -824,6 +847,16 @@ class FileStorageTest : public ::testing::Test {
         bucket_config.bucket_keys_limit = 10;
         auto backend =
             std::make_shared<DelayedReadBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        return backend;
+    }
+
+    std::shared_ptr<GatedBatchLoadBackend> InstallGatedBatchLoadBackend(
+        FileStorage& storage, const FileStorageConfig& config) {
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 10;
+        auto backend =
+            std::make_shared<GatedBatchLoadBackend>(config, bucket_config);
         storage.storage_backend_ = backend;
         return backend;
     }
@@ -3805,6 +3838,71 @@ TEST_F(FileStorageTest,
               ssd_offload::DestinationError::kOk);
     EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request_b, **results[1]),
               ssd_offload::DestinationError::kOk);
+}
+
+TEST_F(FileStorageTest,
+       ConcurrentDuplicateUsesPipelineWhileBulkReadIsInFlight) {
+    auto config = SmallConfig(data_path);
+    config.streaming_read.slot_bytes = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage storage(config, nullptr, "owner");
+    auto backend = InstallGatedBatchLoadBackend(storage, config);
+
+    const std::string value(1024 * 1024, 's');
+    SeedPushBatch(storage, {value});
+    const std::vector<std::string> values{value};
+    const auto first_request = SmallRequest(values, false, 1);
+    const auto second_request = SmallRequest(values, false, 2);
+    std::vector<char> first_bytes(value.size(), '?');
+    std::vector<char> second_bytes(value.size(), '?');
+    auto first_target = std::make_shared<SmallBatchTarget>();
+    auto second_target = std::make_shared<SmallBatchTarget>();
+    first_target->views.push_back({first_bytes.data(), first_bytes.size()});
+    second_target->views.push_back({second_bytes.data(), second_bytes.size()});
+    std::promise<void> second_write_entered;
+    second_target->entered = &second_write_entered;
+    auto second_write = second_write_entered.get_future();
+
+    auto first = std::async(std::launch::async, [&] {
+        return storage.ReadOwnerStreaming(
+            first_request, first_target,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    });
+    // Release before the future is destroyed if an assertion exits early.
+    auto unblock = std::shared_ptr<void>(
+        nullptr, [&](void*) { backend->release.set_value(); });
+    auto bulk_read_entered = backend->entered.get_future();
+    ASSERT_EQ(bulk_read_entered.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    ASSERT_EQ(backend->loads.load(std::memory_order_relaxed), 1u);
+
+    // The first whole-value load remains blocked. A second overlapping
+    // request must avoid joining that flight and advance through its own
+    // bounded pipeline, otherwise both destinations wait behind one bulk
+    // loader.
+    auto second = std::async(std::launch::async, [&] {
+        return storage.ReadOwnerStreaming(
+            second_request, second_target,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    });
+    EXPECT_EQ(second_write.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(first.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    EXPECT_EQ(backend->loads.load(std::memory_order_relaxed), 1u);
+
+    unblock.reset();
+    auto first_result = first.get();
+    auto second_result = second.get();
+    ASSERT_TRUE(first_result) << first_result.error();
+    ASSERT_TRUE(second_result) << second_result.error();
+    EXPECT_EQ(first_result->objects[0].outcome,
+              ssd_offload::AttemptOutcome::kSucceeded);
+    EXPECT_EQ(second_result->objects[0].outcome,
+              ssd_offload::AttemptOutcome::kSucceeded);
+    EXPECT_EQ(std::string(first_bytes.begin(), first_bytes.end()), value);
+    EXPECT_EQ(std::string(second_bytes.begin(), second_bytes.end()), value);
+    EXPECT_EQ(backend->loads.load(std::memory_order_relaxed), 1u);
 }
 
 }  // namespace mooncake

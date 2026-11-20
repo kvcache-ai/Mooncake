@@ -56,6 +56,9 @@ the pipeline. A fragmented staging arena can also use the smaller pipeline
 slots when a contiguous batch allocation does not fit. Complete single-value
 reads share an overlapping disk read through the existing singleflight helper;
 each accepted writer retains its staging owner through transfer completion.
+When another Owner read is active, a complete single value of at least 256 KiB
+uses the bounded streaming slots instead of waiting on the bulk-read flight;
+uncontended and smaller values keep the bulk path.
 The Owner uses four bounded request workers by default.
 
 Small TCP batches with at least four destinations, at most 4 MiB of payload,

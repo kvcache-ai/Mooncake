@@ -788,6 +788,7 @@ FileStorage::ReadOwnerStreaming(
         } while (!active_streaming_sources_.compare_exchange_weak(
             active, active + request.objects.size(),
             std::memory_order_relaxed));
+        const bool another_request_active = active != 0;
         struct SourceCredits {
             std::atomic<size_t>& active;
             size_t count;
@@ -807,8 +808,14 @@ FileStorage::ReadOwnerStreaming(
         batch_keys.reserve(request.objects.size());
         batch_sizes.reserve(request.objects.size());
         unique_keys.reserve(request.objects.size());
-        bool whole_batch = !request.objects.empty() && !config.direct_io &&
-                           !config.fixed_buffers;
+        // Keep the cheaper bulk path for an uncontended request. Under
+        // concurrency, medium single values use the existing bounded pipeline
+        // so an overlapping bulk loader cannot hold up every destination.
+        bool whole_batch =
+            !request.objects.empty() && !config.direct_io &&
+            !config.fixed_buffers &&
+            !(request.objects.size() == 1 && another_request_active &&
+              request.objects.front().expected_object_size >= 256 * 1024);
         for (const auto& object : request.objects) {
             if (!whole_batch) break;
             const uint64_t size = object.expected_object_size;
