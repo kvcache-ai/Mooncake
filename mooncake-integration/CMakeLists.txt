@@ -64,14 +64,6 @@ if(WITH_TE OR WITH_STORE)
         FATAL_ERROR
           "Building an abi3 wheel requires Python Development.SABIModule")
     endif()
-    if(WITH_EP
-       OR WITH_CONDUCTOR
-       OR USE_TENT)
-      message(
-        FATAL_ERROR
-          "abi3 wheels currently require WITH_EP, WITH_CONDUCTOR and USE_TENT to be off"
-      )
-    endif()
     set(MOONCAKE_NANOBIND_ABI STABLE_ABI)
   endif()
 endif()

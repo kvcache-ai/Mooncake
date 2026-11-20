@@ -10,6 +10,17 @@ else()
   set(_WITH_PG_DEFAULT "${WITH_EP}")
 endif()
 option(WITH_PG "build the Mooncake ProcessGroup backend" ${_WITH_PG_DEFAULT})
+option(WITH_CONDUCTOR "build mooncake conductor service" OFF)
+
+if(SKBUILD_SABI_COMPONENT
+   AND (WITH_EP
+        OR WITH_CONDUCTOR
+        OR USE_TENT))
+  message(
+    FATAL_ERROR
+      "abi3 wheels currently require WITH_EP, WITH_CONDUCTOR and USE_TENT to be off"
+  )
+endif()
 
 # indicates cmake is invoked from top-level dir
 set(GLOBAL_CONFIG "true")
@@ -35,7 +46,6 @@ if(WITH_PG AND NOT WITH_TE)
 endif()
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
-option(WITH_CONDUCTOR "build mooncake conductor service" OFF)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE
        "build the Rust interface and sample code for the transfer engine" OFF)

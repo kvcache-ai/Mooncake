@@ -7,6 +7,7 @@
 #include "config.h"
 #include <memory>
 #include <thread>
+#include <utility>
 #include <future>
 #include <vector>
 #include <glog/logging.h>
@@ -43,6 +44,19 @@ RpcCompletion ScheduleRpcCompletion(py::object future, py::handle loop,
         }));
 }
 
+// A Python callback can drop the last reference to its own server.
+thread_local const RpcInterface::Impl* receiving_on = nullptr;
+
+class ReceiveScope {
+   public:
+    explicit ReceiveScope(const RpcInterface::Impl* receiver)
+        : previous_(std::exchange(receiving_on, receiver)) {}
+    ~ReceiveScope() { receiving_on = previous_; }
+
+   private:
+    const RpcInterface::Impl* previous_;
+};
+
 }  // namespace
 
 // Implementation class
@@ -51,6 +65,12 @@ class __attribute__((visibility("hidden"))) RpcInterface::Impl {
     std::shared_ptr<RpcCommunicator> communicator;
     py::callable data_receive_callback;
     py::callable tensor_receive_callback;
+    bool stopping = false;  // Accessed with the GIL held.
+
+    void handleIncomingData(std::string_view source, std::string_view data);
+    void handleIncomingTensor(std::string_view source, std::string_view data,
+                              const std::vector<size_t>& shape,
+                              std::string_view dtype);
 };
 
 int RpcInterface::traversePythonReferences(PyObject* self, visitproc visit,
@@ -66,10 +86,7 @@ int RpcInterface::traversePythonReferences(PyObject* self, visitproc visit,
 
 int RpcInterface::clearPythonReferences(PyObject* self) {
     if (py::inst_ready(self)) {
-        auto& impl = *py::inst_ptr<RpcInterface>(self)->impl_;
-        // Clear both fields before releasing either Python reference.
-        auto data_callback = std::move(impl.data_receive_callback);
-        auto tensor_callback = std::move(impl.tensor_receive_callback);
+        py::inst_ptr<RpcInterface>(self)->shutdown();
     }
     return 0;
 }
@@ -78,20 +95,53 @@ int RpcInterface::clearPythonReferences(PyObject* self) {
 RpcInterface::RpcInterface() : impl_(std::make_unique<Impl>()) {}
 
 // Destructor
-RpcInterface::~RpcInterface() { stopServer(); }
+RpcInterface::~RpcInterface() { shutdown(); }
+
+void RpcInterface::shutdown() {
+    if (receiving_on == impl_.get()) {
+        // The receive worker cannot join itself. Keep the native state and
+        // the callback references alive until a different thread joins it.
+        auto impl = std::exchange(impl_, std::make_unique<Impl>());
+        impl->stopping = true;
+        std::thread([impl = std::move(impl)]() mutable {
+            impl->communicator->stopServer();
+            py::gil_scoped_acquire acquire;
+            impl.reset();
+        }).detach();
+        return;
+    }
+
+    stopServer();
+    // Clear both fields before releasing either Python reference.
+    auto data_callback = std::move(impl_->data_receive_callback);
+    auto tensor_callback = std::move(impl_->tensor_receive_callback);
+}
 
 // Initialize
 bool RpcInterface::initialize(const std::string& local_address,
                               size_t thread_count, size_t timeout_seconds,
                               size_t pool_size) {
+    if (impl_->stopping) return false;
+    stopServer();
+
     RpcCommunicatorConfig config;
     config.listen_address = local_address;
     config.thread_count = thread_count;
     config.timeout_seconds = timeout_seconds;
     config.pool_size = pool_size;
 
-    impl_->communicator = std::make_shared<RpcCommunicator>();
-    return impl_->communicator->initialize(config);
+    auto communicator = std::make_shared<RpcCommunicator>();
+    if (!communicator->initialize(config)) return false;
+    if (!local_address.empty()) {
+        communicator->setDataReceiveCallback(
+            [impl = impl_.get()](std::string_view source,
+                                 std::string_view data) {
+                ReceiveScope receive(impl);
+                impl->handleIncomingData(source, data);
+            });
+    }
+    impl_->communicator = std::move(communicator);
+    return true;
 }
 
 // Convenience method for client initialization
@@ -107,24 +157,33 @@ bool RpcInterface::initializeServer(const std::string& listen_address,
 }
 
 bool RpcInterface::startServer() {
-    if (!impl_->communicator) return false;
+    if (!impl_->communicator || impl_->stopping) return false;
     return impl_->communicator->startServer();
 }
 
 bool RpcInterface::startServerAsync() {
-    if (!impl_->communicator) return false;
+    if (!impl_->communicator || impl_->stopping) return false;
     return impl_->communicator->startServerAsync();
 }
 
 bool RpcInterface::startServerImpl(bool is_async) {
-    if (!impl_->communicator) return false;
+    if (!impl_->communicator || impl_->stopping) return false;
     return impl_->communicator->startServerImpl(is_async);
 }
 
 void RpcInterface::stopServer() {
-    if (impl_->communicator) {
+    if (!impl_->communicator || impl_->stopping) return;
+    if (receiving_on == impl_.get()) {
+        throw std::runtime_error(
+            "Cannot stop the RPC server from its receive callback");
+    }
+
+    impl_->stopping = true;
+    {
+        py::gil_scoped_release release;
         impl_->communicator->stopServer();
     }
+    impl_->stopping = false;
 }
 
 int RpcInterface::sendData(const std::string& target_address, py::handle data) {
@@ -328,15 +387,6 @@ py::object RpcInterface::sendTensorAsync(const std::string& target_address,
 void RpcInterface::setDataReceiveCallback(py::callable callback) {
     py::gil_scoped_acquire acquire;
     impl_->data_receive_callback = callback;
-    if (impl_->communicator) {
-        // Capture this pointer - safe because RpcInterface is managed by Python
-        // and will remain valid as long as the callback is set
-        auto interface_ptr = this;
-        impl_->communicator->setDataReceiveCallback(
-            [interface_ptr](std::string_view source, std::string_view data) {
-                interface_ptr->handleIncomingData(source, data);
-            });
-    }
 }
 
 void RpcInterface::setTensorReceiveCallback(py::callable callback) {
@@ -348,8 +398,8 @@ void RpcInterface::setTensorReceiveCallback(py::callable callback) {
     // to handleIncomingTensor automatically
 }
 
-void RpcInterface::handleIncomingData(std::string_view source,
-                                      std::string_view data) {
+void RpcInterface::Impl::handleIncomingData(std::string_view source,
+                                            std::string_view data) {
     LOG(INFO) << "RpcInterface::handleIncomingData called with " << data.size()
               << " bytes";
 
@@ -431,7 +481,8 @@ void RpcInterface::handleIncomingData(std::string_view source,
     // Handle as regular data if not tensor data
     try {
         py::gil_scoped_acquire acquire;
-        auto callback = impl_->data_receive_callback;
+        if (stopping) return;
+        auto callback = data_receive_callback;
         if (!callback) return;
 
         py::dict received;
@@ -445,17 +496,18 @@ void RpcInterface::handleIncomingData(std::string_view source,
     }
 }
 
-void RpcInterface::handleIncomingTensor(std::string_view source,
-                                        std::string_view data,
-                                        const std::vector<size_t>& shape,
-                                        std::string_view dtype) {
+void RpcInterface::Impl::handleIncomingTensor(std::string_view source,
+                                              std::string_view data,
+                                              const std::vector<size_t>& shape,
+                                              std::string_view dtype) {
     LOG(INFO) << "RpcInterface::handleIncomingTensor called"
               << " - source: " << source << ", data size: " << data.size()
               << ", dtype: " << dtype << ", shape size: " << shape.size();
 
     try {
         py::gil_scoped_acquire acquire;
-        auto callback = impl_->tensor_receive_callback;
+        if (stopping) return;
+        auto callback = tensor_receive_callback;
         if (!callback) {
             LOG(WARNING) << "No tensor receive callback set!";
             return;
