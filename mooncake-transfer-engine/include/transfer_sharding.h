@@ -175,9 +175,18 @@ class TransferShardingExecutor {
             jobs_.splice(jobs_.end(), pending);
         }
         ready_.notify_all();
+        bool timed_out;
         {
             std::unique_lock<std::mutex> lock(parent->mutex);
-            // Completion, not the caller deadline, owns the input lifetime.
+            timed_out = !parent->finished.wait_until(lock, deadline, [&] {
+                return parent->remaining_sub_batches == 0;
+            });
+        }
+        if (timed_out) {
+            parent->stopped.store(true, std::memory_order_release);
+            cancelQueued(parent);
+            std::unique_lock<std::mutex> lock(parent->mutex);
+            // Dequeued jobs still own caller input until their callbacks end.
             parent->finished.wait(
                 lock, [&] { return parent->remaining_sub_batches == 0; });
         }
@@ -189,6 +198,7 @@ class TransferShardingExecutor {
         idle_.notify_all();
         for (const auto& result : parent->sub_batch_results)
             if (result.code != 0 && result.code != kCanceled) return result;
+        if (timed_out) return {-1, "Transfer sharding timed out"};
         for (const auto& result : parent->sub_batch_results)
             if (!result.ok()) return result;
         return Result::OK();
@@ -234,6 +244,31 @@ class TransferShardingExecutor {
         std::shared_ptr<ParentBatch> parent;
         Range range;
     };
+
+    static void finishJob(const Job& job, Result result) {
+        auto& parent = *job.parent;
+        if (!result.ok()) parent.stopped.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(parent.mutex);
+        parent.sub_batch_results[job.range.index] = std::move(result);
+        if (--parent.remaining_sub_batches == 0) parent.finished.notify_one();
+    }
+
+    void cancelQueued(const std::shared_ptr<ParentBatch>& parent) {
+        std::list<Job> canceled;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = jobs_.begin(); it != jobs_.end();) {
+                auto current = it++;
+                if (current->parent == parent)
+                    canceled.splice(canceled.end(), jobs_, current);
+            }
+        }
+        // The queue lock gives either this caller or a worker each job, never
+        // both. Settle without allocating error strings or holding the queue
+        // lock; execute() supplies the timeout diagnostic after joining.
+        for (const auto& job : canceled) finishJob(job, {kCanceled, {}});
+    }
+
     void worker() {
         active_executor_ = this;
         for (;;) {
@@ -260,14 +295,7 @@ class TransferShardingExecutor {
                     result = {-1, "Unknown transfer sharding exception"};
                 }
             }
-            if (!result.ok())
-                parent.stopped.store(true, std::memory_order_release);
-            {
-                std::lock_guard<std::mutex> lock(parent.mutex);
-                parent.sub_batch_results[job.range.index] = std::move(result);
-                if (--parent.remaining_sub_batches == 0)
-                    parent.finished.notify_one();
-            }
+            finishJob(job, std::move(result));
         }
         active_executor_ = nullptr;
     }

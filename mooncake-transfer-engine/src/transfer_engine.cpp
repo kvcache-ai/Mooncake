@@ -1495,8 +1495,15 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
             << " descriptors=" << count;
     int device = -1;
 #ifdef USE_CUDA
-    if (cudaGetDevice(&device) != cudaSuccess)
+    const auto cuda_status = cudaGetDevice(&device);
+    if (cuda_status == cudaErrorNoDevice ||
+        cuda_status == cudaErrorInsufficientDriver) {
+        // CUDA builds also support host-only transfers without a GPU/driver.
+        device = -1;
+        (void)cudaGetLastError();
+    } else if (cuda_status != cudaSuccess) {
         return Status::Context("Could not capture sharding CUDA device");
+    }
 #endif
     // Workers mutate distinct vectors; retain every vector until parent join.
     std::vector<std::vector<TransferRequest>> request_storage(
@@ -1505,7 +1512,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
         count, deadline,
         [&](Executor::Range range, const Executor::Cancellation& cancellation) {
 #ifdef USE_CUDA
-            if (cudaSetDevice(device) != cudaSuccess)
+            if (device >= 0 && cudaSetDevice(device) != cudaSuccess)
                 return Executor::Result{-1,
                                         "Could not bind sharding CUDA device"};
 #endif

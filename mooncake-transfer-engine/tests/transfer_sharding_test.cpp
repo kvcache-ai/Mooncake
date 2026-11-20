@@ -397,13 +397,14 @@ TEST(TransferSharding, ConcurrentParentsKeepInputAndErrorsSeparate) {
 }
 
 TEST(TransferSharding, ExpiredQueuedParentDoesNotSubmitAnySubBatch) {
-    Executor executor({1, 1, 2});
+    Executor executor({2, 1, 2});
     std::promise<void> started, release;
+    std::atomic<int> occupied{0};
     auto unblock = release.get_future().share();
     auto first = std::async(std::launch::async, [&] {
-        return executor.execute(1, Executor::Clock::now() + 10s,
+        return executor.execute(2, Executor::Clock::now() + 10s,
                                 [&](auto, const auto&) {
-                                    started.set_value();
+                                    if (++occupied == 2) started.set_value();
                                     unblock.wait();
                                     return Executor::Result::OK();
                                 });
@@ -417,10 +418,84 @@ TEST(TransferSharding, ExpiredQueuedParentDoesNotSubmitAnySubBatch) {
                                     return Executor::Result::OK();
                                 });
     });
+    // An expired queued parent must return while every worker is occupied.
+    EXPECT_EQ(expired.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(submitted.load(), 0);
     release.set_value();
     EXPECT_TRUE(first.get().ok());
     EXPECT_FALSE(expired.get().ok());
     EXPECT_EQ(submitted.load(), 0);
+    EXPECT_TRUE(
+        executor
+            .execute(1, Executor::Clock::now() + 1s,
+                     [](auto, const auto&) { return Executor::Result::OK(); })
+            .ok());
+}
+
+TEST(TransferSharding, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
+    // Cover active-only, active+queued, and an actual error after expiry.
+    for (auto [count, fail] :
+         {std::pair{1, false}, std::pair{2, false}, std::pair{2, true}}) {
+        SCOPED_TRACE(count);
+        SCOPED_TRACE(fail);
+        Executor executor({2, 1, 2});
+        std::promise<void> occupied, release_other, release_active;
+        std::promise<bool> timeout_seen;
+        auto other_wait = release_other.get_future().share();
+        auto active_wait = release_active.get_future().share();
+        auto other = std::async(std::launch::async, [&] {
+            return executor.execute(1, Executor::Clock::now() + 30s,
+                                    [&](auto, const auto&) {
+                                        occupied.set_value();
+                                        other_wait.wait();
+                                        return Executor::Result::OK();
+                                    });
+        });
+        occupied.get_future().wait();
+        std::atomic<int> calls{0};
+        auto parent = std::async(std::launch::async, [&] {
+            return executor.execute(
+                count, Executor::Clock::now() + 1s,
+                [&](auto, const auto& stop) -> Executor::Result {
+                    ++calls;
+                    // Wait for the caller's timeout handling, with a bound so
+                    // a broken implementation still allows test cleanup.
+                    const auto until = stop.deadline + 2s;
+                    while (!stop.stopped.load() &&
+                           Executor::Clock::now() < until)
+                        std::this_thread::yield();
+                    timeout_seen.set_value(stop.stopped.load());
+                    active_wait.wait();
+                    return fail
+                               ? Executor::Result{-7, "Injected active failure"}
+                               : Executor::Result::OK();
+                });
+        });
+        auto observed = timeout_seen.get_future();
+        auto observed_status = observed.wait_for(5s);
+        EXPECT_EQ(observed_status, std::future_status::ready);
+        if (observed_status == std::future_status::ready) {
+            EXPECT_TRUE(observed.get());
+        }
+        EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
+        release_active.set_value();
+        // The unrelated parent still occupies its worker.
+        EXPECT_EQ(parent.wait_for(2s), std::future_status::ready);
+        EXPECT_EQ(other.wait_for(0s), std::future_status::timeout);
+        release_other.set_value();
+        auto result = parent.get();
+        EXPECT_TRUE(other.get().ok());
+        EXPECT_EQ(calls.load(), 1);
+        EXPECT_EQ(result.code, fail ? -7 : -1);
+        EXPECT_EQ(result.error, fail ? "Injected active failure"
+                                     : "Transfer sharding timed out");
+        EXPECT_TRUE(executor
+                        .execute(1, Executor::Clock::now() + 1s,
+                                 [](auto, const auto&) {
+                                     return Executor::Result::OK();
+                                 })
+                        .ok());
+    }
 }
 
 TEST(TransferSharding, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
