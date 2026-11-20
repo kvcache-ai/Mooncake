@@ -155,22 +155,14 @@ Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints`
 
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
-Set `MC_STORE_CLUSTER_ID` in every client process, including storage-owning
-clients, to match the masters' `--cluster_id`. This variable selects the HA
-leader-discovery namespace as well as labeling client metrics. Unset or empty
-values use `mooncake_cluster` for discovery. A mismatch can leave clients
-without a leader or direct them to another cluster on the same etcd service.
-For the master example above, Method B clients use:
+Set `MC_STORE_CLUSTER_ID` in every client process, including storage-owning clients, to match the masters' `--cluster_id`. This variable selects the HA leader-discovery namespace as well as labeling client metrics. Unset or empty values use `mooncake_cluster` for discovery. A mismatch can leave clients without a leader or direct them to another cluster on the same etcd service. For the master example above, Method B clients use:
 
 ```bash
 export MC_STORE_CLUSTER_ID=mooncake_cluster
 export MOONCAKE_MASTER='etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379'
 ```
 
-For a custom cluster ID, change both the master flag and the client variable
-before starting their processes. The same namespace requirement applies to
-Methods A and C. See {ref}`Client failover <store-ha-client-failover>`
-for discovery, reconnection, and automatic remount behavior.
+For a custom cluster ID, change both the master flag and the client variable before starting their processes. The same namespace requirement applies to Methods A and C. See {ref}`Client failover <store-ha-client-failover>` for discovery, reconnection, and automatic remount behavior.
 
 **etcd TLS and mutual TLS:** the Go etcd wrapper accepts the following environment
 variables. They apply to the Store HA, snapshot, and dedicated lease keepalive
@@ -278,10 +270,7 @@ report success for a visible batch without proving the replica policy was met.
 
 ### Snapshot & Restore
 
-The legacy Master-generated snapshot and restore path has been removed. HA
-recovery uses the standby-generated batch OpLog snapshot path. For its capture,
-verification, fallback, suffix replay, and pruning design, see [Mooncake Store
-High Availability Design](../design/store/high-availability.md#snapshot-and-restore).
+The legacy Master-generated snapshot and restore path has been removed. HA recovery uses the standby-generated batch OpLog snapshot path. For its capture, verification, fallback, suffix replay, and pruning design, see [Mooncake Store High Availability Design](../design/store/high-availability.md#snapshot-and-restore).
 
 ---
 
@@ -447,14 +436,7 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ## High Availability (HA)
 
-With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA
-model. The active Primary serves traffic; enabling `--enable_oplog=true` makes
-Standby masters track its metadata changes so a candidate can catch up and be
-promoted after leadership changes. The [HA design document](
-../design/store/high-availability.md) describes the role lifecycle, batch
-OpLog, promotion, snapshot recovery, and cache-loss semantics.
-`ha_backend_type=redis` is experimental and is not suitable for production
-deployments.
+With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA model. The active Primary serves traffic; enabling `--enable_oplog=true` makes Standby masters track its metadata changes so a candidate can catch up and be promoted after leadership changes. The [HA design document](../design/store/high-availability.md) describes the role lifecycle, batch OpLog, promotion, snapshot recovery, and cache-loss semantics. `ha_backend_type=redis` is experimental and is not suitable for production deployments.
 
 ### HA Configuration
 
@@ -464,22 +446,12 @@ HA leadership and metadata replication are configured separately:
 - The optional batch-record OpLog records metadata mutations so standby masters can catch up and later be promoted. It is the etcd Primary-Standby path. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. On etcd, acknowledged batches form the durable prefix used for promotion. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and is an experimental HA log storage method. A successful Redis write only means Redis accepted the record. Do not treat Redis persistence, including AOF `appendfsync everysec`, as a strict durability guarantee.
 - The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
-For metadata-preserving failover, enable OpLog on every master that can be
-elected, with a matching cluster ID and backend. A master with OpLog disabled
-can be elected with an empty promotion context. Once logs have been pruned,
-every candidate also needs batch snapshot bootstrap enabled and access to the
-retained snapshot artifacts.
+For metadata-preserving failover, enable OpLog on every master that can be elected, with a matching cluster ID and backend. A master with OpLog disabled can be elected with an empty promotion context. Once logs have been pruned, every candidate also needs batch snapshot bootstrap enabled and access to the retained snapshot artifacts.
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
 - `--etcd_max_send_message_bytes`: Outgoing gRPC message limit for the HA store etcd client, in bytes. Defaults to `2097152` (2 MiB) and must be positive. For a server configured with `--max-request-bytes=16777216`, use `--etcd_max_send_message_bytes=16777216` and keep serialized batches below that request budget. The setting is applied before the first connection and reused by reset and keepalive clients; it does not change the server limit, receive limit, Transfer Engine client, or snapshot client. The YAML/JSON configuration key is also `etcd_max_send_message_bytes`; an explicitly supplied CLI flag overrides it.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
-- With `enable_oplog_snapshot=true`, successful publication can also trigger
-  OpLog pruning. Before pruning begins, deploy compaction-floor rebootstrap
-  support to every electable Standby. Once pruning starts, rollback binaries
-  must understand the batch snapshot and floor protocol; older versions cannot
-  recover already-pruned history. See [Snapshot and Restore](../design/store/high-availability.md#snapshot-and-restore)
-  for the recovery and pruning design. This does not perform etcd MVCC
-  compaction/defragmentation.
+- With `enable_oplog_snapshot=true`, successful publication can also trigger OpLog pruning. Before pruning begins, deploy compaction-floor rebootstrap support to every electable Standby. Once pruning starts, rollback binaries must understand the batch snapshot and floor protocol; older versions cannot recover already-pruned history. See [Snapshot and Restore](../design/store/high-availability.md#snapshot-and-restore) for the recovery and pruning design. This does not perform etcd MVCC compaction/defragmentation.
 - `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
@@ -499,19 +471,11 @@ snapshot_object_store_type: "local"
 
 The snapshot configuration above enables a Standby-produced baseline and OpLog suffix replay. The bootstrap and promotion sequences are covered in [Mooncake Store High Availability Design](../design/store/high-availability.md#role-and-serving-lifecycle).
 
-For multi-host deployments using `local`, every recovery candidate must access
-the **same persistent snapshot data** through `MOONCAKE_SNAPSHOT_LOCAL_PATH`.
-Identically named directories on separate local disks do not satisfy this
-requirement; use shared durable storage or a shared snapshot object store.
+For multi-host deployments using `local`, every recovery candidate must access the **same persistent snapshot data** through `MOONCAKE_SNAPSHOT_LOCAL_PATH`. Identically named directories on separate local disks do not satisfy this requirement; use shared durable storage or a shared snapshot object store.
 
 ### Graceful Shutdown
 
-An HA master handles SIGTERM and SIGINT with an ordered drain. The etcd path
-has a 15-second overall shutdown bound; set Kubernetes
-`terminationGracePeriodSeconds` long enough to cover any preStop delay plus
-this bound and a few seconds. See [Graceful Shutdown](
-../design/store/high-availability.md#graceful-shutdown) for the shutdown
-ordering, lease release behavior, exit status, and backend-specific caveats.
+An HA master handles SIGTERM and SIGINT with an ordered drain. The etcd path has a 15-second overall shutdown bound; set Kubernetes `terminationGracePeriodSeconds` long enough to cover any preStop delay plus this bound and a few seconds. See [Graceful Shutdown](../design/store/high-availability.md#graceful-shutdown) for the shutdown ordering, lease release behavior, exit status, and backend-specific caveats.
 
 ### Example: HA Deployment with etcd
 
@@ -634,11 +598,7 @@ curl -fsS http://<master_host>:9003/health
 curl -fsS http://<master_host>:9003/health | jq -e '.service_ready == true'
 ```
 
-HTTP 200 and `status="ok"` indicate that the admin server responds; a Standby
-or recovering master also returns them. `role="leader"` includes warmup, so
-it is insufficient for routing traffic. Require `service_ready=true` for
-serving readiness. This still does not guarantee that every payload replica
-has completed remount or disk metadata recovery; see {ref}`HA readiness semantics <store-ha-process-readiness>`.
+HTTP 200 and `status="ok"` indicate that the admin server responds; a Standby or recovering master also returns them. `role="leader"` includes warmup, so it is insufficient for routing traffic. Require `service_ready=true` for serving readiness. This still does not guarantee that every payload replica has completed remount or disk metadata recovery; see {ref}`HA readiness semantics <store-ha-process-readiness>`.
 
 ---
 
