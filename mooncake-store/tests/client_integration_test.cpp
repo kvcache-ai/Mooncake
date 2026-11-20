@@ -1512,9 +1512,9 @@ TEST_F(ClientIntegrationTest, BatchGetChecksLeasesWithPreferredNode) {
         EXPECT_TRUE(results[1].has_value());
         ASSERT_FALSE(results[2].has_value());
         EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
-        // The expired item completed its transfer too; it must still not be
-        // reported as a successful read once its lease has expired.
-        EXPECT_EQ(memcmp(expired_dst, value.data(), value.size()), 0);
+        // An expired descriptor may already point to a reclaimed buffer.
+        EXPECT_EQ(std::string(expired_dst, value.size()),
+                  std::string(value.size(), '\0'));
         EXPECT_EQ(memcmp(live_dst, value.data(), value.size()), 0);
     }
 }

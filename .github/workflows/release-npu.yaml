@@ -35,6 +35,7 @@ jobs:
 
     env:
       NPU_BUILD: "1"
+      GOEXPERIMENT: "norandomizedheapbase64"
 
     steps:
       - name: Checkout code
@@ -107,6 +108,7 @@ jobs:
           mkdir build
           cd build
           cmake_args=(
+            -DWITH_CONDUCTOR=ON
             -DUSE_ASCEND_DIRECT=ON
             -DUSE_ETCD=ON
             -DSTORE_USE_ETCD=ON

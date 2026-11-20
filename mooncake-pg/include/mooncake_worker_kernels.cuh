@@ -40,6 +40,8 @@ __global__ void enqueueTaskKernel(int opType, size_t dataSize,
                                   size_t activeRanksCount, Task* tasks,
                                   size_t taskId);
 
+__global__ void readDoneKernel(uint32_t* halfReads);
+
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks, int op,
@@ -59,6 +61,8 @@ void launchEnqueueTaskKernel(int opType, size_t dataSize, int64_t broadcastRoot,
                              bool* activeRanks, int32_t* activeRanksMirror,
                              size_t activeRanksCount, Task* tasks,
                              size_t taskId, cudaStream_t stream);
+
+void launchReadDoneKernel(uint32_t* halfReads, cudaStream_t stream);
 
 void launchReduceKernel_uint8(uint8_t* dst, const uint8_t* src,
                               size_t numElements, size_t numRanks, int op,

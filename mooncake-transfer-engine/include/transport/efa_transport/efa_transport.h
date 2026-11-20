@@ -79,6 +79,29 @@ class EfaTransport : public Transport {
     buildLocalNicMap(const TopologyMatrix& matrix,
                      const std::vector<std::string>& device_names);
 
+    // Which NICs each chunk of a buffer is registered on, as indices into the
+    // opened EFA devices. A device buffer keeps its local NICs however many
+    // chunks it has; partitioning every NIC by index left most of a split GPU
+    // buffer reachable only through the other socket's NICs. `local_nics` is
+    // null for host memory and MC_EFA_NIC_SELECTION=all; `full_coverage` means
+    // the whole buffer fits one NIC's PTE budget. Exposed for testing.
+    enum class NicPlanKind {
+        kSingleLocal,
+        kSingleAll,
+        kLocalCoverage,   // every chunk on every local NIC
+        kLocalPartition,  // local NICs divided among the chunks
+        kFullCoverage,
+        kPartition,  // every NIC divided among the chunks
+        kRoundRobin,
+    };
+    struct NicPlan {
+        NicPlanKind kind;
+        std::vector<std::vector<size_t>> assignments;
+    };
+    static NicPlan planChunkNics(size_t num_chunks, size_t num_nics,
+                                 const std::vector<size_t>* local_nics,
+                                 bool full_coverage);
+
     // Writes to `indexed` a copy of `topology` that lists only `device_names`
     // (the EFA devices the transport opened), numbered in the topology's own
     // order. A topology index selects both the NIC in context_list_ and the

@@ -17,7 +17,11 @@
 
 #include <cuda.h>
 
+#include <cstdlib>
+#include <filesystem>
 #include <mutex>
+
+#include "tent/common/config.h"
 
 namespace mooncake {
 namespace tent {
@@ -33,6 +37,17 @@ inline CUresult cudaDriverInitResult() {
 
 inline bool ensureCudaDriverInit() {
     return cudaDriverInitResult() == CUDA_SUCCESS;
+}
+
+// ibv_reg_mr() on CUDA device memory requires a loaded peer-memory module
+// unless WITH_NVIDIA_PEERMEM explicitly overrides the selection.
+inline bool useCudaPeerMemoryModule() {
+    const bool loaded = std::filesystem::exists("/sys/module/nvidia_peermem") ||
+                        std::filesystem::exists("/sys/module/nv_peer_mem");
+    if (const char* env = std::getenv("WITH_NVIDIA_PEERMEM")) {
+        return ConfigHelper::parseBool(env, loaded);
+    }
+    return loaded;
 }
 
 enum class CudaMemoryKind { Unknown, Host, Device, Managed };
