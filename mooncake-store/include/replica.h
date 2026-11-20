@@ -345,6 +345,7 @@ struct LocalDiskReplicaData {
     // set before the replica is published and not changed while readers can
     // see it, so it needs no atomic access.
     ClientSessionSharedPtr owner_session;
+    ObjectIncarnation incarnation;
 };
 
 struct DistributedFSDescriptor {
@@ -382,7 +383,13 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
+
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return object_incarnation.value_or(ObjectIncarnation{});
+    }
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             object_incarnation);
 };
 
 class Replica {
@@ -407,10 +414,11 @@ class Replica {
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status,
-            ClientSessionSharedPtr owner_session = nullptr)
+            ClientSessionSharedPtr owner_session = nullptr,
+            ObjectIncarnation incarnation = {})
         : Replica(next_id_.fetch_add(1), client_id, object_size,
                   std::move(transport_endpoint), status,
-                  std::move(owner_session)) {}
+                  std::move(owner_session), incarnation) {}
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
@@ -940,11 +948,12 @@ class Replica {
 
     Replica(ReplicaID id, UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status,
-            ClientSessionSharedPtr owner_session = nullptr)
+            ClientSessionSharedPtr owner_session = nullptr,
+            ObjectIncarnation incarnation = {})
         : id_(id),
           data_(std::make_unique<LocalDiskReplicaData>(LocalDiskReplicaData{
               client_id, object_size, std::move(transport_endpoint),
-              std::move(owner_session)})),
+              std::move(owner_session), incarnation})),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -1012,6 +1021,9 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        if (!disk_data.incarnation.IsZero()) {
+            local_disk_desc.object_incarnation = disk_data.incarnation;
+        }
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = DfsData(data_).descriptor;

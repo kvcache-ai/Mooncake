@@ -27,16 +27,18 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
         return WithoutOffload(ns, hold, plan, so_far, DropReason::kOffloadCap);
     }
 
+    UUID attempt_id{};
     for (const ReplicaID id : plan.release) {
         Replica* source = metadata.GetReplicaByID(id);
         std::vector<UUID> mirror_clients;
         if (source == nullptr ||
-            !queue_.Push(ns.id(), hold.key(), *source, &mirror_clients)) {
+            !queue_.Push(ns.id(), hold.key(), *source, metadata.incarnation,
+                         attempt_id, &mirror_clients)) {
             continue;
         }
         source->inc_refcnt();
-        hold.state().offloading_task =
-            OffloadingTask{id, Clock::now(), std::move(mirror_clients)};
+        hold.state().offloading_task = OffloadingTask{
+            id, Clock::now(), std::move(mirror_clients), attempt_id};
 
         Plan rest;
         for (const ReplicaID other : plan.release) {

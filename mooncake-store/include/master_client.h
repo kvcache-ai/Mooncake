@@ -500,7 +500,8 @@ class MasterClient {
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
-        const UUID& client_id, bool enable_offloading);
+        const UUID& client_id, bool enable_offloading,
+        bool supports_versioned_offload = false);
 
     /**
      * @brief Deregisters this client's local disk segment from the master,

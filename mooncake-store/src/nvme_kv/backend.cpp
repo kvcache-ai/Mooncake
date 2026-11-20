@@ -171,7 +171,8 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string> &keys,
                             std::vector<StorageObjectMetadata> &metadatas)>
         complete_handler,
-    NvmeKvStorageBackend::EvictionHandler eviction_handler) {
+    NvmeKvStorageBackend::EvictionHandler eviction_handler,
+    const ObjectVersions * /*versions*/) {
     (void)eviction_handler;
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);

@@ -243,6 +243,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
+    tl::expected<void, ErrorCode> MountVersionedLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading);
+
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
         const UUID& client_id);
 

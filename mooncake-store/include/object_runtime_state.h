@@ -49,6 +49,7 @@ struct OffloadingTask {
     // offload is pushed once per completed MEMORY replica and those
     // replicas may live on different clients.
     std::vector<UUID> mirror_clients;
+    UUID attempt_id{};
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source

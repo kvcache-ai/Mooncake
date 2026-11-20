@@ -81,12 +81,14 @@ class FileStorage {
      * forwards them to a remote node.
      * @param keys                 List of keys to read from the local KV store
      * @param sizes                Expected size in bytes for each value
+     * @param expected_incarnations Optional list parallel to keys. Zero
+     *                             identifies an unversioned record.
      * @return tl::expected<BatchGetResult, ErrorCode> containing batch_id and
      * buffer pointers.
      */
     tl::expected<BatchGetResult, ErrorCode> BatchGet(
-        const std::vector<std::string>& keys,
-        const std::vector<int64_t>& sizes);
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        const std::vector<ObjectIncarnation>& expected_incarnations = {});
 
     // Reads [offset, offset + length) of each value. Returned pointers address
     // the first requested byte, not the start of the object.
@@ -94,17 +96,19 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& offsets,
         const std::vector<int64_t>& lengths,
-        const std::vector<int64_t>& object_sizes);
+        const std::vector<int64_t>& object_sizes,
+        const std::vector<ObjectIncarnation>& expected_incarnations = {});
 
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
-        const std::vector<std::string>& keys,
-        const std::vector<int64_t>& sizes);
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        const std::vector<ObjectIncarnation>& expected_incarnations = {});
 
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocalRanges(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& offsets,
         const std::vector<int64_t>& lengths,
-        const std::vector<int64_t>& object_sizes);
+        const std::vector<int64_t>& object_sizes,
+        const std::vector<ObjectIncarnation>& expected_incarnations = {});
 
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
@@ -200,11 +204,12 @@ class FileStorage {
     struct ColdReadInvalidation;
 
     tl::expected<BatchGetResult, ErrorCode> BatchGetOnce(
-        const std::vector<std::string>& keys,
-        const std::vector<int64_t>& sizes);
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        const std::vector<ObjectIncarnation>& expected_incarnations);
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatchShared(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool prefer_pinned, std::string flight_key);
+        bool prefer_pinned, std::string flight_key,
+        const std::vector<ObjectIncarnation>& expected_incarnations);
     static tl::expected<std::vector<uint64_t>, ErrorCode>
     StagingPointersInOrder(const AllocatedBatch& batch,
                            const std::vector<std::string>& keys,
@@ -276,6 +281,8 @@ class FileStorage {
      */
     static bool IsPerBucketSoftOffloadError(ErrorCode error);
 
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
      * 1. Sends object status (e.g., access frequency, size) to the master via
@@ -325,7 +332,9 @@ class FileStorage {
         const std::vector<std::string>& evicted_keys);
 
     tl::expected<void, ErrorCode> BatchLoad(
-        std::unordered_map<std::string, Slice>& batch_object);
+        std::unordered_map<std::string, Slice>& batch_object,
+        const StorageBackendInterface::ObjectVersions& expected_incarnations =
+            {});
 
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans);
@@ -334,7 +343,8 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& offsets,
         const std::vector<int64_t>& lengths,
-        const std::vector<int64_t>& object_sizes, bool prefer_pinned);
+        const std::vector<int64_t>& object_sizes, bool prefer_pinned,
+        const std::vector<ObjectIncarnation>& expected_incarnations);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
@@ -348,7 +358,8 @@ class FileStorage {
 
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatch(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool prefer_pinned);
+        bool prefer_pinned,
+        const std::vector<ObjectIncarnation>& expected_incarnations);
 
     void ClientBufferGCThreadFunc();
 

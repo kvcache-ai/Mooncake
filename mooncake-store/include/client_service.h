@@ -658,7 +658,8 @@ class Client {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        bool enable_offloading, bool supports_versioned_offload = false);
 
     /**
      * @brief Deregisters this client's local disk segment from the master.
