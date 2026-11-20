@@ -287,6 +287,7 @@ TEST(TransferSharding, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
     EXPECT_EQ(returned.load(), 1);
     auto result = parent.get();
     EXPECT_FALSE(result.ok());
+    EXPECT_FALSE(result.retryable);
     EXPECT_FALSE(result.isCanceled());
     EXPECT_EQ(result.error, "Transfer sharding is shutting down");
     EXPECT_FALSE(
@@ -512,6 +513,91 @@ TEST(TransferSharding, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
     EXPECT_EQ(parent.get().error, "first sub-batch failed");
 }
 
+TEST(TransferSharding, RetryDecisionIncludesEveryActualError) {
+    using Result = Executor::Result;
+    struct Case {
+        Result first, second;
+        bool submit_failed, retryable;
+        std::string diagnostic;
+    };
+    for (const auto& test : {
+             Case{Result::TransferError("native failure"), Result::Canceled(),
+                  false, true, "native failure"},
+             Case{Result::Canceled(), Result::TransferError("native failure"),
+                  false, true, "native failure"},
+             Case{Result::TransferError("native failure"),
+                  Result::TransferError("another failure"), false, true,
+                  "native failure"},
+             Case{Result::TransferError("native failure"),
+                  Result::SubmitError("submit error"), true, false,
+                  "native failure"},
+             Case{Result::TransferError("native failure"),
+                  Result::Error("construction error"), false, false,
+                  "native failure"},
+         }) {
+        SCOPED_TRACE(test.second.error);
+        Executor executor({2, 1, 1});
+        std::barrier running(2);
+        auto result = executor.execute(
+            2, Executor::Clock::now() + 5s, [&](auto range, const auto&) {
+                running.arrive_and_wait();
+                return range.index == 0 ? test.first : test.second;
+            });
+        EXPECT_EQ(result.error, test.diagnostic);
+        EXPECT_EQ(result.submit_failed, test.submit_failed);
+        EXPECT_EQ(result.retryable, test.retryable);
+    }
+}
+
+TEST(TransferSharding, NativeFailureAfterDeadlineCannotRetry) {
+    Executor executor({1, 1, 1});
+    auto result = executor.execute(
+        1, Executor::Clock::now() + 10ms, [](auto, const auto& cancellation) {
+            while (!cancellation.expired()) std::this_thread::yield();
+            return Executor::Result::TransferError("late native failure");
+        });
+    EXPECT_EQ(result.error, "late native failure");
+    EXPECT_FALSE(result.retryable);
+}
+
+TEST(TransferSharding,
+     ShutdownDisablesRetryEvenWhenNativeFailureWinsDiagnosis) {
+    Executor executor({1, 1, 1});
+    std::promise<void> started;
+    auto parent = std::async(std::launch::async, [&] {
+        return executor.execute(
+            1, Executor::Clock::now() + 5s, [&](auto, const auto& stop) {
+                started.set_value();
+                while (!stop.expired()) std::this_thread::yield();
+                return Executor::Result::TransferError("native failure");
+            });
+    });
+    started.get_future().wait();
+    executor.shutdown();
+    auto result = parent.get();
+    EXPECT_EQ(result.error, "native failure");
+    EXPECT_FALSE(result.retryable);
+}
+
+TEST(TransferSharding, NativeFailureSurvivesReleaseError) {
+    struct FailedBatch : FakeAcceptedBatch {
+        SubBatchProgress poll() {
+            return {true, false, "native failure", true};
+        }
+        Executor::Result release() {
+            ++freed;
+            return Executor::Result::Error("release error");
+        }
+    } batch;
+    std::atomic<bool> stopped{false};
+    auto result = runSubBatch(
+        batch, Executor::Cancellation{stopped, Executor::Clock::now() + 1s});
+    EXPECT_EQ(result.error, "native failure");
+    EXPECT_TRUE(result.retryable);
+    EXPECT_FALSE(result.submit_failed);
+    EXPECT_EQ(batch.freed, 1);
+}
+
 TEST(TransferSharding, ConcurrentParentsKeepInputAndErrorsSeparate) {
     Executor executor({2, 1, 2});
     std::barrier launch(2);
@@ -653,6 +739,8 @@ TEST(TransferSharding, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
 class ShardingProbe : public Transport {
    public:
     std::atomic<bool> supported{true};
+    bool fail_submit = false;
+    std::atomic<TransferStatusEnum> terminal{TransferStatusEnum::COMPLETED};
     std::atomic<int> submits{0};
     std::function<void()> on_submit;
     std::function<void(BatchID, const TransferRequest*)> on_batch_submit;
@@ -667,6 +755,7 @@ class ShardingProbe : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask*>& tasks) override {
         ++submits;
+        if (fail_submit) return Status::Context("Injected native submit error");
         {
             std::lock_guard<std::mutex> lock(mutex);
             for (auto* task : tasks) {
@@ -681,7 +770,7 @@ class ShardingProbe : public Transport {
     }
     Status getTransferStatus(BatchID id, size_t index,
                              TransferStatus& status) override {
-        status.s = TransferStatusEnum::COMPLETED;
+        status.s = terminal.load();
         status.transferred_bytes =
             toBatchDesc(id).task_list[index].request->length;
         return Status::OK();
@@ -756,6 +845,50 @@ TEST_F(ClassicSharding, ArbitraryTransportNameAndRequestFieldsArePreserved) {
         EXPECT_EQ(request.intent_type, 3);
         EXPECT_EQ(request.transport_hint, 0);
     }
+}
+
+TEST_F(ClassicSharding, FailureInfoMatchesLegacyAndResets) {
+    TransferEngine::ShardedTransferFailureInfo failure{true, true};
+    auto transfer = [&] {
+        auto entries = requests(0, 1);
+        auto id = engine.allocateBatchID(entries.size());
+        auto submitted = engine.submitTransfer(id, entries);
+        TransferStatus status{};
+        if (submitted.ok()) {
+            EXPECT_TRUE(engine.getBatchTransferStatus(id, status).ok());
+        }
+        EXPECT_TRUE(engine.freeBatchID(id).ok());
+        auto result =
+            engine.tryShardedTransfer(1, 1, requests, 5s, 0, &failure);
+        if (result) {
+            EXPECT_EQ(failure.submit_failed, !submitted.ok());
+            EXPECT_EQ(failure.retryable,
+                      submitted.ok() && (status.s == Transport::FAILED ||
+                                         status.s == Transport::TIMEOUT));
+        }
+        return result;
+    };
+    for (auto terminal : {Transport::TransferStatusEnum::FAILED,
+                          Transport::TransferStatusEnum::TIMEOUT}) {
+        transport->terminal.store(terminal);
+        ASSERT_FALSE(transfer()->ok());
+        EXPECT_TRUE(failure.retryable);
+        EXPECT_FALSE(failure.submit_failed);
+    }
+    transport->fail_submit = true;
+    ASSERT_FALSE(transfer()->ok());
+    EXPECT_TRUE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
+    transport->fail_submit = false;
+    transport->terminal.store(Transport::TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(transfer()->ok());
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
+    failure = {true, true};
+    transport->supported.store(false);
+    EXPECT_FALSE(transfer());
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
 }
 
 TEST_F(ClassicSharding, UnsupportedAdmissionBuildsNothingAndFallsBackOnce) {
@@ -900,9 +1033,10 @@ class TentShardingProbe : public tt::Transport {
         caps.dram_to_dram = true;
     }
     std::atomic<bool> supported{true}, pending{false};
+    std::atomic<tt::TransferStatusEnum> terminal{tt::COMPLETED};
     std::atomic<int> submits{0}, releases{0};
     bool fail_submit = false;
-    std::atomic<bool> fail_poll{false};
+    std::atomic<bool> fail_poll{false}, fail_poll_api{false};
     std::function<void()> on_submit, on_poll;
     std::mutex mutex;
     std::vector<tt::Request> observed;
@@ -935,9 +1069,12 @@ class TentShardingProbe : public tt::Transport {
     tt::Status getTransferStatus(SubBatchRef batch, int id,
                                  tt::TransferStatus& status) override {
         if (on_poll) on_poll();
+        if (fail_poll_api.exchange(false))
+            return tt::Status::InvalidArgument(
+                "Injected native poll API error");
         status.s = pending.load()     ? tt::PENDING
                    : fail_poll.load() ? tt::FAILED
-                                      : tt::COMPLETED;
+                                      : terminal.load();
         status.transferred_bytes =
             static_cast<ProbeSubBatch*>(batch)->requests.at(id).length;
         return tt::Status::OK();
@@ -1238,6 +1375,96 @@ TEST_F(TentSharding, NativeSubmitFailureDoesNotReplayTheParent) {
     EXPECT_FALSE(result->ok());
     EXPECT_EQ(transport->submits.load(), 1);
     EXPECT_TRUE(transport->observed.empty());
+}
+
+TEST_F(TentSharding, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
+    TransferEngine facade(false);
+    TransferEngineImplTestPeer::facade(facade, engine);
+    TransferEngine::ShardedTransferFailureInfo failure{true, true};
+    auto hint = tt::TCP;
+    auto builder = [&](size_t begin, size_t end) {
+        std::vector<TransferRequest> entries;
+        for (const auto& request : requests(begin, end)) {
+            TransferRequest entry{};
+            entry.opcode = TransferRequest::WRITE;
+            entry.source = request.source;
+            entry.target_id = request.target_id;
+            entry.target_offset = request.target_offset;
+            entry.length = request.length;
+            entry.transport_hint = hint;
+            entries.push_back(entry);
+        }
+        return entries;
+    };
+    auto transfer = [&] {
+        auto entries = builder(0, 1);
+        auto id = facade.allocateBatchID(entries.size());
+        auto submitted = facade.submitTransfer(id, entries);
+        TransferStatus status{};
+        if (submitted.ok()) {
+            EXPECT_TRUE(facade.getBatchTransferStatus(id, status).ok());
+        }
+        EXPECT_TRUE(facade.freeBatchID(id).ok());
+        auto result = facade.tryShardedTransfer(LOCAL_SEGMENT_ID, 1, builder,
+                                                5s, hint, &failure);
+        if (result) {
+            EXPECT_EQ(failure.submit_failed, !submitted.ok());
+            EXPECT_EQ(failure.retryable,
+                      submitted.ok() && (status.s == Transport::FAILED ||
+                                         status.s == Transport::TIMEOUT));
+        }
+        return result;
+    };
+    for (auto terminal : {tt::FAILED, tt::TIMEOUT}) {
+        transport->terminal.store(terminal);
+        ASSERT_FALSE(transfer()->ok());
+        EXPECT_TRUE(failure.retryable);
+        EXPECT_FALSE(failure.submit_failed);
+    }
+    transport->fail_submit = true;
+    ASSERT_FALSE(transfer()->ok());
+    // TENT absorbs a transport submit error into native FAILED after its
+    // own failover, so the binding may retry just as on the ordinary path.
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_TRUE(failure.retryable);
+    transport->fail_submit = false;
+    // A disabled explicit hint fails the engine submit API itself.
+    hint = tt::RDMA;
+    ASSERT_FALSE(transfer()->ok());
+    EXPECT_TRUE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
+    hint = tt::TCP;
+    transport->terminal.store(tt::COMPLETED);
+    ASSERT_TRUE(transfer()->ok());
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
+    failure = {true, true};
+    transport->supported.store(false);
+    EXPECT_FALSE(transfer());
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
+    tt::TransferEngine::ShardedTransferFailureInfo native_failure{true, true};
+    EXPECT_FALSE(engine->tryShardedTransfer(
+        LOCAL_SEGMENT_ID, 1,
+        [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
+        tt::TCP, &native_failure));
+    EXPECT_FALSE(native_failure.submit_failed);
+    EXPECT_FALSE(native_failure.retryable);
+}
+
+TEST_F(TentSharding, PollApiErrorDoesNotAuthorizeRetry) {
+    transport->fail_poll_api.store(true);
+    tt::TransferEngine::ShardedTransferFailureInfo failure{true, true};
+    auto result = engine->tryShardedTransfer(
+        LOCAL_SEGMENT_ID, 1,
+        [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
+        tt::UNSPEC, &failure);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->ok());
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
+    EXPECT_EQ(transport->submits.load(), 1);
+    EXPECT_EQ(transport->releases.load(), 1);
 }
 
 TEST_F(TentSharding, NativePollErrorUsesOrdinaryFreeWithoutAnotherSubmission) {

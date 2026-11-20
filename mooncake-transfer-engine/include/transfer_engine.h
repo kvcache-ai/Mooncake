@@ -210,13 +210,21 @@ class TransferEngine {
     using SubBatchRequestBuilder =
         std::function<std::vector<TransferRequest>(size_t begin, size_t end)>;
 
+    struct ShardedTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
+
     // Opt-in synchronous path for independent ranges to one peer.
     // nullopt means disabled, below threshold, or unsupported before publish.
     // The builder runs once per sub-batch and must preserve every request
     // field.
     std::optional<Status> tryShardedTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-        std::chrono::nanoseconds timeout, int transport_hint = 0);
+        std::chrono::nanoseconds timeout, int transport_hint = 0,
+        ShardedTransferFailureInfo* failure_info = nullptr);
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;

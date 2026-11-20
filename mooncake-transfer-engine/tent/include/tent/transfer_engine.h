@@ -347,9 +347,16 @@ class TransferEngine {
 
     using SubBatchRequestBuilder =
         std::function<std::vector<Request>(size_t begin, size_t end)>;
+    struct ShardedTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
     std::optional<Status> tryShardedTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-        std::chrono::nanoseconds timeout, TransportType hint = UNSPEC);
+        std::chrono::nanoseconds timeout, TransportType hint = UNSPEC,
+        ShardedTransferFailureInfo* failure_info = nullptr);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,

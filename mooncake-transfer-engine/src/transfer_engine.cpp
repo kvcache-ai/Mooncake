@@ -1421,7 +1421,7 @@ TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::allocate() {
 TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::submit() {
     auto status = engine.submitTransfer(sub_batch_id, requests);
     return status.ok() ? Executor::Result::OK()
-                       : Executor::Result::Error(status.ToString());
+                       : Executor::Result::SubmitError(status.ToString());
 }
 
 SubBatchProgress TransferEngine::TESubBatchAdapter::poll() {
@@ -1430,7 +1430,11 @@ SubBatchProgress TransferEngine::TESubBatchAdapter::poll() {
     if (!polled.ok()) return {true, false, polled.ToString()};
     const bool terminal = status.s != TransferStatusEnum::WAITING &&
                           status.s != TransferStatusEnum::PENDING;
-    return {terminal, status.s == TransferStatusEnum::COMPLETED, {}};
+    return {terminal,
+            status.s == TransferStatusEnum::COMPLETED,
+            {},
+            status.s == TransferStatusEnum::FAILED ||
+                status.s == TransferStatusEnum::TIMEOUT};
 }
 
 TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::release() {
@@ -1452,11 +1456,14 @@ bool TransferEngine::supportsShardedTransfer(SegmentID peer) const {
 
 std::optional<Status> TransferEngine::tryShardedTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-    std::chrono::nanoseconds timeout, int transport_hint) {
+    std::chrono::nanoseconds timeout, int transport_hint,
+    ShardedTransferFailureInfo* failure_info) {
     using Executor = TransferShardingExecutor;
+    if (failure_info) *failure_info = {};
     if (!isBatchSubmitEligible(count)) return std::nullopt;
 #ifdef USE_TENT
     if (use_tent_) {
+        tent::TransferEngine::ShardedTransferFailureInfo tent_failure;
         auto status = impl_tent_->tryShardedTransfer(
             peer, count,
             [&](size_t begin, size_t end) {
@@ -1492,7 +1499,11 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
                 }
                 return converted;
             },
-            timeout, static_cast<tent::TransportType>(transport_hint));
+            timeout, static_cast<tent::TransportType>(transport_hint),
+            failure_info ? &tent_failure : nullptr);
+        if (failure_info)
+            *failure_info = {tent_failure.submit_failed,
+                             tent_failure.retryable};
         if (!status) return std::nullopt;
         return status->ok() ? Status::OK()
                             : Status::Context(status->ToString());
@@ -1545,6 +1556,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
             TESubBatchAdapter sub_batch{*this, requests};
             return runSubBatch(sub_batch, cancellation);
         });
+    if (failure_info) *failure_info = {result.submit_failed, result.retryable};
     return result.ok() ? Status::OK() : Status::Context(result.error);
 }
 

@@ -77,7 +77,7 @@ TransferEngine::TentSubBatchAdapter::allocate() {
 TransferShardingExecutor::Result TransferEngine::TentSubBatchAdapter::submit() {
     auto status = engine.submitTransfer(sub_batch_id, requests);
     return status.ok() ? Executor::Result::OK()
-                       : Executor::Result::Error(status.ToString());
+                       : Executor::Result::SubmitError(status.ToString());
 }
 
 SubBatchProgress TransferEngine::TentSubBatchAdapter::poll() {
@@ -85,7 +85,10 @@ SubBatchProgress TransferEngine::TentSubBatchAdapter::poll() {
     auto polled = engine.getTransferStatus(sub_batch_id, status);
     if (!polled.ok()) return {true, false, polled.ToString()};
     const bool terminal = status.s != PENDING && status.s != INITIAL;
-    return {terminal, status.s == COMPLETED, {}};
+    return {terminal,
+            status.s == COMPLETED,
+            {},
+            status.s == FAILED || status.s == TIMEOUT};
 }
 
 TransferShardingExecutor::Result
@@ -98,8 +101,10 @@ TransferEngine::TentSubBatchAdapter::release() {
 
 std::optional<Status> TransferEngine::tryShardedTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-    std::chrono::nanoseconds timeout, TransportType hint) {
+    std::chrono::nanoseconds timeout, TransportType hint,
+    ShardedTransferFailureInfo* failure_info) {
     using Executor = ::mooncake::TransferShardingExecutor;
+    if (failure_info) *failure_info = {};
     if (!isBatchSubmitEligible(count)) return std::nullopt;
     auto& executor = *sharding_executor_;
     const auto deadline = Executor::Clock::now() + timeout;
@@ -148,6 +153,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
             TentSubBatchAdapter sub_batch{*this, requests};
             return ::mooncake::runSubBatch(sub_batch, cancellation);
         });
+    if (failure_info) *failure_info = {result.submit_failed, result.retryable};
     return result.ok() ? Status::OK() : Status::InternalError(result.error);
 }
 

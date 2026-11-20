@@ -61,9 +61,21 @@ class TransferShardingExecutor {
     struct Result {
         int code = 0;
         std::string error;
+        bool submit_failed = false;
+        bool retryable = false;
         static Result OK() { return {0, {}}; }
         static Result Error(std::string error) {
             return {kError, std::move(error)};
+        }
+        static Result SubmitError(std::string error) {
+            auto result = Error(std::move(error));
+            result.submit_failed = true;
+            return result;
+        }
+        static Result TransferError(std::string error) {
+            auto result = Error(std::move(error));
+            result.retryable = true;
+            return result;
         }
         static Result Canceled(std::string error = {}) {
             return {kCanceled, std::move(error)};
@@ -215,15 +227,37 @@ class TransferShardingExecutor {
         }
         admission_.notify_one();
         idle_.notify_all();
-        for (const auto& result : parent->sub_batch_results)
-            if (!result.ok() && !result.isCanceled()) return result;
-        if (timed_out || parent->deadline_expired)
-            return Result::Error("Transfer sharding timed out");
-        if (parent->shutdown.load(std::memory_order_acquire))
-            return Result::Error("Transfer sharding is shutting down");
-        for (const auto& result : parent->sub_batch_results)
-            if (!result.ok()) return result;
-        return Result::OK();
+        Result outcome = Result::OK();
+        bool submit_failed = false;
+        bool retryable = true;
+        for (const auto& result : parent->sub_batch_results) {
+            submit_failed |= result.submit_failed;
+            if (!result.ok() && !result.isCanceled()) {
+                if (outcome.ok()) outcome = result;
+                retryable &= result.retryable;
+            }
+        }
+        const bool expired = timed_out || parent->deadline_expired;
+        const bool shutdown = parent->shutdown.load(std::memory_order_acquire);
+        // Keep the first actual error for diagnosis, but decide retry using
+        // every sub-batch and the parent's termination reason.
+        retryable &= !outcome.ok() && !submit_failed && !expired && !shutdown &&
+                     Clock::now() < deadline;
+        if (outcome.ok()) {
+            if (expired)
+                outcome = Result::Error("Transfer sharding timed out");
+            else if (shutdown)
+                outcome = Result::Error("Transfer sharding is shutting down");
+            else
+                for (const auto& result : parent->sub_batch_results)
+                    if (!result.ok()) {
+                        outcome = result;
+                        break;
+                    }
+        }
+        outcome.submit_failed = submit_failed;
+        outcome.retryable = retryable;
+        return outcome;
     }
 
     void shutdown() {
@@ -343,6 +377,7 @@ struct SubBatchProgress {
     bool terminal = false;
     bool success = false;
     std::string error;
+    bool retryable = false;
 };
 
 // Each adapter owns one native handle. The parent keeps request storage alive
@@ -379,10 +414,15 @@ TransferShardingExecutor::Result runSubBatch(
         try {
             auto progress = adapter.poll();
             if (progress.terminal) {
-                if (!progress.success)
-                    result = Executor::Result::Error(
-                        progress.error.empty() ? "Sub-batch transfer failed"
-                                               : progress.error);
+                if (!progress.success) {
+                    auto error = progress.error.empty()
+                                     ? "Sub-batch transfer failed"
+                                     : progress.error;
+                    result =
+                        progress.retryable
+                            ? Executor::Result::TransferError(std::move(error))
+                            : Executor::Result::Error(std::move(error));
+                }
                 break;
             }
         } catch (const std::exception& error) {
