@@ -823,6 +823,30 @@ void EventManager::Stop() {
     stop_cv_.notify_all();
 }
 
+void EventManager::PropagateDeployment(
+    const prefixindex::ContextKey& context,
+    const prefixindex::SourceLayout& binding) {
+    std::vector<std::shared_ptr<KVEventHandler>> selected;
+    {
+        std::shared_lock lock(mu_);
+        if (stopped_) return;
+        for (const auto& [key, service] : active_configs_) {
+            // 池发布者（Mooncake）不持有 HBM 副本，注册 reader 会因“非 owner”失败，
+            // 它的池事件靠同 ContextKey 上已激活的 layout 进入 grouped 分支即可。
+            if (service.publisher_kind == common::PublisherKind::kMooncake) continue;
+            if (ContextFromService(service) == context) {
+                selected.push_back(handlers_.at(key));
+            }
+        }
+    }
+    LOG(INFO) << "Propagating cache deployment model=" << context.model_name
+              << " block_size=" << context.block_size
+              << " tenant=" << context.tenant_id
+              << " instances=" << selected.size();
+    // 不能持锁进入订阅者回调
+    for (const auto& handler : selected) handler->AttachDeployment(binding);
+}
+
 void EventManager::RefreshMooncakeDeployments(
     const prefixindex::ContextKey& context) {
     std::vector<std::shared_ptr<KVEventHandler>> selected;

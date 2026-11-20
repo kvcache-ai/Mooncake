@@ -314,8 +314,62 @@ KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc,
                                prefixindex::SourceLayout layout)
     : manager_(manager),
       service_(std::move(svc)),
-      layout_(std::move(layout)),
-      grouped_context_(layout_.layout != nullptr) {}
+      layout_(std::move(layout)) {}
+
+bool KVEventHandler::AttachDeployment(
+    const prefixindex::SourceLayout& binding) {
+    // 注意：即使本实例已有 layout（可能与宣告者共享同一份），也必须走一遍
+    // ActivateDeployment 以登记 (instance, rank) 的 reader；否则该实例看不到池副本。
+    if (!binding.layout) {
+        LOG(WARNING) << "Skip attaching deployment without layout instance="
+                     << service_.instance_id;
+        return false;
+    }
+    if (!binding.layout->unavailable_reason.empty()) {
+        LOG(WARNING) << "Skip attaching unavailable deployment instance="
+                     << service_.instance_id
+                     << " reason=" << binding.layout->unavailable_reason;
+        return false;
+    }
+    if (auto error = manager_->GetIndexer()->ActivateDeployment(
+            ContextFromService(service_), service_.hash_profile, binding,
+            service_.instance_id, service_.dp_rank);
+        !error.empty()) {
+        LOG(WARNING) << "Failed to attach propagated deployment instance="
+                     << service_.instance_id << " error=" << error;
+        return false;
+    }
+    layout_ = binding;
+    LOG(INFO) << "Attached propagated deployment instance="
+              << service_.instance_id << " groups=" << layout_.layout->groups.size()
+              << " readable_domains=" << layout_.readable_domains.size();
+    return true;
+}
+
+bool KVEventHandler::EnsureDeployment() {
+    if (layout_.layout) return true;
+    // 同 ContextKey 的其他实例可能已经宣告过布局（例如同一个 P 组内只有一个 rank 发声明）。
+    prefixindex::SourceLayout binding;
+    if (!manager_->GetIndexer()->GetDeployment(ContextFromService(service_),
+                                               &binding)) {
+        return false;
+    }
+    if (!binding.layout || !binding.layout->unavailable_reason.empty())
+        return false;
+    if (auto error = manager_->GetIndexer()->ActivateDeployment(
+            ContextFromService(service_), service_.hash_profile, binding,
+            service_.instance_id, service_.dp_rank);
+        !error.empty()) {
+        LOG(WARNING) << "Failed to attach shared deployment instance="
+                     << service_.instance_id << " error=" << error;
+        return false;
+    }
+    layout_ = std::move(binding);
+    LOG(INFO) << "Attached shared cache deployment instance="
+              << service_.instance_id
+              << " groups=" << layout_.layout->groups.size();
+    return true;
+}
 
 std::string KVEventHandler::QueuePending(const zmq::DecodedBatch& batch,
                                          const zmq::MessageMetadata& metadata) {
@@ -352,7 +406,7 @@ void KVEventHandler::DrainPending() {
 }
 
 void KVEventHandler::RefreshDeployment() {
-    if (!grouped_context_ || !BeginDispatch()) return;
+    if (!grouped_context() || !BeginDispatch()) return;
     DispatchLease lease(this);
     std::lock_guard lock(grouped_dispatch_mu_);
     if (manager_->GetIndexer()->GetDeployment(ContextFromService(service_),
@@ -405,7 +459,7 @@ std::string KVEventHandler::HandleBatch(const zmq::DecodedBatch& batch,
         return "message endpoint conflicts with trusted registration";
     }
     std::unique_lock<std::mutex> grouped_lock;
-    if (grouped_context_) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
+    if (grouped_context()) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
     if (service_.publisher_kind == common::PublisherKind::kVllm) {
         const auto* vllm_batch = std::get_if<zmq::VllmEventBatch>(&batch);
         if (vllm_batch == nullptr) {
@@ -462,7 +516,9 @@ std::string KVEventHandler::HandleVllmBatch(
                      << " seq=" << metadata.sequence;
         return "batch data_parallel_rank conflicts with trusted registration";
     }
-    if (grouped_context_) {
+    // kv_cache_layout 可能先于/后于数据事件到达，且它正是“是否启用分组路径”的输入，
+    // 所以这里必须无条件扫描；不能用 grouped_context() 作为门控（会形成循环依赖）。
+    {
         for (const auto& decoded : batch.events) {
             if (!decoded.ok()) continue;
             const auto* stored =
@@ -487,6 +543,9 @@ std::string KVEventHandler::HandleVllmBatch(
                       << " instance=" << service_.instance_id
                       << " groups=" << layout_.layout->groups.size();
             manager_->RefreshMooncakeDeployments(ContextFromService(service_));
+            // 同一 ContextKey 的其他实例（还没收到过 layout 的 P、D、mc）也挂上这份部署，
+            // 否则它们既没有 hybrid 索引，也看不到池里的共享副本（cpu_share）。
+            manager_->PropagateDeployment(ContextFromService(service_), layout_);
         }
     }
     if (layout_.layout && !layout_.layout->unavailable_reason.empty())
@@ -900,7 +959,7 @@ std::string KVEventHandler::HandleMooncakeBatch(
 
 std::string KVEventHandler::HandleVllmStored(
     const zmq::VllmStoredEvent& event, const zmq::MessageMetadata& metadata) {
-    if (layout_.layout) return HandleGroupedVllmStored(event);
+    if (EnsureDeployment()) return HandleGroupedVllmStored(event);
     if (std::string error =
             prefixindex::ValidateVllmStoredAssertions(event, service_);
         !error.empty()) {
@@ -937,7 +996,7 @@ std::string KVEventHandler::HandleVllmStored(
 
 std::string KVEventHandler::HandleVllmRemoved(
     const zmq::VllmRemovedEvent& event, const zmq::MessageMetadata& metadata) {
-    if (layout_.layout) return HandleGroupedVllmRemoved(event);
+    if (EnsureDeployment()) return HandleGroupedVllmRemoved(event);
     if (std::string error = prefixindex::ValidateVllmGroup(event.group_idx);
         !error.empty()) {
         return error;
@@ -991,7 +1050,9 @@ std::string KVEventHandler::HandleVllmCleared(
 std::string KVEventHandler::HandleMooncakeStored(
     const zmq::MooncakeStoredEvent& event,
     const zmq::MessageMetadata& metadata) {
-    if (layout_.layout) return HandleGroupedMooncakeStored(event);
+    if (EnsureDeployment()) {
+        return HandleGroupedMooncakeStored(event);
+    }
     if (service_.hash_profile.strategy == "sglang" ||
         service_.hash_profile.strategy == "sglang_bigram") {
         return HandleSglangMooncakeStored(event, metadata);
@@ -1114,7 +1175,7 @@ std::string KVEventHandler::HandleMooncakeStored(
 std::string KVEventHandler::HandleMooncakeRemoved(
     const zmq::MooncakeRemovedEvent& event,
     const zmq::MessageMetadata& metadata) {
-    if (layout_.layout) return HandleGroupedMooncakeRemoved(event);
+    if (EnsureDeployment()) return HandleGroupedMooncakeRemoved(event);
     if (service_.hash_profile.strategy == "sglang" ||
         service_.hash_profile.strategy == "sglang_bigram") {
         return HandleSglangMooncakeRemoved(event, metadata);
@@ -1269,7 +1330,7 @@ std::string KVEventHandler::ClearMooncakeBindings(
 std::string KVEventHandler::InvalidateEndpoint() {
     MarkUnavailable();
     std::unique_lock<std::mutex> grouped_lock;
-    if (grouped_context_) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
+    if (grouped_context()) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
     pending_.clear();
     pending_event_count_ = pending_bytes_ = 0;
     if (service_.publisher_kind == common::PublisherKind::kVllm ||
