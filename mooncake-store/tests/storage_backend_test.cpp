@@ -15,6 +15,7 @@
 #include <new>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1012,6 +1013,100 @@ TEST_F(BucketRecoveryOwnershipTest, EvictionAndRemovalLeaveNestedFilesIntact) {
         BucketStorageBackend child(child_config, bucket_config);
         ASSERT_TRUE(child.Init());
         ExpectValue(child, "foreign", value);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketNotificationPendingBlocksEviction) {
+    for (auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 3;
+        bucket_config.bucket_size_limit = 64 * 1024;
+        bucket_config.max_total_size = 48 * 1024;
+        bucket_config.eviction_policy = policy;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+
+        std::string pending_value(32 * 1024, 'P');
+        std::string small_value(8 * 1024, 'S');
+        auto batch = [](const std::string& key, std::string& value) {
+            return std::unordered_map<std::string, std::vector<Slice>>{
+                {key, {{value.data(), value.size()}}}};
+        };
+        auto result = backend.BatchOffload(
+            batch("pending", pending_value), [&](const auto&, auto&) {
+                // Fix the interleaving inside the unlocked notification
+                // window; no sleeps or extra worker threads are needed.
+                auto blocked = backend.BatchOffload(
+                    batch("blocked", pending_value), nullptr);
+                EXPECT_FALSE(blocked);
+                EXPECT_TRUE(
+                    backend.BatchOffload(batch("ready", small_value), nullptr));
+
+                // Reading is allowed before the ACK and makes the LRU
+                // timestamp stale while the pending index entry is skipped.
+                std::string loaded(pending_value.size(), '\0');
+                std::unordered_map<std::string, Slice> reads{
+                    {"pending", {loaded.data(), loaded.size()}}};
+                EXPECT_TRUE(backend.BatchLoad(reads));
+                EXPECT_EQ(loaded, pending_value);
+
+                EXPECT_TRUE(
+                    backend.BatchOffload(batch("next", small_value), nullptr));
+                auto pending = backend.IsExist("pending");
+                auto ready = backend.IsExist("ready");
+                EXPECT_TRUE(pending && *pending);
+                EXPECT_TRUE(ready && !*ready);
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(result);
+
+        // After the ACK, both retained entries must remain reachable by the
+        // eviction indexes, including the previously skipped pending entry.
+        std::string final_value(40 * 1024, 'F');
+        ASSERT_TRUE(backend.BatchOffload(batch("final", final_value), nullptr));
+        auto pending = backend.IsExist("pending");
+        auto next = backend.IsExist("next");
+        auto final = backend.IsExist("final");
+        EXPECT_TRUE(pending && !*pending);
+        EXPECT_TRUE(next && !*next);
+        EXPECT_TRUE(final && *final);
+        backend.RemoveAll();
+    }
+}
+
+TEST_F(StorageBackendTest, BucketNotificationFailureRollsBack) {
+    for (auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        for (int failure : {0, 1, 2}) {
+            FileStorageConfig config;
+            config.storage_filepath = data_path;
+            BucketBackendConfig bucket_config;
+            bucket_config.max_total_size = 48 * 1024;
+            bucket_config.eviction_policy = policy;
+            BucketStorageBackend backend(config, bucket_config);
+            ASSERT_TRUE(backend.Init());
+            std::string value(32 * 1024, 'P');
+            std::unordered_map<std::string, std::vector<Slice>> batch{
+                {"failed", {{value.data(), value.size()}}}};
+            auto result = backend.BatchOffload(
+                batch, [failure](const auto&, auto&) -> ErrorCode {
+                    if (failure == 1) {
+                        throw std::runtime_error("notification failed");
+                    }
+                    if (failure == 2) throw ErrorCode::INTERNAL_ERROR;
+                    return ErrorCode::INTERNAL_ERROR;
+                });
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+            auto exists = backend.IsExist("failed");
+            EXPECT_TRUE(exists && !*exists);
+            EXPECT_EQ(CountDataFiles(data_path), 0);
+            EXPECT_TRUE(backend.BatchOffload(batch, nullptr));
+            backend.RemoveAll();
+        }
     }
 }
 
