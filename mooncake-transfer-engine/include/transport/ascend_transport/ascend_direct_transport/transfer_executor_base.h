@@ -16,7 +16,9 @@
 #ifndef TRANSFER_EXECUTOR_BASE_H
 #define TRANSFER_EXECUTOR_BASE_H
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -145,7 +147,7 @@ class TransferExecutorBase {
 
     // Async executor waits until every submitted task has finished and the
     // query thread has returned from its follow-up Disconnect. The sync
-    // executor has no such work left once active_sync_transfers_ reaches 0.
+    // executor has no such work left once the active-sync count reaches 0.
     virtual void drainInFlightTransfers() {}
 
     InitParams params_;
@@ -173,25 +175,34 @@ class TransferExecutorBase {
     // call returns.
     std::mutex disconnect_all_mutex_;
 
-    // Guards active_sync_transfers_ and peers_quiesced_.
-    std::mutex transfer_lifecycle_mutex_;
+    // Bit 63 is set by quiesceSyncTransfers() and cleared by
+    // resumeSyncTransfers() after the peer walk. The low 63 bits count
+    // execute() and local Copy() calls still inside the caller. The hot path
+    // claims a slot, or sees that new work must fail, with one load and a CAS.
+    std::atomic<uint64_t> transfer_lifecycle_state_{0};
+    // Held by disconnectAllPeers() while it waits for the count to reach 0.
+    // The transfer that drops the count to 0 while the bit is set holds it
+    // only long enough to notify.
+    std::mutex transfer_lifecycle_cv_mutex_;
     std::condition_variable transfer_lifecycle_cv_;
-    // execute() calls and local Copy() calls still inside the caller.
-    size_t active_sync_transfers_{0};
-    // Set for the duration of disconnectAllPeers(). New execute() and local
-    // Copy() calls fail while it is set, and it is cleared before the call
-    // returns.
-    bool peers_quiesced_{false};
 
     std::shared_ptr<TransferMetadata> metadata_;
 
    private:
     using EngineMemHandle = std::pair<size_t, adxl::MemHandle>;
 
+    // False means peers are quiesced and the caller must fail the slices.
+    // True owns one active-sync slot and must be paired with endSyncTransfer().
+    bool beginSyncTransfer();
+    void endSyncTransfer();
+    // Sets the quiesce bit and waits until every slot taken above is released.
+    void quiesceSyncTransfers();
+    void resumeSyncTransfers();
+
     void rollbackRegisteredMem(
         void* addr, const std::vector<EngineMemHandle>& registered_mem_handles);
     // Polls device-copy groups until none remain. Call only after every
-    // Copy() counted in active_sync_transfers_ has returned.
+    // Copy() counted in transfer_lifecycle_state_ has returned.
     void drainLocalCopies();
     std::map<void*, std::vector<EngineMemHandle>> addr_to_mem_handles_;
 };

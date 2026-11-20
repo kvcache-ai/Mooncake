@@ -50,10 +50,9 @@ int AsyncTransferExecutor::initialize() {
 }
 
 void AsyncTransferExecutor::finalize() {
-    // Wait out an in-progress disconnectAllPeers(). Stopping the query thread
-    // first would drop unfinished batches without decrementing
-    // active_async_tasks_, and the disconnect call would wait forever while
-    // the engines are destroyed.
+    // Wait out an in-progress disconnectAllPeers(). Stopping the query
+    // thread first still drops active_async_tasks_, so that call would go
+    // on to Disconnect while this function destroys the engines.
     std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
     if (finalized_) {
         return;

@@ -58,6 +58,9 @@ constexpr const char* kEnabled = "1";
 constexpr const char* kDisabled = "0";
 constexpr int32_t kTransferRetryTimes = 2;
 constexpr int kMaxAdxlInitAttempts = 4;
+// Bit 63 of transfer_lifecycle_state_. The low 63 bits are the active count.
+constexpr uint64_t kQuiescedBit = uint64_t{1} << 63;
+constexpr uint64_t kActiveSyncMask = kQuiescedBit - 1;
 
 void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     for (auto* slice : slice_list) {
@@ -535,9 +538,52 @@ int TransferExecutorBase::disconnect(size_t engine_idx,
     return 0;
 }
 
+bool TransferExecutorBase::beginSyncTransfer() {
+    uint64_t state = transfer_lifecycle_state_.load(std::memory_order_acquire);
+    while ((state & kQuiescedBit) == 0) {
+        if (transfer_lifecycle_state_.compare_exchange_weak(
+                state, state + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TransferExecutorBase::endSyncTransfer() {
+    const uint64_t previous =
+        transfer_lifecycle_state_.fetch_sub(1, std::memory_order_acq_rel);
+    // The common path is not quiesced. Notify only the disconnect call, and
+    // only once the last in-flight transfer has left. Taking the mutex here
+    // closes the gap between that call's predicate check and its wait.
+    if ((previous & kQuiescedBit) == 0 || (previous & kActiveSyncMask) != 1) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(transfer_lifecycle_cv_mutex_);
+    transfer_lifecycle_cv_.notify_one();
+}
+
+void TransferExecutorBase::quiesceSyncTransfers() {
+    uint64_t state = transfer_lifecycle_state_.load(std::memory_order_acquire);
+    while (!transfer_lifecycle_state_.compare_exchange_weak(
+        state, state | kQuiescedBit, std::memory_order_acq_rel,
+        std::memory_order_acquire)) {
+    }
+    std::unique_lock<std::mutex> lock(transfer_lifecycle_cv_mutex_);
+    transfer_lifecycle_cv_.wait(lock, [this] {
+        return (transfer_lifecycle_state_.load(std::memory_order_acquire) &
+                kActiveSyncMask) == 0;
+    });
+}
+
+void TransferExecutorBase::resumeSyncTransfers() {
+    transfer_lifecycle_state_.fetch_and(~kQuiescedBit,
+                                        std::memory_order_release);
+}
+
 void TransferExecutorBase::drainLocalCopies() {
     // Device copies keep running until Poll() sees their completion flags or
-    // their deadline. New copies stay rejected while peers_quiesced_ is set.
+    // their deadline. New copies stay rejected while the quiesce bit is set.
     while (true) {
         bool pending = false;
         for (const auto& engine : local_copy_engines_) {
@@ -555,9 +601,9 @@ void TransferExecutorBase::drainLocalCopies() {
 }
 
 int TransferExecutorBase::disconnectAllPeers() {
-    // Held for the whole call. The wait for active_sync_transfers_ drops
-    // transfer_lifecycle_mutex_, and connection_mutex_ is taken only for the
-    // peer walk.
+    // Held for the whole call. execute() and local Copy() are counted in
+    // transfer_lifecycle_state_ until they return. connection_mutex_ is
+    // taken only for the peer walk.
     std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
 
     // The caller may keep using this thread after the call, and the next
@@ -573,12 +619,7 @@ int TransferExecutorBase::disconnectAllPeers() {
         }
     });
 
-    {
-        std::unique_lock<std::mutex> lock(transfer_lifecycle_mutex_);
-        peers_quiesced_ = true;
-        transfer_lifecycle_cv_.wait(
-            lock, [this] { return active_sync_transfers_ == 0; });
-    }
+    quiesceSyncTransfers();
 
     // Query-thread Disconnect runs before active_async_tasks_ drops to 0, so
     // this returns only after those Adxl calls have finished. Do not hold
@@ -626,11 +667,7 @@ int TransferExecutorBase::disconnectAllPeers() {
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(transfer_lifecycle_mutex_);
-        peers_quiesced_ = false;
-    }
-    transfer_lifecycle_cv_.notify_all();
+    resumeSyncTransfers();
     return result;
 }
 
@@ -1052,14 +1089,9 @@ void TransferExecutorBase::processGroupedSliceList(
                 ? local_copy_engines_[local_engine_idx].get()
                 : nullptr;
         if (need_local_copy && local_copy_engine != nullptr) {
-            {
-                std::lock_guard<std::mutex> lifecycle_lock(
-                    transfer_lifecycle_mutex_);
-                if (peers_quiesced_) {
-                    markSlicesFailed(slice_list);
-                    return;
-                }
-                ++active_sync_transfers_;
+            if (!beginSyncTransfer()) {
+                markSlicesFailed(slice_list);
+                return;
             }
             if (VLOG_IS_ON(1)) {
                 size_t copy_bytes = 0;
@@ -1081,32 +1113,17 @@ void TransferExecutorBase::processGroupedSliceList(
                            std::chrono::steady_clock::now() - start)
                            .count()
                     << "us";
-            {
-                std::lock_guard<std::mutex> lifecycle_lock(
-                    transfer_lifecycle_mutex_);
-                --active_sync_transfers_;
-            }
-            transfer_lifecycle_cv_.notify_all();
+            endSyncTransfer();
             return;
         }
 
-        {
-            std::lock_guard<std::mutex> lifecycle_lock(
-                transfer_lifecycle_mutex_);
-            if (peers_quiesced_) {
-                markSlicesFailed(slice_list);
-                return;
-            }
-            ++active_sync_transfers_;
+        if (!beginSyncTransfer()) {
+            markSlicesFailed(slice_list);
+            return;
         }
         result = execute(local_engine_idx, target_adxl_engine_name, operation,
                          slice_list);
-        {
-            std::lock_guard<std::mutex> lifecycle_lock(
-                transfer_lifecycle_mutex_);
-            --active_sync_transfers_;
-        }
-        transfer_lifecycle_cv_.notify_all();
+        endSyncTransfer();
         if (result.ret == 0 || !result.retryable ||
             retry + 1 >= kTransferRetryTimes) {
             break;
